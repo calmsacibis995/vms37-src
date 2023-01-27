@@ -1,0 +1,556 @@
+
+MODULE GETREQ (LANGUAGE (BLISS32) ,
+		IDENT = 'V03-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  MTAACP
+!
+! ABSTRACT:
+!
+!	This routine gets the next I/O request from the ACP queue.
+!	If no requests are queued, it hibernates.  When all its work is
+!	complete, it deletes itself.
+!
+! ENVIRONMENT:
+!
+!	Starlet operating system, including privileged system services
+!	and internal exec routines. This routine must be called
+!	in kernel mode.
+!
+!--
+
+!
+!
+! AUTHOR:  D. H. GILLESPIE,	 CREATION DATE:  11-MAY-1977  17:26
+!
+! MODIFIED BY:
+!
+!	V02-006 DMW00012	David Michael Walp	14-Mar-1981
+!		Added routine GET_CCB to find the address of the channel
+!		control block.  Use the routine to find the CCB.
+!
+!	V02-005	REFORMAT	Maria del C. Nasr	30-Jun-1980
+!
+!	A0004	MCN0003		Maria del C. Nasr	25-Sep-79   16:37
+!		Add HDR3 processing
+!
+!	A0003	SPR24947	Maria del C. Nasr	04-Sep-79   10:40
+!		Fixed bug to allow only one file to be accessed at any
+!		one time on a magtape.
+!
+!**
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+
+REQUIRE 'SRC$:MTADEF.B32';
+
+FORWARD ROUTINE
+    GET_CCB,					! get the channel control block
+    GET_REQ	: L$GET_REQ,			! exec mode get request
+    GET_REQUEST	: COMMON_CALL;			! kernel mode get request
+
+EXTERNAL ROUTINE
+    DEALLOCATE,					! deallocate system space
+    CHECK_MAIL	: COMMON_CALL,			! check for mail from operator
+    LOCK_IODB,					! lock i/o database mutex
+    SYS$HIBER	: ADDRESSING_MODE (ABSOLUTE),
+    UNLOCK_IODB;				! unlock i/o databas mutex
+
+EXTERNAL
+
+    DISK_UCB	: REF BBLOCK,			! UCB of device sys$disk
+    IO_CHANNEL,					! i/o channel number
+    MAIL_CHANNEL;				! mailbox channel number
+
+
+ROUTINE GET_REQUEST : COMMON_CALL =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine gets the next i/o request from the ACP queue.
+!	If no more requests, it checks if there are any volumes being
+!	serviced by the ACP.  If there are none, prepare to delete itself.
+!
+! CALLING SEQUENCE:
+!	GET_REQUEST (), called in kernel_mode
+!
+! INPUT PARAMETERS:
+!	none
+!
+! IMPLICIT INPUTS
+!	QUEUE_HEAD: address of ACP queue block
+!	IO_CHANNEL: i/o channel number
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	CURRENT_UCB: address of UCB of request
+!	CURRENT_VCB: address of vcb of request
+!	CURRENT_WCB: window of file if accessed
+!	HDR1:	     address of hdr1 label in volume control block
+!	HDR2:	     address of hdr2 label in volume control block
+!	HDR3:	     address of hdr3 label in volume control block
+!
+! ROUTINE VALUE:
+!	address of request i/o packet
+!
+! SIDE EFFECTS:
+!	I/O channel assigned to device of request
+!	Result string length set to zero and result string cleared
+!	Disable write back of channel window
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    ! This register forces REMQUE to be executed in one instruction
+    !
+
+    REGISTER
+	QUEUE_POINTER	: REF BBLOCK;
+
+    EXTERNAL
+	CURRENT_UCB	: REF BBLOCK,		! address of current UCB
+	CURRENT_WCB	: REF BBLOCK,		! address of file window
+	HDR1		: REF BBLOCK,		! address of hdr1 label
+	HDR2		: REF BBLOCK,		! address of hdr2 label
+	HDR3		: REF BBLOCK,		! address of hdr3 label
+	IOC$GL_AQBLIST	: REF BBLOCK ADDRESSING_MODE (ABSOLUTE),
+	QUEUE_HEAD	: REF BBLOCK,		! ACP queue list head
+	SCH$GL_CURPCB	: REF BBLOCK ADDRESSING_MODE (ABSOLUTE);
+
+    LOCAL
+	CCB		: REF BBLOCK,		! pointer to ccb of i/o channel
+	PACKET		: REF BBLOCK;		! address of new i/o packet
+
+    ! Attempt to dequeue a packet.
+    !
+
+    WHILE 1
+    DO
+	BEGIN
+	QUEUE_POINTER = .QUEUE_HEAD;
+
+	IF NOT REMQUE(.QUEUE_POINTER[AQB$L_ACPQFL], PACKET)
+	THEN
+
+	    ! check that structures are valid
+	    !
+	    BEGIN
+
+	    LOCAL
+		VPAGE	: REF BBLOCK;
+
+	    IF .PACKET[IRP$B_TYPE] NEQ DYN$C_IRP
+	    THEN
+		BUG_CHECK(NOTIRPAQB);
+
+	    CURRENT_UCB = .PACKET[IRP$L_UCB];
+
+	    IF .CURRENT_UCB[UCB$B_TYPE] NEQ DYN$C_UCB
+	    THEN
+		BUG_CHECK(NOTUCBIRP);
+
+	    CURRENT_VCB = .CURRENT_UCB[UCB$L_VCB];
+
+	    IF .CURRENT_VCB[VCB$B_TYPE] NEQ DYN$C_VCB
+	    THEN
+		BUG_CHECK(NOTVCBUCB);
+
+	    ! If the virtual page forward link in the VCB does not point to
+	    ! itself, it means there is a page allocated to this volume.  Get
+	    ! the address, verify the type, and set the header pointers.
+	    !
+	    IF .CURRENT_VCB[VCB$L_VPFL] NEQ CURRENT_VCB[VCB$L_VPFL]
+	    THEN
+		BEGIN
+		VPAGE = .CURRENT_VCB[VCB$L_VPFL];
+
+		IF .VPAGE[VVP$B_TYPE] NEQ VVP_TYPE
+		THEN
+		    BUG_CHECK(NOTVVPVCB);
+
+		HDR1 = VPAGE[VVP$T_HDR1];
+		HDR2 = VPAGE[VVP$T_HDR2];
+		HDR3 = VPAGE[VVP$T_HDR3];
+		END;
+
+	    ! If the volume is blocked for rewind or volume mount, put all
+	    ! requests other than cancel on the stalled i/o queue.
+	    !
+
+	    IF NOT (.CURRENT_VCB[VCB$V_WAIREWIND] OR .CURRENT_VCB[VCB$V_WAIMOUVOL])
+	    THEN
+		EXITLOOP;			! volume is not blocked
+
+	    IF .PACKET[IRP$V_FCODE] EQL IO$_ACPCONTROL
+		AND
+		NOT .PACKET[IRP$V_VIRTUAL]
+	    THEN
+		EXITLOOP;			! let cancel thru
+
+	    ! insert in stalled i/o queue
+	    !
+	    INSQUE(.PACKET, .VPAGE[VVP$L_STALLIOBL]);
+	    END
+	ELSE
+
+	    ! If the REMQUE failed and the mount count in the AQB is zero, this
+	    ! ACP is potentially idle.  Interlock the i/o database and check
+	    ! the queue and the count again.  If the ACP is no longer idle,
+	    ! proceed as if nothing had happended. If it still is, unhook the
+	    ! AQB from the system AQB list.  Once unhooked, the ACP can no
+	    ! longer be found by anyone.  Change the process uic so that a new
+	    ! ACP will be successfully created by mount.  Return to exec mode
+	    ! GET_REQUEST to wait for outstanding i/o and delete the process.
+	    !
+	    BEGIN
+
+	    IF .QUEUE_POINTER[AQB$B_MNTCNT] EQL 0
+	    THEN
+		BEGIN
+		LOCK_IODB();			! lock i/o data base mutex
+
+		IF .QUEUE_POINTER[AQB$B_MNTCNT] EQL 0
+		    AND
+		    .QUEUE_POINTER[AQB$L_ACPQFL] EQL QUEUE_POINTER[AQB$L_ACPQFL]
+		THEN
+		    BEGIN
+
+		    LOCAL
+			P	: REF BBLOCK;
+
+		    P = .IOC$GL_AQBLIST;
+
+		    IF .P EQL .QUEUE_POINTER
+		    THEN
+			IOC$GL_AQBLIST = .QUEUE_POINTER[AQB$L_LINK]
+		    ELSE
+			BEGIN
+
+			UNTIL .P[AQB$L_LINK] EQL .QUEUE_POINTER
+			DO
+			    P = .P[AQB$L_LINK];
+
+			P[AQB$L_LINK] = .QUEUE_POINTER[AQB$L_LINK];
+			END;
+
+		    ! Inc group component of process PCB so the create ACP in
+		    ! mount will not get a duplicate process error.
+		    !
+		    SCH$GL_CURPCB[PCB$W_GRP] = .SCH$GL_CURPCB[PCB$W_GRP] + 1;
+		    UNLOCK_IODB();
+		    END
+		ELSE
+		    UNLOCK_IODB();
+
+		END;				! end of if no more volumes mounted
+
+	    RETURN 0;				! no packet
+
+	    END;				! end of if packet found
+
+	END;					! end of while loop
+
+    ! The current volume may not be on the unit indicated in the users channel
+    !
+    BEGIN
+
+    LOCAL
+	UCBLST	: REF VECTOR [LONG],		! pointer to UCBlst in RVT
+	RVT	: REF BBLOCK;			! relative volume table
+
+    RVT = .CURRENT_VCB[VCB$L_RVT];
+
+    IF .RVT[RVT$B_TYPE] NEQ DYN$C_RVT
+    THEN
+	BUG_CHECK(NOTRVTVCB);
+
+    UCBLST = RVT[RVT$L_UCBLST];
+    CURRENT_UCB = .UCBLST[.CURRENT_VCB[VCB$W_RVN]];
+    END;
+
+    IF .CURRENT_UCB[UCB$B_TYPE] NEQ DYN$C_UCB
+    THEN
+	BUG_CHECK(NOTUCBRVT);
+
+    CCB = GET_CCB ( .IO_CHANNEL );		! point to ccb
+    CCB[CCB$L_UCB] = .CURRENT_UCB;		! and assign it by stuffing UCB
+
+    ! Get the WCB address if there is a file open on the channel. The window
+    ! pointer will not be valid if this is a cancel io which is an ACP control
+    ! function with the virtual bit off.
+    !
+    CURRENT_WCB = .CURRENT_VCB[VCB$L_WCB];
+
+    ! If low order bit is set, then deaccess is pending.  Ignore window.
+    !
+
+    IF .(PACKET[IRP$L_WIND])<0,1>
+    THEN
+	CURRENT_WCB = 0;
+
+    ! address for window is long word aligned
+    !
+
+    IF .(PACKET[IRP$L_WIND])<1,2> NEQ 0
+    THEN
+	BUG_CHECK(BADWCBPT);
+
+    IF .CURRENT_WCB NEQ 0
+    THEN
+	BEGIN
+
+	IF .CURRENT_WCB[WCB$B_TYPE] NEQ DYN$C_WCB
+	THEN
+	    BUG_CHECK(NOTWCBIRP);
+
+	IF .CURRENT_WCB[WCB$V_NOTFCP]
+	THEN
+	    BUG_CHECK(NOTFCPWCB);
+
+	END;
+
+    ! Prevent write-back of WCB.  Set result string length equal to zero.
+    ! Clear result string buffer.
+    !
+
+    IF .PACKET[IRP$V_COMPLX]
+    THEN
+	BEGIN
+
+	LOCAL
+	    ABD	: REF BBLOCKVECTOR [, ABD$C_LENGTH];
+
+	ABD = .BBLOCK[.PACKET[IRP$L_SVAPTE], AIB$L_DESCRIPT];
+	ABD[ABD$C_WINDOW, ABD$W_COUNT] = 0;
+
+	IF .ABD[ABD$C_RESL, ABD$W_COUNT] GEQ 2
+	THEN
+	    (.ABD[ABD$C_RESL, ABD$W_TEXT] + ABD[ABD$C_RESL, ABD$W_TEXT] + 1)<0,16> = 0;
+
+	CH$FILL(0, .ABD[ABD$C_RES, ABD$W_COUNT],
+	    .ABD[ABD$C_RES, ABD$W_TEXT] + ABD[ABD$C_RES, ABD$W_TEXT] + 1);
+	END
+
+	! If there is no buffer packet, the function must be an ACP control
+	! function.
+	!
+    ELSE
+	BEGIN
+
+	IF (.PACKET[IRP$V_FCODE] GTRU IO$_LOGICAL AND .PACKET[IRP$V_FCODE] NEQ IO$_ACPCONTROL)
+	    OR
+	    (.PACKET[IRP$V_FCODE] EQL IO$_ACPCONTROL AND .PACKET[IRP$V_VIRTUAL])
+	THEN
+	    BUG_CHECK(NOBUFPCKT);
+
+	END;
+
+    RETURN .PACKET;
+
+    END;					! end of routine
+
+
+GLOBAL ROUTINE GET_REQ : L$GET_REQ =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine gets a request from the io queue. If there are no
+!	entries, it then enables ast's for exec mode and hibernates.
+!	If an ast is delivered, then  a process may be unblock and continued
+!	from point of block.
+!
+! CALLING SEQUENCE:
+!	GET_REQ(), exec mode
+!
+! INPUT PARAMETERS:
+!	none
+!
+! IMPLICIT INPUTS:
+!	none
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	none
+!
+! ROUTINE VALUE:
+!	Address of request i/o packet
+!
+! SIDE EFFECTS:
+!	none
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    BIND
+	SECONDS = UPLIT (-70000000, -1);
+
+    EXTERNAL
+	QUEUE_HEAD	: REF BBLOCK;		! head of ACP queue
+
+    LOCAL
+	PACKET;					! packet address
+
+    REGISTER
+	QUEUE_POINTER	: REF BBLOCK;
+
+    WHILE 1
+    DO
+	BEGIN
+	$SETAST(ENBFLG = 0);			! disable ast's
+	PACKET = KERNEL_CALL(GET_REQUEST);	! get request off queue
+
+	IF .PACKET NEQ 0
+	THEN
+	    RETURN .PACKET;			! got a request to process
+
+	! if there are no volumes to service and the ACP's queue is empty, check
+	! if all I/O is done, namely rewinds.  Wait for all I/O before deleting
+	! process.  If the ACP still has volumes/requests to service, hibernate.
+	!
+	QUEUE_POINTER = .QUEUE_HEAD;
+
+	IF .QUEUE_POINTER[AQB$B_MNTCNT] EQL 0
+	    AND
+	    .QUEUE_POINTER[AQB$L_ACPQFL] EQL QUEUE_POINTER[AQB$L_ACPQFL]
+	THEN
+	    BEGIN
+
+	    LOCAL
+		CCB	: REF BBLOCK;
+
+	    WHILE 1
+	    DO
+		BEGIN
+		CCB = KERNEL_CALL ( GET_CCB, .IO_CHANNEL );
+
+		IF .CCB[CCB$W_IOC] EQL 0
+		THEN
+		    EXITLOOP;
+
+		IF $SETIMR(EFN = TIMEFN, DAYTIM = SECONDS)
+		THEN
+		    $WAITFR(EFN = TIMEFN);
+
+		END;				! end of short while loop
+
+	    CCB[CCB$L_UCB] = .DISK_UCB;
+	    $DASSGN(CHAN = .MAIL_CHANNEL);
+	    $DASSGN(CHAN = .IO_CHANNEL);
+	    KERNEL_CALL(DEALLOCATE, .QUEUE_POINTER);
+	    $DELPRC();
+	    END
+	ELSE
+	    BEGIN
+	    CHECK_MAIL();
+	    $SETAST(ENBFLG = 1);		! enable before hibernate
+	    SYS$HIBER();			! hibernate
+	    END;
+
+	END;					! end of while loop
+
+    RETURN 1;					! Never Execute
+						!  but gets rid of info error
+
+    END;					! end of routine
+
+
+GLOBAL ROUTINE GET_CCB (CHANNEL) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns the address of the channel control block
+!	associated with the given channel.
+!
+!
+! CALLING SEQUENCE:
+!	GET_CCB (ARG1) in kernel mode
+!
+! INPUT PARAMETERS:
+!	ARG1: channel number
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	address of CCB
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+
+BEGIN
+
+LINKAGE
+	L_VERIFYCHAN	= JSB (REGISTER = 0) :
+			  GLOBAL (CCB = 1)
+			  NOPRESERVE (2, 3, 4, 5);
+
+GLOBAL REGISTER
+	CCB		= 1 : REF BBLOCK; ! CCB address returned
+
+LOCAL
+	STATUS;				! status of system call
+
+EXTERNAL ROUTINE
+	IOC$VERIFYCHAN	: L_VERIFYCHAN ADDRESSING_MODE (ABSOLUTE);
+					! exec routine to find CCB
+
+STATUS = IOC$VERIFYCHAN (.CHANNEL);
+IF NOT .STATUS
+THEN BUG_CHECK (INVCHAN, FATAL, 'Invalid ACP channel number');
+
+RETURN .CCB;
+
+END;					! end of routine GET_CCB
+END
+ELUDOM

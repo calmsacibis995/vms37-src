@@ -1,0 +1,757 @@
+MODULE DBGARI (	IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	DEBUG (DBG)
+!
+! ABSTRACT:
+!	processes names, displays expressions, and writes into memory.
+!
+! ENVIRONMENT:	VAX/VMS, user mode, interrupts disabled. non-AST level.
+!
+! Version:	1.10
+!
+! History:
+!	Author:
+!		Carol Peters, 26 Oct 1976: Version 01
+!
+!	Modified by:
+!		Mike Candela,  9 Jan 1979
+!		DAVID PLUMMER, 2 NOV 1979
+!		Ken Nappa,     18-Jan-80
+!		Richard Title  2-Oct-81
+!
+! Revision history:
+! 1.01	24-AUG-78	DAR	Converted DBG$CNV_D_TO_F to use built-in
+!				function CVTDF.
+! 1.02	22-SEP-78	DAR	Deleted require file DLLNAM.
+! 1.03	25-SEP-78	MCC	Deleted require file SYSLIT
+! 1.04	19-OCT-78	MCC	Changed semantic stack from VECTOR to
+!				BLOCKVECTOR to accomodate BLISS fields
+! 1.05	27-OCT-78	DAR	DBG$GETARRAYADR does not complain if array's
+!				last dimension was declared as 1 and user exceeds
+!				the bounds.
+! 1.06	 9-JAN-79	MCC	Modified dbg$getarrayadr to process new array
+!				descriptor class for COBOL-74
+! 1.07	24-Sep-79	JBD	Remove restrictions regarding DSC$V_FL_COLUMN
+!				in arrays (at least for DSC$K_CLASS_A).
+! 1.08 2-NOV-79		DLP	DISABLED ARRAY BOUNDS CHECKING WHEN
+!				UPPER AND LOWER BOUNDS OF LAST DIMENSION
+!				ARE EQUAL. (DBG$GETARRAYADR)
+! 1.09	10-Jan-80	JBD	Made arrays of type DTYPE_DSC work
+! 1.10	18-Jan-80	KAN	Called read_access from getarrayaddr to catch
+!				garbage BASIC descriptors.
+! 3.00   2-Oct-81	 RT	Modified dbg$get_arrayadr so that it signals
+!				an error if the object that is passed to
+!				it is not really an array
+!--
+
+FORWARD ROUTINE
+	dbg$getarrayadr,			! gets the address of an array element
+	dbg$trans_name : NOVALUE,		! TRANSFORMS A STRING INTO A VALUE
+	dbg$write_mem,				! WRITES data TO MEMORY
+	dbg$lng_dig_str: NOVALUE;		! Make a long digit string from input
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'src$:dbgprolog.req';
+REQUIRE 'SRC$:DBGGEN.REQ';
+REQUIRE 'src$:comter.req';
+REQUIRE 'src$:bstruc.req';
+
+EXTERNAL ROUTINE
+    	dbg$rst_name_addr,
+	dbg$map_to_reg_addr,			! Maps an address to user regs
+	dbg$set_overs : novalue,		! Set current MODE level
+	dbg$fao_put : novalue,			! Do DEBUG I/O
+	dbg$out_dimensn : NOVALUE,		! display dimension info
+	dbg$check_prot,				! CHECKS THE PROTECTION OF A PAGE
+	for$cnv_in_defg,			! converts a floating or real
+	dbg$read_access,			! verify access to memory
+    	dbg$find_val,				! look up a value in the
+    						! DEFINE symbol table
+	dbg$redo_prot;				! RESETS THE PROTECTION OF A PAGE TO READ ONLY
+
+
+EXTERNAL
+	dbg$gb_language : BYTE,			! Holds language index
+	dbg$gl_asci_len,			! Length of ascii string.
+	dbg$gb_loc_type: BYTE,			! TYPE OF LAST LOCATION EXAMINED
+	dbg$gb_mod_ptr: REF VECTOR [, BYTE],	! POINTER TO CURRENT MODES
+	dbg$gl_csp_ptr,				! pointer to current scope
+	dbg$gl_last_loc,			! CURRENT LOCATION
+	dbg$gl_last_val,			! CURRENT VALUE
+	dbg$gl_runframe: REF BLOCK [, BYTE],	! pointer to current run frame
+	dbg$gl_buf_siz,				! standard DEBUG I/O 
+	dbg$cp_out_str : ref vector[,byte],	! standard DEBUG I/O
+	dbg$gl_stk : semantic_stack;		! semantic stack for tokens, etc.
+
+
+
+GLOBAL ROUTINE dbg$getarrayadr (descrip_block, dimen_list, absolute_adr, nt_ptr) =
+!++
+! Functional description:
+!	Find the absolute address of a single array element,
+!	CHARACTER string, CHARACTER substring, or array CHARACTER
+!	string or substring.  ("vec(i)", "string", "string(from:to)",
+!	"strings(i)" or "strings(i)(from:to)", respectively.)
+!
+!	The routine also passes back this element address (via
+!	'absolute_addr'), and then pass back the element's type
+!	(via RETURN).
+!
+! Formal Parameters:
+!	descrip_block	- address of the array descriptor for the array
+!	dimen_list	- address of a nine longword vector that holds
+!			  the number of dimensions in the first location,
+!			  the dimensions of the array element in locations
+!			  two through eight, and an offset (in bytes)
+!			  for the whole array, in location nine.
+!	absolute_adr	- pointer to absolute address of the array element
+!			  that is returned by this routine.
+!	nt_ptr		- pointer to name table entry for the symbol.
+!			  Used in call to SIGNAL.
+!
+! Implicit inputs:
+!	the contents of the array descriptor block
+!
+! Implicit outputs:
+!	none
+!
+! Routine value:
+!	The type of the array.  (one of DSC$K_DTYPE_???)
+!
+! Side effects:
+!	SIGNALs if wrong number of dimensions, dimensions out of
+!	bounds, array descriptor is 'foreign', or CHARACTER
+!	substring designator tries to address out of bounds.
+!--
+BEGIN
+
+	MAP
+		descrip_block : REF BLOCK [, BYTE],
+		dimen_list : REF VECTOR,
+		absolute_adr : REF VECTOR,
+    		nt_ptr	: REF rst$entry;
+
+	LITERAL
+		max_dimensions	= 7;			! maximum number of dimensions
+							! in a FORTRAN array
+
+	MACRO
+		no_of_dimens	= 0%,			! offset in dimen_list to count item
+		first_dimen	= 1%,			! offset to first dimension value
+		array_offset	= 8%,			! offset for the entire
+							!   array reference
+		substring_flag	= 9%;			! 1 => substring designator given
+
+
+	dbg$read_access(.descrip_block, 12);
+
+    	! Check that the argument is really a descriptor for an array
+    	! or a character string
+
+    	IF NOT (.descrip_block[dsc$b_dtype] EQL dsc$k_dtype_t
+    		OR .descrip_block[dsc$b_class] EQL dsc$k_class_a
+    		OR .descrip_block[dsc$b_class] EQL dsc$k_class_nca
+    		OR .descrip_block[dsc$b_dtype] EQL dsc$k_dtype_dsc)
+    	THEN
+    	    BEGIN
+    	    LOCAL
+    		name_string; ! counted string with name of variable
+    			     ! that the user has erroneously used
+    			     ! as an array.
+    	    IF .nt_ptr NEQ 0 
+    	    THEN
+    		name_string = dbg$rst_name_addr(.nt_ptr)
+    	    ELSE 
+    		BEGIN
+    		LOCAL
+    		    sym_ptr;
+    		! try seeing if the user has subscripted a DEFINEd symbol
+    		sym_ptr = dbg$find_val(.descrip_block,1);
+    		IF .sym_ptr NEQ 0
+    		THEN
+    		    name_string = sym_cstring(.sym_ptr)
+    		ELSE 
+    		    ! cannot determine a name (this should not happen)
+    		    name_string = PLIT BYTE ('');
+    		END;
+
+    	    SIGNAL(dbg$_notanarray,1,.name_string);
+
+    	    END;
+
+	! If the symbol we are to resolve is a CHARACTER or array-of-CHARACTER
+	! reference, then we have some pre-processing to do.
+	!-
+	IF  (.descrip_block[ DSC$B_DTYPE ] EQL DSC$K_DTYPE_T)
+	THEN
+		BEGIN
+		LOCAL
+			from_character,
+			to_character;
+
+		! If there was no substring designator "(from:to)"
+		! then the default that we supply is the whole string.
+		! i.e. 'from' is 1, and 'to' is the string length.
+
+		IF NOT .dimen_list[substring_flag]
+		THEN
+		    BEGIN
+		    dbg$gl_asci_len = .descrip_block[dsc$w_length];
+		    IF .dbg$gl_asci_len GTR TTY_ASCII_LEN
+		    THEN
+			dbg$gl_asci_len = TTY_ASCII_LEN;
+
+		    dimen_list[array_offset] = 1;
+		    END;
+
+		! Pick up the two character position indicators given
+		! in the substring designator or supplied by default.
+		! The given size is passed in MODE LENGTH.  See above.
+
+		from_character = .dimen_list[array_offset];
+		to_character = .from_character + .dbg$gl_asci_len -1;
+		! The beginning character position given in the substring
+		! designator must be 1 or greater, and it must be
+		! less than or equal to the maximum size of the string.
+		! Likewise, the end character position must be 1 or greater,
+		! and less than the string's size.  Finally, the two
+		! character positions must not be 'reversed'.
+
+		IF (.from_character LSS 1 )
+		OR  (.from_character GTR .descrip_block[DSC$W_LENGTH] )
+		OR  (.to_character GTR .descrip_block[DSC$W_LENGTH] )
+		OR  (.from_character GTR .to_character )
+		THEN
+		    SIGNAL (DBG$_SUBSTRING, 3,.from_character,.to_character,.descrip_block[DSC$W_LENGTH]);
+		    ! no return
+
+		!+
+		! All is OK.  The beginning of the CHARACTER vector
+		! is all that we need thus far.  The optional
+		! string offset is added later so that we can
+		! handle character vectors as well as characters and vectors.
+		!-
+		absolute_adr[0] = .descrip_block[ DSC$A_POINTER ];
+		END;
+
+	! For ordinary arrays, or for arrays or CHARACTER, we
+	! still have to resolve the subscripting reference.
+
+	IF( .descrip_block[ DSC$B_CLASS ] EQL DSC$K_CLASS_A )
+	OR( .descrip_block[ DSC$B_CLASS ] EQL dsc$k_class_nca)
+	THEN
+		BEGIN
+
+		! Standard array descriptors.  
+
+		LOCAL
+			dimen_count,				! number of dimensions
+			span_block : REF VECTOR,		! pointer to block of
+								! span information
+			bounds_block : REF VECTOR,		! pointer to block of
+								! bounds information
+			poly_a,					! result of polya calculation
+			constant,				! result of constant calculation
+			ptr_to_dimens : REF VECTOR;		! pointer to dimension list after
+								! the count item.
+	
+		!++
+		! If the record is not of the right type, then signal and give up.
+		! Also signal if not all the information required is present.
+		!--
+		dimen_count = .dimen_list [no_of_dimens];
+
+		IF (NOT .descrip_block [dsc$v_fl_coeff])
+		OR (NOT .descrip_block [dsc$v_fl_bounds])
+		THEN
+		    SIGNAL (dbg$_invarrdsc);
+	
+		!++
+		! See whether the number of dimensions given is correct.
+		! If not, SIGNAL an error and return.
+		!--
+		IF .dimen_count NEQ .descrip_block [dsc$b_dimct]
+		THEN
+			begin
+			local
+				out_buf : vector[TTY_OUT_WIDTH,BYTE];
+	
+			! The message includes a re-work of the string
+			! originally given in the DIMENSION statement.
+	
+			dbg$out_dimensn(.descrip_block,out_buf);
+			signal( DBG$_INVDIM, 1, out_buf);
+			! no return
+			END;
+	
+		!++
+		! Now set up pointers to the blocks that describe the spans
+		! of each dimension and the bounds of each dimension.
+		!--
+		span_block = descrip_block [dsc$l_m1];
+		bounds_block = .span_block + (.descrip_block [dsc$b_dimct] * %UPVAL);
+	
+		!++
+		! See whether each dimension specified is within the proper
+		! bounds. If not, SIGNAL a message and get out.
+		!--
+		INCR count FROM 1 to .dimen_count DO
+		    BEGIN
+		    LOCAL
+			bound;				! Holds index to array bounds
+		    bound = .count - 1;
+		    IF (.dimen_list [.count] LSS .bounds_block [.bound * 2])
+		    OR (.dimen_list [.count] GTR .bounds_block [.bound * 2 + 1])
+		    THEN
+			BEGIN
+			LOCAL
+			    out_buf : vector[TTY_OUT_WIDTH,BYTE];
+			IF NOT (.count EQL .dimen_count
+				AND .bounds_block [.bound * 2] EQL .BOUNDS_BLOCK[.BOUND * 2 + 1])
+			THEN
+			    BEGIN
+			    dbg$out_dimensn(.descrip_block,out_buf);
+			    SIGNAL (DBG$_INVDIM, 1, out_buf);
+			    ! no return
+			    END;
+			END;
+		    END;
+	
+		IF  .descrip_block [dsc$b_class] EQL dsc$k_class_a
+		THEN
+		    IF .DESCRIP_BLOCK [DSC$V_FL_COLUMN] EQL 1
+		    THEN			! Column major (Fortran style)
+			BEGIN
+			!++
+			! Perform the calculation that gives the address of the array
+			! element. Starting at the last dimension, add the value of
+			! the dimension to a working sum, and multiply that sum by the
+			! span of the dimension that precedes the current dimension.
+			! Simultaneously, add the lower bound of the current
+			! dimension to another working sum (called "constant"), and
+			! multiple "constant" by the span of the dimension that precedes
+			! the current dimension. For the final dimension (the first 
+			! specified in the reference), omit the multiplications.
+			!
+			! The formula is
+			!	( ... ( d(n) * s(n-1) + d(n-1) ) * s(n-2) + d(n-2) ... )
+			!		* s(1) + d(1)
+			! where "d" is dimension, and "s" is span.
+			!--
+			dimen_count = .dimen_count - 1;
+			ptr_to_dimens = dimen_list [first_dimen];
+			poly_a = 0;
+			constant = 0;
+			REPEAT
+			    BEGIN
+			    poly_a = .poly_a + .ptr_to_dimens [.dimen_count];
+			    constant = .constant + .bounds_block [.dimen_count * 2];
+			    dimen_count = .dimen_count - 1;
+			    IF .dimen_count LSS 0
+			    THEN EXITLOOP;
+			    poly_a = .poly_a * .span_block [.dimen_count];
+			    constant = .constant * .span_block [.dimen_count];
+			    END;
+
+			absolute_adr [0] = .descrip_block [dsc$a_pointer] +
+			    ((.poly_a - .constant) * .descrip_block [dsc$w_length]);
+			END
+		    ELSE		! Row major (BASIC style)
+			BEGIN
+			DIMEN_COUNT = 0;
+			PTR_TO_DIMENS = DIMEN_LIST[FIRST_DIMEN];
+			POLY_A = 0;
+			CONSTANT = 0;
+			WHILE 1 DO
+			    BEGIN
+			    POLY_A = .POLY_A + .PTR_TO_DIMENS[.DIMEN_COUNT];
+			    CONSTANT = .CONSTANT + .BOUNDS_BLOCK[.DIMEN_COUNT*2];
+			    DIMEN_COUNT = .DIMEN_COUNT + 1;
+			    IF .DIMEN_COUNT GEQ .DIMEN_LIST[NO_OF_DIMENS]
+			    THEN EXITLOOP;
+			    POLY_A = .POLY_A*.SPAN_BLOCK[.DIMEN_COUNT];
+			    CONSTANT = .CONSTANT*.SPAN_BLOCK[.DIMEN_COUNT];
+			    END;
+			ABSOLUTE_ADR[0] = .DESCRIP_BLOCK[DSC$A_POINTER] + ((.POLY_A
+			    - .CONSTANT)*.DESCRIP_BLOCK[DSC$W_LENGTH]);
+			END
+		ELSE
+		    IF  .descrip_block [dsc$b_class] EQL dsc$k_class_nca
+		    AND .descrip_block [dsc$v_fl_column] EQL 0
+		    THEN
+			BEGIN
+			LOCAL
+				terms;
+
+			! determine address of the array element being referenced
+
+			terms = 0;
+			INCR count FROM 1 TO .dimen_list[no_of_dimens]
+			DO
+			  terms = .terms + .dimen_list[.count] * .span_block[.count-1];
+			absolute_adr[0] = .descrip_block [dsc$a_a0] + .terms;
+
+			! set asci_len to the length field from the descriptor
+			! for certain data types
+
+			IF ((.descrip_block [dsc$b_dtype] GEQ dsc$k_dtype_t)
+			AND (.descrip_block [dsc$b_dtype] LEQ dsc$k_dtype_nro))
+			OR  (.descrip_block [dsc$b_dtype] EQL dsc$k_dtype_p)
+			THEN
+				dbg$gl_asci_len = .descrip_block [dsc$w_length];
+			END
+		    ELSE
+			SIGNAL (dbg$_invarrdsc);
+
+		END;
+
+	! Now see if the entire CHARACTER reference, or the entire
+	! CHARACTER array reference is to be offset by a given
+	! number of bytes.
+
+	IF( .dimen_list[array_offset] neqa 0 )
+	THEN
+		BEGIN
+	
+		absolute_adr[0] = .absolute_adr[0] + .dimen_list[array_offset] -1;
+		END;
+
+	! Return the element's type.
+
+	IF .DESCRIP_BLOCK[DSC$B_DTYPE] EQL DSC$K_DTYPE_DSC
+	THEN RETURN DBG$GETARRAYADR(.ABSOLUTE_ADR[0], .DIMEN_LIST, .ABSOLUTE_ADR)
+	ELSE RETURN ( .descrip_block[ dsc$b_dtype] );
+	END;
+
+GLOBAL ROUTINE dbg$trans_name (semsp, lexeme_stg_desc) : NOVALUE =
+!++
+! Functional description:
+!	Transforms the simplest element of a DEBUG expression
+!	into a binary value. Tokens expected are digit_str_token,
+!	and the tokens for current location,
+!	last value displayed, next location, and previous location.
+!
+!	A name token is represented as a length count and a buffer
+!	address in the string descriptor. A number token is represented as
+!	a length count and a 32-bit or 64-bit precision number in
+!	the buffer address.
+!
+! Formal Parameters:
+!	semsp		- offset in parse stack that holds the
+!			  current token.
+!	lexeme_stg_desc	- string descriptor to number or name
+!
+! Implicit inputs:
+!	current mode, last value, current location, next location
+!
+! Outputs:
+!	none
+!
+! Implicit outputs:
+!	replaces the value onto the stack in the place of the token found
+!
+! Routine value:
+!	novalue
+!
+! Side effects:
+!	none
+!--
+	BEGIN
+
+	BUILTIN
+	    CVTDF;
+
+	MAP
+	    lexeme_stg_desc : REF BLOCK [, BYTE];
+
+	BIND
+	    register_vector = dbg$gl_runframe [dbg$l_user_regs] : VECTOR;
+
+
+	dbg$gl_stk [.semsp, stk$v_type] = dsc$k_dtype_l;	! Assume the type is LONGWORD
+	SELECTONE .dbg$gl_stk[.semsp, stk$v_val1] OF
+
+		SET
+
+		[digit_str_token]:
+			BEGIN
+			dbg$gl_stk[.semsp, stk$v_val1] = .(.lexeme_stg_desc [dsc$a_pointer])
+			END;
+
+		[l_dig_str_token]:
+			BEGIN
+			dbg$gl_stk[.semsp, stk$v_val1] = .(.lexeme_stg_desc[dsc$a_pointer]);
+			dbg$gl_stk[.semsp, stk$v_val2] = .dbg$gl_stk[.semsp,stk$v_val1];
+			END;
+
+		[period_token]:
+			BEGIN
+			LOCAL
+			    reg_addr;
+
+			! Check to see if '.' is bound to a context register area
+
+			IF dbg$map_to_reg_addr (.dbg$gl_last_loc, reg_addr)
+		        THEN
+			    BEGIN
+			    SIGNAL (dbg$_symregbnd, 1, UPLIT BYTE (%ASCIC '.'));
+			    dbg$gl_stk[.semsp, stk$v_val1] = .reg_addr;
+			    END
+			ELSE
+			    dbg$gl_stk[.semsp, stk$v_val1] = .dbg$gl_last_loc;
+			END;
+
+		[up_arrow_token]:
+			BEGIN
+
+
+			IF .dbg$gb_loc_type EQL memory_loc
+			THEN 
+				BEGIN
+
+				! See if '^' is bound to a context register
+			
+				LOCAL
+					reg_addr;
+
+				IF dbg$map_to_reg_addr (.dbg$gl_last_loc - 4, reg_addr)
+				THEN
+				 	BEGIN
+					SIGNAL (dbg$_symregbnd, 1, UPLIT BYTE (%ASCIC '^'));
+					dbg$gl_stk [.semsp, stk$v_val1] = .reg_addr;
+					END
+				ELSE
+					BEGIN
+					dbg$gl_stk [.semsp, stk$v_val1] = .dbg$gl_last_loc - .dbg$gb_mod_ptr [mode_length];
+					END;
+				END
+			ELSE
+				BEGIN
+
+				LOCAL
+					reg_index;
+
+				reg_index = (.dbg$gl_last_loc - dbg$gl_runframe [dbg$l_user_regs]) / %UPVAL;
+				IF .reg_index LEQ 0
+				THEN dbg$gl_stk [.semsp, stk$v_val1] = dbg$gl_runframe [dbg$l_user_r0]
+				ELSE dbg$gl_stk [.semsp, stk$v_val1] = register_vector [.reg_index - 1];
+				END;
+			END;
+
+		[backslash_token]:
+			BEGIN
+			dbg$gl_stk [.semsp, stk$v_val1] = .dbg$gl_last_val
+			END;
+
+		[single_fl_token, double_fl_token]:
+			BEGIN
+
+			LOCAL
+				status,
+				value : VECTOR [2];
+
+			value[0] = 0;
+			value[1] = 0;
+			status = for$cnv_in_defg (.lexeme_stg_desc, value);
+			IF NOT .status
+			THEN
+				BEGIN
+
+
+!				SIGNAL (dbg$_invnumber, 1, .lexeme_stg_desc);
+!				RETURN
+				SIGNAL(DBG$_NUMTRUNC);
+				END;
+			IF .dbg$gl_stk [.semsp, stk$v_val1] EQL single_fl_token
+			THEN
+				BEGIN
+				CVTDF (value, value);
+				dbg$gl_stk [.semsp, stk$v_val2] = 0;
+				dbg$gl_stk [.semsp, stk$v_type] = dsc$k_dtype_f;
+
+
+				END
+			ELSE
+				BEGIN
+				dbg$gl_stk [.semsp, stk$v_val2] = .value[1];
+				dbg$gl_stk [.semsp, stk$v_type] = dsc$k_dtype_d;
+
+
+				END;
+			dbg$gl_stk [.semsp, stk$v_val1] = .value[0];
+			END;
+
+		[OTHERWISE]:
+			SIGNAL (dbg$_parseerr);
+
+		TES;
+
+
+	END;
+
+GLOBAL ROUTINE dbg$write_mem (dest_address, src_address, length) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!	Writes a sequence of values (bytes) to memory in
+!	the user program.  The destination, source, and
+!	number of bytes to write are all passed as parameters.
+!
+!	THE PROTECTION OF THE FIRST BYTE TO BE WRITTEN AND THE LAST
+!	BYTE TO BE WRITTEN ARE BOTH CHECKED. THE STATUS OF BOTH PAGES
+!	(THEY MAY BE THE SAME PAGE) IS SAVED. THEN THE VALUE IS WRITTEN
+!	TO THE ADDRESS (THE PAGE PROTECTION IS CHANGED DURING THE
+!	CHECKING OPERATION).
+!
+!	THEN, IF THE PROTECTION WAS CHANGED IN EITHER CASE, THE
+!	PROTECTION IS REESTABLISHED. IF EVERYTHING WAS SUCCESSFUL,
+!	THE ROUTINE RETURNS TRUE. OTHERWISE, IT RETURNS FALSE.
+!
+! Formal Parameters:
+!	dest_address	- THE ADDRESS OF THE LOCATION TO BE CHANGED
+!	src_address	- The address of where the bytes are stored.
+!	length		- The number of bytes to be written.
+!
+! IMPLICIT INPUTS:
+!	None.
+!
+! IMPLICIT OUTPUTS:
+!	THE PAGE PROTECTION MAY BE MOMENTARILY ALTERED, THEN REINSTALLED.
+!
+! ROUTINE VALUE:
+!	TRUE OR FALSE
+!
+! SIDE EFFECTS:
+!	THE VALUE IS WRITTEN TO MEMORY
+!--
+	BEGIN
+
+	MAP
+		dest_address	: REF VECTOR[,BYTE],
+		src_address	: REF VECTOR[,BYTE];
+
+	LOCAL
+		prot_status_1,
+		protection_1: BYTE,
+		prot_status_2,
+		protection_2: BYTE;
+
+	IF ((prot_status_1 = dbg$check_prot (.dest_address, protection_1)) NEQ 0) 
+		AND ((prot_status_2 = dbg$check_prot (.dest_address + .length - 1, protection_2)) NEQ 0)
+	THEN
+		BEGIN
+
+		!++
+		! PROTECTION HAS EITHER BEEN ALTERED SUCCESSFULLY, OR IT
+		! DID NOT NEED TO BE ALTERED. NOW WRITE THE VALUE INTO THE
+		! ADDRESS.
+		!--
+
+		CH$MOVE (.length, src_address [0], dest_address [0]);
+
+		!++
+		! IF EITHER OF THE PROTECTION STATUSES SAY RESET THE PROTECTION
+		! (TO READ ONLY), THEN RESET THE PROTECTION ON THAT PAGE.
+		!--
+
+		IF .prot_status_1 EQL dbg$k_reset_prt
+		THEN
+			BEGIN
+			dbg$redo_prot (.dest_address, protection_1);
+			END;
+
+		IF .prot_status_2 EQL dbg$k_reset_prt
+		THEN
+			BEGIN
+			dbg$redo_prot (.dest_address + .length - 1, protection_2);
+			END;
+
+		RETURN TRUE			! User program updated correctly
+		END
+	ELSE
+		RETURN FALSE
+
+	END;
+
+GLOBAL ROUTINE dbg$lng_dig_str(in,out,sz) : NOVALUE=
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine gets free space for the digit string and makes
+!	a character string from it, updating the output descriptor
+!	to point to it
+!
+! Formal Parameters:
+!
+!	in - descriptor pointing to digit string
+!	out - descriptor to receive the address of the string in free space
+!	sz - size of the digit string
+!
+! IMPLICIT INPUTS:
+!	None.
+!
+! IMPLICIT OUTPUTS:
+!
+! ROUTINE VALUE:
+!
+! SIDE EFFECTS:
+!
+!--
+BEGIN
+
+MAP
+    in : REF BLOCK[,BYTE],
+    out : REF BLOCK[,BYTE];
+
+EXTERNAL ROUTINE
+    dbg$freez ;				! Get zeroed free space
+LOCAL
+   l,
+   pnt : REF VECTOR[,BYTE];
+
+!
+! The size of the string inculdes one byte for the sign which we will put
+!  in.  Always put in a plus sign and if the number was supposed to be
+! negative another routine will write over the plus sign with a minus sign
+!  This is to get around the method the grammer uses for handling unary signs
+
+pnt = dbg$freez(RST_UNITS(.sz+1));
+! don't move sign which isn't there and leave room for the sign
+ch$move(.sz-1,.in[dsc$a_pointer],pnt[2]);
+pnt[0] = .sz;
+pnt[1] = %C'+';		! put in the sign
+.out[dsc$a_pointer] = .pnt ;
+RETURN
+END;
+
+END
+ELUDOM

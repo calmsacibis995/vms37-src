@@ -1,0 +1,364 @@
+MODULE SYSMOU (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  MOUNT Utility Structure Levels 1 & 2
+!
+! ABSTRACT:
+!
+!	This module contains the code and data needed to mount the system
+!	disk during system initialization.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  1-Nov-1977  19:02
+!
+! MODIFIED BY:
+!
+!	V02-008	STJ0202		Steven T. Jeffreys,	05-Feb-1982
+!		Make sure the OPT_MOUNTVER bit gets set.  The first
+!		attempt at this ended in disaster.
+!
+!	V02-007	STJ0175		Steven T. Jeffreys,	06-Jan-1982
+!		Set up the database to ensure the system disk
+!		is a candidate for mount verification.
+!
+!	V02-006	ACG0248		Andrew C. Goldstein,	31-Dec-1981  16:56
+!		Use default logical name, fix use of $GETDEV
+!
+!	V02-005	ACG0181		Andrew C. Goldstein,	13-Oct-1980  15:37
+!		Fix cross facility references
+!
+!	V0104	ACG0123		Andrew C. Goldstein,	12-Feb-1980  18:23
+!		Integrate disk rebuild into MOUNT
+!
+!	V0103	ACG0079		Andrew C. Goldstein,	11-Nov-1979  19:32
+!		MOUNT changes for write-back cacheing
+!
+!	V0102	ACG0072		Andrew C. Goldstein,	22-Oct-1979  13:53
+!		Check primary and secondary device char
+!
+!	V101	ACG0003		Andrew C. Goldstein,  28-Dec-1978  15:23
+!	Add global variables for multi-volume MOUNT
+!
+!	V100	ACG0001		Andrew C. Goldstein,  28-Dec-1978  15:22
+!	Previous revision history moved to SYSINIT.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'LIB$:MOUDEF.B32';
+REQUIRE 'OBJD$:[VMSLIB.OBJ]MOUNTMSG.REQ';
+
+
+FORWARD ROUTINE
+	MOUNT_SYSTEM,			! main routine
+	MAIN_HANDLER;			! condition handler
+
+!+
+!
+! Own storage for general use in the MOUNT utility
+!
+!-
+
+GLOBAL
+	CLEANUP_FLAGS	: BITVECTOR [32], ! error cleanup status flags
+	CHANNEL,			! channel number for I/O
+	MAILBOX_CHANNEL,		! channel number of ACP termination mailbox
+	PHYS_NAME	: VECTOR [2],	! descriptor of physical device name
+	PHYS_BUFFER	: VECTOR [20, BYTE],
+					! buffer to construct phys device name
+	LOG_BUFFER	: VECTOR [20, BYTE],
+					! buffer to construct logical name
+	HOME_BLOCK	: BBLOCK [512],	! buffer for volume header label or home block
+	DEVICE_CHAR	: BBLOCK [DIB$K_LENGTH],
+					! buffer for device characteristics
+	DEVICE_CHAR2	: BBLOCK [DIB$K_LENGTH],
+					! buffer for 2nd device characteristics
+	HOMEBLOCK_LBN,			! LBN of home block read
+	HEADER_LBN,			! LBN of file header
+	DEV_INDEX,			! index into device data table
+	USER_STATUS	: VECTOR [2],	! status return for various routines
+	CURRENT_RVN,			! RVN of volume being mounted
+	CURRENT_VCB	: REF BBLOCK,	! address of VCB used by CHECK_HEADER2
+	REAL_RVT	: REF BBLOCK,	! address of RVT allocated for volume set
+	REAL_VCB	: REF BBLOCK,	! address of VCB allocated for volume
+	REAL_FCB	: REF BBLOCK,	! address of FCB allocated for volume
+	REAL_WCB	: REF BBLOCK,	! address of window allocated for volume
+	REAL_VCA	: REF BBLOCK,	! address of cache block allocated
+	REAL_AQB	: REF BBLOCK,	! address of AQB allocated for volume
+	LOG_ENTRY	: REF BBLOCK,	! address of logical name entry
+	MTL_ENTRY	: REF BBLOCK,	! address of mounted volume list entry
+	SLOG_ENTRY	: REF BBLOCK,	! address of volume set logical name entry
+	SMTL_ENTRY	: REF BBLOCK,	! address of volume set mounted volume list entry
+
+	DEVCHAR_DESC	: VECTOR [2] INITIAL (DIB$K_LENGTH, DEVICE_CHAR),
+					! descriptor for device characteristics
+	DEVCHAR_DESC2	: VECTOR [2] INITIAL (DIB$K_LENGTH, DEVICE_CHAR2);
+					! descriptor for device characteristics
+
+
+
+!+
+!
+! The following area is a hand crafted mount parser output suitable for
+! mounting the system disk.
+!
+!-
+
+GLOBAL
+	MOUNT_OPTIONS	: BITVECTOR [64] ! option flags
+			INITIAL (
+				(1^OPT_SYSTEM OR	! First 32 bits
+				 1^OPT_WRITE OR
+				 1^OPT_BLOCK OR
+				 1^OPT_OVR_ID OR
+				 1^OPT_DEVICE OR
+				 1^OPT_LABEL),
+				 1^(OPT_MOUNTVER-32)	! Last 32 bits
+				),
+
+	PROTECTION	: INITIAL (0),	! value of /PROTECTION switch
+	OWNER_UIC	: INITIAL (0),	! value of /OWNER_UIC switch
+	USER_UIC	: INITIAL (0),	! value of /USER_UIC switch
+	EXTENSION	: INITIAL (0),	! value of /EXTENSION switch
+	WINDOW		: INITIAL (0),	! value of /WINDOW switch
+	ACCESSED	: INITIAL (0),	! value of /ACCESSED switch
+	BLOCKSIZE	: INITIAL (0),	! value of /BLOCK switch
+	EXT_CACHE	: INITIAL (0),	! value of /CACHE=(EXTENT=n) switch
+	FID_CACHE	: INITIAL (0),	! value of /CACHE=(FILE=n) switch
+	QUO_CACHE	: INITIAL (0),	! value of /CACHE=(QUOTA=n) switch
+	EXT_LIMIT	: INITIAL (0),	! value of /CACHE=(LIMIT=n) switch
+	DEVICE_COUNT	: INITIAL (1),	! number of devices specified
+	LABEL_COUNT	: INITIAL (1),	! number of volume labels specified
+	LOG_NAME	: VECTOR [2],	! logical name of system disk
+	STRUCT_NAME	: VECTOR [2],	! descriptor of structure name
+	VID_STRING	: VECTOR [2],	! descriptor of VISUAL_ID string
+	COMMENT_STRING	: VECTOR [2],	! descriptor of COMMENT string
+	ACP_STRING	: VECTOR [2],	! descriptor of ACP device or name string
+	DRIVE_COUNT	: VECTOR [1],	! value of /DRIVES switch
+
+	PARSE_IMP_END	: VECTOR [0];	! end of data area
+
+GLOBAL BIND
+	LABEL_STRING	= DESCRIPTOR ('SYSTEMDISK') : VECTOR;
+					! dummy volume label of system disk
+
+GLOBAL ROUTINE MOUNT_SYSTEM (SYS_CHANNEL) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine mounts the system disk (i.e., the disk to which the
+!	channel is assigned) and starts the ACP.
+!
+!
+! CALLING SEQUENCE:
+!	MOUNT_SYSTEM (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: channel number assigned to disk
+!
+! IMPLICIT INPUTS:
+!	own storage of this module
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1 if successful, assorted statuses if not
+!
+! SIDE EFFECTS:
+!	system disk mounted, ACP started, logical name created
+!
+!--
+
+BEGIN
+
+LOCAL
+	STATUS,				! system service status
+	P;				! pointer into characteristics block
+
+EXTERNAL ROUTINE
+	READ_HOMEBLOCK,			! read disk home block
+	MOUNT_DISK1,			! mount disk, level 1
+	MOUNT_DISK2,			! mount disk, level 2
+	REBUILD;			! rebuild disk bitmaps and quota file
+
+
+! Enable the condition handler.
+!
+
+ENABLE MAIN_HANDLER;
+
+CHANNEL = .SYS_CHANNEL;
+
+! Get the device characteristics and do device type validation: Make sure
+! the device is mountable at all, and check that the mount qualifiers are
+! consistent with the device type. A mismatch between primary and secondary
+! device characteristics indicates a spooled device or something else strange.
+! Reject such.
+!
+
+$GETCHN (CHAN = .CHANNEL, PRIBUF = DEVCHAR_DESC, SCDBUF = DEVCHAR_DESC2);
+
+IF CH$NEQ (DIB$K_LENGTH, DEVICE_CHAR, DIB$K_LENGTH, DEVICE_CHAR2, 0)
+OR NOT .DEVICE_CHAR[DEV$V_FOD]
+THEN ERR_EXIT (SS$_NOTFILEDEV);
+
+IF NOT .DEVICE_CHAR[DEV$V_AVL]
+THEN ERR_EXIT (SS$_DEVOFFLINE);
+
+IF .DEVICE_CHAR[DEV$V_MNT]
+THEN ERR_EXIT (SS$_DEVMOUNT);
+
+IF .DEVICE_CHAR[DEV$V_SQD]
+THEN ERR_EXIT (SS$_NOTFILEDEV);
+
+! Construct the physical device name by appending the ascii unit number to
+! the device name in the device characteristics.
+!
+
+PHYS_NAME[0] = 20;
+PHYS_NAME[1] = PHYS_BUFFER;
+$FAO (
+	DESCRIPTOR ('_!AC!UW:'),
+	PHYS_NAME[0],
+	PHYS_NAME[0],
+	DEVICE_CHAR + .DEVICE_CHAR[DIB$W_DEVNAMOFF],
+	.DEVICE_CHAR[DIB$W_UNIT]
+	);
+
+! Now attempt to read the home block or volume header label, as appropriate
+! for the device type.
+!
+
+STATUS = READ_HOMEBLOCK (LABEL_STRING[0]);
+
+MOUNT_OPTIONS[OPT_IS_FILES11] = 1;	! assume volume is Files-11
+IF NOT .STATUS
+AND .STATUS NEQ SS$_INCVOLLABEL
+THEN ERR_EXIT (.STATUS);
+
+IF .MOUNT_OPTIONS[OPT_IS_FILES11B]
+THEN MOUNT_DISK2 ()
+ELSE MOUNT_DISK1 ();
+
+! Rebuild the volume if it was improperly dismounted.
+!
+
+IF .CLEANUP_FLAGS[CLF_REBUILD]
+THEN
+    BEGIN
+    ERR_MESSAGE (MOUN$_REBUILD);
+    REBUILD (.CHANNEL, .CLEANUP_FLAGS[CLF_REBUILDQUO]);
+    END;
+
+1
+END;					! end of routine MOUNT_COMMAND
+
+ROUTINE MAIN_HANDLER (SIGNAL, MECHANISM) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is the main level condition handler for the MOUNT
+!	utility. It undoes anything that MOUNT has done so far and then
+!	unwinds and returns the condition code as status to MOUNT's
+!	caller (i.e., the CLI).
+!
+!
+! CALLING SEQUENCE:
+!	MAIN_HANDLER (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of signal array
+!	ARG2: address of mechanism array
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	SS$_CONTINUE
+!
+! SIDE EFFECTS:
+!	stack unwound, control passed to CLI
+!
+!--
+
+BEGIN
+
+MAP
+	SIGNAL		: REF BBLOCK,	! signal array
+	MECHANISM	: REF BBLOCK;	! mechanism array
+
+EXTERNAL
+	USER_STATUS	: VECTOR;	! status return of some routines
+
+
+! Do cleanup as indicated by the status flags.
+! Cause the condition code to be returned in R0 as the main routine value.
+!
+
+IF .SIGNAL[CHF$L_SIG_NAME] NEQ SS$_UNWIND
+AND .BBLOCK [SIGNAL[CHF$L_SIG_NAME], STS$V_SEVERITY] EQL STS$K_SEVERE
+THEN
+    BEGIN
+
+    IF .SIGNAL[CHF$L_SIG_NAME] NEQ 0
+    THEN MECHANISM[CHF$L_MCH_SAVR0] = .SIGNAL[CHF$L_SIG_NAME]
+    ELSE MECHANISM[CHF$L_MCH_SAVR0] = .USER_STATUS[0];
+    $UNWIND ();
+    END;
+
+RETURN SS$_CONTINUE;			! continue from success signals
+
+END;					! end of routine MAIN_HANDLER
+
+END
+ELUDOM

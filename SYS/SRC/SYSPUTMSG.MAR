@@ -1,0 +1,555 @@
+	.TITLE	SYSPUTMSG - SYS$ERROR/SYS$OUTPUT Linked Message Routine
+	.IDENT	'V03-000'
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY:  System Library
+;
+; ABSTRACT:
+;
+;	This utility routine sends one or more messages to SYS$ERROR and
+;	SYS$OUTPUT.
+;
+; ENVIRONMENT:  
+;
+; AUTHOR:  Ward Clark,	CREATION DATE:  5 December 1977
+;
+; REVISION HISTORY:
+;
+;	V02-014	MLJ0064		Martin L. Jack		13-Dec-1981
+;		Add ACTPRM parameter.
+;
+;	V02-013	KTA0022		Kerbey T. Altmann	10-Jun-1981
+;		Add two new messges to the execption list. Also modify
+;		the list so that PROCSTRT can use it.
+;
+;	V02-012	TMH0012		Tim Halvorsen		24-Feb-1981
+;		Close SYS$OUTPUT and SYS$ERROR files after use.
+;		If error detected in $FAO, output message w/o FAO.
+;
+;	V02-011	KTA0009		Kerbey T. Altmann	10-Feb-1981
+;		Check length of argument list before accessing an
+;		argument to protect against picking up junk.
+;
+;	010	TMH0008		Tim Halvorsen		31-Jan-1980
+;		Increase buffer size to 255 bytes since the supervisor
+;		stack size increased enough to handle the space.
+;		If inhib_msg bit set in status code, completely ignore
+;		message and its arguments.
+;		Allow FAO call with leq 2 arguments for system or rms
+;		messages since they do not have an FAO count longword.
+;
+;	009	TMH0007		Tim Halvorsen		26-Jan-1980
+;		Fix so that FAO is called only if more than 2 arguments
+;		specified, not one (since all msg sets with an FAO count
+;		have at least 2 arguments).  Remove bypass of status=0
+;		messages if the message is the primary message.
+;
+;	008	TMH0006		Tim Halvorsen		17-Jan-1980
+;		Upcase the first character of the message if text only
+;		and suppress null lines.
+;
+;	007	TMH0005		Tim Halvorsen		14-Jan-1980
+;		Save registers r8,r9 over EXE$OPEN_MSG.  Also, always
+;		clear r6 (facnam not inserted) on exit paths from facnam
+;		processing code.
+;
+;	006	TMH0004		Tim Halvorsen		10-Jan-1980
+;		Call EXE$OPEN_MSG only if message needs to be output
+;		in order to reduce the total stack space required for
+;		this routine by caller's not needing output (i.e. DCL).
+;		Rewrite most of the GET_MODEL_MSG so that process msg
+;		flags override if the facility name is given.  Also,
+;		reduce the buffer size to 127.
+;
+;	005	TMH0003		Tim Halvorsen		02-Jan-1980
+;		Ignore facility name if the facility bit is off in the
+;		message flags argument.
+;
+;	004	TMH0002		Tim Halvorsen		29-Dec-1979
+;		Fix increment delimiter insertion when facility name
+;		supplied by caller and text only returned by GETMSG.
+;
+;	003	TMH0001		Tim Halvorsen		19-Dec-1979
+;		Use default message flags from the control region (set
+;		using the SET MESSAGE command).  Fix % handling when
+;		prefixing a facility name so that the % returned from
+;		GETMSG is overwritten with a dash (-).
+;
+;	02	RIH0038		Richard I. Hustvedt	07-Nov-1979
+;		Add status codes for floating faults to list of exception
+;		codes.
+;
+;--
+
+	.PAGE
+	.SBTTL	Declarations
+;
+; MACROS:
+;
+
+	.MACRO	$EXC_CODE  CODE,ARGS
+	.BYTE	ARGS
+	.WORD	CODE/8
+	.ENDM	$EXC_CODE
+
+	.MACRO	$FORMAL ARGUMENT_LIST
+$$FORMAL = 0
+	.IRP	ARGUMENT,<ARGUMENT_LIST>
+$$FORMAL = $$FORMAL+4
+ARGUMENT = $$FORMAL
+	.ENDR
+	.ENDM	$FORMAL
+
+	.MACRO	$LOCAL ARGUMENT_LIST
+	.IRP	ARGUMENT,<ARGUMENT_LIST>
+	$$LOCAL_ARG ARGUMENT
+	.ENDR
+	.ENDM	$LOCAL
+
+	.MACRO	$$LOCAL_ARG NAME,SIZE=4
+	.IF	NDF,$$LOCAL_SIZE
+$$LOCAL_SIZE = 0
+	.ENDC
+$$LOCAL_SIZE = $$LOCAL_SIZE+SIZE
+NAME = -$$LOCAL_SIZE
+	.ENDM	$$LOCAL_ARG
+
+;
+; EQUATED SYMBOLS:
+;
+
+SS_ID = 0				; VAX/VMS subsystem number
+RMS_ID = 1				; RMS subsystem number
+MODEL_BUFF_SIZE = 255			; Size of model message buffer
+MSG_BUFF_SIZE = 255			; Size of actual message buffer
+PREFIX1 = ^A/%/				; Prefix on 1st message
+PREFIX2 = ^A/-/				; Prefix on subsequent messages
+
+					; Define VAX/VMS symbols:
+	$SSDEF				;    Define system status values
+	$STSDEF				;    message code definitions
+	$RMSDEF				;    RMS message codes
+	$FABDEF				;    RMS FAB fields, masks and values
+	$RABDEF				;    RMS RAB fields, masks and values
+
+;
+; OWN STORAGE:
+;
+
+	.PSECT	YEXEPAGED
+EXE$EXCEPTABLE::			; Define and initialize exception codes table.
+	.BYTE	EXCEPTION_COUNT		; Number of entries
+10$:	$EXC_CODE  SS$_ACCVIO,4		;    Access violation - 4 arguments
+EXCEPTION_SIZE = .-10$			;    Length of a single table entry
+	$EXC_CODE  SS$_MCHECK,2		;    Machine check - 2 arguments
+	$EXC_CODE  SS$_ASTFLT,6		;    AST delivery stack fault - 6 arguments
+	$EXC_CODE  SS$_BREAK,2		;    Breakpoint fault - 2 arguments
+	$EXC_CODE  SS$_CMODSUPR,3	;    Change mode to supervisor trap - 3 args
+	$EXC_CODE  SS$_CMODUSER,3	;    Change mode to user trap - 3 arguments
+	$EXC_CODE  SS$_COMPAT,3		;    Compatibility mode fault - 3 arguments
+	$EXC_CODE  SS$_OPCCUS,2		;    Opcode reserved to user fault - 2 args
+	$EXC_CODE  SS$_OPCDEC,2		;    Opcode reserved to DEC fault - 2 args
+	$EXC_CODE  SS$_PAGRDERR,4	;    Page read error - 4 arguments
+	$EXC_CODE  SS$_RADRMOD,2	;    Reserved addressing fault - 2 arguments
+	$EXC_CODE  SS$_ROPRAND,2	;    Reserved operand fault - 2 arguments
+	$EXC_CODE  SS$_SSFAIL,3		;    System service failure - 3 arguments
+	$EXC_CODE  SS$_TBIT,2		;    TBIT pending trap - 2 arguments
+	$EXC_CODE  SS$_DEBUG,2		;    Debug trap - 2 arguments
+	$EXC_CODE  SS$_ARTRES,2		;    Arithmetic trap, reserved trap
+	$EXC_CODE  SS$_INTOVF,2		;    Arithmetic trap, integer overflow
+	$EXC_CODE  SS$_INTDIV,2		;    Arithmetic trap, integer divide by zero
+	$EXC_CODE  SS$_FLTOVF,2		;    Arithmetic trap, floating overflow
+	$EXC_CODE  SS$_FLTDIV,2		;    Arithmetic trap, floating/decimal divide by zero
+	$EXC_CODE  SS$_FLTUND,2		;    Arithmetic trap, floating underflow
+	$EXC_CODE  SS$_DECOVF,2		;    Arithmetic trap, decimal overflow
+	$EXC_CODE  SS$_SUBRNG,2		;    Arithmetic trap, subscript out of range
+	$EXC_CODE  SS$_FLTOVF_F,2	;    Arithmetic fault, floating overflow
+	$EXC_CODE  SS$_FLTDIV_F,2	;    Arithmetic fault, floating/decimal divide by zero
+	$EXC_CODE  SS$_FLTUND_F,2	;    Arithmetic fault, floating underflow
+	$EXC_CODE  SS$_INHCHMK,3	;    Inhibited CHMKernel trap - 3 arguments
+	$EXC_CODE  SS$_INHCHME,3	;    Inhibited CHMExecutive trap - 3 arguments
+EXCEPTION_COUNT = <.-10$>/EXCEPTION_SIZE
+
+	.PAGE
+	.SBTTL	SYS$PUTMSG - SYS$ERROR/SYS$OUTPUT message routine
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is a generalized VAX/VMS message output routine.  Messages
+;	(which the caller references by message id) are sent to the SYS$OUTPUT
+;	device.  Messages which have a severity different from 1 (normal) are also
+;	sent to the SYS$ERROR device.
+;
+;	Since all user and utility routines are encouraged to "signal" error
+;	conditions rather than writing error messages, this routine is
+;	structured to be called from a signal handler.  It can, however, be
+;	directly called by any routine which can construct a proper argument
+;	list.
+;
+;	The primary (required) argument to this routine is the address of a
+;	message argument vector (described below).  The second (optional)
+;	argument is the address of a message action routine provided
+;	by the caller.  This routine, if present, is called after the
+;	standard processing for each message has been performed, but
+;	before the message is actually written to the user.  The completion code
+;	from the action routine indicates whether or not the message should
+;	be sent to the user.  The third (optional) argument is the address
+;	of a string descriptor which defines a facility name to be used in
+;	the first message of a sequence.
+;
+;	The message argument vector has the following format:
+;
+;		a) total number of arguments (b - e)
+;		b) message identifier
+;		c) number of FAO arguments for the message
+;		d) FAO argument(s)
+;		e) repeat items b thru d as many times as necessary
+;
+;	This routine will process each "message set" (items b thru d) by calling
+;	$GETMSG and $FAO and then outputting the completed message.  A simple
+;	message (i.e., no FAO arguments and no linked message) would be items a,
+;	b, f and g.
+;
+;	There are two special cases involving the message argument structure:
+;
+;		* an RMS message (STS value) is always immediately
+;		  followed by the corresponding STV value.  This STV
+;		  value will be used as an FAO argument or another
+;		  message id, based on the RMS message number.
+;
+;		* a system exception message number (e.g., SS$_ARITH)
+;		  is always immediately followed by associated
+;		  exception values (from 2 to 6) which are treated as
+;		  FAO arguments.  The number of arguments is 
+;		  determined from the message number.
+;
+; CALLING SEQUENCE:
+;
+;	CALL SYS$PUTMSG( MSG_ARGS_ADDR.rlu.ra
+;			      ,ACTION_ADDR.ra.v
+;			      ,FAC_NAME_ADDR.rt.ds
+;			      ,ACTION_PARAM.rlu.v )
+;
+;	Note that this routine is actually invoked indirectly thru
+;	use of the system vector.
+;
+; IMPLICIT INPUTS:
+;
+;	None
+;
+; IMPLICIT OUTPUTS:
+;
+;	None
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL - Successful completion
+;
+; SIDE EFFECTS:
+;
+;	None
+;
+;--
+
+	$FORMAL	< -			; Define formal routine arguments:
+MSG_ARGS_ADDR, -			;    address of caller's message vector
+ACTION_ADDR, -				;    address of caller's action routine
+FAC_NAME_ADDR, -			;    address of facility name descriptor
+ACTION_PARAM >				;    parameter to caller's action routine
+
+;
+; Define local (stack) variables
+;
+
+	$LOCAL	< -
+<GETMSG_VALUE>, -			; Message values returned by $GETMSG
+<MSG_FLAGS,2>, -			; Message flags currently selected
+<ARGCNT_LEFT,2>, -			; Total argument count left to process
+<FAO_CTL_DESC,8>, -			; FAO control string descriptor
+<FAO_OUT_DESC,8>, -			; FAO output buffer descriptor
+<SUB_MESSAGE,1>, -			; RMS sub-message indicator
+<SECONDARY_MSG,1>, -			; True if secondary error message
+<SAVE_REGS,8>, -			; Used to save r8,r9 over EXE$OPEN_MSG
+<MODEL_BUFFER,MODEL_BUFF_SIZE>, -	; Model message buffer for SYS$GETMSG
+<MESSAGE_BUFFER,MSG_BUFF_SIZE> >	; Actual message buffer
+ 
+	.ENTRY	EXE$PUTMSG,^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	MOVAB	-$$LOCAL_SIZE(SP),SP	; Allocate space for local variables
+	CLRL	R11			; Mark FAB/RAB's not yet set up
+	MOVL	MSG_ARGS_ADDR(AP),R9	; Get address of message argument list
+	ASSUME	MSG_FLAGS EQ ARGCNT_LEFT+2
+	MOVL	(R9)+,ARGCNT_LEFT(FP)	; Save number of message vector arguments
+					; and set default message flags
+	CLRB	SECONDARY_MSG(FP)	; Clear secondary indicator
+	CLRB	SUB_MESSAGE(FP)		; Clear the sub-message indicator
+ 
+;
+; Repeat the remaining portion of this routine for each
+; message set provided by the caller.
+;
+
+TOP_OF_LOOP:
+	MOVL	#1,R8			; Assume a single message argument.
+	MOVAB	4(R9),R7		; Point to FAO argument count
+	BBSC	#0,SUB_MESSAGE(FP),GET_MODEL_MSG ; If set, sub-message
+
+;
+; Special system message setup.
+;
+
+	.ENABL	LSB
+ 
+	ASSUME	RMS_ID EQ 1
+	ASSUME	SS_ID EQ 0
+ 
+	CMPZV	#STS$V_FAC_NO, -	; Check the facility code portion
+		#STS$S_FAC_NO,(R9), -	; of the current message code
+		#RMS_ID			; for an RMS id
+	BGEQ	RMS_MESSAGE		; If geq not system id
+
+	MOVAB	EXE$EXCEPTABLE,R1	; Point to the table of messages
+	MOVZBL	(R1)+,R0		; Set loop count
+10$:	MOVZBL	(R1)+,R2		; Get number of arguments
+	MOVZWL	(R1)+,R3		; Get next hardware exception code
+	CMPZV	#STS$V_CODE,#STS$S_CODE,- ; Condition name match exception code?
+		(R9),R3
+	BEQL	20$			; Yes - jump to special setup.
+	SOBGTR	R0,10$			; Any more entries to examine?
+	BLBC	SECONDARY_MSG(FP),GET_MODEL_MSG ; Skip zero bypass if primary
+	TSTL	(R9)			; Null message code? (status=0)
+	BNEQ	GET_MODEL_MSG		; If neq no
+	BRW	END_OF_LOOP		; Ignore secondary 0 status codes
+20$:	ADDL	R2,R8			; Calculate actual number of FAO arguments
+	BRB	GET_MODEL_MSG		;
+
+;
+; Special RMS message setup.
+;
+
+RMS_MESSAGE:
+	BNEQ	OTHER_MESSAGE		; If neq not RMS id
+	BBC	#RMS$V_STVSTATUS, -	; Jump if the associated message
+		(R9),30$		; argument is not another message code.
+	INCB	SUB_MESSAGE(FP)		; Indicate sub-message
+	BRB	GET_MODEL_MSG		; Jump to continue normal processing.
+
+;
+; Standard (non-special) message setup.
+;
+
+OTHER_MESSAGE:
+	CMPW	#1,ARGCNT_LEFT(FP)	; Any more arguments to process?
+	BEQL	GET_MODEL_MSG		; If eql no
+	ADDW	(R7)+,R8		; Calculate number of FAO arguments
+	TSTW	(R7)+			; Get message flags specified?
+	BEQL	30$			; If eql no
+	MOVW	-2(R7),MSG_FLAGS(FP)	; Save get message flags
+30$:	INCL	R8			; Augment number by one
+
+	.DSABL	LSB
+
+;
+; Call $GETMSG to retrieve the model message text which corresponds
+; to the current message number.
+;
+
+GET_MODEL_MSG:
+	TSTW	MSG_FLAGS(FP)		; Any message flags specified?
+	BNEQ	5$			; Branch if yes
+	MOVZBW	G^CTL$GB_MSGMASK,MSG_FLAGS(FP)	; Use process message flags
+5$:	MOVZWL	MSG_FLAGS(FP),R5	; Preset GETMSG flags to use
+	MOVZBL	#MODEL_BUFF_SIZE, -	; Setup the GETMSG buffer descriptor
+		FAO_CTL_DESC(FP)	; with the model buffer size
+	MOVAB	MODEL_BUFFER(FP), -	; and buffer address.
+		FAO_CTL_DESC+4(FP)	;
+;
+;	If facility message flag set and a facility name was specified,
+;	then put the facility name given into the buffer before calling GETMSG
+;
+	BLBS	SECONDARY_MSG(FP),15$	; Branch if not first message
+	CMPB	(AP), #FAC_NAME_ADDR/4	; Enough arguments?
+	BLSSU	15$			; No, don't try to access
+	MOVL	FAC_NAME_ADDR(AP),R6	; Any facility name descriptor?
+	BEQL	15$			; If eql not
+	BBC	#3,MSG_FLAGS(FP),15$	; If facility bit off, ignore name
+	SUBW	(R6),FAO_CTL_DESC(FP)	; Put the remaining buffer length
+	DECW	FAO_CTL_DESC(FP)	; into the model buffer descriptor
+	BLEQ	15$			; If leq buffer not large enough
+	MOVL	FAO_CTL_DESC+4(FP),R3	; Address of GETMSG buffer
+	MOVB	#PREFIX1,(R3)+		; Insert leading percent sign
+	MOVC	(R6),@4(R6),(R3)	; Move the facility name to the buffer
+	BICB3	#^X8,MSG_FLAGS(FP),R5	; Clear facility name from default flags
+	ADDW3	#1,(R6),R6		; Calculate real length of prefix
+	MOVL	#^A'-',R4		; Set delim to stick over GETMSG result
+	CMPL	R5,#1			; Requesting text only from GETMSG?
+	BNEQ	10$			; Branch if not
+	MOVB	#^A',',(R3)+		; If so, append facility/text delimiter
+	MOVB	#^A' ',R4		; and set space as delimiter afterwards
+	INCL	R6			; increment prefix length
+	DECL	FAO_CTL_DESC(FP)	; and decrement buffer space left
+10$:	MOVL	R3,FAO_CTL_DESC+4(FP)	; Point to next available space in buffer
+	BRB	20$
+
+15$:	CLRL	R6			; Mark no facility name inserted
+
+20$:	$GETMSG_S -			; Call $GETMSG with the following arguments:
+		(R9), -			;    message number
+		FAO_CTL_DESC(FP), -	;    address of text length deposit area
+		FAO_CTL_DESC(FP), -	;    address of model text buffer descriptor
+		R5, -			;    option bits (see above)
+		GETMSG_VALUE(FP)	;    address of message value deposit area
+
+	TSTL	R6			; Was prefix supplied by caller?
+	BEQL	35$			; branch if not
+	CMPL	R5,#1			; Did we ask only for text?
+	BEQL	35$			; If so, there is no % in string
+	MOVB	R4,@FAO_CTL_DESC+4(FP)	; Overwrite GETMSG % with delimiter
+35$:	ADDW	R6,FAO_CTL_DESC(FP)	; Add in length of prefix
+	MOVAB	MODEL_BUFFER(FP),FAO_CTL_DESC+4(FP) ; Reset to begining of buffer
+	TSTW	FAO_CTL_DESC(FP)	; Null string?
+	BNEQ	40$			; If not, continue
+	BRW	END_OF_LOOP		; If null string, skip to next message
+;
+;	Upcase the first character if text only message
+;
+40$:	CMPW	MSG_FLAGS(FP),#1	; Text only message?
+	BNEQ	FINAL_MESSAGE		; Branch if not
+	MOVL	FAO_CTL_DESC+4(FP),R0	; Get address of first character
+	CMPB	(R0),#^A'a'		; Check lower bounds of lowercase range
+	BLSSU	FINAL_MESSAGE		; Branch if already upper case
+	CMPB	(R0),#^A'z'		; Check upper bounds of lowercase range
+	BGTRU	FINAL_MESSAGE		; Branch if already upper case
+	ADDB	#^A'A'-^A'a',(R0)	; Convert to upper case
+
+
+;
+; Create the final output message by calling $FAOL to fillin the variable
+; portions of the model message returned by $GETMSG, or simply move the
+; model message to the output buffer.
+;
+
+FINAL_MESSAGE:
+	TSTB	GETMSG_VALUE+1(FP)	; If GETMSG indicates that this
+	BEQL	10$			; message has no FAO fields
+	CMPZV	#STS$V_FAC_NO, -	; Check the facility code portion
+		#STS$S_FAC_NO,(R9), -	; of the current message code
+		#RMS_ID			; for an RMS id
+	BLEQU	5$			; If SYSTEM or RMS, allow FAO
+	CMPL	R8,#2			; or if the caller provided no args,
+	BLEQU	10$			; bypass calling FAO.
+5$:	MOVZBL	#MSG_BUFF_SIZE,FAO_OUT_DESC(FP) ; Set length of message buffer
+	MOVAB	MESSAGE_BUFFER(FP),FAO_OUT_DESC+4(FP) ; Set address of buffer
+	$FAOL_S -			; Call $FAOL with the following arguments:
+		FAO_CTL_DESC(FP), -	;    addr of control msg string desc
+		FAO_OUT_DESC(FP), -	;    addr of msg size deposit area
+		FAO_OUT_DESC(FP), -	;    addr of msg buffer descriptor
+		(R7)			;    addr of the FAO argument list, if any
+	BLBS	R0,20$			; Jump to add the message prefix.
+					; If FAO failed, use original string
+10$:	MOVQ	FAO_CTL_DESC(FP), -	; Copy control buffer descriptor
+		FAO_OUT_DESC(FP)	;
+20$:	BBCS	#0,SECONDARY_MSG(FP),CALL_ACTION ; If clr, output first message
+	BBC	#3,R5,CALL_ACTION	; If clr, suppress insertion on minus sign
+	MOVB	#^A/-/,@FAO_OUT_DESC+4(FP) ; Insert leading minus sign
+
+
+;
+; Call the caller's action routine if one was provided.
+;
+
+CALL_ACTION:
+	BBS	#STS$V_INHIB_MSG,(R9),END_OF_LOOP ; ignore message if inhibited
+	CMPB	(AP), #ACTION_ADDR/4	; Enough arguments?
+	BLSSU	PUT_SYS$ERROR		; No, don't try to access it
+	TSTL	ACTION_ADDR(AP)		; if action routine address is zero,
+	BEQL	PUT_SYS$ERROR		; bypass calling an action routine.
+	PUSHL	#0			; Push zero action parameter
+	CMPB	(AP), #ACTION_PARAM/4	; Enough arguments?
+	BLSSU	25$			; No, don't try to access it
+	MOVL	ACTION_PARAM(AP), (SP)	; Copy user's parameter
+25$:	PUSHAB	FAO_OUT_DESC(FP)	; Push the address of message descriptor
+	CALLS	#2,@ACTION_ADDR(AP)	; and call the caller's action routine.
+	BLBC	R0,END_OF_LOOP		; If lbc skip further output of message
+
+;
+; Send error messages to the SYS$ERROR device if this is not a success sequence
+;
+    
+PUT_SYS$ERROR:
+	TSTL	R11			; Have FAB/RAB's been set up yet?
+	BNEQ	5$			; branch if all set from last iteration
+	MOVQ	R8,SAVE_REGS(FP)	; Save registers
+	BSBW	EXE$OPEN_MSG		; Allocate/init FAB and RAB's on stack
+	MOVQ	SAVE_REGS(FP),R8	; Restore registers
+5$:	MCOML	(R9),R0			; Get complement of severity field
+	INSV	R0,#RAB$V_CCO,#1,RAB$L_ROP(R11) ; Cancel ^O if not success or info
+	CMPZV	#STS$V_SEVERITY,#STS$S_SEVERITY,- ; If severity field
+		R0,#<^C<STS$K_SUCCESS>&STS$M_SEVERITY> ; is "success"
+	BEQL	10$			; then don't write SYS$ERROR
+	MOVW	FAO_OUT_DESC(FP),RAB$W_RSZ(R11) ; Set size of output message
+	MOVL	FAO_OUT_DESC+4(FP),RAB$L_RBF(R11) ; Set address of output message
+	$WAIT	RAB=(R11)		; Wait for any outstanding I/O
+	$PUT	RAB=(R11)		; Send the message to SYS$ERROR.
+
+;
+; Send the completed message to the SYS$OUTPUT device if different from 'SYS$ERROR'
+;
+
+	CMPW	RAB$W_ISI(R10),RAB$W_ISI(R11) ; SYS$ERROR and SYS$OUTPUT same?
+	BEQL	END_OF_LOOP		; If eql yes
+10$:	MOVW	FAO_OUT_DESC(FP),RAB$W_RSZ(R10) ; Set size of output message
+	MOVL	FAO_OUT_DESC+4(FP),RAB$L_RBF(R10) ; Set address of output message
+	$WAIT	RAB=(R10)		; Wait for any outstanding I/O
+	$PUT	RAB=(R10)		; Send the message to SYS$OUTPUT.
+    
+;
+; Setup to process the next message, if any.
+;	R8 = Number of longwords gobbled for this message
+;
+
+END_OF_LOOP:
+	SUBW	R8,ARGCNT_LEFT(FP)	; Calculate remaining arguments
+	BLEQ	RETURN			; If leq no more to process
+	MOVAL	(R9)[R8],R9		; Get address of next message code
+	BRW	TOP_OF_LOOP		; Loop until all messages have been
+					; processed.
+;
+; Close the message files
+;
+
+RETURN:
+	BSBW	EXE$CLOSE_MSG		; Close the message files
+
+;
+; Return to the caller.
+;
+
+	MOVL	S^#SS$_NORMAL,R0	; Return a normal completion code
+	RET				; to the caller.
+
+	.END

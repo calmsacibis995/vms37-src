@@ -1,0 +1,1106 @@
+MODULE IOMOD(IDENT='V03-000') =
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!++
+! FACILITY: EDT Version 2
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This module contains all the I/O interface code for VAX/VMS
+!	systems.
+!
+! ENVIRONMENT: VAX
+!
+! AUTHOR: Bob Kushlis, CREATION DATE: 28-JUL-1979
+!
+! MODIFIED BY:
+!
+! Dan Szymanski, 04-DEC-80, 02
+!	FAB$M_MXV added in IO_OOD so that the output file if created with
+!	a maximized version number.
+!
+! Dan Szymanski, 16-DEC-80, 03
+!	Trailing : removed during recursive translation of SYS$INPUT in IO_OT.
+!
+! John Sauter, 06-Jun-1981, 04
+!	Make all $QIOs be $QIOWs, for compatibility with the VMS 3.0 terminal driver.
+!
+! John Sauter, 11-Nov-1981, 05
+!	Change the test for VT100s to accept VT101, VT102, VT125, etc, by testing for
+!	 the ANSI bit in the terminal characteristics if the terminal type is unknown.
+!--
+
+BEGIN
+LIBRARY	'SYS$LIBRARY:STARLET';
+LIBRARY 'EDT';
+
+PSECTS
+
+LITERAL	
+    WINDOW_SIZE = 11,			! The number of buckets in a cache slot
+    NUM_WINDOW	= 20;			! The number of windows to cache
+
+OWN
+    CACHE_ADDR	: VECTOR[2],		! The start and end addresses of the cache
+    CACHE_TIMER	: INITIAL(0),		! Counter incremented for each reference
+    CACHE_WINDOW: VECTOR[NUM_WINDOW] 	! The number of the window in a slot
+    	INITIAL(REP NUM_WINDOW OF(-1)),
+    CACHE_REF 	: VECTOR[NUM_WINDOW]  	! The timer at the last reference to
+    	INITIAL(REP NUM_WINDOW OF (0)),
+    CACHE_DIRTY : VECTOR[NUM_WINDOW,BYTE] ! The window dirty flag.
+    	INITIAL(BYTE(REP NUM_WINDOW OF(0)));
+
+GLOBAL
+    IO_RHB	: BLOCK[CH$ALLOCATION(255)];	! Sequence no. in VFC files.
+
+OWN
+    MYBUF 	: BLOCK[CH$ALLOCATION(256)],
+    NAM_BLOCK 	: $NAM(RSA=MYBUF,RSS=255),
+    RELAT_RSA	: BLOCK[NAM$C_MAXRSS,BYTE],
+    RELAT_NAM	: $NAM(RSA=RELAT_RSA,RSS=NAM$C_MAXRSS),
+    AUD_NAM	: $NAM_DECL,
+    PROTO_FAB 	: $FAB(FAC=<GET>,RAT=CR,NAM=NAM_BLOCK),
+    WORK_FAB	: $FAB_DECL,
+    PROTO_RAB 	: $RAB(RAC=SEQ,ROP=<LOC,RAH,WBH>,UBF=MYBUF,USZ=255,
+                       FAB=WORK_FAB,RHB=IO_RHB,CTX=0),
+    TERM_IN_RAB	: $RAB_DECL,
+    TERM_OUT_RAB: $RAB_DECL,
+    IOSB	: VECTOR[4,WORD],
+    WF_SIZE	: INITIAL(WINDOW_SIZE),
+    OVERDRAFT	: INITIAL(0),
+    TT_CHAN;
+
+GLOBAL
+    WF_IFI,
+    IO_WF_RAB	: $RAB(ROP=<BIO>,FAB=WORK_FAB,CTX=0),
+    IO_MVEC	: INITIAL(2),
+    IO_STS,
+    IO_STV;
+
+EXTERNAL ROUTINE
+    E_AUD_IFI,
+    F_DEC,
+    F_PUT,
+    F_CHAR,
+    F_STRING,
+    F_PUT_MESS,
+    E_MESSAGE,
+    SC_RESET,
+    SY_GET_MESS;
+
+EXTERNAL
+    E_MODE,
+    E_T_TYPE,
+    E_CC : VOLATILE,
+    E_EIGHT,
+    F_BUF,
+    F_CUR,
+    K_RAC,
+    K_RAH;
+
+GLOBAL LITERAL
+    IO_FNF 	=	RMS$_FNF;
+
+FORWARD ROUTINE
+    IO_WT : NOVALUE;
+
+!+
+! Put out an I/O (RMS) error message.  The status and stv have already
+! been placed in the message vector.
+!-
+
+GLOBAL ROUTINE IO_ERR : NOVALUE =
+$PUTMSG(MSGVEC=IO_MVEC);
+
+!+
+! Put out an I/O error message and abort.
+!-
+
+ROUTINE IO_FATAL(N) : NOVALUE =
+BEGIN
+!
+! Reset any screen modes.
+!
+IF .E_MODE EQL CHANGE_MODE THEN
+    SC_RESET();
+IO_ERR();
+$EXIT(CODE = ERR_EDITORABO)
+END;
+
+!+
+! Open the work file.  Abort if it fails.
+!
+! The work file is opened in SYS$LOGIN, if this fails we try the current
+! default directory.  The cache area is allocated from virtual memory.
+!-
+
+GLOBAL ROUTINE IO_OWF =
+BEGIN
+LOCAL
+    STAT,
+    WINDOW : VECTOR[2];
+!
+! Set up the fab for the open.
+!
+CH$MOVE(FAB$C_BLN,PROTO_FAB,WORK_FAB);
+WORK_FAB[FAB$B_FAC] = FAB$M_GET+FAB$M_PUT+FAB$M_BIO;
+WORK_FAB[FAB$L_FOP] = FAB$M_TMD;
+WORK_FAB[FAB$L_ALQ] = WINDOW_SIZE;
+WORK_FAB[FAB$L_FNA] = UPLIT BYTE('SYS$LOGIN:EDTWORK.TMP');
+WORK_FAB[FAB$B_FNS] = 21;
+!
+! Try the open, first in SYS$LOGIN then in the default directory.
+!
+INCR I FROM 1 TO 2 DO
+    BEGIN
+    IF (IO_STS = $RMS_CREATE(FAB=WORK_FAB)) THEN
+	BEGIN
+	WF_IFI = .WORK_FAB[FAB$W_IFI];
+	IF NOT (IO_STS = $RMS_CONNECT(RAB=IO_WF_RAB)) THEN
+	    IO_STV = .IO_WF_RAB[RAB$L_STV];
+	END
+    ELSE
+	IO_STV = .WORK_FAB[FAB$L_STV];
+    IF .IO_STS THEN EXITLOOP;
+    WORK_FAB[FAB$B_FNS] = 0;
+    END;
+!
+! Make sure the file was successfully opened.
+!
+IF NOT .IO_STS THEN
+    BEGIN
+    F_PUT_MESS(ERR_IOERRWRK);
+    IO_FATAL();
+    END;
+!
+! Create the virtual address space for the cache. 
+!
+IF NOT (IO_STS = $EXPREG(PAGCNT=NUM_WINDOW*WINDOW_SIZE,RETADR=CACHE_ADDR)) THEN
+    $EXIT(CODE = .IO_STS);
+IO_WF_RAB[RAB$L_STS] = 1;
+RETURN 1
+END;
+
+!+
+! Locate the window which contains a specified bukt in the cache.  If it
+! is not in the cache return -1 otherwise the window number is returned.
+!
+! BUKT_NUM	The bucket we are trying to locate.
+!
+! ADDR		Address of a longword to receive the address of the requested
+!		bucket.
+!-
+
+ROUTINE FIND_WINDOW(BUKT_NUM,ADDR) =
+BEGIN
+LOCAL
+    WINDOW_NUM;
+!
+! Compute the window which contains this bucket.
+!
+WINDOW_NUM = (.BUKT_NUM-1)/WINDOW_SIZE;
+!
+! Search the cache to find the widow, if found, then compute the address
+! of the requested bucket and return it.
+!
+DECR I FROM NUM_WINDOW-1 TO 0 DO
+    IF .CACHE_WINDOW[.I] EQL .WINDOW_NUM THEN
+        BEGIN
+        .ADDR = .CACHE_ADDR+(.I*WINDOW_SIZE+(.BUKT_NUM-1)MOD WINDOW_SIZE)*512;
+        CACHE_TIMER = .CACHE_TIMER + 1;
+        CACHE_REF[.I] = .CACHE_TIMER;
+        RETURN .I;
+        END;
+!
+! Not in the cache, return failure.
+!
+RETURN -1
+END;
+
+!+
+! This routine is called when the current bucket has been modified by
+! the work file and it is going to a new bucket.  This is a logical write
+! function, but since we are using a cache, it merely marks the bucket
+! as dirty.
+!
+! NUM	the bucket number being "written".
+!-
+
+GLOBAL ROUTINE IO_PWF(NUM) : NOVALUE =
+BEGIN
+LOCAL
+    ADDR;
+CACHE_DIRTY[FIND_WINDOW(.NUM,ADDR)] = 1;
+END;
+
+!+
+! This routine writes out an entire cache window.
+!
+! WINDOW_NUM identifies the slot from which the window is written.
+!-
+
+ROUTINE WRITE_WINDOW(WINDOW_NUM) : NOVALUE =
+BEGIN
+!
+! Mark the window as clean.
+!
+CACHE_DIRTY[.WINDOW_NUM] = 0;
+!
+! Setup the RAB with the address and length and record number.
+!
+IO_WF_RAB[RAB$L_RBF] = .CACHE_ADDR + .WINDOW_NUM*WINDOW_SIZE*512;
+IO_WF_RAB[RAB$W_RSZ] = WINDOW_SIZE*512;
+IO_WF_RAB[RAB$L_BKT] = .CACHE_WINDOW[.WINDOW_NUM] * WINDOW_SIZE + 1;
+!
+! Attempt to write it out, watching out for the exceeded disk quota status.
+!
+WHILE 1 DO
+    IF NOT (IO_STS = $RMS_WRITE(RAB=IO_WF_RAB)) THEN
+	IF .IO_STS EQL RMS$_EXT AND
+	   .IO_WF_RAB[RAB$L_STV] EQL SS$_EXDISKQUOTA THEN
+	    BEGIN
+	    IF .IO_WF_RAB[RAB$L_CTX] THEN
+		BEGIN
+		IO_STV = .IO_WF_RAB[RAB$L_STV];
+		IO_FATAL()
+		END
+	    ELSE
+		BEGIN
+		F_PUT();
+		E_MESSAGE(ERR_EXDISKQUOTA);
+		IO_WF_RAB[RAB$L_CTX] = .IO_WF_RAB[RAB$L_CTX] + 1;
+		END;
+	    END
+	ELSE IF .IO_STS EQL RMS$_EOF THEN
+	    EXITLOOP
+	ELSE
+	    BEGIN
+	    IO_STV = .IO_WF_RAB[RAB$L_STV];
+	    F_PUT_MESS(ERR_IOERRWRK);
+	    IO_FATAL();
+	    EXITLOOP;
+	    END
+    ELSE
+	EXITLOOP;
+END;
+
+!+
+! This routine is called when a new work-file window must be read into the
+! cache.  We find the least recently used window for replacement, and write
+! it out.
+!
+! BUKT_NUM is the number of the bucket which we need to put in the cache.
+!-
+
+ROUTINE REPLACE_WINDOW(BUKT_NUM) =
+BEGIN
+LOCAL
+    WINDOW_NUM,
+    OLD_TIME,
+    OLD_NUM;
+!
+! Determine which window the bucket is in.
+!
+WINDOW_NUM = (.BUKT_NUM-1)/WINDOW_SIZE;
+!
+! Find the least recently used window in the cache.
+!
+OLD_TIME = 999999999;
+DECR I FROM NUM_WINDOW-1 TO 0 DO
+    IF .CACHE_REF[.I] LSSU .OLD_TIME THEN
+         BEGIN
+         OLD_TIME = .CACHE_REF[.I];
+         OLD_NUM = .I;
+         END;
+!
+! Write the sucker out if it is dirty.
+!
+IF .CACHE_DIRTY[.OLD_NUM] NEQ 0 THEN
+    BEGIN
+    WRITE_WINDOW(.OLD_NUM);
+    END;
+!
+! Now, place the new bucket in the cache.
+!
+CACHE_TIMER = .CACHE_TIMER + 1;
+CACHE_REF[.OLD_NUM] = .CACHE_TIMER;
+CACHE_WINDOW[.OLD_NUM] = .WINDOW_NUM;
+RETURN .OLD_NUM
+END;
+
+!+
+! This routine finds a bukt in the cache, or reads it in in necessary.
+!
+! BUKT_NUM	The number of the bucket we are trying to locate.
+!
+! BUF_ADDR	Address of a longword in which the buckets address is returned.
+!
+! READ		Flag indicating that we should read the file from disk if it
+!		is not in the cache.
+!-
+
+ROUTINE GET_WF(BUKT_NUM,BUF_ADDR,READ) : NOVALUE =
+BEGIN
+LOCAL
+    WINDOW_ADDR,
+    WINDOW_NUM;
+!
+! First, see if it is in the cache.
+!
+IF FIND_WINDOW(.BUKT_NUM,.BUF_ADDR) GEQ 0 THEN RETURN;
+!
+! It's not, find a block to replace and read a block.
+!
+WINDOW_NUM = REPLACE_WINDOW(.BUKT_NUM);
+WINDOW_ADDR = .CACHE_ADDR + .WINDOW_NUM * WINDOW_SIZE * 512;
+.BUF_ADDR = .WINDOW_ADDR + ((.BUKT_NUM-1) MOD WINDOW_SIZE)*512;
+!
+! Check to see if we should read it in.
+!
+IF .READ THEN
+    BEGIN
+    IO_WF_RAB[RAB$L_UBF] = .WINDOW_ADDR;
+    IO_WF_RAB[RAB$W_USZ] = WINDOW_SIZE*512;
+    IO_WF_RAB[RAB$L_BKT] = (.BUKT_NUM-1)/WINDOW_SIZE*WINDOW_SIZE + 1;
+    IF NOT (IO_STS = $RMS_READ(RAB=IO_WF_RAB)) THEN
+	IF .IO_STS NEQ RMS$_EOF THEN
+	    BEGIN
+	    IO_STV = .IO_WF_RAB[RAB$L_STV];
+	    F_PUT_MESS(ERR_IOERRWRK);
+	    IO_FATAL();
+	    END;
+    END;
+END;
+
+!+
+! This routine is called get a new current work file bucket.  The
+! cache is searched, and if it is not there, a window is selected
+! for replacement and the bucket is read in.
+!
+! BUKT_NUM	The number of the bucket to read.
+!
+! BUF_ADDR	Address of a longword in which the address of the bucket
+!		is returned.
+!-
+
+GLOBAL ROUTINE IO_GWF(BUKT_NUM,BUF_ADDR) : NOVALUE =
+GET_WF(.BUKT_NUM,.BUF_ADDR,1);
+
+!+
+! This routine is called to add a new bucket to the work file.
+!
+! BUKT_NUM	The number of the bucket to read.
+!
+! BUF_ADDR	Address of a longword in which the address of the bucket
+!		is returned.
+!-
+
+GLOBAL ROUTINE IO_GNB(BUKT_NUM,BUF_ADDR) : NOVALUE =
+GET_WF(.BUKT_NUM,.BUF_ADDR,1);
+
+!+
+! This routine is called by all the open file routines to set up the FAB
+! and RAB for the open.  The FAB and RAB are initialized by moving the
+! prototype blocks into them.  The file name string and its length are then
+! placed in the FAB.
+!
+! RAB	The address of the RAB
+!
+! FNA	The file name string address
+!
+! FNS	The file name string length.
+!-
+
+ROUTINE SETUP_OPEN(RAB,FNA,FNS) : NOVALUE =
+BEGIN
+CH$MOVE(FAB$C_BLN,PROTO_FAB,WORK_FAB);
+WORK_FAB[FAB$L_FNA] = .FNA;
+WORK_FAB[FAB$B_FNS] = .FNS;
+CH$MOVE(RAB$C_BLN,PROTO_RAB,.RAB);
+CH$MOVE(.FNS,.FNA,MYBUF);
+NAM_BLOCK[NAM$B_RSL] = .FNS;
+END;
+
+!+
+! This routine opens a file for input using a name string and default
+! name string.  
+!
+! RAB	The address of the RAB to connect.
+!
+! FNA	The address of the file name string.
+!
+! FNS	The length of the file name string.
+!
+! DNA	The address of the default name string.
+!
+! DNS	The length of the default name string.
+!-
+
+GLOBAL ROUTINE IO_OID(RAB,FNA,FNS,DNA,DNS) =
+BEGIN
+MAP RAB : REF $RAB_DECL;
+!
+! Setup the FAB and RAB
+!
+SETUP_OPEN(.RAB,.FNA,.FNS);
+!
+! Move in the default name string.
+!
+WORK_FAB[FAB$L_DNA] = .DNA;
+WORK_FAB[FAB$B_DNS] = .DNS;
+!
+! Attempt the open and then the connect, setting up the status and STV
+! if either of them fails.
+!
+IF (IO_STS = $RMS_OPEN(FAB=WORK_FAB)) THEN
+    IF (IO_STS = $RMS_CONNECT(RAB=.RAB)) THEN
+	!
+	! Succeeded, return the IFI
+	!
+        RETURN .WORK_FAB[FAB$W_IFI]
+    ELSE
+        IO_STV = .RAB[RAB$L_STV]
+ELSE
+    IO_STV = .WORK_FAB[FAB$L_STV];
+!
+! Failed, return 0
+!
+RETURN 0
+END;
+
+!+
+! This routine opens a file for input using only the file name string.
+! Simply call the open input with a zero default name string.
+!-
+
+GLOBAL ROUTINE IO_OI(RAB,FNA,FNS) =
+IO_OID(.RAB,.FNA,.FNS,0,0);
+
+!+
+! This routine opens a file for output using a name string and default
+! name string.  
+!
+! RAB	The address of the RAB to connect.
+!
+! FNA	The address of the file name string.
+!
+! FNS	The length of the file name string.
+!
+! DNA	The address of the default name string.
+!
+! DNS	The length of the default name string.
+!
+! SEQ	Flag indicating that the file should be VFC format.
+!-
+
+GLOBAL ROUTINE IO_OOD(RAB,FNA,FNS,DNA,DNS,SEQ) =
+BEGIN
+MAP RAB : REF $RAB_DECL;
+!
+! Setup the FAB and RAB for the open.
+!
+SETUP_OPEN(.RAB,.FNA,.FNS);
+!
+! Move in the default name string.
+!
+WORK_FAB[FAB$L_DNA] = .DNA;
+WORK_FAB[FAB$B_DNS] = .DNS;
+WORK_FAB[FAB$B_FAC] = FAB$M_PUT;
+!
+! Set up the related name FAB from the input file.
+! Make sure the output file version number is reasonable.
+!
+WORK_FAB[FAB$L_FOP] = FAB$M_OFP + FAB$M_MXV;
+NAM_BLOCK[NAM$L_RLF] = RELAT_NAM;
+!
+! If the file is to be sequenced, then make it VFC record type.
+!
+IF .SEQ NEQ 0 THEN WORK_FAB[FAB$B_RFM] = FAB$C_VFC;
+!
+! Attempt the open and connect.  Return the IFI if they succeed, otherwise
+! set up IO_STS and IO_STV and return 0.
+!
+IF (IO_STS = $RMS_CREATE(FAB=WORK_FAB)) THEN
+    IF (IO_STS = $RMS_CONNECT(RAB=.RAB)) THEN
+        RETURN .WORK_FAB[FAB$W_IFI]
+    ELSE
+        IO_STV = .RAB[RAB$L_STV]
+ELSE
+    IO_STV = .WORK_FAB[RAB$L_STV];
+RETURN 0
+END;
+
+!+
+! Open output file without default.  simply call the above routine with
+! a zero length default name string.
+!-
+
+GLOBAL ROUTINE IO_OO(RAB,FNA,FNS,SEQ) =
+IO_OOD(.RAB,.FNA,.FNS,0,0,.SEQ);
+
+!+
+! This routine opens a file for append using a name string and default
+! name string.  
+!
+! RAB	The address of the RAB to connect.
+!
+! FNA	The address of the file name string.
+!
+! FNS	The length of the file name string.
+!
+! DNA	The address of the default name string.
+!
+! DNS	The length of the default name string.
+!-
+
+GLOBAL ROUTINE IO_OA(RAB,FNA,FNS,DNA,DNS) =
+BEGIN
+MAP RAB : REF $RAB_DECL;
+!
+! Setup the FAB and RAB
+!
+SETUP_OPEN(.RAB,.FNA,.FNS);
+!
+! Move in the default name string.
+!
+WORK_FAB[FAB$L_DNA] = .DNA;
+WORK_FAB[FAB$B_DNS] = .DNS;
+WORK_FAB[FAB$B_FAC] = FAB$M_PUT;
+!
+! Position to end of file on the connect.
+!
+RAB[RAB$L_ROP] = RAB$M_EOF;
+!
+! Attempt the open, if it succeeds, return the IFI otherwise set up the
+! IO_STS and IO_STV and return zero.
+!
+IF (IO_STS = $RMS_OPEN(FAB=WORK_FAB)) THEN
+    IF (IO_STS = $RMS_CONNECT(RAB=.RAB)) THEN
+        RETURN .WORK_FAB[FAB$W_IFI]
+    ELSE
+        IO_STV = .RAB[RAB$L_STV]
+ELSE
+    IO_STV = .WORK_FAB[FAB$L_STV];
+RETURN 0
+END;
+
+!+
+! Close a file.
+!
+! IFI	The internal file identifier.
+!
+! RAB	The RAB which was connected.
+!-
+
+GLOBAL ROUTINE IO_CLO(IFI,RAB) : NOVALUE =
+BEGIN
+!
+! Disconnect the RAB
+!
+$RMS_DISCONNECT(RAB=.RAB);
+!
+! Move the IFI into the FAB
+!
+WORK_FAB[FAB$W_IFI] = .IFI;
+!
+! And close the file.
+!
+$RMS_CLOSE(FAB=WORK_FAB);
+END;
+
+!+
+! Get a record from a file which is open for input.
+!
+! REC_ADDR	Address of a longword to receive the record address
+!
+! REC_LEN	Address of a longword to receive the record length.
+!
+! One is returned if the operation was successful, zero if end of file
+! or an error status was returned.
+!
+!-
+
+GLOBAL ROUTINE IO_GET(RAB,REC_ADDR,REC_LEN) =
+BEGIN
+MAP RAB : REF $RAB_DECL;
+!
+! Do the get.
+!
+IO_STS = $RMS_GET(RAB=.RAB);
+!
+! Check for record > 255 characters.
+!
+IF .RAB[RAB$W_RSZ] GTRU 255 OR
+   .IO_STS EQL RMS$_RTB THEN
+    BEGIN
+    RAB[RAB$W_RSZ] = 255;
+    E_MESSAGE(ERR_RECTOOBIG);
+    END
+!
+! Check for end of file.
+!
+ELSE IF .IO_STS EQL RMS$_EOF THEN
+    RETURN 0
+!
+! Check for other bad statuses.
+!
+ELSE IF NOT .IO_STS THEN
+    BEGIN
+    E_MESSAGE(ERR_ERRINPFIL);
+    IO_STV = .RAB[RAB$L_STV];
+    IO_ERR();
+    RETURN 0;
+    END;
+!
+! Return the record address and length.
+!
+.REC_ADDR = .RAB[RAB$L_RBF];
+.REC_LEN = .RAB[RAB$W_RSZ];
+RETURN 1
+END;
+
+!+
+! Get the name of the file which was just opened from the name block.
+!-
+
+GLOBAL ROUTINE IO_NAM : NOVALUE = 
+F_STRING(MYBUF,.NAM_BLOCK[NAM$B_RSL]);
+
+!+
+! Put a record to an output file.
+!	
+! RAB		is the RAB for the file to write to.
+!
+! REC_ADDR	is the address of the record.
+!
+! REC_LEN	is the length of the record.
+!
+! One is returned if the operation was successful, zero it not.
+!-
+
+GLOBAL ROUTINE IO_PUT(RAB,REC_ADDR,REC_LEN) =
+BEGIN
+MAP RAB : REF $RAB_DECL;
+!
+! Set up the record address and size.
+!
+RAB[RAB$L_RBF] = .REC_ADDR;
+RAB[RAB$W_RSZ] = .REC_LEN;
+!
+! Do the operation, if it succeeds, then return good status.
+!
+IF (IO_STS = $RMS_PUT(RAB=.RAB)) THEN
+    RETURN 1;
+!
+! Check for the execeeded quota status.  Use the CTX field of the rab
+! to indicate whether or not this file has already exceeded.
+!
+IF .IO_STS EQL RMS$_EXT AND
+   .RAB[RAB$L_STV] EQL SS$_EXDISKQUOTA THEN
+    BEGIN
+    IF .RAB[RAB$L_CTX] THEN
+	BEGIN
+    	IO_STV = .RAB[RAB$L_STV];
+	IO_FATAL()
+	END
+    ELSE
+	BEGIN
+	F_PUT();
+	E_MESSAGE(ERR_EXDISKQUOTA);
+	RAB[RAB$L_CTX] = .RAB[RAB$L_CTX] + 1;
+	IF (IO_STS = $RMS_PUT(RAB=.RAB)) THEN
+	    RETURN 1;
+	END;
+    END;	
+!
+! Bad status other than exceeded disk quota, put out a message and return 0.
+!
+F_PUT();
+E_MESSAGE(ERR_ERROUTFIL);
+IO_STV = .RAB[RAB$L_STV];
+IO_ERR();
+RETURN 0
+END;
+
+!+
+! This routine flushed the buffers for a file which is open for output.
+!
+! RAB 	The address of the rab for the file.
+!-
+
+GLOBAL ROUTINE IO_FLU(RAB) =
+RETURN $RMS_FLUSH(RAB=.RAB);
+
+!+
+! This routine is called after the journal (audit trail) file has been
+! opened for output.  The name block is saved for used when we try to
+! delete the file at a future date.
+!-
+
+GLOBAL ROUTINE IO_AUDIT : NOVALUE =
+CH$MOVE(NAM$C_BLN,NAM_BLOCK,AUD_NAM);
+
+!+
+! Close the audit trail file.
+!
+! DELETE	Flag indicating file should be deleted.
+!-
+
+GLOBAL ROUTINE IO_CAT(DEL) : NOVALUE =
+BEGIN
+CH$MOVE(FAB$C_BLN,PROTO_FAB,WORK_FAB);
+WORK_FAB[FAB$L_NAM] = AUD_NAM;
+WORK_FAB[FAB$L_FOP] = FAB$M_NAM;
+WORK_FAB[FAB$W_IFI] = .E_AUD_IFI;
+IF .DEL THEN WORK_FAB[FAB$L_FOP] = .WORK_FAB[FAB$L_FOP] + FAB$M_DLT;
+$RMS_CLOSE(FAB=WORK_FAB);
+END;
+
+!+
+! This routine is called immediately after successfully opening the
+! primary input file.  The attributes of the input file (with the
+! exception of PRN are placed into the proto-type RAB so all output
+! files will have the same attributes.  The related file name block
+! is also set up at this time.
+!-
+
+GLOBAL ROUTINE IO_GAT : NOVALUE =
+BEGIN
+!
+! If PRN format, make the output CR format.
+!
+IF (.WORK_FAB[FAB$B_RAT] AND FAB$M_PRN) NEQ 0 THEN
+    WORK_FAB[FAB$B_RAT] = (.WORK_FAB[FAB$B_RAT] AND NOT FAB$M_PRN) OR
+				FAB$M_CR;
+PROTO_FAB[FAB$B_RAT] = .WORK_FAB[FAB$B_RAT];
+CH$MOVE(.NAM_BLOCK[NAM$B_RSL],MYBUF,RELAT_RSA);
+RELAT_NAM[NAM$B_RSL] = NAM_BLOCK[NAM$B_RSL];
+INCR I FROM 0 TO RELAT_NAM[NAM$B_RSL]-1 DO
+    IF CH$RCHAR(CH$PTR(RELAT_RSA,.I)) EQL ';' THEN
+        BEGIN
+	RELAT_NAM[NAM$B_RSL] = .I;
+	RETURN;
+	END;
+END;
+
+!+
+! Control-C handling routines.  The flag E_CC is set whenever
+! a control-c is seen.
+!-
+
+FORWARD ROUTINE
+    CC_AST : NOVALUE;
+
+ROUTINE CC_ENABLE =
+$QIOW(EFN=4,CHAN=.TT_CHAN,FUNC=IO$_SETMODE+IO$M_CTRLCAST,P1=CC_AST);
+
+!+
+! This is the AST routine for CTRL/C.  Simply set the E_CC flag and
+! re-enable the AST.
+!-
+
+ROUTINE CC_AST : NOVALUE =
+BEGIN
+E_CC = 1;
+CC_ENABLE();
+END;
+
+BIND
+    TTNAME = UPLIT BYTE('TT'),
+    TTDEV = UPLIT(2,TTNAME);
+
+OWN
+    TT_INFO : BLOCK[12,BYTE],
+    TT_INFO_DESC : VECTOR[2] INITIAL(12,TT_INFO);
+
+!+
+! This routine opens the files SYS$INPUT and SYS$OUTPUT for terminal
+! I/O.
+!-
+
+GLOBAL ROUTINE IO_OT =
+BEGIN
+LOCAL
+    NAME_BUF : VECTOR[64,BYTE],
+    NAME_DESC: VECTOR[2],
+    RES_DESC : VECTOR[2];
+!
+! Open the SYS$INPUT file for terminal input.
+!
+SETUP_OPEN(TERM_IN_RAB,UPLIT BYTE('SYS$INPUT'),9);
+TERM_IN_RAB[RAB$L_ROP] = 0;
+IF (IO_STS = $RMS_OPEN(FAB=WORK_FAB)) THEN
+    IO_STS = $RMS_CONNECT(RAB=TERM_IN_RAB);
+IF NOT .IO_STS THEN 
+    BEGIN
+    IO_STV = .WORK_FAB[FAB$L_STV];
+    IO_ERR();
+    $EXIT();
+    END;
+!
+! Open the SYS$OUTPUT file for terminal output.
+!
+SETUP_OPEN(TERM_OUT_RAB,UPLIT BYTE('SYS$OUTPUT'),10);
+WORK_FAB[FAB$B_FAC] = FAB$M_PUT;
+IF (IO_STS = $RMS_CREATE(FAB=WORK_FAB)) THEN
+    IO_STS = $RMS_CONNECT(RAB=TERM_OUT_RAB);
+IF NOT .IO_STS THEN
+    BEGIN
+    IO_STV = .WORK_FAB[FAB$L_STV];
+    IO_ERR();
+    $EXIT();
+    END;
+!
+! Now also open the terminal for qio's.
+!
+NAME_DESC[0] = 9;
+NAME_DESC[1] = NAME_BUF;
+CH$MOVE(9,UPLIT('SYS$INPUT'),NAME_BUF);
+RES_DESC[1] = NAME_BUF;
+RES_DESC[0] = 64;
+WHILE $TRNLOG(LOGNAM=NAME_DESC,RSLLEN=NAME_DESC[0],RSLBUF=RES_DESC) EQL SS$_NORMAL DO
+    BEGIN
+    IF CH$RCHAR(NAME_BUF) EQL 27 THEN
+	BEGIN
+	NAME_DESC[1] = CH$PTR(NAME_BUF,4);
+	NAME_DESC[0] = .NAME_DESC[0] - 4;
+	END
+    ELSE
+	NAME_DESC[1] = CH$PTR(NAME_BUF);
+    IF CH$RCHAR(CH$PTR(.NAME_DESC[1], .NAME_DESC[0]-1)) EQL %C':' THEN
+    	NAME_DESC[0] = .NAME_DESC[0] - 1;
+    END;
+NAME_DESC[1] = NAME_BUF;
+IF $ASSIGN(DEVNAM=NAME_DESC,CHAN=TT_CHAN) THEN
+    BEGIN
+    $GETCHN(CHAN=.TT_CHAN,PRIBUF=TT_INFO_DESC);
+    IF .TT_INFO[DIB$B_DEVCLASS] EQL DC$_TERM THEN
+        BEGIN
+        !
+        ! Get terminal type.
+        !
+	SELECTONE .TT_INFO[DIB$B_DEVTYPE] OF
+            SET
+            [DT$_VT52]: E_T_TYPE = TERM_VT52;
+            [DT$_VT100]: E_T_TYPE = TERM_VT100;
+            [OTHERWISE]: BEGIN 
+!+
+! Fetch the extended terminal status from the terminal driver.
+! If the VT100-compatibility bit is set, assume that this terminal
+! is to be treated like a VT100.
+!-
+	LOCAL
+	    TT_CHAR : BLOCK [12, BYTE];		! Place to put characteristics
+
+	BIND
+	    DEVDP0 = TT_CHAR [4,0,0,0] : BLOCK [4, BYTE], ! Old characteristics
+	    DEVDP1 = TT_CHAR [8,0,0,0] : BLOCK [4, BYTE]; ! Extended characteristics
+
+	E_T_TYPE = TERM_HCPY;			! In case something fails
+	DEVDP1 [0,0,32,0] = 0;
+
+	IO_STS = $QIOW (CHAN=.TT_CHAN, P1=TT_CHAR, P2=12, IOSB=IOSB, FUNC=IO$_SENSEMODE);
+	IF (.IO_STS AND .IOSB)
+	THEN
+	    BEGIN
+!+
+! If any bit is set in DEVDP1 then the terminal driver has
+! extended characteristics.  If this is an ANSI CRT with at least
+! VT100 functionality, treat it as a VT100.
+!-
+	    IF (.DEVDP0 [TT$V_SCOPE] AND .DEVDP1 [TT2$V_DECCRT])
+	    THEN
+		E_T_TYPE = TERM_VT100;
+
+	    END;
+
+	END;
+            TES;
+        !
+        ! Enable control-c handling.
+        !
+        CC_ENABLE();
+        $SETEF(EFN=3);
+	!
+	! Set the eight-bit flag.
+	!
+	E_EIGHT = .BLOCK[TT_INFO[DIB$L_DEVDEPEND],TT$V_EIGHTBIT];
+        END
+    ELSE
+        E_T_TYPE = TERM_UNKNOWN;
+    END;
+RETURN 1
+END;
+
+!+
+! Read a command line.  A line is read from the sys$command file.
+!
+! PROMPT - is the address of a prompt string.
+! PR_LEN - is the length of the prompt string.
+! BUF 	 - is the address of the receiving buffer.
+! LEN	 - is the address of a longword to receive the length read.
+! BUF_LEN- (optional) is the length of the buffer.
+
+! Return value is 1 if EOF 0 otherwise.
+!-
+
+GLOBAL ROUTINE IO_COM(PROMPT,PR_LEN,BUF,LEN,BUF_LEN) =
+BEGIN
+BUILTIN
+   ACTUALCOUNT;
+TERM_IN_RAB[RAB$L_PBF] = .PROMPT;
+TERM_IN_RAB[RAB$B_PSZ] = .PR_LEN;
+TERM_IN_RAB[RAB$L_UBF] = .BUF;
+TERM_IN_RAB[RAB$W_USZ] = 255;
+TERM_IN_RAB[RAB$L_ROP] = RAB$M_PMT;
+IF ACTUALCOUNT() EQL 5 THEN
+    TERM_IN_RAB[RAB$W_USZ] = .BUF_LEN;
+IO_STS = $RMS_GET(RAB=TERM_IN_RAB);
+
+.LEN = .TERM_IN_RAB[RAB$W_RSZ];
+IF .IO_STS EQL RMS$_EOF THEN RETURN 1;
+IF NOT .IO_STS THEN
+    BEGIN
+    IO_STV = .TERM_IN_RAB[RAB$L_STV];
+    IO_ERR(.IO_STS,UPLIT('IO_COM'));
+    END;
+RETURN 0
+END;
+
+!+
+! This routine writes a line to SYS$OUTPUT, usually the terminal.
+!
+! BUF - is the address of the buffer containing the line.
+! LEN - is the length of the line to be written.
+!
+! If an error is detected, it is considered fatal, since
+! we are not commnunicating with the user.
+!-
+
+GLOBAL ROUTINE IO_WT(BUF,LEN) : NOVALUE =
+BEGIN
+LOCAL
+    STAT;
+TERM_OUT_RAB[RAB$L_RBF] = .BUF;
+TERM_OUT_RAB[RAB$W_RSZ] = .LEN;
+IF (STAT = $RMS_PUT(RAB=TERM_OUT_RAB)) THEN RETURN;
+IO_STV = .TERM_OUT_RAB[RAB$L_STV];
+IO_FATAL(.STAT);
+END;
+
+!+
+! Character level terminal I/O.  This routine reads a single character
+! from the terminal.
+!
+! C 	The address of a longword in which the character is returned.
+!-
+
+GLOBAL ROUTINE IO_GC(C) : NOVALUE =
+BEGIN
+.C = 0;
+$QIOW(EFN=1,CHAN=.TT_CHAN,P1=.C,P2=1,FUNC=IO$_READVBLK+IO$M_NOECHO+
+      IO$M_NOFILTR);
+END;
+
+!+
+! Write to the terminal unformatted.  The buffer is written out without
+! carriage control.
+!
+! BUF	Address of the buffer.
+!
+! LEN	Length of the buffer.
+!-
+
+GLOBAL ROUTINE IO_WTU(BUF,LEN) : NOVALUE =
+BEGIN
+$WAITFR(EFN=3);
+$QIOW(EFN=3,CHAN=.TT_CHAN,P1=.BUF,P2=.LEN,FUNC=IO$_WRITEVBLK+IO$M_NOFORMAT);
+END;
+
+!+
+! This routine attempts to read a character from type-ahead, it it fails
+! it returns a zero and no character, otherwise it returns a 1 and the
+! character in the formal C.
+!-
+
+GLOBAL ROUTINE IO_TRY(C) =
+BEGIN
+.C=0;
+$WAITFR(EFN=3);
+$QIOW(EFN=1,CHAN=.TT_CHAN,P1=.C,P2=1,P3=0,IOSB=IOSB,
+      FUNC=IO$_READVBLK+IO$M_NOECHO+IO$M_NOFILTR+IO$M_TIMED);
+IF .IOSB[0] EQL SS$_TIMEOUT THEN
+    RETURN 0;
+RETURN 1;
+END;
+
+!+
+! Define the terminator mask.
+!-
+OWN
+    TBITS : VECTOR[4] INITIAL(-1,0,0,%X'80000000'),
+    TMASK : VECTOR[2] INITIAL(16,TBITS);
+
+!+
+! This routine reads characters with echo on until any control character or
+! a DEL character are seen.
+!
+! BUF		Address of the buffer to read into.
+!
+! LEN		Length of the buffer.
+!
+! LEN_READ	Address of a longword to receive the number of characters read.
+!-
+
+GLOBAL ROUTINE IO_REC(BUF,LEN,LEN_READ) : NOVALUE =
+BEGIN
+$WAITFR(EFN=3);
+$QIOW(EFN=1,CHAN=.TT_CHAN,P1=.BUF,P2=MIN(.LEN,72),P4=TMASK,P5=F_BUF,
+      P6=.F_CUR-F_BUF,IOSB=IOSB,FUNC=IO$_READPROMPT+IO$M_TRMNOECHO+
+      IO$M_NOFILTR);
+F_CUR = F_BUF;
+.LEN_READ = .IOSB[1];
+!
+! If we had a terminator return it by placing it in the character type
+! ahead buffer.
+!
+IF .IOSB[3] NEQ 0 THEN
+    BEGIN
+    K_RAC = .IOSB<32,8>;
+    K_RAH = .K_RAH+1;
+    END;
+END;
+
+!+
+! Routines which start and terminate change mode terminal handling.
+! Nothing to do here on VMS.
+!-
+
+GLOBAL ROUTINE IO_TAS : NOVALUE = ;
+
+GLOBAL ROUTINE IO_TAE : NOVALUE =
+$WAITFR(EFN=3);
+END
+ELUDOM

@@ -1,0 +1,945 @@
+MODULE detached (IDENT = 'V03-001',
+	ADDRESSING_MODE(EXTERNAL = GENERAL)) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  Login
+!
+! ABSTRACT:
+!
+!	This module handles all processing specific to detached jobs.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system.
+!
+! AUTHOR:  Tim Halvorsen, March 1981
+!
+! Modified by:
+!
+!	V03-001 GAS0057		Gerry Smith		17-Mar-1982
+!		Fix FABS to disable all but system
+!		logical name translation during open/creates.
+!
+!	V03-010	MLJ34580	Martin L. Jack,	1-Feb-1982  0:55
+!		Make use of extensions to DJT record to set name and /NOTIFY
+!		status for log file print job.  Correct queue name translation
+!		so that explicit queue name is not translated and implicit
+!		SYS$PRINT uses standard queue-name translation routine.
+!
+!	V03-009	GAS0032		Gerry Smith		07-Jan-1982
+!		On proxy login, if no UAF record is found, return
+!		FALSE to indicate lookup failure.
+!
+!	V03-008	GAS0031		Gerry Smith		04-Jan-1982
+!		Remove NETUAF structure definitions from this module.
+!		$NAFDEF now resides in LIB.REQ.
+!
+!	V03-007	SPF0050		Steve Forgey		01-Jan-1982
+!		Store remote node info in P1 space for network jobs.
+!
+!	V03-006	GAS0029		Gerry Smith		31-Dec-1981
+!		Add proxy login for network jobs.
+!
+!	V03-005	HRJ0032		Herb Jacobs		12-Nov-1981
+!		Process batch queue WSEXTENT if passed, validate username
+!		as valid for batch job, and allow handler to stop a batch
+!		job.
+!
+!	V004	TMH0004		Tim Halvorsen		26-Oct-1981
+!		Get ORIGUIC and OUTFNM from LGI area rather than from PPD.
+!		Add extra acmode argument to calls to exec_crelog
+!		Make use of global SYS$ERROR descriptor, rather than
+!		re-translating the logical name again here.
+!
+!	V003	GWF0073		Gary Fowler		27-Jul-1981
+!		Change job name to ASCIC string.  Increase maximum length of
+!		message that can be received from the job controller
+!
+!	V002	TMH0002		Tim Halvorsen		16-Jul-1981
+!		Reference SHRLIB$ for shared require files.
+!
+!	V03-001	GWF0051		Gary W. Fowler		29-May-1981
+!		Add file size in message sent when log file is queued for
+!		printing.
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:LIB';		! VAX/VMS system definitions
+REQUIRE 'SHRLIB$:UTILDEF';		! Common BLISS definitions
+
+REQUIRE 'LIB$:PPDDEF';			! Process permanent data region
+REQUIRE 'LIB$:LGIDEF';			! LOGINOUT private permanent storage
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    init_batch:		NOVALUE,	! Initialize batch job step
+    stop_batch_job:	NOVALUE,	! Stop batch job stream
+    request_jbc:	NOVALUE,	! Request function from job controller
+    create_jbc_mailbox:	NOVALUE,	! Set up job controller mailbox
+    terminate_batch:	NOVALUE,	! Stop a batch job
+    init_network:	NOVALUE,	! Initialize network job
+    get_proxy;				! Get proxy username
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    close_output:	NOVALUE,	! Close primary output file
+    validate_uafrec:	NOVALUE,	! Read/validate UAF record
+    get_uafrec:		NOVALUE,	! Read UAF record without validiation
+    logout_message:	NOVALUE,	! Write logout message
+    map_imgact:		NOVALUE,	! Map image activator code segment
+    exec_crelog:	NOVALUE,	! Create an executive mode logical name
+    set_uic,				! Set process UIC
+    set_nodename:	NOVALUE,	! Set remote node info in P1 space
+    tran_queue,				! Translate queue name
+    exit_process:	NOVALUE;	! Exit the process
+
+!
+! Define literals
+!
+
+LITERAL
+    max_jbc_size = 800;			! Maximum size of JBC reply message
+
+!
+! Define message codes
+!
+
+EXTERNAL LITERAL
+    lgi$_jbcmixup,
+    lgi$_userauth;
+
+!
+! Macro to create an executive or supervisor mode logical name
+!
+
+MACRO
+    create_logname (lognam, eqlnam, acmode) =
+	BEGIN
+	LOCAL arglist: VECTOR [4];
+	arglist [0] = 3;
+	arglist [1] = lognam;
+	arglist [2] = eqlnam;
+	arglist [3] = acmode;
+	$CMEXEC(ROUTIN = exec_crelog,
+		ARGLST = arglist);
+	END%;
+
+!
+! External storage
+!
+
+EXTERNAL
+    input_fab:		BBLOCK,		! Input FAB
+    input_nam:		BBLOCK,		! Input NAM
+    output_fab:		BBLOCK,		! Output FAB
+    output_xab:		BBLOCK,		! Output XAB
+    uaf_record:		REF BBLOCK,	! Address of UAF record
+    sys$input:		VECTOR,		! Translation of SYS$INPUT
+    sys$output:		VECTOR,		! Translation of SYS$OUTPUT
+    sys$error:		VECTOR,		! Translation of SYS$ERROR
+    ctl$ag_clidata;			! Process permanent data storage
+
+BIND
+    ppd = ctl$ag_clidata: BBLOCK;	! Address of PPD structure
+
+!
+! Global storage
+!
+GLOBAL
+    jbc_chan:	WORD;			! Channel to JBC mailbox
+
+
+GLOBAL ROUTINE init_batch: NOVALUE =
+
+!---
+!
+!	Perform batch initialization by requesting the job parameters
+!	from the job controller.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	uaf_record = Address of UAF record for user
+!---
+
+BEGIN
+
+OWN
+    jobname:	VECTOR [13,BYTE],	! Must be static to be passed back
+    logfile:	VECTOR [128,BYTE];	! to caller as output filespec
+
+LOCAL
+    logdesc:	VECTOR [2],		! Logical name descriptor
+    logname:	VECTOR [2,BYTE],	! 2 character logical name
+    ptr,length,
+    buffer:	BBLOCK [max_jbc_size],	! JBC message buffer
+    jbcmsg:	VECTOR [2];		! Descriptor of JBC message
+
+create_jbc_mailbox();			! Set up job controller communications
+
+IF .ppd [ppd$w_outifi] NEQ 0		! If not first job step,
+    AND NOT .ppd [ppd$l_lststatus]	! and job step failed,
+    AND ((.ppd [ppd$l_lststatus] AND 6) NEQ 0) ! and its an error or fatal,
+THEN
+    terminate_batch();			! Stop the batch job
+
+!
+! Request detached job step initialization parameters from job controller
+!
+
+buffer [0,0,16,0] = smr$k_detinit;	! Detached job step initialize
+
+jbcmsg [0] = 2;				! Setup descriptor of message
+jbcmsg [1] = buffer;
+
+request_jbc(jbcmsg,buffer);		! Get job step parameters
+
+!
+! If job to be aborted, terminate job stream
+!
+
+IF .buffer [0,0,16,0] EQL msg$_aboopr	! If job aborted,
+THEN
+    stop_batch_job(buffer);		! terminate job stream
+
+IF .ppd [ppd$w_outifi] EQL 0		! If this the first job step,
+THEN
+    BEGIN
+    LOCAL
+	username:	VECTOR [2];	! Descriptor of username
+
+    username [0] = uaf$s_username;	! Setup descriptor of user name
+    username [1] = buffer [dji$t_usernam];
+
+    get_uafrec(username);		! Get user's UAF record
+    IF .uaf_record EQL 0
+    THEN
+	SIGNAL_STOP(lgi$_userauth);	! signal fatal error
+
+    IF .uaf_record NEQ 0		! If UAF record present,
+    THEN
+	BEGIN
+	!
+	! Process working set extent
+	!
+	IF .buffer [dji$v_wseprs]	! If working set extent present,
+	THEN
+	    BEGIN
+	    IF NOT .buffer [dji$v_usewse] ! If not explicit, minimize it
+	    THEN
+		buffer [dji$w_wsextnt] = MINU(.buffer [dji$w_wsextnt],
+						.uaf_record [uaf$w_wsextent]);
+	    uaf_record [uaf$w_wsextent] = .buffer [dji$w_wsextnt];
+	    END;
+	!
+	! Process working set quota
+	!
+	IF .buffer [dji$v_wsqprs]	! If working set quota present,
+	THEN
+	    BEGIN
+	    IF NOT .buffer [dji$v_usewsq] ! If not explicit, minimize it
+	    THEN
+		buffer [dji$w_wsquta] = MINU(.buffer [dji$w_wsquta],
+						.uaf_record [uaf$w_wsquota]);
+	    uaf_record [uaf$w_wsquota] = .buffer [dji$w_wsquta];
+	    END;
+	!
+	! Process working set default
+	!
+	IF .buffer [dji$v_wsdprs]	! If working set default present,
+	THEN
+	    BEGIN
+	    IF NOT .buffer [dji$v_usewsd] ! If not explicit, minimize it
+	    THEN
+		buffer [dji$w_wsdflt] = MINU(.buffer [dji$w_wsdflt],
+						.uaf_record [uaf$w_dfwscnt]);
+	    uaf_record [uaf$w_dfwscnt] = .buffer [dji$w_wsdflt];
+	    END;
+	!
+	! Process CPU time limit
+	!
+	IF .buffer [dji$v_timprs]	! If time limit present,
+	THEN
+	    BEGIN
+	    IF NOT .buffer [dji$v_usetim] ! If not explicit, minimize it
+	    THEN
+		buffer [dji$l_cputim] = MINU(.buffer [dji$l_cputim]-1,
+					.uaf_record [uaf$l_cputim]-1)+1;
+	    uaf_record [uaf$l_cputim] = .buffer [dji$l_cputim];
+	    END;
+	END;
+
+    !
+    ! Setup output log file name from job name
+    !
+
+    length = CH$RCHAR( buffer [dji$t_jobname]);	! get length of job name
+    CH$MOVE(.length, buffer [dji$t_jobname]+1, jobname);
+
+    CH$MOVE(4, UPLIT BYTE('.LOG'), jobname + .length);
+    output_fab [fab$l_dna] = jobname;	! Set default to <jobname>.LOG
+    output_fab [fab$b_dns] = .length + 4;
+    output_fab [fab$b_fns] = 0;		! Assume no primary filespec
+
+    IF .(buffer [dji$l_gflags])		! If log filespec specified,
+	<$BITPOSITION(sjh$v_lfspres),1>
+    THEN
+	BEGIN
+	output_fab [fab$b_fns] = CH$RCHAR(buffer [dji$t_lognam]);
+	output_fab [fab$l_fna] = logfile;
+	CH$COPY(.output_fab [fab$b_fns],
+		buffer [$BYTEOFFSET(dji$t_lognam)+1,0,0,0],
+		0, 128, logfile);
+	END;
+
+    IF .(buffer [dji$l_gflags])		! If /NOLOG specified,
+	<$BITPOSITION(sjh$v_nolog),1>
+    THEN
+	BEGIN
+	output_fab [fab$b_fns] = 4;
+	output_fab [fab$l_fna] = UPLIT BYTE('_NL:');
+	END;
+    END;
+
+!
+! Set input file specification
+!
+
+CH$MOVE(ppd$c_dvifid, buffer [dji$t_volnam], input_nam [nam$t_dvi]);
+
+input_fab [fab$v_nam] = true;		! Mark to open input by NAM block
+
+!
+! If /DELETE of input file requested when job completes, set it now.
+!
+
+IF .(buffer [dji$b_flags])		! If delete of input file requested,
+	<$BITPOSITION(sqr$v_delete),1>
+THEN
+    input_fab [fab$v_dlt] = true;	! then set to delete on close
+
+!
+! Define job parameters as logical name P1 thru P8 (user mode) to pass
+! them to the CLI.
+!
+
+ptr = buffer [dji$t_parms];		! Point at first ASCIC parameter
+logdesc [0] = 2;			! Setup descriptor
+logdesc [1] = logname;
+logname [0] = 'P';			! First character = P
+
+INCRU i FROM 1 TO 8			! For the first 8 strings,
+DO
+    BEGIN
+    LOCAL
+	desc:	VECTOR [2];		! Descriptor of parameter value
+    logname [1] = '0' + .i;		! Second character = parameter number
+    desc [0] = CH$RCHAR_A(ptr);		! Make descriptor of parameter string
+    desc [1] = .ptr;
+    ptr = .ptr + .desc [0];		! Skip to next ASCIC string
+    IF .desc [0] EQL 0			! If null string, end of list
+    THEN
+	EXITLOOP;			! so exit leaving rest undefined (null)
+    $CRELOG(LOGNAM = logdesc,		! Create Pn logical name
+	    EQLNAM = desc,
+	    TBLFLG = log$c_process,
+	    ACMODE = psl$c_user);
+    END;
+    
+!
+! Delete temporary mailbox used to communicate with job controller
+!
+
+$DASSGN(CHAN = .jbc_chan);		! Delete temporary mailbox
+
+END;
+
+GLOBAL ROUTINE create_jbc_mailbox: NOVALUE =
+
+!---
+!
+!	Create a mailbox and channel to communicate with the job controller.
+!	to the caller.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	jbc_chan = channel for job controller communications
+!---
+
+BEGIN
+
+$CREMBX(CHAN = jbc_chan,		! Create a mailbox
+	MAXMSG = max_jbc_size,		! Maximum size of a message
+	BUFQUO = max_jbc_size);		! Quota in bytes
+
+END;
+
+GLOBAL ROUTINE terminate_batch: NOVALUE =
+
+!---
+!
+!	Request a job controller termination message, then stop batch job.
+!
+! Inputs:
+!
+!	jbc_chan = I/O channel to communicate with job controller
+!
+! Outputs:
+!
+!	Job termination, no return, exit via exit process
+!---
+
+BEGIN
+
+LOCAL
+    buffer:	BBLOCK [max_jbc_size],	! JBC message buffer
+    jbcmsg:	VECTOR [2];		! Descriptor of JBC message
+
+    buffer [0,0,16,0] = smr$k_askqnam;	! Ask queue name message
+    jbcmsg [0] = 2;			! Setup descriptor of message
+    jbcmsg [1] = buffer;
+    request_jbc(jbcmsg,buffer); 	! Ask jobctl for termination message
+    stop_batch_job(buffer);		! then terminate job stream
+
+END;
+
+ROUTINE stop_batch_job (djt): NOVALUE =
+
+!---
+!
+!	This routine is called to terminate a job stream as a result
+!	of an operator request or failure of an individual job step.
+!
+! Inputs:
+!
+!	jbc_chan = I/O channel to mailbox
+!	djt = Address of detached job termination message
+!
+! Outputs:
+!
+!	There is no return - the image is exited.
+!---
+
+BEGIN
+
+MAP
+    djt:	REF BBLOCK;		! Address of message
+
+BIND
+    lgi = .ppd [ppd$l_lgi]: BBLOCK;	! Address the LGI area
+
+LOCAL
+    enter:	BBLOCK [max_jbc_size],	! Enter print job message
+    qname:	VECTOR [2],		! Descriptor of queue name
+    bufdesc:	VECTOR [2];		! Descriptor of above buffer
+
+logout_message();			! Write logout message
+
+IF .djt [djt$v_delclos]			! If delete of output file requested
+THEN
+    output_fab [fab$v_dlt] = true;	! then set to delete on close
+
+$CMEXEC(ROUTIN = close_output);		! Close log file so we can print it
+
+$CMKRNL(ROUTIN = set_uic, ARGLST = .lgi [lgi$l_origuic]); ! Reset UIC
+
+IF NOT .djt [djt$v_delclos]		! If output file not deleted,
+    AND NOT .djt [djt$v_nospool]	! and spooling not inhibited,
+THEN
+    BEGIN
+    LOCAL
+	options:	REF BBLOCK;	! Options cursor
+
+    enter [0,0,16,0] = smr$k_enter;	! Setup JBC request type
+
+    IF .djt [djt$v_qnmpres]		! If queue name supplied by user,
+    THEN				! copy it in directly
+	CH$MOVE(djt$s_qname, djt [djt$t_qname], enter [2,0,0,0])
+    ELSE				! else translate SYS$PRINT
+	tran_queue($DESCRIPTOR('SYS$PRINT'), enter [2,0,0,0]);
+
+    CH$MOVE(ppd$c_dvifid, ppd [ppd$t_outdvi], enter+18); ! Append dvi/did/fid
+    CH$MOVE(lgi$s_outfnm, lgi [lgi$t_outfnm], enter+46); ! Append name/type/version
+
+    enter [66,0,8,0] = smo$k_paghdr;	! Print page with headers
+
+    enter [67,0,8,0] = smo$k_filesiz;	! option code for file size
+    enter [68,0,32,0] = .output_xab [xab$l_ebk];
+					! file size
+
+    IF .output_xab [xab$l_ebk] neq 0	! adjust file size
+    AND .output_xab [xab$w_ffb] eql 0	! according to first free byte
+    THEN enter [68,0,32,0] = .output_xab [xab$l_ebk] - 1;
+
+    options = enter + 72;
+
+    IF .djt [djt$v_notify]		! If completion to be notified,
+    THEN
+	BEGIN
+	options [0,0,8,0] = smo$k_notify; ! Notify on completion
+	options = .options + 1;
+	END;
+
+    IF NOT .djt [djt$v_nodelet]		! If log file to be deleted,
+    THEN
+	BEGIN
+	options [0,0,8,0] = smo$k_delete; ! Delete after printing
+	options = .options + 1;
+	END;
+
+    IF CH$RCHAR(djt [djt$t_jobname]) NEQ 0	! If job name specified
+    THEN
+	BEGIN
+	options [0,0,8,0] = smo$k_jobname;
+	options [1,0,8,0] = CH$RCHAR(djt [djt$t_jobname]);
+	options = CH$MOVE(
+	    .options [1,0,8,0],
+	    djt [$BYTEOFFSET(djt$t_jobname)+1,0,0,0],
+	    options [2,0,8,0]);
+	END;
+
+    bufdesc [1] = enter;
+    bufdesc [0] = .options - .bufdesc[1];
+
+    request_jbc(bufdesc, enter); 	! Send message to job controller
+					! and throw away reply
+    END;
+
+$CMEXEC(ROUTIN = exit_process);		! Terminate process
+
+END;
+
+ROUTINE request_jbc (message, retbuf): NOVALUE =
+
+!---
+!
+!	Send a message to the job controller and return the reply
+!	to the caller.
+!
+! Inputs:
+!
+!	jbc_chan = I/O channel to a mailbox
+!	message = Address of descriptor of message to be sent
+!	retbuf = Optional address of buffer to receive JBC reply
+!
+! Outputs:
+!
+!	retbuf = Reply from job controller
+!---
+
+BEGIN
+
+LOCAL
+    status;
+
+status = $SNDSMB(MSGBUF = .message,	! Send message to job controller
+		CHAN = .jbc_chan);	! and give channel to reply mailbox
+
+IF NOT .status				! If error detected,
+THEN
+    SIGNAL_STOP(lgi$_jbcmixup,0,.status); ! signal fatal error
+
+status = $QIOW(FUNC = IO$_READVBLK,	! Read reply mailbox
+		CHAN = .jbc_chan,
+		P1 = .retbuf,		! Address of reply buffer
+		P2 = max_jbc_size);	! Buffer must be this large
+
+IF NOT .status				! If error detected,
+THEN
+    SIGNAL_STOP(lgi$_jbcmixup,0,.status); ! signal fatal error
+
+END;
+
+GLOBAL ROUTINE init_network: NOVALUE =
+
+!---
+!
+!	Perform initializations of a network job.  The primary logical
+!	names have been setup by the calling process (NETACP).
+!
+! Inputs:
+!
+!	sys$input = Name of command procedure to be invoked
+!	sys$output = 3 concatenated ASCIC access control strings
+!				(username, password, account)
+!	sys$error = Network control block (NCB) for connect
+!
+! Outputs:
+!
+!	uaf_record = Address of UAF record, if any
+!---
+
+BEGIN
+
+LOCAL
+    ptr,
+    link,
+    username:	VECTOR [2],		! Username descriptor
+    password:	VECTOR [2];		! Password descriptor
+
+!
+! Check to see if this network job should use the proxy login.  This is 
+! determined by checking the low bit of the first word of the string
+! described by the sys$output descriptor.  If the bit is set, then attempt
+! a proxy login.  If that fails, then use the access control string described 
+! by the sys$output descriptor.
+!
+
+ptr = ..sys$output[1];			! Get first two words of SYS$OUTPUT string
+
+sys$output[0] = .sys$output[0] - 2;	! Drop flag word off SYS$OUTPUT string
+sys$output[1] = .sys$output[1] + 2;
+
+IF NOT
+    BEGIN
+    IF .ptr<0,1> THEN get_proxy()	! If low bit set then try proxy login
+    ELSE FALSE				! Otherwise set FALSE
+    END
+THEN					! If no proxy, or proxy failed
+    BEGIN				! Use the access control string
+    ptr = .sys$output [1];		! Get address of SYS$OUTPUT string
+
+    username [0] = CH$RCHAR_A(ptr);	! Get length of username
+    username [1] = .ptr;		! and address of username
+
+    ptr = .ptr + .username [0];		! Skip to password
+    password [0] = CH$RCHAR_A(ptr);	! Get length of password
+    password [1] = .ptr;		! and address of password
+
+    validate_uafrec(username, password);! Lookup in UAF file
+    END;    
+!
+! Get logical link number from NCB and store remote node info in P1 space
+!
+    ptr = CH$FIND_CH(.sys$error[0],.sys$error[1],%C'/');
+    if .ptr neq 0 then
+	BEGIN
+	link = .(.ptr + 1)<0,16>;	! Fetch logical link number
+	$CMKRNL (ROUTIN = set_nodename,	! Set remote node info in
+		 ARGLST = link);
+	END;
+!
+! Create SYS$NET logical name with contents of NCB
+!
+
+create_logname(%ASCID 'SYS$NET',	! Define SYS$NET
+		sys$error, psl$c_exec);
+
+!
+! If the input file has the file type .EXE, then rather than activating
+! the CLI and creating a log file, activate the program from a small
+! code segment in P1 space.  This is done to optimize network job
+! activation time.
+!
+
+IF CH$FIND_SUB(.sys$input [0], .sys$input [1], 4, UPLIT BYTE('.EXE'))
+THEN
+    BEGIN
+    $CMEXEC(ROUTIN = map_imgact);	! Map the imgact code segment into P1
+    input_fab [fab$l_fna] = UPLIT BYTE('_NL:');		! Set input to NL:
+    input_fab [fab$b_fns] = 4;
+    output_fab [fab$l_fna] = .input_fab [fab$l_fna];	! Set output to NL:
+    output_fab [fab$b_fns] = .input_fab [fab$b_fns];
+    RETURN;				! and return
+    END;
+
+!
+! Set default filespec for input file
+!
+
+input_fab [fab$l_dna] = UPLIT BYTE('CONNECT.COM');
+input_fab [fab$b_dns] = 11;
+
+!
+! Construct filespec of output log file for network job
+!
+
+ptr = CH$FIND_CH(.sys$input [0], .sys$input [1], ']'); ! Look for file name
+
+IF CH$FAIL(.ptr)
+THEN
+    ptr = CH$FIND_CH(.sys$input [0], .sys$input [1], '>');
+
+IF CH$FAIL(.ptr)
+THEN
+    ptr = CH$FIND_CH(.sys$input [0], .sys$input [1], ':');
+    
+IF NOT CH$FAIL(.ptr)			! If delimiter found, isolate file name
+THEN
+    BEGIN
+    sys$output [0] = .sys$input [0] - (CH$DIFF(.ptr,.sys$input [1]) + 1);
+    sys$output [1] = .ptr + 1;
+    END
+ELSE					! If no delimiter, use entire string
+    BEGIN
+    sys$output [0] = .sys$input [0];
+    sys$output [1] = .sys$input [1];
+    END;
+
+ptr = CH$FIND_CH(.sys$output [0], .sys$output [1], '.'); ! Find file type
+
+IF NOT CH$FAIL(.ptr)			! If file type found,
+THEN
+    sys$output [0] = CH$DIFF(.ptr,.sys$output [1]);	! strip off string
+
+output_fab [fab$b_fns] = .sys$output [0]; ! Set as primary output filespec
+output_fab [fab$l_fna] = .sys$output [1];
+
+END;
+
+ROUTINE get_proxy =
+!---
+!
+!	Get the local username that is mapped to the remote username.
+!	The remote username is contained in the NCB string described
+!	by NCB_DESC, the NCB descriptor.
+!
+! Inputs:
+!
+!	sys$error = address of NCB descriptor
+!
+! Outputs:
+!
+!	uaf_record = Address of UAF record, if any
+!
+! Status returns:
+!
+!	TRUE => Proxy username found
+!	FALSE => No proxy username found
+!
+!---
+
+BEGIN
+
+LOCAL
+    netfab : BBLOCK[fab$c_bln],			! Fab for NETUAF.DAT
+    netrab : BBLOCK[rab$c_bln],			! Rab for NETUAF.DAT
+    net_record : VECTOR[naf$c_length,BYTE],	! Place to put a record
+    user_desc : VECTOR[2],			! Username descriptor
+    ptr,					! Temp pointer
+    node_len,					! Length of node
+    node_ptr,					! Pointer to beginning of node
+    user_len,					! Length of username
+    user_ptr;					! Pointer to beginning of username
+
+!
+! Initialize the FAB and RAB
+!
+$FAB_INIT ( FAB = netfab,
+	    FAC = get,				! Want to get records
+	    FNM = 'NETUAF',			! Name is NETUAF
+	    DNM = 'SYS$SYSTEM:.DAT',		! Look in SYS$SYSTEM
+	    SHR = (get,put,upd,del));		! Do shared access
+!
+! Disable group and process logical name translation.  This must be
+! done manually, since $FAB_INIT doesn't know about the disable mask.
+!
+netfab[fab$b_dsbmsk] = (1^log$c_group) OR (1^log$c_process);
+
+$RAB_INIT ( RAB = netrab,
+	    ROP = rlk,				! Don't lock records
+	    RAC = key,				! Access is keyed
+	    KRF = 0,				! Use primary key
+	    KBF = net_record,			! Lookup key overlays net record
+	    KSZ = naf$s_remname,		! and it's this long
+	    UBF = net_record,			! Fetch record and put it here
+	    USZ = naf$c_length,			! Size of record
+	    FAB = netfab);
+
+!
+! Open NETUAF
+!
+
+IF NOT ($OPEN(FAB = netfab)) THEN RETURN false;
+IF NOT ($CONNECT(RAB = netrab)) THEN RETURN false;
+
+!
+! Get the remote node and remote username from the Network Control Block.
+! The NCB is an ASCII string that looks like this:
+!
+!	NODE::"OBJECT=USERNAME/<more stuff>"
+!
+! Where NODE and USERNAME are the two fields to extract and use as a key,
+! to locate the record in NETUAF.DAT which contains the local username to 
+! map to.
+!
+
+!
+! First, get the node.
+!
+
+ptr = CH$FIND_SUB ( .sys$error[0],		! Search the NCB string
+		    .sys$error[1],	
+		    2, UPLIT ('::'));		! Looking for ::
+
+!
+! If the node wasn't there, then return FALSE and process with no proxy
+!
+
+IF  .ptr EQL 0 OR
+    .ptr EQL .sys$error[1]
+THEN RETURN false;
+
+node_len = .ptr - .sys$error[1];		! Store node length
+node_ptr = .sys$error[1];			! And starting address
+
+!
+! Get the username.  This is done by looking for the "=", then the
+! "/", and interpreting whatever is between the two characters as the
+! username.
+!
+
+ptr = CH$FIND_CH ( .sys$error[0],		! Search the NCB string
+		   .sys$error[1],
+		   '=');			! Looking for equal sign
+
+IF .ptr EQL 0					! If no such character found
+THEN RETURN false;				! return a value of FALSE
+
+user_ptr = .ptr + 1;				! Compute beginning of username
+
+ptr = CH$FIND_CH ( .sys$error[0],		! Search the NCB string
+		   .sys$error[1],
+		   '/');			! Looking for slash
+
+!
+! If no slash, or a null username, return FALSE
+!
+
+IF  .ptr EQL 0 OR
+    .ptr EQL .user_ptr
+THEN RETURN false;
+
+!
+! Otherwise, compute the username length
+!
+
+user_len = .ptr - .user_ptr;
+
+!
+! Copy the node and username to NET_KEY, the key buffer that RMS will
+! use to look for the specified record.
+!
+CH$COPY ( .node_len, .node_ptr,			! Copy the nodename
+	  ' ',					! Padded with blanks
+	  naf$s_node, net_record);		! To the key buffer
+
+CH$COPY ( .user_len, .user_ptr,			! Copy the username
+	  ' ',					! Padded with blanks
+	  naf$s_remuser, net_record[naf$s_node]);
+
+!
+! Now perform a $GET, so see if there is a record in NETUAF that
+! exactly matches the node and username specified.  If no exact match
+! is found, wildcarding is applied in the following order:
+!
+!	Wildcard node, specific user
+!	Specific node, wildcard user
+!	Wildcard node, wildcard user
+!
+! If a match is found, then it is used and no further checking is done.
+!
+IF NOT ($GET (RAB = netrab))
+THEN
+    BEGIN
+    CH$COPY ( 1, UPLIT ('*'),			! Put in wildcard node
+	      ' ',
+	      naf$s_node, net_record);
+    IF NOT ($GET (RAB = netrab))
+    THEN
+	BEGIN
+	CH$COPY ( .node_len, .node_ptr,		! Specific node,
+		  ' ',
+		  naf$s_node, net_record);
+	CH$COPY ( 1, UPLIT ('*'),		! Wildcard user
+		  ' ',
+		  naf$s_remuser, net_record[naf$s_node]);
+	IF NOT ($GET (RAB = netrab))
+	THEN
+	    BEGIN
+	    CH$COPY ( 1, UPLIT ('*'),		! Wildcard node and user
+		      ' ',
+		     naf$s_node, net_record);
+	    IF NOT ($GET (RAB = netrab))
+	    THEN
+		BEGIN
+		$CLOSE(FAB = netfab);
+		RETURN false;			! If no matches, return false
+		END;
+	    END;
+	END;
+    END;
+!
+! Close NETUAF
+!
+
+$CLOSE (FAB = netfab);
+!
+! If we get here, then a match was found.  Check to see if the local username
+! is actually a "*", in which case copy the remote username to the local 
+! username.
+!
+
+IF .net_record[naf$s_remname] EQL '*'
+THEN CH$MOVE ( 12, net_record, net_record[naf$s_remname]);
+
+! 
+! Now fill in the user descriptor with the local username, and call
+! GET_UAFREC, to get the UAF record without checking for password.
+!
+
+user_desc[0] = 12;
+user_desc[1] = net_record[naf$s_remname];
+
+get_uafrec (user_desc);
+
+!
+! Done.  If a UAF record was found, return TRUE.  Otherwise return FALSE.
+!
+
+RETURN (.uaf_record NEQ 0);
+END;
+
+END
+ELUDOM

@@ -1,0 +1,1069 @@
+%TITLE 'Instruction decoder'
+MODULE lib$ins_decode (IDENT = 'V03-000',
+	ADDRESSING_MODE (EXTERNAL = LONG_RELATIVE)) =
+BEGIN
+
+!++
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+! FACILITY:
+!	VAX instruction decoder.
+!
+! Portions taken from DBGINS module by KEVIN PAMMETT, 2-MAR-77
+!
+! Author:	Tim Halvorsen, 09-Feb-1981
+!
+! Modified by:
+!
+!	V002	TMH0002		Tim Halvorsen	09-Aug-1981
+!		Remove SHR psect attribute so linker doesn't generate a
+!		non-crf writable section, and the imgact doesn't try to map
+!		a read/write shared section to the .EXE file.
+!
+!	V001	TMH0001		Tim Halvorsen	09-Mar-1981
+!		Use PLIT psect rather than OWN psect for read-only
+!		data arrays.  Make each failure status a separate
+!		code to aid in debugging the case of a decode failure.
+!		Remove probes of instruction stream because a PROBER
+!		instruction determines the access from the previous
+!		mode, not the current mode.  Thus, if you call this
+!		routine with a stream readable only to the current mode,
+!		it will fail.  For now, we skip the checks and allow
+!		an access violation to occur within the routine.
+!--
+
+!
+! Require and Library files:
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';		! Standard VMS definitions
+SWITCHES LIST(REQUIRE);
+REQUIRE 'SRC$:VAXOPS';			! Literals and macros related to opcodes
+
+%SBTTL 'Module declarations'
+
+!
+! Table of contents:
+!
+
+LINKAGE
+    ptr_linkage = CALL: GLOBAL(stream_ptr=11),
+    append_linkage = JSB(REGISTER=0,REGISTER=1);
+
+FORWARD ROUTINE
+    lib$ins_decode,			! decode an instruction.
+    ins_operand:	ptr_linkage,	! print out an operand reference.
+    branch_type:	ptr_linkage,	! handle branch type addressing.
+    displacement:	ptr_linkage,	! extract displacement from instruction
+    ins_context,			! get expected context of an operand
+    put_reg:		NOVALUE,	! print a register reference.
+    append_address:	NOVALUE,	! Append an address
+    append_hex:		NOVALUE,	! Append a hex value
+    append_decimal:	NOVALUE,	! Append an unsigned decimal value
+    append_rad50:	NOVALUE,	! Append a RAD50 string
+    append_string:	append_linkage NOVALUE;	! Append string to the output buffer
+
+!
+! Psect declarations
+!
+
+PSECT
+    OWN  = z$debug_code(PIC,WRITE,EXECUTE,ALIGN(2)),
+    CODE = z$debug_code(PIC,WRITE,EXECUTE,ALIGN(2)),
+    PLIT = z$debug_code(PIC,WRITE,EXECUTE,ALIGN(2));
+
+!
+! Equated symbols:
+!
+
+LITERAL
+    true = 1,
+    false = 0,
+    round_brackets	= 0,		! These are all flag parameters to
+    square_brackets	= 2,		!    the routine 'PUT_REG'.
+    no_brackets		= 1;
+
+!
+! OWN storage for up-level references
+!
+
+OWN
+    user_symbolize_routine,		! Address of user symbolize routine
+    user_buffer_address,		! Address of user buffer storage
+    user_buffer_size:	WORD,		! Size of user buffer
+    user_buffer_left:	WORD,		! # bytes left in user buffer to fill
+    last_literal_value;			! Value of last operand
+
+!
+! Macro to invoke a command, and return if the resultant value is an error
+!
+
+MACRO
+    return_if_error(command) =
+	BEGIN
+	LOCAL
+	    status;
+
+	status = command;
+	IF NOT .status
+	THEN
+	    RETURN .status;
+	END%;
+
+!
+! Macro to probe read accessibility of a data segment
+!
+
+MACRO
+    probe(address,length) =
+	BEGIN
+!	BUILTIN PROBER;
+!	IF NOT PROBER(%REF(0),%REF(length),address)
+!	THEN
+!	    RETURN lib$_accvio;
+	true
+	END%;
+
+!
+! Macro to append a string to the output buffer
+!
+
+MACRO
+    append(string) =
+	append_string(%CHARCOUNT(string),UPLIT BYTE(string)
+	%IF %LENGTH GTR 1 %THEN ,%REMAINING %FI)%;
+!
+! External storage
+!
+
+EXTERNAL
+    lib$gb_opinfo: opcode_tbl;		! Table describing VAX instruction set
+
+!
+! Define message codes
+!
+
+LITERAL
+    lib$_accvio = 0,
+    lib$_noinstran = 2,
+    lib$_numtrunc = 4;
+
+GLOBAL ROUTINE lib$ins_decode(stream_pntr, outbuf, retlen, symbolize_rtn) =
+
+!---
+!	This routine examines a byte stream that it is passed
+!	a pointer to, and tries to output what instructions
+!	this corresponds to symbolically.
+!
+! Inputs:
+!
+!	stream_ptnr = Address of a byte pointer to the instruction stream.
+!	outbuf = Address of a buffer descriptor to receive the
+!			decoded instruction
+!	symbolize_rtn = Address of a routine to call to convert an address
+!			
+!
+! Outputs:
+!
+!	R0 = status code
+!	The stream_pntr is updated to point to the next instruction.
+!--
+
+BEGIN
+
+BUILTIN
+    NULLPARAMETER;
+
+MAP
+    stream_pntr: REF VECTOR [,LONG],
+    outbuf:	REF BLOCK [,BYTE],
+    retlen:	REF VECTOR [,WORD];
+
+GLOBAL REGISTER
+    stream_ptr=11: REF VECTOR[,BYTE];	! Points to the instruction stream
+
+LOCAL
+    opcode: WORD;			! Instruction opcode
+
+stream_ptr = .stream_pntr [0];		! Get pointer to instruction stream
+
+user_buffer_size = .outbuf [dsc$w_length];
+user_buffer_address = .outbuf [dsc$a_pointer];
+user_buffer_left = .user_buffer_size;
+
+IF NULLPARAMETER(4)			! If 4th parameter unspecified,
+THEN
+    user_symbolize_routine = 0		! then set no routine
+ELSE
+    user_symbolize_routine = .symbolize_rtn;
+
+probe(.stream_ptr,1);			! Exit if we can't read the opcode
+
+!
+!  Pick up the opcode and it check for validity.
+!
+
+opcode = .stream_ptr [0];		! Get first byte of opcode
+
+IF .opcode EQL %X'FD'			! Check to see if 2 byte opcode
+THEN
+    BEGIN				! It is. Get the next byte of opcode.
+    opcode = .stream_ptr [1]^8 + .opcode;
+    stream_ptr = .stream_ptr + 1;
+    END;
+
+IF .opcode EQL %X'FF'			! If bugcheck opcode,
+    AND .stream_ptr [1] EQL %X'FE'
+THEN
+    BEGIN
+    probe(.stream_ptr,4);		! Make sure all 4 bytes are readable
+    append('BUG_CHECK #');
+    append_hex(.(.stream_ptr+2)<0,16,0>,2);
+    stream_pntr [0] = .stream_ptr+4;	! Point to next instruction
+    IF NOT NULLPARAMETER(3)		! If RETLEN specified,
+    THEN
+	retlen [0] = .user_buffer_size - .user_buffer_left;
+    RETURN ss$_normal;
+    END;
+
+IF .lib$gb_opinfo[.opcode, op_numops] EQL not_an_op ! If unknown opcode,
+THEN
+    RETURN lib$_noinstran;		! Unable to translate instruction
+
+!
+! Bump the instruction pointer up past the opcode,
+! and output the character sequence which corresponds to it.
+!
+
+stream_ptr = .stream_ptr + 1;
+
+append_rad50(op_ch_size/3, lib$gb_opinfo [.opcode, op_name]);
+append('  ');
+
+!
+! Loop, encoding how each operand is referenced.
+!
+
+INCR I FROM 1 TO .lib$gb_opinfo [.opcode, op_numops]
+DO
+    BEGIN
+    return_if_error(ins_operand(.i, .opcode));
+
+    IF .i NEQ 0 AND .i LSS .lib$gb_opinfo [.opcode, op_numops]
+    THEN
+	append(',');
+    END;
+
+!
+! For CASE instructions, increment the stream pointer past the
+! last offset in the list.
+!
+
+IF .opcode EQL op_caseb			! If CASE instruction,
+    OR .opcode EQL op_casew
+    OR .opcode EQL op_casel
+THEN
+    stream_ptr = .stream_ptr + (.last_literal_value+1)*2;
+
+!
+!  Return a pointer to the beginning of the next instruction.
+!
+
+IF NOT NULLPARAMETER(3)			! If RETLEN specified,
+THEN
+    retlen [0] = .user_buffer_size - .user_buffer_left;
+
+stream_pntr [0] = .stream_ptr;		! Return pointer to next instruction
+
+RETURN ss$_normal;
+
+END;
+
+%SBTTL 'INS_OPERAND - Output instruction''s operand'
+ROUTINE ins_operand(index, opcode): ptr_linkage =
+
+!---
+!	Print out a reference to an instruction operand.
+!
+! Warning:
+!
+!	1) there is code in the 'deferred' macro which will cease
+!	   to work when/if we change the representation of true
+!	   and false.
+!	2) the local macros, below, check for the indicated addressing
+!	   modes only given that they appear in the code where they
+!	   do - ie, the checks take advantage of what we know about
+!	   which cases we have already eliminated, etc.
+!
+! Inputs:
+!
+!	stream_ptr = a byte pointer to the first byte of the instruction
+!		     stream which begins the reference to this operand.
+!		     this byte is what we refer to as the dominant mode.
+!	index = ordinal of which operand we are on.  this is needed to 
+!		     decide the 'context' for this operand if pc-relative
+!		     addressing mode is used.
+!	opcode = The opcode we are currently working on.
+!		 (This parameter has already been validated.)
+!
+! Outputs:
+!
+!	R0 = status code
+!	The stream_ptr is incremented to reflect how much of the instruction
+!	stream we have 'eaten up'.  This pointer should point to the beginning
+!	of either the next instruction, or the next operand reference,
+!	depending on how many operands the current instruction has.
+!---
+
+BEGIN
+
+!
+! Local macros used to check for the indicated addressing modes.
+!
+
+MACRO
+    registr(mode)		! register mode addressing.
+	= (mode EQL 5) %,
+    deferred(mode)		! those which begin with '@' are
+	= (mode LSS 0 AND mode)%,
+				!  9 - @(rn)+,
+				!  b - @byte(rn),
+				!  d - @word(rn),
+				!  f - @long(rn),
+				! or any of these + indexing.
+				! the thing which is common to only these
+				! modes is that they all have the sign
+				! bit set and are odd!
+
+    autodec(mode)		! see if mode is auto decrement.
+	= (mode EQL 7)%,	! this check is right from srm.
+
+    autoinc(mode)		! mode is auto increment
+	= (mode LSS 0)%;
+				! this check depends upon the fact that
+				! we extracted the mode with sign extension,
+				! and that we have already eliminated
+				! many of the other possibilities.
+
+EXTERNAL REGISTER
+    stream_ptr=11: REF BLOCK [,BYTE];	! Points to the instruction stream
+
+LOCAL
+    flag,			! indicates which type of displacment we have.
+    displ,			! the actual displacement.
+    disp_size,			! the size, in bytes, of a displacement.
+    dom_oprnd,			! operand which we extract from the
+				!  dominant mode byte.  it may be rn, 
+				!  rx, or a literal.  (srm notation).
+    dom_mode;			! the primary addressing mode comes from
+				!    this dominant byte as well.
+
+!
+! We have to consider the possibility of
+! so-called 'branch type' addressing first
+! before anything else because otherwise you cannot
+! differentiate short literal from byte displacement
+! branching.
+!
+
+IF branch_type(.index, .opcode)		! If we can output branch operand,
+THEN
+    RETURN ss$_normal;			! Return with updated stream pointer
+
+!
+! See that we can access at least the operand byte.
+!
+
+probe(.stream_ptr, 1);			! Return if we can't read the operand
+
+!
+! Extract the needed fields from the first byte of
+!  the operand specifier.  We extract some fields
+!  with sign extension simply because that makes
+!  making various tests more convenient.
+!
+
+dom_mode = .stream_ptr [amode];
+dom_oprnd = .stream_ptr [areg];
+
+!
+! Take special action for indexing mode.
+!
+
+IF .dom_mode EQL indexing_mode
+THEN
+    BEGIN
+    ! handle indexing mode recursively.
+
+    stream_ptr = stream_ptr [next_field(1)];
+    return_if_error(ins_operand(.index, .opcode));
+    put_reg(.dom_oprnd, square_brackets);
+    RETURN ss$_normal;
+    END;
+
+! Simple modes are easier:
+
+! First see if there will be a literal or displacement in the operand.
+
+return_if_error(displacement(flag, displ, disp_size, .index, .opcode));
+
+! Begin checking for the addressing modes which begin
+! with special characters since we have to print them
+! first.  We try to handle similar cases with the same
+! code, getting the differences out of the way first.
+
+IF deferred(.dom_mode)
+THEN
+    append('@')
+ELSE
+    IF autodec(.dom_mode)
+    THEN
+	append('-');
+
+! Next we have to consider displacements or literals.
+! Whether or not this is the case has already been 
+! determined in the call to 'displacement', above.
+
+IF .flag
+THEN
+    BEGIN
+    ! There is a literal, so print it.
+    ! The flag value returned by displacement()
+    ! distinguishes when there should be a '#',
+    ! as opposed to when the number is actually
+    ! a displacement off a register.
+
+    IF .flag GTR 0			! If its a literal,
+    THEN
+	BEGIN
+	append('#');
+
+	! except for @# mode, Make .dom_oprnd neq pc_reg so that
+	! later only checking that will also tell us
+	! that .flag is gtr 0.
+
+	IF not deferred(.dom_mode)
+	THEN
+	    dom_oprnd = pc_reg +1;
+!	END
+!    ELSE				! Else, for displacements,
+!	BEGIN
+!	OWN
+!	    displ_id: VECTOR[4,BYTE]
+!			INITIAL( BYTE( 'B', 'W', '?', 'L') );
+!
+!	! Print an indication of the displacement size.
+!
+!	append_string(1, displ_id [.disp_size-1]);
+!	append('^');
+	END;
+
+    ! Output here is always "displ(reg)", for non-PC 
+    ! displacments, and just "effective", otherwise. 
+
+    IF .dom_oprnd EQL pc_reg			! If PC relative or absolute,
+    THEN
+	BEGIN
+	IF .flag LSS 0				! If PC relative,
+	THEN
+	    BEGIN
+	    disp_size = 4;
+	    displ = .displ + .stream_ptr;	! Make an effective address
+	    append_address(.displ, 0);		! Output relative address
+	    END
+	ELSE					! Else, if absolute address,
+	    append_address(.displ, 1);		! Output absolute address
+	END
+    ELSE
+	BEGIN
+
+	! Literals or real (non-PC) displacement modes.
+
+	append_hex(.displ, .disp_size);		! Output literal or offset,
+	last_literal_value = .displ;		! Save last literal value
+
+	IF .flag LSS 0				! If relative (from register),
+	THEN
+	    put_reg(.dom_oprnd, round_brackets);
+	END;
+    END
+
+! No literal or displacement -> we must have some type of
+! register reference.  Sort out the few cases and print them.
+
+ELSE
+    IF registr(.dom_mode)
+    THEN
+	put_reg(.dom_oprnd, no_brackets)
+    ELSE
+	BEGIN
+	put_reg(.dom_oprnd, round_brackets);
+	IF autoinc(.dom_mode)
+	THEN
+	    append('+');
+	END;
+
+RETURN ss$_normal;
+
+END;
+
+%SBTTL 'BRANCH_TYPE - Handle branch operands'
+ROUTINE branch_type(index, opcode): ptr_linkage =
+
+!---
+!	Decide if the current operand is using branch type
+!	addressing.  If so, print out the reference and
+!	look after all the details.  Otherwise return 0
+!	and let someone else handle it.
+!
+! Inputs:
+!
+!	stream_ptr = a pointer to the current dominant mode byte.
+!	index = which operand (ordinal) we're working on.
+!	opcode = The opcode we are currently working on.
+!		 (This parameter has already been validated.)
+!
+! Routine value:
+!
+!	Routine value is true if the current operand is a branch, else false.
+!
+!	If the current operand is a branch, the reference is appended
+!	to the output buffer and the stream pointer is updated.
+!--
+
+BEGIN
+
+EXTERNAL REGISTER
+    stream_ptr=11;			! Points to the instruction stream
+
+LOCAL
+    n_ops,				! number of operands for current opcode
+    disp_size,				! size of branch operand, in bytes.
+    displ;				! the actual branch displacement.
+
+! There is no point in even considering branch type
+! addressing unless we're on the last operand for
+! this instruction.
+
+n_ops = .lib$gb_opinfo [.opcode, op_numops];
+
+IF .n_ops NEQ .index
+THEN
+    RETURN false;
+
+! Now we know we can take the op_br_type field literally.
+! it contains the number of bytes used for the branch
+! displacement.  0 in this field indicates that
+! this opcode has no branch type operands.
+
+disp_size = .lib$gb_opinfo [.opcode, op_br_type];
+
+IF .disp_size EQL no_branch
+THEN
+    RETURN false;
+
+probe(.stream_ptr,.disp_size);		! Exit if we can't read displacement
+
+!
+! Success!  We have discovered a case of branch type addressing.
+! handle this by simply extracting the field, (with sign
+! extension as per srm),  printing out the reference,
+! and returning a pointer to the next instruction.
+!
+
+displ = .(.stream_ptr)<0,.disp_size*8,1>;
+stream_ptr = .stream_ptr + .disp_size;
+
+append_address(.stream_ptr + .displ, 0); ! Output relative address
+
+RETURN true;
+
+END;
+
+%SBTTL 'DISPLACEMENT - Determine size of operand'
+ROUTINE displacement (flag, displ, ptr_disp_size, index, opcode): ptr_linkage =
+
+!---
+!	Return any displacement associated with the current operand of the
+!	current instruction. Note that for short literals, the literal is returned
+!	in DISPL; for displacement mode instructions, the actual displacement is
+!	returned in DISPL; and for PC Mode instructions, the displacement is returned
+!	in DISPL. For other mode instructions, the routine effectively No-ops.
+!
+! Inputs:
+!
+!	stream_ptr = Where the current operand specifier starts.
+!	flag = Where we indicate the displacement type
+!	displ = Where we put the actual displacement
+!	ptr_disp_size = Number of bytes in the displcaement
+!	index = Designates the Current operand
+!	opcode = Number of opcode of current instruction
+!
+!
+! Outputs:
+!
+!	R0 = status code
+!	flag = 1 if literal, -1 if displacement, 0 otherwise
+!	displ = Displacement or literal value
+!	ptr_disp_size = Number of bytes of displacement
+!
+!	The stream pointer is updated to the next operand or address
+!	of the same operand if a displacement wasn't found.
+!--
+
+BEGIN
+
+MACRO 
+    short_literal_mode = (.mode LEQ 3 AND .mode GEQ 0)%,
+    displacement_mode = (.mode LEQ 15 AND .mode GEQ 10)%,
+    pc_mode = (.reg EQL pc_reg AND (.mode EQL 8 OR .mode EQL 9))%;
+
+EXTERNAL REGISTER
+    stream_ptr=11: REF BLOCK [,BYTE];	! Points to the instruction stream
+
+MAP
+    flag:	REF VECTOR,
+    displ:	REF BLOCK,
+    opcode:	BLOCK,
+    ptr_disp_size: REF VECTOR;
+
+LOCAL
+    reg,				! Register in operand specifier
+    mode;				! Mode in operand specifier
+
+reg = .stream_ptr [areg];
+mode = .stream_ptr [dspl_mode];
+
+! Get past operand specifier byte
+
+stream_ptr = stream_ptr [next_field(1)];
+
+SELECTONE true OF
+    SET
+    [short_literal_mode]:		! Short literal mode
+		BEGIN
+		! Short literals only allowed on read-only operands
+		IF .lib$gb_opinfo [.opcode, op_datatype(.index)] NEQ access_r
+		THEN
+		    RETURN lib$_noinstran; ! then return invalid instruction
+		! Extract the number from operand specifier
+		displ [0,0,32,0] = .mode<0,2,0>^4 OR .reg;
+		flag [0] = 1;		! Say its a literal
+		ptr_disp_size [0] = 1;
+		RETURN ss$_normal;
+		END;
+    [displacement_mode]:		! Displacement modes
+		BEGIN
+		flag [0] = -1;		! Say its a displacement
+		ptr_disp_size [0] =
+			(CASE .mode FROM 10 TO 15 OF
+				SET
+				[12,13]: 2;	! 2 bytes of displacement info
+				[14,15]: 4;	! 4 bytes of displacement info
+				[INRANGE]: 1;	! 1 byte of displacement info
+				TES);
+		! Save off the displacement
+		block [.displ,0,0,32,0] = .stream_ptr [0,0,8*.ptr_disp_size [0],1];
+		stream_ptr = stream_ptr [next_field(.ptr_disp_size [0])];
+		RETURN ss$_normal;
+		END;
+    [pc_mode]:				! PC Modes
+		BEGIN
+		flag [0] = 1;		! Say its a literal
+		IF .mode EQL 9
+		THEN 
+		    ptr_disp_size [0] = 4	! 4 bytes of address
+		! Else amount of displacement is dependent upon instruction
+		ELSE 
+		    ptr_disp_size [0] = ins_context(.index, .opcode);
+		block [.displ,0,0,32,0] = .stream_ptr [0,0,8*MIN(.ptr_disp_size [0], 4), 0];
+		IF .ptr_disp_size [0] GTR 4
+		THEN
+		    RETURN lib$_numtrunc; ! Can't handle quad or octawords yet.
+		stream_ptr = stream_ptr [next_field(.ptr_disp_size [0])];
+		RETURN ss$_normal;
+		END;
+    [OTHERWISE]:
+		BEGIN			! None of the above, so No op.
+		flag [0] = 0;		! Not a displacement
+		ptr_disp_size [0] = 0;
+		displ [0,0,32,0] = 0;
+		! Back over the byte we advanced over earlier
+		stream_ptr = stream_ptr [next_field(0)];
+		RETURN ss$_normal;
+		END;
+    TES;
+
+END;
+
+%SBTTL 'INS_CONTEXT - Determine operand type'
+ROUTINE ins_context (index, opcode) =
+
+!---
+!	This routine decides what context applies to the given
+!	operand for a specific opcode.  It is used because we need
+!	to know whether a pc-relative mode for this operand would
+!	require a byte, word, longword, or quadword operand.
+!
+! Inputs:
+!
+!	index = Which operand we're dealing with.  This number
+!		must be 1, 2, ... 6.
+!	opcode = The opcode we are currently working on.
+!		 (This parameter has already been validated.)
+!
+! Routine value:
+!
+!	If some error is detected, we return false.  Otherwise we return
+!	the number of bytes from the instruction stream that the current
+!	operand reference should consume.
+!
+!   The value, 0 to 3, stored in the op_context field is simply 
+!   our encoding of 4 values into a 2-bit field.  The 'number of
+!   bytes' entry, above, is the number we are actually after.
+!--
+
+BEGIN
+
+!
+! check for any of the following error conditions:
+!	1) we don't recognize this opcode.
+!	2) we don't have enough information about it.
+!	   (ie - it is reserved or yet to be defined).
+!	3) we know about it, but don't believe that it
+!	   should have as many operands as what
+!	   'index' implies.  this check is necessary
+!	   because the 'nul' entry in the opinfo
+!	   declaration macros results in the same value
+!	   being encoded as the 'byt' ones do.  since
+!	   we can cross-check for this error at this
+!	   point (by looking at the op_numops entry for
+!	   this opcode), it did not seem worth taking up more
+!	   bits in the opinfo table to differentiate 'nul'
+!	   and the others.
+!
+
+IF .lib$gb_opinfo [.opcode, op_numops] EQL not_an_op
+THEN
+    RETURN 0;				! Error 2, see above.
+
+IF .lib$gb_opinfo [.opcode, op_numops] LSS .index OR .index LEQ 0
+THEN
+    RETURN 0;				! Error 3, see above.
+
+! now it is just a matter of looking into our opinfo table
+! where we get 0, 1, 2, or 3.  this just happens to be
+! the power of 2 which we need to calculate the number
+! of bytes occupied by the corresponding operand.
+
+RETURN 1 ^ .lib$gb_opinfo [.opcode, op_context(.index)];
+
+END;
+
+%SBTTL 'PUT_REG - Print a register name'
+ROUTINE put_reg (reg, cs_flag): NOVALUE =
+
+!---
+!	This routine takes 1 parameter which it assumes is
+!	the number of a vax register.  It then prints out
+!	'r' followed by the number (in decimal), unless the
+!	register number is 'special'.  These include:
+!
+!	Register number		Special name
+!
+!		12		   AP
+!		13		   FP
+!		14		   SP
+!		15		   PC
+!
+!	An additional parameter is used as a flag to indicate
+!	whether the register reference should be enclosed in
+!	round/square brackets or not.
+!
+! Inputs:
+!
+!	reg = The register number.
+!	cs_flag = A flag to control printing before/after REG.
+!
+! Outputs:
+!
+!	None.
+!--
+
+BEGIN
+
+LOCAL
+    index;
+
+BIND
+    enclosing_cs = UPLIT BYTE('(',')','[',']'): VECTOR [,BYTE],
+    regnames = UPLIT WORD('AP', 'FP', 'SP', 'PC'): VECTOR [,WORD];
+
+!
+! If we are to put out any enclosing strings,
+! then we have been passed the INDEX which we
+! need to pick this string out of the above
+! vector.
+!
+
+index = .cs_flag;
+
+IF .index NEQ no_brackets
+THEN
+    append_string(1, enclosing_cs [.index]);
+
+! Now print the actual register reference.
+
+IF .reg LSS ap_reg
+THEN
+    BEGIN
+    append('R');
+    append_decimal(.reg);
+    END
+ELSE
+    append_string(2, regnames[.reg-12]);
+
+! See again if there is any enclosing string.
+
+IF .index NEQ no_brackets
+THEN
+    append_string(1, enclosing_cs [.index+1]);
+
+END;
+
+%SBTTL 'APPEND_ADDRESS - Symbolize value and append it'
+ROUTINE append_address (value, absflag): NOVALUE =
+
+!---
+!
+!	This routine converts a given absolute value to a symbol
+!	and an offset (if possible) and appends the resulting string
+!	to the current output buffer.
+!
+! Inputs:
+!
+!	value = Absolute value to be converted
+!	absflag = True if absolute address, else relative address
+!
+! Outputs:
+!
+!	Either the hex value or the symbol+offset is appended.
+!---
+
+BEGIN
+
+IF .user_symbolize_routine EQL 0
+THEN
+    append_hex(.value,4)
+ELSE
+    BEGIN
+    LOCAL
+	retlen: WORD,
+	buffer_left: VECTOR [2];
+    buffer_left [0] = .user_buffer_left;
+    buffer_left [1] = .user_buffer_address;
+    IF (.user_symbolize_routine)(value,buffer_left,retlen,absflag)
+    THEN
+	BEGIN
+	user_buffer_address = .user_buffer_address + .retlen;
+	user_buffer_left = .user_buffer_left - .retlen;
+	END
+    ELSE
+	append_hex(.value,4);
+    END;
+
+END;
+
+%SBTTL 'APPEND_HEX - Append variable size hex value'
+ROUTINE append_hex (value, bytes): NOVALUE =
+
+!---
+!
+!	This routine appends a given hex value to the current output
+!	buffer.
+!
+! Inputs:
+!
+!	value = Absolute value
+!	bytes = Number of bytes to display
+!
+! Outputs:
+!
+!	The hex value is appended.
+!---
+
+BEGIN
+
+LOCAL
+    number;
+
+BIND
+    digit_table = UPLIT BYTE('0123456789ABCDEF'): VECTOR [,BYTE];
+
+number = .value;
+
+IF .number LSS 0			! If negative value,
+THEN
+    BEGIN
+    append('-');			! Output minus sign
+    number = -.number;			! and print the absolute value
+    END;
+
+DECR i FROM .bytes*8-4 TO 0 BY 4	! For each nibble,
+DO
+    append_string(1, digit_table [.number <.i,4>]); ! Output the digit
+
+END;
+
+%SBTTL 'APPEND_DECIMAL - Append unsigned decimal value'
+ROUTINE append_decimal (value): NOVALUE =
+
+!---
+!
+!	This routine appends a given unsigned decimal value
+!	to the current output buffer.
+!
+! Inputs:
+!
+!	value = Number to be output
+!
+! Outputs:
+!
+!	The decimal value is appended, without any padding or fill.
+!---
+
+BEGIN
+
+LINKAGE
+    recursive_jsb = JSB: GLOBAL(number=2);
+
+GLOBAL REGISTER
+    number = 2;
+
+ROUTINE output_remaining_digits: recursive_jsb NOVALUE =
+    BEGIN
+    EXTERNAL REGISTER number=2;
+    LOCAL char: BYTE;
+    char = '0' + (.number MOD 10);
+    number = .number / 10;
+    IF .number NEQ 0 THEN output_remaining_digits();
+    append_string(1, char);
+    END;
+
+number = .value;
+output_remaining_digits();
+
+END;
+
+%SBTTL 'APPEND_RAD50 - Append RAD50 characters'
+ROUTINE append_rad50 (nwords, words): NOVALUE =
+
+!---
+!
+!	This routine converts a series of RAD50 words to ASCII and
+!	appends it to the current output buffer.
+!
+! Inputs:
+!
+!	nwords = Number of words to convert
+!	words = Address of words to convert
+!
+! Outputs:
+!
+!	The string is appended, without any padding or fill.
+!---
+
+BEGIN
+
+MAP
+    words:	REF VECTOR [,WORD];	! Address of array of words
+
+LOCAL
+    number:	WORD,
+    char:	VECTOR [3,BYTE];	! 3 character array
+
+INCRU word_number FROM 0 TO .nwords-1	! For each word to convert,
+DO
+    BEGIN
+    number = .words [.word_number];	! Get value of word
+
+    DECR i FROM 2 TO 0			! For 3 characters,
+    DO
+	BEGIN
+	char [.i] = .number MOD 40;	! Get low order character
+	number = .number / 40;		! and divide by 40
+	END;
+
+    INCR i FROM 0 TO 2			! For each of the 3 characters,
+    DO
+	BEGIN
+	SELECTONEU .char [.i]
+	OF
+	    SET
+	    [0]:	char [.i] = ' ';
+	    [1 TO 26]:	char [.i] = .char [.i] + 'A' - 1;
+	    [27]:	char [.i] = '$';
+	    [OTHERWISE]: char [.i] = .char [.i] + '.' - 28;
+	    TES;
+	append_string(1, char [.i]);
+	END;
+    END;
+    
+END;
+
+%SBTTL 'APPEND_STRING - Append to output buffer'
+ROUTINE append_string (length, string): append_linkage NOVALUE =
+
+!----
+!
+!	Append a string to the current output buffer.
+!
+! Inputs:
+!
+!	length = Length of string
+!	string = Address of string
+!
+!	user_buffer_address = Address of next available byte in user buffer
+!	user_buffer_left = Number of bytes left in user buffer
+!
+! Outputs:
+!
+!	user_buffer_address, user_buffer_left are updated.
+!----
+
+BEGIN
+
+IF .user_buffer_left GEQ .length	! If enough room left,
+THEN
+    BEGIN
+    CH$MOVE(.length, .string, .user_buffer_address);
+    user_buffer_address = .user_buffer_address + .length;
+    user_buffer_left = .user_buffer_left - .length;
+    END;
+
+END;
+
+END
+ELUDOM

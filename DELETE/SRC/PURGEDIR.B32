@@ -1,0 +1,468 @@
+MODULE purgedir (			! Purge directory program
+		IDENT = 'V03-000',
+		ADDRESSING_MODE(EXTERNAL=GENERAL)
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  PURGE Command
+!
+! ABSTRACT:
+!
+!	This utility purges a directory, basically removing
+!	old versions of a specified group of files.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. unprivileged user mode,
+!
+! AUTHOR:  Tim Halvorsen, Oct 1979
+!
+! Modified by:
+!
+!	V02-009	SHZ0002		Stephen H. Zalewski,	4-Feb-1982  14:03
+!		Changed fmg$file_scan to lib$file_scan in order to prevent
+!		multiply defined symbols.
+!
+!	V02-008	SHZ0001		Stephen H. Zalewski,	19-Nov-1981  16:04
+!		Added ADDRESSING_MODE(EXTERNAL=GENERAL) to module header
+!
+!	V007	TMH0007		Tim Halvorsen	11-Aug-1981
+!		Fix bug in TMH0002 to wait until end of directory
+!		to start deleting ODS-1 files, rather than until
+!		detection of a new file name/type.  Since ODS-1
+!		directories have no order at all, you must wait until
+!		end of directory, sort all the entries, and then
+!		start looking for files to be purged.
+!
+!	V02-006	KRM0010		Karl Malik	16-Feb-1981
+!		Fixed bug in DO_FILE which prevented proper processing
+!		of TOPS-20 version number delimiter ('.').
+!
+!	V02-005	KRM0009		Karl Malik	11-FEB-1981
+!		Add check for network device to PURGE_FILES
+!		( allows remote PURGE to work ).
+!
+!	V02-004	ACG0184		Andrew C. Goldstein,	14-Jan-1981  10:33
+!		Add /ERASE qualifier
+!
+!	V003	TMH0003		Tim Halvorsen	10-Mar-1980
+!		Report value of STS and STV rather than addresses
+!		of them (comes out with strange error message).
+!
+!	V002	TMH0002		Tim Halvorsen	04-Feb-1980
+!		Rewrite PURGE algorithm to allow for ODS-1 ACP
+!		which returns files in random version order rather
+!		than descending version order.  This means you cannot
+!		delete old versions after counting the # kept but must
+!		collect a list of all the versions for a particular
+!		file name and type and then purge them when the file
+!		name or type changes.
+!
+!	V001	TMH0001		Tim Halvorsen	02-Dec-1979
+!		Remove code to inhibit priv. violation message if
+!		the file has no delete access for group,owner,world.
+!		It was a krock.
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET.L32';	! VAX/VMS common definitions
+
+SWITCHES LIST(REQUIRE);			! Print require file
+REQUIRE 'SRC$:DELETE.REQ';		! Common DELETE definitions
+
+REQUIRE 'SRC$:DELEMSG.REQ';		! Macros to signal a message
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    purge_files,			! Main directory routine
+    do_file:		NOVALUE,	! Process each wildcard file
+    purge_directory,			! Purge versions for a directory
+    open_error:		NOVALUE;	! Report open/search error
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    file_error:		NOVALUE,	! Report RMS error messages
+    lib$file_scan,			! Search wildcard specifications
+    lib$set_erase,			! Mark file for erase-on-delete
+    lib$cvt_dtb,			! Convert decimal string to binary
+    lib$get_vm,				! Allocate dynamic storage
+    lib$free_vm;			! Deallocate dynamic storage
+
+!
+! Storage definitions
+!
+
+OWN
+    version_list:	INITIAL(0),	! Address of linked list of versions
+    files_purged;			! Number of files purged
+
+EXTERNAL
+    del$cli_status:	BITVECTOR,	! CLI qualifier bitmap
+    del$keepver_val,			! Number of versions to save
+    infile_xabpro:	BBLOCK;		! Protection XAB for input FAB
+
+GLOBAL ROUTINE purge_files (fab_block) =
+
+!++
+! Functional description
+!
+!	This routine performs all the main processing of the
+!	PURGE command.  The command line has already been parsed
+!	and the qualifier values saved.
+!
+! Calling sequence
+!
+!	purge_files(fab) from the DELETE command mainline code
+!
+! Input parameters
+!
+!	fab_block = Address of FAB with FNA,FNS filled in.
+!
+! Output parameters
+!
+!	None
+!
+! Routine value
+!
+!	Status.
+!----
+
+BEGIN
+
+MAP
+    fab_block:	REF BBLOCK;		! Address of FAB block
+
+BIND
+    nam_block = .fab_block [fab$l_nam]: BBLOCK;	! Address of NAM block
+
+LOCAL
+    spec_desc:	VECTOR[2];		! File specification descriptor
+
+del$cli_status [wildcard_bit] = false;	! Turn off wildcards
+
+spec_desc [0] = .nam_block [nam$b_esl];	! Create descriptor of file spec
+spec_desc [1] = .nam_block [nam$l_esa];
+
+IF ((NOT .fab_block [$FAB_DEV(dir)])	! If not a directory device,
+AND (NOT .fab_block [$FAB_DEV(net)]))	! and not a network device
+THEN
+    BEGIN
+    put_message(msg$_nofilpurg,1,spec_desc);	! Output error message
+    RETURN false;
+    END;
+
+IF .del$keepver_val LEQ 0		! If no /KEEP specified,
+THEN
+    del$keepver_val = 1;		! then default to 1
+
+files_purged = 0;			! Initialize number of files purged
+
+fab_block [fab$l_dna] = UPLIT(';*');	! Set default name string to ';*'
+fab_block [fab$b_dns] = 2;
+
+lib$file_scan(.fab_block,		! Match all wildcard files
+		do_file,		! and here if file found
+		open_error,		! calling here if error occurs
+		0);			! no directory action routine
+
+purge_directory(version_list, .del$keepver_val); ! Delete old versions
+
+IF .files_purged EQL 0			! If no files purged,
+THEN
+    put_message(msg$_nofilpurg,		! Output message saying so
+		1,spec_desc);
+
+RETURN true;
+END;
+
+ROUTINE do_file (fab_block): NOVALUE =
+
+!---
+!
+! Functional description
+!
+!	This routine is called as an action routine
+!	from the directory wildcard searching process.
+!	It is given a FAB containing the full name
+!	of the file to be processed.
+!
+! Input parameters
+!
+!	fab_block = Address of FAB
+!
+! Output parameters
+!
+!	None
+!
+!----
+
+BEGIN
+
+MAP
+    fab_block:	REF BBLOCK;		! Address of FAB
+
+BIND
+    nam = .fab_block [fab$l_nam]: BBLOCK;	! Address of NAM
+
+LOCAL
+    status,				! Status code
+    dir_len,				! Length of device/directory
+    version,				! Version number in binary form
+    length,				! Length of new version entry
+    entry:	REF VECTOR,		! Address of new version entry
+    prev:	REF VECTOR,		! Address of previous entry scanned
+    curr:	REF VECTOR;		! Address of current entry scanned
+
+OWN
+    prev_dir_len:	INITIAL(0),	! Length of previous directory
+    prev_dir:	VECTOR [nam$c_maxrss,BYTE]; ! Buffer for previous directory
+
+!
+! If we have reached a new directory, then peruse the linked
+! list of versions and delete the all but the # explicitly kept.
+!
+
+dir_len = .nam [nam$b_node] + .nam [nam$b_dev] + .nam [nam$b_dir];
+
+IF CH$NEQ(				! If new directory
+	.prev_dir_len, prev_dir,
+	.dir_len, .nam [nam$l_rsa], 0)
+THEN
+    BEGIN
+    CH$MOVE(.dir_len, .nam [nam$l_rsa], prev_dir);
+    prev_dir_len = .dir_len;
+    purge_directory(version_list, .del$keepver_val); ! Delete old versions
+    END;
+
+!
+! Convert the version string to binary form
+!
+
+status = LIB$CVT_DTB(.nam [nam$b_ver]-1, ! Store version in binary
+		.nam [nam$l_ver]+1,
+		version);
+IF NOT .status				! If error converting value,
+THEN
+    BEGIN
+    SIGNAL(.status);			! signal the error
+    RETURN;
+    END;
+
+!
+! Add this version to the ordered linked list of files for this directory.
+! This list is ordered first by file name & type in ascending order, and
+! then by version in descending order (this is the same as ODS-2).
+!
+
+length = 6*4 + .nam [nam$b_rsl];	! Length of overhead plus filespec
+status = LIB$GET_VM(length,entry);	! Allocate storage for entry
+IF NOT .status				! If error allocating storage,
+THEN
+    SIGNAL_STOP(.status);		! then signal the error
+
+entry [1] = .nam [nam$b_name] + .nam [nam$b_type]; ! Length of name/type
+entry [2] = entry [6]			! Address of name/type
+	+ (.nam [nam$l_name] - .nam [nam$l_rsa]);
+entry [3] = .version;			! Store binary version number
+entry [4] = .nam [nam$b_rsl];		! Store length of filespec
+entry [5] = entry [6];			! and address of filespec
+CH$MOVE(.nam [nam$b_rsl], .nam [nam$l_rsa], entry [6]); ! Store full filespec
+
+prev = version_list;			! Address of previous entry
+curr = .prev [0];			! Start at first entry
+
+WHILE .curr NEQ 0			! For each entry in list,
+DO
+    BEGIN
+    LOCAL comparison;			! -1 if less, 0 if equal, 1 if greater
+    comparison = CH$COMPARE(.entry [1], .entry [2],
+	.curr [1], .curr [2], 0);	! Compare new to old name/type
+    IF .comparison LSS 0		! If found place to insert entry,
+	OR (.comparison EQL 0		! (ascending order by name/type,
+       AND .entry [3] GTRU .curr [3])	! (then descending order by version)
+    THEN
+	EXITLOOP;			! then exit the loop
+    prev = .curr;			! Save address of previous entry done
+    curr = .curr [0];			! and link to next in list
+    END;
+
+entry [0] = .prev [0];			! Make new entry point to next in list
+prev [0] = .entry;			! Make previous entry point to new one
+
+RETURN;
+
+END;
+
+ROUTINE purge_directory (list, keep) =
+
+!---
+!
+!	This routine purges all versions beyond the number
+!	explicitly kept.
+!
+! Inputs:
+!
+!	list = Address of listhead of version list
+!			0) link to next entry
+!			1-2) descriptor of file name & type
+!			3) version number in binary
+!			4-5) descriptor of filespec
+!			6) File specification follows
+!	keep = Number of higher versions to keep
+!
+! Outputs:
+!
+!	None, the old versions are deleted.
+!---
+
+BEGIN
+
+LOCAL
+    status,
+    prev_name:	VECTOR [2],		! Descriptor of previous name & type
+    prev_buffer: VECTOR [nam$c_maxrss,BYTE], ! Buffer to hold previous name/type
+    versions,				! Number of versions seen so far
+    length,				! Length of current entry
+    entry:	REF VECTOR,		! Current entry in list
+    next;				! Next entry in list
+
+OWN
+    fab:	$FAB();			! FAB used for deleting versions
+
+prev_name [0] = 0;			! Initialize previous name/type = null
+
+entry = ..list;				! Start at first entry in list
+
+WHILE .entry NEQ 0			! For each entry in list,
+DO
+    BEGIN
+    IF CH$NEQ(.prev_name [0], .prev_name [1],
+	.entry [1], .entry [2], 0)	! If new file name & type,
+    THEN
+	BEGIN
+	versions = 0;			! Reset number of versions seen
+	prev_name [0] = .entry [1];	! Save "current" name & type
+	prev_name [1] = prev_buffer;
+	CH$MOVE(.entry [1], .entry [2], .prev_name [1]);
+	END;
+
+    versions = .versions + 1;		! Increment versions seen
+
+    IF .versions GTR .keep		! If past specified limit,
+    THEN
+	BEGIN
+	!
+	! Delete the file as we have exhausted the keep version count.
+	!
+	fab [fab$b_fns] = .entry [4];		! Copy length of string
+	fab [fab$l_fna] = .entry [5];		! Copy address of string
+	IF .del$cli_status [erase_bit]		! If /ERASE requested
+	THEN
+	    BEGIN
+	    status = lib$set_erase (entry[4]);
+	    fab[fab$l_sts] = .status;
+	    fab[fab$l_stv] = 0;
+	    END
+	ELSE
+	    status = TRUE;
+
+	IF .status				! If successful so far,
+	THEN
+	    status = $ERASE (FAB = fab);	! Attempt to delete the file
+
+	IF .status				! If successful,
+	THEN
+	    BEGIN
+	    files_purged = .files_purged + 1;	! Increment number of files purged
+	    IF .del$cli_status [log_msg_bit]	! If logging requested,
+	    THEN
+		put_message(msg$_filpurged,	! Output log message
+			2,entry [4]);
+	    END
+	!
+	! If delete failed, issue error message giving reason.
+	!
+	ELSE
+	    put_message(msg$_filnotpur,		! Output message giving reason
+		2,entry [4],			! with the file spec
+		.fab [fab$l_sts],		! and RMS status
+		.fab [fab$l_stv]);
+	END;
+
+    !
+    ! Delete the storage used for this version entry
+    !
+
+    next = .entry [0];				! Save address of next one
+    length = 6*4 + .entry [4];			! Length of entry
+    status = LIB$FREE_VM(length,entry);		! Delete storage for entry
+    IF NOT .status				! If error deleting storage,
+    THEN
+	SIGNAL(.status);			! then only signal the error
+    entry = .next;				! Link to next in list
+    END;
+
+.list = 0;					! Re-init listhead
+
+RETURN true;
+
+END;
+
+ROUTINE open_error (fab_block): NOVALUE =
+
+!---
+!
+!	This routine reports an error as a result of searching
+!	for the next file to be purged.
+!
+! Inputs:
+!
+!	fab_block = Address of FAB containing error status
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+file_error (msg$_searchfail, .fab_block);	! Report specified RMS error
+
+END;
+
+END
+ELUDOM

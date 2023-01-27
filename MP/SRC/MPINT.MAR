@@ -1,0 +1,491 @@
+	.TITLE	MPINT - MULTI-PROCESSOR INTERRUPT HANDLER
+	.IDENT	'V03-003'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+;
+; Facility:  Executive , Hardware fault handling
+;
+; Abstract:  This module contains the VAX multiport memory interrupt handler.
+;
+; Environment: MODE=Kernel,  Interrupt 
+;
+; Author:  RICHARD I. HUSTVEDT, Creation date:  15-May-1979
+;
+; Modified by:
+;
+;	V03-003	KDM0099		Kathleen D. Morse	11-Apr-1982
+;		Add time-out logic to the primary processor's wait for
+;		the secondary acknowlegement of a bugcheck.
+;
+;	V03-002	KDM0090		Kathleen D. Morse	5-Apr-1982
+;		Implement the STOP/CPU code that halts the secondary and
+;		unloads the multi-processing code.
+;
+;	V03-001	KDM0080		Kathleen D. Morse	31-Mar-1982
+;		Assembly switch the debug and performance measurement
+;		code.
+;
+;	V02-016	KDM0035		Kathleen D. Morse	19-Jan-1982
+;		Correct primary's handling of secondary bugcheck.
+;
+;	V02-015	KDM0034		Kathleen D. Morse	2-Dec-1981
+;		Change name of adapter initialization routine from
+;		EXE$ADPINIT to EXE$INIBOOTADP.
+;
+;	V02-014	KDM0022		Kathleen D. Morse	21-Jul-1981
+;		Remove routine that clears out all error bits in all MA780's
+;		registers as error interrupt is vectored to different place
+;		from inter-processor interrupt.
+;
+;	V02-013	KDM0021		Kathleen D. Morse	21-Jul-1981
+;		Change macro used for secondary bugchecks to SECBUG_CHECK.
+;
+;	V02-012	KDM0017		Kathleen D. Morse	08-Jul-1981
+;		Rename MPS$GL_MPMBASE to MPS$AL_MPMBASE.
+;
+;	V02-011	KDM0016		Kathleen D. Morse	07-Jul-1981
+;		Add logic to check for secondary requests (bugcheck and
+;		error log) to primary interrupt handler.  Add routine to
+;		allow secondary to request bugchecks:  MPS$SECBUGCHK.
+;
+;	V02-010	KDM0015		Kathleen D. Morse	29-Jun-1981
+;		Add routine to clear out all error bits in all MA780's
+;		registers.
+;
+;	V02-009	KDM0013		Kathleen D. Morse	08-Jun-1981
+;		Clean up holes in bugcheck logic.  Conditionalize whether
+;		primary requests bugcheck from secondary and whether
+;		secondary does a SVPCTX.
+;
+;	V02-008	KDM0012		Kathleen D. Morse	08-Jun-1981
+;		Add check for powerfail during primary's loop waiting
+;		for an invalidate acknowledgement.
+;
+;	V02-007	KDM0006		Kathleen D. Morse	27-Mar-1981
+;		Add INIT and STOP states for secondary processor.
+;
+;	V02-006	KDM0005		Kathleen D. Morse	25-Mar-1981
+;		Use interlocked instructions to access MPS$GL_BUGCHECK
+;		so that cached values are not used.
+;
+;	V02-005	KDM0004		Kathleen D. Morse	26-Feb-1981
+;		Add code for bugcheck logic.
+;
+;	V02-004	KDM0003		Kathleen D. Morse	08-Dec-1980
+;		Only request secondary invalidates for system space
+;		addresses.  Process space addresses won't be used
+;		by the secondary and the primary at the same time.
+;
+;	V02-003	KDM0002		Kathleen D. Morse	08-Dec-1980
+;		Change reference to MMG$FREWSLE+^X71 to MMG$FRE_TRYSKIP.
+;
+;	V02-002	KDM0001		Kathleen D. Morse	04-Sep-1980
+;		Replace copyright.
+;
+; 01	- 
+;--
+	.PAGE
+	.SBTTL	DEFINITIONS
+;
+; INCLUDE FILES:
+;
+
+;
+; MACROS:
+;
+
+;
+; EQUATED SYMBOLS:
+;
+	$BUGDEF				; Bugcheck indicator bit definitions
+	$EMBDEF				; Error log message buffer definitions
+	$IPLDEF				; Interrupt priority levels
+	$LCKDEF				; Interlock bit definitons
+	$MPMDEF				; Multiport memory registers
+	$MPSDEF				; Secondary processor state definitions
+	$PCBDEF				; Define PCB offsets
+	$PHDDEF				; Define process header offsets
+	$PRDEF				; Define processor registers
+	$PTEDEF				; Define page table entry format
+	$RPBDEF				; Define reboot parameter block
+	$VADEF				; Virtual address definition
+
+MAX_PORTS = 4				; Maximum number of ports
+
+;
+; OWN STORAGE:
+;
+	.PSECT	AEXENONPAGED,LONG	;
+	.PAGE
+	.SBTTL	MPS$MAINIT - INITIALIZE MULTI-PORT MEMORY ADAPTER
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is called at system initialization and after a power
+; recovery restart to initialize the port adapter by clearing any
+; errors and enabling all interrupts.
+;
+;
+; OUPUTS:
+;
+;	Any errors in port are cleared and all interrupts are enabled.
+;
+;--
+MPS$MAINIT::				;
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save registers
+ 	MOVL	W^MPS$AL_MPMBASE,R4	; Get base of MPM registers
+	MOVL	#MPM$M_CSR_PU,-		; Clear any power-up status
+		MPM$L_CSR(R4)		;
+	MOVL	#MPM$M_CR_ERRS!-	; Clear any port errors and
+		MPM$M_CR_MIE,-		; Enable master interrupt
+		MPM$L_CR(R4)		;  
+	MOVL	#MPM$M_SR_SS!-		; Clear any status errors and
+		MPM$M_SR_IDL!-		;  disable error interrupts
+		MPM$M_SR_IT!-		;
+		MPM$M_SR_AGP!-		;
+		MPM$M_SR_MXF!-		;
+		MPM$M_SR_ACA,-		;
+		MPM$L_SR(R4)		;
+	MOVL	MPM$L_INV(R4),R0	; Get invalidation register
+	BICL	#^C<MPM$M_INV_STADR>,R0	; Clear all but starting address
+	ASSUME	MPM$V_INV_ID EQ 0	; Cached nexus id's start at 0
+	BISL3	#1@0,R0,MPM$L_INV(R4)	; Set cpu (nexus 0) as cached
+	MOVL	#MPM$M_ERR_ELR!-	; Clear any errors
+		MPM$M_ERR_IMP,-		;
+		MPM$L_ERR(R4)		;
+	MOVL	#MPM$M_CSR1_MIA,-	; Clear any error
+		MPM$L_CSR1(R4)		;
+	CLRL	MPM$L_MR(R4)		; Clear any diagnostic settings
+	MOVL	MPM$L_CSR(R4),R0	; Get CSR register
+	EXTZV	#MPM$V_CSR_PORT,-	; Get port number
+		#MPM$S_CSR_PORT,R0,R0	;
+	MULL	#MAX_PORTS,R0		; Compute interrupt enable bit #
+	ADDL	#MPM$V_IIE_CTL,R0	; ...
+	ASHL	R0,#^XF,MPM$L_IIE(R4)	; Enable interport interrupts
+					;  from all ports
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore registers
+	RSB				; Return
+
+	.PAGE
+	.SBTTL	MPS$INTPRIM - INTERRUPT PRIMARY PROCESSOR
+;++
+; FUNTIONAL DESCRIPTION:
+;
+; MPS$INTPRIM is called to cause an interrupt to the primary processor.
+;
+; CALLING SEQUENCE:
+;
+;	BSB/JSB	MPS$INTPRIM
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;--
+
+MPS$INTPRIM::				;
+	MOVL	W^MPS$GL_PRIMSKT,@W^MPS$GL_MPMIIR ; Trigger primary interrupt
+	RSB				; And return
+
+	.PAGE
+	.SBTTL	MPS$INTSCND - INTERRUPT SECONDARY PROCESSOR
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+; MPS$INTSCND is called to interrupt the secondary processor.
+;
+; CALLING SEQUENCE:
+;
+;	BSB/JSB	MPS$INTSCND
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;--
+
+MPS$INTSCND::				;
+	MOVL	W^MPS$GL_SCNDMSKT,@W^MPS$GL_MPMIIR ; Trigger secondary interrupt
+	RSB				; And return
+
+	.PAGE
+	.SBTTL	MPS$PINTSR - PRIMARY PROCESSOR INTERRUPT SERVICE ROUTINE
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+; MPS$PINTSR is entered via the interrupt vector for the MA780 in
+; the primary processor in response to a call to MPS$INTPRIM.
+;
+;--
+
+	.ALIGN	LONG
+MPS$PINTSR::				; Primary interrupt service routine
+	BBCCI	#MPS$V_SECBUGCHK,W^MPS$GL_SECREQFLG,10$ ; Br if no bugchk to do
+	.LIST	MEB
+	BUG_CHECK MPBADMCK,FATAL	; Jump to bugcheck code
+MPS$GW_BUGCHKCOD == .-2			; Location for secondary to place the
+					;  type of bugcheck it is requesting
+	.NLIST	MEB
+10$:	BBCCI	#MPS$V_SECERRLOG,W^MPS$GL_SECREQFLG,40$ ; Br if no errlog to do
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save registers
+	MOVZWL	W^MPS$AL_ERLBUFADR+EMB$W_SIZE,R1 ; Find size of error log entry
+	SUBL3	#EMB$C_HD_LENGTH,R1,R5	; Remember size of entry to move in
+	JSB	G^ERL$ALLOCEMB		; Allocate an error log buffer
+	BLBC	R0,15$			; Br if none available
+	MOVL	W^MPS$AL_ERLBUFADR+EMB$L_HD_SID,- ; Set system ID
+		EMB$L_HD_SID(R2)	; in error message
+	MOVW	W^MPS$AL_ERLBUFADR+EMB$W_HD_ENTRY,- ; Set message type
+		EMB$W_HD_ENTRY(R2)	; in error message
+	PUSHL	R2			; Remember address of buffer
+	MOVC3	R5,W^MPS$AL_ERLBUFADR+EMB$C_HD_LENGTH,-
+		EMB$C_HD_LENGTH(R2)	; Move msg into buf
+	POPL	R2			; Restore buffer address
+	JSB	G^ERL$RELEASEMB		; Release the error log buffer
+15$:	BBCCI	#MPS$V_ERLBUFBSY,W^MPS$GL_ERLBUFIND,20$ ; Mark err log buf avail
+20$:	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore registers
+40$:	PUSHL	R0			; Save R0
+ 	MOVL	W^MPS$AL_MPMBASE,R0	; Get base of MPM registers
+	MOVL	W^MPS$GL_PRIMSKC,MPM$L_IIR(R0)	; Clear pending interrupt
+	SOFTINT	#5			; Request IPL 5 interrupt
+	POPL	R0			; Restore R0
+	REI				; And return
+
+	.PAGE
+	.SBTTL	MPS$SINTSR - SECONDARY INTERRUPT SERVICE ROUTINE
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+; MPS$SINTSR is entered in response to an interrupt on the secondary
+; processor.  The interrupt was sent for one of the following reasons:
+;
+;	1) An AST was sent to the process currently
+;	   running on the secondary
+;	   (Primary processor is executing QAST.)
+;
+;	2) A system space address was invalidated by
+;	   the primary processor
+;	   (Primary processor is executing FREWSL or PAGEFAULT.)
+;
+;	3) The primary wants to bugcheck.
+;
+; The secondary processor, not knowing which reason the interrupt
+; was sent, does the appropriate work to handle all the reasons.
+; (Since the code is small, there is no need to figure out the real
+; reason for the interrupt.)  The following list corresponds to the
+; work done to handle the above conditions causing an interrupt:
+;
+;	1) The ASTLVL for the process currently running
+;	   on the secondary is updated
+;
+;	2) An invalidate is done for the system space
+;	   address indicated by MPS$GL_INVALID
+;
+;	3) First, fold up the current process.
+;	   Second, load the loop address into the RPB.
+;	   Third, acknowlege the bugcheck request.
+;	   Fourth, halt to turn off mapping.  Execution continues
+;	   if restart is enabled, by the console program executing
+;	   RESTAR.CMD.
+;--
+
+	.ALIGN	LONG
+MPS$SINTSR::				; Secondary interrupt service routine
+	BBSSI	#LCK$V_INTERLOCK,W^MPS$GL_INTERLOCK,5$ ; Flush cache queue
+5$:	BBS	#BUG$V_BUGCHK,W^MPS$GL_BUGCHECK,10$ ; Br if bugcheck requested
+	BBS	#MPS$V_STOPREQ,W^MPS$GL_STOPFLAG,50$ ; Br if STOP/CPU requested
+	PUSHL	R0			; Save R0
+ 	MOVL	W^MPS$AL_MPMBASE,R0	; Get base of MPM registers
+	MOVL	W^MPS$GL_SCNDMSKC,MPM$L_IIR(R0); Clear pending interrupt
+;
+; Update the ASTLVL for the process currently running on the secondary.
+;
+	MOVL	W^MPS$GL_CURPCB,R0	; Get current PCB address
+	MOVL	PCB$L_PHD(R0),R0	; Get PHD address
+	MOVB	PHD$B_ASTLVL(R0),R0	; And fetch ASTLVL
+	MTPR	R0,#PR$_ASTLVL		; Update current value
+;
+; Invalidate the system space address that is contained in MPS$GL_INVALID.
+;
+	INVALID	W^MPS$GL_INVALID	; Invalidate requested page
+	CLRL	W^MPS$GL_INVALID	; And acknowledge it
+	POPL	R0			; Restore R0
+	REI				; And continue
+
+;
+; Primary processor has requested a bugcheck.  The secondary must fold
+; up the process it is running and loop quietly in a safe place out of
+; the way of the primary.
+;
+10$:	BBSSI	#LCK$V_INTERLOCK,W^MPS$GL_INTERLOCK,20$ ; Flush cache queue
+20$:	CMPL	W^MPS$GL_STATE,#MPS$K_EXECSTATE ; Was LDPCTX done?
+	BNEQ	30$			; Br if not done, don't do SVPCTX
+	SVPCTX				; Save state of current process
+30$:	MOVL	G^EXE$GL_RPB,R0		; Get address of RPB
+	ADDL3	#RPB$B_WAIT,RPB$L_BASE(R0),RPB$L_BUGCHK(R0) ; Load loop adr
+	MOVL	#MPS$K_STOPSTATE,W^MPS$GL_STATE ; Indicate processor not active
+	BBSSI	#BUG$V_ACK1,W^MPS$GL_BUGCHECK,40$ ; Acknowlege bugcheck request
+40$:	HALT				; This halt causes the secondary to
+					; start executing RESTAR.CMD on the
+					; console device if restart is enabled.
+;
+; A STOP/CPU was issued.  The secondary must return its current process,
+; if any, load a wait loop into the RPB, and halt.
+;
+50$:	BBSSI	#LCK$V_INTERLOCK,W^MPS$GL_INTERLOCK,60$ ; Flush cache queue
+60$:	CMPL	W^MPS$GL_STATE,#MPS$K_EXECSTATE ; Is there a current process?
+	BNEQ	70$			; Br if no current state to save
+	SVPCTX				; Save state of current process
+	MOVL	#MPS$K_DROPSTATE,W^MPS$GL_STATE ; Primary must take process back
+70$:	MOVL	G^EXE$GL_RPB,R0		; Get address of RPB
+	ADDL3	#RPB$B_WAIT,RPB$L_BASE(R0),RPB$L_BUGCHK(R0) ; Load loop adr
+	CLRL	W^MPS$GL_INVALID	; Indicate no invalidate to wait on
+	BBSSI	#MPS$V_STOPACK1,W^MPS$GL_STOPFLAG,80$ ; Acknowlege STOP request
+80$:	HALT				; Stop the secondary
+	.PAGE
+	.SBTTL	MPS$INVALID - Relay invalidate request to secondary
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+; MPS$INVALID relays a translation buffer invalidate request to
+; the secondary processor and waits for acknowledgement before
+; proceeding.  Since P0 pages are only referenced by the processor
+; currently executing a process, only system pages need to be
+; invalidated by both the primary and secondary processors at
+; the same time.
+;
+; This code is hooked into the pagefault exception handling code.
+;
+;--
+
+MPS$INVALID::				;
+	BICB	#<PTE$M_VALID!PTE$M_MODIFY>@-24,3(R3); Clear valid and modify
+					; (Replaced instruction)
+	INVALID	R2			; Invalidate for primary processor
+	BBC	#VA$V_SYSTEM,R2,20$	; Only invalidate for system space
+	ASSUME	MPS$K_STOPSTATE GT MPS$K_INITSTATE
+	BBSSI	#LCK$V_INTERLOCK,W^MPS$GL_INTERLOCK,5$ ; Flush cache queue
+5$:	CMPL	W^MPS$GL_STATE,#MPS$K_INITSTATE ; Secondary active?
+	BGEQ	20$			; Br if no, secondary not responding
+	MOVL	R2,W^MPS$GL_INVALID	; Set address to invalidate
+
+	.IF	DF,MPPFMSWT
+	INCL	W^PFM$L_CNT_INVAL	; Add one to perf meas invalidate ctr
+	.ENDC
+
+	BSBW	MPS$INTSCND		; Interrupt secondary processor
+10$:	BBSSI	#LCK$V_INTERLOCK,W^MPS$GL_INTERLOCK,15$ ; Flush cache queue
+15$:	TSTL	W^MPS$GL_PFAILTIM	; Has secondary powerfailed?
+	BNEQ	20$			; Br if yes, don't wait for him
+
+	.IF	DF,MPPFMSWT
+	INCL	W^PFM$L_CNT_IWAIT	; Inc perf meas invalidate loop counter
+	.ENDC
+
+	TSTL	W^MPS$GL_INVALID	; Acknowledged yet?
+	BNEQ	10$			; No, continue waiting
+20$:	JMP	G^MMG$FRE_TRYSKIP	; Continue with page fault
+	.PAGE
+	.SBTTL	MPS$BUGCHECK - Relay bugcheck request to secondary and wait
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+; MPS$BUGCHECK makes sure that the secondary is out of the way before
+; the primary procedes with the bugcheck logic.  It sets a flag to
+; indicate a bugcheck is requested.  Then interrupts the secondary to
+; make it notice the flag.  The primary then waits for the secondary
+; to acknowlege the bugcheck request.
+;
+; ENVIRONMENT:
+;
+;	Executed by the primary processor.
+;	IPL = 31
+;
+;--
+
+MPS$BUGCHECK::				;
+	BBSSI	#BUG$V_BUGCHK,W^MPS$GL_BUGCHECK,10$ ; Indicate bugcheck request
+	ASSUME	MPS$K_STOPSTATE GT MPS$K_INITSTATE
+10$:	CMPL	W^MPS$GL_STATE,#MPS$K_INITSTATE ; Is secondary active?
+	BGEQ	50$			; Br on not active, don't request bugchk
+	BBSSI	#BUG$V_BUGCHK,W^MPS$GL_BUGCHECK,20$ ; Indicate bugcheck request
+20$:	BSBW	W^MPS$INTSCND		; Interrupt secondary to notice request
+	MOVL	#15000000,R0		; Wait a significant amount of time
+30$:	BBCCI	#BUG$V_ACK1,W^MPS$GL_BUGCHECK,40$ ; Wait for secondary acknowlege
+	BRB	50$			; Secondary done, continue with bugchk
+40$:	SOBGEQ	R0,30$			; Repeat as secondary not acknowleged
+50$:	JMP	@#EXE$INIBOOTADP	; Continue with normal bugcheck code
+	.PAGE
+	.SBTTL	MPS$SECBUGCHK - Relay secondary's bugcheck request to primary
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+; MPS$SECBUGCHK is executed when the secondary processor wants to initiate
+; a bugcheck.   It sets a flag indicating a bugcheck is requested and
+; interrupts the primary to make it notice the flag.  The secondary then
+; waits for the primary to interrupt it with the actual bugcheck request
+; by executing a self-branch.
+;
+; INPUTS:
+;
+;	The return address pushed on the stack by calling this routine
+;	is the address of the bugcheck code being requested.
+;
+; OUTPUTS:
+;
+;	None
+;
+; ENVIRONMENT:
+;
+;	Executed by the secondary processor.
+;
+;--
+
+MPS$SECBUGCHK::				;
+	MOVW	@(SP),W^MPS$GW_BUGCHKCOD ; Set type of bugcheck requested
+	MOVL	G^EXE$GL_RPB,R0		; Get address of RPB
+	ADDL3	#RPB$B_WAIT,RPB$L_BASE(R0),RPB$L_BUGCHK(R0) ; Load loop adr
+	SETIPL	#IPL$_SYNCH		; Lower IPL, enabling inter-proc intrpt
+	BBSSI	#MPS$V_SECBUGCHK,W^MPS$GL_SECREQFLG,10$ ; Set request flag
+10$:	BSBW	W^MPS$INTPRIM		; Interrupt primary processor
+	BBSSI	#LCK$V_INTERLOCK,W^MPS$GL_INTERLOCK,20$ ; Flush cache queue
+20$:	CMPL	W^MPS$GL_STATE,#MPS$K_INITSTATE ; Secondary active?
+	BGEQ	40$			; Br if not active
+30$:	BRB	30$			; Wait for interrupt from primary to
+					;  handle the bugcheck
+40$:	HALT				; This halt causes the secondary to
+					; start executing RESTAR.CMD on the
+					; console device if restart is enabled.
+
+	.END

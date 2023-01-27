@@ -1,0 +1,758 @@
+	$BEGIN	RM0SETDID,001,F$RMSOPEN0,<SET DID FROM DIRECTORY NAME>
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; Facility: rms32
+;
+; Abstract:
+;	this module includes various routines to
+;	obtain the did of a given directory spec.
+;
+;
+; Environment:
+;		star processor running starlet exec.
+;
+; Author: l f laverdure,	 creation date: 11-march-77
+;
+; Modified By:
+;
+;	V03-001	RAS0086		Ron Schaefer	 8-Apr-1982
+;		Zero-out FIB$W_VERLIMIT after directory access to
+;		correctly propagate version limits.
+;
+;	V02-008	RAS0068		Ron Schaefer	16-Feb-1982
+;		Correct spurious error code caused be wildcard directories
+;		appearing in calls to SETDID.
+;
+;	V02-007	RAS0040		Ron Schaefer	18-Oct-1981
+;		Implement rooted directories for concealed devices.
+;
+;	V006	REFORMAT	P S Knibbe	23-Jul-1980
+;
+;	V005	RAS0010		Ron Schaefer	07-JAN-1980
+;		complete the v004 code by checking for null fids and dids.
+;
+;	V004	RAS0009		Ron Schaefer	20-DEC-1979
+;		check for invalid directory rename operation by
+;		comparing each did in the search tree with the
+;		source file's fid.
+;
+;	V003	TMH0003		Tim Halvorsen	13-NOV-1979
+;		do not allow wildcard directory names to be
+;		sent to the acp.  this prohibits open or create
+;		to use wildcard directory names.
+;
+;	V002	TMH0002		Tim Halvorsen	18-SEP-1979
+;		this module was extracted from rm0filfnc.
+;		zeroed wcc before calling acp.
+;--
+;
+
+
+	.SBTTL	DECLARATIONS
+
+;
+; Macros:
+;
+
+	$UCBDEF
+	$DRCDEF
+	$FABDEF
+	$FWADEF
+	$IFBDEF
+	$NAMDEF
+	$FIBDEF
+	$QIODEF
+	$DEVDEF
+
+;
+; Equated Symbols:
+;
+
+	FOP=FAB$L_FOP*8			; bit offset to fop
+	MFD_FILE_ID	= <4@16>+4	; master file directory file id
+
+;
+; Own Storage:
+;
+
+DIR_SUFFIX:
+	.ASCII	/.DIR;1/		; constant suffix for directory files
+
+
+	.SBTTL	RM$SETDID - ROUTINE TO SET DIRECTORY FILE ID
+
+;++
+; RM$SETDID  - Set directory ID
+;
+; the rm$setdid routine's function is to initialize the
+; directory id field of the fib by setting it to the file id
+; of the (lowest level) directory file.  it accomplishes this
+; by performing the following operations:
+;
+;	1.  assumes the fib buffer descriptor is initialized.
+;	2.  utilities the file id or directory id value from the
+;	    user's nam block if specified and if non-zero.
+;	    if found, returns to caller with fib fid or did filled in.
+;	3.  otherwise, constructs the directory filename
+;	    based on the directory spec format
+;		- if [grp,mbr] prefixes from 0 to 2 zeroes
+;		  to each of the grp and mbr octal values
+;		  to give a 6-character file name, e.g.,
+;		  [1,20] gives 001020
+;		- if [directory-name] format uses the name as given
+;	4.  searches the directory cache for the specified device and directory
+;	    entries.
+;	5.  if any entry not found, a new entry is made by looking up the directory.
+;	    in order to do the lookup, the code appends the fixed type and version
+;	    of '.dir;1' to the filename and issues a qio to lookup the file id
+;	    in the master file directory or lower level directory.
+;	6.  the returned file id is copied to the directory id field of the fib
+;	7.  the file id field of the fib is zeroed.
+;
+; Calling sequence:
+;
+;	bsbw	rm$setdid
+;
+; Input Parameters:
+;
+;	r11	impure area address
+;	r10	fwa address
+;	r9	ifab address
+;	r8	fab address
+;
+; Implicit Inputs:
+;
+;	nam$w_did	-  directory id to use else zero
+;	ifb$l_chnl	-  channel # for qio
+;	ifb$l_prim_dev	-  device characteristics
+;	fwa$v_grpmbr	-  flag for [group, member] format
+;	fwa$q_dir1, etc.	- directory spec element descriptors
+;	fwa$q_dir+4	-  address of scratch buffer
+;	fwa$t_fibbuf	-  must be zero
+;	the directory cache
+;
+; Output Parameters:
+;
+;	r0	status code
+;	r1-r7,ap destroyed
+;
+; Implicit Outputs:
+;
+;	fwa$q_fib	-  descriptor initialized
+;	fwa$t_fibbuf+fib$w_did	-  directory file id initialized
+;	fwa$t_fibbuf+fib$w_fid	-  set from nam$w_fid
+;	ifb$l_ios	-  set to i/o status
+;	fab$l_stv	-  set to system error code on error
+;	the directory cache is updated.
+;
+; Completion Codes:
+;
+;	standard rms, in particular, suc, dnf and idr.
+;
+; Side Effects:
+;
+;	may have switched to running at ast level.
+;	all user structures except fab must be re-probed.
+;
+;--
+
+
+RM$SETDID::
+	$TSTPT	SETDID
+
+;
+; check if we really need to go through this code
+;
+
+	BBC	#DEV$V_DIR,-		; branch if no directory
+		IFB$L_PRIM_DEV(R9),-
+		SUCCESS
+	MOVL	FAB$L_NAM(R8),R7	; get nam block
+	BEQL	CHKMT			; branch if none
+	BSBW	RM$CHKNAMBLK		; verify nam (returns only if o.k.)
+
+;
+; try to get file id from nam block
+;
+
+	BBC	#FAB$V_NAM+FOP,-
+		(R8),CHKMT		; branch if not doing nam blk open
+	MOVL	NAM$W_FID(R7),-		; get file-id
+		FIB$W_FID+FWA$T_FIBBUF(R10)
+	BEQL	10$			; branch if none
+	MOVW	NAM$W_FID_RVN(R7),-	; copy relative vol number too
+		FIB$W_FID_RVN+FWA$T_FIBBUF(R10)
+	BRB	SUCCESS			; all done
+
+;
+;  try to get directory id from nam block
+;
+
+10$:	MOVW	NAM$W_DID(R7),-		; pick up directory id from nam blk
+		FIB$W_DID_NUM+FWA$T_FIBBUF(R10)
+	BEQL	CHKMT			; branch if not specified
+
+	ASSUME	FIB$W_DID_RVN EQ FIB$W_DID_SEQ+2
+
+	MOVL	NAM$W_DID_SEQ(R7),-
+		FIB$W_DID_SEQ+FWA$T_FIBBUF(R10)	; move the rest of the did
+SUCCESS:
+	RMSSUC
+	RSB
+
+;
+;  set mfd did for magtape and exit
+;
+
+SET_MT_MFD:
+	BSBB	SETMFD
+	BRB	SUCCESS
+
+;
+;  subroutine to set the mfd directory id into the fib
+;
+
+SETMFD:	ASSUME	FIB$W_DID_SEQ EQ FIB$W_DID_NUM+2
+
+	MOVL	FWA$T_MFD_FID(R10),-	; set file id of mfd
+		FIB$W_DID_NUM+FWA$T_FIBBUF(R10)
+	MOVW	FWA$T_MFD_FID+4(R10),-	; from the rooted directory DID
+		FIB$W_DID_RVN+FWA$T_FIBBUF(R10)
+	RSB
+
+
+;++
+;
+; directory id wasn't in nam block.  get it from directory cache.
+;
+;  alternate entry if nam block not to be used for input (from rms$rename)
+;
+;--
+
+RM$SETDID_ALT::
+CHKMT:	BBS	#DEV$V_SQD,-
+		IFB$L_PRIM_DEV(R9),-
+		SET_MT_MFD		; branch if magtape
+
+;++
+;
+;  locate the device node for the device and unit in the directory cache
+;
+;--
+
+	MOVL	FWA$Q_DIR+4(R10),R3	; set addr of scratch buffer
+	BSBW	RM$GETDEVNAM		; fill in device name
+	MOVAW	UCB$W_DIRSEQ(R6),R7	; save ucb dirseq address here
+	MOVW	R4,(R3)			; append unit # in binary
+	MOVL	FWA$Q_DIR+4(R10),R4	; restore string start addr
+	ADDB2	#3,(R4)			; add in unit # size & count
+					;  field itself
+	MOVAL	@#PIO$GL_DIRCACHE,R5	; addr of device list head
+	BSBW	FIND_ENTRY		; go find this entry in cache
+	BEQL	10$			; branch if none found
+	CMPW	DRC$W_DIRSEQ(AP),(R7)	; cache entry still valid?
+	BEQL	20$			; branch if yes
+	MOVL	AP,R5			; get device node to correct reg
+	MOVL	AP,FWA$L_DEVNODADR(R10)	; save the device node address
+	BRW	PRUNE			; and go prune back branch
+
+;
+;  no entry for this device in the directory cache.  -  make one.
+;
+
+10$:	BSBW	GET_FREE		; go pick a free node
+	INSQUE	(AP),(R5)		; insert node at list head
+	MOVZBW	(R4),R0			; get length of device string
+	MOVC3	R0,(R4),DRC$T_NAME(AP)	; move the device string
+	MOVW	(R7),DRC$W_DIRSEQ(AP)	; save the dir seq. count
+20$:	MOVL	AP,FWA$L_DEVNODADR(R10)	; save the device node address
+
+
+;++
+;
+;  follow the directory cache entries for this directory spec.
+;  if any missing, do a lookup to supply the entry and restart scan from the top.
+;
+;--
+
+CLR_LOOKUP:
+	CLRL	FWA$L_LOOKUP(R10)	; say no lookup done
+
+;
+; If a root directory is defined, then locate the root directory string
+; before starting the (sub)directory lookups.  This is necessary since the
+; the UFD in this case is actually an SFD of the root directory.
+;
+
+FIRST_DIR:
+	MOVL	FWA$L_DEVNODADR(R10),AP	; reset device node address
+	BBC	#FWA$V_ROOT_DIR,-	; no root present
+		(R10),10$	
+	MOVAB	FWA$T_ROOT_DIR(R10),R4	; get addr of rootdir string
+	MOVAB	DRC$L_LVLFLNK(AP),R5	; get UFD-level directory cache addr
+	BSBW	FIND_ENTRY		; find the root directory
+	BEQL	NOT_FND			; not present, go look it up	
+10$:	MOVAQ	FWA$Q_DIR1(R10),R6	; get addr of 1st dir. discriptor
+
+;
+; construct directory name
+;
+
+BLDNAM:	SUBL3	#1,FWA$Q_DIR+4(R10),R3	; get addr for name scratch buffer
+	PUSHL	R3			; save buff start addr
+	BBS	#FWA$V_GRPMBR,(R10),10$	; branch if [grp,mbr] format
+
+;
+; directory name is in [name1.name2...] format
+; construct the current level directory name
+;
+
+	MOVL	(R6)+,R0		; get name length
+	ADDB3	#1,R0,(R3)+		; store length count in string
+	MOVC3	R0,@(R6)+,(R3)		; move to temporary buffer
+	BRB	20$			; go look up the file id
+
+;
+; directory name is in [grp,mbr] format.
+; build the directory name from the two values, prefixing
+; with leading zeroes if neccessary to get a 6-character name
+;
+
+10$:	MOVB	#7,(R3)+		; count of string to match
+	BSBW	PREFIX_0		; move group part
+	BSBW	PREFIX_0		; move member part
+
+;
+;  look up file in cache
+;
+
+20$:
+	POPR	#^M<R4>			; restore counted string addr
+	MOVAB	DRC$L_LVLFLNK(AP),R5	; addr of list hdr for nxt level
+	BSBW	FIND_ENTRY		; go find this (sub)directory entry
+	BNEQ	NXT_DIR			; next_dir if found
+
+;++
+;
+;  no entry for this (sub)directory in the cache.
+;  must lookup the file and make and entry.
+;  because a more priviliged mode could invalidate the cache while we stall
+;  (verrrry unlikely, but possible), must find our way back down to this level
+;  before actually adding the new entry.
+;
+;--
+
+NOT_FND:MOVL	FWA$L_LOOKUP(R10),AP	; get addr node for last lookup
+	BEQL	LOOKUP			; branch if none
+
+;
+;  this is the 2nd time thru.  lookup has already been done.  add the looked-up
+;  entry to the cache as long as it's still the one we want.
+;
+
+	CLRL	FWA$L_LOOKUP(R10)	; indicate no lookup node
+	MOVZBW	(R4),R0			; get length of string
+	CMPC3	R0,(R4),DRC$T_NAME(AP)	; is this the right entry?
+	BNEQ	FREE_UP			; branch if not
+	INSQUE	(AP),(R5)		; insert new node after header
+NXT_DIR:BRB	NEXT_DIR		; and continue
+
+FREE_UP:BSBW	ADD_TO_FREE		; return the node
+
+;
+;  must look up the file.  use the current cache node to set the did.
+;
+
+LOOKUP:	SUBL2	#DRC$L_LVLFLNK,R5	; back to start of current node
+	CMPL	R5,FWA$L_DEVNODADR(R10)	; is this the device node?
+	BNEQ	10$			; branch if not
+	BSBW	SETMFD			; go set mfd did
+	BRB	20$			; continue
+10$:	MOVL	DRC$W_DID(R5),-
+		FIB$W_DID+FWA$T_FIBBUF(R10); set the did from cur. node
+	MOVW	DRC$W_DID+4(R5),-
+		FIB$W_DID+4+FWA$T_FIBBUF(R10);  (ditto)
+
+;
+; append '.dir;1' to the directory name, determine
+; the total string length, and perform qio to get the file-id
+;
+
+20$:	MOVZBL	(R4),R3			; set size of dir name string
+	LOCC	#^A'*',R3,1(R4)		; '*' in file name?
+	BNEQ	ERRDIR			; do not allow wildcards here
+	LOCC	#^A'%',R3,1(R4)		; '%' in file name?
+	BNEQ	ERRDIR			; do not allow wildcards here
+	MOVC3	#6,DIR_SUFFIX,(R4)[R3]	; append fixed suffix
+	SUBL3	FWA$Q_DIR+4(R10),-
+		R3,-
+		FWA$Q_DIR(R10)		; compute name length
+	CLRL	FWA$T_FIBBUF+FIB$L_WCC(R10); wcc must be zero
+	CLRQ	-(SP)			; p5, p6 zero
+	CLRQ	-(SP)			; p3, p4 zero
+	PUSHAQ	FWA$Q_DIR(R10)		; p2 = directory name descriptor
+	MOVZBL	S^#IO$_ACCESS,R0	; qio function code
+	BSBW	RM$FCPFNC		; issue the fcp function 
+	BLBC	R0,ERRDNF		; get out on error
+
+;
+; directory look up succeeded.
+; move the directory file id to the new directory cache node
+;
+
+	BSBW	GET_FREE		; go pick a free node
+	MOVL	AP,FWA$L_LOOKUP(R10)	; save addr of lookup node
+	MOVC3	#6,-
+		FIB$W_FID+FWA$T_FIBBUF(R10),-
+		DRC$W_DID(AP)		; save the directory fid
+	SUBL3	#1,FWA$Q_DIR+4(R10),R3	; get save string addr
+	MOVZBW	(R3),R0			; get string len
+	MOVC3	R0,(R3),DRC$T_NAME(AP)	; save string in dir node
+	BRW	FIRST_DIR		; branch to top to come down
+					; tree again and find this node
+
+;
+;  return error if wildcards got this far
+;
+ERRDIR:	RMSERR	DIR			; return error in directory
+	RSB
+
+
+;++
+;
+;  found this directory entry o.k.  -  see if more to find
+;
+;--
+
+NEXT_DIR:
+	BBS	#FWA$V_GRPMBR,(R10),EXIT; branch if dir list
+
+;
+; pick up the next sub-directory name if any more to go
+;
+
+	TSTL	(R6)			; zero directory length?
+	BEQL	EXIT			; branch if yes (all done)
+	PUSHAQ	FWA$Q_DIR1+<8*FWA$C_MAXSUBDIR>(R10); get lowest level sub directory
+					;  descriptor addr
+	CMPL	R6,(SP)+		; past it already?
+	BGTRU	EXIT			; branch if yes (all done)
+	BRW	BLDNAM			; keep going with next level
+
+;++
+;
+;  have found all needed nodes.  check if directory sequence count still valid.
+;
+;--
+
+EXIT:	MOVL	AP,R6			; save addr of dir node
+	MOVL	FWA$L_LOOKUP(R10),AP	; unused lookup node?
+	BEQL	10$			; branch if not
+	BSBW	ADD_TO_FREE		; return it to the free list
+10$:	BSBB	CHKDIRSEQ		; cache still valid?
+	BNEQ	PRUNE			; branch if not
+
+;++
+;
+;  all set.  just set the did in the fib and clear the fid and 
+;  version limit.
+;
+;--
+
+	MOVC3	#6,DRC$W_DID(R6),-
+		FIB$W_DID+FWA$T_FIBBUF(R10); set the directory id
+	CLRL	FIB$W_FID+FWA$T_FIBBUF(R10); zero the file id
+	CLRW	FIB$W_VERLIMIT+FWA$T_FIBBUF(R10); zero the version limit
+	INCL	R0			; show success (r0 = 0 from movc3)
+	RSB				; back to caller of rm$setdid
+
+
+;++
+;
+;  have run into an invalid cache condition, i.e., something was done
+;  by the acp (e.g., mount) to invalidate the cache contents.
+;  remove all entries below the device, reset dirseq, and try again.
+;
+;--
+
+PRUNE:	$PSECT_BR	L$RMS0
+	ADDL2	#DRC$L_LVLFLNK,R5	; get address of ufd header
+	MOVL	R5,R4			; set stop address
+	CMPL	(R5),R5			; anything to prune?
+	BEQL	30$			; branch if not
+10$:	PUSHL	R5			; save header addr
+	MOVL	(R5),AP			; get next level down
+15$:	MOVAL	DRC$L_LVLFLNK(AP),R5	; get addr of level link
+	CMPL	(R5),R5			; another level?
+	BNEQ	10$			; branch if yes
+
+;
+;  at lowest level  -  remove this node and move to side node
+;
+
+20$:	PUSHL	(AP)			; save next node addr
+	REMQUE	(AP),AP			; remove node
+	BSBW	ADD_TO_FREE		; add it to the free list
+	MOVL	(SP)+,AP		; get next node addr
+	CMPL	AP,(SP)			; back to previous level?
+	BNEQ	15$			; branch if not
+	SUBL2	#DRC$L_LVLFLNK,AP	; get node start address
+	CMPL	(SP)+,R4		; back to dev node?
+	BNEQ	20$			; branch if not
+
+;
+;  store new dirseq value and rebuild tree for this device
+;
+
+30$:	MOVW	(R7),DRC$W_DIRSEQ-DRC$L_LVLFLNK(R4)
+	BRW	CLR_LOOKUP
+	$PSECT_RESTORE
+
+
+;++
+;
+;  handle directory not found error.
+;
+;--
+
+ERRDNF:	$PSECT_BR	L$RMS0
+	BSBW	CHKDIRSEQ		; error due to invalid cache?
+	BEQL	5$			; branch if not
+	BRW	PRUNE			; possibly - go try again
+5$:	CMPW	R0,#SS$_NOSUCHFILE	; was error file not found?
+	BNEQ	10$			; branch if not
+	MOVL	R0,FAB$L_STV(R8)	; save system code
+	RMSERR	DNF			; replace with directory not found
+	RSB				; and return
+10$:	RMSERR	DNF,R1			; default error to directory not found
+	BRW	RM$MAPERR		; map error to rms & return
+	$PSECT_RESTORE
+
+;++
+;
+;  handle bad directory rename error.
+;
+;--
+
+ERRIDR:	$PSECT_BR	L$RMS0
+	POPR	#^M<R0>			; discard local ret addr
+	RMSERR	IDR			; set bad directory rename
+	RSB				; and return
+	$PSECT_RESTORE
+
+;++
+;
+;  chkdirseq subroutine to verify cache validity
+;
+;  inputs:
+;		r10	fwa address
+;		r7	ucb$w_dirseq address
+;		fwa$l_devnodadr
+;
+;  outputs:
+;		r5	fwa$l_devnodadr
+;		z-bit	set if cache valid, else clear
+;--
+
+CHKDIRSEQ:
+	MOVL	FWA$L_DEVNODADR(R10),R5	; get device node address
+	CMPW	DRC$W_DIRSEQ(R5),(R7)	; still valid?
+	RSB
+
+
+;++
+;
+;  find_entry subroutine to find an entry in the directory cache
+;
+;  inputs:
+;		r4	address of counted string to match
+;		r5	address of list head for level to scan
+;
+;  outputs:
+;		z-bit	set if no match found, else clear
+;		ap	address of matching entry
+;		r0-r3	destroyed
+;
+;  note: if match found, matching entry is requeued to immediately follow list head.
+;
+;--
+
+FIND_ENTRY:
+	MOVL	R5,AP			; set up to find 1st node
+10$:	MOVL	DRC$L_NXTFLNK(AP),AP	; get next node
+	CMPL	AP,R5			; back at head?
+	BEQL	20$			; branch if yes (no match)
+	MOVZBW	(R4),R0			; get len of string to match
+	CMPC3	R0,(R4),DRC$T_NAME(AP)	; do they match?
+	BNEQ	10$			; branch if not
+
+;
+;  matching entry found  -  requeue entry to head of the list
+;
+
+	REMQUE	(AP),AP
+	INSQUE	(AP),(R5)
+
+;
+; check if the saved fid is the same as this directory id.
+; true iff both fid and did are valid file identification fields.
+;
+
+	BISW3	FWA$T_RNM_FID(R10),-	; is this a valid fid?
+		FWA$T_RNM_FID+4(R10),R0	; not if 1st and 3rd words are 0
+	BEQL	15$
+	BISW3	DRC$W_DID(AP),-
+		DRC$W_DID+4(AP),-
+		R0			; likewise for did
+	BEQL	15$
+	CMPC3	#6,FWA$T_RNM_FID(R10),-	; is directory same as file?
+		DRC$W_DID(AP)
+	BEQL	ERRIDR			; bad operation if so
+15$:	TSTL	AP			; clear z-bit
+20$:	RSB
+
+
+;++
+;
+;  get_free subroutine to find a free node.
+;  picks node from free list, if any, else picks least recently used dir entry
+;  on least recently used device.
+;
+;  inputs:
+;		none
+;
+;  outputs:
+;		ap	addr of node
+;		r0	destroyed
+;--
+
+GET_FREE:
+	MOVAL	@#PIO$GL_DIRCFRLH,R0	; get free list addr
+	MOVL	(R0),AP			; pick first node
+	BEQL	10$			; branch if none
+	MOVL	(AP),(R0)		; bring up next free node
+	RSB
+
+;
+;  nothing on free list.  check that it has been initialized.
+;
+
+10$:	MOVL	B^PIO$GL_DIRCACHE+4-PIO$GL_DIRCFRLH(R0),AP
+
+;
+; get lru device node
+;
+
+	CMPL	AP,(AP)			; empty list?
+	BNEQ	30$			; branch if not
+
+;
+;  initialize free directory nodes list
+;
+
+	MOVL	R0,AP			; set up to init free node list head
+	MOVAL	PIO$GL_FMLH+<2*512>-PIO$GL_DIRCFRLH(R0),R0
+
+;
+; get addr of directory cache page
+;
+
+	PUSHL	#<512/DRC$C_BLN>	; set # of nodes per page
+15$:	MOVL	R0,(AP)			; set flink of previous node
+	MOVL	R0,AP			; save addr this flink for next node
+	ASSUME	DRC$L_LVLFLNK EQ 8
+	CLRQ	(R0)+			; move to level list head
+	MOVL	R0,(R0)			; init list to empty (flink)
+	MOVL	R0,4(R0)		; 	"	     (blink)
+	ADDL2	#DRC$C_BLN-DRC$L_LVLFLNK,R0; move to next node
+	SOBGTR	(SP),15$		; loop if more
+	POPR	#^M<R0>			; clean stack
+	BRB	GET_FREE		; and try again
+
+;
+;  pick relatively little used node
+;
+
+20$:	MOVL	DRC$L_LVLBLNK(AP),AP	; get lru (sub)directory
+30$:	MOVAL	DRC$L_LVLFLNK(AP),R0	; get next level list head
+	CMPL	(R0),R0			; list empty?
+	BNEQ	20$			; branch if not
+	REMQUE	(AP),AP			; pick the node
+	RSB
+
+;++
+;
+;  add_to_free subroutine to return a node to the free list.
+;
+;  inputs:
+;		ap	node address
+;
+;  outputs:
+;		r0	destroyed
+;--
+
+ADD_TO_FREE:
+	MOVAL	@#PIO$GL_DIRCFRLH,R0	; get free list head addr
+	MOVL	(R0),(AP)		; flink to new node
+	MOVL	AP,(R0)			; new node addr to list head
+	RSB
+
+
+;++
+;
+; subroutine prefix_0 to move either the group or
+; member part of a directory spec prefixing it
+; with one or two zeros to give 3 characters total
+;
+; inputs:
+;
+;	r6	addr of descriptor for group of member part
+;	r3	addr of output buffer
+;
+; outputs:
+;
+;	r6	r6+8
+;	r3	r3+3
+;	r0,r1,r2,r4,r5	destroyed
+;
+;--
+
+RM$PREFIX_0::
+					; provide global entry for rm$knownfile
+PREFIX_0:
+					; local symbol
+	MOVL	(R6)+,R0		; get length
+	CMPL	R0,#3			; all 3 chars present?
+	BEQL	20$			; branch if yes
+	CMPL	R0,#2			; 2 of the 3?
+	BEQL	10$			; branch if yes
+	MOVB	#^A/0/,(R3)+		; move a zero
+10$:	MOVB	#^A/0/,(R3)+		; move a zero
+20$:	MOVC3	R0,@(R6)+,(R3)		; move the grp or mbr number
+	RSB
+
+	.END

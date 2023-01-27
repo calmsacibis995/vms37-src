@@ -1,0 +1,272 @@
+MODULE DELFIL (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This module deletes a file, returning its blocks to the storage map
+!	and releasing the file header.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  4-Apr-1977  15:50
+!
+! MODIFIED BY:
+!
+!	A0101	ACG26369	Andrew C. Goldstein,	28-Dec-1979  15:38
+!		Fix multi-header file interlock bug
+!
+!	A0100	ACG00001	Andrew C. Goldstein,  10-Oct-1978  20:02
+!	Previous revision history moved to F11A.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	DELETE_FILE	: NOVALUE,	! complete file deletion
+	DELETE_FID	: NOVALUE;	! just release file header
+
+GLOBAL ROUTINE DELETE_FILE (FIB, FILEHEADER) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine deletes a file by releasing its blocks to the storage
+!	bitmap and then releasing the header.
+!
+! CALLING SEQUENCE:
+!	DELETE_FILE (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: FIB of operation
+!	ARG2: address of file header buffer
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	File deleted, storage map and index file bitmap modified, VCB modified
+!
+!--
+
+BEGIN
+
+MAP
+	FIB		: REF BBLOCK,	! address of user FIB
+	FILEHEADER	: REF BBLOCK;	! address of file header
+
+LOCAL
+	HEADER		: REF BBLOCK,	! local address of file header
+	FCB		: REF BBLOCK,	! FCB of header in process
+	FILE_NUMBER,			! file number of header being deleted 
+	MAP_AREA	: REF BBLOCK,	! address of file header map area
+	EXT_FID		: BBLOCK [FID$C_LENGTH], ! extension file ID
+	EX_SEGNUM;			! header extension segment number
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	FILE_HEADER	: REF BBLOCK;	! global file header address
+
+EXTERNAL ROUTINE
+	SEARCH_FCB,			! search FCB list for FCB
+	MARK_DIRTY,			! mark buffer for write-back
+	MARKDEL_FCB,			! mark FCB for deletion
+	CHECKSUM,			! compute file header checksum
+	FLUSH_FID,			! flush file from buffer pool
+	WRITE_BLOCK,			! write block to disk
+	INVALIDATE,			! invalidate block buffer
+	TRUNCATE_HEADER,		! truncate file header
+	NEXT_HEADER;			! read next file extension header
+
+
+! If the file looks like a directory file flush it from the buffer pool
+! to avoid retaining stale directory data.
+!
+
+
+HEADER = .FILEHEADER;
+IF .BBLOCK [HEADER[FH1$W_RECATTR], FAT$B_RTYPE] EQL FAT$C_FIXED
+AND .BBLOCK [HEADER[FH1$W_RECATTR], FAT$W_RSIZE] EQL NMB$C_DIRENTRY
+THEN FLUSH_FID (HEADER[FH1$W_FID]);
+
+! Loop for all headers, releasing the blocks mapped and the headers.
+! If this is an extension header, search the FCB list for the off chance
+! that this header is open as a file. If so, mark it for delete and get out.
+! First write out the deleted file header. Thus, if the system bombs during
+! the delete, we will not have a valid header on the disk mapping blocks
+! that may have been returned to the storage map.
+!
+
+WHILE 1 DO
+    BEGIN
+    MAP_AREA = .HEADER + .HEADER[FH1$B_MPOFFSET]*2;
+    IF .MAP_AREA[FM1$B_EX_SEGNUM] NEQ 0
+    THEN
+	BEGIN
+	FCB = SEARCH_FCB (HEADER[FH1$W_FID]);
+	IF .FCB NEQ 0
+	THEN
+	    BEGIN
+	    HEADER[FH1$V_MARKDEL] = 1;
+	    CHECKSUM (.HEADER);
+	    MARK_DIRTY (.HEADER);
+	    KERNEL_CALL (MARKDEL_FCB, .FCB);
+	    RETURN;
+	    END;
+	END;
+
+    FILE_NUMBER = .HEADER[FH1$W_FID_NUM]; 
+    HEADER[FH1$W_FID_NUM] = 0;		! deleted header has zero file number
+    HEADER[FH1$W_CHECKSUM] = 0;		! and zero checksum
+    FILE_HEADER = 0;
+    WRITE_BLOCK (.HEADER);
+    INVALIDATE (.HEADER);
+
+! Now return the blocks mapped by the header to the storage map.
+! Then extract the extension header data.
+!
+
+    TRUNCATE_HEADER (.FIB, .HEADER, DEALLOC_BLOCKS);
+
+    EX_SEGNUM = .MAP_AREA[FM1$B_EX_SEGNUM] + 1;
+    EXT_FID[FID$W_NUM] = .MAP_AREA[FM1$W_EX_FILNUM];
+    EXT_FID[FID$W_SEQ] = .MAP_AREA[FM1$W_EX_FILSEQ];
+    EXT_FID[FID$W_RVN] = 0;
+
+! Now free the header in the index file bitmap. Then chain to the next header,
+! if any, and repeat.
+!
+
+    DELETE_FID (.FILE_NUMBER);
+
+    IF .EXT_FID[FID$W_NUM] EQL 0 THEN EXITLOOP;
+    HEADER = NEXT_HEADER (0, 0, EXT_FID, .EX_SEGNUM);
+    END;
+
+END;					! end of routine DELETE_FILE
+
+GLOBAL ROUTINE DELETE_FID (FILENUM) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine marks the indicated file header free in the index
+!	file bitmap.
+!
+! CALLING SEQUENCE:
+!	DELETE_HEADER (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: file number of header
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	Header deleted - index file bitmap & VCB altered
+!
+!--
+
+BEGIN
+
+LOCAL
+	FILE_NUMBER,			! file number - 1 of header
+	VBN,				! relative block in bitmap
+	BITPOS,				! bit number in bitmap
+	BUFFER		: REF BITVECTOR; ! bitmap buffer
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK;	! VCB of operation
+
+EXTERNAL ROUTINE
+	READ_BLOCK,			! read a block from the disk
+	WRITE_BLOCK,			! write it back
+	UPDATE_IBVBN;			! update index file VBN in VCB
+
+
+! Deleting a file header consists of simply reading in the appropriate block
+! of the index file bitmap, zeroing the bit representing that file number,
+! and writing the block back out.
+!
+
+FILE_NUMBER = .FILENUM - 1;
+VBN = .FILE_NUMBER<12,20>;
+BITPOS = .FILE_NUMBER<0,12>;
+
+IF .VBN GEQU .CURRENT_VCB[VCB$B_IBMAPSIZE]
+THEN BUG_CHECK (BADFID, FATAL, 'ACP file number out of range for this volume');
+
+BUFFER = READ_BLOCK (.VBN + .CURRENT_VCB[VCB$L_IBMAPLBN], 1, INDEX_TYPE);
+BUFFER[.BITPOS] = 0;
+WRITE_BLOCK (.BUFFER);
+
+! If the bitmap block just written precedes the current start point for
+! the bitmap scan, update the start point.
+!
+
+IF .VBN LSSU .CURRENT_VCB[VCB$B_IBMAPVBN]
+THEN KERNEL_CALL (UPDATE_IBVBN, .VBN);
+
+END;					! end of routine DELETE_HEADER
+
+END
+ELUDOM

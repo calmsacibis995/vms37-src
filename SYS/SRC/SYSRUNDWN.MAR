@@ -1,0 +1,456 @@
+	.TITLE	SYSRUNDWN IMAGE RUNDOWN SYSTEM SERVICE
+	.IDENT	'V03-003'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY: EXECUTIVE, SYSTEM SERVICES
+;
+; ABSTRACT:
+;
+; ENVIRONMENT:
+;
+;--
+;
+;	.PAGE
+	.SBTTL	HISTORY			; DETAILED
+;
+; AUTHOR:	R. HUSTVEDT	 CREATION DATE: 10-OCT-76
+;
+; MODIFIED BY:
+;
+;	V03-003	LJK0164		Lawrence J. Kenah	20-Apr-1982
+;		Clear byte following RSB in privileged vector rundown loop
+;		so that next activation of privileged image succeeds.
+;
+;	V03-002	LJK0158		Lawrence J. Kenah	9-Apr-1982
+;		Reset privileged vectors with process-specific array
+;		to allow some vectors to survive image exit.
+;
+;	V03-001	ACG0278		Andrew C. Goldstein,	1-Apr-1982  10:30
+;		Enable resource wait mode during rundown,
+;		disable channel deassignment bug trap
+;
+;	V02-020	SRB0046		Steve Beckhardt		1-Jan-1982
+;		Lowered IPL to IPL$_ASTDEL when calling piggyback AST
+;		routines when purging undelivered ACBs.
+;
+;	V02-019 WMC0032		Wayne M. Cardoza	04-Jan-1982
+;		Put privileged library rundown back here.  Also leave it in
+;		SYSDELPRC.  It may be called from both places.
+;
+;	V02-018	KTA0063		Kerbey T. Altmann	02-Jan-1982
+;		Clear IPAST vector in PCB.
+;
+;	V02-17	WMC0031		Wayne Cardoza		23-Dec-1981
+;		Move privileged library rundown from here to SYSDELPRC so
+;		it occurs before RMS rundown.
+;
+;	V02-016	SRB0041		Steve Beckhardt		30-Nov-1981
+;		Changed $DEQ system service call to use new flags
+;		argument.
+;
+;	V02-015	SPF0040		Steve Forgey		28-Sep-1981
+;		Fix image accounting synchronization bug.
+;
+;	V02-014 SPF0019		Steve Forgey		27-Aug-1981
+;		Add image accounting logic.
+;
+;	V02-013	SRB0033		Steve Beckhardt		27-Aug-1981
+;		Made rundown of AST control blocks call the
+;		piggyback kernel AST routine.
+;
+;	V02-012 SRB0016		Steve Beckhardt		22-Apr-1981
+;		Added $DEQ call to dequeue remaining locks for a given
+;		access mode.
+;
+;	V02-011	LMK0002		Len Kawell		24-Mar-1981
+;		Add clearing of PCB$V_WAKEPEN.
+;
+;	V02-010	KTA0010		Kerbey T. Altmann	25-Feb-1981
+;		Change the search algorithm for the channels to use
+;		the new meaning of CHINDX as hi-water mark.
+;
+;	V02-009	ACG0189		Andrew C. Goldstein,	12-Feb-1981  16:41
+;		Bug check on channel deassign failure
+;
+;	V02-008	KTA0005		Kerbey T. Altmann	22-Jan-1981
+;		Change word displ to long due to changing code from
+;		non-paged to paged.
+;
+;	V02-007	KTA0001		Kerbey T. Altmann	19-Jan-1981
+;		Add invocation of user rundown service.  Change code to
+;		pageable, but lock down the elevated IPL section.
+;
+;	V02-006	KDM0004		KATHLEEN D. MORSE	16-APR-1980
+;		FIX CODE TO RESET THE SUPERVISOR CHANGE MODE HANDLER.
+;
+;
+
+	.SBTTL	DECLARATIONS
+
+;
+; INCLUDE FILES:
+;
+
+	$ACBDEF				; DEFINE AST CONTROL BLOCK
+	$ACMDEF				; DEFINE ACCOUNTING MESSAGE OFFSETS
+	$CCBDEF				; DEFINE CHANNEL CONTROL BLOCK
+	$IPLDEF				; DEFINE INTERRUPT PRIORITIES
+	$LCKDEF				; DEFINE $ENQ/$DEQ FLAGS
+	$LOGDEF				; DEFINE LOGICAL NAME BLOCK
+	$OPDEF				; DEFINE OPCODE SYMBOLIC CONSTANTS
+	$PCBDEF				; DEFINE PCB OFFSETS
+	$PHDDEF				; DEFINE PROCESS HEADER OFFSETS
+	$PRDEF				; DEFINE PROCESSOR REGISTERS
+	$SSDEF				; DEFINE STATUS CODES
+
+;
+; EQUATED SYMBOLS:
+;
+ACMODE=4				; DISPLACEMENT TO ACCESS MODE ARGUMENT
+
+NXTKVEC=0			;OFFSET TO NEXT FREE KERNEL VECTOR
+NXTEVEC=256			;OFFSET TO NEXT FREE EXEC VECTOR
+NXTRVEC=512			;OFFSET TO NEXT FREE RUNDWN VECTOR
+NXTMVEC=768			;OFFSET TO NEXT MESSAGE VECTOR
+
+	.SBTTL	EXE$RUNDWN - IMAGE RUNDOWN SYSTEM SERVICE
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;	EXE$RUNDWN TERMINATES ALL PENDING ACTIVITY FOR THE SPECIFIED
+;	AND ALL LESS PRIVILEGED ACCESS MODES.  ALL RESOURCES ASSOCIATED 
+;	WITH THE PENDING ACTIVITY WILL BE RELEASED IF APPROPRIATE
+;
+; CALLING SEQUENCE:
+;	CALLG	ARGLIST,EXE$RUNDWN
+;
+; INPUT PARAMETERS:
+;	ACMODE(AP) - ACCESS MODE BOUNDARY FOR WHICH RUNDOWN IS TO BE PERFORMED
+;			(MAXIMIZED WITH THE ACCESS MODE OF THE CALLER)
+;
+; IMPLICIT INPUTS:
+;	R4 - POINTER TO CURRENT PCB
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	ALL ACTIVITY INITIATED BUT NOT COMPLETED FOR ALL ACCESS MODES
+;	HAVING THE SAME OR LESSER PRIVILEGE THAN THAT SPECIFIED WILL
+;	BE TERMINATED.
+;
+; COMPLETION CODES:
+;	SS$_NORMAL  -  SUCCESSFUL COMPLETION
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+	.PSECT	YEXEPAGED
+	.ENTRY	EXE$RUNDWN,^M<R2,R3,R4,R5,R6,R7>
+	EXTZV	#0,#2,ACMODE(AP),R0	; FETCH ACCESS MODE ARGUMENT
+	BSBW	EXE$MAXACMODE		; MAXIMIZE WITH PREVIOUS
+	MOVL	R0,R7			; SAVE IN R7 FOR REFERENCE
+	BBCC	#PCB$V_PWRAST,PCB$L_STS(R4),10$	; SKIP IF NO POWER FAIL AST
+	CLRL	@#CTL$GL_POWERAST	; ZAP AST ADDRESS
+	INCW	PCB$W_ASTCNT(R4)	; AND RESTORE AST QUOTA
+10$:					;
+;-------------------------------------------------------------
+;
+;	Enable resource wait mode to ensure that rundown will succeed.
+;
+;-------------------------------------------------------------
+
+	$SETRWM_S WATFLG=#0		; ENABLE WAIT MODE
+	PUSHL	R0			; SAVE RETURN STATUS
+
+;-------------------------------------------------------------
+;
+;	INVOKE THE USER RUNDOWN SERVICE(S)
+;
+;	The user service is invoked in KERNEL mode with a JSB and must
+;	exit with a RSB.
+;
+;	R4 - Pointer to current PCB
+;	R7 - Access mode parameter to SYSRUNDWN maximized with previous mode
+;	ACMODE(AP) - Access mode parameter to SYSRUNDWN
+;
+;-------------------------------------------------------------
+
+	MOVL	@#CTL$GL_USRUNDWN, R5	; GET PER-PROCESS USER RUNDOWN VECTOR
+	BEQL	20$			; NOT PRESENT, SKIP ON
+	JSB	(R5)			; CALL THRU THE VECTOR(S)
+20$:	MOVL	G^EXE$GL_USRUNDWN, R5	; GET SYSTEM-WIDE USER RUNDOWN VECTOR
+	BEQL	30$			; NOT PRESENT, SKIP ON
+	JSB	(R5)			; CALL THRU THE VECTOR(S)
+30$:					;
+;-------------------------------------------------------------
+;
+;	WRITE IMAGE ACCOUNTING RECORD
+;
+;-------------------------------------------------------------
+	BBC	#ACM$V_IMAGE,EXE$GL_ACMFLAGS,40$; IMAGE ACCOUNTING ENABLED ?
+	CLRL	R5				; NOT A SPECIAL KERNEL AST
+	BSBW	EXE$IMGDELMSG			; WRITE IMAGE DELETION MESSAGE
+40$:
+	CLRQ	@#CTL$GQ_ISTART			; IMAGE ACCOUNTING INACTIVE
+;-------------------------------------------------------------
+;
+;	CLOCK THE IMAGE COUNTER
+;
+;-------------------------------------------------------------
+
+	MOVL	@#CTL$GL_PHD,R5		; GET ADDRESS OF PROCESS HEADER
+	INCL	PHD$L_IMGCNT(R5)	; PROVIDE A CHECKING MECHANISM TO
+					; PREVENT DELIVERY OF AST'S TO THE
+					; WRONG OR SUBSEQUENT IMAGES
+;-------------------------------------------------------------
+;
+;	RESET THE DISPATCH VECTORS TO THEIR INITIAL VALUES. (NO VECTORS USED)
+;
+;-------------------------------------------------------------
+	MOVAB	@#CTL$A_DISPVEC,R6	;GET ADR OF 1ST VECTOR PAGE
+; VERIFY THAT EACH SET OF VECTORS USES ONE HALF PAGE
+
+	ASSUME	<NXTEVEC-NXTKVEC> EQ 256
+	ASSUME	<NXTRVEC-NXTEVEC> EQ 256
+	ASSUME	<NXTMVEC-NXTRVEC> EQ 256
+
+	MOVZBL	#4,R2			; THERE ARE FOUR VECTORS TO RESET
+	MOVAW	@#IAC$AW_VECRESET,R1	; R1 LOCATES RESET CONTEXT
+
+50$:	MOVZWL	(R1)+,R0		; GET OFFSET INTO VECTOR
+	MOVL	R0,(R6)			; STORE OFFSET INTO FIRST LONGWORD
+	ADDL2	R6,R0			; LOCATE ADDRESS TO BE RESET
+	MOVZBL	#OP$_RSB,(R0)		; STORE "RSB" AT APPROPRIATE OFFSET
+	MOVAL	256(R6),R6		; ADVANCE R6 TO NEXT VECTOR
+	SOBGTR	R2,50$			;  AND LOOP IF NOT YET DONE
+
+	MOVL	G^MMG$GL_RMSBASE,G^CTL$GL_RMSBASE ;RESET TO DEFAULT RMS
+ 
+;-------------------------------------------------------------
+;
+;	DEASSIGN CHANNELS WITHOUT OPEN FILES
+;
+;-------------------------------------------------------------
+DASSIGN1:				; FIRST DEASSIGN PASS
+	MOVZWL	@#CTL$GW_CHINDX,R5	; GET MAXIMUM INDEX
+	BEQL	22$			; NO CHANNELS ASSIGNED, LEAVE
+	MNEGL	R5,R5			; CONVERT TO NEGATIVE OFFSET
+	ADDL3	#CCB$B_AMOD,-
+		@#CTL$GL_CCBBASE,R3	; COMPUTE ADDRESS OF HIGHEST CHANNEL
+10$:	CMPB	(R3)[R5],R7		; IS THIS CHANNEL DEASSIGNABLE?
+	BLEQ	20$			; NO, ASSIGNED BY LOWER ACMODE
+	MNEGL	R5,-(SP)		; CONVERT TO REAL CHANNEL NUMBER
+	CALLS	#1,G^SYS$DASSGN		; DE-ASSIGN CHANNEL
+20$:	ADDL2	#CCB$C_LENGTH,R5	; POINT AT NEXT CHANNEL
+	BLSS	10$			; NEXT CHANNEL
+ 
+;-------------------------------------------------------------
+;
+;	RELEASE MEMORY
+;
+;-------------------------------------------------------------
+
+22$:	BSBW	MMG$IMGRESET		; RELEASE IMAGE PAGES
+
+;-------------------------------------------------------------
+;
+;	DEASSIGN CHANNELS - ALL
+;
+;-------------------------------------------------------------
+ 
+	MOVZWL	@#CTL$GW_CHINDX,R5	; GET MAXIMUM INDEX
+	BEQL	40$			; NO CHANNELS ASSIGNED, LEAVE
+	MNEGL	R5,R5			; CONVERT TO NEGATIVE OFFSET
+	ADDL3	#CCB$B_AMOD,-
+		@#CTL$GL_CCBBASE,R3	; COMPUTE ADDRESS OF HIGHEST CHANNEL
+25$:	CMPB	(R3)[R5],R7		; IS THIS CHANNEL DEASSIGNABLE?
+	BLEQ	30$			; NO, ASSIGNED BY LOWER ACMODE
+	MNEGL	R5,-(SP)		; CONVERT TO REAL CHANNEL NUMBER
+	CALLS	#1,G^SYS$DASSGN		; DE-ASSIGN CHANNEL
+	BRB	30$			; BYPASS ERROR CHECK CODE
+	NOP				; LEAVE SPACE TO REAPPLY FOLLOWING...
+;***	BLBS	R0,30$			; BRANCH ON SUCCESS
+	CMPL	R0,#SS$_IVCHNLSEC	; CHECK FOR SECTION ON CHANNEL
+	BEQL	30$			; WHICH IS OK
+	BUG_CHECK FILCNTNONZ,FATAL	; IT REALLY SHOULD HAVE WORKED
+
+30$:	ADDL	#CCB$C_LENGTH,R5	; POINT AT NEXT CHANNEL
+	BLSS	25$			; NEXT CHANNEL
+ 
+;-------------------------------------------------------------
+;
+;	DEALLOCATE ALLOCATED DEVICES
+;
+;-------------------------------------------------------------
+ 
+40$:	$DALLOC_S	ACMODE=R7	; DE-ALLOCATE AT ACCESS MODE
+
+;-------------------------------------------------------------
+;
+;	CANCEL TIMER AND SCHEDULED WAKEUP REQUESTS
+;
+;-------------------------------------------------------------
+
+	$CANTIM_S	ACMODE=R7	; CANCEL TIMER REQUESTS
+	$CANWAK_S			; CANCEL WAKE UP REQUESTS
+
+;-------------------------------------------------------------
+;
+;	DEQUEUE REMAINING LOCKS
+;
+;-------------------------------------------------------------
+
+	$DEQ_S		ACMODE=R7,-	; DEQUEUE ALL LOCKS AT SPECIFIED
+			FLAGS=#LCK$M_DEQALL  ; ACCESS MODE
+
+;-------------------------------------------------------------
+;
+;	DISASSOCIATE COMMON EVENT BLOCKS
+;
+;-------------------------------------------------------------
+
+	$DACEFC_S	EFN=#64		; DISASSOCIATE GROUP #2
+	$DACEFC_S	EFN=#96		; DISASSOCIATE GROUP #3
+
+;-------------------------------------------------------------
+;
+;	CLEAR THE IPAST VECTOR AND ADDRESS
+;
+;-------------------------------------------------------------
+
+	MOVL	PCB$L_IPAST(R4),R1	; Pick up the vector
+	BEQL	70$			; There are none
+	MOVL	#7,R2			; Set up for 8 entries
+50$:	ASHL	#2,R2,R0		; Each entry is 4 bits
+	EXTZV	R0,#4,R1,R3		; Pick up the entry (mode+1)
+	BEQL	60$			; None there
+	CMPL	R3,R7			; At a more priv mode than ACMODE?
+	BLEQ	60$			; Yes, do not clear
+	INSV	#0,R0,#4,PCB$L_IPAST(R4); No, clear it out
+	CLRL	@#CTL$AL_IPASTVEC[R2]	;  and its associated address
+60$:	SOBGEQ	R2,50$			; Loop until all done
+70$:
+
+;-------------------------------------------------------------
+;
+;	PURGE PENDING UNDELIVERED AST CONTROL BLOCKS
+;
+;-------------------------------------------------------------
+
+ASTRUNDWN:				; 
+	MOVAL	PCB$L_ASTQFL(R4),R6	; COMPUTE ADDRESS OF HEADER
+LOCK_BEGIN:
+	SETIPL	W^LOCK_IPL		; BLOCK AST ARRIVAL & LOCK DOWN CODE
+	CMPL	G^EXE$GQ_ERLMBX+4,PCB$L_PID(R4)	; CHECK FOR ERROR LOG MAILBOX
+	BNEQ	10$			; BR IF NO
+	CLRQ	G^EXE$GQ_ERLMBX		; YES, DEASSIGN IT
+10$:	MOVL	PCB$L_ASTQBL(R4),R0	; GET TAIL OF AST QUEUE
+	CMPL	R0,R6			; CHECK FOR EMPTY QUEUE
+	BEQL	20$			; YES, DONE WITH ASTS
+	CMPZV	#ACB$V_MODE,#ACB$S_MODE,ACB$B_RMOD(R0),R7 ; CHECK ACCESS MODE OF ACB
+	BLSS	20$			; REACHED THE END OF DELETABLE ASTS
+	REMQUE	(R0),R0			; REMOVE IT FROM AST QUEUE
+	BVS	20$			; EXIT IF QUEUE EMPTY
+	BBC	#ACB$V_QUOTA,ACB$B_RMOD(R0),15$	; SKIP IF NO QUOTA ACCOUNTING
+	INCW	PCB$W_ASTCNT(R4)	; ALLOW ANOTHER AST
+15$:	BITB	#<ACB$M_NODELETE!ACB$M_PKAST>,ACB$B_RMOD(R0)  ; SPECIAL ACTIONS?
+	BNEQ	18$			; YES
+	JSB	G^EXE$DEANONPAGED	; NO, DEALLOCATE IT
+	BRB	10$			; CONTINUE
+
+18$:	BBC	#ACB$V_PKAST,ACB$B_RMOD(R0),10$	; BR IF NO PIGGYBACK AST
+	MOVL	R0,R5			; PUT ACB ADDRESS IN R5
+;
+; CALL PIGGY-BACK SPECIAL KERNEL AST ROUTINE.
+; 	R5 - ACB ADDRESS (MUST BE PRESERVED)
+; 	IPL = IPL$_ASTDEL (MUST NOT BE LOWERED)
+;
+	SETIPL	#IPL$_ASTDEL		; LOWER IPL TO IPL$_ASTDEL
+	SUBL	#4,SP			; EXTRA LONGWORD FOR INTER-PROCESS ASTS
+	JSB	@ACB$L_KAST(R5)		; CALL KAST ROUTINE
+	ADDL	#4,SP			; REMOVE EXTRA LONGWORD
+	BRB	LOCK_BEGIN		; NO DELETE FOR PKAST
+
+;-------------------------------------------------------------
+;
+;	RESET AST ACTIVE AND AST ENABLE BITS
+;
+;-------------------------------------------------------------
+
+20$:	MOVL	R7,R5			; INITIALIZE MODE INDEX
+	BEQL	40$			; SKIP TERMINATION HANDLER FOR KERNEL
+30$:	
+	CMPL	#2,R5			; SUPERVISOR OR USER MODE?
+	BGEQ	35$			; BRANCH IF NOT
+	CLRL	@#CTL$GL_CMSUPR-8[R5]	; CLEAR CHANGE MODE HANDLER
+35$:	CLRL	@#CTL$GL_THEXEC-4[R5]	; CLEAR TERMINATION HANDLER
+40$:	CLRQ	@#CTL$AQ_EXCVEC[R5]	; CLEAR EXCEPTION HANDLER ENTRIES
+	CLRL	@#CTL$AL_FINALEXC[R5]	; CLEAR LAST CHANCE EXCEPTION HANDLER
+	BBSS	R5,PCB$B_ASTEN(R4),50$	; SET ENABLE BIT
+50$:	BBCC	R5,PCB$B_ASTACT(R4),60$	; CLEAR AST ACTIVE
+60$:	ADDL3	#PCB$V_SSFEXC,R5,R0	; COMPUTE SSFAIL ENABLE BIT NUMBER
+	BBCC	R0,PCB$L_STS(R4),70$	; AND CLEAR IT
+70$:	AOBLSS	#4,R5,30$		; DO ALL REQUESTED MODES
+	CLRL	@#CTL$GL_CMHANDLR	; CLEAR COMPATIBILITY MODE HANDLER
+	JSB	G^SCH$NEWLVL		; COMPUTE NEW ASTLVL
+	BICL	#<1@PCB$V_FORCPEN>!<1@PCB$V_WAKEPEN>,- ; CLEAR FORCE EXIT AND
+		PCB$L_STS(R4)		; WAKE PENDING
+	SETIPL	#0			; ENABLE AGAIN
+;-------------------------------------------------------------
+;
+;	DELETE IMAGE LOGICAL NAMES
+;
+;-------------------------------------------------------------
+
+LOGNRUNDWN:				; LOGICAL NAME RUNDOWN
+	$DELLOG_S	TBLFLG=#2,-	; DELETE PROCESS LOCAL
+			ACMODE=R7	; FOR RUNDOWN MODE
+
+;-------------------------------------------------------------
+;
+;	Restore previous setting of resource wait mode
+;
+;-------------------------------------------------------------
+
+	CLRL	R0			; ASSUME ON
+	CMPL	(SP)+,#SS$_WASSET	; CHECK IF IT WAS OFF
+	BNEQ	10$			; BRANCH IF ON
+	INCL	R0			; SET TO TURN OFF
+10$:	$SETRWM_S WATFLG=R0
+
+	MOVZWL	#SS$_NORMAL,R0		; SET NORMAL COMPLETION STATUS
+	RET				; RETURN
+
+LOCK_IPL:				; END OF LOCKED DOWN CODE
+	.LONG	IPL$_SYNCH
+LOCK_END:
+	ASSUME	LOCK_END-LOCK_BEGIN LE 512	; MUST BE ON ADJOINING PAGES
+
+	.END

@@ -1,0 +1,571 @@
+MODULE LIB$FILESCAN (						! LIBFILESCA.B32
+		%TITLE 'Search a file wildcard sequence of files'
+		IDENT = 'V03-008'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!++
+! FACILITY: General Utility Library
+!
+! ABSTRACT:
+!	This module contains routines which can be used to find all
+!	files that match a wildcard file specification.
+!
+! ENVIRONMENT:
+!	VAX/VMS, User mode, Non-AST re-entrant
+!
+! AUTHOR:	Tim Halvorsen, CREATION DATE: 1-AUG-1979
+!
+! MODIFIED BY:
+!
+!	V03-008	BLS0133		Benn Schreiber		11-Jan-1982
+!		Make lib$file_scan continue when it gets nopriv.  Make
+!		lib$file_scan always copy expanded name string to resultant
+!		name string on errors and network non-wild files
+!
+!	V03-007	TMK0001		Todd M. katz		31-Dec-1981
+!		Check for a PPF file before doing a $SEARCH. Do not do 
+!		searches on PPF files.
+!
+!	V03-006	MLJ0044		Martin L. Jack,	8-Sep-1981  14:00
+!		Correct problems when $PARSE fails.
+!
+!	V03-005	BLS0071		Benn Schreiber		22-Aug-1981
+!		Correct looping if priv violation in lib$find_file
+!
+!	V03-004	BLS0065		Benn Schreiber		 4-Aug-1981
+!		Fix handling of devices mounted foreign, and move
+!		saved status into a longword out of the fab for lib$find_file.
+!
+!	V03-003	BLS0041		Benn Schreiber		23-Feb-1981
+!		Correct error in call to lib$free_vm
+!
+!	V03-002	BLS0027		Benn Schreiber		28-Nov-1980
+!		Correct protection violation handling in LIB$FIND_FILE
+!
+!	V03-001	LMK0001		Len Kawell		19-Sep-1980
+!		Recode in BLISS and add LIB$FILE_SEARCH.
+!--
+
+%SBTTL	'Declarations';
+
+SWITCHES
+	ADDRESSING_MODE (EXTERNAL = GENERAL,		!Declare addressing modes
+			NONEXTERNAL = WORD_RELATIVE);
+LIBRARY
+	'RTLSTARLE';					!System symbols
+
+REQUIRE
+	'RTLIN:RTLPSECT';				!Define PSECT declaration macros
+
+DECLARE_PSECTS (LIB);					!Declare PSECTs for LIB$ facility
+
+FORWARD ROUTINE
+	COPY_ESL_TO_RSL : NOVALUE,			!Copies ESL to RSL
+	LIB$FILE_SCAN,					!Wild card scan using FAB
+	LIB$FIND_FILE;					!Wild card scan using context
+
+EXTERNAL ROUTINE
+	LIB$FREE_VM,					!Deallocate virtual memory
+	LIB$GET_VM,					!Allocate virtual memory
+	LIB$SCOPY_R_DX;					!Copy string
+
+%SBTTL	'COPY_ESL_TO_RSL Copy Expanded Name String to Resultant';
+ROUTINE COPY_ESL_TO_RSL(FAB,NAM) : NOVALUE =
+!---
+!	This routine sets up the resultant name string data
+!	in the NAM block.  It is called in the case of an
+!	error from $PARSE/$SEARCH, or on network non-wild
+!	card operations.
+!
+! Inputs:
+!
+!	FAB = FAB address
+!	NAM = NAM address
+!
+! Outputs:
+!
+!	NAM$B_RSL setup with length of string copied into
+!	resultant name string buffer pointed to by NAM$L_RSA.
+!---
+BEGIN
+
+MAP
+	FAB:	REF BLOCK[,BYTE],		! FAB structure
+	NAM:	REF BLOCK[,BYTE];		! NAM structure
+
+IF .NAM[NAM$B_RSL] EQL 0			! If name not set up
+    THEN IF (NAM[NAM$B_RSL] = .NAM[NAM$B_ESL]) NEQ 0	! If expanded string present
+	THEN CH$MOVE(MINU(.NAM[NAM$B_RSS],
+				.NAM[NAM$B_ESL]),! then use it
+		.NAM[NAM$L_ESA],.NAM[NAM$L_RSA])
+	ELSE BEGIN				! No expanded string, use
+	    NAM[NAM$B_RSL] = .FAB[FAB$B_FNS];	!  the filename string from FAB
+	    CH$MOVE(MINU(.NAM[NAM$B_RSS],.FAB[FAB$B_FNS]),
+			.FAB[FAB$L_FNA],.NAM[NAM$L_RSA]);
+	END;
+RETURN;
+END;
+
+%SBTTL	'LIB$FILE_SCAN File scan given FAB and NAM block';
+GLOBAL ROUTINE LIB$FILE_SCAN(FAB,SUCCESS_RTN,ERROR_RTN) =
+!---
+!
+!	This routine is called with a wildcard file specification
+!	and calls a specified set of action routines for each file
+!	and/or error found in the wildcard sequence.  Certain errors
+!	are checked for in order to allow the search sequence to be
+!	completed even though errors like nopriv are present.
+!	Stickyness is also handled if this routine is called once
+!	for each file specification parameter in a command line.
+!
+! Inputs:
+!
+!	FAB = FAB address
+!	SUCCESS_RTN = file success action routine address
+!			The success routine is called with one argument,
+!			which is a pointer to the FAB.
+!	ERROR_RTN  = error action routine address
+!			The error routine is called with one argument,
+!			which is a pointer to the FAB.
+!
+! Implicit inputs:
+!
+!	The FAB must be initialized as a FAB with a pointer to a valid
+!	NAM block.
+!
+! Outputs:
+!
+!	The action routines are called appropriately.  This
+!	routine returns when there are no more files.
+!
+! Implicit outputs:
+!
+!
+! Routine values:
+!
+!	Any valid RMS status code
+!
+!---
+BEGIN
+
+GLOBAL BIND
+	FMG$FILE_SCAN = LIB$FILE_SCAN;	! Define old name
+LOCAL
+	STATUS,				! Routine status
+	NAM,				! NAM block address
+	RNAM;				! Related file NAM block address
+MAP
+	FAB:	REF BLOCK[,BYTE],	! FAB structure address
+	NAM:	REF BLOCK[,BYTE],
+	RNAM:	REF BLOCK[,BYTE];
+BUILTIN
+	AP,CALLG;
+
+MACRO CALL_SUCCESS =
+	(IF .SUCCESS_RTN NEQ 0 THEN CALLG(.AP,.SUCCESS_RTN))%;
+
+MACRO CALL_ERROR =
+	(IF .ERROR_RTN NEQ 0 THEN CALLG(.AP,.ERROR_RTN))%;
+!
+! Tell RMS to save context over calls to speed things up.  This also
+! causes directories to be read by RMS instead of the ACP.
+!
+NAM = .FAB[FAB$L_NAM];
+NAM[NAM$V_SVCTX] = 1;
+!
+! Parse the file spec
+!
+STATUS = $PARSE(FAB = .FAB);	
+IF NOT .STATUS
+THEN	BEGIN
+	COPY_ESL_TO_RSL(.FAB,.NAM);
+	CALL_ERROR;
+	RETURN .STATUS;
+	END;
+FAB[FAB$V_NAM] = 1;			! Use NAM block
+!
+! Handle the stickyness of multiple file names.  Copy the expanded
+! file name into the related name block and clear the default name
+! string in the original FAB block.
+!
+IF .NAM[NAM$B_ESL] NEQ 0
+AND .NAM[NAM$L_RLF] NEQ 0
+THEN	BEGIN
+	RNAM = .NAM[NAM$L_RLF];
+	RNAM[NAM$B_RSL] = .NAM[NAM$B_ESL];
+	RNAM[NAM$L_RSA] = .NAM[NAM$L_ESA];
+	FAB[FAB$B_DNS] = 0;
+	END;
+!
+! If a wildcard version number was specified on this filespec
+! (via either FNM or DNM), then leave dnm set to ';*' so that
+! the version will be sticky.  This is because RMS does not copy
+! the version field from related file name string.
+!
+IF .NAM[NAM$V_WILD_VER]
+THEN	BEGIN
+	FAB[FAB$B_DNS] = %CHARCOUNT(';*');
+	FAB[FAB$L_DNA] = UPLIT(';*');
+	END;
+!
+! If the device is non-directory structured, then simply return
+! to the caller's success action routine with the spec and
+! avoid the SEARCH sequence. Also avoid the SEARCH sequence if 
+! the file is a PPF file.
+!
+IF NOT .(FAB[FAB$L_DEV])<$BITPOSITION(DEV$V_DIR),1>
+AND NOT .NAM[NAM$V_NODE]
+OR .(FAB[FAB$L_DEV])<$BITPOSITION(DEV$V_FOR),1>
+OR .NAM[NAM$V_PPF]
+THEN	BEGIN
+	COPY_ESL_TO_RSL(.FAB,.NAM);
+	CALL_SUCCESS;
+	RETURN .STATUS;
+	END;
+!
+! If the file specification is non-wild, then SEARCH once to get
+! the FID/DID filled in and do not repeat the search.
+! If no wildcard in a network spec, no need for search.
+!
+IF NOT .NAM[NAM$V_WILDCARD]
+THEN	BEGIN
+	IF NOT .NAM[NAM$V_NODE]
+	THEN	BEGIN
+		STATUS = $SEARCH(FAB = .FAB);
+		IF NOT .STATUS
+		THEN	BEGIN
+			COPY_ESL_TO_RSL(.FAB,.NAM);
+			CALL_ERROR;
+			RETURN .STATUS;
+			END;
+		END
+	ELSE COPY_ESL_TO_RSL(.FAB,.NAM);
+	CALL_SUCCESS;
+	RETURN .STATUS;
+	END;
+!
+! Search for the each file which matches the wildcard sequence.  If
+! success call success action routine and continue.  If no more files,
+! quit.  If other error, call the error action routine and if not
+! a wildcard directory or failure wasn't no privilege, then quit.
+!
+DO	BEGIN
+	STATUS = $SEARCH(FAB = .FAB);
+	IF .STATUS
+	THEN 	CALL_SUCCESS
+	ELSE	BEGIN
+		IF .STATUS EQLU RMS$_NMF
+		THEN	
+			RETURN .STATUS
+		ELSE
+			BEGIN
+			COPY_ESL_TO_RSL(.FAB,.NAM);
+			CALL_ERROR;
+			!
+			! Quit if not a wildcard directory or system status
+			! not NOPRIV.
+			!
+			IF NOT .NAM[NAM$V_WILD_DIR]
+			 OR .FAB[FAB$L_STV] NEQU SS$_NOPRIV
+			 THEN RETURN .STATUS;
+			IF .FAB[FAB$L_STV] EQL SS$_NOPRIV
+			 THEN STATUS = 1;
+			END;
+		END;
+
+	END
+UNTIL NOT .STATUS;
+RETURN .STATUS;
+END;
+
+%SBTTL 'LIB$FIND_FILE Find a file given a file name';
+GLOBAL ROUTINE LIB$FIND_FILE(FILE_NAME,RESULT_NAME,CONTEXT,
+			       DEFAULT_NAME,RELATED_NAME) =
+!---
+!	This routine is called with a wildcard file specification, which
+!	it searches for, and returns the next resultant file spec.
+!
+! Inputs:
+!
+!	FILE_NAME = File name descriptor address.
+!	RESULT_NAME = Result file name descriptor address.
+!	CONTEXT = Address of a longword containing previous call "context".
+!		= Zero if no previous call.
+!	DEFAULT_NAME = Default file name descriptor address (optional).
+!	RELATED_NAME = Related file name descriptor address (optional).
+!
+! Implicit inputs:
+!
+!	CONTEXT is either 0 or as set up from a previous call to
+!	LIB$FIND_FILE.
+!
+! Outputs:
+!
+!	CONTEXT = Address of internal FAB/NAM buffer.
+!	RESULT_NAME = Result file name.
+!
+! Implicit outputs:
+!
+!	CONTEXT will point to a FAB/NAM block
+!
+! Routine values:
+!
+!	Any valid RMS error code
+!	Error codes returned by LIB$GET_VM
+!	Error codes returned by LIB$SCOPY_R_DX
+!---
+BEGIN
+
+BUILTIN
+	NULLPARAMETER;
+LOCAL
+	STATUS,					! Status
+	BLOCKSIZE,				! Size of request to lib$get/free vm
+	FNBUF,					! FAB/NAM buffer address
+	FNBUF_SIZ,				! FAB/NAM buffer length
+	FAB,					! FAB address
+	NAM,					! NAM address
+	RNAM,					! Related NAM address
+	ESBUF,					! Expanded name buffer address
+	RSBUF,					! Result name buffer address
+	NEXT_STATUS;				! Status to return next call
+MAP
+	CONTEXT:	REF VECTOR[,LONG],	! Pointer to context block
+	FILE_NAME:	REF BLOCK[,BYTE],	! File name string descriptor
+	RESULT_NAME:	REF BLOCK[,BYTE],	! Result name buffer descriptor
+	DEFAULT_NAME:	REF BLOCK[,BYTE],	! Default name string descriptor
+	RELATED_NAME:	REF BLOCK[,BYTE],	! Related file name string desc
+
+	FAB:		REF BLOCK[,BYTE],	! FAB
+	NAM:		REF BLOCK[,BYTE],	! NAM block
+	RNAM:		REF BLOCK[,BYTE],	! Related NAM block
+	ESBUF:		REF BLOCK[,BYTE],	! Expanded name buffer
+	RSBUF:		REF BLOCK[,BYTE],	! Result name buffer
+	NEXT_STATUS:	REF VECTOR[,LONG];
+
+LITERAL
+	NAM_OFF = FAB$C_BLN,			! Offset to NAM block
+	RNAM_OFF = NAM_OFF + NAM$C_BLN,		! Offset to related NAM block
+	ESBUF_OFF = RNAM_OFF + NAM$C_BLN,	! Offset to expanded name 
+	RSBUF_OFF = ESBUF_OFF + NAM$C_MAXRSS,	! Offset to result name
+	STATUS_OFF = RSBUF_OFF + NAM$C_MAXRSS;	! Offset to next status
+
+
+STATUS = 1;					! Preset success
+FNBUF_SIZ = FAB$C_BLN + (2 * NAM$C_BLN) 	! Set FAB/NAM buffer size
+		+ (2 * NAM$C_MAXRSS) + 4;
+!
+! If the specified previous "context" is zero, then there was no 
+! previous call, so the FAB/NAM block buffer needs to be allocated.
+!
+IF .CONTEXT[0] EQL 0
+THEN 	BEGIN
+	STATUS = LIB$GET_VM(FNBUF_SIZ,FNBUF);
+	IF NOT .STATUS
+	THEN
+		RETURN .STATUS;
+	CONTEXT[0] = .FNBUF;
+	!
+	! Initialize the FAB and NAM blocks
+	!
+	$FAB_INIT(	FAB = .FNBUF,
+			FOP = NAM,
+			NAM = .FNBUF + NAM_OFF);
+	$NAM_INIT(	NAM = .FNBUF + NAM_OFF,
+			RLF = .FNBUF + RNAM_OFF,
+			RSS = NAM$C_MAXRSS,
+			RSA = .FNBUF + RSBUF_OFF,
+			ESS = NAM$C_MAXRSS,
+			ESA = .FNBUF + ESBUF_OFF);
+	$NAM_INIT(	NAM = .FNBUF + RNAM_OFF);
+	(.FNBUF + STATUS_OFF) = 1;
+	END
+ELSE
+	FNBUF = .CONTEXT[0];
+!
+! Get the block addresses and check the validity of the FAB/NAM buffer.
+!
+FAB = .FNBUF;
+NAM = .FNBUF + NAM_OFF;
+RNAM = .FNBUF + RNAM_OFF;
+ESBUF = .FNBUF + ESBUF_OFF;
+RSBUF = .FNBUF + RSBUF_OFF;
+NEXT_STATUS = .FNBUF + STATUS_OFF;
+IF .FAB[FAB$B_BID] NEQ FAB$C_BID
+OR .FAB[FAB$B_BLN] NEQ FAB$C_BLN
+THEN
+	RETURN RMS$_FAB;
+!
+! If the specified file-name does not match the previous file-name,
+! set up the new filenames and parse them.
+!
+IF CH$NEQ(.FAB[FAB$B_FNS],.FAB[FAB$L_FNA],
+	  .FILE_NAME[DSC$W_LENGTH],.FILE_NAME[DSC$A_POINTER],' ')
+THEN 	BEGIN
+	!
+	! If there is a previous name string, then delete it.  Then
+	! allocate space for new filename string.
+	!
+	IF (BLOCKSIZE = .FAB[FAB$B_FNS]) NEQ 0
+	THEN
+	    LIB$FREE_VM(BLOCKSIZE,FAB[FAB$L_FNA]);
+	BLOCKSIZE = .FILE_NAME[DSC$W_LENGTH];
+	IF NOT (STATUS = LIB$GET_VM(BLOCKSIZE,FAB[FAB$L_FNA]))
+	THEN
+	    RETURN .STATUS;
+	CH$MOVE((FAB[FAB$B_FNS] = .BLOCKSIZE),.FILE_NAME[DSC$A_POINTER],
+						.FAB[FAB$L_FNA]);
+
+	!
+	! If specified, set the default name.
+	!
+	IF NOT NULLPARAMETER(4)
+	THEN	BEGIN
+		FAB[FAB$B_DNS] = .DEFAULT_NAME[DSC$W_LENGTH];
+		FAB[FAB$L_DNA] = .DEFAULT_NAME[DSC$A_POINTER];
+		END
+	ELSE
+		FAB[FAB$B_DNS] = 0;
+	!
+	! If specified, set the related default name.
+	!
+	IF NOT NULLPARAMETER(5)
+	THEN	BEGIN
+		RNAM[NAM$B_RSL] = .RELATED_NAME[DSC$W_LENGTH];
+		RNAM[NAM$L_RSA] = .RELATED_NAME[DSC$A_POINTER];
+		END
+	ELSE
+		RNAM[NAM$B_RSL] = 0;
+
+	!
+	! Parse the file-spec.
+	!
+	NAM[NAM$V_SVCTX] = 1;				! Save RMS context
+	STATUS = $PARSE(FAB = .FAB);
+	NEXT_STATUS[0] = .STATUS;			! Save status for next call
+	IF NOT .STATUS
+	THEN
+		BEGIN
+		IF (BLOCKSIZE = .NAM[NAM$B_ESL]) NEQ 0
+		THEN
+			LIB$SCOPY_R_DX(BLOCKSIZE,.NAM[NAM$L_ESA],
+					.RESULT_NAME)
+		ELSE
+		    BEGIN
+			BLOCKSIZE = .FAB[FAB$B_FNS];
+			LIB$SCOPY_R_DX(BLOCKSIZE,.FAB[FAB$L_FNA],
+					.RESULT_NAME);
+			END;
+		NEXT_STATUS[0] = RMS$_NMF;
+		RETURN .STATUS;
+		END;
+	END;
+!
+! If error parsing, or from the last search (could have been RMS$_NMF 
+! set because of no wildcarding) deallocate the FAB/NAM buffer and quit.
+! The case of a wildcard directory and SS$_NOPRIV is special cased to
+! allow a search to continue even if a particular directory is not accessable.
+!
+IF .NEXT_STATUS[0] EQL RMS$_NMF
+THEN	BEGIN
+	CONTEXT[0] = 0;
+	BLOCKSIZE = .FAB[FAB$B_FNS];
+	IF .FAB[FAB$B_FNS] NEQ 0 AND .FAB[FAB$L_FNA] NEQ 0
+	THEN
+	    LIB$FREE_VM(BLOCKSIZE,FAB[FAB$L_FNA]);
+	LIB$FREE_VM(FNBUF_SIZ,FNBUF);
+	RETURN RMS$_NMF;
+	END;
+!
+! If the device is non-directory structured, or the file is a PPF file,
+! then simply return to the caller and avoid the SEARCH sequence.
+!
+IF NOT .(FAB[FAB$L_DEV])<$BITPOSITION(DEV$V_DIR),1>
+AND NOT .NAM[NAM$V_NODE]
+OR .(FAB[FAB$L_DEV])<$BITPOSITION(DEV$V_FOR),1>
+OR .NAM[NAM$V_PPF]
+THEN	BEGIN
+	NEXT_STATUS[0] = RMS$_NMF;			! No more files on next call
+	BLOCKSIZE = .NAM[NAM$B_ESL];
+	LIB$SCOPY_R_DX(BLOCKSIZE,.NAM[NAM$L_ESA],.RESULT_NAME);
+	RETURN .STATUS;
+	END;
+!
+! Search for the next file, unless it is a non-wildcard remote file,
+! in which case, don't bother because it's so expensive.
+!
+IF NOT (.NAM[NAM$V_NODE] AND NOT .NAM[NAM$V_WILDCARD])
+THEN
+	STATUS = $SEARCH(FAB = .FAB);
+!
+! IF PRIVILEGE VIOLATION AND NON-WILDCARD DIRECTORY SPEC THEN
+! SET TO RETURN NO MORE FILES ON NEXT CALL.
+!
+IF NOT .STATUS
+AND NOT (.NAM[NAM$V_WILD_DIR] AND (.FAB[FAB$L_STV] EQL SS$_NOPRIV))
+THEN	BEGIN
+	NEXT_STATUS[0] = RMS$_NMF;			! No more files on next call
+	END;
+!
+! If the filespec is non-wildcarded, set status so next call will return
+! no more files.
+!
+IF NOT .NAM[NAM$V_WILDCARD]
+THEN	
+	NEXT_STATUS[0] = RMS$_NMF;
+!
+! Return the result name.  If the result name isn't set, return the expanded
+! name.
+!
+IF (BLOCKSIZE = .NAM[NAM$B_RSL]) NEQ 0
+THEN
+	LIB$SCOPY_R_DX(BLOCKSIZE,.NAM[NAM$L_RSA],
+			.RESULT_NAME)
+ELSE
+    BEGIN
+	BLOCKSIZE = .NAM[NAM$B_ESL];
+	LIB$SCOPY_R_DX(BLOCKSIZE,.NAM[NAM$L_ESA],
+			.RESULT_NAME);
+	END;
+!
+! If no more files, deallocate the FAB/NAM buffer
+!
+IF .STATUS EQL RMS$_NMF
+THEN	BEGIN
+	CONTEXT[0] = 0;
+	BLOCKSIZE = .FAB[FAB$B_FNS];
+	IF .FAB[FAB$B_FNS] NEQ 0 AND .FAB[FAB$L_FNA] NEQ 0
+	THEN
+	    LIB$FREE_VM(BLOCKSIZE,FAB[FAB$L_FNA]);
+	LIB$FREE_VM(FNBUF_SIZ,FNBUF);
+	END;
+
+RETURN .STATUS
+
+END;
+
+END ELUDOM

@@ -1,0 +1,733 @@
+	.TITLE	FALMAIN - FAL MAINLINE
+	.IDENT	'V03-001'		; Also change FAL$GT_VERSION!!!
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: FAL (DECnet File Access Listener)
+;
+; Abstract:
+;
+;	FAL is the DECnet-VAX file access server program, known as DECnet
+;	object type 17 (decimal). Its purpose is to provide access to files
+;	and unit record devices on a VMS node on behalf of processes executing
+;	on any node of the DECnet communications network. FAL uses the Data
+;	Access Protocol (DAP) to communicate with the requesting process and it
+;	accesses the specified file (or device) through RMS calls.
+;
+; Environment:
+;
+;	The FAL image executes in the context of a process created by NETACP.
+;	It runs in user mode and requires NETMBX and TMPMBX privilege.
+;
+; Author: James A. Krycka,	Creation Date:	16-JUN-1977
+;
+; Modified By:
+;
+;	V03-001	JAK0028		J A Krycka	23-APR-1982
+;		Update FAL$GT_VERSION for FAL logging.
+;
+;	V02-053	KRM0022		K R Malik	14-AUG-1981
+;		Save the name of the partner node in FAL$GT_NODENAME for
+;		possible use by FAL$CRC_LOGERR.
+;
+;	V02-052	JAK0020		J A Krycka	17-JUL-1981
+;		Call $GETJPI to get BYTCNT value, then determine largest QIO
+;		request that the process can support considering that both
+;		transmits and receives will be outstanding.
+;
+;	V02-051	JAK0018		J A Krycka	22-JUN-1981
+;		Revise FAL$CHECK_SS and FAL$CHECK_RMS routines and other error
+;		detection/reporting logic.
+;
+;--
+
+	.SBTTL	DECLARATIONS
+	.PSECT	FAL$DATA	SHR,NOEXE,RD,WRT,LONG
+
+;
+; Include Files:
+;
+
+	$DAPCNFDEF			; Define DAP Configuration message
+	$FALWRKDEF			; Define FAL Work Area symbols
+	$JPIDEF				; Define Job/Process Information symbols
+	$SSDEF				; Define System Service status codes
+
+;
+; Macros:
+;
+;	None
+;
+; Equated Symbols:
+;
+
+	ASSUME	FAL$Q_FLG EQ 0
+
+;
+; Own Storage:
+;
+; Text stored as counted ASCII strings:
+;
+
+FAL$GT_VERSION::			; FAL version number string used by
+	.ASCIC	\V03-001\		;  FALLOGGER--same as module ident #
+
+;
+; Device name and logical name descriptor blocks with text:
+;
+
+FAL$GQ_LNKNAM::				; Device name descriptor block
+	QBLOCK	TEXT=<_NET0:>		;  for the link
+FAL$GQ_SYSNAM::				; Logical name descriptor block
+	QBLOCK	TEXT=<SYS$NET>		;  for SYS$NET
+FAL$GQ_LOGNAM::				; Logical name descriptor block
+	QBLOCK	TEXT=<FAL$LOG>		;  for FAL$LOG
+
+;
+; Item list parameter block for the $GETJPI System Service call:
+;
+
+	.ALIGN	LONG
+FAL$GETJPI_LST::			; Start of parameter block
+	.WORD	4			; Length of buffer
+	.WORD	JPI$_BYTCNT		; Type of info to return
+	.LONG	FAL$GL_BYTCNT		; Address of buffer
+	.LONG	0			; Don't return length of value
+	.LONG	0			; End of parameter block
+FAL$GL_BYTCNT::				; Remaining buffered I/O byte count
+	.BLKL	1			;  quota value is returned here
+
+	.SBTTL	FAL$START - MAINLINE
+	.PSECT	FAL$CODE	NOSHR,EXE,RD,NOWRT,BYTE
+
+;++
+; Functional Description:
+;
+;	FAL$START is responsible for the initialization and termination of FAL.
+;	These activities include:
+;
+;	(1) allocation of the FAL work area and several control blocks within
+;	(2) translation of FAL$LOG and logging information to SYS$OUTPUT
+;	(3) creation of a control/information path to NETACP via NET0
+;	(4) translation of SYS$NET and construction of an NCB
+;	(5) completion of the logical link
+;	(6) allocation of receive, transmit, and auxiliary buffers
+;	(7) posting reads and transferring control to the state table manager
+;	(8) terminating the image and exiting to VMS
+;
+;	Once a logical link has been established between FAL and its requestor,
+;	control is passed to FAL$STATE, the state transition table manager,
+;	which controls the operation of FAL.
+;
+; Calling Sequence:
+;
+;	Normally, FAL is run from SYS$SYSTEM:FAL.COM, a batch procedure that
+;	is executed when an inbound connect request for object type 17 (decimal)
+;	is received by this node.
+;
+; Input Parameters:
+;
+;	None
+;
+; Implicit Inputs:
+;
+;	Logical name 'FAL$LOG'
+;	Logical name 'SYS$NET'
+;
+; Output Parameters:
+;
+;	None
+;
+; Implicit Outputs:
+;
+;	None
+;
+; Completion Codes:
+;
+;	Standard RMS completion codes
+;
+; Side Effects:
+;
+;	None
+;
+;--
+
+	.ENTRY	FAL$START,^M<>		; Entry point from executive
+
+;+
+; Allocate space for the FAL work area (defined by $FALWRKDEF). Within this
+; work area space is reserved for several other structures. These include the
+; DAP, STB, FAB, RAB, NAM, and XAB control blocks.
+;-
+
+	MOVL	#<FAL$K_WRKBLN+511/512>,R1 ; Request required # pages
+	BSBW	FAL$GETPAGE		; Expand program region
+	MOVL	R2,R8			; Get address of FAL work area
+	MOVAB	FAL$T_DAP(R8),R9	; Get address of DAP control block
+	MOVAL	FAL$L_FAB(R8),R10	; Get address of FAB
+	MOVAL	FAL$L_RAB(R8),R11	; Get address of RAB
+
+;+
+; Translate the logical name 'FAL$LOG' to determine what type of information
+; (if any) is to be logged in the print file. For 'FAL$LOG' to be used, it
+; must translate to an equivalence string of the form 'xx_yy' where:
+;
+;   (1)	xx is a hexidecimal number that represents a longword flag value.
+;   (2) yy is a hexidecimal number that specifies how many bytes of each DAP
+;	message to display in the print file.
+;
+; Note that the definition of FAL$LOG as a logical name is strictly optional.
+;-
+
+TRANS_FAL$LOG:				; Continuation of mainline
+	MOVAQ	FAL$Q_NCB(R8),R7	; Get address of descriptor
+	MOVZBL	#FAL$K_NCBBUF,(R7)	; Store buffer size
+	MOVAB	FAL$T_NCBBUF(R8),4(R7)	; Store buffer address
+	$TRNLOG_S-			; Translate 'FAL$LOG'
+		LOGNAM=W^FAL$GQ_LOGNAM-	;  Address of logical name descriptor
+		RSLLEN=(R7)-		;  Store equivalence string size
+		RSLBUF=(R7)		;  Put equivalence string in buffer
+	CMPW	R0,#<SS$_NOTRAN&^XFFFF>	; Branch if logical name is not defined
+	BEQL	ASSIGN_CHAN		;
+	CHECK_SS			; Check status code
+
+;
+; Process display byte count parameter ('yy' as define above).
+;
+
+	LOCC	#^A\_\,(R7),@4(R7)	; Find underline delimiter, if any
+	BEQL	10$			; Branch if no underline found
+	SUBL2	R0,(R7)			; Compute size of flag string
+	DECL	R0			; Skip over slash
+	INCL	R1			;
+	PUSHAL	W^FAL$GL_LOGCNT		; Address of result
+	PUSHL	R1			; Address of input string
+	PUSHL	R0			; Size of input string
+	CALLS	#3,G^LIB$CVT_HTB	; Convert hex byte count to binary
+	BLBC	R0,ASSIGN_CHAN		; Branch on error
+
+;
+; Process flag mask parameter ('xx' as defined above).
+;
+
+10$:	PUSHAL	W^FAL$GL_LOGFLG		; Address of result
+	PUSHL	4(R7)			; Address of input string
+	PUSHL	(R7)			; Size of input string
+	CALLS	#3,G^LIB$CVT_HTB	; Convert hex flag string to binary
+	BLBC	R0,ASSIGN_CHAN		; Branch on error
+	MOVB	W^FAL$GL_LOGFLG,-	; Copy flags to FAL work area for
+		FAL$B_LOGFLG(R8)	;  easy reference
+
+;+
+; Create the print file and allocate print buffers.
+;
+; Note:	Usually, SYS$OUTPUT will refer to the batch log file (FAL.LOG).
+;	However, SYS$OUTPUT may be assigned to any file specification,
+;	including one containing a node name.
+;-
+
+INIT_PRINT_FILE:			; Continuation of mainline
+
+	ASSUME	FAL$V_LOG_NAM+1 EQ FAL$V_LOG_STA
+	ASSUME	FAL$V_LOG_STA+1 EQ FAL$V_LOG_MSG
+	ASSUME	FAL$V_LOG_MSG+1 EQ FAL$V_LOG_AST
+	ASSUME	FAL$V_LOG_AST+1 EQ FAL$V_LOG_QIO
+
+	EXTZV	#FAL$V_LOG_NAM,#5,(R8),R0 ; Get logging flags
+	BEQL	ASSIGN_CHAN		; Branch in none set
+	$CREATE	FAB=W^FAL$PRTFAB	; Create the file
+	CHECK_RMS			; Check completion code
+	$CONNECT RAB=W^FAL$PRTRAB	; Establish record stream
+	CHECK_RMS			; Check completion code
+	MOVL	#<<FAL$K_PRTBUF*2+511>/512>,R1
+					; Request required # pages
+	BSBW	FAL$GETPAGE		; Expand program region
+	MOVZWL	#FAL$K_PRTBUF,R1	; Get size of print buffer
+	MOVQ	R1,W^FAL$GQ_PRTBUF	; Initialize descriptor of primary
+					;  (non-AST-level) print buffer
+	ADDL2	R1,R2			; Refer to next print buffer
+	MOVQ	R1,W^FAL$GQ_PRTBUFA	; Initialize descriptor of secondary
+					;  (AST-level) print buffer
+
+;+
+; Create a temporary mailbox and assign a channel to it. Then assign a channel
+; to the pseudo device _NET0 and associate the temporary mailbox with this
+; channel.
+;
+; Note:	Assigning a channel to _NET0 does not confirm the logical link--it
+;	simply creates a control/information path to NETACP in preparation for
+;	non-transparent network I/O. A QIO access function must be issued to
+;	complete the logical link.
+;-
+
+ASSIGN_CHAN:				; Continuation of mainline
+	MOVAB	FAL$T_MBXBUF(R8),R1	; Get address of scratch buffer
+	MOVZWL	#FAL$K_MBXBUF,(R1)	; Store mailbox buffer size parameter
+	MOVZWL	#FAL$K_MBXQUOTA,4(R1)	; Store mailbox buffer quota parameter
+	PUSHAW	FAL$W_MBXCHN(R8)	; Address to return mailbox channel #
+	PUSHAW	FAL$W_LNKCHN(R8)	; Address to return device channel #
+	PUSHAL	4(R1)			; Address of mailbox buffer quota
+	PUSHAL	(R1)			; Address of mailbox buffer size
+	PUSHAQ	W^FAL$GQ_LNKNAM		; Address of device name descriptor
+	CALLS	#5,G^LIB$ASN_WTH_MBX	; Assign a channel to _NET0 and
+					;  associate a temporary mailbox with it
+	CHECK_SS			; Check status code
+
+;+
+; Translate the logical name 'SYS$NET'. It's equivalence string is defined by
+; VMS to be the entire network connect block (NCB) which is required to gain
+; non-transparent access to the network.
+;
+; The general format of the equivalence string is:
+;
+;	nodespec::"objecttype=taskid/{binary_data}"
+;
+; However, the string output to the print file will have the binary data
+; truncated as shown below:
+;
+;	nodespec::"objecttype=taskid"
+;
+; Finally, the string put into the NCB for a connect accept without userdata
+; will include only the first two bytes of the binary data past the slash:
+;
+;	nodespec::"objecttype=taskid/{two_bytes_of_binary_data}"
+;-
+
+TRANS_SYS$NET:				; Continuation of mainline
+	MOVAQ	FAL$Q_NCB(R8),R7	; Get address of NCB descriptor
+	MOVZBL	#FAL$K_NCBBUF,(R7)	; Store buffer size
+	MOVAB	FAL$T_NCBBUF(R8),4(R7)	; Store buffer address
+	$TRNLOG_S-			; Translate 'SYS$NET'
+		LOGNAM=W^FAL$GQ_SYSNAM- ;  Address of logical name descriptor
+		RSLLEN=(R7)-		;  Update size in NCB descriptor
+		RSLBUF=(R7)		;  Put equivalence string in NCB
+	CMPW	R0,#<SS$_NOTRAN&^XFFFF>	; Branch if logical name is not defined
+	BEQL	20$			;
+	CHECK_SS			; Check status code
+
+;
+; Extract the name of the partner node and save it for use by FAL$CRC_LOGERR.
+;
+
+	MOVQ	(R7),R2			; Make writable copy of descriptor
+	LOCC	#^A/:/,R2,(R3)		; Find the colon
+	SUBL3	R3,R1,R2		; Compute the nodename length
+	CMPB	#^A/_/,(R3)		; Nodename start with an underscore?
+	BNEQ	10$			; No
+	DECL	R2			; Yes, lower the count
+	INCL	R3			; and bump pointer past underscore
+10$:	MOVAB	W^FAL$GT_NODENAME,R4	; Get address of buffer to put nodename
+	MOVB	R2,(R4)+		; Move the count into the buffer
+	MOVC3	R2,(R3),(R4)		; Put the nodename in buffer
+
+;
+; Locate the slash preceeding the binary data and save its address.
+;
+
+	LOCC	#^A\/\,(R7),@4(R7)	; Find taskid delimiter
+	BNEQ	30$			; Branch if slash found
+20$:	MOVZWL	#SS$_IVLOGNAM,W^FAL$GL_EXIT ; Declare error
+	BRW	FAL$TERMINATE		; Terminate image execution
+30$:	MOVL	R1,R2			; Save address of slash
+
+;
+; Output FAL version number and the identity of the requestor to the print file.
+;
+
+	EXTZV	#FAL$V_LOG_NAM,#5,(R8),R0 ; Get logging flags
+	BEQL	COMPLETE_LINK		; Branch in none set
+	MOVB	#^A\"\,(R1)+		; Overlay slash to truncate string
+	SUBL3	4(R7),R1,(R7)		; Update string size in descriptor
+	$FAO_S-				; Format the message
+		CTRSTR=W^FAL$GQ_CALLER-	;  Address of control string
+		OUTLEN=W^FAL$GW_PRTLEN-	;  Address of receive string length
+		OUTBUF=W^FAL$GQ_PRTBUF-	;  Address of buffer to put string
+		P1=#FAL$GT_VERSION-	;  FAL version number string address
+		P2=#0-			;  Use current date and time
+		P3=R7-			;  Address of requestor string desc
+		P4=FAL$B_LOGFLG(R8)	;  Logging flag mask
+	CHECK_SS			; Check status code
+	BSBW	FAL$PRINT_FAO		; Print message
+
+;+
+; Respond to the connect initiate with a connect accept (without userdata)
+; to complete the logical link.
+;-
+
+COMPLETE_LINK:				; Continuation of mainline
+	MOVB	#^A\/\,(R2)+		; Restore slash to string
+	TSTW	(R2)+			; Skip over first 2 bytes of binary data
+	MOVB	#^A\"\,(R2)+		; Truncate string here
+	SUBL3	4(R7),R2,(R7)		; Update string size in NCB descriptor
+	$QIOW_S-			; Issue connect accept to complete link
+		EFN=#FAL$K_XMTEFN-	;  Event flag number
+		CHAN=FAL$W_LNKCHN(R8)-	;  Channel number
+		FUNC=#IO$_ACCESS!IO$M_ACCESS- ; Function code
+		IOSB=FAL$Q_XMTIOSB(R8)-	;  Address of I/O status block
+		P1=0-			;  Must be zero
+		P2=R7			;  Address of NCB descriptor
+	CHECK_SS			; Check status code
+
+;
+; Output link established message to the print file.
+;
+
+	BBC	#FAL$V_LOG_STA,(R8),-	; Branch if logging disabled
+		ALLOC_BUFFERS		;
+	$GETTIM_S TIMADR=W^FAL$GQ_TIME0	; Get current date and time
+	CHECK_SS			; Check status code
+	$FAO_S-				; Format the message
+		CTRSTR=W^FAL$GQ_LINKUP-	;  Address of control string
+		OUTLEN=W^FAL$GW_PRTLEN-	;  Address of receive string length
+		OUTBUF=W^FAL$GQ_PRTBUF-	;  Address of buffer to put string
+		P1=#FAL$GQ_TIME0	;  Address of absolute date and time
+	CHECK_SS			; Check status code
+	BSBW	FAL$PRINT_FAO		; Print message
+
+;+
+; Allocate space for two receive buffers, one transmit buffer (for building a
+; DAP message), and one auxiliary buffer (for blocking DAP messages to send).
+;-
+
+ALLOC_BUFFERS:				; Allocate logical link I/O buffers
+
+;
+; Determine the remaining buffered I/O byte count quota available to this
+; process for transmit and receive QIO requests over the logical link. This
+; information will be in determining the size of I/O buffers to allocate.
+;
+; Note:	It is important to make the call to $GETJPI after VMS has subtracted
+;	quota for the network UCB, the mailbox UCB, and the mailbox buffer
+;	(via the LIB$ASN_WTH_CHN call).
+;
+
+	MOVAB	W^FAL$GETJPI_LST,R7	; Get address of parameter block
+	$GETJPI_S-			; Get job/process information
+		ITMLST=(R7)		;  Address of item list
+	CHECK_SS			; Check status code
+	MOVL	W^FAL$GL_BYTCNT,R4	; Get remaining buffered I/O quota
+	EXTZV	#FAL$V_LOG_NAM,#5,(R8),R0 ; Get logging flags
+	BEQL	10$			; Branch in none set
+	SUBW2	#FAL$K_PRTBUF,R4	; Subtract largest message that may be
+					;  sent to print file from quota
+
+;
+; Assuming that FAL will have no more than two QIO requests outstanding for the
+; logical link (1 XMT and 1 RCV), compute the size of the largest QIO request
+; supported by this process. Next determine the size of each buffer to allocate.
+; This value will be the smaller of the process supported size and the largest
+; buffer size that DECnet-VAX FAL is allowed to use. Finally, check that this
+; value against the smallest buffer size that DECnet-VAX FAL is allowed to use.
+;
+; The intent is to have (DAP$K_MINBUFSIZ <= FAL$W_QIOBUFSIZ <= DAP$K_MAXBUFSIZ).
+;
+
+10$:	ASHL	#-1,R4,R4		; Divide by 2
+	CMPW	R4,#DAP$K_MAXBUFSIZ	; Branch if remaining quota exceeds
+	BGEQU	20$			;  maximum DAP buffer size
+	CMPW	R4,#DAP$K_MINBUFSIZ	; Branch if quota is large enough to
+	BGEQU	30$			;  accomodate minimum DAP buffer size
+	MOVZWL	#SS$_EXQUOTA,W^FAL$GL_EXIT ; Declare error
+	BRW	FAL$TERMINATE		; Terminate image execution
+20$:	MOVZWL	#DAP$K_MAXBUFSIZ,R4	; Use maximum buffer size value instead
+30$:	MOVW	R4,FAL$W_QIOBUFSIZ(R8)	; Save supported buffer size for use
+					;  in building Configuration message
+	MOVW	R4,FAL$W_DAPBUFSIZ(R8)	; Initialize DAP buffer size for use by
+					;  FAL$RCV_QIO (it will be revised after
+					;  exchange of Configuration messages
+
+;
+; Allocate space for receive, transmit, and auxiliary buffers and put size and
+; address information about them in the FAL work area. All buffers will be the
+; the same size and each will start on a page boundary.
+;
+
+
+	ADDW2	#511,R4			; Compute # of pages required for
+	ASHL	#-9,R4,R4		;  each buffer
+	MULL3	#<FAL$K_RCVBUFCNT+1+1>,-; Compute total # of pages required
+		R4,R1			;  for RCV, XMT, and AUX buffers
+	BSBW	FAL$GETPAGE		; Expand program region
+	ASHL	#9,R4,R5		; Compute # bytes per buffer
+	MOVL	#FAL$K_RCVBUFCNT,R0	; Get number of receive buffers
+	MOVAL	FAL$L_RCVBUF(R8),R1	; Get address of buffer address table
+40$:	MOVL	R2,(R1)+		; Store receive buffer address
+	ADDL2	R5,R2			; Compute next buffer address
+	SOBGTR	R0,40$			; Branch if more to do
+	MOVL	R2,FAL$Q_XMT+4(R8)	; Store transmit buffer address
+	ADDL2	R5,R2			; Compute next buffer address
+	MOVL	R2,FAL$Q_AUX+4(R8)	; Store AUX transmit buffer address
+	MOVL	R2,FAL$L_AUX_PTR(R8)	; Initialize next byte pointer
+
+;+
+; Post read requests to the mailbox and logical link, then transfer control
+; to the state table manager.
+;-
+
+END_OF_SETUP:				; Continuation of mainline
+
+;
+; Issue a read with an AST for the associated mailbox so that FAL will be
+; notified of a change in the status of the link such as partner exited or
+; of the receipt of an interrupt message.
+;
+; Note:	Each time that a read completes, another read will be issued to keep
+;	one read request outstanding.
+;
+
+	BSBW	FAL$MBX_RCV_QIO		; Issue mailbox read with AST
+
+;
+; Issue a read with an AST for the logical link.
+;
+; Note:	Each time that a read completes, another read will be issued to keep
+;	one read request outstanding.
+;
+
+	BSBW	FAL$RCV_QIO		; Issue link read with AST
+
+;
+; Transfer control to the state transiton table mananger.
+;
+
+	MOVAB	W^FAL$STATE_TABLE,R2	; Get address of state transition table
+	BSBW	FAL$STATE		; Give control to state table manager
+
+	.SBTTL	FAL$TERMINATE, FAL$IMAGE_EXIT
+
+;++
+; Graceful exit to VMS.
+;--
+
+FAL$TERMINATE::				; Control point
+
+;
+; Output link terminated message and statistics messages to the print file.
+;
+
+	BBC	#FAL$V_LOG_STA,(R8),10$	; Branch if logging disabled
+	BBC	#FAL$V_CNF_MSG,(R8),10$	; Branch if no messages received
+	$GETTIM_S TIMADR=W^FAL$GQ_TIME1	; Get current date and time
+	CHECK_SS			; Check status code
+	$FAO_S-				; Format the message
+		CTRSTR=W^FAL$GQ_LINKDOWN-; Address of control string
+		OUTLEN=W^FAL$GW_PRTLEN-	;  Address of receive string length
+		OUTBUF=W^FAL$GQ_PRTBUF-	;  Address of buffer to put string
+		P1=#FAL$GQ_TIME1	;  Address of absolute date and time
+	CHECK_SS			; Check status code
+	BSBW	FAL$PRINT_FAO		; Print message
+	BSBW	FAL$STATISTICS		; Compute and print statistics
+
+;
+; Output exit message to the print file.
+;
+
+10$:	EXTZV	#FAL$V_LOG_NAM,#5,(R8),R0 ; Get logging flags
+	BEQL	FAL$IMAGE_EXIT		; Branch if none set
+	$FAO_S-				; Format the message
+		CTRSTR=W^FAL$GQ_EXIT-	;  Address of control string
+		OUTLEN=W^FAL$GW_PRTLEN-	;  Address of receive string length
+		OUTBUF=W^FAL$GQ_PRTBUF-	;  Address of buffer to put string
+		P1=#0			;  Use current date and time
+	CHECK_SS			; Check status code
+	BSBW	FAL$PRINT_FAO		; Print message
+
+;
+; Close the print file.
+;
+
+	$CLOSE	FAB=W^FAL$PRTFAB	; Close the print file
+	CHECK_RMS			; Check completion code
+
+;++
+; Quick exit to VMS (or continuation of FAL$TERMINATE).
+;
+; Note:	Image rundown will deassign all channels (which will break the logical
+;	link with partner).
+;--
+
+FAL$IMAGE_EXIT::			; Control point
+	$EXIT_S	CODE=W^FAL$GL_EXIT	; Exit to VMS with status code specified
+
+	.SBTTL	FAL$CHECK_SS - CHECK SYSTEM SERVICE STATUS CODE
+	.PSECT	FAL$CODE	NOSHR,EXE,RD,NOWRT,BYTE
+
+;++
+; Functional Description:
+;
+;	FAL$CHECK_SS checks the status code in R0 following a call to a
+;	System Service. If failure is indicated, the image is terminated with
+;	R0 as the exit completion code.
+;
+; Calling Sequence:
+;
+;	BSBW	FAL$CHECK_SS
+;
+; Input Parameters:
+;
+;	R0	System Service status code
+;
+; Implicit Inputs:
+;
+;	FAL$GL_EXIT
+;
+; Output Parameters:
+;
+;	None
+;
+; Implicit Outputs:
+;
+;	FAL$GL_EXIT
+;
+; Completion Codes:
+;
+;	None
+;
+; Side Effects:
+;
+;	If the System Service indicates failure, the image is terminated with
+;	R0 on input as the exit completion code.
+;
+;--
+
+FAL$CHECK_SS::				; Entry point
+	BLBC	R0,10$			; Was System Service successful?
+	RSB				; Yes, exit
+					; No, terminate execution ...
+10$:	BLBC	W^FAL$GL_EXIT,30$	; Branch if an error was previously
+					;  detected to prevent possible loop
+	CMPW	R0,#SS$_LINKABORT	; Do not report these error codes as
+	BEQL	20$			;  the partner process tells FAL to
+	CMPW	R0,#SS$_LINKDISCON	;  terminate by breaking the logical
+	BEQL	20$			;  link (i.e., there is no DAP directive
+	CMPW	R0,#SS$_LINKEXIT	;  to tell FAL to terminate)
+	BEQL	20$			;
+	MOVL	R0,W^FAL$GL_EXIT	; Store error code for use at image exit
+20$:	BRW	FAL$TERMINATE		; Take graceful termination path
+30$:	BRW	FAL$IMAGE_EXIT		; Take quick termination path
+
+	.SBTTL	FAL$CHECK_RMS - CHECK RMS COMPLETION CODE
+	.PSECT	FAL$CODE	NOSHR,EXE,RD,NOWRT,BYTE
+
+;++
+; Functional Description:
+;
+;	FAL$CHECK_RMS checks the completion code in R0 following a call to RMS.
+;	It is intended for use after RMS calls that refer to the print file.
+;
+; Calling Sequence:
+;
+;	BSBW	FAL$CHECK_RMS
+;
+; Input Parameters:
+;
+;	R0	RMS completion code
+;
+; Implicit Inputs:
+;
+;	FAL$GL_EXIT
+;
+; Output Parameters:
+;
+;	None
+;
+; Implicit Outputs:
+;
+;	FAL$GL_EXIT
+;
+; Completion Codes:
+;
+;	None
+;
+; Side Effects:
+;
+;	If the RMS call indicates failure, then the image is terminated with
+;	R0 on input as the exit completion code.
+;
+;--
+
+FAL$CHECK_RMS::				; Entry point
+	BLBC	R0,10$			; Was RMS call successful?
+	RSB				; Yes, exit
+					; No, terminate execution ...
+10$:	BLBC	W^FAL$GL_EXIT,20$	; Store error code in R0 for use at
+	MOVL	R0,W^FAL$GL_EXIT	;  image exit unless an error was
+					;  previously detected
+20$:	BRW	FAL$IMAGE_EXIT		; Take quick termination path
+
+	.SBTTL	FAL$GETPAGE - EXPAND PROGARM REGION
+	.PSECT	FAL$CODE	NOSHR,EXE,RD,NOWRT,BYTE
+
+;++
+; Functional Description:
+;
+;	FAL$GETPAGE expands the program region (P0) by the number of pages
+;	specified. These are demand zero pages.
+;
+; Calling Sequence:
+;
+;	BSBW	FAL$GETPAGE
+;
+; Input Parameters:
+;
+;	R1	# of pages to allocate
+;
+; Implicit Inputs:
+;
+;	None
+;
+; Output Parameters:
+;
+;	R0-R1	Destroyed
+;	R2	Address of first byte allocated
+;	R3	Address of last byte allocated
+;
+; Implicit Outputs:
+;
+;	None
+;
+; Completion Codes:
+;
+;	None
+;
+; Side Effects:
+;
+;	The virtual address space of the image is expanded.
+;
+;--
+
+FAL$GETPAGE::				; Entry point
+	CLRQ	-(SP)			; Form array to receive address bounds
+	MOVL	SP,R0			;  and save its address
+	$EXPREG_S-			; Expand program region
+		PAGCNT=R1-		;  # pages desired in P0 space
+		RETADR=(R0)		;  Address to receive lo & hi addresses
+	CHECK_SS			; Check status code
+	MOVQ	(SP)+,R2		; Store first and last addresses
+	RSB				; Exit
+
+	.END	FAL$START		; Image transfer address

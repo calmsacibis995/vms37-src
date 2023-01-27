@@ -1,0 +1,1545 @@
+
+MODULE RM3GET (LANGUAGE (BLISS32) ,
+		IDENT = 'V03-006'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:	RMS32 INDEX SEQUENTIAL FILE ORGANIZATION
+!
+! Abstract:
+!                This module implements the get and find record operations
+!		 for the indexed file organization.
+!
+!
+! ENVIRONMENT:
+!
+!		VAX/VMS OPERATING SYSTEM
+!
+!--
+
+!
+! AUTHOR:        E. H. MARISON     CREATION DATE:        	18-APR-78  13:11
+!
+!
+! MODIFIED BY:
+!
+!	V03-006 LJA0008		Laurie Anderson		08-Apr-1982
+!		Must check for allocation of IDX_DFN, before access fields in
+!		it.  The IDX_DFN will not be allocated if there is an error
+!		returned from RM$KEY_DESC which is called by GET_RECORD.
+!
+!	V03-005	TMK0003		Todd M. Katz		01-Apr-1982
+!		If record locking is enabled, in GET_RECORD we lock the record
+!		we have found. If we had to wait for this record, the status 
+!		returned is an alternate success (OK_WAT). We should be setting
+!		the IRB$V_UNLOCK_RP bit so that whenever we have finished 
+!		with this record RMS will know to release it, but because our
+!		status is OK_WAT and not success, the current flow of control 
+!		forces a return before this bit can be set. Therefore, the 
+!		possibility exists that once a process has waited for a record
+!		lock and successfully locks the record, it will not release the
+!		lock unless explicitely told to do so (such as by an explicit
+!		$RELEASE). To avoid this undesirable possibility, we will
+!		make sure that IRB$V_UNLOCK_RP will be set even when we had
+!		to wait for a record lock.
+!
+!	V03-004	TMK0002		Todd M. Katz		26-Mar-1982
+!		Under two different set of circumstances we will have to 
+!		release the record lock obtained in GET_RECORD.
+!
+!		1. If we have decided to make another iterative call to
+!		   GET_RECORD and we have locked a record within the last
+!		   call, then we must release this lock before attempting
+!		   to locate the next record in the current call.
+!		
+!		2. If we are currently performing a random $FIND/$GET, and
+!		   we must wait in our attempt to lock the record we have
+!		   found (RAB$V_WAT is set), and upon returning and reaccessing
+!		   the bucket we found that this record has been deleted by
+!		   the stream that previously had it locked, then we must
+!		   release our lock on this deleted record before returning
+!		   the status of deleted record from RM$GET3B.
+!
+!		Both of these record lock releases may be signaled by setting
+!		the IRAB bit IRB$L_UNLOCK_RP within GET_RECORD at the 
+!		appropriate time. The record will then be locked either within
+!		GET_RECORD in the former case or within RM$GET3B in the latter.
+!
+!	V03-003	TMK0001		Todd M. Katz		24-Mar-1982
+!		Change all references to te keybuffers to use the macro
+!		KEYBUF_ADDR
+!
+!		If an error status of RLK is returned on an attempt to
+!		"get" a data record, try again until the record is retrieved
+!		or a different error is returned. This will only occur when
+!		our key of reference is other than key 0, and someone else had
+!		the primary data (or RRV) bucket locked when we attempted to
+!		access it from the SIDR. The SIDR bucket must be released
+!		and we have to reaccess it inorder to avoid a potential 
+!		deadlock situation, and returning an error of RLK will now
+!		guarentee that this is what will happen.
+!
+!		If the attempt to sequentially access a record results in a
+!		status of record deleted being returned from GET_RECORD,
+!		attempt to sequentially retrieve the very next record, and
+!		continue doing this until some other status is returned. This
+!		situation can develop if we try for a record lock and end up
+!		waiting (the ROP WAT bit is set) for it. While we are waiting
+!		the process (or stream) which has the record lock deletes it.
+!		When control returns to this process, the status it gets back
+!		indicates that it had to wait, and so it reacesses the bucket
+!		the record was in (it had to release it when it went for the
+!		record lock) and now finds the record is deleted and returns
+!		that status.
+!
+!		When control returns to RM$GETRECORD from RM$POS_SEQ, 
+!		RM$POS_KEY, or RM$FIND_BY_RRV with a success status, the next 
+!		record has been found, the bucket containing it has been 
+!		locked, and the IRAB fields IRB$L_RFA_VBN, IRB$W_RFA_ID, and 
+!		IRB$W_SAVE_POS contain the information necessary to update the 
+!		NRP context to that of the "found" record. If a decision is
+!		made to lock the record, and RMS has to stall for the record
+!		lock (RAB$V_WAT is set and some other stream has the record 
+!		locked) then when the lock is obtained, the bucket containing
+!		the record is no longer locked (if we have to wait for the
+!		record lock we must release the lock on the bucket to avoid the
+!		possibility of deadlock), and the NRP updating information 
+!		within the IRAB can no longer be considered valid because the 
+!		bucket containing the record might have split moving the record
+!		to the new bucket, and the record itself might even have been 
+!		deleted. If we are accessing this file by its primary key,
+!		then as its record pointer (RP) information is still valid,
+!		we can call RM$FIND_BY_RRV to lock the bucket. Once the bucket
+!		has been again locked, the information necessary to update
+!		the next record context can be obtained and we can proceed.
+!		However, if we are accessing this record by an alternate
+!		key and we stall, then there is no easy way to reobtain the
+!		next record context information necessary for later updating of
+!		the NRP list. Thus, if the primary data record which we have
+!		locked is not deleted, and if we are performing a sequential
+!		$FIND, or a $GET operation (for which NRP list updating is
+!		mandatory), then we have no choice but repeat this lengthy
+!		process from the beginning. This is done BYby noting on return
+!		from GET_RECORD, that we have an alternate success status
+!		(OK_WAT), that we our key of reference is not the primary key,
+!		and that we have not locked the primary data bucket.
+!
+!	V03-002	LJA0006		Laurie Anderson		23-Mar-1982
+!		If the get record caused an RTB error, then the primary key
+!		was not copied into an RMS internal buffer.  This key buffer
+!		is used to avoid un-locking a record during a random access
+!		for an exact match by key when that record is the current 
+!		record.
+!
+!	V03-001	KPL0009		Peter Lieberwirth	17-Mar-1982
+!		Set UNLOCK_RP on errors reaccessing record after successful
+!		wait for record lock.  This will cause the record to be
+!		unlocked on the way out.
+!
+!		Add sutitles.
+!
+!	V02-025	DJD0001		Darrell Duffy		1-March-1982
+!		Clean up probing of input parameters
+!
+!	V02-024	KPL0008		Peter Lieberwirth	 5-Nov-1981
+!		Add support for PUT to EOF by clearing internal EOF flag on
+!		random gets, and returning RMS$_EOF on sequential gets.
+!
+!	V02-023	KPL0007		Peter Lieberwirth	 7-Oct-1981
+!		Fix bug on reacessing buffer logic on secondary key.
+!
+!	V02-022	KPL0006		Peter Lieberwirth	 2-Oct-1981
+!		Fix bugs related to interaction of WAT bit set when QUERY_LCK
+!		is called.  When re-accessing same record, don't WAT even if
+!		user said to until real lock logic.  Also, when QUERY_LCK
+!		called with WAT set in lock logic of GET_RECORD, remember to
+!		reaccess the bucket if RMS stalled.  Fix reaccess logic to
+!		work with secondary keys.  (Oops!)
+!
+!	V02-021	KPL0005		Peter Lieberwirth	23-Aug-1981
+!		Fix incorrect and misleading commentary due to V02-018.
+!		Also, allocate a temporary variable more efficently.
+!
+!	V02-020	MCN0011		Maria del C. Nasr	24-Jul-1981
+!		Implement key type conversion.
+!
+!	V02-019	MCN0010		Maria del C. Nasr	23-Jul-1981
+!		Incorporate all the following changes:
+!
+!		Use RM$REC_OVHD, and user's buffer to get key
+!		Use key buffer 4 to unpack primary key.
+!		Include code for unpacking of prologue 3 data records.
+!		Change calling sequence of RM$FIND_BY_RRV.
+!		Increase size of record identifier to a word in the IRB,
+!		NRP, and RLB.
+!		Modify routine to handle new prologue 3 data structure
+!		changes (base level 1).
+!
+!	V02-018	KPL0004		P. Lieberwirth		15-Jan-1981   3:15
+!		Change GET_RECORD to reaccess bucket if it had to be given
+!		up for wait on record.  Implements new ROP functionality
+!		implied by WAT and REA.
+!
+!	V02-017	SPR33597	P. Lieberwirth		24-Nov-1980  10:00
+!		Fix bug where omitted fetch operator caused incorrect test
+!		for validity of NRP.  Bug caused incorrect operation on
+!		sequential $FINDs.  Clarify some commentary by cleaning up
+!		some spelling mistakes, and explaining FIND some more.
+!
+!	V02-016	REFORMAT	K. E. Kinnear		24-Jul-1980  9:54
+!
+!	V02-015	CDS0073		C. D. Saether		17-Jan-1980  2:35
+!		Restructure current record unlocking logic to add check
+!		when duplicates aren't allowed to avoid record lock window
+!		and reaccessing current record.
+!
+!	V02-014	PSK0005		P. S. Knibbe		18-Dec-1979  5:00
+!		Check that packed decimal keys are in the correct format.
+!
+! REVISION HISTORY:
+!
+!	V02-013			C. D. Saether		12-Jul-1979  11:30
+!		Level calling RM$COMPARE_REC should be -1.
+!
+!	V01-012			W. Koenig		6-Feb-1979  17:19
+!		Fill in user's RFA after some other checks.
+!
+!	V01-011			W. Koenig		6-Dec-1978  10:19
+!		Implement RMS$_OK_LIM.
+!
+!	V01-010			W. Koenig		5-Dec-1978  10:25
+!		Don't return DCT Field.
+!
+!	V01-009			W. Koenig		24-Oct-1978  14:02
+!		Make changes caused by sharing conventions.
+!
+!	V01-008			W. Koenig		5-Oct-1978  14:02
+!		Zero all the NRP flags when resetting the NRP data.
+!
+!	V01-007			W. Koenig		26-Sep-1978  16:42
+!		Don't zero the RP information after a successful get or
+!		sequential find.
+!
+!	V01-006			W. Koenig		26-Sep-1978  13:15
+!		Can no longer zero out RP_SECOND as a longword.
+!
+!	V01-005			C. D. Saether		21-Sep-1978  16:44
+!		Clear SRCFLAGS always.
+!
+!	V01-004			W. Koenig		21-Sep-1978  15:50
+!		Return the data to the user on any seccess, not just "suc".
+!
+!	V01-003			C. D. Saether		20-Sep-1978  16:25
+!		Clear NRP update flags when storing NRP.
+!
+!	V01-002			C. D. Saether		12-Sep-1978  15:21
+!		Remove NXTBDB setup on RFA access.
+!
+!*****
+
+LIBRARY 'RMSLIB:RMS';
+
+REQUIRE 'RMSSRC:RMSIDXDEF';
+
+! Define default psects for code
+!
+
+PSECT
+    CODE = $$RMSGET3(PSECT_ATTR),
+    PLIT = $RMSGET3(PSECT_ATTR);
+
+! Linkages
+!
+
+LINKAGE
+    L_COMPARE_REC,
+    L_GET3B,
+    L_KEY_DESC,
+    L_KEY_TYPE_CONV,
+    L_LOCK,
+    L_NOREAD_LONG,
+    L_NOWRT_LONG,
+    L_POS_KEY,
+    L_FIND_BY_RRV,
+    L_POS_SEQ,
+    L_QUERY_LCK,
+    L_UNLOCK,
+    L_PCKDEC_CHECK,
+    L_UNPACK_REC,
+    L_REC_OVHD,
+    L_RECORD_KEY,
+    L_RECORD_VBN,
+    L_RLSBKT,
+    L_GET_RECORD = JSB () : GLOBAL (COMMON_RABREG, R_REC_ADDR, R_IDX_DFN)
+			    NOPRESERVE (2, 3, 4, 5),
+    L_SETUP_NRP  = JSB () : GLOBAL (COMMON_RABREG, R_IDX_DFN)
+			    NOPRESERVE (2, 3, 4, 5);
+
+! Forward Routines
+!
+
+FORWARD ROUTINE
+    GET_RECORD		: L_GET_RECORD;
+
+! External Routines
+!
+
+EXTERNAL ROUTINE
+    RM$COMPARE_REC	: RL$COMPARE_REC,
+    RM$KEY_DESC		: RL$KEY_DESC,
+    RM$KEY_TYPE_CONV	: RL$KEY_TYPE_CONV,
+    RM$LOCK		: RL$LOCK,
+    RM$PCKDEC_CHECK	: RL$PCKDEC_CHECK,
+    RM$QUERY_LCK	: RL$QUERY_LCK,
+    RM$UNLOCK		: RL$UNLOCK,
+    RM$REC_OVHD		: RL$REC_OVHD,
+    RM$RECORD_KEY	: RL$RECORD_KEY,
+    RM$RECORD_VBN	: RL$RECORD_VBN,
+    RM$NOREAD_LONG	: RL$NOREAD_LONG,
+    RM$NOWRT_LONG	: RL$NOWRT_LONG,
+    RM$RLSBKT		: RL$RLSBKT,
+    RM$FIND_BY_RRV	: RL$FIND_BY_RRV,
+    RM$POS_KEY		: RL$POS_KEY,
+    RM$POS_SEQ		: RL$POS_SEQ,
+    RM$UNPACK_REC	: RL$UNPACK_REC;
+
+
+%SBTTL 'SETUP_NRP_DATA'
+ROUTINE SETUP_NRP_DATA : L_SETUP_NRP NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine sets up the next record data (NRP)
+!	from the data saved during the retrieval of the
+!	current record (RP).
+!
+! CALLING SEQUENCE:
+!
+!	SETUP_NRP_DATA()
+!
+! INPUT PARAMETERS:
+!
+!	Outputs from GET_RECORD routine
+!
+! OUTPUT PARAMETERS:
+!
+!	The following NRP fields have been updated:
+!
+!		VBN,ID,DUP_POS
+!		UPD_NRP flags zeroed.
+!		IRB$B_NRP_KREF has been updated.
+!		Key buffer 1 contains the key field value from 
+!		the retrieved record.
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	R_IDX_DFN_STR,
+	COMMON_RAB_STR;
+
+    BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$W_DUP_POS] = .IRAB[IRB$W_SAVE_POS];
+    BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$L_VBN] 	= .IRAB[IRB$L_RFA_VBN];
+    BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$W_ID] 	= .IRAB[IRB$W_RFA_ID];
+    BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$B_FLAGS] 	= 0;
+    IRAB[IRB$B_NRP_KREF] = .IRAB[IRB$B_RP_KREF];
+    CH$MOVE(.IDX_DFN[IDX$B_KEYSZ], KEYBUF_ADDR(2), KEYBUF_ADDR(1));
+    RETURN;
+
+    END;
+
+
+%SBTTL 'RM$GET3B'
+GLOBAL ROUTINE RM$GET3B : RL$GET3B =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine implements the get/find operation for the
+!	indexed file organization.
+!
+! CALLING SEQUENCE:
+!
+!	RM$GET3()
+!
+! INPUT PARAMETERS:
+!
+!	R11	Impure area pointer
+!	R10	IFAB --  Pointer to IFAB
+!	R9	IRAB -- Pointer to IRAB
+!	R8	RAB -- pointer to users RAB
+!		ROP field options (NLK,ULK,RLK,LOC,NXR)
+!		RAC field = (SEQ, or KEY, or RFA)
+!		RFA field if RAC = RFA
+!		KBF,KSZ,KRF if RAC = KEY and KBF,KSZ if RAC = SEQ and LIM set
+!		UBF,USZ -- if a GET
+!
+! IMPLICIT INPUTS:
+!
+!	IRAB fields:
+!
+!		IRB$V_UNLOCK_RP - current record should be unlocked before
+!				  accessing new record.
+!		IRB$V_FIND_LAST - last operation was a FIND.
+!		IRB$V_SKIP_NEXT - last operation was sequential, the record
+!				  described by the nrp info is to be skipped
+!				  and the record beyond it becomes the new
+!				  record.
+!		IRB$L_NRP_PTR	- pointing to cell including:
+!					NRP -- VBN,ID,DUP_POS, flag word
+!					RP_VBN,RP_ID, flag word
+!		IRB$B_RP_KREF, IRB$B_NRP_KREF
+!		IRB$L_KEYBUF	  (key buffer 1 or 2, maybe 3)
+!
+!	IFAB fields:
+!
+!		IFB$B_PLG_VER
+!		IFB$V_NORECLCK - record locking not required, i.e., not
+!				 sharing the file and single stream only.
+!		IFB$V_WRTACC -   if accessed for other than read only.
+!
+! OUTPUT PARAMETERS:
+!
+!	RAB fields:
+!
+!		RFA of record found
+!		STV if io errors
+!		RBF,RSZ -- if a GET
+!
+! IMPLICIT OUTPUTS:
+!
+!	IRAB fields:
+!
+!		IRB$V_UNLOCK_RP
+!		IRB$V_FIND_LAST
+!		IRB$V_SKIP_NEXT
+!		IRB$L_NRP_PTR : pointing to cell including:
+!				NRP -- VBN,ID,DUP_POS, flag word
+!				RP_VBN,RP_ID, flag word
+!		IRB$B_RP_KREF, IRB$B_NRP_KREF
+!		IRB$L_KEYBUF 	(key buffer 1 or 2, maybe 3)
+!		IRB$L_RBF	User buffer address and size
+!		IRB$W_RSZ
+!
+! ROUTINE VALUE:
+!
+!	Internal RMS status code
+!
+! SIDE EFFECTS:
+!
+!	Retrieved record maybe locked, and next record context is modified.
+!
+!--
+
+    BEGIN
+
+    BUILTIN
+	AP,
+	TESTBITSC;
+
+    EXTERNAL REGISTER
+	COMMON_RAB_STR;
+
+    GLOBAL REGISTER
+	R_REC_ADDR_STR,
+	R_IDX_DFN_STR;
+
+    LOCAL
+	STATUS;
+
+    ! Continue to attempt to get the next record under the following 
+    ! circumstances:
+    !
+    ! 1. The status returned from GET_RECORD indicates the next record has 
+    !    been deleted and our access mode is sequential. Any key of reference.
+    !
+    ! 2. The status returned from GET_RECORD is an alternate success status 
+    !	 (OK_WAT), our key of reference is NOT the primary key, and the
+    !	 primary data bucket has not been locked.
+    !
+    ! 3. An IDX_DFN has been allocated for the key descriptor, indicating 
+    !    there are no problems with the key of reference.
+
+    ! Force the key descriptor to be initially zero.  
+    !
+    IDX_DFN = 0;
+
+    WHILE 1
+    DO
+	BEGIN
+
+	! Check the key descriptor after return from GET_RECORD.  
+	! If still zero, something wrong with the key of 
+	! reference, so exit loop.
+	!
+	STATUS = GET_RECORD();
+
+	IF .IDX_DFN EQLU 0
+	THEN
+	    EXITLOOP;
+	
+	IF NOT ((.STATUS EQL RMSERR(DEL))
+		  AND
+		(.RAB[RAB$B_RAC] EQL RAB$C_SEQ))
+	THEN
+	   IF NOT ((.IDX_DFN[IDX$B_KEYREF] NEQ 0)
+		    AND
+		   (.STATUS EQL RMSSUC(OK_WAT))
+		    AND
+		   (.IRAB[IRB$L_CURBDB] EQL 0))
+	    THEN
+		EXITLOOP;
+
+	CH$MOVE (.IDX_DFN[IDX$B_KEYSZ], KEYBUF_ADDR(1), KEYBUF_ADDR(2));
+	END;
+
+    IRAB[IRB$V_FIND_LAST] = 0;
+    !
+    !	Obtain user buffer address and size for later probe
+    !
+    IRAB [IRB$L_RBF] = .RAB [RAB$L_RBF];
+    IRAB [IRB$W_RSZ] = .RAB [RAB$W_RSZ];
+
+    ! NOTE: AP is 0 if no special action is needed to unlock the RP on errors
+    ! produced due to user buffer/size errors. Otherwise it is 1. if the user
+    ! has set the lim bit in the rop on a sequential get/find we can tell him
+    ! if the key he specified has been exceeded by the record found.
+    !
+
+    IF .STATUS
+	AND
+	(.RAB[RAB$B_RAC] EQL RAB$C_SEQ)
+	AND
+	.RAB[RAB$V_LIM]
+    THEN
+	BEGIN
+
+	LOCAL
+	    KBF_ADDR	: LONG,
+	    KEYSIZE;
+
+	KEYSIZE = .RAB[RAB$B_KSZ];
+
+	IF .KEYSIZE EQL 0
+	THEN
+
+	    IF .IDX_DFN[IDX$B_DATATYPE] EQL IDX$C_STRING
+	      OR .IDX_DFN[IDX$B_SEGMENTS] GTR 1
+	    THEN
+		STATUS = RMSERR(KSZ)
+	    ELSE
+		KEYSIZE = .IDX_DFN[IDX$B_KEYSZ];
+
+	BEGIN
+
+	MAP
+	    KEYSIZE	: BYTE;
+
+	IF .KEYSIZE GTRU .IDX_DFN[IDX$B_KEYSZ]
+	THEN
+	    STATUS = RMSERR(KSZ)
+	END;
+
+	KBF_ADDR = .RAB [RAB$L_KBF];
+	IFNORD(KEYSIZE, .KBF_ADDR, IRAB[IRB$B_MODE],
+	    STATUS = RMSERR(KBF));
+
+	IF .STATUS
+	THEN
+
+	    ! Call RM$COMPARE_REC with level = -1 when comparing against
+	    ! alternate key value in primary data record.
+	    !
+
+	    IF RM$COMPARE_REC(.KBF_ADDR, .KEYSIZE, -1) LSS 0
+	    THEN
+		STATUS = RMSSUC(OK_LIM);
+
+	END;
+
+    IF .STATUS
+    THEN
+	BEGIN
+
+	IF .IRAB[IRB$V_FIND]
+	THEN
+
+	    ! This is a find operation don't
+	    ! return record etc.
+	    !
+	    BEGIN
+	    IRAB[IRB$V_FIND_LAST] = 1;
+
+	    ! Set up the next record context for non-random $FIND operations.
+	    !
+	    IF  (.RAB[RAB$B_RAC] EQL RAB$C_SEQ)
+	    THEN
+		SETUP_NRP_DATA();
+
+	    END
+	ELSE
+	    BEGIN
+
+	    ! Return the user the data on the record
+	    !
+
+	    LOCAL
+		RSZ	: WORD;
+	
+	    ! Add record overhead, and calculate record's size
+	    !
+
+	    BEGIN
+
+	    GLOBAL REGISTER
+		R_REC_SIZE;
+
+	    REC_SIZE = 0;		! primary data level
+	    REC_ADDR = .REC_ADDR + RM$REC_OVHD();
+	    RSZ = .REC_SIZE;
+	    END;
+
+	    IF .IFAB[IFB$B_PLG_VER] EQLU PLG$C_VER_3
+	    THEN
+		RSZ = RM$UNPACK_REC(.IRAB[IRB$L_RECBUF],.RSZ);
+
+	    IF (.RAB[RAB$V_LOC] AND NOT (.IFAB[IFB$V_UPD])
+		AND
+		NOT (.BBLOCK[.IRAB[IRB$L_CURBDB], BDB$V_NOLOCATE]))
+	    THEN
+		BEGIN				! We can do locate mode get
+		IF .IFAB[IFB$B_PLG_VER] LSSU PLG$C_VER_3
+		THEN
+		    RAB[RAB$L_RBF] = .REC_ADDR
+		ELSE
+		    RAB[RAB$L_RBF] = .IRAB[IRB$L_RECBUF];
+		RAB[RAB$W_RSZ] = .RSZ;
+		END
+	    ELSE
+		BEGIN				! We must do move mode get
+
+		LOCAL
+		    USZ	: WORD;
+
+		USZ = .RAB[RAB$W_USZ];
+
+		IF .USZ EQL 0
+		THEN
+		    BEGIN
+
+		    IF .AP
+		    THEN
+			IRAB[IRB$V_UNLOCK_RP] = 1;	! flag unlock RP
+
+		    STATUS = RMSERR(USZ);
+		    END
+		ELSE
+		    BEGIN
+
+		    LOCAL
+			UBF_ADDR;
+		    UBF_ADDR = .RAB [RAB$L_UBF];
+
+		    IF .RSZ GTRU .USZ
+		    THEN
+			BEGIN
+			RAB[RAB$L_STV] = .RSZ;
+			RSZ = .USZ;
+			STATUS = RMSERR(RTB);
+			END;
+
+		    IF RM$NOWRT_LONG(.RSZ, .UBF_ADDR, .IRAB[IRB$B_MODE])
+		    THEN
+			BEGIN
+
+			IF .AP
+			THEN
+			    IRAB[IRB$V_UNLOCK_RP] = 1;	! flag unlock RP
+
+			STATUS = RMSERR(UBF);
+			END
+		    ELSE
+			BEGIN
+			RAB[RAB$W_RSZ] = .RSZ;
+			RAB[RAB$L_RBF] = .UBF_ADDR;
+			IF .IFAB[IFB$B_PLG_VER] LSSU PLG$C_VER_3
+			THEN
+			    CH$MOVE(.RSZ, .REC_ADDR, .UBF_ADDR)
+			ELSE
+			    CH$MOVE(.RSZ, .IRAB[IRB$L_RECBUF], .UBF_ADDR );
+
+			END;
+
+		    END;
+
+		END;
+
+	    END;
+
+	END;
+
+    IF (.STATUS	
+	OR 
+	(.STATUS<0, 16> EQL RMSERR(RTB)))
+    THEN
+	BEGIN
+
+	IF NOT .IRAB[IRB$V_FIND]
+	THEN
+	    BEGIN
+	    
+	    ! Set up the next record context for all $GET operations.
+	    !
+	    SETUP_NRP_DATA();
+
+
+
+	    RM$KEY_DESC(0);		! set up idx_dfn for primary key
+
+	    ! If dupes aren't allowed on primary key, save primary key value of
+	    ! this record in keybuffer 3 so reaccess and record lock window can
+	    ! be avoided on subsequent random FIND on primary key (cobol does
+	    ! this a lot).
+	    !
+
+	    IF NOT .IDX_DFN[IDX$V_DUPKEYS]
+	    THEN
+		BEGIN
+
+		LOCAL
+		    TMP_REC_ADDR;
+
+		TMP_REC_ADDR = .REC_ADDR;
+		REC_ADDR = .RAB [RAB$L_RBF];
+		
+		IF RM$NOREAD_LONG ( .RAB [RAB$W_RSZ], .REC_ADDR,
+			.IRAB [IRB$B_MODE] )
+		THEN
+		    STATUS = RMSERR(RBF);
+		AP = 3;			! no overhead / expanded
+		IF (.STATUS
+		   OR 
+		   (.STATUS<0, 16> EQL RMSERR(RTB)))
+		THEN
+		    RM$RECORD_KEY (KEYBUF_ADDR(3));
+		REC_ADDR = .TMP_REC_ADDR
+		END;
+	    END;
+
+	END
+    ELSE
+	BEGIN
+
+	! UNLOCK_RP is used as a flag on error conditions to indicate whether
+	! the record described by the current record (rp) information is to be
+	! unlocked or not.  This will be the case when buffer errors are
+	! discovered after the new record has been locked, or if the current
+	! record before this operation was not unlocked at the beginning of
+	! this operation.
+	!
+
+	IF TESTBITSC(IRAB[IRB$V_UNLOCK_RP])
+	THEN
+	    RM$UNLOCK(.BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$L_RP_VBN],
+		.BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$W_RP_ID]);
+
+	BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$L_RP_VBN] = 0;
+	BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$W_RP_ID] = 0;
+	END;
+
+    RAB[RAB$L_RFA0] = .BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$L_RP_VBN];
+    RAB[RAB$W_RFA4] = .BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$W_RP_ID];
+    IRAB[IRB$V_FIND] = 0;
+    BEGIN
+
+    GLOBAL REGISTER
+	R_BDB;
+
+    IF (BDB = .IRAB[IRB$L_CURBDB]) NEQ 0
+    THEN
+	RM$RLSBKT(0);
+
+    IRAB[IRB$L_CURBDB] = 0;
+    END;
+    RETURN .STATUS
+
+    END;
+
+
+%SBTTL 'GET_RECORD'
+ROUTINE GET_RECORD : L_GET_RECORD =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine implements the actual retrieval of the
+!	data record for internal RMS usage. The use request
+!	is checked for valid input parameters and all internal state
+!	information is setup to retrieve the record.
+!	Then current record is unlocked if required and the
+!	requested record retrieved and locked if required. All NRP
+!	update data is saved in the IRAB but is not placed in the
+!	NRP fields of the IRAB.
+!
+! CALLING SEQUENCE:
+!
+!	GET_RECORD()
+!
+! INPUT PARAMETERS:
+!
+!	Same as for RM$GET3 or RM$FIND3
+!
+! IMPLICIT INPUTS:
+!
+!	Same as for RM$GET3 or RM$FIND3
+!
+! OUTPUT PARAMETERS:
+!
+!	IRAB context setup for retrieved record:
+!
+!		CURBDB,RFA_VBN,RFA_ID,SAVE_POS
+!		REC_ADDR
+!
+!	RAB The DCT field is cleared in all cases.
+!
+!	If the value of the routine is a success status then
+!	the AP = 0 if no special action is needed to unlock the RP
+!	and is 1 if special action is needed, on errors detected after
+!	this routine.
+!
+! IMPLICIT OUTPUTS:
+!
+!	IRB$V_UNLOCK_RP
+!	IRB$V_FIND_LAST = 0
+!
+! ROUTINE VALUE:
+!
+!	Internal RMS status code
+!
+! SIDE EFFECTS:
+!
+!	Retrieved record maybe locked, old current record
+!	may have been unlocked, the data bucket for the
+!	retrieved record is accessed.
+!
+!--
+
+    BEGIN
+
+    BUILTIN
+	TESTBITCC,
+	TESTBITSC,
+	AP;
+
+    EXTERNAL REGISTER
+	R_REC_ADDR_STR,
+	R_IDX_DFN_STR,
+	COMMON_RAB_STR;
+
+    LABEL
+	UNLOCK,
+	KEY;
+
+    IRAB[IRB$B_CACHEFLGS] = 0;
+    IRAB[IRB$B_SRCHFLAGS] = 0;
+    IRAB[IRB$V_DUP] = 0;
+
+    ! Based on the record access mode (RAC) of this operation (GET/FIND)
+    ! set up the IRAB RP fields, key buffer 2 etc to retrieve the record.
+    !
+    !
+    RAB[RAB$L_DCT] = 0;
+
+    ! Get record block 1 --- set up the IRAB search context data to get the
+    ! record the user is requesting, and unlock the current record if this is
+    ! required.
+    !
+UNLOCK :
+    BEGIN
+
+    ! NOTE: register REC_ADDR will be used in this block to point to the nrp
+    ! list. There should be no references to it as REC_ADDR in this block.  It
+    ! is only used as an output of the positioning routines in the next block.
+    !
+    !
+
+    MACRO
+	NRP_PTR = REC_ADDR %;
+
+    NRP_PTR = .IRAB[IRB$L_NRP_PTR];
+
+    CASE .RAB[RAB$B_RAC] FROM RAB$C_SEQ TO RAB$C_RFA OF
+	SET
+
+	[RAB$C_SEQ] :
+
+	    !+
+	    ! Sequential Access:
+	    !
+	    !	Setup to retrieve the record associated with the NRP if this
+	    !	is a GET and the last operation was not a FIND or if this is
+	    !	a FIND.
+	    !
+	    !	If last operation was a FIND and this operation is a GET then
+	    !	retrieve record which is described by the NRP if that FIND was
+	    !	sequential.
+	    !
+	    !	If the FIND was random then change the NRP data for the record
+	    !	which was found and retrieve it.
+	    !
+	    !   Note that a sequential FIND following a random FIND returns to
+	    !   the sequential next record (NRP).  That is to say that the
+	    !	random operation will not change the NRP VBN and ID fields.
+	    !-
+	    BEGIN
+
+	    IF .IRAB[ IRB$V_EOF ]
+	    THEN
+		RETURN RMSERR(EOF);
+
+	    IF (.IRAB[IRB$V_FIND_LAST]
+		AND
+		NOT (.IRAB[IRB$V_FIND]))
+	    THEN
+		BEGIN
+
+		! NOTE:	keybuffer 2 contains key value, RP_KREF has key of
+		! reference, RP_VBN and RP_ID contains record's RFA/RRV, and
+		! SAVE_DUP contains the duplicate position count.
+		!
+
+		IF TESTBITSC(IRAB[IRB$V_SKIP_NEXT])
+		THEN
+
+		    ! Last find was sequential so retrieve
+		    ! the record described by the NRP.
+		    !
+		    RM$KEY_DESC(.IRAB[IRB$B_NRP_KREF])
+		ELSE
+
+		    ! Last operation was a find random and this operation is a
+		    ! get sequential therefore we must invalidate NRP data and
+		    ! setup to get the record described by the RP data.
+		    !
+		    BEGIN
+		    NRP_PTR[NRP$L_VBN] = 0;
+		    RM$KEY_DESC(.IRAB[IRB$B_RP_KREF]);
+		    END;
+
+		IRAB[IRB$B_KEYSZ] = .IDX_DFN[IDX$B_KEYSZ];
+
+		! Unless no lock is desired on this record, leave this block to
+		! avoid unlocking the current record.  This avoids a potential
+		! window where the record is unlocked as it is reaccessed on
+		! this get operation.
+		!
+
+		IF NOT .RAB[RAB$V_NLK]
+		THEN
+		    LEAVE UNLOCK;
+
+		END
+	    ELSE
+		BEGIN
+		IRAB[IRB$V_SKIP_NEXT] = 1;
+
+		! First time call after CONNECT or REWIND.
+		!
+
+		IF .NRP_PTR[NRP$L_VBN] EQL 0
+		THEN
+
+		    ! NRP vbn is zero so also zero rp vbn to signal rm$pos_seq
+		    ! we want first record.
+		    !
+		    BEGIN
+
+		    ! We want first record, so don't skip next record
+		    !
+		    IRAB[IRB$V_SKIP_NEXT] = 0;
+		    NRP_PTR[NRP$L_RP_VBN] = 0;
+		    END;
+
+		RETURN_ON_ERROR (RM$KEY_DESC(.IRAB[IRB$B_NRP_KREF]));
+
+		IRAB[IRB$B_KEYSZ] = .IDX_DFN[IDX$B_KEYSZ];
+		CH$MOVE(.IDX_DFN[IDX$B_KEYSZ], KEYBUF_ADDR(1), KEYBUF_ADDR(2));
+		END;
+
+	    END;
+
+	[RAB$C_KEY] :
+KEY :
+	    BEGIN
+
+	    LOCAL
+		KEYSIZE	: BYTE,
+		KBF_ADDR : LONG;
+
+	    IRAB[ IRB$V_EOF ] = 0;
+
+	    IRAB[IRB$V_SKIP_NEXT] = 0;
+
+	    RETURN_ON_ERROR (RM$KEY_DESC(.RAB[RAB$B_KRF]));
+	    KEYSIZE = .RAB[RAB$B_KSZ];
+
+	    ! Check and setup for user key value.
+	    !
+
+	    IF .IDX_DFN[IDX$B_DATATYPE] EQL IDX$C_STRING
+	      OR .IDX_DFN[IDX$B_SEGMENTS] GTR 1
+	    THEN
+		BEGIN
+
+		IF ((.KEYSIZE EQL 0)
+		    OR
+		    (.KEYSIZE GTRU .IDX_DFN[IDX$B_KEYSZ]))
+		THEN
+		    RETURN RMSERR(KSZ);
+
+		END
+	    ELSE
+		BEGIN
+
+		IF .KEYSIZE EQL 0
+		THEN
+		    KEYSIZE = .IDX_DFN[IDX$B_KEYSZ];
+
+		IF .KEYSIZE NEQU .IDX_DFN[IDX$B_KEYSZ]
+		THEN
+		    RETURN RMSERR(KSZ);
+
+		END;
+
+	    IRAB[IRB$B_KEYSZ] = .KEYSIZE;
+	    KBF_ADDR = .RAB [RAB$L_KBF];
+	    IFNORD(KEYSIZE, .KBF_ADDR, IRAB[IRB$B_MODE],
+		RETURN RMSERR(KBF));
+
+	    ! In prologue 3 files, must convert user's key to ASCII
+	    ! as it is moved into the key buffer.
+	    !
+
+	    IF .IFAB[IFB$B_PLG_VER] LSSU PLG$C_VER_3
+	    THEN
+		CH$MOVE(.KEYSIZE, .KBF_ADDR, KEYBUF_ADDR(2))
+	    ELSE
+		RM$KEY_TYPE_CONV ( .KBF_ADDR, KEYBUF_ADDR(2), 0);
+
+	    ! If key type is packed decimal or more than one segment,
+	    ! check it for valid nibbles.
+	    !
+
+	    IF .IDX_DFN[IDX$B_DATATYPE] EQLU IDX$C_PACKED
+	      OR (.IDX_DFN[IDX$B_SEGMENTS] GTR 1
+		AND .IFAB[IFB$B_PLG_VER] EQLU PLG$C_VER_3)
+	    THEN
+		RETURN_ON_ERROR ( RM$PCKDEC_CHECK ( .KBF_ADDR, 0 ) );
+
+	    ! Check that key match is logically consistent.
+	    !
+
+	    IF .RAB[RAB$V_KGE]
+	    THEN
+
+		IF .RAB[RAB$V_KGT]
+		THEN
+		    RETURN RMSERR(ROP)
+		ELSE
+		    BEGIN
+		    IRAB[IRB$V_SRCHGE] = 1;
+		    LEAVE KEY
+
+		    END
+	    ELSE
+
+		IF .RAB[RAB$V_KGT]
+		THEN
+		    BEGIN
+		    IRAB[IRB$V_SRCHGT] = 1;
+		    LEAVE KEY
+
+		    END;
+
+	    !+
+	    ! At this point we have determined that this a random access for an
+	    ! exact match by key.  Now try to find out if this is for the
+	    ! current record, i.e., is it the same one we just got.  This will
+	    ! be checked only for primary key. The following conditions must be
+	    ! met to take this optimization:
+	    !
+	    !	Previous operation was a GET.
+	    !	This operation is for primary key.
+	    !	Duplicates aren't allowed on primary key.
+	    !	The full key size is being used.
+	    !	The key value matches the saved primary key value of the 
+	    !		current record (in keybuffer 3).
+	    !	There is a current record (rp_vbn neq 0).
+	    !	The current record is already locked, if locking required.
+	    !	The new record is to be locked, if locking required.
+	    !-
+	    !
+
+	    IF .IRAB[IRB$V_FIND_LAST]
+		OR
+		.IDX_DFN[IDX$B_KEYREF] NEQ 0
+		OR
+		.IDX_DFN[IDX$V_DUPKEYS]
+	    THEN
+		LEAVE KEY;
+
+	    IF .IRAB[IRB$B_KEYSZ] NEQ .IDX_DFN[IDX$B_KEYSZ]
+	    THEN
+		LEAVE KEY;
+
+	    BEGIN
+
+	    LOCAL
+		SIZE;
+
+	    SIZE = .IRAB[IRB$B_KEYSZ];
+
+	    IF NOT CH$EQL(.SIZE, KEYBUF_ADDR(2), .SIZE, KEYBUF_ADDR(3))
+	    THEN
+		LEAVE KEY;
+
+	    END;
+	    BEGIN
+
+	    LOCAL
+		VBN;
+
+	    IF (VBN = .NRP_PTR[NRP$L_RP_VBN]) EQL 0
+	    THEN
+		LEAVE KEY;
+
+	    ! If record locking is required, make sure this record is already
+	    ! locked, otherwise it may be deleted or locked by another
+	    ! accessor.  Also that the new record is to be locked also,
+	    ! otherwise there is potentially an obscure window where it could
+	    ! be deleted while reaccessing the bucket after the current lock is
+	    ! released.
+	    !
+
+	    IF NOT .IFAB[IFB$V_NORECLK]
+	    THEN
+		BEGIN
+
+		LOCAL
+		    ST;
+
+		IF .RAB[RAB$V_NLK]
+		THEN
+		    LEAVE KEY;
+
+		BEGIN
+
+		LOCAL	WAIT_SET;
+
+		! This block is used to disable the WAT bit if its set for the
+		! duration of this query_lck.  We don't want to wait because
+		! we're just inerested in knowing if we locked the record, or
+		! there's a window.  We don't want to wait for it here.  The
+		! lock logic later on will do that.  I know that clearing,
+		! saving, and restoring the state of the WAT bit is a cluge,
+		! but it will do for the time being.  There should be some
+		! other way of signalling query_lck not to wait even if the
+		! user said to.  I think this is the only place in RMS that
+		! such a function is needed.
+		!
+		IF .RAB[ RAB$V_WAT ]
+		THEN
+		    BEGIN
+		    WAIT_SET = 1;
+		    RAB[ RAB$V_WAT ] = 0
+		    END;
+
+		ST = RM$QUERY_LCK(.VBN, .NRP_PTR[NRP$W_RP_ID]);
+
+		IF .WAIT_SET
+		THEN
+		    RAB[ RAB$V_WAT ] = 1
+
+		END;				! Of block defining WAIT_SET
+
+		IF .ST<0, 16> NEQU RMSSUC(OK_ALK)
+		THEN
+		    LEAVE KEY
+
+		END;
+
+	    END;
+
+	    ! If we are here we have determined that this is the same record
+	    ! that we already have locked as the current record. Flag that
+	    ! state by setting DUP. By leaving the unlock block, the current
+	    ! record is not unlocked.
+	    !
+	    IRAB[IRB$V_DUP] = 1;
+	    LEAVE UNLOCK;
+
+	    END;				! of block KEY
+
+	[RAB$C_RFA] :
+
+	    ! RFA access -- check RFA for legality and setup for primary key
+	    !		access for next record pointer (NRP) data.
+	    !
+	    BEGIN
+
+	    IRAB[ IRB$V_EOF ] = 0;
+
+	    IRAB[IRB$V_SKIP_NEXT] = 0;		! flag random access
+
+	    IF .RAB[RAB$L_RFA0] EQL 0
+		OR
+		.RAB[RAB$W_RFA4] EQL 0
+	    THEN
+		RETURN RMSERR(RFA);
+
+	    RETURN_ON_ERROR (RM$KEY_DESC(0));
+
+	    END;
+
+	[OUTRANGE] :
+	    RETURN RMSERR(RAC);
+
+	TES;
+
+    ! The current record is now unlocked before accessing the new record,
+    ! unless it has already been determined that the new record is the same as
+    ! the old current record, in which case this block was left and this code
+    ! is skipped.
+    !
+
+    IF TESTBITSC(IRAB[IRB$V_UNLOCK_RP])
+    THEN
+	BEGIN
+
+	LOCAL
+	    VBN;
+
+	IF (VBN = .NRP_PTR[NRP$L_RP_VBN]) NEQ 0
+	THEN
+	    RM$UNLOCK(.VBN, .NRP_PTR[NRP$W_RP_ID]);
+
+	END;
+
+    END;					! of block UNLOCK
+    IRAB[IRB$B_RP_KREF] = .IDX_DFN[IDX$B_KEYREF];
+
+    ! Get record block 2 -- position and perform lock logic for record which
+    ! the IRAB search context data describes.
+    !
+    BEGIN
+
+    LOCAL
+	STATUS;
+
+    IF NOT (STATUS =
+	BEGIN
+
+	LOCAL
+	    RAC	: BYTE;
+
+	RAC = .RAB[RAB$B_RAC];
+
+	IF .IRAB[IRB$V_DUP]			! re-accessing current record
+	THEN
+	    BEGIN
+
+	    ! If next record info also for primary key, then use sequential
+	    ! postioning code and nrp info - it's faster. irb$v_skip_next
+	    ! will be clear in this case so that record itself is retrieved.
+	    !
+
+	    ASSUME_C(RAB$C_SEQ, 0);
+
+	    ! sneaky way to set rac = rab$c_seq
+	    !
+	    RAC = .IRAB[IRB$B_NRP_KREF];
+
+	    IF .RAC NEQ 0			! when nrp_kref = 0.
+	    THEN
+		RAC = RAB$C_RFA;
+
+	    END;
+
+	CASE .RAC FROM RAB$C_SEQ TO RAB$C_RFA OF
+	    SET
+
+	    ! Sequential access. Continue to try and retrieve the "next"
+	    ! record as long as record locks are encountered.
+	    !
+	    [RAB$C_SEQ] :
+		BEGIN
+
+		DO
+		    STATUS = RM$POS_SEQ()
+		    WHILE (.STATUS EQL RMSERR(RLK));
+
+		.STATUS
+		END;
+
+	    ! Random access by key. Continue to try and retrieve the record
+	    ! by its key value as long as record locks are encountered.
+	    !
+	    [RAB$C_KEY] :
+		BEGIN
+
+		DO
+		    STATUS = RM$POS_KEY()
+		    WHILE (.STATUS EQL RMSERR(RLK));
+
+		.STATUS
+		END;
+
+	    ! Random access by RFA.
+	    !
+	    [RAB$C_RFA] :
+		BEGIN
+		STATUS = RM$FIND_BY_RRV(.RAB[RAB$L_RFA0], .RAB[RAB$W_RFA4],0);
+
+		IF .STATUS
+		THEN
+		    BEGIN
+		    IRAB[IRB$L_RFA_VBN] = .BBLOCK[.IRAB[IRB$L_CURBDB],
+			BDB$L_VBN];
+		    IRAB[IRB$W_RFA_ID] = IRC$_ID(REC_ADDR);
+		    END
+		ELSE
+		    IRAB[IRB$L_CURBDB] = 0;
+
+		.STATUS
+		END;
+	    TES
+
+	END)
+    THEN
+	RETURN .STATUS;
+
+    ! Setup record pointer (RP) to the RFA/RRV of retrieved record and place
+    ! record's key value in key buffer 2.
+    !
+    BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$W_RP_ID] =
+	(IF .IFAB[IFB$B_PLG_VER] LSSU PLG$C_VER_3
+	THEN    
+	    .REC_ADDR[IRC$B_RRV_ID]
+	ELSE
+	    .REC_ADDR[IRC$W_RRV_ID]);
+    AP = 3;					! setup for user data record 
+    BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$L_RP_VBN] = RM$RECORD_VBN();
+
+    ! Move key field to key buffer 2
+    !
+    AP = 0;				! Flag data record with overhead data
+    RM$RECORD_KEY (KEYBUF_ADDR(2));
+
+    !
+    ! Don't do any record-locking if there aren't any writers of the file.
+    !
+    IF .IFAB[IFB$V_NORECLK]
+    THEN
+	RETURN .STATUS;
+
+    END;				! of block defining local STATUS
+
+    BEGIN
+
+    LOCAL
+	STATUS;
+
+    BEGIN
+
+    LOCAL
+	RP_VBN,
+	RP_ID;
+
+    RP_VBN = .BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$L_RP_VBN];
+    RP_ID  = .BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$W_RP_ID];
+
+    ! Flag no special action needed for unlocking the RP
+    !
+    AP = 0;
+
+    !
+    ! only query_lock the record if:
+    !
+    !	1. the user has specified no locking ( NLK )
+    ! OR
+    !	2. the file is opened for read ( not WRTACC )
+    !	   and the user has not specified read-only locking ( not REA )
+    !
+    IF  .RAB[RAB$V_NLK]
+	OR
+	( (NOT .IFAB[IFB$V_WRTACC])	
+	   AND
+	  (NOT .RAB[RAB$V_REA]) )
+    THEN
+	STATUS = RM$QUERY_LCK(.RP_VBN, .RP_ID)
+    ELSE
+	STATUS = RM$LOCK(.RP_VBN, .RP_ID);
+
+
+    ! OK_WAT success status means we had to wait for someone else to unlock the
+    ! record.  To wait, we deaccessed the bucket.  Therefore, we must reaccess
+    ! it, and we can  use the record pointer information for this. Deaccessing
+    ! the bucket also means that our NRP context updating information in the
+    ! IRAB canno longer be considered to be valid.
+    !
+    IF .STATUS EQL RMSSUC(OK_WAT)
+    THEN
+	BEGIN
+
+	LOCAL
+	    TEMP_STATUS;
+
+	! reposition to record using record pointer contents
+	!
+	IF NOT (TEMP_STATUS = RM$FIND_BY_RRV( .RP_VBN, .RP_ID, 0) )
+	THEN
+	    STATUS = .TEMP_STATUS;
+
+	IF .STATUS
+	THEN
+
+	    ! If our key of reference is the primary key, then we can reclaim
+	    ! our NRP updating information from the primary data bucket's
+	    ! VBN and the record ID.
+	    !
+	    IF (.IDX_DFN[IDX$B_KEYREF] EQL 0)
+	    THEN
+		BEGIN
+		IRAB[IRB$L_RFA_VBN] = .BBLOCK[.IRAB[IRB$L_CURBDB], BDB$L_VBN];
+		IRAB[IRB$W_RFA_ID] = IRC$_ID(REC_ADDR);
+		END
+
+	    ! If our key of reference is not the primary key, then we have no
+	    ! easy way to reclaim the NRP list updating information which is
+	    ! for the SIDR bucket (long since released) and not the primary
+	    ! data bucket. If the current operation requires the NRP list to
+	    ! be updated (and the only operation that doesn't is a random 
+	    ! $FIND), then we must release the primary data bucket (which we 
+	    ! have accessed by means of the find-by-rrv). This together with
+	    ! the alternate success status, and the fact that the key of
+	    ! reference is other than the primary will force another attempt
+	    ! to access the primary data bucket after accessing the 
+	    ! necessary SIDR, and to lock the next record.
+	    !
+	    ELSE
+		BEGIN
+
+		GLOBAL REGISTER
+		    R_BDB_STR;
+
+		IF NOT  (.IRAB[IRB$V_FIND]
+			 AND
+			(.RAB[RAB$B_RAC] NEQ RAB$C_SEQ))
+		THEN
+		    RELEASE (IRAB[IRB$L_CURBDB]);
+		END
+	ELSE
+	    IRAB[IRB$L_CURBDB] = 0;
+
+	END;
+
+    ! Return here if query_lck
+    !
+    IF  .RAB[RAB$V_NLK]
+	OR
+	( (NOT .IFAB[IFB$V_WRTACC])	
+	   AND
+	  (NOT .RAB[RAB$V_REA]) )
+    THEN
+	RETURN .STATUS;
+
+    END;				! of block defining RP_VBN and RP_ID
+
+    !
+    ! If UNLOCK_RP was set coming here, it can only mean that this was a
+    ! reaccessing of a previously automatically locked record that was not
+    ! unlocked at the beginning of this operation to avoid a locking window.
+    ! It will get an ok_alk status (not suc) from rm$lock.  It wants to release
+    ! the current record on potential buffer errors.  The case where we don't
+    ! want to release the now current record lock is if the status from rm$lock
+    ! was rms$_ok_alk (i.e., not suc) which meant that it had been previously
+    ! manually locked, and should remain that way even if this operation fails.
+    !
+	
+    IF TESTBITCC(IRAB[IRB$V_UNLOCK_RP])
+    THEN
+
+	IF  (.STATUS EQL RMSSUC())
+	     OR
+	    (.STATUS EQL RMSSUC(OK_WAT))
+	THEN
+	    AP = 1
+	ELSE
+
+	    ! If it is necessary for us to release the record lock set
+	    ! IRB$V_UNLOCK_RP. It will only be necessary to release the
+	    ! record lock in some circumstances when we have had to stall
+	    ! waiting for it. If after waiting for the lock, we have some
+	    ! problem reaccessing the bucket, or we find that the record is
+	    ! deleted while we were waiting, then we must release the record
+	    ! lock. If we are positioning by means of an alternate key and we 
+	    ! have had to stall waiting for the record lock, and this is an
+	    ! operation where the NRP list must be updated (any operation but a
+	    ! nonrandom $FIND), then the record lock must also be released.
+	    !
+	    BEGIN
+	    IF  (.IRAB[IRB$L_CURBDB] EQL 0)
+		 AND
+		(.STATUS NEQ RMSERR(RLK))
+	    THEN
+		IRAB[IRB$V_UNLOCK_RP] = 1;
+	    RETURN .STATUS;
+	    END
+    ELSE
+	AP = 1;
+
+    IF NOT .RAB[RAB$V_ULK]
+    THEN
+	IRAB[IRB$V_UNLOCK_RP] = 1;
+	
+    RETURN .STATUS;
+	
+    END					! of local block defining STATUS
+    END;				! of routine
+END					! of module
+
+ELUDOM

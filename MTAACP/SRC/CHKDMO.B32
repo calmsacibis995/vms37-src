@@ -1,0 +1,288 @@
+
+MODULE CHKDMO (LANGUAGE (BLISS32) ,
+		IDENT = 'V03-001'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  VAS/VMS MTAACP
+!
+! ABSTRACT:
+!
+!	This routine dismounts the volume in use if it should be.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  29-Apr-1977  17:19
+!
+! MODIFIED BY:
+!
+!	V03-001	STJ0263		Steven T. Jeffreys	22-Apr-1982
+!		Do not mung the device allocation access mode.
+!
+!	V02-010 DMW00035	David Michael Walp	15-Sep-1981
+!		Fixed Cancel I/O vs Dismount race condition
+!
+!	V02-009 DMW00026	David Michael Walp	20-Jul-1981
+!		Changes to RET_FREE_PAGE, new parameter to say
+!		that the P0 space will should be contracted.
+!
+!	V02-008 DMW00011	David Michael Walp	14-Mar-1981
+!		Changed calculation of CCB address to GET_CCB
+!
+!	V02-007	REFORMAT	Maria del C. Nasr	30-Jun-1980
+!
+!**
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+
+REQUIRE 'SRC$:MTADEF.B32';
+
+!
+! Part of this routine runs at IPL$_SYNCH, so it must be locked into the
+! working set.
+!
+LOCK_CODE;
+
+
+GLOBAL ROUTINE CHECK_DISMOUNT (UCB) : COMMON_CALL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine checks if the volume in use is marked for dismount and
+!	idle. If so, it completes the dismount.
+!
+! CALLING SEQUENCE:
+!	CHECK_DISMOUNT (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1 - address of unit control block for primary UCB
+!
+! IMPLICIT INPUTS:
+!	QUEUE_HEAD: queue header for ACP
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	None
+!
+! ROUTINE VALUE:
+!	None
+!
+! SIDE EFFECTS:
+!	Volume dismounted if appropriate
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    LITERAL
+	SUPER_MODE = 2;				! supervisor mode
+
+    MAP
+	UCB	: REF BBLOCK;		! address of unit control block
+
+    LOCAL
+	CCB	: REF BBLOCK,		! address of channel control block
+
+	! address of mag tape volume entry
+	!
+	MVL_ENTRY	: REF BBLOCKVECTOR [, MVL$K_LENGTH],
+	PAGE,
+	UCBLIST	: REF VECTOR,	! vector of ucb's allocated to volume set
+	VCB	: REF BBLOCK;			! local address of VCB
+
+    EXTERNAL
+
+	IO_CHANNEL,				! assign channel for tape I/O
+	QUEUE_HEAD	: REF BBLOCK;		! address of ACP queue header
+
+    EXTERNAL ROUTINE
+	
+	RET_FREE_PAGE	: COMMON_CALL,	! return free page to virtual mem pool
+	LOCK_IODB,			! lock I/O data base mutex
+	SEND_ERRLOG,
+	UNLOCK_IODB,			! unlock I/O data base mutex
+	DEALLOCATE,			! deallocate dynamic memory
+	GET_CCB;			! get address of the CCB
+
+
+    ! first check if the volume is marked for dismount
+    !
+
+    IF NOT .BBLOCK[UCB[UCB$L_DEVCHAR], DEV$V_DMT]
+    THEN
+	RETURN;
+
+    VCB = .UCB[UCB$L_VCB];			! pickup VCB address
+
+    ! The volume is marked for dismount. The remainder of the tests and the
+    ! dismount bit twiddling must be done interlocked.
+    !
+    LOCK_IODB();
+    SET_IPL(IPL$_SYNCH);
+
+    ! If a cancel I/O is pending we can not dismount the volume, the volume
+    ! will be check for dismount when the cancel I/O is completed.  This stops
+    ! the crash caused by cancel and dismount happening while the ACP has a QIO
+    ! with an completion AST outstanding to the volume.
+    ! 
+    IF (.VCB[VCB$W_TRANS] EQL 1) AND (NOT .VCB[VCB$V_CANCELIO])
+    THEN
+	BEGIN
+
+	! The volume is marked for dismount and idle.  Mark primary unit and
+	! secondary units dismounted and deallocate those units which should be
+	! on dismount.
+	!
+	UCBLIST = BBLOCK[.VCB[VCB$L_RVT], RVT$L_UCBLST];
+
+	DECR NVOL FROM .BBLOCK[.VCB[VCB$L_RVT], RVT$B_NVOLS] - 1 TO 0 DO
+	    BEGIN
+	    UCB = .UCBLIST[.NVOL];		! UCB from RVT list
+	    SEND_ERRLOG(0, .UCB);
+
+	    ! set allocation access mode to super
+	    !
+	    !UCB[UCB$B_AMOD] = SUPER_MODE;
+
+	    IF .UCB[UCB$V_DEADMO]
+		AND
+		.BBLOCK[UCB[UCB$L_DEVCHAR], DEV$V_ALL]
+	    THEN
+		BEGIN
+		UCB[UCB$V_DEADMO] = 0;
+		BBLOCK[UCB[UCB$L_DEVCHAR], DEV$V_ALL] = 0;
+		UCB[UCB$W_REFC] = .UCB[UCB$W_REFC] - 1;
+		UCB[UCB$L_PID] = 0;
+		END;
+
+	    BBLOCK[UCB[UCB$L_DEVCHAR], DEV$V_MNT] = 0;
+	    BBLOCK[UCB[UCB$L_DEVCHAR], DEV$V_DMT] = 0;
+	    BBLOCK[UCB[UCB$L_DEVCHAR], DEV$V_SWL] = 0;
+	    UCB[UCB$L_VCB] = 0;
+	    UCB[UCB$W_VPROT] = 0;
+	    UCB[UCB$L_OWNUIC] = 0;
+	    END;
+
+	! We can now release the locks while we proceed to clean up the mounted
+	! volume data base.
+	!
+	UNLOCK_IODB();
+
+	! Now rewind those volumes that are still on a unit calc address of
+	! channel control block.
+	!
+	CCB = KERNEL_CALL ( GET_CCB, .IO_CHANNEL );
+	MVL_ENTRY = .VCB[VCB$L_MVL] + MVL$K_FIXLEN;
+
+	! set UCB to primary UCB which has the UNLOAD/NOUNLOAD indicator
+	!
+	UCB = .UCBLIST[0];
+
+	DECR NVOL FROM .BBLOCK[.VCB[VCB$L_MVL], MVL$B_NVOLS] - 1 TO 0 DO
+	    BEGIN
+
+	    LOCAL
+		FUNCTION;
+
+	    IF .MVL_ENTRY[.NVOL, MVL$V_MOUNTED]
+	    THEN
+		BEGIN
+
+		! pseudo assign device
+		!
+		CCB[CCB$L_UCB] = .UCBLIST[.MVL_ENTRY[.NVOL, MVL$B_RVN]];
+
+		IF .UCB[UCB$V_UNLOAD]
+		THEN
+		    FUNCTION = IO$_UNLOAD
+		    OR
+		    IO$M_NOWAIT
+		ELSE
+		    FUNCTION = IO$_REWIND
+		    OR
+		    IO$M_NOWAIT;
+
+		$QIOW(CHAN = .IO_CHANNEL, FUNC = .FUNCTION);
+		END;
+
+	    END;
+
+	! Run thru UCB's "invalidating" them
+	!
+	LOCK_IODB();
+	SET_IPL(IPL$_SYNCH);
+
+	DECR NVOL FROM .BBLOCK[.VCB[VCB$L_RVT], RVT$B_NVOLS] - 1 TO 0 DO
+	    BEGIN
+	    UCB = .UCBLIST[.NVOL];
+	    UCB[UCB$V_VALID] = 0;
+	    END;
+
+	UNLOCK_IODB();
+	DEALLOCATE(.VCB[VCB$L_RVT]);
+	DEALLOCATE(.VCB[VCB$L_MVL]);
+
+	! return volume virtual page
+	!
+
+	WHILE 1
+	DO
+	    BEGIN
+
+	    IF REMQUE(.VCB[VCB$L_VPFL], PAGE)
+	    THEN
+		EXITLOOP;
+
+	    RET_FREE_PAGE(.PAGE,TRUE);
+	    END;
+
+	DEALLOCATE(.VCB);			! release the VCB
+	QUEUE_HEAD[AQB$B_MNTCNT] = .QUEUE_HEAD[AQB$B_MNTCNT] - 1;
+	END					! end of dismount processing
+    ELSE
+	UNLOCK_IODB();
+
+    END;				! end of routine CHECK_DISMOUNT
+
+END
+
+ELUDOM

@@ -1,0 +1,860 @@
+MODULE INS_PROCESSCMD (				! Command processing
+			IDENT = 'V03-000',
+			ADDRESSING_MODE(EXTERNAL = GENERAL),
+			MAIN = INSTALL_START
+		 ) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  Install
+!
+! ABSTRACT:
+!
+!	This module controls command parsing and processing.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system.
+!
+! AUTHOR:  Bob Grosso, June 1981
+!
+! Modified by:
+!
+!	V03-005	RPG0005		Bob Grosso		02-Feb-1982
+!		Improve INSTALL's handling of continuation lines.
+!
+!	V03-004	RPG0004		Bob Grosso		25-Jan-1982
+!		Remove double NOCMK signal.
+!
+!	V03-003	RPG0003		Bob Grosso		11-Jan-1982
+!		Inform how to obtain help.
+!
+!	V03-002	RPG0002		Bob Grosso		23-Dec-1981
+!		Cleanup code and support process kfi.
+!
+!	V03-001	RPG0001		Bob Grosso		18-Nov-1981
+!		/FULL now implies /LIST.
+!		Report errors when privileges improperly specified.
+!		Default /PRIV with no privileges specified to be all
+!		all privileges.
+!
+!--
+
+%SBTTL  'Declarations';
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:LIB';		! VAX/VMS system definitions
+
+REQUIRE
+	'SRC$:INSPREFIX.REQ';
+REQUIRE
+	'LIB$:INSDEF.B32';
+
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    process_command,		! execute the command line
+    check_priv,			! enforce privilege check in case INSTALL is installed
+    help;			! print interactive help
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    cli$dcl_parse,		! Parse DCL command
+    cli$present,		! Check if entity present
+    cli$get_value,		! Get value from command line
+    lbr$output_help,		! print interactive help
+    lib$get_foreign,		! get command line
+    lib$get_input,		! Get subcommands
+    lib$put_output,		! echo command line, and print help
+    proc_create_delete,		! process create, replace, delete
+    process_global,		! list global sections
+    process_list,		! list known file entries
+    prv$setpriv,		! set privilege bits given ASCII string
+    str$compare,		! compare two strings
+    str$concat,			! concatenate strings
+    str$copy_dx,		! Copy strings by descriptor
+    str$position,    
+    str$right,
+    str$upcase;
+
+EXTERNAL LITERAL
+    ins$_confqual,		! Conflicting qualifiers
+    ins$_help,			! Enter /HELP for INSTALL help
+    ins$_invprvnam,		! Invalid privilege name
+    ins$_ivqual,		! Invalid qualifier
+    ins$_nocmk,			! Must have CMKRNL priv to not use /PROCESS
+    ins$_nokfifnd,		! Known File not found
+    ins$_prvnotunq,		! Privilege name not unique
+    prv$_notunq,		! Privilege name not unique
+    prv$_invnam;		! Invalid privilege name
+
+
+EXTERNAL
+    ctl$gq_procpriv : BBLOCK,		! privilege mask of user
+    ins$gl_kfirns : 			! buffer for sending resultant name 
+		BBLOCK [dsc$c_s_bln],	!  string to Image activator.
+    ins$gl_kfinam : BBLOCK,		! file name block declaration
+    ins$gl_kfichan,			! channel for kfi open
+    ins$gl_ctlmsk : BLOCK [1],		! Control flags
+    ins$gl_kfiflgs : BLOCK [1],		! Control flags to go into KFI
+    ins$gq_kfiprivs : BBLOCK [8],	! Quadword privilege mask
+    ins$gl_imgactflg : BLOCK [1],	! Control flags for $IMGACT call
+    ins$gl_kfiadr;			! id of file to be listed
+
+GLOBAL
+    ins$gl_fildsc : 			! descriptor to get filename returned
+	BBLOCK [dsc$c_s_bln] 		!  from CLI.
+	PRESET([dsc$b_class] = dsc$k_class_d),
+    ins$gl_kfifab : $FAB_DECL,		! file access block declaration
+    ins$gl_outrab : $RAB_DECL,		! output record access block
+    ins$gl_outfab : $FAB_DECL;		! output stream access block
+
+BIND
+    EXIT_dsc = %ASCID 'EXIT',
+    FILE_SPEC_dsc = %ASCID 'FILE_SPEC',
+    PRIVILEGED_dsc = %ASCID 'PRIVILEGED',
+    Slash_HEL_dsc = $descriptor ('/HEL'),
+    Slash_HELP_dsc = $descriptor ('/HELP'),
+    HEL_dsc = $descriptor ('HEL'),
+    HELP_dsc = $descriptor ('HELP');
+
+
+%SBTTL  'INSTALL_START';
+
+GLOBAL ROUTINE  install_start =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Read the command line.  If ^Z or /EXIT, then exit.  If /HELP then print
+!	interactive help.  If there is a command then parse command and call
+!	command dispatcher.
+!
+!  IMPLICIT INPUT:
+!
+!	none
+!
+!  OUTPUT:
+!
+!	Print command line prompt and signal any errors.
+!
+!  IMPLICIT OUTPUT:
+!
+!	none
+!
+!  ROUTINE VALUE:
+!
+!	Low bit set for success.  All errors are signalled.
+!
+!---
+EXTERNAL
+    ins_command;		! Tables describing the Install commands
+
+!
+!   Use Arguement pointer to access verify bit in CLI block
+!
+BUILTIN
+    AP;
+MAP 
+    AP : REF BBLOCK;
+
+LOCAL
+    interactive,				! boolean to record if this is a single execution of a 
+						!  foreign command or an interactive session.
+    verify,					! Boolean set true if execution is from a 
+						!  command procedure and input should be echoed.
+    command_desc : BBLOCK [dsc$c_s_bln],	! descriptor of "INSTALL>" concatenated with input string
+    echo_desc : BBLOCK [dsc$c_s_bln],		! descriptor for echoing command line
+    input_desc : BBLOCK [dsc$c_s_bln];		! command string input
+
+!+++
+!
+!   Initialization
+!
+!---
+
+!
+!   If program is being executed from a command procedure, then set flag so
+!   command lines will be echoed.
+!
+verify = .AP [cli$v_vfyinp];
+
+
+!
+!   Initialize descriptors
+!
+CH$FILL(0,dsc$c_s_bln,input_desc);
+input_desc [dsc$b_class] = dsc$k_class_d;
+CH$FILL(0,dsc$c_s_bln,command_desc);
+command_desc [dsc$b_class] = dsc$k_class_d;
+CH$FILL(0,dsc$c_s_bln,echo_desc);
+echo_desc [dsc$b_class] = dsc$k_class_d;
+
+!+++
+!
+!   See if there is a foreign command line.  If there is 
+!   and it is not blank then flag non-interactive mode 
+!   and execute only that command.
+!
+!---
+
+execute (lib$get_foreign( input_desc ) );
+IF ( .input_desc [dsc$w_length] NEQ 0 ) AND		! If there is something on the line 
+   NOT CH$FAIL( CH$FIND_NOT_CH				! and there is something besides blanks
+	( .input_desc[dsc$w_length], .input_desc[dsc$a_pointer], %C' '))	
+THEN
+    BEGIN
+    interactive = false;		! A command was entered on the foreign command line.
+    str$upcase ( command_desc, input_desc );
+    END
+ELSE
+    interactive = true;		! Will loop for command input
+
+
+!+++
+!
+!   Command loop.  If not interactive, execute command and exit, else
+!   print "INSTALL>", read in command, parse command and execute command.
+!   Exit loop for ^Z and /EXIT
+!
+!---
+
+DO
+    BEGIN
+    LOCAL
+	hlp_ptr,
+	hlp_len,
+	status;
+    IF .interactive
+    THEN
+	BEGIN
+	LOCAL
+	    copy_desc : BBLOCK [dsc$c_s_bln],
+	    dash_ptr,		! Locate the '-' continuation character
+	    last_was_cont;	! Last command line was continued
+
+	status = lib$get_input( input_desc, $descriptor('INSTALL> ') ); ! print the prompt and get input line
+	IF .status EQL rms$_eof		! EXIT on CNTRL Z
+	THEN EXITLOOP;
+	IF .verify			! If executing from command procedure
+	THEN
+	    BEGIN			! echo the input line
+	    STR$CONCAT (echo_desc, $descriptor('INSTALL> '),input_desc);	! Pad prompt to input line
+	    lib$put_output ( echo_desc );
+	    END;
+
+	dash_ptr = CH$FIND_CH( .input_desc [dsc$w_length], .input_desc [dsc$a_pointer], %C'-');
+	IF NOT CH$FAIL(.dash_ptr)
+	THEN
+	    BEGIN	! Line continued
+	    last_was_cont = true;
+	    copy_desc [dsc$b_class] = dsc$k_class_s;
+	    copy_desc [dsc$w_length] = .dash_ptr - .input_desc [dsc$a_pointer];
+	    copy_desc [dsc$a_pointer] = .input_desc [dsc$a_pointer];
+	    str$copy_dx ( command_desc, copy_desc );	! copy dst from src
+	    WHILE .last_was_cont DO
+		!
+		!   while last was continued, input next line, 
+		!   echo input and concatenate with previous.
+		!
+		BEGIN
+		status = lib$get_input( input_desc, $descriptor ('_> ') ); ! get input line
+		IF .status EQL rms$_eof
+		THEN
+		    BEGIN
+		    interactive = false;
+		    EXITLOOP;
+		    END;
+
+		IF .verify THEN lib$put_output ( input_desc );
+
+		copy_desc [dsc$a_pointer] = .input_desc [dsc$a_pointer];
+
+		dash_ptr = CH$FIND_CH( .input_desc [dsc$w_length], .input_desc [dsc$a_pointer], %C'-');
+		IF CH$FAIL (.dash_ptr)
+		THEN
+		    BEGIN
+		    last_was_cont = false;
+		    copy_desc [dsc$w_length] = .input_desc [dsc$w_length];
+		    END
+		ELSE
+		    BEGIN
+		    copy_desc [dsc$w_length] = .dash_ptr - .input_desc [dsc$a_pointer];
+		    END;
+		str$concat (command_desc, command_desc, copy_desc );
+		END;	! While reading lines following continuation lines
+
+	    IF NOT .interactive THEN EXITLOOP;		! ^Z entered on continuation line
+	    str$upcase ( command_desc, command_desc );
+	    END
+	ELSE
+	    str$upcase ( command_desc, input_desc );
+	END;	! If interactive
+
+    !+++
+    !
+    !   Check for /HELP request
+    !
+    !---
+
+    hlp_ptr = str$position ( command_desc, Slash_HELP_dsc);		! Look for "/HELP" on command line
+    hlp_len = 5;
+    IF NOT .hlp_ptr							! If not found, look for "/HEL"
+    THEN
+	BEGIN
+	hlp_ptr = str$position ( command_desc, Slash_HEL_dsc);
+	hlp_len = 4;
+	END;
+    IF .hlp_ptr
+    THEN
+	!
+	!  Help was requested, treat entire line as help request
+	!
+	BEGIN
+	!
+	!   replace "/HEL" or "/HELP" with "INSTALL" since lbr$output_help
+	!   needs to see the topic keyword.
+	!   Then call the help routine.
+	!
+	str$right ( command_desc, command_desc, %REF(.hlp_ptr+.hlp_len) );
+	report( help( command_desc ));
+	END
+    ELSE
+
+	!+++
+	!
+	!   No help requested, proceed to parsing command line
+	!   Must concatenate command line to "INSTALL" string for
+	!   cli$dcl_parse to execute.
+	!
+	!---
+
+	BEGIN
+	STR$CONCAT (command_desc, $descriptor('INSTALL '),command_desc);! Stick "INSTALL on front of command line for CLI parse
+	status = cli$dcl_parse( command_desc, ins_command );		! parse the command line
+	IF .status 
+	THEN 
+	    BEGIN
+	    IF cli$present( EXIT_dsc )				! If /EXIT, then exit program
+	    THEN EXITLOOP;
+	    report (process_command( ) );				! execute the command
+	    END;
+	END;
+
+    !
+    !	Be sure to clean up any opened file by deassigning the channel
+    !
+    IF .ins$gl_kfichan NEQ 0
+    THEN
+	BEGIN
+	report ($DASSGN ( chan = .ins$gl_kfichan ));
+	ins$gl_kfichan = 0;
+	END;
+    END		! while
+WHILE .interactive;
+
+RETURN true;		! Return success
+
+END;		! Global routine install_start
+
+
+%SBTTL  'process_command';
+
+ROUTINE  process_command =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Set up the control flags and call the appropriate routines to execute
+!	the commands.
+!
+!  IMPLICIT INPUT:
+!
+!	CLI$DCL_PARSE has been called with the input command line.
+!
+!  OUTPUT:
+!
+!	none
+!
+!  IMPLICIT OUTPUT:
+!
+!	Set up global control flags, set up FAB for open file, store
+!	any privilege mask specified and record the open channel number.
+!
+!  ROUTINE VALUE:
+!
+!	success
+!	error:
+!	    RMS from file open
+!	    INSTALL : 	ins$_ivqual, for invalid qualifier
+!			ins$_confqual, for conflicting qualifiers
+!	    PRV$SETPRIV: if there are invalid privileges specified
+!
+!---
+OWN
+    ins$l_privdsc : BBLOCK [dsc$c_s_bln]
+			PRESET([dsc$b_class] = dsc$k_class_d),
+    ins$l_kfiess : BBLOCK [nam$c_maxrss],	! buffer for expanded name string
+    ins$l_kfirss : BBLOCK [nam$c_maxrss];	! buffer for resultant name string
+
+!+++
+!
+!   Initialization
+!
+!---
+
+$FAB_INIT(				! Initialize the File Access Block
+	FAB = ins$gl_outfab,
+	FAC = PUT,
+	RAT = CR,
+	FNM = 'SYS$OUTPUT'
+	);
+$RAB_INIT(				! Initialize the Record Access Block
+	RAB = ins$gl_outrab,
+	FAB = ins$gl_outfab
+	);
+execute ($CREATE (fab = ins$gl_outfab) );	! Create a channel to sys$output
+execute ($CONNECT (rab = ins$gl_outrab) );	! Connect to the channel
+
+
+!+++
+!
+!   Set flags for the qualifiers present in command line
+!
+!---
+
+!
+!   Flags to be entered into KFI
+!
+ins$gl_kfiflgs = 0;					! clear flags
+ins$gl_ctlmsk = 0;					! clear flags
+ins$gl_imgactflg = 0;					! clear flags
+
+!
+!   INSTALL control flags
+!
+ins$gl_ctlmsk [ins$v_filspc] = cli$present( FILE_SPEC_dsc );
+ins$gl_ctlmsk [ins$v_prot] = cli$present( %ASCID 'PROTECTED' );
+ins$gl_ctlmsk [ins$v_create] = cli$present( %ASCID 'CREATE' );
+ins$gl_ctlmsk [ins$v_delete] = cli$present( %ASCID 'DELETE' );
+ins$gl_ctlmsk [ins$v_replace] = cli$present( %ASCID 'REPLACE' );
+ins$gl_ctlmsk [ins$v_list] = cli$present( %ASCID 'LIST' );
+ins$gl_ctlmsk [ins$v_full] = cli$present( %ASCID 'FULL' );
+ins$gl_ctlmsk [ins$v_global] = cli$present( %ASCID 'GLOBAL' );
+ins$gl_ctlmsk [ins$v_help] = cli$present( %ASCID 'HELP' );
+ins$gl_ctlmsk [ins$v_exit] = cli$present( %ASCID 'EXIT' );
+ins$gl_ctlmsk [ins$v_process] = cli$present( %ASCID 'PROCESS' );
+ins$gl_ctlmsk [ins$v_open] = cli$present( %ASCID 'OPEN' );
+ins$gl_ctlmsk [ins$v_hdrres] = cli$present( %ASCID 'HEADER_RESIDENT' );
+ins$gl_ctlmsk [ins$v_priv] = cli$present( PRIVILEGED_dsc );
+ins$gl_ctlmsk [ins$v_shared] = cli$present( %ASCID 'SHARED' );
+ins$gl_ctlmsk [ins$v_writable] = cli$present( %ASCID 'WRITEABLE' );
+
+IF .ins$gl_ctlmsk [ins$v_process]
+THEN
+    BEGIN				! /PROCESS qualifier check
+    IF (.ins$gl_ctlmsk AND
+       (ins$m_prot OR ins$m_open OR ins$m_hdrres
+	OR ins$m_priv OR ins$m_shared OR ins$m_writable)
+	) NEQ 0
+    THEN RETURN ins$_confqual;
+    RETURN ins$_ivqual;			! *** Turn off /PROCESS ***
+    END
+
+ELSE
+    BEGIN				! not /PROCESS
+    LOCAL
+	cmk_arglst : VECTOR [1],	! arguement list for change mode dispatcher
+	status;
+
+    !
+    !	Since INSTALL may be installed with CMKRNL privilege,
+    !	check that user has CMKRNL privilege before allowing
+    !	any operations other than /PROCESS operations.
+    !
+    cmk_arglst [0] = 0;
+    status = $CMKRNL (ROUTIN = check_priv, ARGLST = cmk_arglst);
+    IF NOT .status
+    THEN
+	BEGIN
+	SIGNAL (ins$_nocmk, 0);
+	RETURN true;
+	END;
+
+    !
+    !	Flags to be entered into KFI
+    !
+    IF .ins$gl_ctlmsk [ins$v_open]
+    THEN ins$gl_kfiflgs = ( .ins$gl_kfiflgs OR kfi$m_kp_open );
+
+    IF .ins$gl_ctlmsk [ins$v_hdrres]
+    THEN ins$gl_kfiflgs = ( .ins$gl_kfiflgs OR kfi$m_kp_reshdr );
+
+    IF .ins$gl_ctlmsk [ins$v_priv]
+    THEN
+	BEGIN
+	LOCAL
+	    all_privs;	! boolean
+
+	all_privs = true;						! turn on all privs by default
+	CH$FILL (0, 8, ins$gq_kfiprivs);				! initialize privilege quadword to zeros
+	ins$gl_kfiflgs = ( .ins$gl_kfiflgs OR kfi$m_procpriv ); 	! Flag that image is to be installed with privs
+	WHILE cli$get_value ( PRIVILEGED_dsc, ins$l_privdsc ) DO
+	    BEGIN
+	    all_privs = false;						! turn off default
+	    SELECT prv$setpriv (ins$l_privdsc, ins$gq_kfiprivs) OF	! set the appropriate bit in the mask
+		SET
+
+		[prv$_invnam]:
+		    BEGIN
+		    SIGNAL (ins$_invprvnam, 1, ins$l_privdsc);
+		    RETURN true;
+		    END;
+
+		[prv$_notunq]:
+		    BEGIN
+		    SIGNAL (ins$_prvnotunq, 1, ins$l_privdsc);
+		    RETURN true;
+		    END;
+		TES;
+	    END;		! end while there are more privs
+	IF .all_privs					! No privs specified with /PRIV so
+	THEN CH$FILL (1, 8, ins$gq_kfiprivs);		! use default of all privs set
+	END;
+
+    IF .ins$gl_ctlmsk [ins$v_prot]
+    THEN ins$gl_kfiflgs = ( .ins$gl_kfiflgs OR kfi$m_protect );
+
+    IF .ins$gl_ctlmsk [ins$v_shared]
+    THEN ins$gl_kfiflgs = ( .ins$gl_kfiflgs OR kfi$m_kp_shared );
+
+    !
+    !   Set up control flags in case of call to $IMGACT
+    !
+    ins$gl_imgactflg [iac$v_writable] = .ins$gl_ctlmsk [ins$v_writable];
+    ins$gl_imgactflg [iac$v_noact] = true;		! special execution path in image activator
+							! to modify KFI entry without activating image
+    END;	! not /PROCESS
+
+
+!+++
+!
+!   Act on the command entered
+!
+!---
+
+IF .ins$gl_ctlmsk [ins$v_full]			! /FULL implies /LIST
+THEN ins$gl_ctlmsk [ins$v_list] = true;
+
+IF (NOT .ins$gl_ctlmsk [ins$v_filspc] ) 
+THEN
+    !
+    !	A file spec wasn't entered, therefore the only legal qualifiers
+    !	are /LIST and /GLOBAL.
+    !
+    BEGIN
+    IF (.ins$gl_ctlmsk AND
+	(ins$m_open OR ins$m_hdrres OR ins$m_priv OR ins$m_prot OR
+	 ins$m_shared OR ins$m_writable OR ins$m_delete OR ins$m_replace)
+	) NEQ 0
+    THEN RETURN ins$_ivqual;
+    IF .ins$gl_ctlmsk [ins$v_list] THEN execute( process_list (0) );
+    IF .ins$gl_ctlmsk [ins$v_global] THEN execute( process_global () );
+    END
+
+
+!
+!   A file name was specified
+!
+
+ELSE
+    BEGIN
+    LOCAL
+	open_status;
+
+    !
+    ! Get the file spec from the CLI
+    !
+    execute( cli$get_value ( FILE_SPEC_dsc, ins$gl_fildsc) );
+
+    !+++
+    !
+    !   Prepare to OPEN the file
+    !
+    !---
+
+    $FAB_INIT (
+	fab = ins$gl_kfifab,
+	nam = ins$gl_kfinam,
+	shr = <get,put,upi>,
+	dnm = 'SYS$SYSTEM:.EXE',
+	fna = .ins$gl_fildsc [dsc$a_pointer],
+	fns = .ins$gl_fildsc [dsc$w_length],
+	fop = <ufo, kfo>
+	);
+    ins$gl_kfifab [fab$l_ctx] = 0;	! Zero CTX longword in the FAB to 
+					! determine if KFI address is returned by OPEN
+
+    $NAM_INIT (
+	nam = ins$gl_kfinam,
+	esa = ins$l_kfiess,
+	ess = nam$c_maxrss,
+	rsa = ins$l_kfirss,
+	rss = nam$c_maxrss
+	);
+    ins$gl_kfinam [nam$b_rsl] = 0;			! zero to tell if resultant string returned by OPEN
+
+
+    !+++
+    !
+    !   Open the file
+    !
+    !---
+
+    open_status = $OPEN (fab = ins$gl_kfifab);
+    IF NOT .open_status	! open error
+    THEN
+	BEGIN
+	LOCAL
+	    err_desc : BBLOCK [dsc$c_s_bln];
+
+	err_desc = 0;
+	err_desc [dsc$b_class] = dsc$k_class_s;
+
+	IF .ins$gl_kfinam [nam$b_rsl] GTRU 0
+	THEN 
+	    BEGIN
+	    err_desc [dsc$w_length] = .ins$gl_kfinam [nam$b_rsl];
+	    err_desc [dsc$a_pointer] = .ins$gl_kfinam [nam$l_rsa];
+	    END
+	ELSE
+	    IF .ins$gl_kfinam [nam$b_esl] GTRU 0
+	    THEN
+		BEGIN
+		err_desc [dsc$w_length] = .ins$gl_kfinam [nam$b_esl];
+		err_desc [dsc$a_pointer] = .ins$gl_kfinam [nam$l_esa];
+		END
+	    ELSE
+		BEGIN
+		err_desc [dsc$w_length] = .ins$gl_kfifab [fab$b_fns];
+		err_desc [dsc$a_pointer] = .ins$gl_kfifab [fab$l_fna];
+		END;
+	SIGNAL ( ins$_openin, 1, err_desc, .open_status, .ins$gl_kfifab [fab$l_stv] );
+	IF (str$compare (hel_dsc, ins$gl_fildsc) EQL 0) OR
+	   (str$compare (help_dsc, ins$gl_fildsc) EQL 0)
+	THEN
+	    BEGIN
+	    SIGNAL (ins$_help);
+	    END;
+	RETURN true;
+	END;
+
+    ins$gl_kfichan = .ins$gl_kfifab [fab$l_stv];	! save the channel
+
+
+    !+++
+    !
+    !   Save the resultant name string
+    !
+    !---
+
+    CH$FILL (0, dsc$c_s_bln, ins$gl_kfirns);		! zero resultant name string descriptor
+    IF .ins$gl_kfinam [nam$b_rsl] NEQ 0
+    THEN
+	BEGIN		! use resultant string name
+	ins$gl_kfirns [dsc$a_pointer] = ins$l_kfirss;
+	END
+    ELSE
+	BEGIN		! use expanded string name
+	ins$gl_kfirns [dsc$a_pointer] = ins$l_kfiess;
+	END;
+    !
+    !	Drop off the version field, be it ';' or ';n' or '.' or '.n'
+    !
+    ins$gl_kfirns [dsc$w_length] = .ins$gl_kfinam [nam$b_dev] +
+	.ins$gl_kfinam [nam$b_dir] + .ins$gl_kfinam [nam$b_name] +
+	.ins$gl_kfinam [nam$b_type];
+
+    !
+    !	Store the KFI address returned by RMS $OPEN.
+    !	After a replace or create operation, those routines will deposit the
+    !	new KFI address in ins$gl_kfiadr in case /LIST was requested
+    !
+    ins$gl_kfiadr = .ins$gl_kfifab [fab$l_ctx];
+
+
+    !+++
+    !
+    !   Process file operations
+    !
+    !---
+
+    IF .ins$gl_ctlmsk [ins$v_delete] 
+    THEN
+	!
+	!   if /delete requested then /replace/create are invalid
+	!   if /list requested then all the remaining known files will
+	!   be listed after the delete
+	!
+	BEGIN
+	IF (.ins$gl_ctlmsk [ins$v_replace] OR .ins$gl_ctlmsk [ins$v_create])
+	THEN RETURN ins$_confqual;
+
+	execute( proc_create_delete () );
+	IF .ins$gl_ctlmsk [ins$v_list]
+	THEN execute(process_list (0));
+	END
+
+
+
+    ELSE
+	IF .ins$gl_ctlmsk [ins$v_replace]
+	THEN
+	    !
+	    !	If /list requested with /replace then do the replace and
+	    !	list the new entry.
+	    !
+	    BEGIN
+	    IF (.ins$gl_ctlmsk AND
+		(ins$m_create OR ins$m_open OR ins$m_hdrres OR ins$m_priv OR
+		ins$m_prot OR ins$m_shared OR ins$m_writable)
+		) NEQ 0
+	    THEN RETURN ins$_confqual;
+
+	    execute( proc_create_delete () );
+	    IF .ins$gl_ctlmsk [ins$v_list]
+	    THEN execute(process_list (.ins$gl_kfiadr));
+
+	    END		! /REPLACE
+
+
+	ELSE
+	    !
+	    !   filespec given but not for replace or delete.
+	    !   A /LIST without /CREATE requests list of given file's KFI.
+	    !   A /LIST with /CREATE requests file be added to KFI and a 
+	    !   that entry be listed.
+	    !   A filename without /LIST or /CREATE is an implied /CREATE.
+	    !
+	    BEGIN
+	    IF .ins$gl_ctlmsk [ins$v_list] AND 
+		NOT .ins$gl_ctlmsk [ins$v_create]
+	    THEN
+		BEGIN
+		IF .ins$gl_kfiadr EQL 0 
+		THEN RETURN ins$_nokfifnd;
+		execute (process_list (.ins$gl_kfiadr));
+		END
+	    ELSE
+		BEGIN
+		ins$gl_ctlmsk [ins$v_create] = true;	! set create flag
+		execute( proc_create_delete () );
+		IF .ins$gl_ctlmsk [ins$v_list]
+		THEN
+		    execute (process_list (.ins$gl_kfiadr))
+		END;
+	    END;
+
+
+
+    IF .ins$gl_ctlmsk [ins$v_global]
+    THEN execute ( process_global ());
+    END;
+RETURN true;
+END;		! routine process_command
+
+
+%SBTTL  'check_priv';
+
+ROUTINE check_priv =
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!	Check that user has CMKRNL privilege.
+!
+!  INPUT:
+!	None
+!
+!  OUTPUT:
+!	None
+!
+!  ROUTINE VALUE:
+!	isn$_nocmk	If user does not have CMKRNL privilege
+!	low bit set	If user has CMKRNL privilege
+!---
+BEGIN
+IF NOT .ctl$gq_procpriv [prv$v_cmkrnl]
+THEN
+    RETURN ins$_nocmk
+ELSE
+    RETURN true;
+END;		! routine check_priv
+
+
+%SBTTL  'help';
+
+ROUTINE help ( hlp_dsc) =
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!	Conduct interactive help session
+!
+!  INPUT:
+!	hlp_dsc : Descriptor of command, possibly with qualifier(s) for
+!		  which help is requested
+!
+!  OUTPUT:
+!	Interactive help session
+!
+!  ROUTINE VALUE:
+!	Low bit set for success 
+!	unless an error is returned from lbr$output_help.
+!---
+BEGIN
+!
+!   Request help be printed by lib$put_output to sys$output,
+!   from library SYS$HELP:INSTALHLP.HLB.  Query for additional help
+!   to sys$input using lib$get_input.
+!
+report ( lbr$output_help (lib$put_output, 0, .hlp_dsc,
+		$DESCRIPTOR('INSTALHLP'), 0,lib$get_input) );
+RETURN true;
+END;
+
+END		! Module instalcmd
+ELUDOM

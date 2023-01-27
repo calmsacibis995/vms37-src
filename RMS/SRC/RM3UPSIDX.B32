@@ -1,0 +1,822 @@
+
+MODULE RM3UPSIDX (LANGUAGE (BLISS32) ,
+		IDENT = 'V03-001'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:	RMS32 index sequential file organization
+!
+! ABSTRACT:
+!                insert SIDR data record, all index updates
+!
+!
+! ENVIRONMENT:
+!
+!		VAX/VMS operating system
+!
+!--
+
+!
+! AUTHOR:		        Christian Saether
+!
+! CREATION DATE:        	20-JUL-78  13:58
+!
+!
+! MODIFIED BY:
+!
+!	V03-001	MCN0001		Maria del C. Nasr	25-Mar-1981
+!		Use macro to calculate key buffer address.
+!
+!	V018	TMK0001		Todd M. Katz	11-Feb-1982
+!		After an index bucket has been split, as part of the
+!		preparation for updating the index level immediatly above
+!		the current level, clear IRAB[IRB$L_VBN_MID]. There is a
+!		possibility that because a new index record must be inserted
+!		in the next level's index bucket, that index bucket may
+!		split. If the point of insertion of the new high key value
+!		resulting from the just split index bucket will be at the
+!		split point of the index bucket immediately above it, and
+!		if IRAB[IRB$L_VBN_MID] is not zero (which it won't be if a
+!		multibucket split occurred at the data level), the bucket
+!		at the next level may be incorrectly handled as a two-pass
+!		multibucket split instead of as a two-pass non-multibucket 
+!		split. This will result in the corruption of the new index 
+!		bucket. It will contain two identical keys with different 
+!		VBN pointers, the low order key will have the same VBN 
+!		pointer as the new high order key of the old bucket, and a 
+!		pointer will be overwritten resulting in an inability to
+!		randomly access all records below it. 
+!
+!	V017	CDS0001		C Saether	30-Aug-1981
+!		Reset CURBDB after release with keep lock, as
+!		it has changed and become the lock blb.
+!
+!	V016	PSK0003		P S Knibbe	09-Aug-1981
+!		Add support for splitting index buckets.
+!
+!	V015	PSK0002		P S Knibbe	29-Jul-1981
+!		Remove support for growing prologue three
+!		compressed indexes.
+!
+!	V014	PSK0001		P S Knibbe	14-Jun-1981
+!		Add support to RM$INS_IF_FIT for prologue three
+!		files.
+!		Add support to RM$INSS_OR_IDX for UKEY_ONLY
+!
+!	V013	CDS0081		C D Saether	26-Feb-1981	22:00
+!		Check for errors on split_em.
+!
+!       V012    REFORMAT	 D M Walp	24-JUL-1980
+!
+!	V011	CDS0080		 C D Saether	27-FEB-1980
+!		Don't mark buffers invalid on errors.
+!
+!	V010	CDS0072		 C D Saether	15-JAN-1980	14:50
+!		Don't zero or update nrp list unless splitting. (also
+!		corrects bug calling nrp routines with uninitialized value).
+!
+! REVISION HISTORY:
+!
+!   Wendy Koenig, 	12-OCT-78  14:51
+!   X0002 - CHANGE NRP STUFF
+!
+!   Wendy Koenig, 	24-OCT-78  14:03
+!   X0003 - MAKE CHANGES CAUSED BY SHARING CONVENTIONS
+!
+!   Christian Saether, 	12-DEC-78  20:40
+!   X0004 - handle case where SIDR pointer being added to deleted record
+!
+!   Christian Saether, 	14-DEC-78  17:39
+!   X0005 - recvr_spc forces record to be deleted unless positioned for insert
+!           on it
+!
+!   Wendy Koenig, 	25-JAN-79  11:26
+!   X0006 - GET RID OF SETTING VALID
+!
+!   Christian Saether,  1-july-79  11:30
+!   X0007 - set irb$v_dup when dupes seen on alternate
+!
+!   Christian Saether,	26-NOV-79  12:10
+!   0008 - don't force write thru if links don't change
+!
+!   Ron Schaefer,	11-JAN-80  16:50
+!   0009 - clear deleted-sidr flag on each call to RM$SQUISH_SIDR
+!
+!*****
+
+LIBRARY 'RMSLIB:RMS';
+
+REQUIRE 'RMSSRC:RMSIDXDEF';
+
+! define default psects for code
+!
+PSECT
+    CODE = $$RMSPUT3(PSECT_ATTR),
+    PLIT = $$RMSPUT3(PSECT_ATTR);
+
+! linkages
+!
+LINKAGE
+    L_SQUISH_SIDR,
+    L_GETNEXT_REC,
+    L_REC_OVHD,
+    L_ZERO_NRP,
+    L_BKT_SORT,
+    L_RLSBKT,
+    L_CSEARCH_TREE,
+    L_SRCH_BY_KEY,
+    L_RECORD_SIZE,
+    L_INS_REC,
+    L_ALLOC_BKT,
+    L_UPD_NRP,
+    RL$INS_IF_FIT = JSB () : GLOBAL (R_BKT_ADDR, R_RAB, R_IRAB,
+				     R_IFAB, R_REC_ADDR, R_IDX_DFN),
+    L_SPLIT_EM,
+    RL$RECVR_SPC  = JSB () : GLOBAL (R_REC_ADDR, R_BKT_ADDR,
+				     R_IRAB, R_IFAB, R_IDX_DFN),
+    L_UPD_PLG,
+    L_INSS_OR_IDX,
+    L_NEW_ROOT,
+    L_MOVE;
+
+! forward routines
+!
+FORWARD ROUTINE
+    RM$RECVR_SPC	: RL$RECVR_SPC,
+    RM$INS_IF_FIT	: RL$INS_IF_FIT;
+
+
+! external routines
+!
+EXTERNAL ROUTINE
+    RM$SQUISH_SIDR	: RL$SQUISH_SIDR,
+    RM$GETNEXT_REC	: RL$GETNEXT_REC,
+    RM$REC_OVHD		: RL$REC_OVHD,
+    RM$ZERO_NRP		: RL$ZERO_NRP NOVALUE,
+    RM$UPD_NRP		: RL$UPD_NRP NOVALUE,
+    RM$INS_REC		: RL$INS_REC,
+    RM$CSEARCH_TREE	: RL$CSEARCH_TREE,
+    RM$SRCH_BY_KEY	: RL$SRCH_BY_KEY,
+    RM$BKT_SORT		: RL$BKT_SORT,
+    RM$ALLOC_BKT	: RL$ALLOC_BKT,
+    RM$RLSBKT		: RL$RLSBKT,
+    RM$SPLIT_EM		: RL$SPLIT_EM,
+    RM$RECORD_SIZE	: RL$RECORD_SIZE,
+    RM$UPD_PLG		: RL$UPD_PLG,
+    RM$NEW_ROOT		: RL$NEW_ROOT,
+    RM$MOVE		: RL$MOVE;
+
+GLOBAL ROUTINE RM$INSS_OR_IDX : RL$INSS_OR_IDX =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+! 	Call from level 0 to insert SIDR record and perform all neccessary
+! 	index updates, or from level 1 on primary key to update index
+!
+! CALLING SEQUENCE:
+!	RM$INSS_OR_IDX()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!        IRAB - 	    pointer to internal RAB
+!	    [ LOCK_BDB ] -  BDB of bucket to access if at level 1 on primary
+!			    key and LOCKABOVE used on position for insert
+!			    otherwise 0
+!	    [ CURBDB ] -    locked BDB of level 0 if primary key. This is
+!			    released after successfully positioning at current 
+!			    level 1.  For SIDR insert this is zero on entry 
+!			    causing search down alternate index from root.
+!	    [ STOPLEVEL ] - 1 for index update primary key, 0 for SIDR insert
+!	    [ SPL_BITS ] -  status flags from primary data level split, 0 for
+!			    SIDR insert
+!	    BIG_SPLIT -     more than two bucket split
+!	    [ VBN_LEFT ] -  VBN of left hand bucket for primary key index 
+!			    update
+!	    [ VBN_RIGHT ] - VBN of right bkt prim key if present
+!	    [ VBN_MID ] -   middle bkt VBN in 3-4 bkt prim key split case
+!	    [ SRCHFLAGS ] - search flags for CSEARCH_TREE
+!	    POSINSERT -     set to cause position for insert
+!	    IDX_DFN -       pointer to index descriptor for key of reference
+!	    [ DUPKEYS ] -   duplicate keys are allowed if set other fields as 
+!			    used by routines called by this routine
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	SUC - success
+!	any error codes from allocation or get bucket routines
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_RAB_STR,
+	R_REC_ADDR_STR,
+	R_IDX_DFN_STR,
+	R_BKT_ADDR_STR;
+
+    GLOBAL REGISTER
+	R_BDB_STR;
+
+    LOCAL
+	ERRSTATUS;
+
+    MACRO
+	EXONERR (CALL) =
+	BEGIN
+	IF NOT (ERRSTATUS = (CALL))
+	THEN EXITLOOP
+	END %;
+
+    ! This routine is constructed as one while loop which is left via a return
+    ! when no further index updates are neccessary
+    !
+
+    WHILE 1
+    DO
+	BEGIN
+
+	! if LOCK_BDB is nonzero then it was not released on the way down the
+	! tree and no further action is needed otherwise we must force a search
+	! from the root
+	!
+
+	IF (BDB = .IRAB[IRB$L_LOCK_BDB]) NEQ 0
+	THEN
+	    BEGIN
+
+	    ! swap current and lock bdb's and set up REC_ADDR
+	    !
+	    REC_ADDR = .BDB[BDB$L_ADDR] + BKT$C_OVERHDSZ;
+	    IRAB[IRB$L_LOCK_BDB] = .IRAB[IRB$L_CURBDB];
+	    IRAB[IRB$L_CURBDB] = .BDB;
+	    END
+	ELSE
+
+	    ! current bdb becomes lock bdb to be released later and curbdb is
+	    ! zeroed to force search from root
+	    !
+	    BEGIN
+	    IRAB[IRB$L_LOCK_BDB] = .IRAB[IRB$L_CURBDB];
+	    IRAB[IRB$L_CURBDB] = 0;
+	    END;
+
+	EXONERR(RM$CSEARCH_TREE());
+
+	! REC_ADDR is now pointing to position of insert
+	! If this is a prologue three file with compressed index records,
+	! then shift the contents of key buff 2 down two bytes so that
+	! all key buffers look alike.
+	!
+
+	IF .IDX_DFN [IDX$V_IDX_COMPR]
+	THEN
+	    BEGIN
+
+	    MACRO
+		KEYLEN 		= 0,0,8,0 %,
+		FRNT_CMPR 	= 1,0,8,0 %;
+
+	    LOCAL
+		BUFF : REF BBLOCK;
+
+	    BUFF = KEYBUF_ADDR(2);
+	    RM$MOVE (.IRAB[IRB$B_KEYSZ], .BUFF, .BUFF+2);
+	    BUFF [KEYLEN] = .IRAB [IRB$B_KEYSZ];
+	    BUFF [FRNT_CMPR] = 0;
+	    END;
+
+	! if duplicates aren't allowed and we saw some then that's an error
+	!
+
+	IF .IRAB[IRB$B_STOPLEVEL] EQL 0
+	THEN
+	    BEGIN
+
+	    IF .IRAB[IRB$V_DUPS_SEEN]
+	    THEN
+
+		IF NOT .IDX_DFN[IDX$V_DUPKEYS]
+		THEN
+		    BEGIN
+		    ERRSTATUS = RMSERR(DUP);
+		    EXITLOOP;
+		    END
+		ELSE
+		    IRAB[IRB$V_DUP] = 1;
+	
+	    END
+	
+	! if this wasn't position to level 0 then release lock on level
+	! below after positioning to point of insert above
+	!
+	ELSE
+	    RELEASE(IRAB[IRB$L_LOCK_BDB]);
+	
+	BDB = .IRAB[IRB$L_CURBDB];
+	BKT_ADDR = .BDB[BDB$L_ADDR];
+	BDB[BDB$V_DRT] = 1;
+
+	
+	! now try to put the record into the existing bucket - success if it
+	! fits
+	!
+
+	IF RM$INS_IF_FIT()
+	THEN
+	    BEGIN
+
+	    ! record fits without splitting so release lock bdb (there is
+	    ! one only at level 0 when lock above was used on positioning)
+	    ! write thru bucket and return
+	    !
+
+	    LOCAL
+	    	FLAGS;
+
+	    FLAGS = 0;
+
+	    IF (BDB = .IRAB[IRB$L_LOCK_BDB]) NEQ 0
+	    THEN
+	    	BEGIN
+	    	IRAB[IRB$L_LOCK_BDB] = 0;
+	    	RM$RLSBKT(0);
+	    	END;
+
+	    BDB = .IRAB[IRB$L_CURBDB];
+	    IRAB[IRB$L_CURBDB] = 0;
+	    RETURN RM$RLSBKT(.FLAGS);
+
+	    END;
+
+	! allocate a new bucket to split into
+	!
+	EXONERR(RM$ALLOC_BKT());
+
+	! if LOCKABOVE was used and we are doing a SIDR data level split there
+	! are now 3 buffers in use
+	!
+	BDB = .IRAB[IRB$L_NXTBDB];
+
+	! if this is an alternate index data level then pre-scan nrp list and
+	! initialize if further action will be necessary
+	!
+
+	IF .IRAB[IRB$B_STOPLEVEL] EQLU 0
+	THEN
+	    RM$ZERO_NRP();
+	
+	! split the bucket !!!
+	!
+
+	IF NOT (ERRSTATUS = RM$SPLIT_EM())
+	THEN
+	    BEGIN
+	    BDB [BDB$V_VAL] = 0;
+	    IRAB [IRB$L_NXTBDB] = 0;
+	    RM$RLSBKT(0);
+	    BBLOCK [.IRAB[IRB$L_CURBDB], BDB$V_VAL] = 0;
+	    EXITLOOP
+	    END;
+
+	! now save the VBN of the new bucket for next level update
+	!
+	IRAB[IRB$L_VBN_RIGHT] = .BDB[BDB$L_VBN];
+	BDB[BDB$V_DRT] = 1;
+	IRAB[IRB$L_NXTBDB] = 0;
+
+	! We must clear VBN_MID for the next level update as a precaution.
+	! If the current index bucket split was for a multibucket data level 
+	! split, the update at the next level could be done incorrectly if
+	! that index bucket split and the point of insertion of the new key 
+	! was at the split point, and if this VBN cell is not zero.
+	!
+	IRAB[IRB$L_VBN_MID] = 0;
+
+	! write the new bucket
+	!
+	EXONERR(RM$RLSBKT(RLS$M_WRT_THRU));
+
+	! if this was a continuation bucket then no index update is neccessary
+	! so release lock bdb if any and write out current bdb. nrp update is
+	! not necessary in this case because only the new record will go into
+	! the new bucket when a continuation bucket is created for alternate
+	! index data levels.
+	!
+
+	IF .IRAB[IRB$V_CONT_BKT]
+	THEN
+	    BEGIN
+
+	    LOCAL
+		FLAGS;
+
+	    FLAGS = RLS$M_WRT_THRU;
+
+	    IF (BDB = .IRAB[IRB$L_LOCK_BDB]) NEQ 0
+	    THEN
+		(IRAB[IRB$L_LOCK_BDB] = 0;
+		RM$RLSBKT(0));
+
+	    BDB = .IRAB[IRB$L_CURBDB];
+	    IRAB[IRB$L_CURBDB] = 0;
+	    RETURN RM$RLSBKT(.FLAGS);
+
+	    END;
+
+	! set up bdb and bkt_addr for new root code if taken or releasing
+	! curbdb if not and VBN_LEFT for next pass, i.e., the index update or
+	! new root generation
+	!
+	BDB = .IRAB[IRB$L_CURBDB];
+	BKT_ADDR = .BDB[BDB$L_ADDR];
+	IRAB[IRB$L_VBN_LEFT] = .BDB[BDB$L_VBN];
+
+	IF .BKT_ADDR[BKT$V_ROOTBKT]
+	    AND
+	    .BKT_ADDR[BKT$B_LEVEL] EQL .IDX_DFN[IDX$B_ROOTLEV]
+	THEN
+
+	    ! this is a root bucket which split so link in new bucket make new
+	    ! root, make non root out of old bucket
+	    !
+	    BEGIN
+	    BKT_ADDR[BKT$V_ROOTBKT] = 0;
+	    EXONERR(RM$ALLOC_BKT());
+
+	    ! restore next bucket link of original bucket that got clobbered
+	    ! when we linked in a bucket for the new root
+	    !
+	    BKT_ADDR[BKT$L_NXTBKT] = .IRAB[IRB$L_VBN_RIGHT];
+
+	    ! set up BDB and BKT_ADDR for NEW_ROOT
+	    !
+	    BDB = .IRAB[IRB$L_NXTBDB];
+	    BKT_ADDR = .BDB[BDB$L_ADDR];
+	    RM$NEW_ROOT();
+
+	    ! write out and release new root
+	    !
+	    BDB[BDB$V_DRT] = 1;
+	    IRAB[IRB$L_NXTBDB] = 0;
+	    EXONERR(RM$RLSBKT(RLS$M_WRT_THRU));
+
+	    ! update all relevant prologue information
+	    !
+	    EXONERR(RM$UPD_PLG());
+
+	    ! now write out original root bucket
+	    !
+	    BDB = .IRAB[IRB$L_CURBDB];
+	    IRAB[IRB$L_CURBDB] = 0;
+	    RETURN (RM$RLSBKT(RLS$M_WRT_THRU));
+
+	    END;
+
+	! write out current bdb keeping lock on it until positioned to level
+	! above on index update
+	!
+	EXONERR(RM$RLSBKT(RLS$M_WRT_THRU
+		OR
+		RLS$M_KEEP_LOCK));
+	IRAB[IRB$L_CURBDB] = .BDB;
+
+	IF .IRAB[IRB$B_STOPLEVEL] EQL 0
+	THEN
+	    RM$UPD_NRP(.IRAB[IRB$L_VBN_LEFT]);
+
+	IRAB[IRB$B_STOPLEVEL] = .IRAB[IRB$B_STOPLEVEL] + 1;
+	IRAB[IRB$B_SRCHFLAGS] = IRB$M_POSINSERT;
+	IRAB[IRB$B_SPL_BITS] = 0;
+	END;	! end of WHILE loop
+
+    ! this is the error code to release lock bdb and current bdb if they
+    ! are non-zero.  this code is only executed on errors.
+    !
+    IF (BDB = .IRAB[IRB$L_LOCK_BDB]) NEQ 0
+    THEN
+	(IRAB[IRB$L_LOCK_BDB] = 0;
+	RM$RLSBKT(0));
+
+    IF (BDB = .IRAB[IRB$L_CURBDB]) NEQ 0
+    THEN
+	BEGIN
+	IRAB[IRB$L_CURBDB] = 0;
+	RM$RLSBKT(0);
+	END;
+
+    RETURN .ERRSTATUS;
+
+    END;
+
+GLOBAL ROUTINE RM$INS_IF_FIT : RL$INS_IF_FIT =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine inserts a SIDR or index record into the bucket
+!	at the position pointed to by REC_ADDR and returns success if
+!	it fits else returns 0 to indicate a split is neccessary.
+!
+! CALLING SEQUENCE:
+!	RM$INS_IF_FIT()
+!
+! INPUT PARAMETERS
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	RAB [ LOA ] - 	     if set use fill sizes to determine bucket size
+!	IRAB [ DUPS_SEEN ] - set if duplicates seen meaning only continuation
+!	 	             record is neccessary
+!	BKT_ADDR - 	     points to beginning of bucket
+!	IDX_DFN - 	     pointer to index descriptor
+!	[ DATFILL ] -        fill size for data buckets when fill percents used
+!	[ IDXFILL ] -        "        "    index  "         "        "      "
+!	[ DATBKTSZ ] -       size of data bkts in VBN's
+!	[ IDXBKTSZ ] -       "    "  index "     "
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	R_BKT_ADDR_STR,
+	R_RAB_STR,
+	R_IRAB_STR,
+	R_IFAB_STR,
+	R_REC_ADDR_STR,
+	R_IDX_DFN_STR;
+
+    LOCAL
+	REC_SZ;
+
+    ! this block is defined to limit scope of BKT_ROOM
+    !
+    BEGIN
+
+    LOCAL
+	END_BKT,
+	BKT_ROOM	: SIGNED;
+
+    ! set up bucket size used to determine split based on whether this is
+    ! data or index level and whether fill percentages are used
+    !
+    IF .BKT_ADDR[BKT$B_LEVEL] EQL 0
+    THEN
+	BEGIN
+	END_BKT = .BKT_ADDR + .IDX_DFN[IDX$B_DATBKTSZ]*512;
+
+	IF .RAB[RAB$V_LOA]
+	THEN
+	    BKT_ROOM = .IDX_DFN[IDX$W_DATFILL]
+	ELSE
+	    BKT_ROOM = .IDX_DFN[IDX$B_DATBKTSZ]*512;
+	END
+    ELSE
+	BEGIN
+	END_BKT = .BKT_ADDR + .IDX_DFN[IDX$B_IDXBKTSZ]*512;
+
+	IF .RAB[RAB$V_LOA]
+	THEN
+	    BKT_ROOM = .IDX_DFN[IDX$W_IDXFILL]
+	ELSE
+	    BKT_ROOM = .IDX_DFN[IDX$B_IDXBKTSZ]*512;
+	END;
+
+    ! set up record size
+    !
+    REC_SZ = RM$RECORD_SIZE();
+
+    ! establish amount of room left in bucket with new record minus 1 byte for
+    ! check byte at end of bucket
+    !
+    IF .IFAB [IFB$B_PLG_VER] LSSU PLG$C_VER_3 
+    THEN
+	BKT_ROOM = .BKT_ROOM - .REC_SZ - .BKT_ADDR[BKT$W_FREESPACE] - 1
+    ELSE
+
+	! Prologue three index or SIDR bucket
+	!
+	BEGIN
+
+	LOCAL
+	    VBN_FREE;
+
+	VBN_FREE = .END_BKT - BKT$C_ENDOVHD;
+	BKT_ROOM = .(.VBN_FREE)<0,16> - .BKT_ADDR [BKT$W_FREESPACE];
+	BKT_ROOM = .BKT_ROOM - .REC_SZ<0,16> - .REC_SZ <16,16>;
+	END;		
+
+    IF .BKT_ROOM LSS 0
+    THEN
+	BEGIN
+
+	IF .BKT_ADDR[BKT$B_LEVEL] NEQ 0 
+		OR .IFAB [IFB$B_PLG_VER] EQLU PLG$C_VER_3
+	THEN
+	    RETURN 0; ! no room index level, must split
+
+	! data level SIDR we can try to recover space which may have been
+	! left behind by that messy RMS-11 as deleted records which have not
+	! been recovered
+	!
+	IF RM$RECVR_SPC() + .BKT_ROOM LSS 0
+	THEN
+	    RETURN 0
+
+	END;
+
+    IRAB[IRB$W_POS_INS] = .REC_ADDR - .BKT_ADDR; ! set up for INS_REC
+    END; ! of block defining BKT_ROOM
+    RETURN RM$INS_REC(.BKT_ADDR, .REC_SZ);
+
+    END;
+
+
+GLOBAL ROUTINE RM$RECVR_SPC : RL$RECVR_SPC =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	scans thru the sidrs squishing out records that rms-11
+!	may have left around even though they're deleted
+!
+! CALLING SEQUENCE:
+!	bsbw rm$recvb_spc
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	bkt_addr - address of bucket, [freespace]
+!	idx_dfn
+!	irab
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	upd_nrp bit in irab set if the nrp list needs updating
+!	rec_addr is updated to reflect the change
+!
+! ROUTINE VALUE:
+!	number of bytes squished out
+!
+! SIDE EFFECTS:
+!	some records have been squished out
+!
+!--
+
+    BEGIN
+
+    LABEL
+	BLK;
+
+    EXTERNAL REGISTER
+	R_REC_ADDR_STR,
+	R_IFAB_STR,
+	R_IDX_DFN_STR,
+	R_BKT_ADDR_STR,
+	R_IRAB_STR;
+
+    LOCAL
+	SAVE_REC_ADDR,
+	SQUISH,
+	EOB,
+	BOS,
+	COUNT	: WORD,
+	EOS;
+
+    SAVE_REC_ADDR = .REC_ADDR;
+    SQUISH = 0;
+    REC_ADDR = .BKT_ADDR + BKT$C_OVERHDSZ;
+    EOB = .BKT_ADDR + .BKT_ADDR[BKT$W_FREESPACE];
+
+    IF .REC_ADDR EQL .EOB
+    THEN
+	BEGIN
+	REC_ADDR = .SAVE_REC_ADDR;
+	RETURN .SQUISH;
+
+	END;
+
+    DO
+BLK :
+	BEGIN
+	BOS = .REC_ADDR;
+	RM$GETNEXT_REC();
+	EOS = .REC_ADDR;
+	REC_ADDR = .BOS;
+
+	BEGIN
+	GLOBAL REGISTER
+	    R_REC_SIZE;
+
+	REC_SIZE = -1;
+	REC_ADDR = .REC_ADDR + RM$REC_OVHD() + .IDX_DFN[IDX$B_KEYSZ];
+        END;
+
+	COUNT = 0;
+
+	WHILE .REC_ADDR LSSU .EOS
+	DO
+	    BEGIN
+
+	    IF .REC_ADDR[IRC$V_DELETED]
+		OR
+		.REC_ADDR[IRC$V_KEYDELETE]
+	    THEN
+		BEGIN
+
+		BUILTIN
+		    AP;
+
+		LOCAL
+		    SIZE;
+
+		AP = .COUNT;
+		AP<17, 1> = 1; ! signal begin called from recvr_spc
+		SIZE = RM$SQUISH_SIDR(.BOS);
+		SQUISH = .SQUISH + .SIZE;
+
+		IF .SAVE_REC_ADDR GTRU .REC_ADDR
+		THEN
+		    SAVE_REC_ADDR = .SAVE_REC_ADDR - .SIZE;
+
+		IF .IRAB[IRB$L_LST_REC] GTRU .REC_ADDR
+		THEN
+		    IRAB[IRB$L_LST_REC] = .IRAB[IRB$L_LST_REC] - .SIZE;
+
+		IF .AP<16, 1>
+		THEN
+		    EXITLOOP;
+
+		EOS = .EOS - .SIZE
+		END
+	    ELSE
+		(COUNT = .COUNT + 1;
+		REC_ADDR = .REC_ADDR + .REC_ADDR[IRC$V_PTRSZ] + 4);
+
+	    END; ! {end of while still in sidr }
+
+	EOB = .BKT_ADDR + .BKT_ADDR[BKT$W_FREESPACE];
+	END
+    UNTIL .REC_ADDR EQL .EOB;
+
+    REC_ADDR = .SAVE_REC_ADDR;
+    RETURN .SQUISH;
+
+    END; ! {end of recover_space }
+END
+
+ELUDOM

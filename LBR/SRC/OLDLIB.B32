@@ -1,0 +1,753 @@
+MODULE LBR_OLDLIB (			! Routines to process old format libraries
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  Library access procedures
+!
+! ABSTRACT:
+!
+!		The VAX/VMS librarian procedures implement a standard access method
+!		to libraries through a shared, common procedure set.
+!
+! ENVIRONMENT:
+!
+!	VAX native, user mode.
+!
+!--
+!
+!
+! AUTHOR:  Benn Schreiber,	 CREATION DATE:  24-July-1979
+!
+! MODIFIED BY:
+!
+!	V02-001		RPG0001		Bob Grosso	31-Aug-1981
+!		Remove LBRMSG.
+!--
+
+
+
+LIBRARY
+	'SYS$LIBRARY:STARLET.L32';
+REQUIRE
+	'PREFIX';
+REQUIRE
+	'LBRDEF';
+REQUIRE
+	'OLDFMTDEF';
+
+LINKAGE
+    fmg_match = JSB (REGISTER = 2, REGISTER = 3, REGISTER = 4, REGISTER = 5) : NOTUSED (10, 11);
+
+FORWARD ROUTINE
+    check_wild,					!Check wildcard match
+    call_user,					!Call user routine
+    check_rfa,					!Check RFA before calling user
+    travers_old_idx;				!Traverse index
+
+EXTERNAL ROUTINE
+    fmg$match_name : fmg_match,			!Embedded wild card matching
+    find_block : JSB_3,				!Find block and map in memory
+    read_block : JSB_2,				!Read disk block
+    read_n_block : JSB_2,			!Read and cache multiple disk blocks
+    get_mem : JSB_2,				!Allocate dynamic memory
+    dealloc_mem : JSB_2;			!Deallocate dynamic memory
+
+EXTERNAL
+    lbr$gl_control : REF BBLOCK;		!Librarian control block
+
+EXTERNAL LITERAL
+    lbr$_keynotfnd,
+    lbr$_normal;
+
+GLOBAL LITERAL
+    lbr$k_libblocks = 10;			!Size of window into index
+
+!
+! MACROS:
+!	The following three macros are used to set the elements of a
+!	library table name descriptor relative to some other name descriptor
+!
+!	CALLING SEQUENCE (same for each):
+!		OTHER	is name of the source of the descriptor variables
+!		BLOCKOFF	is the offset to add to the relative block number field
+!		ENTRYOFF	is the offset to add to the relative entry number field
+!
+!	The code generated is conditional upon the existence of these parameters 
+!
+MACRO
+	SETHILIMIT(OTHER,BLOCKOFF,ENTRYOFF) =		! Set high limit name descriptor
+		SETENTRYDESC(HILIMIT,OTHER,BLOCKOFF,ENTRYOFF)%,
+!
+	SETLOLIMIT(OTHER,BLOCKOFF,ENTRYOFF) =		! Set low limit name descriptor
+		SETENTRYDESC(LOLIMIT,OTHER,BLOCKOFF,ENTRYOFF)%,
+!
+	SETRIAL(OTHER,BLOCKOFF,ENTRYOFF) =		! Set the trial name descriptor
+		SETENTRYDESC(TRIAL,OTHER,BLOCKOFF,ENTRYOFF)%,
+!
+!	This macro does all the work for the above three macros.
+!	The calling arguments are the same except for the name of the descriptor
+!	whose elements are to be set.
+!	The following compile time actions are taken (in order):
+!		if "BLOCKOFF" is specified:
+!			"ENTRYOFF" is taken as a general expression
+!			as is "BLOCKOFF" and the entry and rel. block fields of
+!			the desired descriptor are set.
+!		If both are null, the entry, relative block and table address are
+!			just copied.
+!
+!		If only "BLOCKOFF" is null, "ENTRYOFF" is assumed to be
+!			either + or -1. Code is generated to increment or decrement
+!			the entry number with appropriate checks
+!			for movement off top or bottom of the block
+!
+	SETENTRYDESC(THISONE,OTHER,BLOCKOFF,ENTRYOFF) =
+	    %IF NOT %NULL(BLOCKOFF)				! Fully general expressions assumed so
+	    %THEN	%NAME(THISONE,'RBN') = BLOCKOFF;	! Set the block offset
+			%NAME(THISONE,'ENT') = ENTRYOFF;	! And the entry number
+								!
+	    %ELSE %IF %NULL(ENTRYOFF)					! If both arguments are null so
+		  %THEN CH$MOVE(12, %NAME(OTHER,'ENT'), %NAME(THISONE,'ENT')); !  copy entry number, rel blk, and address
+									!
+		  %ELSE	%IF NOT %IDENTICAL(THISONE,OTHER)			! If not the same
+			%THEN %NAME(THISONE,'RBN') = .%NAME(OTHER,'RBN');	! Copy block number
+			%FI
+			%IF %IDENTICAL(ENTRYOFF,-1)				! If the entry number 
+			%THEN IF (%NAME(THISONE,'ENT') = .%NAME(OTHER,'ENT')	! Is being decremented
+					+ (ENTRYOFF)) LSS 0
+			      THEN BEGIN					! Do it checking for crossing
+					%NAME(THISONE,'ENT') = ENTSPERBLK - 1;	! Block down and if so
+					%NAME(THISONE,'RBN') = .%NAME(OTHER,	! Set to top of previous
+								'RBN') - 1;	!
+				   END;						! Otherwise leave rbn as is
+										!
+			%ELSE %IF %IDENTICAL(ENTRYOFF,1)			! If incrementing the
+			      %THEN IF (%NAME(THISONE,'ENT') = .%NAME(OTHER,	!
+						'ENT') + (ENTRYOFF)) GEQ	!
+							ENTSPERBLK		!
+				   THEN BEGIN					! Entry then check for block
+						%NAME(THISONE,'ENT') = 0;	! Crossing up to next
+						%NAME(THISONE,'RBN') =		! And set to its first
+							.%NAME(OTHER,'RBN') + 1;	!
+					END;
+
+			      %ELSE IF (%NAME(THISONE,'ENT') = .%NAME(OTHER,'ENT')	! If a general expression
+					+ (ENTRYOFF)) LSS 0			! Then have to check both
+				    THEN BEGIN					! Do it checking for crossing
+					%NAME(THISONE,'ENT') = ENTSPERBLK - 1;	! Block down and if so
+					%NAME(THISONE,'RBN') = .%NAME(OTHER,	! Set to top of previous
+								'RBN') - 1;	!
+					 END					! Otherwise leave rbn as is
+				    ELSE IF .%NAME(THISONE,'ENT') GEQ ENTSPERBLK
+					THEN BEGIN
+						%NAME(THISONE,'ENT') = 0;	! Crossing up to next
+						%NAME(THISONE,'RBN') =		! And set to its first
+							.%NAME(OTHER,'RBN') + 1;!
+					     END;
+			      %FI
+			%FI
+		  %FI
+	    %FI
+	    %IF NOT %NULL(BLOCKOFF)
+	     OR NOT %NULL(OTHER)
+	    %THEN
+		BEGIN
+		    perform(find_block(.windowbaseblk+.%NAME(THISONE,'RBN'),
+					blockaddr, cache_entry));
+		    %NAME(THISONE,'ADR') = .blockaddr + entrysize*.%NAME(THISONE,'ENT');
+		    END;
+	    %FI
+	%;
+
+GLOBAL ROUTINE lbr_old_lib_dat (header) =
+BEGIN
+!
+! This routine extracts the needed information from the library
+! header of an old format (VMS R1) library and stores it in a
+! block of memory (the last part of the library header)
+!
+
+MAP
+    header : REF BBLOCK;
+
+BIND
+    oldctx = header[ohd$t_oldctx] : BBLOCK;
+
+LOCAL
+    index_desc : REF BBLOCK;
+
+CH$FILL(0, ofl$c_length, oldctx);			!Zero the block
+oldctx[ofl$l_mntvbn] = .header[ohd$w_mntvbn];		!VBN of start of MNT
+oldctx[ofl$l_mntesiz] = .header[ohd$w_mntesiz];		!Size of MNT entry
+oldctx[ofl$l_numods] = .header[ohd$w_mntallo] -		!compute number of modules
+			.header[ohd$w_mntaval];
+IF .oldctx[ofl$l_mntesiz] NEQ 0
+THEN BEGIN
+    oldctx[ofl$l_mntepblk] = 
+		lbr$c_pagesize/.oldctx[ofl$l_mntesiz]; !Number entries/block
+    oldctx[ofl$l_mntblks] = (.oldctx[ofl$l_numods]
+			+ .oldctx[ofl$l_mntepblk] - 1)
+			/ .oldctx[ofl$l_mntepblk];
+    END;
+oldctx[ofl$l_gstvbn] = .header[ohd$w_gstvbn];		!VBN of start of GST
+oldctx[ofl$l_gstesiz] = .header[ohd$w_gstesiz];		!Size of GST entry
+oldctx[ofl$l_numsyms] = .header[ohd$w_gstallo] -
+			.header[ohd$w_gstaval];
+IF .oldctx[ofl$l_gstesiz] NEQ 0
+THEN BEGIN
+    oldctx[ofl$l_gstepblk] = 
+		lbr$c_pagesize/.oldctx[ofl$l_gstesiz];	!Entries/block
+    oldctx[ofl$l_gstblks] = (.oldctx[ofl$l_numsyms]
+			+ .oldctx[ofl$l_gstepblk] - 1)
+			/ .oldctx[ofl$l_gstepblk];
+    END;
+!
+! Set the number of indices into the header location lhd$b_nindex.
+! Note that this will overwrite the byte ohd$b_fmtlvl, which is a
+! constant used for sanity checkin and is not needed after this point.
+!
+header[lhd$b_nindex] = (IF .header[ohd$b_type] EQL lbr$c_typ_obj
+				THEN 2
+				ELSE 1
+			);
+!
+! Set the size of the module header user data into the header location
+! lhd$b_mhdusz.  This lies in the reserved space in the memory-resident
+! header.
+!
+header[lhd$b_mhdusz] = (IF .header[ohd$b_type] EQL lbr$c_typ_obj
+					THEN ofl$c_maxsymlng + 2
+					ELSE 0
+					);
+!
+! Set the total number of index entries into the header location
+! lhd$l_idxcnt.  This lies in the reserved space in the memory-resident
+! header.
+!
+header [lhd$l_idxcnt] = .oldctx [ofl$l_numods] + .oldctx [ofl$l_numsyms];
+header [lhd$l_modcnt] = .oldctx [ofl$l_numods];
+!
+! Set up phony index descriptors with only the keylen field filled in.
+! This is so make_upper_case will work.
+!
+index_desc = .header + lhd$c_idxdesc;	!Point to first descriptor
+index_desc [idd$w_keylen] = ofl$c_maxsymlng;
+index_desc [idd$w_flags] = idd$m_ascii;	!Set type to ASCII
+index_desc = .index_desc + idd$c_length; !Now the second
+index_desc [idd$w_keylen] = ofl$c_maxsymlng;
+index_desc [idd$w_flags] = idd$m_ascii;	!Set type to ASCII
+
+RETURN true
+END;					!Of lbr_old_lib_dat
+
+GLOBAL ROUTINE lbr_old_lkp_key (keydesc, retrfa) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine searches one of the indices of an old format library.
+!
+! INPUTS:
+!
+!	keyname - address of a descriptor for the key to find
+!	retrfa - address of storage to return RFA of module if found
+!
+! ROUTINE OUTPUTS:
+!
+!	The name is found in the search table:
+!		routine value = true
+!	If name is not found routine value = false.
+!
+!
+!--
+
+MAP
+    keydesc : REF BBLOCK[dsc$c_s_bln],
+    retrfa : REF BBLOCK[rfa$c_length];
+
+BIND
+    namblk = .lbr$gl_control[lbr$l_usrnam] : BBLOCK,	! NAM block for library
+    context = .lbr$gl_control[lbr$l_ctxptr] : BBLOCK,	! Librarian context block
+    header = .lbr$gl_control[lbr$l_hdrptr] : BBLOCK,	! Library header
+    oldctx = header[ohd$t_oldctx] : BBLOCK,	! Context for old library
+    idxnum = .lbr$gl_control[lbr$l_curidx] - 1,	! Index of selected index
+    idxdat = (					! Name the index data
+		IF idxnum EQL 0			!
+		    THEN oldctx[ofl$l_mntvbn]	! which is the mnt if index 0
+		    ELSE oldctx[ofl$l_gstvbn]	! or the gst if index 1
+	     ) : BBLOCK,			!  and is a structure
+    entrysize = .idxdat[oib$l_esiz],		! size of an entry
+    entsperblk = .idxdat[oib$l_entpblk],	! number entries in a block
+    srchbaseblk = .idxdat[oib$l_vbn],		! base vbn of search
+    srchtopblk = srchbaseblk + .idxdat[oib$l_nblks] - 1, ! top vbn of search
+    topblkents = (
+		IF .idxdat[oib$l_nents] LEQ entsperblk
+			THEN .idxdat[oib$l_nents]
+			ELSE .idxdat[oib$l_nents] -
+				entsperblk*(.idxdat[oib$l_nblks] - 1)
+		),
+    windowbaseblk = oldctx[ofl$l_winbvbn],	! Base VBN of window
+    windowtopblk = oldctx[ofl$l_wintvbn],	! Top VBN of window
+    windowblocks = oldctx[ofl$l_winblks],	! Size in blocks of window
+    trialent = oldctx[ofl$l_trilent],		! Trial table entry number within block
+    trialrbn = oldctx[ofl$l_trilrbn],		! location of entry within window
+    trialadr = oldctx[ofl$l_triladr] : REF BBLOCK, ! Pointer to entry in table
+    lolimitent = oldctx[ofl$l_lowent],		! lowest possible name entry
+    lolimitrbn = oldctx[ofl$l_lowrbn],		! Rel. blk number in window
+    lolimitadr = oldctx[ofl$l_lowadr] : REF BBLOCK, ! and its address in table
+    hilimitent = oldctx[ofl$l_hient],		! highest possible name entry
+    hilimitrbn = oldctx[ofl$l_hirbn],		! rel. blk number in window
+    hilimitadr = oldctx[ofl$l_hiadr] : REF BBLOCK; ! and its address in table
+
+LOCAL
+    cache_entry,
+    blockaddr,
+    trialblockoff,
+    entryoff,
+    ch_result,
+    moveflag,					! direction movement control
+    readwindow;					! window read flag
+
+IF .idxdat[oib$l_tbladr] EQL 0			! If index has not been read
+THEN BEGIN
+    IF .idxdat[oib$l_nblks] EQL 0		! but if nothing in index
+	THEN RETURN lbr$_keynotfnd;		! then return key not found
+    perform(read_n_block(.idxdat[oib$l_vbn],	!  then read it now
+		.idxdat[oib$l_nblks]));
+    idxdat[oib$l_tbladr] = 1;			! flag index read
+    END;
+moveflag = 0;					! reset the direction of last read
+						! if the current window is
+!write('Searching for key !AS', .keydesc);
+IF .windowbaseblk GEQU srchbaseblk		! completely within the search
+AND.windowtopblk LEQU srchtopblk		! range or contains it
+THEN 
+    BEGIN					! compare target symbol
+    perform(find_block(.windowbaseblk+.trialrbn, blockaddr, cache_entry));
+!    write('Looking at key !AD',.trialadr[one$b_namlng], trialadr[one$t_name]);
+    IF (ch_result = CH$COMPARE(.keydesc[dsc$w_length], .keydesc[dsc$a_pointer],
+		.trialadr[one$b_namlng], trialadr[one$t_name])) EQL 0
+    THEN
+	BEGIN						! with last trial
+	retrfa[rfa$l_vbn]=.trialadr[one$w_modvbn];	! and if equal
+	retrfa[rfa$w_offset]=.trialadr[one$w_modbytoff];	! compute module's
+	RETURN lbr$_normal;					! rfa and return
+	END
+    ELSE IF .ch_result LSS 0
+	THEN
+	    BEGIN					! if it is less
+		IF .trialent EQL 0			! and if trial
+		AND.trialrbn EQL 0			! is first in window
+		THEN readwindow = -1			! then set to read backwards
+		ELSE
+		    BEGIN				!  if less
+			readwindow = 0;
+			sethilimit(trial,,-1)		! and not first in window
+			setlolimit(lolimit,0,0)		! low limit is the first
+			moveflag = -1;			! set for moved backwards
+			END;				! and entry before the trial
+             END					! is the highest possible
+	    ELSE
+		BEGIN					! target is greater
+									! than last trial .if
+		    IF .trialrbn EQL .windowblocks-1	! last in window, set
+		    AND(.trialent EQL entsperblk-1
+		    OR(.windowtopblk EQL srchtopblk
+		    AND.trialent EQL topblkents-1))
+		    THEN readwindow = 1			! to read next window
+		    ELSE
+			BEGIN				! greater but trial is not
+			    readwindow = 0;			! last in window, so
+			    IF .windowtopblk EQL srchtopblk
+			    THEN entryoff = topblkents -1
+			    ELSE entryoff = entsperblk -1;
+			    sethilimit(hilimit,.windowblocks-1,! high limit is top of
+						.entryoff)		! window and
+			    setlolimit(trial,,1)		! lowest possible is trial
+			    moveflag = 1;			! set as moved forward
+			    END;				! plus 1
+			END;
+		    END
+    ELSE
+	BEGIN							! current window is
+	    readwindow=1;						! no use, set to
+	    windowtopblk= srchbaseblk-1;				! read the first
+	    END;
+WHILE true DO								! begin an infinite loop
+BEGIN
+    IF .readwindow NEQ 0						! another window to be read?
+    THEN
+	BEGIN
+	    IF .readwindow LSS 0					! if flag negative, read
+	 								! backwards, provided last was
+	    THEN IF .moveflag GTR 0					! not a forward move
+		THEN RETURN lbr$_keynotfnd				! in which
+		ELSE
+		    BEGIN						! case name cannot be here
+			IF .windowbaseblk EQL srchbaseblk	! also if back at first window
+			THEN RETURN lbr$_keynotfnd;			! it's all over
+			windowbaseblk=.windowbaseblk-		! otherwise set up the
+					lbr$k_libblocks;		! window as full
+			windowtopblk=.windowtopblk-.windowblocks;	! since must have been
+										! one before
+			moveflag=-1;				! at base of search range
+			END					! remembering this fact
+									! read next window up in
+	    ELSE IF .moveflag LSS 0					! the search range, provided
+		THEN RETURN lbr$_keynotfnd				! we haven't reached the
+		ELSE
+		    BEGIN					! end already and provided
+									! did not reverse last time
+			IF .windowtopblk EQL srchtopblk		! 
+			THEN RETURN lbr$_keynotfnd;			! in which case name cannot be here
+			windowbaseblk = .windowtopblk + 1;	! set block range of
+			windowtopblk = MINU(srchtopblk,		! new window to next and
+					(.windowbaseblk+
+						lbr$k_libblocks-1));	! perhaps last of range
+			moveflag=1;				! for next time to suppress backup
+			END;
+	    windowblocks = .windowtopblk - .windowbaseblk + 1;	! calculate number of blocks in window
+	    setlolimit(lolimit,0,0)					! low limit on searck is first entry
+	    IF .windowtopblk EQL srchtopblk
+	    THEN entryoff = topblkents -1
+	    ELSE entryoff = entsperblk -1;
+	    sethilimit(hilimit,.windowblocks-1,.entryoff)		! high limit is the last
+	    setrial(hilimit,,)					! initialize the last trial
+	    END;							! and all set to search it
+!
+! we now have a valid window and the highest and lowest possible
+! entries in this window have been set.
+! now compare the target name against these limits
+! and if outside set up for a window read.
+! if between, begin binary search with adjusted limits
+! and a trial half way between.
+!
+	perform(find_block(.windowbaseblk+.hilimitrbn, blockaddr, cache_entry));
+!	write('High limit look at !AD',.hilimitadr[one$b_namlng],
+!			hilimitadr[one$t_name]);
+	IF (ch_result = CH$COMPARE (.keydesc[dsc$w_length], .keydesc[dsc$a_pointer],
+		.hilimitadr[one$b_namlng], hilimitadr[one$t_name])) EQL 0
+	THEN BEGIN									! if required name is
+		retrfa[rfa$l_vbn] = .hilimitadr[one$w_modvbn];				! equal to upper limit
+											! return the rfa
+		retrfa[rfa$w_offset] = .hilimitadr[one$w_modbytoff];			! of top limit entry
+	     RETURN lbr$_normal;
+	     END
+	ELSE BEGIN
+	     IF .ch_result GTR 0						! if high limit
+										! is greater than top
+	     THEN readwindow = 1						! limit, then set to
+	     ELSE BEGIN								! read next up
+		IF .hilimitrbn EQL 0						! if less than high
+		AND .hilimitent EQL 0						! limit, and high limit
+										! is first in window
+		THEN readwindow = -1						! then set for first
+		ELSE BEGIN							! window read
+		     perform(find_block(.windowbaseblk+.lolimitrbn, blockaddr,
+						cache_entry));
+!		    write('Lolimit look at !AD',.lolimitadr[one$b_namlng],
+!				lolimitadr[one$t_name]);
+		     IF (ch_result = CH$COMPARE(.keydesc[dsc$w_length], .keydesc[dsc$a_pointer],	! otherwise compare
+				.lolimitadr[one$b_namlng],			! with low limit and
+				lolimitadr[one$t_name])) EQL 0				! if equal, return
+		      THEN BEGIN						! rfa now
+			   retrfa[rfa$l_vbn] = .lolimitadr[one$w_modvbn];	!
+			   retrfa[rfa$w_offset] = .lolimitadr[one$w_modbytoff];
+			   setrial(lolimit,,)					! and remember it for next time
+			   RETURN lbr$_normal;
+			   END
+		      ELSE IF .ch_result LSS 0					! not equal but if less, set to read
+           		   THEN readwindow = -1					! first window.
+			   ELSE IF .lolimitrbn EQL 				! if greater than
+					.windowblocks-1				! lolimit, provided
+			        AND (.lolimitent EQL entsperblk-1		! that is not last
+				     OR (.windowtopblk EQL srchtopblk		! of window, the
+					AND .lolimitent EQL topblkents-1))
+				THEN readwindow = 1				! block (set read up)
+				ELSE EXITLOOP;					! we have the window
+                      END;							! containing the re-
+                  END;								! quired name, if
+	     END;								! it is in table
+END;
+!
+!	now begin binary search of the window, after adjusting
+!	low limit up one and high limit down one; unless they
+!	are the same, in which case required name is
+!	not here.
+!
+	IF .lolimitadr EQL .hilimitadr
+	THEN RETURN lbr$_keynotfnd;
+	setlolimit(lolimit,,1)							! limits are not same, so
+	IF .lolimitadr NEQ .hilimitadr
+	THEN sethilimit(hilimit,,-1)						! increment low and decr.high
+	WHILE .lolimitrbn NEQ .hilimitrbn					! loop until we have both
+	DO BEGIN								! limits on the same block
+		trialblockoff = (.hilimitrbn-.lolimitrbn+1)/2;			! calculate a trial entry
+		IF (.lolimitrbn+.trialblockoff) EQL				! half way between
+		    (.hilimitrbn-.trialblockoff)				! that is, middle
+		THEN entryoff = (entsperblk+1)/2				! entry of midblock
+										! or first entry of
+		ELSE entryoff = 0;						! midpoint higher
+										! block if mid point
+		setrial(lolimit,.trialblockoff+.lolimitrbn,.entryoff)		! is a block boundary
+		perform(find_block(.windowbaseblk+.trialrbn, blockaddr,
+						cache_entry));
+!		write('window search look at !AD',.trialadr[one$b_namlng],
+!			trialadr[one$t_name]);
+		IF (ch_result = CH$COMPARE(.keydesc[dsc$w_length], .keydesc[dsc$a_pointer],	! compare required name
+			.trialadr[one$b_namlng], trialadr[one$t_name])) EQL 0	! and if equal, set
+		THEN BEGIN							! up return values
+			retrfa[rfa$l_vbn]=.trialadr[one$w_modvbn];
+			retrfa[rfa$w_offset]=.trialadr[one$w_modbytoff];
+			RETURN lbr$_normal;						! and all done
+		     END;
+		IF .ch_result GTR 0						! if the required is greater, update
+		THEN BEGIN							! lolimit to trial+1
+			setlolimit(trial,,1)		
+		     END
+		ELSE BEGIN							! if less, update
+		     sethilimit(trial,,-1)					! high limit to
+		     END;							! trial-1
+	END;									! end of loop
+!
+!	both limits are now on the same block. start half way
+!	between limits and step toward high limit if target is
+!	greater, toward low limit if target is less.
+!
+	setrial(lolimit,,(.hilimitent-.lolimitent)/2)				! set trial at mid
+	moveflag = 0;								! point entry and clear direction
+	DO BEGIN								! loop until we hit the limit
+		perform(find_block(.windowbaseblk+.trialrbn, blockaddr,
+						cache_entry));
+!		write('Final look at !AD', .trialadr[one$b_namlng],
+!			trialadr[one$t_name]);
+		IF (ch_result = CH$COMPARE(.keydesc[dsc$w_length], .keydesc[dsc$a_pointer],	! if target is
+			.trialadr[one$b_namlng], trialadr[one$t_name])) GTR 0	! greater than the
+		THEN IF .moveflag EQL -1					! trial, and were moving
+		     THEN RETURN lbr$_keynotfnd						! backwards - not here
+		     ELSE BEGIN							! otherwise move
+		     	moveflag = 1;						! forward to next
+			setrial(trial,,1)					! entry.
+			   END
+		ELSE IF .ch_result EQL 0					! if target is equal to the trial
+		     THEN BEGIN							! then return the parameters
+			retrfa[rfa$l_vbn] = .trialadr[one$w_modvbn];
+			retrfa[rfa$w_offset] = .trialadr[one$w_modbytoff];
+			RETURN lbr$_normal;
+			  END
+		     ELSE IF .moveflag EQL 1					! target symbol is
+			THEN RETURN lbr$_keynotfnd					! less, so if we were
+			ELSE BEGIN						! moving forward - name
+				moveflag = -1;					! not here. otherwise
+				setrial(trial,,-1)				! move back one
+			     END;
+	   END
+	UNTIL .trialent EQL .lolimitent						! loop until at the low
+	OR .trialent EQL .hilimitent;						! or high limit
+!
+!	trial entry is at one of the limits. check for
+!	 a match and return values
+!
+!	write('End of limit check on !AD', .trialadr[one$b_namlng],
+!			trialadr[one$t_name]);
+	IF CH$EQL(.keydesc[dsc$w_length], .keydesc[dsc$a_pointer],
+		.trialadr[one$b_namlng], trialadr[one$t_name])
+	THEN BEGIN
+		retrfa[rfa$l_vbn] = .trialadr[one$w_modvbn];
+		retrfa[rfa$w_offset] = .trialadr[one$w_modbytoff];
+		RETURN lbr$_normal;
+	     END
+	ELSE RETURN lbr$_keynotfnd;
+END;						!Of lbr_old_lkp_key
+
+GLOBAL ROUTINE lbr_old_get_idx (index, user_routine, match_desc) =
+BEGIN
+!
+! This routine calls the specified user routine for each entry
+! in the index
+!
+
+perform(travers_old_idx(.index, (IF .match_desc NEQ 0
+					THEN check_wild
+					ELSE call_user),
+				.user_routine, .match_desc));
+RETURN true
+END;						!Of lbr_old_get_idx
+
+GLOBAL ROUTINE lbr_old_src_idx (index, rfa, user_routine) =
+BEGIN
+!
+! This routine searches the index for the given RFA and calls the
+! user routine for each entry that matches.
+!
+
+perform(travers_old_idx(.index, check_rfa, .user_routine, .rfa));
+RETURN true
+END;						!Of lbr_old_src_idx
+
+ROUTINE check_wild (entry, user_routine, match_desc) =
+BEGIN
+!---
+!	Called by traverse for each entry in the index.  Check to
+!	see if current entry matches the match_desc.  Call user if so.
+!
+! Inputs:
+!
+!	entry = Address of key entry
+!	user_routine = Address of user action routine
+!	match_desc = string descriptor for match string
+!
+!---
+MAP
+    entry : REF BBLOCK,
+    match_desc : REF BBLOCK;
+
+IF (fmg$match_name (.entry [one$b_namlng], entry [one$t_name],
+			.match_desc [dsc$w_length],
+			.match_desc [dsc$a_pointer])
+	OR CH$EQL (.match_desc [dsc$w_length], entry [one$t_name],
+			.match_desc [dsc$w_length],
+			.match_desc [dsc$a_pointer]))
+    THEN perform (call_user (.entry, .user_routine));
+RETURN true
+END;						!Of check_wild
+
+ROUTINE check_rfa (entry, user_routine, rfa) =
+BEGIN
+!
+! This routine checks if the RFA of the entry matches the given RFA
+! and calls the user back if so.
+!
+
+MAP
+    entry : REF BBLOCK,
+    rfa : REF BBLOCK;
+
+IF .entry[one$w_modvbn] EQL .rfa[rfa$l_vbn]
+AND .entry[one$w_modbytoff] EQL .rfa[rfa$w_offset]
+THEN perform (call_user (.entry, .user_routine));
+RETURN true
+END;						!Of check_rfa
+
+ROUTINE call_user (entry, user_routine) =
+BEGIN
+!
+! This routine calls the user routine for a given entry
+!
+MAP
+    entry : REF BBLOCK;
+
+LOCAL
+    desc : BBLOCK[dsc$c_s_bln],
+    localrfa : BBLOCK[rfa$c_length];
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK;
+
+localrfa[rfa$l_vbn] = .entry[one$w_modvbn];
+localrfa[rfa$w_offset] = .entry[one$w_modbytoff];
+desc[dsc$w_length] = .entry[one$b_namlng];
+desc[dsc$a_pointer] = entry[one$t_name];
+perform ((.user_routine) (desc, localrfa));
+context [ctx$v_found1] = true;
+RETURN true
+END;						!Of call_user
+
+ROUTINE travers_old_idx (index, action_routine, user_routine, rfa) =
+BEGIN
+!
+! This routine calls the given action routine for each entry in the index.
+!
+MAP
+    rfa : REF BBLOCK;
+
+BIND
+    context = .lbr$gl_control[lbr$l_ctxptr] : BBLOCK,	!Context block
+    header = .lbr$gl_control[lbr$l_hdrptr] : BBLOCK,	!Library header
+    oldctx = header[ohd$t_oldctx] : BBLOCK,		!Old library context block
+    idxdat = (
+		IF .index EQL 1
+		THEN oldctx[ofl$l_mntvbn]
+		ELSE oldctx[ofl$l_gstvbn]
+		) : BBLOCK,
+    entrysize = .idxdat[oib$l_esiz],			!Size of an entry
+    entsperblk = .idxdat[oib$l_entpblk],		!Number of entries in a block
+    topblkents = (
+		IF .idxdat[oib$l_nents] LEQ entsperblk
+		THEN .idxdat[oib$l_nents]
+		ELSE (.idxdat[oib$l_nents]
+		 - entsperblk*(.idxdat[oib$l_nblks] - 1))
+		);
+
+LOCAL
+    cache_entry,
+    blkadr : REF VECTOR[,BYTE];
+
+!
+! Read in index if necessary
+!
+IF .idxdat[oib$l_tbladr] EQL 0			! If index has not been read
+THEN BEGIN
+    IF .idxdat[oib$l_nblks] EQL 0		! If index is empty
+	THEN return true;			!  then all done
+    perform(read_n_block(.idxdat[oib$l_vbn],	!  then read it now
+		.idxdat[oib$l_nblks]));
+    idxdat[oib$l_tbladr] = 1;			! flag index read
+    END;
+
+IF .idxdat[oib$l_nents] GTRU entsperblk			!If at least one full block
+THEN
+    INCRU i FROM 0 TO .idxdat[oib$l_nblks] - 2
+    DO BEGIN
+	perform(find_block(.idxdat[oib$l_vbn]+.i, blkadr, cache_entry)); !Find block in memory
+!
+! Call action routine for all entries in block
+!
+	INCRU j FROM 0 TO entsperblk - 1
+	     DO IF NOT (.action_routine) (blkadr[.j*entrysize],
+					.user_routine, .rfa)
+		THEN RETURN true;
+	END;
+!
+! Now do the partial block (if it exists)
+!
+IF topblkents GTR 0
+THEN BEGIN
+    perform(find_block(.idxdat[oib$l_vbn] + .idxdat[oib$l_nblks] - 1,
+			blkadr, cache_entry));
+    INCRU i FROM 0 TO topblkents - 1
+	DO IF NOT (.action_routine) (blkadr[.i*entrysize], 
+				.user_routine, .rfa)
+		THEN RETURN true;
+    END;
+RETURN true
+END;						!Of travers_old_idx
+END						!Of module
+ELUDOM

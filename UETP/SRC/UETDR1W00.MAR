@@ -1,0 +1,1643 @@
+	.TITLE	UETDR1W00 - VAX/VMS UETP DR11-W EXERCISER
+	.IDENT	'V03-000'
+	.ENABLE	SUPPRESSION
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY:
+;	This module will be distributed with VAX/VMS under the [SYSTEST]
+;	account.
+;
+; ABSTRACT:
+;	Using $QIO System Services, this program exercises the maintenance mode
+;	functions of a DR11-W.
+;
+; ENVIRONMENT:
+;	This program will run in user access mode, with ASTs enabled except
+;	during error processing.  The program requires an AST limit of 6, a
+;	buffered I/O limit of 10(10) and the PHY_IO and DIAGNOSE privileges.
+;
+;--
+;
+; AUTHOR: Richard N. Holstein, CREATION DATE: August, 1981
+;
+; MODIFIED BY:
+;
+;	V03-001	RNH0001		Richard N. Holstein,	4-Dec-1981
+;		Fix problems in reset routine which caused errors when the
+;		turnaround connector wasn't installed.
+;
+;**
+
+	.SBTTL	Declarations
+;
+; INCLUDE FILES:
+;
+;	SYS$LIBRARY:LIB.MLB	for general definitions
+;	SHRLIB$:UETP.MLB	for UETP definitions
+;
+; MACROS:
+;
+	$CHFDEF				; Condition handler frame definitions
+	$DEVDEF				; Device definitions
+	$DIBDEF				; Device Information Block
+	$IODEF				; I/O functions codes, etc.
+	$QIODEF				; $QIO offsets and NARGS
+	$SHRDEF				; Shared messages
+	$STSDEF				; Status return
+	$UETUNTDEF			; UETP unit block offset definitions
+	$UETPDEF			; UETP
+	$XADEF				; DR11-W
+;
+; EQUATED SYMBOLS:
+;
+;   Facility number definitions:
+	UETP_K = 116
+	RMS_K = 1
+
+;   SHR message definitions:
+	UETP = UETP_K@STS$V_FAC_NO	; Define the UETP facility code
+;
+	UETP$_ABENDD = UETP!SHR$_ABENDD	; Define the UETP message codes
+	UETP$_BEGIND = UETP!SHR$_BEGIND
+	UETP$_ENDEDD = UETP!SHR$_ENDEDD
+	UETP$_OPENIN = UETP!SHR$_OPENIN
+	UETP$_TEXT   = UETP!SHR$_TEXT
+
+;   Internal flag bits...:
+	TEST_OVERV   = 1		; Set when test is over
+	SAFE_TO_UPDV = 2		; Set when it's safe to update UETINIDEV
+	BEGIN_MSGV   = 3		; Set when "begin" msg has been output
+	ONE_SHOTV    = 4		; Set if running in one-shot mode
+	DUMP_MODEV   = 5
+	NO_MESSAGEV  = 6		; Set if bad data msg printed after $QIO
+;   ...and corresponding masks:
+	TEST_OVERM   = 1@TEST_OVERV
+	SAFE_TO_UPDM = 1@SAFE_TO_UPDV
+	BEGIN_MSGM   = 1@BEGIN_MSGV
+	ONE_SHOTM    = 1@ONE_SHOTV
+	DUMP_MODEM   = 1@DUMP_MODEV
+	NO_MESSAGEM  = 1@NO_MESSAGEV
+
+;   Miscellany:
+	LC_BITM       = ^X20		; Mask to convert lower case to upper
+	REC_SIZE      = 20		; UETINIDEV.DAT record size
+	TEXT_BUFFER   = 500		; Internal text buffer size
+	EFN2          = 4		; EFN used for three minute timer
+	MAX_PROC_NAME = 15		; Longest possible process name
+	MAX_DEV_DESIG = 8		; Longest possible controller name
+	MAX_UNIT_DESIG= 5		; Longest possible unit number
+
+;   DR11-W specific definitions:
+	QIO_EFN  = EFN2+1		; EFN for DR11-W I/O
+	DWT_SIZE = 1000			; Typical DR11-W transfer size in bytes
+.IIF NE DWT_SIZE&1, .ERROR DWT_SIZE	; DWT_SIZE must be an even number!
+.IIF GE DWT_SIZE-65535, .ERROR DWT_SIZE	; DWT_SIZE must be less than 65535!
+	MINIMUM  = 300000/<DWT_SIZE/2>	; Min. acceptable $QIOs for normal run
+	;        = transfer-rate-in-words-per-second/transfer-size-in-words
+	; The test lasts well over a second and not all $QIOs transfer so many
+	; bytes, so this should be quite a minimal value!
+
+; Note well that the DR11-W transfers words, but VMS counts bytes, and that in
+; maintenance mode, "the DR11-W does alternating DATI/DATO transfers at
+; consecutive locations; a DATI from location X followed by a DATO to location
+; X+2, followed by a DATI from location X+4 and so on." - DR11-W Specification,
+; September 1980 revision.  The word count is decremented twice for each word
+; of data, once for the DATI and once for the DATO.
+	WRITE_SIZE = DWT_SIZE		; Buffer size in bytes
+
+; For conciseness later on, define here bit masks for I/O function codes.
+	XAW__RESET_CYCLE   = IO$_WRITEPBLK!IO$M_DIAGNOSTIC!IO$M_RESET!IO$M_CYCLE
+	XAW__CYCLE         = IO$_WRITEPBLK!IO$M_DIAGNOSTIC!IO$M_CYCLE
+	XAW__SETFNCT_CYCLE = IO$_WRITEPBLK!IO$M_DIAGNOSTIC!IO$M_SETFNCT!IO$M_CYCLE
+	XAW__TIMED_CYCLE   = IO$_WRITEPBLK!IO$M_DIAGNOSTIC!IO$M_TIMED!IO$M_CYCLE
+
+;
+; For each unit, there will be a data structure set up, called a
+; node.  These nodes will be linked together in a self-relative queue whose
+; header is UNIT_LIST.  The first part of each node will be the standard
+; definition from $UETUNTDEF.  Following that will come the device test
+; dependent stuff, defined below.  NOTE THAT THIS DEFINITION IS DONE WITH AN
+; ABSOLUTE PSECT.  This means that what look like declarations are really
+; definitions and the labels are really just offsets into a given node on the
+; queue.  (A not necessarily obvious consequence of using an ABS PSECT is that
+; space must be reserved with .BLKx operations, since .BYTE, etc., attempt to
+; store data.)
+;
+	.PSECT	DEVDEP_STR_DEF,ABS,NOEXE,NOWRT,PAGE ; Note ABS attribute!
+
+	.BLKB	UETUNT$C_DEVDEP		; Skip over standard UETUNT block
+
+XA_Q_IOSB:				; IOSB for our DR11-W
+	.BLKQ	1
+
+XA_Q_CHARAC:				; Characteristics buffer for IO$_SETCHAR
+	.BLKQ	1
+
+XA_Q_ORIGINAL:				; DR11-W characteristics before starting test
+	.BLKQ	1
+
+XA_K_QIO:				; Space for $QIO_G argument list...
+	.BLKL	QIO$_NARGS+1		; ...and the argument list counter
+
+;
+; All the code which uses the following two items is heavily dependent on its
+; dealing with quadword pairs (i.e., 16-byte) of time stamps and on the
+; number of quadword pairs fitting into a byte.
+;
+	TIME_STAMP_LEN = 256		; 2*count of start/finish quadword pairs
+XA_B_TSI:				; Index into the following...
+	.BLKB	1
+XA_K_TSTAMP:				; ...circular list of time stamps of...
+	.BLKQ	TIME_STAMP_LEN		; ...last start/finish of $QIOs
+
+	DEVDEP_SIZE = .-UETUNT$C_DEVDEP ; Device dependent part size of node
+					; Note that this excludes buffers
+
+	.ALIGN	WORD			; Unibus DDP requires word alignment
+XA_K_BUF:				; I/O buffer for both reads and writes
+	.BLKB	WRITE_SIZE
+
+	PAGES = <<UETUNT$C_INDSIZ+-	; Add together all of the pieces...
+		  DEVDEP_SIZE+-		; ...which make up a UETP unit block...
+		  WRITE_SIZE+-		; ...to give to the $EXPREG service...
+		  511>/512>		; ...later
+
+	.SBTTL	Read-Only Data
+	.PSECT	RODATA,NOEXE,NOWRT,PAGE
+
+ACNT_NAME:				; Process name on exit
+	.ASCID	/SYSTEST/
+
+TEST_NAME:				; This test name
+	.ASCID	/UETDR1W00/
+
+SUPDEV_GBLSEC:				; How we access UETSUPDEV.DAT
+	.ASCID	/UETSUPDEV/
+
+CONTROLLER:				; Logical name of controller
+	.ASCID	/CTRLNAME/
+
+MODE:					; Run mode logical name
+	.ASCID	/MODE/
+
+CS1:					; Device class and type control string
+	.ASCID	/!2XB !2XB /
+
+CS3:					; Device class-only control string
+	.ASCID	/!2XB **/
+
+TTNAME_ROPTR:				; Descriptor for recursive...
+	.WORD	63,0			; ...translation of TTNAME
+	.ADDRESS TTNAME
+
+CNTRLCMSG:
+	.ASCID	\Aborted via a user CTRL/C\
+
+NO_CTRLNAME:
+	.ASCID	/No controller specified./
+
+DEAD_CTRLNAME:
+	.ASCID	/Can't test controller !AS, marked as unusable in UETINIDEV.DAT./
+
+NOUNIT_SELECTED:
+	.ASCID	/No units selected for testing./
+
+ILLEGAL_REC:
+	.ASCID	/Illegal record format in file UETINIDEV.DAT!/
+
+PASS_MSG:
+	.ASCID	/End of pass !UL with !UL iterations at !%D./
+
+THREEMIN:				; 3 minute delta time
+	.LONG	-10*1000*1000*180,-1
+
+UNIT_DESC:				; Descriptor used to convert unit #
+	.LONG	5
+	.ADDRESS BUFFER+6
+
+CONT_DESC:				; Descriptor used to convert controller...
+	.WORD	REC_SIZE,0		; ...from lowercase to uppercase
+	.ADDRESS BUFFER
+
+FILE:					; Fills in RMS_ERR_STRING
+	.ASCID	/file/
+
+RECORD:					; Fills in RMS_ERR_STRING
+	.ASCID	/record/
+
+RMS_ERR_STRING:				; Announces an RMS error
+	.ASCID	/RMS !AS error in file !AD/
+
+PROMPT:
+	.ASCII	/Controller designation?: /
+	PMTSIZ = .-PROMPT
+
+DEVALLOC:				; Warns if DR11-W already assigned
+	.ASCID	/!AS is not available for testing./
+
+SLOW_DR11W:				; Warns if DR11-W didn't do min. I/O
+	.ASCID	/!AC only completed !UL $QIOs./
+
+QIO_ERROR:				; Message if $QIO itself fails
+	.ASCID	/$QIO error on device !AC./
+
+QIO_FUNC_FAIL:				; Message if $QIO function failed
+	.ASCID	\$QIO on !AC failed, function !XL, IOSB !XL !XL.\
+
+DEBUG_MSG:				; Useful stuff if test dies
+	.ASCID	\!/Debug info:  R0 = !XL, QIO$_EFN(R10) = !XL,\-
+		\!/QIO$_CHAN(R10) = !XL, QIO$_FUNC(R10) = !XL,\-
+		\!/QIO$_ASTADR(R10) = !XL, QIO$_ASTPRM(R10) = !XL,\-
+		\!/QIO$_P1(R10) = !XL, QIO$_P2(R10) = !XL,\-
+		\!/QIO$_P3(R10) = !XL, QIO$_P4(R10) = !XL, QIO$_P5(R10) = !XL,\-
+		\!/XA_Q_IOSB(R6) = !XL, XA_Q_IOSB+4(R6) = !XL\-
+		\!/XA_Q_CHARAC(R6) = !XL, XA_Q_CHARAC+4(R6) = !XL\
+
+DIAG_MSG:				; Contents of $QIO P6 buffer
+	.ASCID	\!/Diagnostic buffer: !6(9XL)!/\-
+		\!/CSRTMP = !XL, BARTMP = !XL, CSR    = !XL, EIR    = !XL\-
+		\!/IDR    = !XL, BAR    = !XL, WCR    = !XL, ERROR  = !XL\-
+		\!/DPRnum = !XL, DPRcon = !XL, FMPR   = !XL, PMPR   = !XL\-
+		\!/DPRpar = !XL!/!8(9XL)\
+
+;+
+; The TABLE_GEN macro is used to coherently and consistently lay out the
+; parameters which will change from $QIO to $QIO when testing the DR11-W.
+; Each line is a call to the LINE_GEN macro.  The LINE_GEN macro will be
+; expanded to fill in a set of parallel tables from which the parameters
+; will be taken when the $QIO is performed.
+;
+; Because these tables introduce an additional level of indirection in the
+; arguments, the typical $QIO_S form of the system service becomes unuseable.
+; We will use the $QIO_G form.  The argument list will be reserved space in
+; the node on UNIT_LIST for the DR11-W; we can't use the $QIO macro there
+; because of ABS .PSECT restrictions.  Define a dummy argument list now with
+; the items which can be supplied at assembly time:
+;
+DUMMY_QIO:
+	$QIO	EFN = QIO_EFN, P6 = DIAG_BUF
+;
+; The rest of the arguments will be supplied as the node is allocated (those
+; which are static across $QIOs) or as an individual $QIO is done.
+;-
+
+.MACRO	TABLE_GEN
+;
+; The function codes used below are all defined earlier in the DR11-W Specific
+; definitions area.
+;
+; First, try some basic functions:  in maintenance mode, do various length word
+; and block mode transfers.  Since logical, virtual and physical I/O are the
+; same to the DR11-W, doing all I/O in physical mode is sufficient.  Physical
+; mode I/O is necessary to access the DR11-W in maintenance mode.
+;
+	LINE_GEN IO$_SETCHAR, 0, XA_Q_CHARAC, 0,  0,  0,  0
+;
+;	LINE_GEN          FUNC, ASTADR,     P1,      P2, P3, P4, P5
+	LINE_GEN XAW__RESET_CYCLE, 0, XA_K_BUF,       4,  0,  0,  0
+	LINE_GEN XAW__RESET_CYCLE, 0, XA_K_BUF,       4,  0,  0,  0
+	LINE_GEN       XAW__CYCLE, 0, XA_K_BUF,       4,  0,  0,  0
+	LINE_GEN       XAW__CYCLE, 0, XA_K_BUF,DWT_SIZE,  0,  0,  0
+	LINE_GEN       XAW__CYCLE, 0, XA_K_BUF,DWT_SIZE,  0,  0,  0
+;
+; Play with FNCT and STATUS bits.  The set won't transfer any
+; data, per se, but will cause the DR11-W IDR and ODR to be accessed.
+; NOTE: This function cancelled because it works only if the turnaround
+; connector is installed.
+;
+;	LINE_GEN            FUNC, ASTADR,     P1, P2, P3, P4,       P5
+;	LINE_GEN XAW__SETFNCT_CYCLE, 0, XA_K_BUF,  0,  0,  5, <^XA72E>
+;
+; Do some word and block mode transfers with a timeout parameter.  Get an
+; AST when the device finishes.
+;
+;	LINE_GEN            FUNC, ASTADR,       P1,       P2, P3, P4, P5
+	LINE_GEN XAW__TIMED_CYCLE, IOAST, XA_K_BUF, DWT_SIZE,  2,  0,  0
+
+.ENDM	TABLE_GEN
+
+;+
+; We now need to generate the set of parallel tables from which the $QIOs
+; will take their arguments.  Define the LINE_GEN macro twice, the first time
+; to count the number of calls, and the second time to fill the tables.  In
+; between, allocate the space for the tables.
+;-
+	.MACRO	LINE_GEN FUNC,ASTADR,P1,P2,P3,P4,P5
+	LINE_GEN_COUNT = LINE_GEN_COUNT+1
+	.ENDM	LINE_GEN
+
+	LINE_GEN_COUNT = 0
+	TABLE_GEN			; This one counts LINE_GEN calls
+
+	.ALIGN	LONG			; May as well speed things up a bit
+
+FUNC_TABLE:				; $QIO function code
+	.BLKL	LINE_GEN_COUNT
+
+ASTADR_TABLE:				; AST routine when I/O completes
+	.BLKL	LINE_GEN_COUNT
+
+P1_TABLE:				; Data buffer, characteristics buffer
+	.BLKL	LINE_GEN_COUNT		; or attention AST service routine
+
+P2_TABLE:				; Byte size of data buffer
+	.BLKL	LINE_GEN_COUNT
+
+P3_TABLE:				; Timeout in seconds or AST access mode
+	.BLKL	LINE_GEN_COUNT
+
+P4_TABLE:				; CSR FNCT bits (2-0 only)
+	.BLKL	LINE_GEN_COUNT
+
+P5_TABLE:				; Value (word) to load into ODR
+	.BLKL	LINE_GEN_COUNT
+
+	.MACRO	LINE_GEN	FUNC,ASTADR,P1,P2,P3,P4,P5
+	. = FUNC_TABLE+<4*LINE_GEN_COUNT>
+	.LONG	FUNC
+	. = ASTADR_TABLE+<4*LINE_GEN_COUNT>
+	.ADDRESS ASTADR
+	. = P1_TABLE+<4*LINE_GEN_COUNT>
+	.ADDRESS P1
+	. = P2_TABLE+<4*LINE_GEN_COUNT>
+	.LONG	P2
+	. = P3_TABLE+<4*LINE_GEN_COUNT>
+	.LONG	P3
+	. = P4_TABLE+<4*LINE_GEN_COUNT>
+	.LONG	P4
+	. = P5_TABLE+<4*LINE_GEN_COUNT>
+	.LONG	P5
+	LINE_GEN_COUNT = LINE_GEN_COUNT+1
+	.ENDM	LINE_GEN
+
+	LINE_GEN_COUNT = 0
+	TABLE_GEN			; This one fills the above tables
+
+	.SBTTL	Read/Write Data
+	.PSECT	RWDATA,WRT,NOEXE,PAGE
+
+TTCHAN:					; Channel associated with ctrl. term.
+	.WORD	0
+
+TTNAME_RWPTR:				; Descriptor for recursive...
+	.WORD	TTNAME_LEN,0		; ...translation of TTNAME
+	.ADDRESS TTNAME
+TTNAME:					; Logical name of controlling terminal
+	.ASCII	/SYS$INPUT/
+	TTNAME_LEN = .-TTNAME
+	.BLKB	63-TTNAME_LEN		; Space for recursive translation
+
+FLAG:					; Miscellaneous flag bits
+	.WORD	0			; (See Equated Symbols for definitions)
+
+FAO_BUF:				; FAO output string descriptor
+	.WORD	TEXT_BUFFER,0
+	.ADDRESS BUFFER
+
+BUFFER_PTR:				; Fake .ASCID buffer for misc. strings
+	.WORD	TEXT_BUFFER,0		; A word for length, a word for desc.
+	.ADDRESS BUFFER
+
+BUFFER:					; FAO output and other misc. buffer
+	.BLKB	TEXT_BUFFER
+
+DEVDSC:					; Device name descriptor
+	.WORD	MAX_DEV_DESIG,0
+	.ADDRESS DEV_NAME
+
+
+; NOTE THAT THE CODE DEPENDS ON THE FOLLOWING TWO ITEMS BEING TOGETHER.
+PROCESS_NAME:				; Process name
+	.ASCID	/UETDR1W00_/
+DEV_NAME:				; Device name buffer
+	.BLKB	MAX_DEV_DESIG+MAX_UNIT_DESIG
+	NAME_LEN = .-DEV_NAME
+; END OF ITEMS WHICH CODE DEPENDS ON BEING TOGETHER.
+
+
+DIB:					; Device Information Block
+	.WORD	DIB$K_LENGTH,0
+	.ADDRESS DIBBUF
+DIBBUF:
+	.BLKB	DIB$K_LENGTH
+
+ERROR_COUNT:				; Cumulative error count at runtime
+	.LONG	0
+
+STATUS:					; Status value on program exit
+	.LONG	0
+
+STAT:					; IO status block
+	.QUAD	0
+
+AST_MODE:				; Prior setting of AST delivery
+	.LONG	0
+
+SS_FAIL_MODE:				; Prior setting of SS failure mode
+	.LONG	0
+
+INADDRESS:				; $CRMPSC address storage
+	.LONG	0,0
+
+OUTADDRESS:
+	.LONG	0,0
+
+DEVNAM_LEN:				; Current device name length
+	.WORD	0
+
+; RANDOM1 and RANDOM2 may be combined to produce a set of pseudo-random numbers
+RANDOM1:				; Random word #1
+	.LONG	^XAAAAAAAA
+
+RANDOM2:				; Random word #2
+	.LONG	^XA72EA72E
+
+ITERATION:				; # of times all tests were executed
+	.LONG	0
+
+PASS:					; Pass count
+	.LONG	0
+
+MSG_BLOCK:				; Auxiliary $GETMSG info
+	.BLKB	4
+
+EXIT_DESC:				; Exit handler descriptor
+	.LONG	0
+	.ADDRESS EXIT_HANDLER
+	.LONG	1
+	.ADDRESS STATUS
+
+ARG_COUNT:				; Argument counter used by ERROR_EXIT
+	.LONG	0
+
+	.ALIGN QUAD			; For self-relative queue of unit blocks
+
+UNIT_LIST:				; Head of unit block circular list
+	.QUAD	0
+
+NEW_NODE:				; Newly acquired node address
+	.QUAD	0
+
+DIAG_BUF:				; $QIO P6 diagnostic buffer
+	.BLKL	50
+
+	.SBTTL	RMS-32 Data Structures
+	.ALIGN	LONG
+
+SYSIN_FAB:				; Allocate FAB for SYS$INPUT
+	$FAB-
+	FNM = <SYS$INPUT:>
+
+SYSIN_RAB:				; Allocate RAB for SYS$INPUT
+	$RAB-
+	FAB = SYSIN_FAB,-
+	ROP = PMT,-
+	PBF = PROMPT,-
+	PSZ = PMTSIZ,-
+	UBF = DEV_NAME,-
+	USZ = NAME_LEN
+
+INI_FAB:				; Allocate FAB for UETINIDEV
+	$FAB-
+	FAC = <GET,PUT,UPD>,-
+	RAT = CR,-
+	SHR = <GET,PUT,UPI>,-
+	FNM = <UETINIDEV.DAT>
+
+INI_RAB:				; Allocate RAB for UETINIDEV
+	$RAB-
+	FAB = INI_FAB,-
+	RBF = BUFFER,-
+	UBF = BUFFER,-
+	USZ = REC_SIZE
+
+DDB_RFA:				; RFA storage for INI_RAB
+	.BLKB	6
+
+	.ALIGN	LONG
+SUP_FAB:				; Allocate FAB for UETSUPDEV
+	$FAB-
+	FAC = GET,-
+	SHR = <UPI,GET>,-
+	RAT = CR,-
+	FOP = UFO,-
+	FNM = <UETSUPDEV.DAT>
+
+	.SBTTL	Test and Device Initialization
+	.PSECT	DR11W,EXE,NOWRT,PAGE
+
+	.DEFAULT DISPLACEMENT,WORD
+
+;+
+;	Start up the DR11-W test.  This entails some overhead necessary to cope
+;	with both expected and unforseen conditions, figuring out just what
+;	devices are to be tested, making sure we can test the indicated devices
+;	and setting up writeable space for each device to be tested.
+;-
+
+.ENTRY	UETDR1W00,^M<>			; Entry mask
+
+	MOVAL	SSERROR,(FP)		; Declare exception handler
+	$SETSFM_S ENBFLG = #1		; Enable system service failure mode
+	$DCLEXH_S DESBLK = EXIT_DESC	; Declare an exit handler
+	$TRNLOG_S LOGNAM = TTNAME_RWPTR,- ; See if there is some SYS$INPUT
+		  RSLBUF = BUFFER_PTR
+	CMPL	R0,#SS$_NOTRAN		; Is there some translation?
+	BEQL	20$			; BR if no SYS$INPUT assigned
+	$OPEN	FAB = SYSIN_FAB,-	; Open SYS$INPUT
+		ERR = RMS_ERROR
+	$CONNECT RAB = SYSIN_RAB,-	; Connect RAB to SYS$INPUT
+		 ERR = RMS_ERROR
+	BBC	#DEV$V_TRM,-		; BR if SYS$INPUT is NOT a terminal
+		SYSIN_FAB+FAB$L_DEV,10$
+	$TRNLOG_S LOGNAM = CONTROLLER,-	; Get the name of our DR11-W
+		  RSLLEN = DEVNAM_LEN,-
+		  RSLBUF = DEVDSC
+	CMPL	R0,#SS$_NORMAL		; Was a controller specified?
+	BEQL	PROC_CONT_NAME		; BR if it was - go process it
+10$:
+	$GET	RAB = SYSIN_RAB,-	; Read SYS$INPUT for controller name
+		ERR = RMS_ERROR
+	MOVW	SYSIN_RAB+RAB$W_RSZ,-	; Save the name length
+		DEVNAM_LEN
+	BNEQ	PROC_CONT_NAME		; BR if we got something
+20$:
+	MOVL	#SS$_BADPARAM,STATUS	; Save the exit status
+	PUSHAL	NO_CTRLNAME		; Prepare for message...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR ; ...
+	PUSHL	#3			; ...
+	BRW	ERROR_EXIT		; ...to tell of bad setup
+
+PROC_CONT_NAME:
+	MOVW	DEVNAM_LEN,DEVDSC	; Set the device name length
+	PUSHAL	DEVDSC			; Make sure...
+	PUSHAL	DEVDSC			; ...that the specified controller...
+	CALLS	#2,G^STR$UPCASE		; ...is all uppercase for later comparison
+	ADDW2	DEVNAM_LEN,PROCESS_NAME	; Get true process name length
+	CMPW	PROCESS_NAME,#MAX_PROC_NAME ; Is the result too long for VMS?
+	BLEQ	10$			; BR if not
+	MOVW	#MAX_PROC_NAME,PROCESS_NAME ; Make it as long as you can
+10$:
+	CLRL	-(SP)			; Set the time stamp flag
+	PUSHAL	PROCESS_NAME		; Set the test name
+	PUSHL	#2			; Push the argument count
+	PUSHL	#UETP$_BEGIND!STS$K_SUCCESS ; Set the message code
+	CALLS	#4,G^LIB$SIGNAL		; Print the startup message
+	BISW2	#BEGIN_MSGM,FLAG	; Set flag so we don't output it again
+	$SETPRN_S PRCNAM = PROCESS_NAME	; Set the process name to UETDR1W00_yyn
+	BBS	#DEV$V_TRM,-		; BR if SYS$INPUT is a terminal
+		SYSIN_FAB+FAB$L_DEV,20$
+	BRW	40$
+20$:
+	$TRNLOG_S LOGNAM = TTNAME_RWPTR,- ; Recursively translate the name...
+		  RSLLEN = TTNAME_RWPTR,- ; ...of our controlling terminal
+		  RSLBUF = TTNAME_ROPTR
+	MOVAL	TTNAME,TTNAME_RWPTR+4	; Undo possible previous PPF fixup
+	CMPL	R0,#SS$_NOTRAN		; Have we reached the end yet?
+	BEQL	30$			; BR if we have
+	CMPW	#^X001B,TTNAME		; Is this a Process Permanent File?
+	BNEQ	20$			; Recursively translate if not
+	SUBW	#4,TTNAME_RWPTR		; Remove RMS overhead from PPF name
+	ADDL2	#4,TTNAME_RWPTR+4
+	BRB	20$
+30$:
+	$ASSIGN_S DEVNAM = TTNAME_RWPTR,- ; We always need to assign a channel
+		  CHAN   = TTCHAN	  ; Returned channel number
+	$QIOW_S	CHAN     = TTCHAN,-	; Enable CTRL/C AST's...
+		FUNC     = #IO$_SETMODE!IO$M_CTRLCAST,-
+		P1       = CCASTHAND
+	PUSHAL	TEST_NAME		; ...and tell the user...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_ABORTC!STS$K_SUCCESS ; ...how to abort gracefully...
+	CALLS	#3,G^LIB$SIGNAL		; ...
+40$:
+	$TRNLOG_S LOGNAM = MODE,-	; Get the run mode
+		  RSLLEN = BUFFER_PTR,-
+		  RSLBUF = FAO_BUF
+	BICB2	#LC_BITM,BUFFER		; Convert to upper case
+	CMPB	#^A/O/,BUFFER		; Is this a one shot?
+	BNEQ	45$			; BR if not
+	BISW2	#ONE_SHOTM,FLAG		; Set flag for one-shot mode
+45$:
+	CMPL	#^A/DUMP/,BUFFER	; Special dump mode info wanted?
+	BNEQ	47$			; BR if not
+	BISW2	#DUMP_MODEM,FLAG	; Set flag for dump mode messages
+47$:
+
+;
+; From UETINIDEV.DAT and UETSUPDEV.DAT, get information which gives controller
+; and unit configuration and lets us know if the setup to run this test was
+; done correctly.
+;
+	$OPEN	FAB = INI_FAB,-		; Open file "UETINIDEV.DAT"
+		ERR = RMS_ERROR
+	$CONNECT RAB = INI_RAB,-	; Connect the RAB and FAB
+		 ERR = RMS_ERROR
+	$MGBLSC_S  INADR = INADDRESS,-	; Connect to UETSUPDEV global section
+		  RETADR = OUTADDRESS,-
+		  GSDNAM = SUPDEV_GBLSEC,-
+		   FLAGS = #SEC$M_EXPREG
+	CMPL	R0,#SS$_NOSUCHSEC	; Was the section already there?
+	BNEQ	50$			; BR if it was...
+	$OPEN	FAB = SUP_FAB,-		; ...else open "UETSUPDEV.DAT"
+		ERR = RMS_ERROR
+	$CRMPSC_S CHAN = SUP_FAB+FAB$L_STV,- ; Create the global section
+		 INADR = INADDRESS,-
+		RETADR = OUTADDRESS,-
+		GSDNAM = SUPDEV_GBLSEC,-
+		 FLAGS = #SEC$M_EXPREG!SEC$M_GBL
+50$:
+	SUBL3	OUTADDRESS,OUTADDRESS+4,R6 ; Create global section length
+
+FIND_IT:
+	$GET	RAB = INI_RAB,-		; Get the first record
+		ERR = RMS_ERROR
+	PUSHAL	CONT_DESC		; Make sure...
+	PUSHAL	CONT_DESC		; ...that the controller name...
+	CALLS	#2,G^STR$UPCASE		; ...is all uppercase letters
+	CMPB	#^A/D/,BUFFER		; Is this a DDB?
+	BEQL	10$			; Go on if not
+	CMPB	#^A/E/,BUFFER		; Is this the end of the file?
+	BNEQ	FIND_IT			; Continue on if not
+	PUSHAL	DEVDSC			; Push device not supported message
+	PUSHAL	PROCESS_NAME		; Parameters on the stack
+	PUSHL	#2
+	PUSHL	#UETP$_DENOSU
+	INSV	#STS$K_WARNING,-
+		#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,(SP)	; Set the severity code...
+	MOVL	(SP),STATUS		; ...and save it as the exit status
+	PUSHL	#4
+	BRW	ERROR_EXIT		; Exit in error
+10$:
+	CMPC	DEVNAM_LEN,BUFFER+6,DEV_NAME ; Is this the right controller?
+	BNEQ	FIND_IT			; BR if not
+	MOVC3	#6,INI_RAB+RAB$W_RFA,DDB_RFA ; Save the record file address
+	CMPB	#^A/T/,BUFFER+4		; Can we test this controller?
+	BEQL	FOUND_IT		; BR if we can...
+	$FAO_S	CTRSTR = DEAD_CTRLNAME,- ; ...and yell at user if we can't
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = #DEVDSC
+	MOVL	#SS$_BADPARAM,STATUS	; Set return status
+	PUSHAL	BUFFER_PTR		; ...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; ...
+	PUSHL	#3			; ...
+	BRW	ERROR_EXIT		; We can't test what we can't test
+
+FOUND_IT:
+	$GET	RAB = INI_RAB,-		; Get a record
+		ERR = RMS_ERROR
+	PUSHAL	CONT_DESC		; Make sure...
+	PUSHAL	CONT_DESC		; ...that this line...
+	CALLS	#2,G^STR$UPCASE		; ...is all uppercase letters
+	CMPB	#^A/U/,BUFFER		; Is this a UCB?
+	BEQL	20$			; BR if it is
+	CMPB	#^A/D/,BUFFER		; Is this a DDB?
+	BEQL	10$			; BR if yes
+	CMPB	#^A/E/,BUFFER		; Is this the end?
+	BEQL	10$			; BR if yes
+	PUSHAL	ILLEGAL_REC		; Then this is an error in the record
+	PUSHL	#1			; Push the error message
+	PUSHL	#UETP$_TEXT!STS$K_ERROR ; Push the signal name
+	PUSHL	#3			; Push the temp arg count
+	BRW	ERROR_EXIT		; Finish for good
+10$:
+	BRW	ALL_SET			; Found DDB or END
+20$:
+	CMPB	#^A/T/,BUFFER+4		; Is the unit testable?
+	BNEQ	FOUND_IT		; BR if not
+	SKPC	#^A/ /,#MAX_UNIT_DESIG,-
+		BUFFER+6		; Find out where unit number really is
+	ADDW3	R0,DEVNAM_LEN,DEVDSC	; Calculate device'unit string length
+	MOVZWL	DEVNAM_LEN,R2		; Offset to unit number in DEVDSC
+	MOVC3	R0,(R1),DEV_NAME(R2)	; Append unit number to device
+	$GETDEV_S DEVNAM = DEVDSC,-	; Get the device characteristics
+		  PRIBUF = DIB
+	MOVZBL	DIBBUF+DIB$B_DEVCLASS,R7 ; Save the device class
+	MOVZBL	DIBBUF+DIB$B_DEVTYPE,R8	; Save the device type
+	$FAO_S	CTRSTR = CS1,-
+		OUTBUF = FAO_BUF,-
+		P1     = R7,-
+		P2     = R8		; Make it into a string
+	MATCHC	#6,BUFFER,R6,@OUTADDRESS ; Find the device class and type
+	BEQL	30$			; BR if it was found
+	$FAO_S	CTRSTR = CS3,-		; Try for full class support
+		OUTBUF = FAO_BUF,-
+		    P1 = R7
+	MATCHC	#6,BUFFER,R6,@OUTADDRESS ; Find the device class only
+	BNEQ	40$			; BR if not found
+30$:
+	MOVZBL	TEST_NAME,R5		; Get the test name length
+	CMPC3	R5,(R3),TEST_NAME+8	; Are we the right test?
+	BEQL	50$			; BR if yes
+40$:
+	PUSHAL	DEVDSC			; Push device not supported message
+	PUSHAL	PROCESS_NAME		; Parameters on the stack
+	PUSHL	#2			; Push the argument count
+	PUSHL	#UETP$_DENOSU
+	INSV	#STS$K_ERROR,-
+		#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,(SP)	; Set the severity code...
+	MOVL	(SP),STATUS		; ...and save it as the exit status
+	PUSHL	#4			; Push the partial arg count...
+	BRW	ERROR_EXIT		; ...and split this scene
+50$:
+	$EXPREG_S PAGCNT = #PAGES,-	; Get a new node of demand zero memory
+		  RETADR = NEW_NODE
+	INSQTI	@NEW_NODE,UNIT_LIST	; Put the new node in the unit list
+	MOVL	NEW_NODE,R6		; Save a copy of its address
+	MOVB	#1,UETUNT$B_TYPE(R6)	; Set the structure type
+	MOVW	#UETUNT$C_INDSIZ+DEVDEP_SIZE,-
+		UETUNT$W_SIZE(R6)	; Set the structure size
+	MOVB	DEVDSC,UETUNT$T_FILSPC(R6) ; Set the device name size
+	MOVC3	DEVDSC,@DEVDSC+4,-	; Save the device name
+		UETUNT$T_FILSPC+1(R6)
+	BISB2	#UETUNT$M_TESTABLE,UETUNT$B_FLAGS(R6) ; Assume DR11-W testable
+	$ASSIGN_S DEVNAM = DEVDSC,-	; Get the DR11-W for our exclusive use
+		  CHAN   = UETUNT$W_CHAN(R6)
+	BLBS	R0,60$			; We're OK if we got the device
+	MOVL	R0,STATUS		; Save the failure code as exit status
+	INSV	#STS$K_ERROR,-
+		#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,STATUS	; Set the severity code
+	BICB2	#UETUNT$M_TESTABLE,UETUNT$B_FLAGS(R6) ; We can't test DR11-W
+	$FAO_S	CTRSTR = DEVALLOC,-	; Otherwise bitch somewhat
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = #DEVDSC
+	PUSHAL	BUFFER_PTR		; ...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; ...
+	PUSHL	STATUS			; ...
+	PUSHL	#4
+	BRW	ERROR_EXIT
+60$:
+	MOVC3	#4*<QIO$_NARGS+1>,DUMMY_QIO,XA_K_QIO(R6) ; Fill static $QIO_G args...
+	MOVZWL	UETUNT$W_CHAN(R6),XA_K_QIO+QIO$_CHAN(R6) ; ...with those which...
+	MOVAQ	XA_Q_IOSB(R6),XA_K_QIO+QIO$_IOSB(R6) ; ...can't be filled at assembly
+	MOVQ	DIBBUF+DIB$B_DEVCLASS,XA_Q_ORIGINAL(R6) ; Save original characs
+	BRW	FOUND_IT		; Do the next UCB
+
+;
+; Arrive here when we have the device configuration.  In normal or loop forever
+; mode, set a timer far enough in the future such that we can do a reasonable
+; set of tests before the timer expires, but if our device gets hung, the
+; program won't waste too much time before noticing.  Let one-shot mode be a
+; special case.
+;
+ALL_SET:
+	TSTL	UNIT_LIST		; Anything to test?
+	BNEQ	10$			; BR if yes
+	PUSHAL	NOUNIT_SELECTED		; Else set up the error message...
+	PUSHL	#1			; ...argument count...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; ...signal name...
+	PUSHL	#3			; ...and parameter count
+	MOVL	#SS$_BADPARAM,STATUS	; Set return status
+	BRW	ERROR_EXIT		; ...and give up, complaining
+10$:
+	BISW2	#SAFE_TO_UPDM,FLAG	; OK, safe to update UETINIDEV.DAT now
+	MOVL	DEVNAM_LEN,DEVDSC	; DEVDSC will describe controller name
+	BBC	#ONE_SHOTV,FLAG,TIME_IT	; BR if in normal loop forever modes
+	BISW2	#TEST_OVERM,FLAG	; One-shot mode, stop after one shot!
+; Because not all $QIOs have a timeout parameter, this test will always fall
+; into TIME_IT to do a $SETIMR.
+
+TIME_IT:
+	$SETIMR_S DAYTIM = THREEMIN,-	; Set timer AST to 3 minutes
+		  ASTADR = TIME_OUT,-
+		  EFN    = #EFN2
+
+	.SBTTL	Test the DR11-W
+RESTART:
+;
+; At this point the device designation is in location DEV_NAME pointed to by
+; descriptor DEVDSC.  The device is known to be supported by this test.
+;
+	MOVAL	UNIT_LIST,R6		; R6 will point to the current node
+TEST_LOOP:
+	ADDL2	(R6),R6			; Point to the next possible node
+	CMPL	#UNIT_LIST,R6		; Back at the head of the queue?
+	BNEQ	10$			; BR if not
+	BRW	90$			; Exit test portion if we are
+10$:
+	BBC	#UETUNT$V_TESTABLE,-	; Skip this unit if can't test it
+		UETUNT$B_FLAGS(R6),TEST_LOOP
+
+	MOVL	#<WRITE_SIZE/4>,R8	; Fill alternate words (byte count/4)...
+	MOVAL	XA_K_BUF(R6),R9		; ...of the read/write buffer...
+20$:
+	ADDL2	RANDOM2,RANDOM1		; ...with random...
+	MOVZWL	RANDOM1,(R9)+		; ...words...
+	SOBGTR	R8,20$			; ...until it's full
+;
+; Set up DR11-W quadword characteristics buffer for future IO$_SETMODEs.
+; Copy device type, class and (bogus) buffer size and enabling for Unibus BDP
+; when we want it.
+;
+	MOVQ	XA_Q_ORIGINAL(R6),XA_Q_CHARAC(R6) ; Class, type & transfer count
+	BISB2	#XA$M_LINK,- 		; Add other characteristics...
+		XA_Q_CHARAC+4(R6)	; ...(but avoid XA$M_DATAPATH)
+;
+; As described previously, the TABLE_GEN and LINE_GEN macros set up a set of
+; parallel tables with parameters to be used in $QIOs to the DR11-W.  Go
+; through those tables.  For each $QIO which transfers data, check that the
+; data were passed correctly and clear the words into which data were written.
+;
+; Although the data structures of this test would permit multi-unit,
+; asynchronous testing of DR11-W's, the way VMS treats DR11-W's (one unit per
+; logical controller) means that we will test one one unit per test invocation.
+; Since operations will turn out synchronous anyway, we may as well be honest
+; and use the $QIOW system service to synchronize control.
+;
+	CLRL	R7			; Set up counter to go thru tables
+	MOVAL	XA_K_QIO(R6),R10	; Point to $QIO arglist for clarity
+30$:
+	MOVL	P5_TABLE[R7],QIO$_P5(R10) ; Set up those $QIO_G args...
+	MOVL	P4_TABLE[R7],QIO$_P4(R10) ; ...which must be done for...
+	MOVL	P3_TABLE[R7],QIO$_P3(R10) ; ...each individual $QIO
+	MOVL	P2_TABLE[R7],QIO$_P2(R10) ; ...
+	ADDL3	R6,P1_TABLE[R7],QIO$_P1(R10) ; ...
+	MOVL	R7,QIO$_ASTPRM(R10)	; ...
+	MOVL	ASTADR_TABLE[R7],QIO$_ASTADR(R10) ; ...
+	MOVL	FUNC_TABLE[R7],QIO$_FUNC(R10) ; ...
+	$QIOW_G	(R10)			; Do one function of the DR11-W
+	INCL	UETUNT$L_ITER(R6)	; Count $QIOs done
+
+	MOVZBL	XA_B_TSI(R6),R1		; Put index value into index register
+	MOVQ	DIAG_BUF,XA_K_TSTAMP(R6)[R1] ; Store $QIO starting time stamp
+	INCL	R1			; Bump up index
+	MOVQ	DIAG_BUF+8,XA_K_TSTAMP(R6)[R1] ; Store $QIO ending time stamp
+	INCL	R1			; Bump up index
+	MOVB	R1,XA_B_TSI(R6)		; Keep index modulus 2**8
+
+	BLBS	R0,40$			; BR if the $QIO itself worked
+	CALLS	#0,DEBUG_DUMP		; Print diagnostic info if it failed
+	MOVL	R0,STATUS		; Save a record of what failed...
+	MOVAL	UETUNT$T_FILSPC(R6),R8	; ...
+	$FAO_S	CTRSTR = QIO_ERROR,-	; ... and consider it a fatal error
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R8
+	PUSHL	STATUS			; ...
+	PUSHAL	BUFFER_PTR		; ...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; ...
+	PUSHL	#4			; ...
+	BRW	ERROR_EXIT		; ...
+40$:
+	BLBS	XA_Q_IOSB(R6),50$	; BR if the function of the $QIO worked
+	CALLS	#0,DEBUG_DUMP		; Type special info if in DUMP mode
+	MOVAL	UETUNT$T_FILSPC(R6),R8
+	$FAO_S	CTRSTR = QIO_FUNC_FAIL,- ; Report the problem otherwise
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R8,-
+		P2     = FUNC_TABLE[R7],-
+		P3     = XA_Q_IOSB(R6),-
+		P4     = XA_Q_IOSB+4(R6)
+	MOVZWL	XA_Q_IOSB(R6),-(SP)	; ...
+	PUSHAL	BUFFER_PTR		; ...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT		; ...
+	INSV	XA_Q_IOSB(R6),-		; Set the severity code
+		#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,(SP)
+	INCL	ERROR_COUNT		; Keep a running count...
+	PUSHL	ERROR_COUNT		; ...of the errors we've gotten
+	PUSHL	#1
+	PUSHL	#UETP$_ERBOX!STS$K_ERROR ; Have the error stand out
+	CALLS	#7,G^LIB$SIGNAL		; Bitch, bitch, bitch
+	BICB2	#UETUNT$M_TESTABLE,-	; Indicate that this unit is no good
+		UETUNT$B_FLAGS(R6)
+	BISW2	#NO_MESSAGEM,FLAG	; Indicate message already printed
+50$:
+
+	TSTL	P2_TABLE[R7]		; If zero length data transfer (words)...
+	BEQL	80$			; ...skip the check and reset
+	ASHL	#-2,P2_TABLE[R7],R8	; Convert byte count to every-other-word count
+	ADDL3	R6,P1_TABLE[R7],R9	; Check that the data buffer...
+60$:
+	XORW3	(R9)+,(R9),R11		; ...got filled correctly
+	BEQL	70$			; BR if it did
+	BBS	#NO_MESSAGEV,FLAG,70$	; Avoid extra messages
+	CALLS	#0,DEBUG_DUMP		; Type special info if in DUMP mode
+	FFS	#0,#16,R11,R11		; Find the first bit of bad data
+	ASHL	#-3,R11,R11		; Convert bit-position to byte-in-word
+	MOVZBL	(R9)[R11],-(SP)		; Save the bad byte,...
+	MOVZBL	-2(R9)[R11],-(SP)	; ...the corresponding good byte,...
+	SUBL3	R6,R9,-(SP)		; ...where the bad data was...
+	ADDL2	R11,(SP)		; ...
+	SUBL2	P1_TABLE[R7],(SP)	; ...in our buffer,...
+	CLRL	-(SP)			; ...the unit (identically 0),...
+	PUSHAL	DEVDSC			; ...the controller,...
+	PUSHL	#5			; ...the argument count,...
+	PUSHL	#UETP$_DATAER!STS$K_ERROR ; ...and the error type
+	INCL	ERROR_COUNT		; Keep a running count...
+	PUSHL	ERROR_COUNT		; ...of the errors we've gotten
+	PUSHL	#1
+	PUSHL	#UETP$_ERBOX!STS$K_ERROR ; Have the error stand out
+	CALLS	#10,G^LIB$SIGNAL	; Bitch, bitch, bitch
+	BICB2	#UETUNT$M_TESTABLE,-	; Indicate that this unit is no good
+		UETUNT$B_FLAGS(R6)
+	BISW2	#NO_MESSAGEM,FLAG	; Indicate message already printed
+70$:
+	CLRW	(R9)+			; Clear word to which DR11-W does DATO
+	SOBGTR	R8,60$			; Loop through the whole buffer
+80$:
+	BICW2	#NO_MESSAGEM,FLAG	; New buffer rates another message
+	BBS	#TEST_OVERV,FLAG,90$	; Exit quickly if the test is over
+	ACBB	#LINE_GEN_COUNT-1,#1,R7,30$ ; Loop until all $QIOs are done
+
+	BRW	TEST_LOOP		; Loop for next DR11-W
+
+90$:
+	BSBW	RESET_DR11WS		; Do $QIOs to reset original characs
+
+	INCL	ITERATION		; Increment iteration count
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6	; Go through UNIT_LIST to...
+100$:
+	BBS	#UETUNT$V_TESTABLE,-	; ...see if any testable units are left
+		UETUNT$B_FLAGS(R6),110$	; ...and BR if at least one is
+	ADDL2	(R6),R6			; This one isn't.  Is there another?
+	CMPL	#UNIT_LIST,R6
+	BNEQ	100$			; BR if there are others to try
+	BISW2	#TEST_OVERM,FLAG	; None testable so indicate test over
+110$:
+	BITW	#TEST_OVERM,FLAG	; Is the test over?
+	BNEQ	SUC_EXIT		; BR if yes
+	BRW	RESTART			; Loop until the test is over
+
+SUC_EXIT:
+	BBS	#ONE_SHOTV,FLAG,30$	; Skip minimum I/O check if one-shot
+	MOVAL	UNIT_LIST,R6		; Check the queue...
+20$:
+	ADDL2	(R6),R6			; ...to see if...
+	CMPL	#UNIT_LIST,R6		; ...each DR11-W...
+	BEQL	30$			; ...tested...
+	CMPL	#MINIMUM,UETUNT$L_ITER(R6) ; ...has done the minimum I/O...
+	BLEQ	20$			; ...to not be considered hung
+	MOVAL	UETUNT$T_FILSPC(R6),R7
+	$FAO_S	CTRSTR = SLOW_DR11W,-	; Otherwise bitch somewhat
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R7,-
+		P2     = UETUNT$L_ITER(R6)
+	PUSHAL	BUFFER_PTR		; ...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT!STS$K_WARNING ; ...
+	CALLS	#3,G^LIB$SIGNAL		; ...
+	BRB	20$
+30$:
+	$TRNLOG_S LOGNAM = MODE,-
+		  RSLLEN = BUFFER_PTR,-
+		  RSLBUF = FAO_BUF	; Get the run mode
+	BICB2	#LC_BITM,BUFFER		; Convert to upper case
+	CMPB	#^A/L/,BUFFER		; Is this a loop for ever?
+	BNEQ	10$			; BR if not
+	BICW2	#TEST_OVERM,FLAG	; Reset the termination flag
+	INCL	PASS			; Bump the pass count
+	$FAO_S	CTRSTR = PASS_MSG,-
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = PASS,-
+		P2     = ITERATION,-
+		P3     = #0		; Make the end of pass message
+	PUSHAL	BUFFER_PTR		; Push the string desc.
+	PUSHL	#1			; Push arg count
+	PUSHL	#UETP$_TEXT!STS$K_INFO	; Push the signal name
+	CALLS	#3,G^LIB$SIGNAL		; Print the end of pass message
+	CLRL	ITERATION		; Reset the iteration count
+	BRW	TIME_IT			; Do the next pass
+10$:
+	MOVL	#SS$_NORMAL!STS$M_INHIB_MSG,STATUS ; Set successful exit status
+	$EXIT_S STATUS			; Exit with the status
+
+	.SBTTL	Routine to Dump Debugging Info
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine will be called only if the logical name MODE translates to
+;	the string "DUMP", and then only for those situations where a dump of
+;	info pertaining to the last $QIO would be useful.
+;
+; CALLING SEQUENCE:
+;	CALLS	#0,DEBUG_DUMP
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	R0 has the $QIO (in)completion status.
+;	R7 is an index into the $QIO tables.
+;	R10 points to the $QIO argument list.  (redundant with R6)
+;	XA_Q_IOSB(R6) is the IOSB for the last $QIO.
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Message to SYS$OUTPUT
+;	R0 and R1 returned unscathed!
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	BUFFER and BUFFER_PTR modified after $FAO call
+;
+;--
+
+DEBUG_DUMP:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	BBS	#DUMP_MODEV,FLAG,10$	; Dump mode info wanted?
+	RET				; Nope - call is a no-op
+10$:
+	PUSHR	#^M<R0,R1>		; Save all registers!
+	$FAO_S	CTRSTR = DEBUG_MSG,-	; All the news that fits, we print
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R0,-
+		P2     = QIO$_EFN(R10),-
+		P3     = QIO$_CHAN(R10),-
+		P4     = QIO$_FUNC(R10),-
+		P5     = QIO$_ASTADR(R10),-
+		P6     = QIO$_ASTPRM(R10),-
+		P7     = QIO$_P1(R10),-
+		P8     = QIO$_P2(R10),-
+		P9     = QIO$_P3(R10),-
+		P10    = QIO$_P4(R10),-
+		P11    = QIO$_P5(R10),-
+		P12    = XA_Q_IOSB(R6),-
+		P13    = XA_Q_IOSB+4(R6),-
+		P14    = XA_Q_CHARAC(R6),-
+		P15    = XA_Q_CHARAC+4(R6)
+	PUSHAL	BUFFER_PTR
+	CALLS	#1,G^LIB$PUT_OUTPUT
+	MOVZBL	XA_B_TSI(R6),R1		; Index of next time stamp quad pair
+	SUBL2	#2,R1			; Step back to current time stamp quad pair
+	MOVL	#<19*4>,R2		; First available longword in DIAG_BUF
+	MOVL	#2,R3			; Number of quad pairs for DIAG_MSG
+20$:
+	SUBL2	#2,R1			; Step back one quad pair
+	BGEQ	30$			; BR if not below first entry
+	MOVL	#TIME_STAMP_LEN-2,R1	; Point to top of quad pair list if it is
+30$:
+	MOVQ	XA_K_TSTAMP(R6)[R1],DIAG_BUF(R2) ; Position one time stamp for $FAO
+	ADDL2	#8,R2			; Next available longword in DIAG_BUF
+	INCL	R1			; Bump index
+	MOVQ	XA_K_TSTAMP(R6)[R1],DIAG_BUF(R2) ; Position one time stamp for $FAO
+	ADDL2	#8,R2			; Next available longword in DIAG_BUF
+	DECL	R1			; Bump index back where expected
+	SOBGTR	R3,20$
+	$FAOL_S	CTRSTR = DIAG_MSG,-
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		PRMLST = DIAG_BUF
+	PUSHAL	BUFFER_PTR
+	CALLS	#1,G^LIB$PUT_OUTPUT
+	POPR	#^M<R0,R1>		; Restore registers pristine
+	RET
+
+	.SBTTL	DR11-W AST Receiver
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine will be called when DR11-W I/O completes for those $QIOs
+;	which specify an ASTADR parameter.
+;
+; CALLING SEQUENCE:
+;	Called via AST at I/O completion.
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+IOAST:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	RET
+
+	.SBTTL	Restore Original DR11-W Characteristics
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine will be called when the sequence of $QIOs completes for
+;	all DR11-W's or when something causes the test to abort.
+;
+; CALLING SEQUENCE:
+;	BSBW	RESET_DR11WS
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	Original characteristics buffer for each DR11-W.  We will assume there
+;	are valid data if there is anything in here.
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Each DR11-W has the same characteristics as it had at the start of the
+;	test.
+;
+;--
+
+RESET_DR11WS:
+
+	MOVAL	UNIT_LIST,R6		; This will point to current node
+10$:
+	ADDL2	(R6),R6			; Point to the next node
+	CMPL	#UNIT_LIST,R6		; Back at the queue head?
+	BEQL	20$			; BR if so
+	TSTL	XA_Q_ORIGINAL(R6)	; Did we ever get DR11-W characs?
+	BEQL	10$			; BR if not
+	MOVAL	XA_K_QIO(R6),R10	; Point to $QIO arglist for clarity
+	CLRQ	QIO$_P4(R10)		; Clear P4 and P5
+	CLRL	QIO$_P3(R10)		; Clear P3
+	MOVL	#4,QIO$_P2(R10)		; We must transfer at least some data
+	MOVAL	XA_K_BUF(R6),QIO$_P1(R10) ; P1 gets data buffer
+	CLRQ	QIO$_ASTADR(R10)	; Clear ASTADR and ASTPRM
+	MOVL	#XAW__RESET_CYCLE,QIO$_FUNC(R10) ; Set FUNC
+	$QIOW_G	(R10)			; Reset DR11-W
+	CLRL	QIO$_P2(R10)		; Clear P2
+	MOVAL	XA_Q_ORIGINAL(R6),QIO$_P1(R10) ; P1 gets characteristics buffer
+	MOVL	#IO$_SETCHAR,QIO$_FUNC(R10) ; Set FUNC.  Other args must be OK
+	$QIOW_G	(R10)			; Reset original DR11-W characteristics
+	; We don't care about failure of these two $QIOs.  There's nothing we
+	; can do to remedy the situation now, anyway.
+	BRB	10$			; Loop to next unit
+20$:
+	RSB
+
+	.SBTTL	Timer Expiration Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine will be called if the normal three-minute timer to
+;	indicate the end of the test goes off.
+;
+; CALLING SEQUENCE:
+;	Called via AST at $SETIMR expiration.
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+TIME_OUT:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	BISW2	#TEST_OVERM,FLAG	; Indicate no more testing
+	RET
+
+	.SBTTL	System Service Exception Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine is executed if a software or hardware exception occurs or
+;	if a LIB$SIGNAL system service is used to output a message.
+;	Information about this method of handling messages and errors can be
+;	found in the VMS COMMON RUN-TIME manual and in the VMS SYSTEM SERVICE
+;	manual.
+;
+; CALLING SEQUENCE:
+;	Entered via an exception from the system
+;
+; INPUT PARAMETERS:
+;	ERROR_COUNT   = previous cumulative error count
+;	                -----------------
+;	   AP ---->     !       2       !
+;			!---------------!
+;			! SIGNL ARY PNT !
+;			!---------------!
+;			! MECH  ARY PNT !
+;			!---------------! ---------
+;			!       4       !         ^
+;			!---------------!         !
+;			! ESTABLISH FP  !         !
+;			!---------------!         !
+;			!    DEPTH      ! Mechanism Array
+;			!---------------!         !
+;			!      R0       !         !
+;			!---------------!         !
+;			!      R1       !         v
+;			!---------------! ---------
+;			!       N       !         ^
+;			!---------------!         !
+;			! CONDITION NAME!         !
+;			!---------------!         !
+;			! N-3 ADDITIONAL!    Signal Array
+;			! LONG WORD ARGS!         !
+;			!---------------!         !
+;			!      PC       !         !
+;			!---------------!         !
+;			!      PSL      !         v
+;			!---------------! ---------
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	May branch to ERROR_EXIT
+;--
+
+SSERROR:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	$SETAST_S ENBFLG = #0		; Disable AST delivery
+	CLRL	AST_MODE		; Assume it was disabled
+	CMPL	R0,#SS$_WASSET		; Were AST's enabled?
+	BNEQ	10$			; BR if not enabled
+	MOVL	#1,AST_MODE		; Set it to be reenabled
+10$:	$SETSFM_S ENBFLG = #0		; Disable SS failure mode for PUTMSG
+	CLRL	SS_FAIL_MODE		; Assume it was disabled
+	CMPL	R0,#SS$_WASSET		; Was SS failure mode enabled?
+	BNEQ	20$			; BR if not enabled
+	MOVL	#1,SS_FAIL_MODE		; Set it to be reenabled
+20$:	MOVL	CHF$L_SIGARGLST(AP),R6	; Get the signal array pointer
+	CMPZV	#STS$V_FAC_NO,#STS$S_FAC_NO,- ; Is this a message from LIB$SIGNAL?
+		CHF$L_SIG_NAME(R6),#UETP_K
+	BNEQ	30$			; BR if this is a system exception
+	SUBL2	#2,CHF$L_SIG_ARGS(R6)	; Drop the PC and PSL
+	$PUTMSG_S MSGVEC = CHF$L_SIG_ARGS(R6) ; Print the message
+	$SETSFM_S ENBFLG = SS_FAIL_MODE	; Set to previous state
+	$SETAST_S ENBFLG = AST_MODE	; Set to previous state
+	RET				; Return to the program
+30$:
+	CMPZV	#STS$V_FAC_NO,#STS$S_FAC_NO,- ; Is it an RMS failure?
+		CHF$L_SIG_ARG1(R6),#RMS_K
+	BNEQ	40$			; BR if not
+	$SETSFM_S ENBFLG = SS_FAIL_MODE	; Set to previous state
+	$SETAST_S ENBFLG = AST_MODE	; Set to previous state
+	RET				; Yes, RMS_ERROR gets to handle them
+40$:
+	MOVL	CHF$L_SIG_NAME(R6),STATUS ; Save the status
+	CLRL	R8			; Assume for now it's not SS failure
+	CMPL	#SS$_SSFAIL,STATUS	; But is it a System Service failure?
+	BNEQ	60$			; BR if not - no special case message
+	$GETMSG_S MSGID = CHF$L_SIG_ARG1(R6),- ; Get SS failure code associated text
+		 MSGLEN = BUFFER_PTR,-
+		 BUFADR = FAO_BUF,-
+		 FLAGS  = #14,-
+		 OUTADR = MSG_BLOCK
+	TSTB	MSG_BLOCK+1		; Get FAO arg count for SS failure code
+	BEQL	50$			; Don't use $GETMSG if no $FAO args...
+	PUSHAL	BUFFER_PTR		; ...else build up...
+	PUSHL	#1			; ...a message describing...
+	PUSHL	#UETP$_TEXT		; ...why the System Service failed
+	INSV	CHF$L_SIG_ARG1(R6),-	; Give the message...
+		#STS$V_SEVERITY,-	; ...the correct severity code
+		#STS$S_SEVERITY,(SP)
+	MOVL	#3,R8			; Count the number of args we pushed
+	BRB	60$
+50$:
+	PUSHL	CHF$L_SIG_ARG1(R6)	; Save SS failure code
+	MOVL	#1,R8			; Count the number of args we pushed
+60$:
+	MULL3	#4,CHF$L_SIG_ARGS(R6),R7 ; Convert longwords to bytes
+	SUBL2	R7,SP			; Save the current signal array...
+	MOVC3	R7,CHF$L_SIG_NAME(R6),(SP) ; ...on the stack
+	ADDL3	R8,CHF$L_SIG_ARGS(R6),-(SP) ; Push the current arg count
+	BRW	ERROR_EXIT
+
+
+	.SBTTL	RMS Error Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles error returns from RMS calls.
+;
+; CALLING SEQUENCE:
+;	Called by RMS when a file processing error is found.
+;
+; INPUT PARAMETERS:
+;	The FAB or RAB associated with the RMS call.
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Program may exit, depending on severity of the error.
+;
+;--
+
+RMS_ERROR:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	MOVL	4(AP),R6		; See whether we're dealing with...
+	CMPB	#FAB$C_BID,FAB$B_BID(R6) ; ...a FAB or a RAB
+	BNEQ	10$			; BR if it's a RAB
+	MOVAL	FILE,R7			; FAB-specific code:  text string...
+	MOVL	R6,R8			; ...address of FAB...
+	PUSHL	FAB$L_STV(R6)		; ...STV field for error...
+	PUSHL	FAB$L_STS(R6)		; ...STS field for error...
+	MOVL	FAB$L_STS(R6),STATUS	; ...and save the error code
+	BRB	COMMON			; FAB and RAB share other code
+10$:
+	MOVAL	RECORD,R7		; RAB-specific code:  text string...
+	MOVL	RAB$L_FAB(R6),R8	; ...address of associated FAB...
+	PUSHL	RAB$L_STV(R6)		; ...STV field for error...
+	PUSHL	RAB$L_STS(R6)		; ...STS field for error...
+	MOVL	RAB$L_STS(R6),STATUS	; ...and save the error code
+COMMON:
+	MOVZBL	FAB$B_FNS(R8),R10
+	$FAO_S	CTRSTR = RMS_ERR_STRING,- ; Common code, prepare error message...
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R7,-
+		P2     = R10,-
+		P3     = FAB$L_FNA(R8)
+	PUSHAL	BUFFER_PTR		; ...and arguments for ERROR_EXIT...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT		; ...
+	EXTZV	#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,-
+		STATUS,R9 		; ...get the severity code...
+	BISB2	R9,(SP)			; ...and add it into the signal name
+	PUSHL	#5			; Current arg count
+	BRW	ERROR_EXIT
+
+	.SBTTL	CTRL/C Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles CTRL/C AST's
+;
+; CALLING SEQUENCE:
+;	Called via AST
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+CCASTHAND:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	PUSHAL	CNTRLCMSG		; Set message pointer
+	PUSHL	#1			; Set arg count
+	PUSHL	#UETP$_TEXT!STS$K_WARNING ; Set signal name
+	PUSHL	#0			; Indicate an abnormal termination
+	PUSHAL	PROCESS_NAME		; ...
+	PUSHL	#2			; ...
+	PUSHL	#UETP$_ABENDD!STS$K_WARNING ; ...
+	CALLS	#7,G^LIB$SIGNAL		; Output the message
+	MOVL	#<SS$_CONTROLC-STS$K_SUCCESS+STS$K_WARNING>,-
+		STATUS			; Set the exit status
+	$EXIT_S	STATUS			; Terminate program cleanly
+
+	.SBTTL	Error Exit
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine prints an error message and exits.
+;
+; CALLING SEQUENCE:
+;	MOVx  error status value,STATUS
+;	PUSHx error specific information on the stack
+;	PUSHL current argument count
+;	BRW   ERROR_EXIT
+;
+; INPUT PARAMETERS:
+;	Arguments to LIB$SIGNAL, as above
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	Message to SYS$OUTPUT and SYS$ERROR
+;
+; IMPLICIT OUTPUTS:
+;	Program exit
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+ERROR_EXIT:
+
+	$SETAST_S ENBFLG = #0		; ASTs can play havoc with messages
+	BBS	#BEGIN_MSGV,FLAG,10$	; BR if "begin" msg has already been output
+	CLRL	-(SP)			; Set the time stamp flag
+	PUSHAL	PROCESS_NAME		; Set the test name
+	PUSHL	#2			; Push the argument count
+	PUSHL	#UETP$_BEGIND!STS$K_SUCCESS ; Set the message code
+	CALLS	#4,G^LIB$SIGNAL		; Print the startup message
+10$:
+	ADDL3	(SP)+,#7,ARG_COUNT	; Get total # args, pop partial count
+	INCL	ERROR_COUNT		; Keep running error count
+	PUSHL	#0			; Push the time parameter
+	PUSHAL	PROCESS_NAME		; Push test name...
+	PUSHL	#2			; ...arg count...
+	PUSHL	#UETP$_ABENDD!STS$K_ERROR ; ...and signal name
+	PUSHL	ERROR_COUNT		; Finish off arg list...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_ERBOX!STS$K_ERROR ; ...for error box message
+	CALLS	ARG_COUNT,G^LIB$SIGNAL	; Truly bitch
+
+	BISL	#STS$M_INHIB_MSG,STATUS	; Don't print messages twice!
+	$EXIT_S STATUS			; Exit in error
+
+	.SBTTL	Exit Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles cleanup at exit.  If the MODE logical name is
+;	equated to "ONE", the routine will update the test flag in the
+;	UETINIDEV.DAT file depending on the UETUNT$M_TESTABLE flag state in the
+;	UETUNT$B_FLAGS field of the unit block corresponding to a line in the
+;	file.
+;
+; CALLING SEQUENCE:
+;	Invoked automatically by $EXIT System Service.
+;
+; INPUT PARAMETERS:
+;	STATUS	contains the exit status.
+;	FLAG	has synchronizing bits.
+;	DDB_RFA	contains the RFA of the DDB record for this device in UETINIDEV
+;
+; IMPLICIT INPUTS:
+;	UNIT_LIST points to te head of a doubly linked circular list of unit
+;		  blocks for the device under test.
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Various files are de-accessed, the process name is reset, and any
+;	necessary synchronization with UETPDEV01 is carried out.
+;	If the MODE logical name is equated to "ONE", the routine will update
+;	the test flag in the UETINIDEV.DAT file depending on the
+;	UETUNT$M_TESTABLE flag state in the UETUNT$B_FLAGS field of the unit
+;	block corresponding to the DR11-W.
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+EXIT_HANDLER:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	$SETSFM_S ENBFLG = #0		; Turn off System Service failure mode
+	$SETAST_S ENBFLG = #0		; We're finished - no more ASTs
+	BBS	#ONE_SHOTV,FLAG,10$	; If one-shot, update testability...
+	BRW	END_UPDATE		; ...else don't update UETINIDEV.DAT
+10$:
+	BBS	#SAFE_TO_UPDV,FLAG,20$	; Only update if it's safe
+	BRW	END_UPDATE		; Else forget it
+20$:
+	MOVAL	INI_RAB,R10		; Set the RAB address
+	MOVB	#RAB$C_RFA,RAB$B_RAC(R10) ; Set RFA mode
+	MOVC3	#6,DDB_RFA,RAB$W_RFA(R10) ; Set RFA to DDB line
+	$GET	RAB = (R10)		; Go back to the DDB record
+	BLBC	R0,END_UPDATE		; If failure then forget it
+	MOVB	#RAB$C_SEQ,RAB$B_RAC(R10) ; Set back to sequential mode
+	ADDL3	#UNIT_LIST,UNIT_LIST,R11 ; Set the unit block list header
+	CLRL	R9			; Init an index
+UNIT_LOOP:
+	BITB	#UETUNT$M_TESTABLE,-
+		UETUNT$B_FLAGS(R11)	; Is this unit testable?
+	BEQL	10$			; BR if not
+	INCL	R9			; Another unit that's testable
+10$:
+	ADDL2	(R11),R11		; Next unit block
+	CMPL	R11,#UNIT_LIST		; Are we full circle in the list?
+	BNEQ	UNIT_LOOP		; BR if not
+	TSTL	R9			; Any testable units?
+	BNEQ	20$			; BR if yes...
+	MOVB	#^A/N/,BUFFER+4		; ...else disable the DDB record...
+	$UPDATE RAB = (R10)		; ...here
+	BLBC	R0,END_UPDATE		; If error then forget it
+20$:
+	ADDL2	(R11),R11		; Next unit block
+	CMPL	R11,#UNIT_LIST		; Are we full circle in the list?
+	BEQL	END_UPDATE		; BR if yes
+	$GET	RAB = (R10)		; Get a record
+	BLBC	R0,END_UPDATE		; If error then forget it
+	BICB2	#LC_BITM,BUFFER		; Convert to uppercase
+	CMPB	#^A/U/,BUFFER		; Is it a UCB record?
+	BNEQ	END_UPDATE		; BR if not
+	BITB	#UETUNT$M_TESTABLE,-
+		UETUNT$B_FLAGS(R11)	; Is this unit testable?
+	BNEQ	20$			; BR if yes...
+	MOVB	#^A/N/,BUFFER+4		; ...else disable the UCB record...
+	$UPDATE RAB = (R10)		; ...here
+	BLBC	R0,END_UPDATE		; If error then forget it
+	BRB	20$			; Look at the next record
+END_UPDATE:
+	BBS	#TEST_OVERV,FLAG,10$	; Did the test complete normally?
+	BSBW	RESET_DR11WS		; Reset original DR11-W characs if not
+10$:
+	PUSHL	#0			; Set the time flag
+	PUSHAL	PROCESS_NAME		; Push the test name
+	PUSHL	#2			; Push arg count
+	PUSHL	#UETP$_ENDEDD!STS$K_SUCCESS ; Push signal name
+	EXTZV	#STS$V_SEVERITY,-	; Get the proper exit severity
+		#STS$S_SEVERITY,-
+		STATUS,R0
+	INSV	R0,#STS$V_SEVERITY,-	; Set the end message severity
+		#STS$S_SEVERITY,(SP)
+	CALLS	#4,G^LIB$SIGNAL		; Output the message
+	$DISCONNECT  RAB = INI_RAB	; Disconnect the RAB from the FAB
+	$CLOSE	     FAB = INI_FAB	; Close the file
+	$SETPRN_S PRCNAM = ACNT_NAME	; Reset the process name
+	RET				; That's all folks!
+
+	.END	UETDR1W00

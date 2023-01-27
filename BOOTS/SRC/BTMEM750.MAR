@@ -1,0 +1,414 @@
+	.TITLE	BTMEM750 - Configure and Test 11/750 Memory
+	.IDENT	'V03-001'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; FACILITY:
+;
+;	Linked with VMB.EXE - part of the
+;	bootstrap module for VAX 11/750 hardware.
+;
+; ENVIRONMENT:
+;
+;	Runs at IPL 31, kernel mode, memory management is OFF, IS=1
+;	(running on interrupt stack), and code must be PIC.
+;
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is 11/750 specific and
+;	determines how many memory controllers are on the system,
+;	where they are, how much memory they control, which pages
+;	of that memory are present (and good). Then the routines
+;	set bits in the PFN bitmap to represent each present (and
+;	good) page of memory.
+;
+;	As a side effect, the routines store the type of adapter located
+;	at each bus slot in the RPB.
+;
+; INPUTS:
+;
+;	R5	- address of 1st RPB configuration code field
+;	R7	- address of the SCB
+;	R11	- address of the RPB
+;
+; IMPLICIT INPUTS:
+;
+;	The positions on the 11/750 system bus are called slots, and are
+;	identified by slot numbers 16-31. Slots 16-25 are called fixed
+;	slots. If an adapter is present in a fixed slot, the adapter
+;	must be of a predefined type. For example,
+;
+;		slot 16 = memory controller 0	= ^XF20000
+;		slot 20 = MASSBUS adapter 0	= ^XF28000
+;		slot 24 = UNIBUS adapter 0	= ^XF30000
+;
+;	Adapters at fixed slots do not have configuration registers.
+;	This routine determines their presence by reading the first
+;	longword of the slot and not having the read result in a
+;	non-existent memory machine check. The data resulting from the
+;	read will be garbage.
+;
+;	10 fixed system bus slots are currently defined for the 11/750:
+;
+;		4 memory controllers, starting at ^XF20000
+;		4 MASSBUS adapters, starting at ^XF28000
+;		2 UNIBUS adapters, starting at ^XF30000
+;
+;	The other 6 system bus slots are floating slots. If an adapter
+;	is present, that adapter must have a configuration register as
+;	the first location in the slot's address space. The register
+;	must contain the adapter type in the low byte.
+;
+;	The 11/750 currently supports only 1 memory controller, located
+;	at ^XF20000. The 11/750 does not have interleaved memory. This
+;	routine tests all controller slots as though memory could exist
+;	at them.
+;
+;	Memory controller registers also contain the starting page
+;	number / 128. This routine determines where the end of memory
+;	on a memory controller is by analyzing the memory present map
+;	in the third memory controller register.
+;
+; OUTPUTS:
+;
+;	R7, R8, R11, and SP are preserved
+;	All others (including AP and FP) are altered
+;
+; IMPLICIT OUTPUTS:
+;
+;	The PFN bitmap is modified to describe all of physical memory.
+;
+;	RPB$L_PFNCNT stores the number of pages of physical memory.
+;
+;	All single parity errors in memory are cleared.
+;
+;	RPB$B_CONFREG describes each NEXUS on the system bus with an
+;	adapter type code.
+;
+; AUTHOR:
+;
+;	C. A. Samuelson, creation date 24-April-1981
+;
+; REVISION HISTORY:
+;
+;	V03-001	KDM0078		Kathleen D. Morse	15-Mar-1982
+;		Clear all MA780-specific boot flags.
+;
+;	V02-004	TCM0001		Trudy C. Matthews	17-Sep-1981
+;		Save R2 (address of fixed nexus table) before calling
+;		BOO$TEST_QUAD.
+;
+;	V02-003	PHL0012		Peter H. Lipman		04-Aug-1981
+;		Change PSECT to put this code into an area that VMB
+;		can overlay when it reads in the secondary boot.
+;
+;	V02-002	PHL0011		Peter H. Lipman		9-Jul-1981
+;		Use new common test memory loop routine BOO$TEST_MEM.
+;
+;	V02-001	NPK2004		N. Kronenberg		5-Jun-1981
+;		Added support of 64Kb memory arrays.  Removed check
+;		that start memory address does not exceed maximum
+;		memory address.
+;
+;--
+
+	.SBTTL	Declarations
+
+	.DEFAULT DISPLACEMENT, WORD
+
+;
+; Macros to describe VMS data structures
+;
+
+	$DMPDEF				; System dump file header definitions
+	$IO750DEF			; 11/750 definitions
+	$NDTDEF				; Nexus device types
+	$PRDEF				; Processor registers
+	$RPBDEF				; Restart parameter block
+	$UBIDEF				; 11/750 UNIBUS adapter
+
+;
+; Macros
+;
+
+	.MACRO	ERROR,STR		; Outputs an error string to the
+	BSBW	ERROUT			; console terminal.
+	.ASCIZ	STR
+	.ENDM	ERROR
+
+	.PSECT	YBTMEM,LONG
+
+	.SBTTL	CHECKMEM_750, Identify 11/750 memory
+
+;++
+;
+; CHECKMEM_750, Locate and test memory for 11/750
+;
+;--
+
+;
+; The table that follows identifies the adapter type codes of adapters
+; located in fixed 750 SBI slots. The last 6 slots contain zeroes to
+; indicate floating slots.
+;
+
+ADAP_TYPE_750:				; Adapter type table for 11/750
+	.BYTE	NDT$_MEM16NI		; Memory controller 0.
+	.BYTE	NDT$_MPM0		; Multiport memory 0.
+	.BYTE	NDT$_MPM1		; Multiport memory 1.
+	.BYTE	NDT$_MPM2		; Multiport memory 2.
+	.BYTE	NDT$_MB			; MASSBUS adapter.
+	.BYTE	NDT$_MB			; MASSBUS adapter.
+	.BYTE	NDT$_MB			; MASSBUS adapter.
+	.BYTE	NDT$_MB			; MASSBUS adapter.
+	.BYTE	NDT$_UB0		; UNIBUS adapter 0.
+	.BYTE	NDT$_UB1		; UNIBUS adapter 1.
+	.BYTE	0			; Floating slot.
+	.BYTE	0			; Floating slot.
+	.BYTE	0			; Floating slot.
+	.BYTE	0			; Floating slot.
+	.BYTE	0			; Floating slot.
+	.BYTE	0			; Floating slot.
+
+
+;
+; Get address of appropriate fixed slot assignment taable for each 
+; CPU:
+;
+
+CHECKMEM_750::				; Entry for 11/750.
+	MOVAB	ADAP_TYPE_750,R2	; Get 11/750 fixed slot assignment
+					; table
+;
+; Start testing slot positions to find adapters. First save the stack
+; position so it can be restored after a machine check.
+;
+
+INIT_SEARCH:				; Start searching for adapters
+	MOVZBL	#IO750$AL_NNEX,AP	; Set up NEXUS loop counter.
+	MOVL	SP,FP			; Save current top of stack.
+
+;
+; Set up the physical address of the 1st slot on the system bus and
+; the address of the adapter type table.
+;
+
+	MOVAB	@#IO750$AL_IOBASE,R4	; Get address of 1st slot.
+
+;
+; During this memory locate and test loop, the following registers are
+; used:
+;
+;	R0	- the contents of the slot's configuration register;
+;		  the 3rd memory controller register;
+;	R1	- bit position within memory present map;
+;	R2	- address of the next byte in the 750-specific adapter
+;		  type table; address of TEST_QUAD_750 routine
+;	R3	- the default adapter type for the current slot;
+;		  the number of pages in this controller
+;	R4	- address of the configuration register at the current
+;		  slot position
+;	R5	- address of next byte in RPB adapter type table
+;	R7	- address of the SCB
+;	R9	- bit setting in memory present map;
+;		  starting page number in this controller
+;	R10	- address of the memory description list in RPB (pagcnt & pfn)
+;	R11	- address of the RPB
+;
+; Initialize the RPB slot field to a zero and obtain the default adapter
+; type for this slot. Then set up a machine check fault handler to gain
+; control if the loop addresses a non-existent configuration register
+; (an empty slot). Then read the slot's configuration register.
+;
+; Initialize R10 (RPB  memory descripter list pointer) for search loop
+;
+	MOVAB	RPB$L_MEMDSC(R11),R10	; Set pointer to memory description list
+	BICL	#<RPB$M_MPM ! RPB$M_USEMPM ! RPB$M_FINDMEM>, -
+		RPB$L_BOOTR5(R11)	; Clear all MA780-specific boot flags
+ 
+
+TRY_NEXUS_750:				; Memory locate and test loop.
+	CLRB	(R5)+			; Assume nothing on slot.
+	MOVZBL	(R2)+,R3		; Get default adapter type.
+	MOVAB	DO_NEXT_750+1,4(R7)	; Set up fault handler (+1 for
+					; handler execution on the
+					; interrupt stack).
+	MOVL	(R4),R0			; Read CR at current slot.
+
+;
+; Execution continues here if the configuration register is present.
+; Load the adapter type into the RPB field. Then, if the adapter type
+; is a memory controller, proceed to test memory. Otherwise, move to
+; the next SBI slot.
+;
+
+	TSTL	R3			; Is this a floating slot?
+	BNEQ	FIXED_SLOT		; Branch if not
+	MOVB	R0,-1(R5)		; Save type read from config register
+	BRB	CHECK_TYPE		; Check if memory controller
+
+FIXED_SLOT:				; Slot is fixed assignment
+	MOVB	R3,-1(R5)		; Save fixed type
+
+CHECK_TYPE:				; Check adapter type for memory
+
+	CMPB	-1(R5),#NDT$_MEM16NI	; Memory controller?
+	BNEQ	DO_NEXT_750		; No, advance to next slot.
+
+;
+; Memory controller found:
+; Find out whether the memory addresses are within legal bounds by
+; computing the number of pages on the controller and the starting page.
+; number.  Each controller is assumed to contain up to 8 array 
+; boards.  Both 16Kb and 64Kb boards can be supported on the same
+; controller.  Sizing is done by examining bits <15:0> in CSR2 in
+; pairs.  Each pair is coded as follows:
+;
+;	00 --> no board, 0 Mbyte
+;	11 --> 16Kb chips, 1/4 Mbyte
+;	other --> 64Kb chips, 1Mbyte
+;
+
+	MOVL	8(R4),R0		; Get starting address register.
+	CLRL	R3			; Start with zero 128K chunks.
+	MOVL	#14,R1			; Start with top array slot in map.
+
+TRY_NXT_ARRAY:
+	EXTZV	R1,#2,R0,R9		; Get next array size
+	BEQL	STEP_ARRAY		; Branch if 0 (no board present)
+	ADDL	#2,R3			; Add at least 2 128 Kb chunks
+	CMPL	R9,#3			; Got 1/4 Mbyte of memory here?
+	BEQL	STEP_ARRAY		; Branch if so
+	ADDL	#6,R3			; No, add 6 more 128Kb chunks
+					;  for 1Mbyte of memory here
+
+STEP_ARRAY:
+	DECL	R1			; Decrease bit # in sizing register
+	SOBGEQ	R1,TRY_NXT_ARRAY	;  by 2 and try next array, if any
+	ASHL	#8,R3,R3		; Convert number of 128K byte
+					; chunks to number of pages.
+	EXTZV	#17,#7,R0,R9		; Starting page number/128
+	ASHL	#7,R9,R9		; Multiply by 128 = page number.
+	MOVL	R3,(R10)+		; Save # of pages in this memory
+	ASSUME	DMP$V_TR EQ 24
+	ASSUME	DMP$S_TR EQ 8
+	MOVB	#IO750$AL_NNEX,-1(R10)	; Compute the TR number for this
+	SUBB	AP,-1(R10)		; memory and store in descriptor
+	MOVL	R9,(R10)+		; Save starting PFN for this memory
+
+;
+; Before starting memory test, establish a page skipping handler for
+; machine checks, and turn off the cache so that writes followed by
+; reads to memory don't write to memory and then read from the cache.
+;
+
+	MOVAB	PAGE_MCHECK_750+1,4(R7)	; Set page skipping handler (+1
+					; for interrupt stack).
+	MTPR	#-1,#PR$_CADR		; Turn off memory cache.
+	PUSHL	R2			; Save address of fixed nexus table.
+	MOVAB	TEST_QUAD_750,R2	; Page test routine address
+	BSBW	BOO$TEST_MEM		; Test the specified range of PFN's
+	POPR	#^M<R2>			; Retrieve fixed nexus table address.
+	BRB	DO_NEXT_750		; Do the next controller if any
+
+	.ALIGN	LONG			; Longword-aligned handler.
+
+;
+; Fault handler for non-existent configuration register, or unreadable
+; registers, or a non-memory controller slot device. Restore stack
+; pointer, clear all errors, and try for another slot if any remain.
+;
+
+DO_NEXT_750:				; Skip to next slot.
+	MOVL	FP,SP			; Restore stack pointer.
+	MTPR	#-1,#PR$_MCESR		; Clear any faults.
+	MOVAB	IO750$AL_PERNEX(R4),R4	; Move to next slot.
+	SOBGTR	AP,NEXT_NEXUS_750	; If still a slot, loop.
+
+;
+; Reestablish the normal machine check fault handler.
+;
+
+	MOVAL	UNEXP_MCHK+1,4(R7)	; Reset SCB vector.
+	CLRL	(R10)+			; Indicate end of RPB memory descr list
+	RSB				; Return to main routine.
+
+;
+; Extra label and branch here to loop back through the slot testing
+; code.
+;
+
+NEXT_NEXUS_750:				; Try the next slot.
+	BRW	TRY_NEXUS_750		; Branch to top of loop.
+;++
+;
+; Functional Description:
+;
+;	Test a page of 780 memory,
+;
+; Calling Sequence:
+;
+;	JSB	TEST_QUAD_750
+;
+; Inputs:
+;
+;	R0 = starting address to test
+;	R1 = Quad word iteration count (64)
+;
+; Outputs:
+;
+;	Returns via RSB if the entire page is OK
+;	Error exit via Machine Check code to BOO$PAGE_MCHECK
+;
+;--
+
+TEST_QUAD_750:				; Test 1 quadword at a time.
+	CLRQ	(R0)			; Clear a quadword.
+	CMPL	(R0)+,(R0)+		; Read both longwords, and
+					; advance to next quadword.
+
+;
+; If no gross errors occur in the clear to the quadword or in the
+; subsequent read instruction, then execution continues below. Otherwise
+; execution goes to the fault handler.
+;
+
+	SOBGTR	R1,TEST_QUAD_750	; Continue clearing unless done.
+	RSB
+
+	.ALIGN	LONG			; All handlers longword-aligned.
+
+;
+; Handler that gains control when a page has gross memory errors. Just
+; clear the error, recover the stack top, and advance to the next page.
+;
+
+PAGE_MCHECK_750:			; Handle machine check.
+	MTPR	#-1,#PR$_MCESR		; Clear error indicator.
+	BRW	BOO$PAGE_MCHECK		; Exit to common bad page code
+	.END

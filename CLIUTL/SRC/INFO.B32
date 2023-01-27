@@ -1,0 +1,962 @@
+MODULE SHOW$PROCESS_CONT (IDENT='V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!++
+! FACILITY:  SHOW PROCESS/CONTINUOUS utility
+!
+! ABSTRACT:
+!
+!	This utility allows anyone to examine a given process
+!	extremely closely to watch process statistics.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system.  User mode with CMEXEC, CMKRNL, WORLD privs.
+!
+! AUTHOR:  Tim Halvorsen, Oct 1979
+!
+! Modified by:
+!
+!	V03-00  MMD001		Meg Dumont	 19-Jan-1981
+!		Make INFO callable from SHOW PROCESS with the /CONTINUOUS
+!		qualifier.
+!	V02-012	BLS0098		Benn Schreiber	 4-Nov-1981
+!		General addressing mode for scr$ routines
+!
+!	V02-011	MHB0076		Mark Bramhall	15-Jul-1981
+!		Fix process name display to substitute "?" for "funny"
+!		characters.  Allow process selection based on PID.
+!
+!	V02-010	MHB0075		Mark Bramhall	24-Jun-1981
+!		Exit handler now goes to screen's last line and only
+!		erases that.
+!
+!	V009	TMH0009		Tim Halvorsen	15-Jun-1981
+!		Do not declare exit handler to erase screen until all
+!		preliminary error checking is done.
+!
+!	V008	TMH0008		Tim Halvorsen	11-Jun-1981
+!		Replace GETMEM module with GETJPI call.  Fix overlapping
+!		display of local event flags.  Erase screen when exiting
+!		the program.
+!
+!	V02-007	MHB0074		Mark Bramhall	 9-Jun-1981
+!		Modified vmap display to handle 132 column mode with
+!		128 pages per row.  Changed from unsolicited input ast's
+!		to fullduplex operation with simply a single character,
+!		echo off read posted.
+!
+!	VO2-006 WMC0001		Wayne Cardoza	12-May-1981
+!		Add display of local event flags.
+!
+!	V02-005	TMH0001		Tim Halvorsen	19-Dec-1980
+!		Add ability to see system working set by typing '*'
+!		as the process name.  In vmap display, show 'G' for
+!		global section, 'L' for locked page.  Fix optimization
+!		which inhibits setting the cursor if its already set
+!		to the right place to speed things up.  Add current time
+!		to main display.  Fix mode changing so that partial output
+!		does not appear on the screen.
+!
+!	V02-004 GRR0001		Greg Robert	18-Dec-1980
+!		Relaxed screen length restrictions.  Removed 'nohardcopy'
+!		restriction.  Removed lib$put_output sycronization
+!		call.  Added single spacing option.  Increased
+!		wait time when not a terminal.  Changed SHOW_VPN to
+!		be more efficient. Add BOLD attribute to PC
+!		display in VMAP.
+!
+!	V02-003	MHB0069		Mark Bramhall	 2-Oct-1980
+!		Use LIB$SCREEN_INFO to check and size screen before starting.
+!		Add a <CR><LF> to the process name prompt.
+!		Exit on CTRL/Z as well as "E".
+!
+!	V02-002	MHB0062		Mark Bramhall	15-Sep-1980
+!		Exit cleanly on user typed Control/Z.
+!		Do initial process search without upper-cased name.
+!		Unsolicited 'E' (or 'e') causes a clean exit.
+!		'maxvirt' is defined as <#rows-to-use> * 64.
+!		Add PC, State, Image name to last line of VMAP display.
+!
+!	V001	TMH0001		Tim Halvorsen	27-Jul-1980
+!		Slow down display if process is quiesient.
+!		Force immediate read of image filespec on entry.
+!		Fix image filespec read to test if successfully
+!		completed.
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+
+!
+! Table of contents
+!
+SWITCHES ADDRESSING_MODE (EXTERNAL=GENERAL);	! Set longword addressing
+FORWARD ROUTINE
+    exit_handler:	NOVALUE,	! Image exit handler
+    fao_buffer,				! Format an FAO string
+    translate_value,			! Translate coded value to string
+    kernel_get_info,			! Get information from PCB/PHD
+    wake_ast:		NOVALUE,	! Unsolicited character AST routine
+    proc_cont_display;			! Main routine
+
+EXTERNAL ROUTINE
+    lib$screen_info : ADDRESSING_MODE(GENERAL),	! Get screen information
+    scr$erase_page : ADDRESSING_MODE(GENERAL),	! Erase entire screen
+    scr$erase_line : ADDRESSING_MODE(GENERAL),	! Erase entire line
+    scr$set_cursor : ADDRESSING_MODE(GENERAL),	! Set cursor position
+    scr$put_screen : ADDRESSING_MODE(GENERAL),	! Write output string
+    scr$set_buffer : ADDRESSING_MODE(GENERAL),	! Enable/disable screen buffering
+    scr$put_buffer : ADDRESSING_MODE(GENERAL);	! Flush screen buffer
+
+MACRO
+    cstring[] =
+	UPLIT BYTE(%CHARCOUNT(%STRING(%REMAINING)),
+	    %STRING(%REMAINING))%,
+
+    table_entry(prefix)[name] =
+	%NAME(prefix,name),cstring(name)%,
+
+    nametable(prefix)[] =
+	UPLIT(table_entry(prefix,%REMAINING),-1,-1)%,
+
+    perform(command) =
+	IF NOT (status = command) THEN BEGIN
+	    SIGNAL(.status);
+	    RETURN true;
+	    END%,
+
+    at(line,column) =
+	scr$set_cursor(line,column)%,
+
+    fao(string) =
+	fao_buffer(%ASCID string
+	%IF %LENGTH GTR 1 %THEN ,%REMAINING %FI)%,
+
+    write(string) =
+	scr$put_screen(fao(string
+	%IF %LENGTH GTR 1 %THEN ,%REMAINING %FI))%;
+
+LITERAL
+    maxvirt	= 23*128,		! Maximum virtual pages in vmap
+    true	= 1,			! Boolean value true
+    false	= 0;			! Boolean value false
+
+MACRO
+    all		= 0,0,8,0%,		! All bits in a byte
+    pc_in_page	= 0,7,1,0%;		! Use unused bit to indicate "PC page"
+
+!
+!	Define a macro to print the proper character in the vmap display
+!	given the virtual page number (VPN)
+!
+
+MACRO
+    show_vpn(page_number) =
+	BEGIN
+	LOCAL bits: BLOCK [BYTE,BYTE];		! Bits from working set entry
+	bits = .vmap [page_number,all];		! Get working set bits
+	SELECTONEU true
+	OF
+	    SET
+	    [.bits [pc_in_page]]:
+				scr$put_screen(%ASCID '@',0,0,1);
+	    [.bits [wsl$v_valid] AND (.bits [wsl$v_wslock] OR .bits [wsl$v_pfnlock])]:
+				scr$put_screen(%ASCID 'L');
+	    [.bits [wsl$v_valid] AND (.bits [wsl$v_pagtyp] EQL wsl$c_gblwrt
+		OR .bits [wsl$v_pagtyp] EQL wsl$c_global)]:
+				scr$put_screen(%ASCID 'G');
+	    [.bits [wsl$v_valid]]:
+				scr$put_screen(%ASCID '*');
+	    [OTHERWISE]:
+				scr$put_screen(%ASCID ' ');
+	    TES;
+	END%;
+
+!
+!	Define macro to set the cursor to the position corresponding
+!	to a given virtual address
+!
+
+MACRO
+    at_vpn(vpn) = at((vpn/.vpn_per_col)+1,(vpn MOD .vpn_per_col)+.vpn_1st_col)%;
+
+EXTERNAL
+    proc_a_desc:	BLOCK [8,BYTE],		! Process name descriptor
+    proc_z_name:	VECTOR[15,BYTE],	! Buffer for process name
+    proc_l_pid,					! Process identification
+    proc_l_status;				! PROC_CONT entry status, set
+						! for SHOW$PROCESS
+
+PSECT	OWN = INFO_OWN;
+PSECT	GLOBAL = INFO_GLOB;
+PSECT	PLIT = INFO_PLIT;
+PSECT	CODE = INFO_CODE;
+
+OWN
+
+!
+!	The following OWN storage is locked into real memory to
+!	improve performance, since references are made to almost
+!	all pieces during every loop.
+!
+
+    lock_start,				! Start of locked down OWN storage
+    spacing:	INITIAL(2),		! Default spacing equal 2
+    keep_going:	INITIAL(true),		! Time to exit flag
+    exit_block:	VECTOR [5]		! Exit control block
+		INITIAL(0,exit_handler,1,exit_block [4],0),
+    mode_change:	INITIAL(true),	! Mark display mode changed
+    new_display_mode,			! New display mode (only if mode_change true)
+    state_current,			! To know if PC, SP are not current
+    dev_flags,				! Established by SCR$GET_INFO
+    max_row,				! Maximum legal row for cursor
+    tt_chan:	WORD,			! Channel to TT
+    tt_buffer:	VECTOR[2,BYTE],		! Buffer for TT "unsol" chars
+    prev_prcnam: VECTOR[15,BYTE],	! Buffer for previous name
+    prev_desc: BLOCK[8,BYTE],		! Descriptor for above buffer
+    prev_image:	VECTOR[nam$c_maxrss,BYTE],	! Previous image name
+    prev_imgdesc: VECTOR[2],		! Descriptor for above buffer
+    prev_state,				! Previous process values...
+    prev_pri,
+    prev_prib,
+    prev_grp,
+    prev_mem,
+    prev_pc,
+    prev_sp,
+    prev_psl,
+    prev_ppgcnt,
+    prev_gpgcnt,
+    prev_cputime,
+    prev_dirio,
+    prev_bufio,
+    prev_pageflts,
+    prev_locevfl0,
+    prev_locevfl1,
+    prev_vause,
+    prev_vmap:	REF BLOCKVECTOR [maxvirt,BYTE,BYTE],
+
+!
+!	The following OWN storage must be locked into real memory to
+!	avoid page faults by the kernel mode code running at a
+!	high IPL.
+!
+
+    display_mode,			! Display mode (0=normal,1=vmap)
+    grp,				! Group of UIC
+    mem,				! Member of UIC
+    state,				! Process state
+    pri,				! Process priority
+    prib,				! Process base priority
+    pc,					! PC register
+    sp,					! Current SP
+    ppgcnt,				! Process pages in WS
+    gpgcnt,				! Global pages in WS
+    cputime,				! Total CPU time
+    dirio,				! Total direct I/O requests
+    bufio,				! Total buffered I/O requests
+    pageflts,				! Total page faults
+    vause,				! Virtual pages in use
+    psl,				! Current PSL
+    locevfl0,				! Local event flag cluster 0
+    locevfl1,				! Local event flag cluster 1
+    vmap: BLOCKVECTOR [maxvirt,BYTE,BYTE], ! Map of virtual address space
+    lock_end;				! End of locked down OWN storage
+
+ROUTINE exit_handler (status_address): NOVALUE =
+
+!---
+!
+!	This routine is called during image rundown to cleanup.
+!	Its sole function is to erase the screen.
+!
+! Inputs:
+!
+!	status_address = Address of final status longword
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+scr$put_buffer();			! Dump contents of current buffer
+scr$erase_page(.max_row,1);		! Go to last line and erase it
+
+END;
+
+ROUTINE fao_buffer(ctrstr,args) =
+BEGIN
+
+!---
+!
+!	This routine passes an ascii string through the FAO
+!	system service with any number of specified parameters.
+!
+!---
+
+OWN
+    desc :	VECTOR[2],		! Result descriptor
+    buf :	VECTOR[80,BYTE];	! Output buffer
+
+MAP
+    ctrstr :	REF VECTOR[2],
+    args :	VECTOR[4];
+
+desc[0] = 80;				! Set up result descriptor
+desc[1] = buf;
+$faol(ctrstr=.ctrstr,outlen=desc,outbuf=desc,prmlst=args);
+RETURN desc;
+END;
+
+ROUTINE translate_value(value,table) =
+BEGIN
+
+!---
+!
+!	This routine returns the address of a counted string
+!	describing a given value.
+!
+! Inputs
+!
+!	value = The value to be translated
+!	table = Address of the table which describes the values:
+!
+!		cstring-addr,	value
+!		     .		  .
+!		     .		  .
+!			  -1,	   -1
+!
+! Outputs
+!
+!	The value of the routine is the address of the counted
+!	ascii stringg.  If the search fails, a pointer to the
+!	string "<NONE>" is returned.
+!
+!---
+
+MAP
+    table:	REF VECTOR[,LONG];	! Name table
+
+INCR entry FROM 0 BY 1 DO
+    SELECT .table[.entry*2] OF SET
+	[-1]:
+	    RETURN cstring('<NONE>');
+	[.value]:
+	    RETURN .table[.entry*2+1];
+    TES
+END;
+
+FORWARD
+    info_ipl;					! Longword containing IPL
+
+ROUTINE kernel_get_info =
+
+!---
+!
+!	This routine runs in kernel mode to obtain
+!	the necessary information about a process
+!	from the process control block and process
+!	header in system space.
+!
+! On input:
+!	proc_l_pid = Process ID of desired process
+!
+!---
+
+BEGIN
+
+EXTERNAL
+    sch$gl_pcbvec: ADDRESSING_MODE(GENERAL),	! PCB address vector
+    sch$gl_maxpix: ADDRESSING_MODE(GENERAL);	! Maximum number of processes
+
+MACRO
+    set_ipl(ipl) = (BUILTIN MTPR; MTPR(%REF(ipl),PR$_IPL))%;
+
+BIND
+    pid = proc_l_pid : VECTOR [,WORD];	! We need the index portion also
+
+BIND
+    pcb_list = .sch$gl_pcbvec: VECTOR [,LONG];	! Address list of PCB's
+
+REGISTER
+    pcb:	REF BLOCK [,BYTE],	! Address of PCB
+    phd:	REF BLOCK [,BYTE],	! Address of PHD
+    vpn;				! VPN for filling in vmap
+
+IF .pid [0] GTRU .sch$gl_maxpix		! If process index out of range,
+THEN
+    RETURN ss$_nonexpr;			! Exit with failure;
+
+pcb = .pcb_list [.pid [0]];		! Get address of PCB
+
+IF  .pcb EQL .pcb_list[0]		! If process went away,
+ OR .pcb [pcb$l_pid] NEQ .proc_l_pid	! or if the pcb has been reused,
+THEN
+    RETURN ss$_nonexpr;			! then exit with failure
+
+CH$MOVE(15,pcb[$BYTEOFFSET(pcb$t_lname),8,0,0],proc_z_name);
+proc_a_desc[dsc$w_length] = .pcb[$BYTEOFFSET(pcb$t_lname),0,8,0];
+proc_a_desc[dsc$a_pointer] = proc_z_name;
+grp = .pcb[pcb$w_grp];
+mem = .pcb[pcb$w_mem];
+state = .pcb[pcb$w_state];
+pri = 31-.pcb[pcb$b_pri];
+prib = 31-.pcb[pcb$b_prib];
+locevfl0 = .pcb[pcb$l_efcs];
+locevfl1 = .pcb[pcb$l_efcu];
+ppgcnt = .pcb[pcb$w_ppgcnt];
+gpgcnt = .pcb[pcb$w_gpgcnt];
+
+IF .display_mode NEQ 0
+THEN
+    CH$FILL(0,maxvirt,vmap);		! Initialize vmap to zero if needed
+
+!
+!	Set the IPL to SYNCH to avoid outswaps while examining the PHD.
+!	The IPL is set from a longword at the end of the routine so that 
+!	the remainder of the routine is paged into memory as the IPL is set.
+!
+
+SET_IPL(.info_ipl);			! Set IPL to avoid outswaps
+
+phd = .pcb [pcb$l_phd];			! Get PHD address
+
+IF NOT .pcb[pcb$v_res]			! If swapped out,
+    OR .phd EQL 0			! Or if PHD address zero,
+THEN
+    BEGIN
+    SET_IPL(0);				! Restore IPL
+    RETURN ss$_normal;
+    END;
+
+cputime = .phd[phd$l_cputim];
+dirio = .phd[phd$l_diocnt];
+bufio = .phd[phd$l_biocnt];
+pageflts = .phd[phd$l_pageflts];
+vause = .phd[phd$l_frep0va]+(%x'80000000'-.phd [phd$l_frep1va]);
+pc = .phd[phd$l_pc];
+psl = .phd [phd$l_psl];
+sp = .phd[phd$l_usp];
+
+!
+!	Copy the WSLE bits into vmap for each page in the working set.
+!	Only do this if the mode is VMAP to minimize time at SYNCH.
+!
+
+IF .display_mode NEQ 0
+THEN
+    BEGIN
+    REGISTER				! Speed the loop up a little
+	maxtest;
+    maxtest = maxvirt;
+
+    INCRA wsle FROM .phd+.phd[phd$w_wslist]*4 TO .phd+.phd[phd$w_wslast]*4 BY 4
+    DO
+	BEGIN
+	MAP wsle: REF BLOCK[,BYTE];		! Reference WSLE structure
+	vpn = ..wsle^-9;		! Get VPN of page in WS
+	IF .vpn LSSU .maxtest		! If page within range of vmap,
+	THEN
+	    vmap [.vpn,all] = .wsle [all];	!  -then copy attributes to vmap
+	END;
+
+    SET_IPL(0);				! Restore IPL back to zero
+    vpn = .pc^-9;			! Get VPN of current PC
+
+    IF .vpn LSSU .maxtest 		! If current PC is in vmap
+    THEN
+	vmap [.vpn,pc_in_page] = true;	! Set bit indicating PC in this page
+
+    END;	! End of gathering VMAP statistics
+
+SET_IPL(0);				! Restore IPL back to zero
+RETURN ss$_normal;
+
+END;
+
+!
+! The following PSECT manipulation is used to place the data segment INFO_IPL
+! in the executable PSECT.  This will force the routine to be in-faulted as
+! the IPL is changed.
+!
+PSECT OWN = INFO_CODE;			! Make the following OWN follow routine
+
+OWN info_ipl:	INITIAL(ipl$_synch);	! Used by SET_IPL in previous routine
+
+PSECT OWN = INFO_OWN;			! Restore OWN psect attributes
+
+ROUTINE wake_ast (ast_type) : NOVALUE =
+
+!---
+!
+!	This routine is invoked when the user types any character or
+!	Control/C.
+!
+!---
+
+BEGIN
+
+OWN
+    iosb : VECTOR [4, WORD];
+
+IF .ast_type LSS 0 THEN			! If Control/C,
+    tt_buffer [0] = 26;			! fake a CTRL/Z
+
+IF .tt_buffer [0] EQL 'V'		! If vmap requested,
+THEN
+    BEGIN
+    new_display_mode = 1;		! set new vmap display mode
+    mode_change = true;			! mark mode has changed
+    END
+ELSE IF .tt_buffer [0] EQL ' '		! If normal requested,
+THEN
+    BEGIN
+    new_display_mode = 0;		! set new normal display mode
+    mode_change = true;			! mark mode has changed
+    END
+ELSE IF .tt_buffer [0] EQL 'E'		! If exit requested
+     OR .tt_buffer [0] EQL 26		!  one way or another (CTRL/Z),
+THEN
+    BEGIN
+    keep_going = false;			! say time to exit
+    END;
+
+IF .keep_going THEN
+    keep_going = $QIO(EFN=2,CHAN=.tt_chan,
+	    FUNC=IO$_READVBLK OR IO$M_NOECHO OR IO$M_CVTLOW,IOSB=iosb,
+	    ASTADR=wake_ast,P1=tt_buffer,P2=1);
+
+!
+! If the above QIO has already completed with an error, then terminate
+! the image.  This fixed a bug which caused an AST level loop when a 
+! remote terminal link disappeared.
+!
+IF (.iosb [0] NEQ 0) AND (.iosb [0] NEQ SS$_NORMAL)
+THEN
+    keep_going = false;
+
+IF NOT .keep_going THEN
+    $DASSGN(CHAN=.tt_chan);
+
+END;
+
+GLOBAL ROUTINE proc_cont_display =
+BEGIN
+
+!---
+!
+!	This is the main entry point for the program.
+!
+!	This routine reads the process name from SYS$INPUT
+!	and displays process parameters on the screen.  The
+!	display is updated continuously.
+!
+!---
+
+LITERAL
+    buflen = 512;			! Size of terminal output buffer
+
+LOCAL
+    prev_vmap_buf: BLOCKVECTOR[maxvirt,BYTE,BYTE],
+    status,				! Status return from calls
+    max_col,				! Maximum legal column for cursor
+    vpn_per_col,			! # of vpn's per column (64 or 128)
+    vpn_1st_col,			! 1st column used for vpn's
+    pos,				! Position of last PC on screen
+    count,				! Interations/image file read
+    msec,				! Wait time in millisecs
+    quad_time: VECTOR[2] INITIAL (-100,-1),	! Quad time for waits
+    image:	VECTOR[nam$c_maxrss,BYTE],	! Current image name
+    image_desc:	VECTOR[2],		! Descriptor for above buffer
+    buffer:	VECTOR[buflen,BYTE],	! Buffer for terminal output
+    bufdesc:	VECTOR[2];		! Descriptor for above buffer
+
+BIND
+    state_table = nametable(sch$c_,
+	COLPG,MWAIT,CEF,PFW,LEF,LEFO,HIB,HIBO,SUSP,SUSPO,
+	FPG,COM,COMO,CUR);
+
+prev_vmap = prev_vmap_buf;		! Store the address into the REF
+proc_l_status = 1;			! Let SHOW$PROCESS know we executed
+
+!
+!	Make certain portions of OWN storage non-paged to avoid
+!	pagefaults by kernel mode code which runs at a high IPL.
+!	Make most of the rest of the own storage non-paged for
+!	performance.
+!
+
+bufdesc [0] = lock_start;		! Starting address of program
+bufdesc [1] = lock_end;			! Ending address of program
+perform($LKWSET(INADR=bufdesc));	! Lock down pages to avoid paging
+
+!
+!	Make sure we can handle the screen and get its width & height
+!
+
+BEGIN
+    LOCAL
+	type;
+    perform(lib$screen_info(dev_flags,type,max_col,max_row));
+    IF (.max_col LSS 72) OR (.max_row LSS 10)
+	THEN
+	    BEGIN
+	    SIGNAL(rms$_dev);		! Call it an inappropriate device...
+	    RETURN true;
+	    END;
+    IF .max_row LSS 20 then spacing = 1;	! Single space if small screen
+    IF .max_col LSS 132 THEN			! Less than 132 columns gets
+	vpn_per_col = 64			!  64 vpn's per column
+    ELSE					! elsewise
+	vpn_per_col = 128;			!  128 vpn's per column
+    vpn_1st_col = MINU(10,.max_col-.vpn_per_col)+1; ! Find 1st vpn column
+    max_row = MINU((maxvirt/.vpn_per_col)+1,.max_row); ! Limit max to vmap max
+END;
+
+!
+! Get a channel to the terminal, set it to FULLDUPLEX, and post a read on it
+!
+
+BEGIN
+LOCAL
+    dib_buf: BLOCK[dib$c_length,BYTE],
+    dib_buf_desc: VECTOR[2];
+perform($ASSIGN(CHAN=tt_chan,DEVNAM=%ASCID 'TT'));
+dib_buf_desc[0] = dib$c_length;
+dib_buf_desc[1] = dib_buf;
+perform($GETCHN(CHAN=.tt_chan,PRIBUF=dib_buf_desc));
+dib_buf[dib$l_devdepend] = .dib_buf[dib$l_devdepend] AND NOT tt$m_halfdup;
+perform($QIOW(CHAN=.tt_chan,
+	FUNC=IO$_SETMODE,P1=dib_buf[dib$b_devclass]));
+perform($QIOW(CHAN=.tt_chan,
+	FUNC=IO$_SETMODE OR IO$M_CTRLCAST,P1=wake_ast,P2=-1));
+perform($QIO(EFN=2,CHAN=.tt_chan,
+	FUNC=IO$_READVBLK OR IO$M_NOECHO OR IO$M_CVTLOW,
+	ASTADR=wake_ast,P1=tt_buffer,P2=1));
+END;
+
+proc_a_desc [dsc$w_length] = 0;		! Display name first time
+
+!
+!	Declare exit handler
+!
+
+perform($DCLEXH(DESBLK = exit_block));	! Declare exit handler
+
+!
+!	Setup screen buffer to optimize screen output
+!
+
+bufdesc[0] = buflen;			! Buffer length
+bufdesc[1] = buffer;			! Address of buffer
+scr$set_buffer(bufdesc);		! Enable output buffering
+
+!
+!	Display the page heading information
+!
+
+DO
+    BEGIN
+    IF .mode_change			! If display mode just changed,
+    THEN
+	BEGIN
+	mode_change = false;		! then mark it no longer just changed
+	display_mode = .new_display_mode; ! and set to new display mode
+	scr$erase_page(1,1);		! Erase the entire screen
+	IF .display_mode EQL 0		! If normal display
+	THEN
+	    BEGIN
+	    at(.spacing*1,30);	write('Process ');
+	    at(.spacing*3,5);	write('State');
+	    at(.spacing*4,5);	write('Cur/base priority');
+	    at(.spacing*5,5);	write('UIC');
+	    at(.spacing*6,5);	write('PID');
+	    at(.spacing*6,25);	write('!XL',.proc_l_pid);
+	    at(.spacing*7,5);	write('Current PC');
+	    at(.spacing*8,5);	write('Current PSL');
+	    at(.spacing*9,5);	write('Current user SP');
+	    at(.spacing*3,45);	write('Working set');
+	    at(.spacing*4,45);	write('Virtual pages');
+	    at(.spacing*5,45);	write('CPU time');
+	    at(.spacing*6,45);	write('Direct I/O');
+	    at(.spacing*7,45);	write('Buffered I/O');
+	    at(.spacing*8,45);	write('Page faults');
+	    at(.spacing*9,45);	write('Event flags');
+	    END
+	ELSE				! Else, if vmap display
+	    BEGIN
+	    INCR line FROM 1 TO .max_row-1 ! Label each line with starting VA
+	    DO
+		BEGIN
+		LOCAL
+		    vpn_1st_addr;
+		vpn_1st_addr = (.line-1)*.vpn_per_col*512;
+		at(.line,1);
+		IF .vpn_1st_col GEQ 8 THEN
+		    write('!#XL:', .vpn_1st_col-3, .vpn_1st_addr)
+		ELSE
+		    write('!#XL:', .vpn_1st_col-3, IF .vpn_per_col EQL 64 THEN
+						      .vpn_1st_addr/4096
+						    ELSE
+						      .vpn_1st_addr/65536);
+		END;
+	    at(.max_row,3); write('PC:');
+	    at(.max_row,17); write('State:');
+	    END;
+
+	pos = 1;			! Initial PC display location
+	image_desc[0] = 0;		! Initially null image name
+	count = 99;			! Interations/image read; force 1st one
+	CH$FILL(0,(.max_row-1)*.vpn_per_col,vmap); ! Initialize vmap
+	grp = -1;
+	mem = -1;
+	state = -1;
+	pri = -1;
+	prib = -1;
+	pc = -1;
+	sp = -1;
+	ppgcnt = -1;
+	gpgcnt = -1;
+	cputime = -1;
+	dirio = -1;
+	bufio = -1;
+	pageflts = -1;
+	locevfl0 = -1;
+	locevfl1 = -1;
+	vause = -1;
+	psl = -1;
+	proc_a_desc [dsc$w_length] = 0;
+	END;
+
+!
+!	Keep refreshing the information that changes
+!
+
+    status = .prev_pc EQL .pc		! Set flag true if quiesent
+		AND .prev_cputime EQL .cputime;
+
+    CH$MOVE(.proc_a_desc[dsc$w_length],.proc_a_desc[dsc$a_pointer],
+	prev_prcnam);
+    prev_desc[dsc$w_length] = .proc_a_desc[dsc$w_length];
+    prev_desc[dsc$a_pointer] = prev_prcnam;
+    CH$MOVE(.image_desc[0],.image_desc[1],prev_image);
+    prev_imgdesc[0] = .image_desc[0];
+    prev_imgdesc[1] = prev_image;
+    prev_state = .state;
+    prev_pri = .pri;
+    prev_prib = .prib;
+    prev_grp = .grp;
+    prev_mem = .mem;
+    prev_pc = .pc;
+    prev_psl = .psl;
+    prev_sp = .sp;
+    prev_ppgcnt = .ppgcnt;
+    prev_gpgcnt = .gpgcnt;
+    prev_cputime = .cputime;
+    prev_dirio = .dirio;
+    prev_bufio = .bufio;
+    prev_pageflts = .pageflts;
+    prev_locevfl0 = .locevfl0;
+    prev_locevfl1 = .locevfl1;
+    prev_vause = .vause;
+    CH$MOVE((.max_row-1)*.vpn_per_col, vmap, .prev_vmap);
+
+    !
+    ! Set the time delay according to type of terminal and activity of
+    ! process, then update all the stats.
+    !
+    msec =				! Compute msecs to wait
+		(IF .dev_flags AND 1	!  -if screen oriented device
+		THEN (IF .status	!  --and if process quiescent
+			THEN 750	!  --then .75 seconds
+			ELSE 100)	!  --else .10 seconds
+		ELSE 2000);		!  -if not screen then 2 seconds.
+    quad_time [0] = (.msec * -10000);	! Convert to 100 usec units
+
+    perform($SETIMR(efn=1,daytim=quad_time));	! Event flag 1
+    perform($WAITFR(efn=1));			! Wait to complete
+    perform($CMKRNL(routin=kernel_get_info));	! Get fresh copies of everything
+
+    count = .count+1;			! Increment count/image read
+    IF .count GEQ 5			! Every 5 interations,
+    THEN
+	BEGIN
+	LOCAL
+	    iosb:	VECTOR [4,WORD],	! I/O status block
+	    item_list:	BLOCK [16,BYTE];	! GETJPI item list
+
+	count = 0;			! Reset counter
+	image_desc [1] = image;
+	item_list [0,0,16,0] = 128;	! Buffer length
+	item_list [2,0,16,0] = jpi$_imagname;	! Request image filespec
+	item_list [4,0,32,0] = .image_desc [1];	! Buffer address
+	item_list [8,0,32,0] = image_desc [0];	! Return length address
+	item_list [12,0,32,0] = 0;	! Terminate list
+
+	IF $GETJPI(ITMLST = item_list,	! Read image filespec
+		PIDADR = proc_l_pid,
+		EFN = 0,
+		IOSB = iosb)
+	THEN
+	    BEGIN
+	    perform($WAITFR(EFN = 0));	! Wait for completion
+
+	    IF NOT .iosb [0]		! If deferred error detected
+	    THEN
+		image_desc [0] = 0;	! then force string to null
+	    END
+	ELSE				! If error detected by GETJPI
+	    image_desc [0] = 0;		! then force string to null
+	END;
+
+    IF .display_mode EQL 0		! If normal display,
+    THEN BEGIN
+    at(.spacing*1,65); write('!8%T',0);	! Write current time
+    IF CH$NEQ(.prev_desc[dsc$w_length],.prev_desc[dsc$a_pointer],
+	.proc_a_desc[dsc$w_length],.proc_a_desc[dsc$a_pointer],' ')
+	THEN BEGIN at(.spacing*1,38); 
+	write('!15<!AF!>', .proc_a_desc[dsc$w_length], .proc_a_desc[dsc$a_pointer]);
+	END;
+    IF CH$NEQ(.prev_imgdesc[0],.prev_imgdesc[1],
+	.image_desc[0],.image_desc[1],' ')
+        THEN BEGIN
+	at(.spacing*10,5); write('!AS',image_desc); scr$erase_line();
+	IF .spacing EQL 1 THEN prev_locevfl1 = .locevfl1+1;
+	END;
+    IF .prev_state NEQ .state THEN BEGIN
+	at(.spacing*3,25); write('!6AC',translate_value(.state,state_table));
+	END;
+    IF .prev_pri NEQ .pri THEN BEGIN
+	at(.spacing*4,24); write('!2UB/',.pri);
+	END;
+    IF .prev_prib NEQ .prib THEN BEGIN
+	at(.spacing*4,27); write('!UB',.prib);
+	END;
+    IF .prev_grp NEQ .grp OR .prev_mem NEQ .mem THEN BEGIN
+	at(.spacing*5,25); write('[!3OW,!3OW]',.grp,.mem);
+	END;
+    IF .prev_pc NEQ .pc THEN BEGIN
+	at(.spacing*7,25); write('!XL',.pc);
+	END;
+    IF .prev_psl NEQ .psl THEN BEGIN
+	at(.spacing*8,25); write('!XL',.psl);
+	END;
+    IF .prev_sp NEQ .sp THEN BEGIN
+	at(.spacing*9,25); write('!XL',.sp);
+	END;
+    IF .state EQL sch$c_cur THEN BEGIN
+	at(.spacing*7,5); write('Stored ');  at(.spacing*8,5); write('Stored ');
+	at(.spacing*9,5); write('Stored ');  state_current = true;
+	END
+    ELSE BEGIN
+	IF .state_current THEN BEGIN
+	    at(.spacing*7,5); write('Current');  at(.spacing*8,5); write('Current');
+	    at(.spacing*9,5); write('Current');  state_current = false;
+	    END;
+	END;
+    IF .prev_ppgcnt+.prev_gpgcnt NEQ .ppgcnt+.gpgcnt THEN BEGIN
+	at(.spacing*3,69); write('!4UL',.ppgcnt+.gpgcnt);
+	END;
+    IF .prev_vause NEQ .vause THEN BEGIN
+	at(.spacing*4,66); write('!7UL',.vause/512);
+	END;
+    IF .prev_cputime NEQ .cputime THEN BEGIN
+	at(.spacing*5,62); write('!2ZL:!2ZL:!2ZL.!2ZL',
+			(.cputime/(100*60*60)) MOD 24,
+			(.cputime/(100*60)) MOD 60,
+			(.cputime/100) MOD 60,
+			.cputime MOD 100);
+	END;
+    IF .prev_dirio NEQ .dirio THEN BEGIN
+	at(.spacing*6,65); write('!8UL',.dirio);
+	END;
+    IF .prev_bufio NEQ .bufio THEN BEGIN
+	at(.spacing*7,65); write('!8UL',.bufio);
+	END;
+    IF .prev_pageflts NEQ .pageflts THEN BEGIN
+	at(.spacing*8,65); write('!8UL',.pageflts);
+	END;
+    IF .prev_locevfl0 NEQ .locevfl0 THEN BEGIN
+	at(.spacing*9,65); write('!XL',.locevfl0);
+	END;
+    IF .prev_locevfl1 NEQ .locevfl1 THEN BEGIN
+	at(.spacing*9+1,65-1); write(' !XL',.locevfl1);
+	END;
+    END
+    ELSE				! Else, if display mode is vmap
+	BEGIN
+	LOCAL vpn,prev_vpn,last_at;
+	last_at = -2;
+	IF CH$NEQ((.max_row-1)*.vpn_per_col, vmap,
+		  (.max_row-1)*.vpn_per_col, .prev_vmap, 0)
+	THEN
+	    INCR i FROM 0 TO ((.max_row-1)*.vpn_per_col)-1 ! For each page in virtual space,
+	    DO
+		IF .vmap [.i,all] NEQ .prev_vmap [.i,all] ! If virtual page residency has changed,
+		THEN
+		    BEGIN
+		    IF .i NEQ .last_at+1	! If not already at position,
+			OR .i MOD .vpn_per_col EQL 0 ! or skipping to next line
+		    THEN
+			at_vpn(.i);		! Set cursor position to VPN
+		    last_at = .i;		! Save current cursor position
+		    show_vpn(.i);		! Display virtual page
+		    END;
+
+	!
+	! Put current PC, State, and Image name on last line
+	!
+
+	IF .prev_pc NEQ .pc THEN BEGIN
+	    at(.max_row,7); write('!XL',.pc);
+	    END;
+	IF .prev_state NEQ .state THEN BEGIN
+	    at(.max_row,24); write('!6AC',translate_value(.state,state_table));
+	    END;
+	IF CH$NEQ(.prev_imgdesc[0],.prev_imgdesc[1],
+		.image_desc[0],.image_desc[1],' ')
+	    THEN BEGIN
+	    at(.max_row,32); write('!AS',image_desc); scr$erase_line();
+	    END;
+	END;
+
+    at(.max_row,1);
+    scr$put_buffer();
+    scr$set_buffer(bufdesc);		! Output contents of buffer
+
+    END WHILE .keep_going;
+
+RETURN ss$_normal;
+END;
+
+END
+ELUDOM

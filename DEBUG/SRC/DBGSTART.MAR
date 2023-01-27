@@ -1,0 +1,968 @@
+	.TITLE	DBGSTART
+	.IDENT	'V03-000'
+
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY: DEBUG
+;
+; ABSTRACT: 
+;	Start-up module for DEBUG facility.
+;
+; ENVIRONMENT:
+;	VAX/VMS User mode : Mapped and entered initially from the CLI. From
+;	then on DEBUG runs as a (very complex) exception handler.
+;
+; VERSION:	3.00
+;
+
+; REVISION HISTORY:
+;
+;
+;	MODIFIED BY:
+;		John Francis, 30 November 1981
+;+
+; 1.01	05-OCT-78	DAR	Fixed bug in the way WINDOW_2 returns to VMS.
+; 1.02	20-OCT-78	MCC	Changed size of writable storage to be
+;				calculated at link time.
+; 1.03	24-OCT-78	DAR	PROBER transfer address before initializing
+;				the PSL's IV and DV bits.
+; 1.04	10-NOV-78	DAR	Added routine DBG$THREAD_BPT for threaded BPT's.
+; 1.05	07-DEC-78	DAR	Fixed exit handler to exit if SS$_CLIFRCEXT.
+; 1.06	18-DEC-78	DAR	Added global label to threaded breakpoint routine
+;				to enable "GO %line x" to work in threaded code.
+; 1.07	23-MAR-79	MCC	Modified dbg$out_message to write error messages
+;				to the LOG file
+; 1.08	 6-AUG-79	MCC	Modified dbg$final_handl to check for error msgs
+;				from shared msg file, before signaling "internal
+;				DEBUG coding error"
+; 1.09	 5-SEP-79	MCC	Made a fix to toggle system service failure
+;				mode when user program has set it and DEBUG 
+;				gets control
+; 1.10	 7-APR-81	JF	Signal DBG$_SUPERDEBUG if testable debugger
+;				and any unexpected errors are encountered
+; 3.00	30-NOV-81	JF	Tidy up entry and exit sequences to fix bugs
+;				with AST's and user termination handlers.
+;--
+
+	.SBTTL	DECLARATIONS
+
+	.EXTRN	DBG$GL_SUP_OR_TEST
+	.EXTRN	DBG$CP_OUT_STR,DBG$GB_DEBUG,DBG$GL_BUF_SIZ
+	.EXTRN	DBG$GL_INPRAB,DBG$GL_OUTPRAB,DBG$GL_RUNFRAME
+	.EXTRN	PRT$C_UW
+	.EXTRN	DBG$END_OF_LINE,DBG$EXC_HANDLER,DBG$FAO_PUT,DBG$RST_INIT
+	.EXTRN	DBG$FREERELEASE,DBG$INIT_DEBUG,DBG$OUT_NUM_VAL,DBG$OUT_PUT
+	.EXTRN	DBG$PUTMSG,DBG$INS_OPCODES,LIB$SIGNAL,SYS$DCLEXH,SYS$EXIT
+	.EXTRN	SYS$GETMSG,SYS$PUT,SYS$SETAST,SYS$SETPRT,SYS$UNWIND
+	.EXTRN	DBG$GL_LOGRAB,DBG$GB_DEF_OUT
+
+
+;
+; invoke data definitions
+;
+	$CHFDEF			; Condition handler mnemonics
+	$CLIDEF			; CLI status bit definitions
+	$DBGDEF			; Debug definitions
+	$IFDDEF			; Image file definitions
+	$PSLDEF			; Processor Status Longword bits
+	$RABDEF			; RAB definitions
+	$SFDEF			; Stack Frame offset definitions
+	$SHRDEF			; Shared error messages
+	$SSDEF			; System error codes
+	$STSDEF			; Status code fields
+;
+; Equated symbols
+;
+	dbg_start1	= 0		; debug diagnostic switch, 0 => no messages
+	dbg_start2	= 0		; Last chance handler diagnostics
+	buf_siz		= 256		; length of getmsg, FAO, and $PUT buffers
+	dbg_facility	= 2		; DEBUG facility code.
+
+;+
+; Special vector that contains the beginning and end addresses of DEBUG's
+; writable storage area.  The third address in the vector is the transfer
+; address of DEBUG that is in this module.
+;-
+	.PSECT	DBG$ABS_ZERO LONG, PIC, SHR, NOWRT, EXE
+virtual_zero:
+	.LONG	0	;.ADDRESS writable_stor	; lowest writable location
+	.LONG	0	;.ADDRESS end_write_stor; highest writable location
+	.LONG	<beginhere+2> - virtual_zero	; start address of mapped DEBUG
+
+
+	.PSECT	DBG$GLOBAL LONG, PIC, NOSHR, NOEXE
+
+writable_stor:					; Define lowest writable address
+
+	.PSECT	ZZZ$ZZZZZZ LONG, PIC, NOSHR, NOEXE
+
+end_write_stor:					; Define highest writable address
+
+
+;
+; OWN STORAGE
+;
+	.PSECT	DBG$OWN LONG, PIC, NOSHR, NOEXE
+
+term_reason:
+	.LONG	0		; Location for termination reason
+
+term_block_one:
+	.LONG	0		; Forward link
+fix_1:	.ADDRESS term_handler	; Address of termination handler
+	.LONG	1		; Argument count
+fix_2:	.ADDRESS term_reason	; Address of termination reason
+
+term_block_two:
+	.LONG	0		; Forward link
+fix_3:	.ADDRESS restore_context; Address of termination handler
+	.LONG	1		; Argument count
+fix_4:	.ADDRESS term_reason	; Address of termination reason
+
+; **************** saved_AP and saved_FP must be contiguous ****************
+; **************** saved_R0 and saved_R1 must be contiguous ****************
+
+saved_AP:.LONG	0		; Original AP	
+saved_FP:.LONG	0		; Original FP
+saved_R0:.LONG	0		; R0 and R1 are saved contiguously so that
+saved_R1:.LONG	0		;  they can be preserved across $EXIT_S
+
+faobufdesc:
+	.LONG	buf_siz		; length of FAO buffer
+	.LONG	0		; address of FAO buffer
+msg_length:
+	.WORD	0		; holds temporary buffer lengths
+fao_buf:
+	.BLKB	buf_siz		; buffer for FAO messages
+log_buf:
+	.BLKB	buf_siz		; buffer for LOG file
+term_buf:
+	.BLKB	buf_siz		; buffer for EXIT reason messages
+
+dbg$gv_control::
+	.BYTE	dbg$gl_sup_or_test	; SUPERDEBUG/TEST DEBUG control bits
+				; Bit 0 set if we are TEST DEBUG
+				; Bit 1 set if we are SUPERDEBUG
+
+	.PSECT	DBG$PLIT BYTE, PIC, SHR, NOWRT, EXE
+
+routine_value:
+	.ASCIC \value returned is \
+
+.IF NE DBG_START1
+
+	code_message:	.ASCIC	\code is !XL\
+	frame_info:	.ASCIC	\frame is at !XL, count is !SL\
+	sig_arg_list:	.ASCIC	\Signal argument list:!/!#(9XL)\
+.ENDC
+
+	.SBTTL	BEGINHERE	- called by DCL via DBGBOOT
+	.PSECT	DBG$CODE BYTE, PIC, SHR, NOWRT, EXE
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	 Routine "beginhere" is where DEBUG is given control from the CLI,
+;	either at the start of program execution or in response to the DCL
+;	"DEBUG" command (in the case of RUN/NODEBUG).
+;	The routine first resolves the two separate ways that DEBUG can be
+;	entered from the CLI, and coerces them to a common format. It then
+;	performs once-only DEBUG initialization, and finally it enters the
+;	exception handler that initiates command processing.
+;
+;	AP --->	----------------------------
+;		!                        6 !
+;		----------------------------
+;		! transfer vector address  ! (Exception args if RUN/NODEBUG)
+;		----------------------------
+;		! parsing information      !
+;		----------------------------
+;		! image header information ! 
+;		----------------------------
+;		!  image file information  !
+;		----------------------------
+;		! LINK status bits         !
+;		----------------------------
+;		!  CLI status bits         !
+;		----------------------------
+;
+;	The transfer vector has three or less transfer addresses in it.
+;	They are ordered as in the picture below:
+;
+;		----------------------------
+;		! DEBUG transfer address   !
+;		----------------------------
+;		! OTS transfer address     !
+;		----------------------------
+;		! user transfer address    !
+;		----------------------------
+;
+;	If the DEBUG or OTS transfer addresses are absent, the subsequent
+;	addresses are moved upward in the list.
+
+	.ENTRY	BEGINHERE,^M<>		; Null entry mask
+
+	MOVB	#1,dbg$gb_exit_dbg	; Exit on initialization errors
+	BSBW	fix_up_addresses	; [TEMP] until VMS bug is fixed
+	MOVQ	AP,saved_AP		; Save pointer to CLI parameters
+	BBC	#cli$v_dbgexcp,24(AP),3$; Branch if normal entry to DEBUG
+;
+; DEBUG has been entered after user program has been started. Find the
+; call frame on the stack which will resturn control to SYS$IMGSTA and
+; change the return address to point to dbg$user_exit so that DEBUG is
+; given control if the user program exits via a RETURN.
+;
+;	MOVAW	W^window_handler_1,(FP)	; Establish setup exception handler
+	MOVL	4(AP),AP		; Get pointer to exception parameters
+	MOVL	chf$l_mcharglst(AP),R0	; Get address of MECHANISM arguments
+	MOVL	chf$l_mch_frame(R0),R0	; Get FP of establisher (SYS$IMGSTA)
+	MOVL	R0,saved_FP		; Save for last-chance handler
+	MOVL	FP,R1			; Get current frame pointer
+1$:	MOVL	sf$l_save_fp(R1),R1	; Step back to previous frame
+	PROBER	#0,#20,(R1)		; Can this stack frame be read ?
+	BEQL	2$			; No  - stack is corrupted ?
+	CMPL	sf$l_save_fp(R1),R0	; Do we point back to SYS$IMGSTA ?
+	BNEQ	1$			; No  - go look at earlier frames
+	MOVAB	W^dbg$user_exit,sf$l_save_pc(R1); Yes - change return PC
+2$:	BRW	setup			; Go perform common initialization
+;
+; DEBUG has been given control directly at start of program execution.
+; We need to build a fake call-frame on the stack,  so that it appears
+; to the user as though DEBUG had been given control after the CALL of
+; his program but before execution of any user instructions.
+;
+3$:	BBS	#1,dbg$gv_control,4$	; Leave transfer vector if SUPERDEBUG
+	ADDL2	#4,4(AP)		; Otherwise step to OTS or USER entry
+4$:	ASHL	#16,#1,R0		; Get all-zero default entry mask
+	MOVL	@4(AP),R1		; Get address of user transfer vector
+	PROBER	#0,#2,(R1)		; Can transfer address be read ?
+	BEQL	5$			; If not, don't try to read it !
+	MOVZWL	(R1),R0			; Get user entry mask bits in R0
+5$:	MOVL	R0,saved_R0		; Save entry-mask and flag bit
+	ADDL3	#2,R1,saved_R1		; Save transfer address as well
+	EXTZV	#0,#2,SP,R1		; Get low two bits of stack pointer
+	BICL2	#3,SP			; Force stack to longword alignment
+	BICW2	#^XF000,R0		; Mask to just bits 0-11 (registers)
+	PUSHR	R0			; Save registers given in entry mask
+	PUSHAB	W^dbg$user_exit		; Set up fake return address
+	PUSHR	#^M<FP,AP>		; Save current context registers
+	ROTL	#-2,R1,-(SP)		; Set stack alignment bits
+	BISW2	R0,2(SP)		; Include register save mask
+	CLRL	-(SP)			; Initialize stack exception handler
+	MOVAB	B^one_shot_handler,(FP)	; Establish handler in outer frame
+	MOVL	SP,FP			; Frame established - set pointer
+	MOVL	#dbg$_normal,-(SP)	; Stack special exception code
+	CALLS	#1,G^LIB$SIGNAL		; SIGNAL into exception handler
+;
+;	Never returns here - PC changed within handler !
+
+one_shot_handler:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Full save entry mask
+
+	MOVL	chf$l_sigarglst(AP),R0	; Get address of SIGNAL arg list
+	MOVZWL	#ss$_debug,4(R0)	; Change exception name to SS$_DEBUG
+	SUBL3	#1,chf$l_sig_args(R0),R1; Get offset to saved PC value
+	MOVAL	(R0)[R1],R0		; Get address of saved PC parameter
+	MOVL	saved_R1,(R0)+		; Change to user program start address
+	EXTZV	#15,#1,saved_R0,R1	; Get entry-mask decimal enable bit
+	INSV	R1,#psl$v_dv,#1,(R0)	; Set decimal overflow bit in saved PSL
+	EXTZV	#14,#1,saved_R0,R1	; Get entry-mask integer enable bit
+	INSV	R1,#psl$v_iv,#1,(R0)	; Set integer overflow bit in saved PSL
+;
+; fall through into common DEBUG once-only initialization code
+;
+setup:	MOVL	chf$l_mcharglst(AP),R0	; Get address of MECHANISM array
+	MOVL	chf$l_mch_frame(R0),R1	; Get frame of our establisher
+	MOVAL	W^dbg$final_handl,(R1)	; Establish final exception handler
+
+	MOVAL	W^dbg$final_handl,(FP)	; Establish local exception handler
+	BSBW	setup_exit_handler	; Establish DEBUGs final exit handler
+	 BLBC	R0,1$			; Go EXIT with error-status on failure
+	CALLS	#0,dbg$init_debug	; initialize DEBUG context.
+	BSBW	save_user_context	; Establish known state of the world
+	$SETEXV_S VECTOR=#2,ADDRES=last_chance; Declare last chance handler
+	 BLBC	R0,1$			; Go EXIT with error-status on failure
+	EXTZV	#0,#1,dbg$gv_control,R0	; Vector-number 1 if TEST, 0 otherwise
+	$SETEXV_S VECTOR=R0,ADDRES=primary_handler; Declare primary handler
+	 BLBS	R0,2$			; Carry on if declaration successful
+1$:	INSV	#4,#0,#3,R0		; Otherwise make this a fatal error
+	$EXIT_S	R0			;  and report status via SYS$EXIT
+
+2$:	MOVL	chf$l_sigarglst(AP),R0	; Get address of SIGNAL arg list
+	SUBL3	#1,chf$l_sig_args(R0),R1; Get offset to saved PC value
+	PUSHL	(R0)[R1]		; Stack PC value for dbg$rst_init
+	MOVL	saved_AP,R0		; Get address of CLI vector
+	PUSHL	cli$a_imghdadr(R0)	; Push address of image header info.
+	MOVL	cli$a_imgfiled(R0),R0	; Get the address of the image file
+	MOVZWL	ifd$w_filnamoff(R0),R1	; get offset to file name
+	ADDL3	R0,R1,-(SP)		; Push address onto stack
+    	MOVZWL	ifd$w_chan(R0),-(SP)	; Push channel number onto stack
+	CALLS	#4,dbg$rst_init		; Initialize the symbol tables.
+	CLRB	dbg$gb_exit_dbg		; All initialized - turn off exit flag
+	BRW	prim_handl_4		; Act as though its a normal exception
+
+	.SBTTL	DEBUG Termination  and last-chance handlers
+
+term_handler:
+	.WORD	^M<>			; Null entry mask
+dbg$term_handlr::
+	BLBS	dbg$gb_exit_dbg,1$	; Output message if exit flag clear
+	CMPL	#ss$_clifrcext,term_reason;Check the exit status
+	BNEQ	2$			; Continue unless "CLI forced exit"
+1$:	RET				; Don't intercept - return to CLI
+
+2$:	MOVB	#1,dbg$gb_debug		; Note that DEBUG is in control
+	BSBW	reset_debug		; Re-establish a known context
+	BSBW	setup_exit_handler	; Re-establish final exit handler
+	MOVZWL	#buf_siz-1,faobufdesc	; Try to convert the status	
+	MOVAB	term_buf+1,faobufdesc+4	; to a system message
+	$GETMSG_S MSGID=term_reason,MSGLEN=msg_length,BUFADR=faobufdesc
+	MOVB	msg_length,term_buf	; Make counted string in TERM_BUF
+	PUSHAB	term_buf		; Address of counted string
+	PUSHL	#1			; One FAO parameter for SIGNAL
+	PUSHL	#dbg$_exitstatus	; Message number
+	CALLS	#3,G^LIB$SIGNAL		; SIGNAL exit status back to DEBUG
+
+last_chance:
+	.WORD	^M<>			; Null entry mask
+	MOVB	#1,dbg$gb_debug		; Note that DEBUG is in control
+	CALLG	(AP),dbg$putmsg		; Output signal message text
+	MOVL	chf$l_mcharglst(AP),R0	; Get address of MECHANISM array
+	MOVQ	chf$l_mch_savr0(R0),saved_R0 ; Save contents of user registers
+	BSBW	reset_debug		; Reset stack to a known state
+	PUSHL	#dbg$_lastchance	; Message number
+	CALLS	#1,G^LIB$SIGNAL		; SIGNAL back in to DEBUG
+
+term_window_handler:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; Full entry mask
+
+	MOVQ	chf$l_sigarglst(AP),R2	; Get SIGNAL & MECHANISM addresses
+	MOVQ	saved_R0,chf$l_mch_savr0(R3)	; Set contents of user R0,R1
+	CLRL	@chf$l_mch_frame(R3)	; Remove link to this handler
+	CALLG	(AP),dbg$putmsg		; Output signal message text
+	SUBL3	#1,(R2),R1		; Get offset to saved PC value
+	CLRL	(R2)+[R1]		; Clear PC to make restart difficult
+	MOVZWL	#ss$_debug,(R2)		; Change signal name to 'SS$_DEBUG'
+	CLRB	dbg$gb_debug		; Turn off DEBUG's presence
+	BSBW	save_user_context	; Save registers in current RUNFRAME
+	BRW	prim_handl_4		; Go issue DEBUG prompt
+
+reset_debug:
+	MOVL	(SP)+,R0		; Get back return address
+	MOVQ	saved_AP,AP		; Restore saved AP and FP
+	MOVL	FP,SP			; Restore SP to be the saved FP
+	PUSHAB	W^dbg$user_exit		; Set up fake return address
+	PUSHR	#^M<FP,AP>		; Save current context registers
+	CLRL	-(SP)			; Set register save mask & PSW
+	MOVAB	term_window_handler,-(SP);Establish temporary window handler
+	MOVL	SP,FP			; Point to current frame
+	PUSHL	R0			; Stack return address again
+	MNEGL	#1,-(SP)		; Replace all BPT's with their real
+	CALLS	#1,dbg$ins_opcodes	;  opcodes, and unprotect all pages
+	RSB				; Return to caller with a new frame
+
+setup_exit_handler:
+	$DCLEXH_S DESBLK=term_block_one	; Declare a termination handler
+	 BLBC	R0,3$			; Return error-status to caller
+	BLBS	dbg$gv_control,3$	; No re-arranging if TEST DEBUG
+1$:	MOVL	term_block_one,R1	; Get link to first USER exit handler
+	BEQL	3$			; Zero link means we are the last one
+	PUSHL	R1			; Save address of control block
+	$CANEXH_S DESBLK=(R1)		; Un-declare user exit handler
+	 BLBC	R0,2$			; Return error status to caller
+	BSBB	1$			; Repeat for all user exit handlers
+2$:	MOVL	(SP)+,R1		; Get back address of control block
+	BLBC	R0,3$			; Report error-status to caller
+	$DCLEXH_S DESBLK=(R1)		; Re-establish handlers in LIFO order
+3$:	RSB				; Return status in R0
+
+	.SBTTL	DEBUG entry and exit routines - save/restore state of user
+;
+;  This routine is called on entry to DEBUG to save the user's registers
+; and sundry other user context in the current RUNFRAME,  and to set the
+; context of DEBUG to a known state (AST's disabled, etc.).
+;
+save_user_context:
+	BLBC	dbg$gb_debug,1$		; Only do this if user was 'in control'
+	RSB				; Otherwise return immediately
+1$:	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8>	; Save all registers we use
+	MOVL	dbg$gl_runframe,R6	; Get pointer to current RUNFRAME
+	MOVQ	4(AP),R7		;  and to SIGNAL & MECHANISM arrays
+	BICW2	#dbg$m_enab_fex+dbg$m_enab_ast,dbg$w_run_stat(R6)
+	$SETAST_S #0			; Disable AST interrupts
+	CMPL	#ss$_wasclr,R0		; Were they enabled?
+	BEQL	2$			; No - flag is already clear
+	BISW2	#dbg$m_enab_ast,dbg$w_run_stat(R6) ; Yes - remember to reenable
+2$:	$SETSFM_S #0			; Disable sys service failure exception
+	CMPL	#ss$_wasclr,R0		; Was it enabled?
+	BEQL	3$			; No - flag is already clear
+	BISW2	#dbg$m_enab_fex,dbg$w_run_stat(R6) ; Yes - remember to reenable
+3$:	PUSHL	chf$l_sig_name(R7)	; Stack actual exception code
+	CALLS	#1,dbg$exception_is_fault;Get type of exception (fault/trap)
+	INSV	R0,#dbg$v_at_fault,#1,dbg$w_run_stat(R6) ; Remember exc type
+	MOVAL	dbg$l_user_regs(R6),R3	; Get address for user's registers
+	MOVQ	chf$l_mch_savr0(R8),(R3)+;Copy R0,R1 from MECHANISM array
+	MOVC3	#40,20(FP),(R3)		; Save user registers R2 - R11
+	MOVQ	sf$l_save_ap(FP),(R3)+	; Save user AP - FP
+	ADDL3	(R7),#1,R0		; Get signal arg count plus 1
+	MOVAL	(R7)[R0],R0		; Calculate value of user SP
+	MOVL	R0,(R3)+		; Save user SP in RUNFRAME
+	MOVQ	-(R0),(R3)+		; Save last 2 SIGNAL args (PC & PSL)
+	$DCLEXH_S DESBLK=term_block_two	; Declare temporary exit handler
+	MOVB	#1,dbg$gb_debug		; Set flag that says DEBUG is running
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8>	; Restore all used registers
+	RSB				; Return with user context saved
+
+restore_context:
+	.WORD	^M<R2>			; Save contents of register R2
+	CLRB	dbg$gb_debug		; Say control returning to user
+	MOVL	dbg$gl_runframe,R2	; Get base of current run frame
+	BBC	#dbg$v_enab_fex,dbg$w_run_stat(R2),1$	; Was SFM enabled ?
+	$SETSFM_S #1			; Yes - reenable exceptions
+1$:	BBC	#dbg$v_enab_ast,dbg$w_run_stat(R2),2$	; Were AST's enabled ?
+	$SETAST_S #1			; Yes - reenable ASTs
+2$:	RET				; Eser context reset - return
+
+dbg$user_exit::
+	BLBS	dbg$gb_exit_dbg,debug_return	; Return if DEBUG exiting
+	MOVQ	R0,saved_R0		; Stuff away for later restoration.
+	$EXIT_S	R0			; Force SYS$EXIT with user's R0 value.
+
+debug_return:
+	RET				; Don't need to set R0 here !
+
+;
+;	When the user program runs to completion, then control runs back
+;	to the label dbg$user_exit.  If DEBUG really wants to exit, then
+;	just return from beginhere. Otherwise, force a SYS$EXIT with the
+;	user's value of R0. Our termination handler then reports this R0
+;	as a system message.  The rest of this routine  (which starts at
+;	beginhere_2) is jumped to from within the termination handler.
+;	It recreates the original argument list	with a new R0,R1 pair to
+;	preserve them across $EXIT_S, and moves back through the restart
+;	logic to the command processor.
+
+;++
+;   The following entry point is used by the termination handler to reset the
+; stack and get back into the DEBUG command processing after the user program
+; has caused an exception unfieldable by DEBUG (or has done a SYS$EXIT).
+;--
+restart_2:
+	ADDL3	#12,8(SP),R0		; Restore R0,R1 just as VMS would
+	MOVQ	(R0),R0			;  in the case of a real exception.
+	ADDL2	#40,SP			; Pop all arguments except PC and PSL.
+	BLBS	dbg$gb_exit_dbg,1$	; Skip if exiting from DEBUG, otherwise
+	REI				; Return as though from an exception.
+
+1$:	ADDL2	#8,SP			; pop the PC and the PSL.
+	MOVZWL	#ss$_normal,R0		; return success value
+	RET
+
+	.SBTTL	DBG$PSEUDO_PROG	- Structure to implement CALL
+
+dbg$pseudo_prog::
+	MOVL	dbg$gl_runframe,R0	; Get address of current run frame
+	PUSHL	dbg$l_call_addr(R0)	; Get address or routine to be called
+	PUSHL	dbg$l_frame_ptr(R0)	; Get address of routine parameter list
+	MOVL	dbg$l_user_regs(R0),R0	; Get back contents of user register 0
+	CALLG	@(SP)+,@(SP)+		; Call the routine.
+
+dbg$pseudo_exit::; Label to detect STEPping off the end of the CALLed routine.
+
+	MOVQ	R0,saved_R0		; Save return value from user procedure
+	$SETAST_S #0			; Disable AST interrupts
+	$DCLEXH_S DESBLK=term_block_two	; Declare temporary exit handler
+	MOVB	#1,dbg$gb_debug		; Say DEBUG is in control
+	MOVL	(FP),AP			; Get pointer to current handler
+	MOVAW	B^pseudo_handler,(FP)	; Get handler to bootstrap into DEBUG
+	PUSHL	#dbg$_normal		; Get phony exception value
+	CALLS	#1,G^LIB$SIGNAL		; SIGNAL back to proper context
+;	point of no return !
+
+pseudo_handler:	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Full save mask
+
+	MOVQ	chf$l_sigarglst(AP),R10	; Get pointers to SIGNAL & MECHANISM
+	MOVL	sf$l_save_ap(FP),@chf$l_mch_frame(R11)	; Restore handler
+	MOVAB	1+fao_buf,dbg$cp_out_str; Set up for standard DEBUG output
+	CLRL	dbg$gl_buf_siz		; Now report the value returned
+	PUSHAL	routine_value		;  from the user's routine
+	PUSHAL 	fao_buf			;   in the standard way
+	CALLS	#2,dbg$fao_put		; Insert text in buffer
+	CLRQ	-(SP)			; Set up argument list for
+	PUSHL	saved_R0		;  call of DBG$OUT_NUM_VAL
+	PUSHAL  fao_buf			;   .   .   .   .
+	CALLS	#4,dbg$out_num_val	; Insert returned numeric value
+	PUSHAL	fao_buf			; Address of counted string
+	CALLS	#1,dbg$out_put		; Output buffer contents
+	MOVL	dbg$gl_runframe,R3	; Get address of routine's runframe
+	MOVL	dbg$l_next_link(R3),R4	;  and address of previous runframe
+	MOVL	dbg$l_frame_ptr(R3),R5	; get address of routine argument list
+.IF NE DBG_START1
+		PUSHL	(R5)			; Diagnostic gives address
+		PUSHL	R5			;  and count of call frame
+		PUSHAL	frame_info		; FAO message
+		CALLS	#3,dbg$fao_out		; output it
+.ENDC
+	INCL	(R5)			; Add one for count longword
+	PUSHL	(R5)			; Push length of block
+	PUSHL	R5			;  and address of block.
+	CALLS	#2,dbg$freerelease	; Free space used for argument list
+	PUSHL	#<<dbg$k_runfr_len+3>/4>; Push length of runframe
+	PUSHL	R3			; Push address of runframe
+	CALLS	#2,dbg$freerelease	; Free this storage too
+	MOVL	R4,dbg$gl_runframe	; Restore previous context
+	SUBL3	#1,(R10),R1		; Get offset to saved SIGNAL PC
+	MOVAL	(R10)[R1],R1		; Get actual address for PC & PSL
+	MOVZWL	#ss$_debug,4(R10)	; Change signal name to 'SS$_DEBUG'
+	MOVQ	dbg$l_user_pc(R4),(R1)	; Restore PC & PSL to SIGNAL array
+	BRB	prim_handl_4		; Rejoin common exception flow
+
+	.SBTTL	PRIMARY_HANDLER
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Exception handler declared in the primary vector. Simply resignals
+;	if the exception occurred during the execution of a debug command.
+;	If the exception occurred in the user program being debugged, this
+;	routine disables ASTs (if they were enabled),  saves the registers
+;	from the user program at the time of the exception, and then calls
+;	a routine to handle the exception.
+;	When the called routine returns, the registers are restored,  ASTs
+;	are re-enabled (if they were disabled),  and the exception handler
+;	returns with the resignal value received from the called routine.
+;
+; CALLING SEQUENCE:
+;	4(AP)	- Address of SIGNAL ARRAY
+;	8(AP)	- Address of MECHANISM ARRAY
+;
+; IMPLICIT INPUTS:
+;	The global symbol dbg$gb_debug, which indicates whether the user
+;	program was running, or debug was executing a debug command.
+;
+; IMPLICIT OUTPUTS:
+;	The "dbg$v_enab_ast" flag indicates whether asts were enabled
+;	at the time of the interrupt
+;
+; ROUTINE VALUE:
+;	SS$_RESIGNAL or the value returned by DBG$EXC_HANDLER
+;
+; SIDE EFFECTS:
+;	The user may get control under DEBUG
+;--
+
+	.ENTRY	PRIMARY_HANDLER,^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+prim_handl_2::
+	BLBC	dbg$gb_debug,1$		; Are debug commands being executed?
+	MOVZWL	#ss$_resignal,R0	; Yes - just resignal exception
+	RET				;  and return
+
+1$:	BSBW	save_user_context	; Establish known state of the world
+prim_handl_4:
+	MOVAL	W^window_handler,(FP)	; Establish temporary exception handler
+	CALLG	(AP),dbg$exc_handler	; Call inner exception handler
+return_to_user:
+	PUSHR	#^M<R0>			; Save resignal value
+	MOVL	dbg$gl_runframe,R1	; get address of block that holds
+	MOVAL	dbg$l_user_regs(R1),R1	;  user's registers into R1
+	ADDL3	#12,8(AP),R9		; Get the address for R0 - R1 on stack
+	MOVQ	(R1)+,(R9)		; And restore R0 - R1,
+	MOVC3	#40,(R1),20(FP)		;  user R2 - R11
+	MOVQ	(R1)+,8(FP)		;   and user AP - FP
+	CLRL	(FP)			; Remove stack-frame exception handler
+	CALLS	#0,restore_context	; Go reset user AST/SFM enables
+	$CANEXH_S DESBLK=term_block_two	; Un-declare temporary exit handler
+	POPR	#^M<R0>			; Get the resignal value back
+	RET				;  and return
+
+	.SBTTL	DBG$THREAD_BPT	- Entry to DEBUG for threaded BPT's
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine is called by a "JMP @(R11)+" instruction when the "thread"
+;	processor encounters the thread where the user has set a breakpoint.
+;	An exception frame is built on the stack to describe the breakpoint
+;	using R11 -4 as the address of the "PC".  The PRIMARY_HANDLER is called
+;	which will announce the breakpoint and process user commands.
+;
+;	When the user issues a GO or STEP command the actual thread is moved
+;	onto the stack from R11 and the exception frame is removed.  The user
+;	program is then restarted by an REI to the next thread.
+;
+; CALLING SEQUENCE:
+;	R11	- Contains the address after the thread where the breakpoint
+;		  was set.
+;
+; IMPLICIT INPUTS:
+;	The routine was called with a JMP @(R11)+ instruction.
+;
+; IMPLICIT OUTPUTS:
+;	R11 is still the thread pointer.
+;
+; ROUTINE VALUE:
+;	None.
+;
+; SIDE EFFECTS:
+;	None.
+;
+;--
+
+dbg$thread_bpt::
+	MOVPSL	-(SP)			; Save the current PSL
+	PUSHAL	-(R11)			; Treat R11 as the PC, and set it to
+					; the address of the thread.
+	PUSHL	#ss$_break		; This is a breakpoint exception.
+	PUSHL	#3			; Exception frame has 3 longwords
+	MOVQ	R0,-(SP)		; Save R0,R1
+	CLRQ	-(SP)			; next 2 longwords of mechanism array
+	PUSHL	#4			; Mechanism array has 4 longwords.
+	PUSHAL	(SP)			; Build arg list for primary handler
+	PUSHAL	24(SP)			;
+	CALLS	#2,primary_handler	; Call primary handler
+dbg$thread_ret::			; Label where threaded breakpoint returns
+	MOVL	(R11)+,28(SP)		; Save user's actual thread in case
+					; he changed it during the breakpoint
+	ADDL2	#12,SP			; Get address of new R0,R1
+	MOVQ	(SP)+,R0		; Restore R0,R1
+	ADDL2	#8,SP			; Remove all but new PC - PSL pair
+	REI				; Transfer control to "thread" routine
+
+	.SBTTL	WINDOW_HANDLER	- Call frame exception handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This handler is put up by the primary handler to be used during the
+;	"window" during the processing of an exception and before the DEBUG
+;	prompt is output. SS$_DEBUG signals are ignored (we are trying hard
+;	to get back to DEBUG command level). everything else causes a jump
+;	to FINAL_HANDLER to report the error.
+;
+; CALLING SEQUENCE:
+;	4(AP)	- Address of SIGNAL ARRAY
+;	8(AP)	- Address of MECHANISM ARRAY
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; ROUTINE VALUE:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Errors reported by FINAL_HANDLER
+;--
+window_handler:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	MOVL	4(AP),R0		; Get address of SIGNAL ARRAY
+	CMPL	4(R0),#ss$_debug	; Is this the DEBUG exception ?
+	BNEQ	dbg$final_handl+2	; No  - transfer to the final handler
+	MOVZWL	#ss$_continue,R0	; Yes - load CONTINUE code
+	RET				; Ignore extra 'SS$_DEBUG' signals
+
+	.SBTTL	DBG$FINAL_HANDL	- Call frame exception handler
+;++
+; Functional description:
+;	This handler is the ultimate exception handler for exceptions
+;	that occur under DEBUG control or during execution of the user
+;	program. Any exception that gets here has already passed thru
+;	primary handlers, secondary handlers, and user-declared
+;	stack handlers. This handler stops the exception from causing
+;	an exit to the operating system, and drops the user back at
+;	DEBUG command level.
+;
+;	This routine first determines whether it was called because of
+;	a hard/software exception condition, or because of a software
+;	generated SIGNAL. The identification of the error is from the
+;	signal-arg-list.
+;
+;	The handler outputs DEBUG generated messages and operating
+;	system generated conditions in distinct manners. The latter
+;	conditions are reported, analyzed for source of error, and
+;	then the user regains control. DEBUG messages are output, and
+;	control is returned to the user or to CLI according to the
+;	severity of the message.
+;
+; Calling sequence:
+;	4(AP)	- Address of SIGNAL ARRAY for an exception. Contains the
+;		  exception name, the PC of the exception, and the PSL
+;		  and any additional FAO arguments required by the
+;		  particular message to be generated.
+;	8(AP)	- Address of MECHANISM ARRAY for an exception. Contains
+;		  R0 and R1.
+;
+; Implicit inputs:
+;	The global symbol dbg$gb_debug says whether DEBUG or the user
+;	was running when the exception occurred. The severity of the
+;	error is determined by the low three bits in the error
+;	identifier (exception name).
+;
+; Implicit outputs:
+;	The name of the exception is changed if primary_handler is
+;	called.
+;
+; Routine value:
+;	SS$_RESIGNAL is returned when the exception was SS$_UNWIND.
+;	SS$_CONTINUE is returned when the exception occurred in DEBUG
+;		code (unless the error was fatal).
+;	Otherwise, this code JMPs to primary_handler and the return is
+;		dependent upon many subsequent things.
+;
+; Side effects:
+;	An error message is output to the terminal.
+;--
+
+	.ENTRY	DBG$FINAL_HANDL,^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	MOVL	chf$l_sigarglst(AP),R2	; Get address of signal argument list
+	CMPL	4(R2),#ss$_unwind	; Is this a SYSTEM unwind exception ?
+	BNEQ	1$			; If not unwind, look at it further.
+	MOVZWL	#ss$_resignal,R0	; if unwind, just resignal condition
+	RET
+
+1$:	MOVZBL	dbg$gb_debug,R3		; Save current state of DEBUG flag
+	BSBW	save_user_context	; Establish known state of the world
+	BISL2	#rab$m_cco,dbg$gl_outprab+rab$l_rop ; Cancel control-O
+.IF NE DBG_START1
+		PUSHL	4(R2)			; Push error code
+		PUSHAB	code_message		;  and FAO message
+		CALLS	#2,dbg$fao_out		; Output error code in HEX
+.ENDC
+	CMPL	4(R2),#ss$_debug	; Is this the DEBUG exception ?
+	BEQL	4$			; Yes - suppress message output
+	CMPL	4(R2),#dbg$_normal	; Special DEBUG initialization ?
+	BEQL	3$			; Yes - suppress message output
+	CALLG	(AP),dbg$putmsg		; Write system message to DBG$OUTPUT
+	CMPZV	#sts$v_fac_no,#sts$s_fac_no,4(R2),#dbg_facility
+	BNEQ	4$			; Skip if facility is not DEBUG
+	CMPW	4(R2),#shr$_appendedb	; Not DEBUG if bit 15 is clear
+	BLSSU	4$			; unless this is a "shared" message
+;+
+; Arrive here because the error was generated by a DEBUG signal.
+;-
+.IF NE DBG_START1
+		MOVL	(R2),R0			; Get count of arguments
+	1000$:	PUSHL	(R2)[R0]		; Copy arg list onto stack
+		SOBGEQ	R0,1000$		; (including argument count)
+		ADDL3	(R2),#1,-(SP)		; Stack argument repeat count
+		PUSHAB	sig_arg_list		; Stack FAO string address
+		ADDL3	#2,(R2),R0		; Get total number of arguments
+		CALLS	R0,DBG$FAO_OUT		; Display arg list in HEX
+.ENDC
+	CMPB	#dbg$gl_sup_or_test,#1	; Are we a test debugger ?
+	BNEQ	3$			; No - no SUPERDEBUG signal
+	CMPZV	#sts$v_severity,#sts$s_severity,4(R2),#sts$k_severe ; Fatal ?
+	BEQL	2$			; If so, signal condition
+	CMPL	4(R2),#dbg$_dbgbug	; Check for either of the two
+	BEQL	2$			;  'DEBUG internal coding error'
+	CMPL	4(R2),#dbg$_debugbug	;  conditions, and if we have either
+	BNEQ	3$			;  of them call the SUPERDEBUGGER
+2$:	PUSHL	#dbg$_superdebug	; Get special signal for SUPERDEBUG
+	CALLS	#1,G^LIB$SIGNAL		; Alert the superdebugger
+3$:	BLBC	4(R2),6$		; Exit, but allow DEBUG to continue
+	BRW	7$			; if message is 'INFORMATION'
+
+;+
+; Here if not a DEBUG-specific exception (System or User generated).
+; If the user was running, jump into the register saving exception handler.
+; If DEBUG was running, output a message saying that DEBUG caused the error.
+;-
+4$:	BLBS	R3,5$			; Report error if DEBUG was running
+	SUBL3	#1,(R2),R4		; Get address of saved PC
+	PUSHAB	dbg$pseudo_exit		; Get address of dbg$pseudo_exit
+	CMPL	(R2)[R4],(SP)+		; See if CALLed routine has finished
+	BEQL	7$			; If so, just return CONTINUE
+	BLBS	4(R2),7$		; Continue if INFORMATION or SUCCESS
+	MOVZWL	#ss$_debug,4(R2)	; Change to special DEBUG exception
+	BISL2	#rab$m_pta,dbg$gl_inprab+rab$l_rop	; Purge typeahead
+	BICL2	#rab$m_cco,dbg$gl_outprab+rab$l_rop	; Un-cancel ctrl-O
+	BRW	prim_handl_4		; Jump into exception handler
+
+5$:	CMPL	4(R2),#ss$_debug	; Is this the DEBUG exception ?
+	BEQL	6$			; Yes -  UNWIND to DEBUG command level
+	PUSHL	#dbg$_dbgerr		; Message blaming DEBUG for the error
+	PUSHL	#1			; Number of parameters
+	PUSHL	#0			; No facility string
+	PUSHAB	W^dbg$out_message	; Action routine name to output message
+	PUSHAB	8(SP)			; Address of argument list
+	CALLS	#3,G^SYS$PUTMSG		; Get message formatted and output
+	ADDL2	#8,SP			; Remove temporary argument list
+	CMPB	#dbg$gl_sup_or_test,#1	; Are we a test debugger ?
+	BNEQ	6$			; No  - no SUPERDEBUG available
+	PUSHL	#dbg$_superdebug	; Yes - get special signal
+	CALLS	#1,G^LIB$SIGNAL		; Alert the superdebugger
+;+
+; The messages are all out. Unless the exit flag is set, do end-of-command
+; processing and unwind the stack to the caller of the command processor,
+; (or whoever established DBG$FINAL_HANDL as the exception handler)
+; and return a continue code.
+;-
+
+6$:	BLBS	dbg$gb_exit_dbg,10$	; EXIT if the exit flag is set
+	CALLS	#0,dbg$end_of_line	; Clean up DEBUG internal status
+	$UNWIND_S			; Unwind to caller of the routine
+					;  that declared this handler
+7$:	MOVZWL	#ss$_continue,R0	; Return status "CONTINUE"
+	BLBC	R3,9$			; Restore registers on user exit
+	BLBS	4(R2),8$		; Don't purge type ahead unless
+	BISL2	#rab$m_pta,dbg$gl_inprab+rab$l_rop	; not INFO or SUCCESS
+8$:	BICL2	#rab$m_cco,dbg$gl_outprab+rab$l_rop	; Un-cancel ctrl-O
+	RET				; Return to exception mechanism
+9$:	BRW	return_to_user		; Go restore user context
+
+10$:	MOVL	4(R2),R0		; Unrecoverable error - get code
+	INSV	#4,#0,#3,R0		; Change severity to FATAL
+	$EXIT_S	R0			;  and take an exit.
+
+	.SBTTL	DBG$OUT_MESSAGE	- Write SYS$PUTMSG output to DBG$OUTPUT
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine is called as an action routine from EXE$PUTMSG to output
+;	the string that EXE$PUTMSG has just formatted.  The string is output
+;	to the logical device DBG$OUTPUT, and a value of zero is returned to
+;	EXE$PUTMSG preventing it from outputing the message also.
+;
+; CALLING SEQUENCE:
+;	4(AP)	- Address of a quadword string descriptor
+;
+; IMPLICIT INPUTS:
+;	The output RAB for DBG$OUTPUT at location DBG$GL_OUTPRAB
+;
+; ROUTINE VALUE:
+;	R0 = 0	- To inhibit further typing of the message
+;
+;--
+
+	.ENTRY	DBG$OUT_MESSAGE,^M<>
+
+	MOVAB	@4(AP),R0		; Get address of string descriptor
+	MOVW	 (R0),dbg$gl_outprab+rab$w_rsz	; Load string length into RAB
+	MOVL	4(R0),dbg$gl_outprab+rab$l_rbf	; Load address of string
+	BLBC	dbg$gb_def_out,1$	; Check if LOG file being written
+	MOVB	#^A"!",log_buf		; Put "!" into first byte of LOG buf
+	MOVC5	dbg$gl_outprab+rab$w_rsz,@<dbg$gl_outprab+rab$l_rbf>, -
+		#^A" ",#buf_siz-1,log_buf+1	; Copy message to LOG buffer
+	ADDW3	#1,dbg$gl_outprab+rab$w_rsz,dbg$gl_lograb+rab$w_rsz ; Length
+	MOVAB	log_buf,dbg$gl_lograb+rab$l_rbf	; Load address of string
+	$PUT	RAB = dbg$gl_lograb	; Write string to LOG file
+1$:	$PUT	RAB = dbg$gl_outprab	; Write string to DBG$OUTPUT
+	BLBC	R0,2$			; Exit if we encountered an error
+	CLRL	R0			; Otherwise return 0
+	RET				;
+2$:	INSV	#4,#0,#3,R0		; Change severity to FATAL
+	$EXIT_S	R0			;  and take an exit.
+
+	.SBTTL	DBG$CHECK_PROT	- Makes page writable
+;++
+; FUNCTIONAL DESCRIPTION:
+;	 Probes a single byte to see whether it can be written.  If it can,
+;	the value dbg$k_no_reset is returned.  Otherwise, the SETPRT system
+;	service is called to change the protection of the page in which the
+;	byte is located to user read/write and we return dbg$k_reset_prt as
+;	the value of this routine.  If the system service returns an error,
+;	zero is returned.
+;
+; CALLING SEQUENCE:
+;	4(AP)	- The address of the byte to make writeable
+;	8(AP)	- The address of a byte in which the system service can put
+;		  the previous protection of the page
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; ROUTINE VALUE:
+;	dbg$k_no_reset	- Protection was already writeable, no change made
+;	dbg$k_reset_prt	- Protection changed, old protection stored
+;	0		- Error in system service call
+;
+; SIDE EFFECTS:
+;	NONE
+;--
+
+	.ENTRY	DBG$CHECK_PROT,^M<>
+
+	PROBEW	#0,#1,@4(AP)		; See if this byte can be written
+	BEQL	1$			; No, must change protection
+	MOVL	#dbg$k_no_reset,R0	; Yes, set return value
+	RET				;  to no change, and return
+
+1$:	PUSHL	4(AP)			; Get address passed as argument
+	PUSHL	4(AP)			; Same address for end of area
+	MOVL	SP,R0			; Save stack address
+	$SETPRT_S INADR=(R0),PROT=#prt$c_uw,PRVPRT=@8(AP); Change protection
+	BLBC	R0,2$			; Return error if service failed
+	MOVL	#dbg$k_reset_prt,R0	; Service succeeded, set return value
+	RET				; And return
+
+2$:	CLRL	R0			; Set error return value
+	RET
+
+
+	.SBTTL	DBG$REDO_PROT	- Sets page to read only
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Sets the protection of a page to a specified protection.
+;
+; CALLING SEQUENCE:
+;	4(AP)	- Address of byte whose protection must be changed
+;	8(AP)	- Address of byte which contains the new protection
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUTS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; ROUTINE VALUE:
+;	NONE
+;
+; SIDE EFFECTS:
+;	SIGNAL "DBG$_NOWPROT" if page cannot be write protected.
+;--
+
+	.ENTRY	DBG$REDO_PROT,^M<>	; Null entry mask
+
+	PUSHL	4(AP)			; Get address passed as argument
+	PUSHL	4(AP)			; Same address for end of area
+	MOVL	SP,R0			; Save stack address
+	MOVZBL	@8(AP),R1		; Get protection of this page
+	$SETPRT_S INADR=(R0),PROT=R1	; Reset protection
+	BLBS	R0,1$			; Return if service succeeded
+	PUSHL	#dbg$_nowprot		; If not, tell user that protection
+	CALLS	#1,G^LIB$SIGNAL		; Resetting did not work
+1$:	RET				; And return
+
+fix_up_addresses:
+	MOVAB	term_handler,fix_1	; [TEMP]
+	MOVAB	term_reason,fix_2	; [TEMP]
+	MOVAB	restore_context,fix_3	; [TEMP]
+	MOVAB	term_reason,fix_4	; [TEMP]
+	RSB
+
+	.END  	beginhere	

@@ -1,0 +1,22 @@
+$	VERIFY = 'F$VERIFY(0)
+$ !
+$ !	GETSYSVER - Get System Version Number
+$ !
+$ !	P1 = Device:[directory] from which to read SYS.MAP
+$ !	P2 = Symbol name in which to return version
+$ !
+$	RECORD = ""
+$	OPEN /READ /ERROR=60 SYSMAP 'P1'SYS.MAP
+$10:	READ /END_OF_FILE=50 SYSMAP RECORD
+$	IF 'F$LOCATE("VERSION",RECORD) .EQ. 'F$LENGTH(RECORD) THEN GOTO 10
+$	RECORD = RECORD - "VERSION"
+$20:	IF "''F$EXTRACT(0,1,RECORD)'" .NES. " " THEN GOTO 30
+$	RECORD := 'F$EXTRACT(1,80,RECORD)
+$	GOTO 20
+$	IF RECORD .NES. "" THEN GOTO 20
+$30:	TEMP = 'F$LOCATE(" ",RECORD)
+$	RECORD := 'F$EXTRACT(0,TEMP,RECORD)
+$50:	CLOSE SYSMAP
+$60:	STORE := "''P2' == RECORD"
+$	'STORE
+$	IF VERIFY THEN SET VERIFY

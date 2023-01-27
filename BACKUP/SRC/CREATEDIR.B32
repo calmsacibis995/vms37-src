@@ -1,0 +1,637 @@
+MODULE CREATEDIR(%TITLE 'Create directory'
+		IDENT = 'V03-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!	Backup/Restore
+!
+! ABSTRACT:
+!	This module contains the routines that create directories.
+!
+! ENVIRONMENT:
+!	VAX/VMS user mode.
+!
+! AUTHOR: M. Jack, CREATION DATE: 28-Sep-1980
+!
+! MODIFIED BY:
+!
+!	V02-003	MLJ0063		Martin L. Jack,	31-Dec-1981  11:05
+!		Readapt from new LIB$CREATE_DIR to handle root directories.
+!
+!	V02-002	MLJ0062		Martin L. Jack,	3-Dec-1981  12:30
+!		Set backup date of created directory, return file ID and
+!		backup date of directory, and consider lookups that return a
+!		file ID of all ones to be nonexistent, all to support
+!		/INCREMENTAL.
+!
+!	V02-001	MLJ0036		Martin L. Jack,	28-Aug-1981  17:32
+!		Make use of new NAM block descriptors.
+!
+!--
+
+REQUIRE 'SRC$:COMMON';
+LIBRARY 'SYS$LIBRARY:LIB';
+
+
+FORWARD ROUTINE
+	CREATE_DIR;				! Create directory file
+
+
+EXTERNAL ROUTINE
+	LIB$CVT_OTB,			! Convert octal to binary
+	LIB$EXTRACT_CONCEALED;		! Extract concealed device/root directory
+
+
+EXTERNAL LITERAL			! Completion status codes
+	LIB$_INVFILSPE;			! Invalid file specification
+
+
+G$DEFINE();					! Define common area
+
+GLOBAL ROUTINE CREATE_DIR (			! Create directory
+	DEV_DIR_SPEC:	REF BBLOCK,		! Device and directory string
+	OWNER_UIC,				! Owner UIC
+	PROT_VALUE,				! File protection value
+	MAX_VERSIONS,				! Maximum version count
+	FILE_ID:	REF BBLOCK,		! File ID of lowest level directory
+	BAKDATE:	REF VECTOR		! Backup date of lowest level directory
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine creates directory files.
+!
+! FORMAL PARAMETERS:
+!
+!	DEV_DIR_SPEC	Address of a descriptor for the device and directory
+!			specification.  This string is a standard RMS file
+!			specification; it must not contain a node name, file
+!			name, file type, file version, or wild card characters;
+!			it must contain an explicit directory; it must
+!			reference a disk device.  The string must be no longer
+!			than 255 characters.
+!
+!	OWNER_UIC	A longword passed by immediate value that specifies the
+!			owner UIC of the created directories.  If zero, the
+!			owner UIC is that of the parent directory.
+!
+!	PROT_VALUE	A word passed by immediate value that specifies the
+!			file protection.  If all ones, the file protection is
+!			that of the parent directory with delete access dropped
+!			for all access categories.
+!
+!	MAX_VERSIONS	A word passed by immediate value that specifies the
+!			default maximum number of versions for files cataloged
+!			in the created directories.
+!
+!	FILE_ID		The address of an array of three words that receives
+!			the file ID of the lowest level directory.
+!
+!	BAKDATE		The address of a quadword that receives the backup date
+!			of the lowest level directory.
+! IMPLICIT INPUTS:
+!
+!	OUTPUT_CHAN	Assigned to the output volume.
+!	QUAL		Qualifiers.
+!	COM_O_BSRDATE	Date of backup.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION STATUS:
+!
+!	SS$_NORMAL	Normal successful completion; all specified directories
+!			already exist
+!
+!	SS$_CREATED	Normal successful completion; one or more directories
+!			created
+!
+!	LIB$_INVFILSPE	File specification did not contain an explicit
+!			directory or contained a node name, file name, file
+!			type, file version, or wildcard, or device not a disk
+!
+!	$PARSE errors
+!	LIB$EXTRACT_CONCEALED errors
+!	$QIO errors
+!
+! SIDE EFFECTS:
+!
+!	Directory files created as requested.
+!
+!--
+
+BEGIN
+LOCAL
+	FAB:		$FAB_DECL,	! FAB for $PARSE
+	NAM:		$NAM_DECL,	! NAM block for $PARSE
+	ESA_BUFFER:	VECTOR[NAM$C_MAXRSS,BYTE], ! Expanded string area
+	ROOT_BUFFER:	VECTOR[NAM$C_MAXRSS,BYTE], ! Root directory name area
+	TEMP_DESC_1:	BLOCK[DSC$K_S_BLN,BYTE], ! Utility descriptor
+	TEMP_DESC_2:	BLOCK[DSC$K_S_BLN,BYTE], ! Utility descriptor
+	NAME_BUFFER:	VECTOR[15,BYTE], ! Directory name buffer
+	NAME_DESC:	BLOCK[DSC$K_Z_BLN,BYTE], ! Directory name descriptor
+	RECATTR:	BLOCK[ATR$S_RECATTR,BYTE]
+			VOLATILE,	! Record attributes
+	UCHAR:		BLOCK[ATR$S_UCHAR,BYTE]
+			VOLATILE,	! File characteristics
+	FPRO:		BLOCK[ATR$S_FPRO,BYTE]
+			VOLATILE,	! File protection
+	UIC:		BLOCK[ATR$S_UIC,BYTE]
+			VOLATILE,	! File owner UIC
+	BAK:		VECTOR[2]
+			VOLATILE,	! File backup date
+	HEADER:		BLOCK[ATR$S_HEADER,BYTE]
+			VOLATILE,	! File header
+	FIB:		BLOCK[FIB$C_LENGTH,BYTE], ! FIB
+	FIB_DESC:	VECTOR[2],	! Descriptor for FIB
+	ATR:		BLOCKVECTOR[7,8,BYTE], ! Attribute descriptors
+	IOSB:		VECTOR[4,WORD],	! I/O status block
+	GROUP,				! Binary group number
+	MEMBER,				! Binary member number
+	DIR_LENGTH,			! Length of residual directory string
+	DIR_ADDRESS,			! Address of residual directory string
+	P2_VALUE,			! Value for P2 in initial access
+	STATUS_2,			! Status return
+	STATUS_3,			! Status return
+	FINAL_STATUS;			! Status return
+BIND
+	DIR_TYP_VER = UPLIT BYTE ('.DIR;1');
+					! File type and version string
+LABEL
+	PROCESS;			! Block exited when processing complete
+BUILTIN
+	LOCC,				! LOCC instruction
+	ROT;				! Rotate longword
+
+!+
+! Initialize RMS structures required to do a $PARSE.
+!-
+
+$FAB_INIT(FAB=FAB,
+    FNS=.DEV_DIR_SPEC[DSC$W_LENGTH],
+    FNA=.DEV_DIR_SPEC[DSC$A_POINTER],
+    NAM=NAM);
+$NAM_INIT(NAM=NAM,
+    ESA=ESA_BUFFER,
+    ESS=NAM$C_MAXRSS);
+
+!+
+! Parse the file specification to obtain the expanded name string.  RMS will
+! usually return RMS$_DNF (directory not found), but all that is needed is
+! the expanded string.
+!-
+
+STATUS_2 = $PARSE(FAB=FAB);
+IF NOT .STATUS_2 AND .STATUS_2 NEQ RMS$_DNF THEN RETURN .STATUS_2;
+
+!+
+! Get the length and address of the directory string without brackets.
+!-
+
+DIR_LENGTH = .NAM[NAM$B_DIR] - 2;		! Length without brackets
+DIR_ADDRESS = .NAM[NAM$L_DIR] + 1;		! Address without bracket
+
+!+
+! If the directory is in UIC format, convert it to normal format.
+!-
+
+IF .NAM[NAM$V_GRP_MBR]
+THEN
+    BEGIN
+    REGISTER
+	R0 = 0,
+	R1 = 1;
+    LOCAL
+	COMMA_LENGTH,
+	COMMA_ADDRESS;
+
+    !+
+    ! Locate the comma separating the group and member numbers and convert
+    ! each to binary.
+    !-
+
+    IF NOT LOCC(%REF(%C','), DIR_LENGTH, .DIR_ADDRESS; R0, R1)
+    THEN RETURN LIB$_INVFILSPE;				! No comma found
+    COMMA_LENGTH = .R0;
+    COMMA_ADDRESS = .R1;
+    IF NOT LIB$CVT_OTB(.COMMA_ADDRESS - .DIR_ADDRESS, .DIR_ADDRESS, GROUP)
+    THEN RETURN LIB$_INVFILSPE;				! Invalid group number
+    COMMA_LENGTH = .COMMA_LENGTH - 1;
+    IF NOT LIB$CVT_OTB(.COMMA_LENGTH, .COMMA_ADDRESS + 1, MEMBER)
+    THEN RETURN LIB$_INVFILSPE;				! Invalid member number
+
+    !+
+    ! Overwrite the directory string with the converted one.
+    !-
+
+    TEMP_DESC_1[DSC$B_CLASS] = DSC$K_CLASS_Z;
+    TEMP_DESC_1[DSC$B_DTYPE] = DSC$K_DTYPE_Z;
+    TEMP_DESC_1[DSC$W_LENGTH] =  %CHARCOUNT('!OB!OB');
+    TEMP_DESC_1[DSC$A_POINTER] = UPLIT BYTE('!OB!OB');
+    TEMP_DESC_2[DSC$B_CLASS] = DSC$K_CLASS_Z;
+    TEMP_DESC_2[DSC$B_DTYPE] = DSC$K_DTYPE_Z;
+    TEMP_DESC_2[DSC$W_LENGTH] = DIR_LENGTH = 6;
+    TEMP_DESC_2[DSC$A_POINTER] = .DIR_ADDRESS;
+    $FAO(TEMP_DESC_1, 0, TEMP_DESC_2, .GROUP, .MEMBER);
+    END;
+
+!+
+! Determine if the specified device name is a concealed device with a root
+! directory name.
+!-
+
+TEMP_DESC_1[DSC$B_CLASS] = DSC$K_CLASS_S;
+TEMP_DESC_1[DSC$B_DTYPE] = DSC$K_DTYPE_T;
+TEMP_DESC_1[DSC$W_LENGTH] = .NAM[NAM$B_DEV];
+TEMP_DESC_1[DSC$A_POINTER] = .NAM[NAM$L_DEV];
+TEMP_DESC_2[DSC$B_CLASS] = DSC$K_CLASS_S;
+TEMP_DESC_2[DSC$B_DTYPE] = DSC$K_DTYPE_T;
+TEMP_DESC_2[DSC$W_LENGTH] = NAM$C_MAXRSS;
+TEMP_DESC_2[DSC$A_POINTER] = ROOT_BUFFER;
+STATUS_3 = LIB$EXTRACT_CONCEALED(TEMP_DESC_1, 0, TEMP_DESC_2, 0, TEMP_DESC_2);
+IF NOT .STATUS_3
+THEN
+    BEGIN
+    IF .STATUS_3 NEQ LIB$_INVFILSPE THEN RETURN .STATUS_3;	! Unexpected
+    END
+ELSE
+    BEGIN
+    LOCAL
+	ROOT_LENGTH;			! Length of root directory string
+
+    ROOT_LENGTH = .TEMP_DESC_2[DSC$W_LENGTH];
+
+    IF .ROOT_LENGTH NEQ 0
+    THEN
+	BEGIN
+
+	!+
+	! Construct the complete directory string by concatenating the root
+	! directory specification and the specified directory into the root
+	! directory buffer.
+	!-
+    
+	ROOT_BUFFER[.ROOT_LENGTH] = %C'.';
+	CH$MOVE(.DIR_LENGTH, .DIR_ADDRESS, ROOT_BUFFER[.ROOT_LENGTH+1]);
+	DIR_LENGTH = .DIR_LENGTH + .ROOT_LENGTH + 1;
+	DIR_ADDRESS = ROOT_BUFFER;
+	END;
+    END;
+
+!+
+! Set up the FIB to look up the MFD.
+!-
+
+CH$FILL(0, FIB$C_LENGTH, FIB);
+FIB[FIB$L_ACCTL] = FIB$M_WRITE OR FIB$M_NOREAD OR FIB$M_NOWRITE;
+FIB[FIB$W_FID_NUM] = FID$C_MFD;
+FIB[FIB$W_FID_SEQ] = FID$C_MFD;
+
+!+
+! Set up the FIB descriptor.
+!-
+
+FIB_DESC[0] = FIB$C_LENGTH;
+FIB_DESC[1] = FIB;
+
+!+
+! Set up the name descriptor.  The length is filled in as need be.
+!-
+
+NAME_DESC[DSC$A_POINTER] = NAME_BUFFER;
+
+!+
+! Set up the attribute list.  Because of dependencies later in the routine,
+! the file header attribute must be last, preceded by the owner UIC attribute.
+!-
+
+ATR[0, ATR$W_TYPE] = ATR$C_RECATTR;	! Record attributes
+ATR[0, ATR$W_SIZE] = ATR$S_RECATTR;
+ATR[0, ATR$L_ADDR] = RECATTR;
+ATR[1, ATR$W_TYPE] = ATR$C_UCHAR;	! File characteristics
+ATR[1, ATR$W_SIZE] = ATR$S_UCHAR;
+ATR[1, ATR$L_ADDR] = UCHAR;
+ATR[2, ATR$W_TYPE] = ATR$C_FPRO;	! File protection
+ATR[2, ATR$W_SIZE] = ATR$S_FPRO;
+ATR[2, ATR$L_ADDR] = FPRO;
+ATR[3, ATR$W_TYPE] = ATR$C_BAKDATE;	! File backup date
+ATR[3, ATR$W_SIZE] = ATR$S_BAKDATE;
+ATR[3, ATR$L_ADDR] = BAK;
+ATR[4, ATR$W_TYPE] = ATR$C_UIC;		! File owner UIC
+ATR[4, ATR$W_SIZE] = ATR$S_UIC;
+ATR[4, ATR$L_ADDR] = UIC;
+ATR[5, ATR$W_TYPE] = ATR$C_HEADER;	! File header
+ATR[5, ATR$W_SIZE] = ATR$S_HEADER;
+ATR[5, ATR$L_ADDR] = HEADER;
+ATR[6, 0,0,32,0] = 0;			! End of list
+
+!+
+! Beginning of block that is exited when processing is complete.  FINAL_STATUS
+! contains the status to be returned to caller.
+!-
+
+PROCESS:  BEGIN
+
+!+
+! Loop to look up directories.
+!-
+
+P2_VALUE = 0;
+WHILE 1 DO
+    BEGIN
+
+    !+
+    ! Read attributes of the directory at the current level.  If the directory
+    ! does not exist, exit the loop to begin creating directories.
+    !-
+
+    FINAL_STATUS = $QIOW(
+	FUNC=IO$_ACCESS,
+	CHAN=.OUTPUT_CHAN,
+	IOSB=IOSB,
+	P1=FIB_DESC,
+	P2=.P2_VALUE,
+	P5=ATR);
+    IF .FINAL_STATUS THEN FINAL_STATUS = .IOSB[0];
+    IF
+	.FINAL_STATUS EQL SS$_NOSUCHFILE OR
+	(.FIB[FIB$W_FID_NUM] EQL 65535 AND
+	    .FIB[FIB$W_FID_SEQ] EQL 65535 AND
+	    .FIB[FIB$B_FID_NMX] EQL 255)
+    THEN
+	EXITLOOP;
+    IF NOT .FINAL_STATUS THEN LEAVE PROCESS;
+
+    !+
+    ! If no more directory levels were specified, all specified directories
+    ! already exist, so return with success.
+    !-
+
+    IF .DIR_LENGTH LEQ 0
+    THEN
+	BEGIN
+	FINAL_STATUS = SS$_NORMAL;
+	LEAVE PROCESS;
+	END;
+
+    !+
+    ! Locate the next directory name.
+    !-
+
+    BEGIN ! block to use output registers
+    REGISTER
+	R0 = 0,
+	R1 = 1;
+    LOCAL
+	NAME_LENGTH,
+	NAME_ADDRESS;
+
+    NAME_ADDRESS = .DIR_ADDRESS;		! Save starting point
+    LOCC(%REF(%C'.'), DIR_LENGTH, .DIR_ADDRESS; R0, R1);
+    NAME_LENGTH = .DIR_LENGTH - .R0;		! Length preceding dot or end
+    DIR_ADDRESS = .R1 + 1;			! Prune to string following dot
+    R0 = .R0 - 1;
+    DIR_LENGTH = .R0;
+
+    !+
+    ! Construct the directory name concatenated with '.DIR;1' in the name
+    ! buffer, and a descriptor for this name in the name descriptor.
+    !-
+
+    NAME_DESC[DSC$W_LENGTH] = .NAME_LENGTH + 6;
+    CH$MOVE(6, DIR_TYP_VER, CH$MOVE(.NAME_LENGTH, .NAME_ADDRESS, NAME_BUFFER));
+    END; ! block to use output registers
+
+    !+
+    ! Copy the file ID to FIB$W_DID so that the next lookup is done in that
+    ! directory.
+    !-
+
+    FIB[FIB$W_DID_NUM] = .FIB[FIB$W_FID_NUM];
+    FIB[FIB$W_DID_SEQ] = .FIB[FIB$W_FID_SEQ];
+    FIB[FIB$W_DID_RVN] = .FIB[FIB$W_FID_RVN];
+
+    !+
+    ! Set up so that the next lookup is done by name.
+    !-
+
+    FIB[FIB$W_FID_NUM] = 0;
+    FIB[FIB$W_FID_SEQ] = 0;
+    FIB[FIB$W_FID_RVN] = 0;
+    P2_VALUE = NAME_DESC;
+    END;
+
+!+
+! We have reached the level at which directories do not yet exist.  FIB$W_DID
+! now contains the file ID of the directory in which the new directory must be
+! cataloged and the filename descriptor contains the name of the new directory.
+!
+! Delete the file header attribute from the attribute list, since it is not
+! valid (or necessary) for creates.
+!-
+
+ATR[5, 0,0,32,0] = 0;
+BAK[0] = BAK[1] = 0;
+IF (.QUAL[QUAL_RECO] OR .QUAL[QUAL_INCR])	! If /RECORD or /INCREMENTAL
+AND .HEADER[FH2$B_STRUCLEV] EQL 2
+THEN
+    BEGIN
+    BAK[0] = .COM_O_BSRDATE[0];
+    BAK[1] = .COM_O_BSRDATE[1];
+    END;
+
+!+
+! Establish the allocation of the created directories.  A Structure Level 1
+! directory is allocated zero blocks; a Structure Level 2 directory is
+! allocated one block.  (This block is later initialized.)  In both cases,
+! the file is marked contiguous.
+!-
+
+FIB[FIB$W_EXCTL] = FIB$M_EXTEND OR FIB$M_FILCON OR FIB$M_ALCON;
+FIB[FIB$W_NMCTL] = FIB$M_SUPERSEDE;	! To handle superseding -1 file ID
+IF .HEADER[FH2$B_STRUCLEV] EQL 2 THEN FIB[FIB$L_EXSZ] = 1;
+
+!+
+! Set up the end of file pointer.  It points to the highest allocated block
+! plus one (with a first free byte of zero).  Note that EFBLK is stored in
+! inverted format.
+!-
+
+RECATTR[FAT$L_EFBLK] = ROT(.FIB[FIB$L_EXSZ] + 1, 16);
+
+!+
+! Establish the owner UIC of the created directories.
+!-
+
+IF .OWNER_UIC NEQ 0
+THEN
+    UIC = .OWNER_UIC;
+
+!+
+! Establish the file protection of the created directories.
+!-
+
+FPRO = .FPRO OR %X'8888';
+IF .PROT_VALUE<0,16> NEQ %X'FFFF'
+THEN
+    FPRO = .PROT_VALUE<0,16>;
+
+!+
+! Establish the default version limit of the created directories.
+!-
+
+RECATTR[FAT$W_VERSIONS] = .MAX_VERSIONS;
+
+!+
+! Loop to create directories.
+!-
+
+WHILE 1 DO
+    BEGIN
+
+    !+
+    ! Create and access the file.
+    !-
+
+    FINAL_STATUS = $QIOW(
+	FUNC=IO$_CREATE OR IO$M_CREATE OR IO$M_ACCESS,
+	CHAN=.OUTPUT_CHAN,
+	IOSB=IOSB,
+	P1=FIB_DESC,
+	P2=NAME_DESC,
+	P5=ATR);
+    IF .FINAL_STATUS THEN FINAL_STATUS = .IOSB[0];
+    IF NOT .FINAL_STATUS THEN LEAVE PROCESS;
+
+    !+
+    ! If the directory is Structure Level 2, write the first block of the
+    ! file.
+    !-
+
+    IF .HEADER[FH2$B_STRUCLEV] EQL 2
+    THEN
+	BEGIN
+	LOCAL
+	    BLOCK_BUFFER:	VECTOR[256,WORD];	! Block buffer
+
+	BLOCK_BUFFER[0] = -1;				! End of block marker
+	CH$FILL(0, 510, BLOCK_BUFFER[1]);		! Fill rest of block
+	FINAL_STATUS = $QIOW(
+	    FUNC=IO$_WRITEVBLK,
+	    CHAN=.OUTPUT_CHAN,
+	    IOSB=IOSB,
+	    P1=BLOCK_BUFFER,
+	    P2=512,
+	    P3=1);
+	IF .FINAL_STATUS THEN FINAL_STATUS = .IOSB[0];
+	IF NOT .FINAL_STATUS THEN LEAVE PROCESS;
+	END;
+
+    !+
+    ! Deaccess the file.
+    !-
+
+    FINAL_STATUS = $QIOW(
+	FUNC=IO$_DEACCESS,
+	CHAN=.OUTPUT_CHAN,
+	IOSB=IOSB);
+    IF .FINAL_STATUS THEN FINAL_STATUS = .IOSB[0];
+    IF NOT .FINAL_STATUS THEN LEAVE PROCESS;
+
+    !+
+    ! If no more directory levels were specified, they have all been created.
+    !-
+
+    IF .DIR_LENGTH LEQ 0
+    THEN
+	BEGIN
+	FINAL_STATUS = SS$_CREATED;
+	LEAVE PROCESS;
+	END;
+
+    !+
+    ! Locate the next directory name.
+    !-
+
+    BEGIN ! block to use output registers
+    REGISTER
+	R0 = 0,
+	R1 = 1;
+    LOCAL
+	NAME_LENGTH,
+	NAME_ADDRESS;
+
+    NAME_ADDRESS = .DIR_ADDRESS;		! Save starting point
+    LOCC(%REF(%C'.'), DIR_LENGTH, .DIR_ADDRESS; R0, R1);
+    NAME_LENGTH = .DIR_LENGTH - .R0;		! Length preceding dot or end
+    DIR_ADDRESS = .R1 + 1;			! Prune to string following dot
+    R0 = .R0 - 1;
+    DIR_LENGTH = .R0;
+
+    !+
+    ! Construct the directory name concatenated with '.DIR;1' in the name
+    ! buffer, and a descriptor for this name in the name descriptor.
+    !-
+
+    NAME_DESC[DSC$W_LENGTH] = .NAME_LENGTH + 6;
+    CH$MOVE(6, DIR_TYP_VER, CH$MOVE(.NAME_LENGTH, .NAME_ADDRESS, NAME_BUFFER));
+    END; ! block to use output registers
+
+    !+
+    ! Copy the file ID of the created directory to FIB$W_DID so that the next
+    ! directory is cataloged in the directory just created.
+    !-
+
+    FIB[FIB$W_DID_NUM] = .FIB[FIB$W_FID_NUM];
+    FIB[FIB$W_DID_SEQ] = .FIB[FIB$W_FID_SEQ];
+    FIB[FIB$W_DID_RVN] = .FIB[FIB$W_FID_RVN];
+    END;
+
+!+
+! End of block that is exited when processing is complete.  FINAL_STATUS
+! contains the status that is to be returned to caller.
+!-
+
+END; ! of block PROCESS
+
+!+
+! Return the status.
+!-
+
+FILE_ID[FID$W_NUM] = .FIB[FIB$W_FID_NUM];
+FILE_ID[FID$W_SEQ] = .FIB[FIB$W_FID_SEQ];
+FILE_ID[FID$W_RVN] = .FIB[FIB$W_FID_RVN];
+BAKDATE[0] = .BAK[0];
+BAKDATE[1] = .BAK[1];
+RETURN .FINAL_STATUS;
+END;
+
+END
+ELUDOM

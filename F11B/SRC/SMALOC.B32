@@ -1,0 +1,1509 @@
+MODULE SMALOC (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This module contains the routines that manipulate the volume
+!	storage bitmap. These include the routines to allocate a contiguous
+!	area, deallocate an area, and the basic bitmap scanner.
+!	Also included are the routines that manage the extent cache.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  21-Feb-1977  18:42
+!
+! MODIFIED BY:
+!
+!	V02-014	ACG43131	Andrew C. Goldstein,	4-Jan-1982  18:11
+!		Fix spurious allocation failures in approx. placed allocation
+!
+!	V02-013	ACG0229		Andrew C. Goldstein,	23-Dec-1981  22:10
+!		Count extent cache hits and misses
+!
+!	V02-012	ACG38789	Andrew C. Goldstein,	1-Jul-1981  19:48
+!		Check for running out bit count in cylinder round up
+!
+!	V02-011	ACG0195		Andrew C. Goldstein,	3-Mar-1981  22:54
+!		Fix 4096 block boundary problem by checking zero in BITSCAN
+!
+!	V02-010	ACG0180		Andrew C. Goldstein,	10-Sep-1980  14:44
+!		Fix cluster and cylinder rounding in extent cache allocator
+!
+!	V02-009	ACG0172		Andrew C. Goldstein,	9-May-1980  10:42
+!		Check map pointer count for non-zero in RETURN_BLOCKS
+!
+!	V02-008	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:28
+!		Previous revision history moved to F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+!
+! Modes of operation of the bit scanner.
+!
+
+LITERAL
+	FIND_SET	= 0,		! find first one
+	FIND_CLEAR	= 1,		! find first zero
+	SET_BITS	= 2,		! set n bits
+	CLEAR_BITS	= 3;		! clear n bits
+
+
+FORWARD ROUTINE
+	ALLOC_BLOCKS,
+	RETURN_BLOCKS	: NOVALUE,
+	ALLOC_EXTENT,			! allocate entry from extent cache
+	RETURN_EXTENT,			! return entry to extent cache
+	PURGE_EXTENT	: NOVALUE,	! return cache entries back to bitmap
+	REMOVE_EXTENT,			! remove entry from extent cache
+	ALLOC_BITMAP,			! allocate blocks from storage bitmap
+	RETURN_BITMAP	: NOVALUE,	! return blocks to storage bitmap
+	BITSCAN,
+	SET_SMVBN	: NOVALUE,
+	UPDATE_FREE	: NOVALUE;
+
+GLOBAL ROUTINE ALLOC_BLOCKS (FIB, BLOCKS_NEEDED, START_LBN, BLOCKS_ALLOC) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine allocates a single contiguous area of disk. It first
+!	attempts allocation from the extent cache. If that fails, it performs
+!	the allocation from the storage bitmap.
+!
+!
+! CALLING SEQUENCE:
+!	ALLOC_BLOCKS (ARG1, ARG2, ARG3, ARG4)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of FIB for this operation
+!	ARG2: number of blocks to allocate
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!	CURRENT_UCB: UCB of volume
+!
+! OUTPUT PARAMETERS:
+!	ARG3: address of longword to store starting LBN
+!	ARG4: address of longword to store block count
+!
+! IMPLICIT OUTPUTS:
+!	LOC_LBN: plcement LBN of allocation or 0
+!
+! ROUTINE VALUE:
+!	1 if successful allocation
+!	0 if failure
+!
+! SIDE EFFECTS:
+!	storage map, VCB, and extent cache modified
+!
+!--
+
+BEGIN
+
+MAP
+	FIB		: REF BBLOCK;	! FIB of operation
+
+LOCAL
+	STATUS,				! status return value
+	EXTENT_CACHE	: REF BBLOCK,	! pointer to extent cache
+	TEMP		: VECTOR [2],	! quadword temp for EMUL & EDIV
+	EXT_LIMIT,			! local longword copy of extent limit parameter
+	DUMMY,				! dummy to receive remainder from EDIV
+	CACHE_TOTAL,			! total disk space to allocate into cache
+	LBN,				! LBN being allocated
+	COUNT;				! block count being allocated
+
+BIND
+	DUMMY_FIB	= UPLIT (REP FIB$C_EXTDATA OF (BYTE (0)));
+					! default FIB for allocation for cache
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume
+	CURRENT_UCB	: REF BBLOCK,	! UCB of volume
+	LOC_LBN,			! placement LBN
+	PMS$GL_EXTHIT	: ADDRESSING_MODE (GENERAL),
+					! count of extent cache hits
+	PMS$GL_EXTMISS	: ADDRESSING_MODE (GENERAL);
+					! count of extent cache misses
+
+
+! First attempt to allocate the space from the extent cache. Note that
+! a placed allocation can actually split a cache entry; therefore, if the
+! cache is full after the allocation, purge it to half.
+!
+
+EXTENT_CACHE = .BBLOCK [.CURRENT_VCB[VCB$L_CACHE], VCA$L_EXTCACHE];
+IF KERNEL_CALL (ALLOC_EXTENT, .FIB, .BLOCKS_NEEDED, .START_LBN, .BLOCKS_ALLOC)
+THEN
+    BEGIN
+    IF .EXTENT_CACHE[VCA$W_EXTCOUNT] GEQU .EXTENT_CACHE[VCA$W_EXTSIZE]
+    THEN
+	BEGIN
+	PMS$GL_EXTMISS = .PMS$GL_EXTMISS + 1;
+	PURGE_EXTENT (.EXTENT_CACHE[VCA$W_EXTSIZE] / 2, -1);
+	END
+    ELSE
+	PMS$GL_EXTHIT = .PMS$GL_EXTHIT + 1;
+    RETURN 1;
+    END;
+
+! If the cache allocation fails, purge the cache if there is anything in
+! it, to make the bitmap consistent. Then attempt allocation from the bitmap.
+!
+
+PMS$GL_EXTMISS = .PMS$GL_EXTMISS + 1;
+IF .EXTENT_CACHE[VCA$W_EXTCOUNT] NEQ 0
+THEN PURGE_EXTENT (0);
+
+STATUS = ALLOC_BITMAP (.FIB, .BLOCKS_NEEDED, .START_LBN, .BLOCKS_ALLOC, 0);
+IF .STATUS
+THEN KERNEL_CALL (UPDATE_FREE, -..BLOCKS_ALLOC);
+
+! If extent cacheing is not shut off, now refill the cache from the
+! bitmap block currently in memory.
+!
+
+IF .EXTENT_CACHE[VCA$W_EXTSIZE] GEQU 2
+AND NOT .BBLOCK [CURRENT_UCB[UCB$L_DEVCHAR], DEV$V_DMT]
+AND NOT .CURRENT_VCB[VCB$V_WRITE_SM]
+THEN
+    BEGIN
+    LOC_LBN = 0;			! discard placement
+    EXT_LIMIT = .EXTENT_CACHE[VCA$W_EXTLIMIT];
+    EMUL (EXT_LIMIT, CURRENT_VCB[VCB$L_FREE], %REF (0), TEMP);
+    EDIV (%REF (1000), TEMP, CACHE_TOTAL, DUMMY);
+    UNTIL .EXTENT_CACHE[VCA$W_EXTCOUNT] GEQU .EXTENT_CACHE[VCA$W_EXTSIZE]/2
+    DO
+	BEGIN
+	IF NOT ALLOC_BITMAP (DUMMY_FIB, .CACHE_TOTAL, LBN, COUNT, 1)
+	THEN EXITLOOP;
+	KERNEL_CALL (RETURN_EXTENT, .LBN, .COUNT, 0);
+	CACHE_TOTAL = .CACHE_TOTAL - .COUNT;
+	IF .CACHE_TOTAL LEQ 0
+	THEN EXITLOOP;
+	END;
+    END;
+
+RETURN .STATUS;
+
+END;					! end of routine ALLOC_BLOCKS
+
+GLOBAL ROUTINE RETURN_BLOCKS (START_LBN, BLOCK_COUNT) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns a single contiguous area to the storage pool.
+!	If there is space in the cache, the blocks are simply returned to
+!	the cache. If the cache is full, if first purges some of the cache
+!	entries and then returns the blocks.
+!
+! CALLING SEQUENCE:
+!	RETURN_BLOCKS (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: starting LBN to free
+!	ARG2: number of blocks to free
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!	CURRENT_UCB: UCB of device
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	storage map, VCB, and extent cache modified
+!
+!--
+
+BEGIN
+
+LOCAL
+	EXTENT_CACHE	: REF BBLOCK,	! pointer to extent cache
+	TEMP		: VECTOR [2],	! quadword temp for EMUL & EDIV
+	EXT_LIMIT,			! local longword copy of extent limit parameter
+	DUMMY,				! dummy to receive remainder from EDIV
+	CACHE_LIMIT;			! total disk space to allocate into cache
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume in process
+	CURRENT_UCB	: REF BBLOCK,	! UCB of device unit
+	PMS$GL_EXTHIT	: ADDRESSING_MODE (GENERAL),
+					! count of extent cache hits
+	PMS$GL_EXTMISS	: ADDRESSING_MODE (GENERAL);
+					! count of extent cache misses
+
+
+! First check the block count for non-zero.
+!
+
+IF .BLOCK_COUNT EQL 0
+THEN ERR_EXIT (SS$_BADFILEHDR);
+
+! Check the blocks being returned against the volume size.
+!
+
+IF .START_LBN + .BLOCK_COUNT GTRU .CURRENT_UCB[UCB$L_MAXBLOCK]
+THEN ERR_EXIT (SS$_BADFILEHDR);
+
+! Check that the start LBN and count are integral multiples of the
+! cluster factor. If not, reject the operation on grounds of a bad
+! file header.
+!
+
+IF .START_LBN MOD .CURRENT_VCB[VCB$W_CLUSTER] NEQ 0
+OR .BLOCK_COUNT MOD .CURRENT_VCB[VCB$W_CLUSTER] NEQ 0
+THEN ERR_EXIT (SS$_BADFILEHDR);
+
+! If the cache is null, return the blocks directly to the bitmap
+!
+
+EXTENT_CACHE = .BBLOCK [.CURRENT_VCB[VCB$L_CACHE], VCA$L_EXTCACHE];
+IF .EXTENT_CACHE[VCA$W_EXTSIZE] LSSU 2
+THEN
+    BEGIN
+    RETURN_BITMAP (.START_LBN, .BLOCK_COUNT);
+    KERNEL_CALL (UPDATE_FREE, .BLOCK_COUNT);
+    PMS$GL_EXTMISS = .PMS$GL_EXTMISS + 1;
+    END
+
+! Return the blocks to the cache. If the cache is full or if it now contains
+! more space than we want, then purge it to half and/or below the limit.
+!
+
+ELSE
+    BEGIN
+    IF NOT KERNEL_CALL (RETURN_EXTENT, .START_LBN, .BLOCK_COUNT, 1)
+    THEN ERR_EXIT (SS$_BADFILEHDR);
+
+    EXT_LIMIT = .EXTENT_CACHE[VCA$W_EXTLIMIT];
+    EMUL (EXT_LIMIT, CURRENT_VCB[VCB$L_FREE], %REF (0), TEMP);
+    EDIV (%REF (1000), TEMP, CACHE_LIMIT, DUMMY);
+    IF .EXTENT_CACHE[VCA$W_EXTCOUNT] GEQU .EXTENT_CACHE[VCA$W_EXTSIZE]
+    OR .EXTENT_CACHE[VCA$L_EXTTOTAL] GTRU .CACHE_LIMIT
+    THEN
+	BEGIN
+	PURGE_EXTENT (.EXTENT_CACHE[VCA$W_EXTSIZE] / 2, .CACHE_LIMIT);
+	PMS$GL_EXTMISS = .PMS$GL_EXTMISS + 1;
+	END
+    ELSE
+	PMS$GL_EXTHIT = .PMS$GL_EXTHIT + 1;
+    END;
+
+END;					! end of routine RETURN_BLOCKS
+
+GLOBAL ROUTINE ALLOC_EXTENT (FIB, BLOCKS_NEEDED, START_LBN, BLOCKS_ALLOC) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine allocates a single contiguous area of disk from
+!	the extent cache. Mode of allocation is determined by the
+!	allocation control in the FIB.
+!
+! CALLING SEQUENCE:
+!	ALLOC_EXTENT (ARG1, ARG2, ARG3, ARG4)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of FIB for this operation
+!	ARG2: number of blocks to allocate
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: ADDRESS OF VCB IN PROCESS
+!	CURRENT_UCB: ADDRESS OF UCB IN PROCESS
+!
+! OUTPUT PARAMETERS:
+!	ARG3: address of longword to store starting LBN
+!	ARG4: address of longword to store block count
+!
+! IMPLICIT OUTPUTS:
+!	LOC_LBN: placement LBN of allocation or 0
+!	NONE
+!
+! ROUTINE VALUE:
+!	1 if successful allocation
+!	0 if failure
+!
+! SIDE EFFECTS:
+!	Extent cache modified
+!
+!--
+
+BEGIN
+
+MAP
+	FIB		: REF BBLOCK;	! FIB or operation
+
+LABEL
+	CACHE_SEARCH;			! extent cache search procedure
+
+REGISTER
+	EXTENT_LIST	: REF BBLOCKVECTOR [,8]; ! pointer to extent list
+
+LOCAL
+	EXTENT_CACHE	: REF BBLOCK,	! pointer to extent cache
+	BLOCK_COUNT,			! blocks needed rounded up to cluster
+	J,				! loop and extent list index
+	LBN,				! LBN of current extent
+	COUNT,				! block count of current extent
+	CYL_SIZE,			! size in blocks of volume's cylinder
+	CYL_BOUNDARY;			! LBN of next cylinder boundary
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume
+	CURRENT_UCB	: REF BBLOCK,	! UCB of volume
+	LOC_LBN;			! LBN of placed allocation
+
+
+! Search the extent cache. If placement is specified, check for a match
+! against the placement LBN.
+!
+
+CACHE_SEARCH: BEGIN
+
+BLOCK_COUNT = ((.BLOCKS_NEEDED+.CURRENT_VCB[VCB$W_CLUSTER]-1)
+		/ .CURRENT_VCB[VCB$W_CLUSTER]) * .CURRENT_VCB[VCB$W_CLUSTER];
+EXTENT_CACHE = .BBLOCK [.CURRENT_VCB[VCB$L_CACHE], VCA$L_EXTCACHE];
+EXTENT_LIST = EXTENT_CACHE[VCA$Q_EXTLIST];
+
+J = 1;
+WHILE .J LEQU  .EXTENT_CACHE[VCA$W_EXTCOUNT]
+DO
+    BEGIN
+    LBN = .EXTENT_LIST[.J-1, VCA$L_EXTLBN];
+    COUNT = .EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS];
+
+    IF .LOC_LBN EQL 0
+    OR (.LOC_LBN GEQU .LBN AND .LOC_LBN LSSU .LBN + .COUNT)
+    THEN
+	BEGIN
+
+! If placement is specified, adjust the base LBN and count accordingly.
+! Likewise, if on-cylinder allocation is requested, move the LBN to the
+! cylinder boundary. Then adjust to the cluster boundary.
+!
+
+	IF .LOC_LBN NEQ 0 THEN LBN = .LOC_LBN / .CURRENT_VCB[VCB$W_CLUSTER]
+					      * .CURRENT_VCB[VCB$W_CLUSTER];
+	IF .FIB[FIB$V_ONCYL]
+	THEN
+	    BEGIN
+	    CYL_SIZE = .CURRENT_UCB[UCB$B_SECTORS]
+		     * .CURRENT_UCB[UCB$B_TRACKS]
+		     / .CURRENT_VCB[VCB$B_BLOCKFACT];
+	    CYL_BOUNDARY = (.LBN / .CYL_SIZE + 1) * .CYL_SIZE;
+	    IF .CYL_BOUNDARY - .LBN LSSU .BLOCKS_NEEDED
+	    THEN
+		BEGIN
+		IF NOT .FIB[FIB$V_EXACT]
+		THEN LBN = ((.CYL_BOUNDARY + .CURRENT_VCB[VCB$W_CLUSTER] - 1)
+			   / .CURRENT_VCB[VCB$W_CLUSTER]) * .CURRENT_VCB[VCB$W_CLUSTER]
+		ELSE RETURN 0;
+		END;
+	    END;
+
+	IF .LBN GEQU .EXTENT_LIST[.J-1, VCA$L_EXTLBN] + .COUNT
+	THEN COUNT = 0
+	ELSE COUNT = .COUNT + .EXTENT_LIST[.J-1, VCA$L_EXTLBN] - .LBN;
+
+! If the size is sufficient at this point, we win. If not, and the allocation
+! is neither exact nor on-cylinder, try backing off the adjustments made
+! above. Then check the size again; if the allocation is non-contiguous
+! or if the size is big enough, this is it.
+!
+
+	IF .COUNT GEQU .BLOCK_COUNT
+	THEN LEAVE CACHE_SEARCH;
+
+	IF .LOC_LBN NEQ 0
+	AND NOT .FIB[FIB$V_ONCYL]
+	AND NOT .FIB[FIB$V_EXACT]
+	THEN
+	    BEGIN
+	    COUNT = MINU (.BLOCK_COUNT, .EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS]);
+	    LBN = .EXTENT_LIST[.J-1, VCA$L_EXTLBN]
+		+ .EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS]
+		- .COUNT;
+	    END;
+	IF .COUNT GEQU .BLOCK_COUNT
+	OR  (.COUNT NEQ 0
+	     AND NOT .FIB[FIB$V_ALCON]
+	     AND NOT .FIB[FIB$V_ALCONB])
+	THEN LEAVE CACHE_SEARCH;
+	END;
+    J = .J + 1;
+    END;				! end of cache search loop
+
+RETURN 0;				! whole cache searched - nothing found
+
+END;					! end of block CACHE_SEARCH
+
+! We get here if we find a suitable cache entry. Deduct the count needed
+! from the count in the entry. If the result is zero, squish out the entry.
+!
+!
+
+COUNT = MINU (.COUNT, .BLOCK_COUNT);
+IF .COUNT EQL 0
+THEN BUG_CHECK (MAPCNTZER, FATAL, 'Found zero extent in cache');
+
+EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS] = .EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS] - .COUNT;
+IF .EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS] EQL 0
+THEN
+    BEGIN
+    CH$MOVE ((.EXTENT_CACHE[VCA$W_EXTCOUNT]-.J)*8,
+	     EXTENT_LIST[.J, VCA$L_EXTBLOCKS],
+	     EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS]);
+    EXTENT_CACHE[VCA$W_EXTCOUNT] = .EXTENT_CACHE[VCA$W_EXTCOUNT] - 1;
+    END
+
+! Otherwise the allocation is only part of the extent. If it is from the
+! front of the extent, recompute the startin LBN of the extent.
+!
+
+ELSE IF .EXTENT_LIST[.J-1, VCA$L_EXTLBN] EQL .LBN
+THEN
+    EXTENT_LIST[.J-1, VCA$L_EXTLBN] = .EXTENT_LIST[.J-1, VCA$L_EXTLBN] + .COUNT
+
+! If the allocation is from the end of the extent, no further action is necessary.
+! If it is from the middle, we must split the extent. To do so, shuffle the
+! remainder of the extent list up by one, bump the entry count, and compute
+! the split entries.
+!
+
+ELSE IF .EXTENT_LIST[.J-1, VCA$L_EXTLBN] + .EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS] NEQ .LBN
+THEN
+    BEGIN
+    CH$MOVE ((.EXTENT_CACHE[VCA$W_EXTCOUNT]-.J)*8,
+	     EXTENT_LIST[.J, VCA$L_EXTBLOCKS],
+	     EXTENT_LIST[.J+1, VCA$L_EXTBLOCKS]);
+    EXTENT_CACHE[VCA$W_EXTCOUNT] = .EXTENT_CACHE[VCA$W_EXTCOUNT] + 1;
+    EXTENT_LIST[.J, VCA$L_EXTLBN] = .COUNT + .LBN;
+    EXTENT_LIST[.J, VCA$L_EXTBLOCKS] = .EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS]
+				     + .EXTENT_LIST[.J-1, VCA$L_EXTLBN]
+				     - .LBN;
+    EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS] = .EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS]
+				       - .EXTENT_LIST[.J, VCA$L_EXTBLOCKS];
+    END;
+
+.START_LBN = .LBN;
+.BLOCKS_ALLOC = .COUNT;
+EXTENT_CACHE[VCA$L_EXTTOTAL] = .EXTENT_CACHE[VCA$L_EXTTOTAL] - .COUNT;
+CURRENT_VCB[VCB$L_FREE] = .CURRENT_VCB[VCB$L_FREE] - .COUNT;
+
+RETURN 1;
+
+END;					! end of routine ALLOC_EXTENT
+
+ROUTINE RETURN_EXTENT (START_LBN, BLOCK_COUNT, ADJUST_FREE) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns the indicated extent to the extent cache.
+!	It searches the cache to insert the entry in LBN order, and merges
+!	it with any adjacent entries. If the extent overlaps existing
+!	entries, an error return is made.
+!
+!
+! CALLING SEQUENCE:
+!	RETURN_EXTENT (ARG1, ARG2, ARG3)
+!
+! INPUT PARAMETERS:
+!	ARG1: starting LBN of extent
+!	ARG2: block count
+!	ARG3: 1 to credit blocks to free space on volume
+!	      0 to not
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1 if successful
+!	0 if blocks overlap
+!
+! SIDE EFFECTS:
+!	extent cache modified
+!
+!--
+
+BEGIN
+
+LOCAL
+	EXTENT_CACHE	: REF BBLOCK,	! pointer to extent cache
+	EXTENT_LIST	: REF BBLOCKVECTOR [,8], ! pointer to extent list
+	J;				! extent list index
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK;	! VCB of volume
+
+
+! Search the extent cache until we find an entry whose start LBN is
+! higher than the end LBN of the extent being returned.
+!
+
+IF .BLOCK_COUNT EQL 0
+THEN BUG_CHECK (MAPCNTZER, FATAL, 'Attempted to return zero extent to cache');
+
+EXTENT_CACHE = .BBLOCK [.CURRENT_VCB[VCB$L_CACHE], VCA$L_EXTCACHE];
+EXTENT_LIST = EXTENT_CACHE[VCA$Q_EXTLIST];
+J = 1;
+UNTIL .J GTRU .EXTENT_CACHE[VCA$W_EXTCOUNT]
+DO
+    BEGIN
+    IF .EXTENT_LIST[.J-1, VCA$L_EXTLBN] GEQU .START_LBN + .BLOCK_COUNT
+    THEN EXITLOOP;
+    J = .J + 1;
+    END;
+
+! If there is a preceding entry, check it for overlap.
+!
+
+IF .J GTRU 1
+THEN
+    BEGIN
+    IF .EXTENT_LIST[.J-2, VCA$L_EXTLBN] + .EXTENT_LIST[.J-2, VCA$L_EXTBLOCKS]
+    GTRU .START_LBN
+    THEN RETURN 0;
+    END;
+
+! Check for adjacency with the preceding and current extents; if so, do
+! a merge.
+!
+
+IF .J GTRU 1
+AND .EXTENT_LIST[.J-2, VCA$L_EXTLBN] + .EXTENT_LIST[.J-2, VCA$L_EXTBLOCKS]
+    EQL .START_LBN
+THEN
+    BEGIN
+    EXTENT_LIST[.J-2, VCA$L_EXTBLOCKS] = .EXTENT_LIST[.J-2, VCA$L_EXTBLOCKS] + .BLOCK_COUNT;
+
+    IF .J LEQU .EXTENT_CACHE[VCA$W_EXTCOUNT]
+    AND .EXTENT_LIST[.J-1, VCA$L_EXTLBN] EQL .START_LBN + .BLOCK_COUNT
+    THEN
+	BEGIN
+	EXTENT_LIST[.J-2, VCA$L_EXTBLOCKS] =
+	    .EXTENT_LIST[.J-2, VCA$L_EXTBLOCKS]
+	  + .EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS];
+	CH$MOVE ((.EXTENT_CACHE[VCA$W_EXTCOUNT]-.J)*8,
+		 EXTENT_LIST[.J, VCA$L_EXTBLOCKS],
+		 EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS]);
+	EXTENT_CACHE[VCA$W_EXTCOUNT] = .EXTENT_CACHE[VCA$W_EXTCOUNT] - 1;
+	END;
+    END
+
+ELSE IF .J LEQU .EXTENT_CACHE[VCA$W_EXTCOUNT]
+     AND .EXTENT_LIST[.J-1, VCA$L_EXTLBN] EQL .START_LBN + .BLOCK_COUNT
+THEN
+    BEGIN
+    EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS] = .EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS] + .BLOCK_COUNT;
+    EXTENT_LIST[.J-1, VCA$L_EXTLBN] = .START_LBN;
+    END
+
+ELSE
+    BEGIN
+    CH$MOVE ((.EXTENT_CACHE[VCA$W_EXTCOUNT]-.J+1)*8,
+	     EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS],
+	     EXTENT_LIST[.J, VCA$L_EXTBLOCKS]);
+    EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS] = .BLOCK_COUNT;
+    EXTENT_LIST[.J-1, VCA$L_EXTLBN] = .START_LBN;
+    EXTENT_CACHE[VCA$W_EXTCOUNT] = .EXTENT_CACHE[VCA$W_EXTCOUNT] + 1;
+    END;
+
+EXTENT_CACHE[VCA$L_EXTTOTAL] = .EXTENT_CACHE[VCA$L_EXTTOTAL] + .BLOCK_COUNT;
+IF .ADJUST_FREE
+THEN CURRENT_VCB[VCB$L_FREE] = .CURRENT_VCB[VCB$L_FREE] + .BLOCK_COUNT;
+
+RETURN 1;
+
+END;					! end of routine RETURN_EXTENT
+
+GLOBAL ROUTINE PURGE_EXTENT (ENTRY_COUNT, CACHE_LIMIT) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine removes the specified number of entries from the
+!	extent cache and returns the blocks to the storage bitmap.
+!
+!
+! CALLING SEQUENCE:
+!	PURGE_EXTENT (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: number of entries to retain
+!	ARG2: total number of blocks to retain in cache
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	extent cache and storage bitmap modified
+!
+!--
+
+BEGIN
+
+LOCAL
+	EXTENT_CACHE	: REF BBLOCK,	! pointer to extent cache
+	EXTENT_LIST	: REF BBLOCKVECTOR [,8], ! pointer to extent list
+	BLOCK,				! bitmap block number of current extent
+	VBN,				! bitmap block number of best group
+	COUNT,				! count of entries in current group
+	BLOCKS,				! block count in current group
+	BASE_J,				! cache index of start of current map block
+	BEST_COUNT,			! count of entries in best group
+	BEST_BLOCKS,			! count of blocks in best group
+	BEST_J,				! index of start of best group
+	MOST_BLOCKS,			! count of blocks in largest group
+	MOST_J,				! starting index on largest group
+	BLOCKS_TO_REM,			! number of blocks to remove from cache
+	LBN,				! starting LBN of extent
+	BLOCK_COUNT;			! count of extent
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK;	! VCB of volume
+
+
+! If we are not removing all the entries, scan the extent cache for the
+! desired number of entries that reside in the same bitmap block.
+!
+
+EXTENT_CACHE = .BBLOCK [.CURRENT_VCB[VCB$L_CACHE], VCA$L_EXTCACHE];
+EXTENT_LIST = EXTENT_CACHE[VCA$Q_EXTLIST];
+
+IF .ENTRY_COUNT NEQ 0
+THEN
+    BEGIN
+    BEST_COUNT = 0;
+    BEST_BLOCKS = 0;
+    MOST_BLOCKS = 0;
+    VBN = -1;
+
+    INCR J FROM 1 TO .EXTENT_CACHE[VCA$W_EXTCOUNT]
+    DO
+	BEGIN
+	BLOCK = (.EXTENT_LIST[.J-1, VCA$L_EXTLBN] / 4096)
+		/ .CURRENT_VCB[VCB$W_CLUSTER];
+	IF .BLOCK NEQ .VBN
+	THEN
+	    BEGIN
+	    VBN = .BLOCK;
+	    COUNT = 0;
+	    BLOCKS = 0;
+	    BASE_J = .J;
+	    END;
+	COUNT = .COUNT + 1;
+	BLOCKS = .BLOCKS + .EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS];
+
+	IF .COUNT GTRU .BEST_COUNT
+	THEN
+	    BEGIN
+	    BEST_COUNT = .COUNT;
+	    BEST_BLOCKS = .BLOCKS;
+	    BEST_J = .BASE_J;
+	    END;
+
+	IF .BLOCKS GTRU .MOST_BLOCKS
+	THEN
+	    BEGIN
+	    MOST_BLOCKS = .BLOCKS;
+	    MOST_J = .BASE_J;
+	    END;
+	END;
+
+! See what we got from scanning the cache. If removing the greatest number
+! of entries will satisfy the space reduction, then do that. Otherwise,
+! go for the set of entries with the most space. If that isn't sufficient,
+! start at the beginning of the cache.
+!
+
+    BLOCKS_TO_REM = .EXTENT_CACHE[VCA$L_EXTTOTAL] - .CACHE_LIMIT;
+    IF .CACHE_LIMIT GTRU .EXTENT_CACHE[VCA$L_EXTTOTAL]
+    THEN BLOCKS_TO_REM = 0;
+
+    IF .BEST_BLOCKS LSSU .BLOCKS_TO_REM
+    THEN
+	BEGIN
+	BEST_J = .MOST_J;
+	IF .MOST_BLOCKS LSSU .BLOCKS_TO_REM
+	THEN BEST_J = 1;
+	END;
+    END
+
+ELSE
+    BEST_J = 1;				! do the whole cache
+
+VBN = (.EXTENT_LIST[.BEST_J-1, VCA$L_EXTLBN] / 4096) / .CURRENT_VCB[VCB$W_CLUSTER];
+
+! Now scan the extent cache, remove the called for entries, and return
+! the blocks to the storage bitmap.
+!
+
+UNTIL .BEST_J GTRU .EXTENT_CACHE[VCA$W_EXTCOUNT]
+DO
+    BEGIN
+    LBN = .EXTENT_LIST[.BEST_J-1, VCA$L_EXTLBN];
+    IF .EXTENT_CACHE[VCA$L_EXTTOTAL] LEQU .CACHE_LIMIT
+    AND (.EXTENT_CACHE[VCA$W_EXTCOUNT] LEQU .ENTRY_COUNT
+	 OR (.VBN NEQ (.LBN / 4096) / .CURRENT_VCB[VCB$W_CLUSTER]
+	      AND .ENTRY_COUNT NEQ 0)
+	)
+    THEN EXITLOOP;
+
+    BLOCK_COUNT = .EXTENT_LIST[.BEST_J-1, VCA$L_EXTBLOCKS];
+    IF .EXTENT_CACHE[VCA$L_EXTTOTAL] - .BLOCK_COUNT LSSU .CACHE_LIMIT
+    AND .EXTENT_CACHE[VCA$W_EXTCOUNT] LEQU .ENTRY_COUNT
+    THEN
+	BEGIN
+	BLOCK_COUNT = .EXTENT_CACHE[VCA$L_EXTTOTAL] - .CACHE_LIMIT;
+	BLOCK_COUNT = ((.BLOCK_COUNT + .CURRENT_VCB[VCB$W_CLUSTER]-1)
+			/ .CURRENT_VCB[VCB$W_CLUSTER]) * .CURRENT_VCB[VCB$W_CLUSTER];
+	END;
+    KERNEL_CALL (REMOVE_EXTENT, .LBN, .BLOCK_COUNT);
+    RETURN_BITMAP (.LBN, .BLOCK_COUNT);
+    END;
+
+END;					! end of routine PURGE_EXTENT
+
+ROUTINE REMOVE_EXTENT (LBN, COUNT) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine removes the indicated number of blocks from the indicated
+!	extent in the cache. If the total block count of the extent is removed,
+!	then the extent is eliminated completely.
+!
+!
+! CALLING SEQUENCE:
+!	REMOVE_EXTENT (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: LBN of extent to remove
+!	ARG2: count of blocks to remove
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1
+!
+! SIDE EFFECTS:
+!	extent cache altered
+!
+!--
+
+BEGIN
+
+LOCAL
+	EXTENT_CACHE	: REF BBLOCK,	! pointer to extent cache
+	EXTENT_LIST	: REF BBLOCKVECTOR [,8]; ! pointer to extent list
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK;	! VCB of volume
+
+
+! Get the pointer to the extent cache and search it for the LBN. When
+! found, squish out the entry.
+!
+
+EXTENT_CACHE = .BBLOCK [.CURRENT_VCB[VCB$L_CACHE], VCA$L_EXTCACHE];
+EXTENT_LIST = EXTENT_CACHE[VCA$Q_EXTLIST];
+
+INCR J FROM 1 TO .EXTENT_CACHE[VCA$W_EXTCOUNT]
+DO
+    BEGIN
+    IF .EXTENT_LIST[.J-1, VCA$L_EXTLBN] EQL .LBN
+    THEN
+	BEGIN
+	EXTENT_LIST[.J-1, VCA$L_EXTLBN] = .EXTENT_LIST[.J-1, VCA$L_EXTLBN] + .COUNT;
+	EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS] = .EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS] - .COUNT;
+	IF .EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS] NEQ 0 THEN EXITLOOP;
+	CH$MOVE ((.EXTENT_CACHE[VCA$W_EXTCOUNT]-.J)*8,
+		 EXTENT_LIST[.J, VCA$L_EXTBLOCKS],
+		 EXTENT_LIST[.J-1, VCA$L_EXTBLOCKS]);
+	EXTENT_CACHE[VCA$W_EXTCOUNT] = .EXTENT_CACHE[VCA$W_EXTCOUNT] - 1;
+	EXITLOOP;
+	END;
+    END;
+
+EXTENT_CACHE[VCA$L_EXTTOTAL] = .EXTENT_CACHE[VCA$L_EXTTOTAL] - .COUNT;
+
+1
+END;					! end of routine REMOVE_EXTENT
+
+GLOBAL ROUTINE ALLOC_BITMAP (FIB, BLOCKS_NEEDED, START_LBN, BLOCKS_ALLOC, PARTIAL) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine allocates a single contiguous area of disk.
+!	Mode of allocation is determined by the allocation control
+!	in the FIB.
+!
+! CALLING SEQUENCE:
+!	ALLOC_BITMAP (ARG1, ARG2, ARG3, ARG4, ARG5)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of FIB for this operation
+!	ARG2: number of blocks to allocate
+!	ARG5: 0 to scan entire bitmap
+!	      1 to scan only currently resident block
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: ADDRESS OF VCB IN PROCESS
+!	CURRENT_UCB: ADDRESS OF UCB IN PROCESS
+!
+! OUTPUT PARAMETERS:
+!	ARG3: address of longword to store starting LBN
+!	ARG4: address of longword to store block count
+!
+! IMPLICIT OUTPUTS:
+!	LOC_LBN: placement LBN of allocation or 0
+!	NONE
+!
+! ROUTINE VALUE:
+!	1 if successful allocation
+!	0 if failure
+!
+! SIDE EFFECTS:
+!	storage map and VCB modified
+!
+!--
+
+BEGIN
+
+MAP
+	FIB		: REF BBLOCK;	! FIB of request
+
+LOCAL
+	CLUSTER,			! cluster factor of volume
+	BITS_NEEDED,			! number of map bits to allocate
+	BEGIN_BIT,			! first bitmap bit looked at
+	START_BIT,			! bit address in storage map
+	BIT_COUNT,			! number of bits to scan
+	FIRST_SET,			! start of free area
+	BITS_SCANNED,			! number of bits processed by scanner
+	END_BIT,			! last bit processed
+	BEST_STARTBIT,			! start of largest free area
+	BEST_BITSFOUND,			! size of largest free area
+	CYL_SIZE,			! volume cylinder size in clusters
+	CYL_BOUNDARY;			! bit address of next cylinder boundary
+
+LABEL
+	MAP_SCAN;			! code block to scan the storage map
+
+EXTERNAL
+	LOC_LBN,			! placement LBN or 0
+	USER_STATUS	: VECTOR,	! user I/O status block
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume
+	CURRENT_UCB	: REF BBLOCK;	! UCB of volume
+
+
+! Adjust the desired block count to a bit count through the volume
+! cluster factor. Set up the running parameters.
+!
+
+CLUSTER = .CURRENT_VCB[VCB$W_CLUSTER];
+BITS_NEEDED = (.BLOCKS_NEEDED + .CLUSTER - 1) / .CLUSTER;
+BEST_BITSFOUND = 0;
+START_BIT = BEGIN_BIT = .CURRENT_VCB[VCB$B_SBMAPVBN] * 4096;
+
+CYL_SIZE = .CURRENT_UCB[UCB$B_SECTORS]
+	 * .CURRENT_UCB[UCB$B_TRACKS]
+	 / .CURRENT_VCB[VCB$B_BLOCKFACT];
+
+! Get placement data if specified. If the placement LBN is garbage, fail if
+! exact placement is called for, else forget it.
+!
+
+IF .LOC_LBN NEQ 0
+THEN
+    BEGIN
+    IF .LOC_LBN GEQU .CURRENT_UCB[UCB$L_MAXBLOCK]
+    THEN
+	BEGIN
+	IF .FIB[FIB$V_EXACT]
+	THEN RETURN 0
+	ELSE LOC_LBN = 0;
+	END;
+    START_BIT = BEGIN_BIT = .LOC_LBN / .CLUSTER;
+    END;
+
+! The outer loop potentially scans the map twice: once from the given starting
+! point through to the end and then from beginning to end, if necessary to
+! locate a large contiguous area with a bad start.
+!
+
+MAP_SCAN:
+    BEGIN
+    WHILE 1 DO
+	BEGIN
+	BIT_COUNT = .CURRENT_UCB[UCB$L_MAXBLOCK] / .CLUSTER - .START_BIT;
+	IF .PARTIAL
+	THEN BIT_COUNT = MINU (.BIT_COUNT, 4096);
+
+! Now scan the bitmap for the first free block. Having found it, scan
+! to see how many free blocks there are there. If it is a non-contiguous
+! allocation, accept the blocks regardless. If it is contiguous, and the
+! free area is too small, keep looking.
+!
+
+	WHILE 1 DO
+	    BEGIN
+
+	    IF .LOC_LBN EQL 0
+	    THEN
+		BEGIN
+		IF BITSCAN (FIND_SET, .START_BIT, .BIT_COUNT, FIRST_SET, BITS_SCANNED)
+		THEN EXITLOOP;		! out if end of map
+
+		BIT_COUNT = .BIT_COUNT - .BITS_SCANNED;
+		END
+	    ELSE
+		FIRST_SET = .START_BIT;
+
+! If on cylinder allocation is requested, see if sufficient space remains
+! between the current point and the next cylinder boundary. If not, nudge
+! to the next cylinder boundary if exact is not specified. If exact is
+! specified, we allow for a nudge of 1 cluster to allow for the vagaries
+! of cluster boundaries.
+!
+
+	    IF .FIB[FIB$V_ONCYL]
+	    THEN
+		BEGIN
+		CYL_BOUNDARY = ((.FIRST_SET*.CLUSTER) /.CYL_SIZE + 1) * .CYL_SIZE;
+		IF .CYL_BOUNDARY/.CLUSTER - .FIRST_SET LEQU .BITS_NEEDED
+		THEN
+		    BEGIN
+		    CYL_BOUNDARY = (.CYL_BOUNDARY + .CLUSTER - 1) / .CLUSTER;
+		    IF .FIB[FIB$V_EXACT]
+		    AND .LOC_LBN NEQ 0
+		    AND .CYL_BOUNDARY - .FIRST_SET GTRU 1
+		    THEN RETURN 0;
+
+		    BIT_COUNT = .BIT_COUNT - .CYL_BOUNDARY + .FIRST_SET;
+		    IF .BIT_COUNT LEQ 0 THEN EXITLOOP;
+		    FIRST_SET = .CYL_BOUNDARY;
+		    END;
+		END;
+
+	    BITSCAN (FIND_CLEAR, .FIRST_SET, MIN (.BIT_COUNT, .BITS_NEEDED),
+			START_BIT, BITS_SCANNED);
+
+	    BIT_COUNT = .BIT_COUNT - .BITS_SCANNED;
+
+	    IF .BITS_SCANNED GTRU .BEST_BITSFOUND
+	    THEN
+		BEGIN
+		BEST_STARTBIT = .FIRST_SET;
+		BEST_BITSFOUND = .BITS_SCANNED;
+		END;
+
+	    IF .BEST_BITSFOUND GEQU .BITS_NEEDED
+	    OR (NOT (.FIB[FIB$V_ALCON] OR .FIB[FIB$V_ALCONB])
+		AND .BEST_BITSFOUND NEQ 0)
+	    THEN LEAVE MAP_SCAN;	! found what we were after
+
+	    IF .BIT_COUNT EQL 0
+	    THEN EXITLOOP;		! end of storage map
+
+! If an exact placement was asked for and we didn't get it, it's all over.
+! Otherwise, forget placement and continue scanning normally.
+!
+
+	    IF .FIB[FIB$V_ALCON]
+	    AND .FIB[FIB$V_EXACT]
+	    AND .LOC_LBN NEQ 0
+	    THEN RETURN 0;
+	    LOC_LBN = 0;
+
+	    END;			! end of map scan loop
+
+! We get here when we run into the end of the storage map. If the scan
+! started in the middle, do it once more from the top.
+!
+
+	IF .BEGIN_BIT EQL 0
+	OR .PARTIAL
+	THEN LEAVE MAP_SCAN;
+	BEGIN_BIT = START_BIT = 0;
+	END;				! end of outer loop
+    END;				! end of block MAP_SCAN
+
+! We have either found a cluster of free blocks suitable to the occasion
+! or we have searched the entire map. If nothing was found, or for a
+! normal contiguous request, return error if the number of blocks is
+! insufficient; otherwise, allocate the blocks.
+!
+
+IF .BEST_BITSFOUND EQL 0
+OR (.FIB[FIB$V_ALCON] AND NOT .FIB[FIB$V_ALCONB]
+    AND .BEST_BITSFOUND LSSU .BITS_NEEDED)
+THEN
+    BEGIN
+    USER_STATUS[1] = .BEST_BITSFOUND * .CLUSTER;
+    RETURN 0;
+    END;
+
+BITSCAN (CLEAR_BITS, .BEST_STARTBIT, .BEST_BITSFOUND, END_BIT, BITS_SCANNED);
+
+KERNEL_CALL (SET_SMVBN, .END_BIT / 4096);
+
+.START_LBN = .BEST_STARTBIT * .CLUSTER;
+.BLOCKS_ALLOC = .BEST_BITSFOUND * .CLUSTER;
+
+RETURN 1;
+
+END;					! end of routine ALLOC_BITMAP
+
+GLOBAL ROUTINE RETURN_BITMAP (START_LBN, BLOCK_COUNT) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns a single contiguous area to the storage map.
+!
+! CALLING SEQUENCE:
+!	RETURN_BITMAP (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: starting LBN to free
+!	ARG2: number of blocks to free
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!	CURRENT_UCB: UCB of device
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	storage map and VCB modified
+!
+!--
+
+BEGIN
+
+LOCAL
+	START_BIT,			! starting bit number in storage map
+	BIT_COUNT,			! number of bits to set
+	DUMMY1,				! dummies to receive return data
+	DUMMY2;				! from BITSCAN, which is not used
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume in process
+	CURRENT_UCB	: REF BBLOCK;	! UCB of device unit
+
+
+! First check the blocks being returned against the volume size.
+!
+
+IF .START_LBN + .BLOCK_COUNT GTRU .CURRENT_UCB[UCB$L_MAXBLOCK]
+THEN BUG_CHECK (EXTCACHIV, FATAL, 'Contents of extent cache is garbage');
+
+! Divide down by the volume cluster factor to convert blocks to storage
+! map bits. If there are non-zero remainders, reject the operation on grounds
+! of a bad file header.
+!
+
+IF .START_LBN MOD .CURRENT_VCB[VCB$W_CLUSTER] NEQ 0
+THEN BUG_CHECK (EXTCACHIV, FATAL, 'Contents of extent cache is garbage');
+START_BIT = .START_LBN / .CURRENT_VCB[VCB$W_CLUSTER];
+
+IF .BLOCK_COUNT MOD .CURRENT_VCB[VCB$W_CLUSTER] NEQ 0
+THEN BUG_CHECK (EXTCACHIV, FATAL, 'Contents of extent cache is garbage');
+BIT_COUNT = .BLOCK_COUNT / .CURRENT_VCB[VCB$W_CLUSTER];
+
+! Call the bit scanner to set the appropriate
+! bits. Finally update the volume free block count.
+!
+
+BITSCAN (SET_BITS, .START_BIT, .BIT_COUNT, DUMMY1, DUMMY2);
+
+END;					! end of routine RETURN_BITMAP
+
+GLOBAL ROUTINE BITSCAN (MODE, STARTBIT, BITCOUNT, STOPBIT, LENGTHFOUND) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is the basic bitmap scanner. It scans the bitmap
+!	over the specified number of bits, performing the operation
+!	specified by the mode.
+!
+! CALLING SEQUENCE:
+!	BITSCAN (ARG1, ARG2, ARG3, ARG4, ARG5)
+!
+! INPUT PARAMETERS:
+!	ARG1: mode of operation - see module preface
+!	ARG2: starting bit address in bitmap
+!	ARG3: maximum number of bits to process
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: address of VCB in process
+!
+! OUTPUT PARAMETERS:
+!	ARG4: address of longword to receive ending bit address
+!	ARG5: address of longword to receive number of bits scanned
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1 if maximum bit count processed
+!	0 if not
+!
+! SIDE EFFECTS:
+!	bitmap blocks may be altered, read, and written
+!
+!--
+
+BEGIN
+
+LOCAL
+	COUNT,				! number of bits to go
+	BLOCK,				! current bitmap block number
+	CBYTE,				! current byte offset in block
+	CBIT,				! current bit number within byte
+	BYTELIM,			! number of bytes to scan
+	BITLIM,				! number of bits to scan
+	BUFFER,				! address of bitmap buffer
+	ENDBYTE,			! end of current byte scan
+	ENDBIT;				! end of current bit scan
+
+EXTERNAL
+	BITMAP_VBN,			! VBN of current storage map block
+	BITMAP_RVN,			! RVN of current bitmap block
+	CURRENT_RVN,			! RVN of current volume
+	BITMAP_BUFFER	: REF BITVECTOR, ! address of current map block
+	CURRENT_VCB	: REF BBLOCK;	! VCB in process
+
+EXTERNAL ROUTINE
+	MARK_DIRTY,			! mark buffer for writeback
+	READ_BLOCK;			! read a disk block
+
+
+! Initialize by setting the count and setting up the pointers to
+! the starting position. Read the first map block. The case of a
+! zero count is handled specially to avoid bitmap edge problems.
+!
+
+COUNT = .BITCOUNT;
+IF .COUNT EQL 0
+THEN
+    BEGIN
+    .LENGTHFOUND = 0;
+    .STOPBIT = .STARTBIT;
+    RETURN 1;
+    END;
+
+BLOCK = .STARTBIT<12,20>;
+IF .BLOCK GEQU .CURRENT_VCB[VCB$B_SBMAPSIZE]
+THEN BUG_CHECK (BADSBMBLK, FATAL, 'ACP tried to reference off end of bitmap');
+
+IF .BLOCK+1 EQL .BITMAP_VBN
+AND .CURRENT_RVN EQL .BITMAP_RVN
+THEN
+    BUFFER = .BITMAP_BUFFER
+ELSE
+    BEGIN
+    BITMAP_VBN = 0;
+    BUFFER = READ_BLOCK (.BLOCK+.CURRENT_VCB[VCB$L_SBMAPLBN], 1, BITMAP_TYPE);
+    BITMAP_VBN = .BLOCK+1;
+    BITMAP_RVN = .CURRENT_RVN;
+    BITMAP_BUFFER = .BUFFER;
+    END;
+
+CBYTE = .BUFFER + .STARTBIT<3,9>;
+CBIT = .STARTBIT<0,3>;
+
+! The outer loop allows us to use the same set of bit processing instructions
+! for the odd bits at both the start and end of the scan.
+!
+
+WHILE 1 DO
+    BEGIN
+
+! Process bits from the starting position up to the first byte boundary.
+!
+
+    BITLIM = MIN (8 - .CBIT, .COUNT);	! max number of bits to scan
+    CASE .MODE FROM 0 TO 3 OF
+	SET
+	[FIND_SET]:	FFS (CBIT, BITLIM, .CBYTE, ENDBIT);
+
+	[FIND_CLEAR]:	FFC (CBIT, BITLIM, .CBYTE, ENDBIT);
+
+	[SET_BITS]:	BEGIN
+			(.CBYTE)<.CBIT, .BITLIM> = -1;
+			ENDBIT = .CBIT + .BITLIM;
+			END;
+
+	[CLEAR_BITS]:	BEGIN
+			(.CBYTE)<.CBIT, .BITLIM> = 0;
+			ENDBIT = .CBIT + .BITLIM;
+			END;
+
+	TES;
+
+! Update the counters and pointers.
+!
+
+    COUNT = .COUNT - (.ENDBIT - .CBIT);
+
+! If we are now positioned on a byte boundary, we can process the bitmap
+! on a byte by byte basis. Page through the bitmap until the count runs out.
+!
+
+    IF .COUNT EQL 0 OR .ENDBIT NEQ 8 THEN EXITLOOP;
+
+    CBYTE = .CBYTE + 1;
+    CBIT = 0;
+
+    WHILE 1 DO
+	BEGIN
+	BYTELIM = MIN (.COUNT/8, 512 - (.CBYTE-.BUFFER));
+
+	CASE .MODE FROM 0 TO 3 OF
+	    SET
+
+	    [FIND_SET]:	    ENDBYTE = CH$FIND_NOT_CH (.BYTELIM, .CBYTE, 0);
+
+	    [FIND_CLEAR]:   ENDBYTE = CH$FIND_NOT_CH (.BYTELIM, .CBYTE, 255);
+
+	    [SET_BITS]:	    ENDBYTE = CH$FILL (255, .BYTELIM, .CBYTE);
+
+	    [CLEAR_BITS]:   ENDBYTE = CH$FILL (0, .BYTELIM, .CBYTE);
+
+	    TES;
+
+	IF CH$FAIL (.ENDBYTE) THEN ENDBYTE = .CBYTE + .BYTELIM;
+
+! If the count runs out or we run into an end condition leave the loop.
+! Otherwise read the next block, wrapping around the end of the bitmap
+! when necessary, and loop.
+!
+
+	COUNT = .COUNT - (.ENDBYTE - .CBYTE) * 8;
+	IF .ENDBYTE - .BUFFER NEQ 512 OR .COUNT EQL 0 THEN EXITLOOP;
+
+	CASE .MODE FROM MINU (SET_BITS, CLEAR_BITS) TO MAXU (SET_BITS, CLEAR_BITS) OF
+	    SET
+
+	    [SET_BITS, CLEAR_BITS]: MARK_DIRTY (.BUFFER);
+
+	    [INRANGE, OUTRANGE]: 0;
+
+	    TES;
+
+	BLOCK = .BLOCK + 1;
+	IF .BLOCK GEQU .CURRENT_VCB[VCB$B_SBMAPSIZE]
+	THEN BUG_CHECK (BADSBMBLK, FATAL, 'ACP tried to reference off end of bitmap');
+
+	BITMAP_VBN = 0;
+	BUFFER = READ_BLOCK (.BLOCK+.CURRENT_VCB[VCB$L_SBMAPLBN], 1, BITMAP_TYPE);
+	BITMAP_VBN = .BLOCK+1;
+	BITMAP_BUFFER = .BUFFER;
+	CBYTE = .BUFFER;
+	END;				! end of block scan loop
+
+! We have either found the desired end condition or the count will run
+! out within the next byte. Process the final byte bit by bit.
+!
+
+    IF .COUNT EQL 0 THEN EXITLOOP;
+    CBYTE = .ENDBYTE;
+    END;				! end of major loop
+
+! Scan is completed. Mark the buffer dirty if necessary and return the
+! output values.
+!
+
+CASE .MODE FROM MINU (SET_BITS, CLEAR_BITS) TO MAXU (SET_BITS, CLEAR_BITS) OF
+    SET
+
+    [SET_BITS, CLEAR_BITS]: MARK_DIRTY (.BUFFER);
+
+    [INRANGE, OUTRANGE]: 0;
+
+    TES;
+
+.LENGTHFOUND = .BITCOUNT - .COUNT;
+.STOPBIT = .STARTBIT + ..LENGTHFOUND;
+RETURN .COUNT EQL 0;
+
+END;					! end of routine BITSCAN
+
+ROUTINE SET_SMVBN (VBN) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine updates the current storage map VBN in the VCB.
+!	It must be called in kernel mode.
+!
+! CALLING SEQUENCE:
+!	SET_SMVBN (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: new storage map VBN
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	CURRENT_VCB: address of volume VCB
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	storage map VBN altered
+!
+!--
+
+BEGIN
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK;	! VCB of volume
+
+
+CURRENT_VCB[VCB$B_SBMAPVBN] = .VBN;
+
+END;					! end of routine SET_SMVBN
+
+ROUTINE UPDATE_FREE (COUNT) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine updates the free block count in the volume's VCB.
+!	It must be called in kernel mode.
+!
+! CALLING SEQUENCE:
+!	UPDATE_FREE (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: value (positive or negative) to alter free count
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	CURRENT_VCB: VCB of volume
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	free count altered
+!
+!--
+
+BEGIN
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK;	! VCB of volume
+
+
+CURRENT_VCB[VCB$L_FREE] = .CURRENT_VCB[VCB$L_FREE] + .COUNT;
+
+END;					! end of routine UPDATE_FREE
+
+END
+ELUDOM

@@ -1,0 +1,1759 @@
+	.TITLE	PAINTR
+	.IDENT	'V03-003'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1981, 1982                                                *
+;*  BY DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASS.			    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND  COPIED  *
+;*  ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH  LICENSE AND WITH THE  *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR  ANY  OTHER  *
+;*  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY  *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE  IS  HEREBY  *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE  WITHOUT  NOTICE  *
+;*  AND  SHOULD  NOT  BE  CONSTRUED  AS  A COMMITMENT BY DIGITAL EQUIPMENT  *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF  ITS  *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; FACILITY:
+;
+;	VAX/VMS EXECUTIVE, I/O DRIVERS
+;
+; ABSTRACT:  CI PORT INTERRUPT SERVICE AND RESPONSE DISPATCHING
+;
+; AUTHOR:  N. KRONENBERG,  MAY 1981
+;
+; MODIFIED BY:
+;
+;	V03-003	NPK2019		N. Kronenberg		6-Apr-1982
+;		Add routine RSP_CRASH_PORT.
+;		Fixed a number of error conditions in responses which
+;		previously bugchecked to call RSP_CRASH_PORT.
+;		Added separate error handlers for queue interlock
+;		failures on different queues.  Change failure to crash
+;		port and continue rather than bugcheck.
+;		Removed test code from REM_NEXT_RSP.
+;		Change RSP_UNREC_PKT to crash vc if unrecognized
+;		pkt is from node we have open VC to.
+;		Fix RSP action dispatcher to branch to error handler
+;		and not to leave anything on the stack.
+;
+;	V03-002	NPK2018		N. Kronenberg		25-Mar-1982
+;		Fix calculation of path status byte in RSP_PATH_FAIL.
+;		Fix REC_SETCKT to not deallocate dg if this is a SETCKT
+;		closed on VC crash.  This dg is attached to PB.
+;		Fix to permit path failures reported on REQID, SNDRST,
+;		SNDSTRT to cause virtual circuit crashes.
+;
+;	V03-001	NPK2016		N. Kronenberg		18-Mar-1982
+;		Fixed .TITLE
+;
+;--
+
+	.SBTTL	DEFINITIONS
+
+;
+; Set PSECT to driver code:
+;
+
+	.PSECT	$$$115_DRIVER,LONG
+
+
+;
+; System definitions (LIB.MLB):
+;
+
+	$CDLDEF				; Connection descriptor list
+	$CDTDEF				; Connection descriptor table format
+	$CDRPDEF			; Class Driver Request Pkt format
+	$DYNDEF				; Structure type definitions
+	$IDBDEF				; Interrupt Dispatch Block format
+	$NDTDEF				; Nexus Device Type codes
+	$PBDEF				; Path Block format
+	$PDTDEF				; Port Descriptor Table format
+	$SCSDEF				; SCS message format
+	$RDDEF				; Response Descriptor format
+	$RDTDEF				; Resp Descriptor Table format
+	$UCBDEF				; Unit Control Block format
+
+;
+; CI specific definitions (PALIB.MLB):
+;
+
+	$PAPDTDEF			; CI extension to PDT
+	$PAREGDEF			; Define ci register layout
+	$PPDDEF				; Port-port message format
+	$PAUCBDEF			; UCB extensions
+
+
+	.SBTTL	PA_INTERRUPT_SERVICE ROUTINE
+
+;+
+; PA$INT is called to service a CI interrupt.  First, several error
+; conditions are checked:
+;
+; /TBS/
+;
+; Call:	JSB from CRB interrupt vector dispatcher
+; Inputs:
+;
+;	@0(SP)			-Addr of IDB
+;	4(SP)-16(SP)		-Saved R2-R5
+;	20(SP)			-Interrupt PC
+;	24(SP)			-Interrupt PSL
+;
+;-
+
+ASSUME	PA_CNF	EQ 0
+ASSUME	PA_PS_M_MTE  EQ 1@31
+
+SBIERR 	=^XFC000000			; CNF, SBI errors that are ignored
+					;  because they will be caught via
+					;  SBI fault:  PAR FLT, WSQ FLT,
+					;  URD FLT, unused bit, MXT FLT,
+					;  XMT FLT
+
+FATAL_CNFERR =^X001E0700		; CNF errors that are not ignored:
+					;  CXTMO, RDTO, CXTER, RDS, TFAIL,
+					;  TDEAD, PFD
+
+	.ENABL	LSB
+
+PA$INT::
+
+	MOVL	@(SP)+,R3		; Get IDB address
+	MOVQ	R0,-(SP)		; Save additional registers
+	MOVL	IDB$L_CSR(R3),R4	; Get addr of configuration register
+	MOVL	IDB$L_UCBLST(R3),R5	; Get UCB addr
+
+CHK_CNF:
+
+	CMPL	PA_CNF(R4),#NDT$_CI	; Any config reg bits set except type?
+	BNEQ	CNF_ERR			; Branch if yes
+
+CHK_MTE:
+
+	TSTL	PA_PS(R4)		; MTE set?
+	BLSS	REINIT_PORT		; Branch if so (parity error)
+
+CHK_PSR:
+
+	BITL	#^C<PA_PS_M_RQA>,-	; Any bits set in PSR besides RQA?
+		PA_PS(R4)		;
+	BNEQ	REINIT_PORT		; Branch if so (serious error)
+					; Else no error!
+	MOVL	#PA_PSR_M_PSC,-		; Release port registers
+		PA_PSR(R4)		;
+	BBSS	#UCB_V_FKLOCK,-		; Set fork block interlock and
+		UCB$W_DEVSTS(R5),-	;  branch if already set
+		DISMISS_INT		;  to dismiss interrupt
+	BSBW	HANDLE_INT		; Handle interrupt at fork IPL
+
+DISMISS_INT:
+
+	MOVQ	(SP)+,R0		; Restore registers saved
+	MOVQ	(SP)+,R2		;
+	MOVQ	(SP)+,R4		;  on interrupt
+
+	REI
+
+CNF_ERR:
+
+	MOVL	PA_CNF(R4),R0		; Get copy of config register handy
+	BITL	#<SBIERR!PA_CNF_M_CRD>,R0  ; Ignorable error bit set?
+	BEQL	OTHER_CNF_ERR		; Branch if not
+	
+CNF_OK:					; Else config register OK
+	
+	MOVL	PA_CNF(R4),PA_CNF(R4)	; Clear status bits in CNF
+	BRB	CHK_MTE			; Continue error checking
+
+OTHER_CNF_ERR:
+
+	BITL	#FATAL_CNFERR,R0	; Fatal error bit in config reg?
+	BNEQ	REINIT_PORT		; Branch if so
+	BBS	#PA_CNF_V_PDN,R0,PWR_DN	; Branch if port power down
+	BBS	#PA_CNF_V_PUP,R0,PWR_UP	; Branch if port power up
+	BBC	#PA_CNF_V_RDS,R0,-	; Branch if RDS not set either
+		CNF_OK			;  to check elsewhere for error
+
+REINIT_PORT:
+
+					;***Log event
+	MOVL	#PA_PMC_M_MIN,PA_PMC(R4); Do a maint init on port in case
+					;  we are out of init retries
+	MOVZWL	#SS$_ABORT,R1		; Assume we are not out of retries,
+					;  but tell SYSAP not to expect
+					;  cached send dg's back
+	DECB	UCB$B_ERTCNT(R5)	; Decr retry count
+	BGEQ	10$			; Branch if not out of retries
+	MOVZWL	#SS$_CTRLERR,R1		; Else set aux status to tell SYSAP's
+					;  port won't be coming back
+	
+10$:	MOVL	UCB$L_PDT(R5),R4	; Get PDT addr
+	BRB	20$			; Join common crashed port code
+
+PWR_DN:
+
+					;***Log event
+	MOVL	PA_CNF(R4),PA_CNF(R4)	; Clear power down condition
+	MOVL	#PA_PSR_M_PSC,-		; Release port registers
+		PA_PSR(R4)		;
+	MOVL	UCB$L_PDT(R5),R4	; Get PDT addr
+	BICW	#PDT$M_PUP,-		; Clear PUP in PDT
+		PDT$W_LPORT_STS(R4)	;
+	MOVZWL	#SS$_POWERFAIL,R1	; Set aux status to report to SYSAP's
+
+20$:	BISW	#PDT$M_PWF_CLNUP,-	; Set cleanup in progress
+		PDT$W_LPORT_STS(R4)	;
+	BSBW	ERR$PWF_RECOV		; Call routine to set unit offline,
+					;  and fork to notify SYSAP's to 
+					;  DISCONNECT
+	BRW	DISMISS_INT		; Go dismiss interrupt
+
+PWR_UP:
+
+					;***Log event
+	BICL	#PA_PMC_M_MIE,-		; Disable interrupts on CI port,
+		PA_PMC(R4)		;  but leave pup set to show CI
+					;  has powered up again
+	MOVL	UCB$L_PDT(R5),R4	; Get PDT addr
+	BISW	#PDT$M_PUP,-		; Set power up occurred
+		PDT$W_LPORT_STS(R4)	;  in port status
+	BBS	#PDT$V_PWF_CLNUP,-	; Branch if pwr failure cleanup
+		PDT$W_LPORT_STS(R4),30$	;  still underway
+	MOVL	PDT$L_CNF(R4),R4	; Get config register addr
+	DSBINT				; Set IPL to 31
+	BSBW	INI$PORT		; Reinitialize port
+	ENBINT				; Return to lower IPL
+
+30$:	BRW	DISMISS_INT		; Go dismiss PUP interrupt
+
+
+	.SBTTL	HANDLE_INT,	HANDLE PORT INTERRUPT
+;+
+; This routine forks immediately leaving the address of the port
+; UCB0 in R5.  From the UCB, the PDT is obtained.
+;
+; Entry REM_NEXT_RSP is where the next response is removed from
+; the response queue and checked for error.  Packet errors are handled
+; in RSP_ERROR and other routines labelled 'RSP_...'.
+;
+; Error-free dequeued responses are dispathced on the messge opcode.  
+; Note that the 'message received' opcode is optimized by checkin
+; for it first before casing on other opcodes.  Unrecoginzed
+; opcodes are handled as follows:  \TBS\
+;
+; Legal opcodes are handled by branching to their handlers.  Handler 
+; routine names are of the form REC_'opcode.
+;
+; The message is processed by the handler which completes with a
+; branch back to REM_NEXT_RSP to dequeue the next response.  Thus
+; a single interrupt results in several responses being processed
+; if they are in the queue.  Responses are dequeued and processed
+; until none remain on the queue.  At this time the I/O fork process
+; completes with an RSB
+;
+; Inputs:
+;
+;	R4			-Addr of port configuration register
+;	R5			-Addr of port UCB, unit  0
+;-
+
+	.ENABL	LSB
+
+HANDLE_INT:
+
+	IOFORK				; Fork and lower IPL
+	BICW	#UCB_M_FKLOCK,-		; Clear fork block in use 
+		UCB$W_DEVSTS(R5)	;  lock bit
+	MOVL	UCB$L_PDT(R5),R4	; Get PDT address
+
+REM_NEXT_RSP:				; Entry for removing next response
+
+	$REM_RESPQ			; Get next response, addr in R2
+	BVS	NO_RSP			; Branch if no more responses
+	BBC	#PPD$V_ERR,-		; Branch if no error set
+		PPD$B_STATUS(R2),-	;  in response status
+		OPCODE_DISP		;
+	BRW	RSP_ERROR		; Else go handle error and
+					;  dispose of the response
+					; Continue with known good
+					;  good response or ignorable error.
+
+OPCODE_DISP:
+
+	CMPB	PPD$B_OPC(R2),-		; Is this a message receive?
+		#PPD$C_MSGREC		; 
+	BNEQ	10$			; Branch if not
+	BRW	REC_MSGREC		; Branch if so
+
+NO_RSP:					; No more responses, end of
+					;  fork process
+	RSB
+
+10$:					; Begin giant dispatch:
+	$DISPATCH -
+		PPD$B_OPC(R2),TYPE=B,-		;  Dispatch on opcode
+		<-				
+		<PPD$C_SNDDG,	REC_SNDDG>,-	;  Datagram sent
+		<PPD$C_SNDMSG,	REC_SNDMSG>,-	;  Message sent
+		<PPD$C_RETCNF,	REC_RETCNF>,-	;  Confirm returned
+		<PPD$C_REQDAT,	REC_REQDAT>,-	;  Data requested
+		<PPD$C_REQID,	REC_REQID>,-	;  ID requested
+		<PPD$C_SNDRST,	REC_SNDRST>,-	;  Reset sent
+		<PPD$C_SNDSTRT,	REC_SNDSTRT>,-	;  Start sent
+		<PPD$C_REQMDAT,	REC_REQMDAT>,-	;  Maint data requested
+		<PPD$C_SNDDAT,	REC_SNDDAT>,-	;  Data sent
+		<PPD$C_RETDAT,	REC_RETDAT>,-	;  Data returned
+		<PPD$C_SNDMDAT,	REC_SNDMDAT>,-	;  Maint data sent
+		<PPD$C_SETCKT,	REC_SETCKT>,-	;  Virtual circuit opened
+		<PPD$C_RDCNT,	REC_RDCNT>,-	;  Counters read
+		<PPD$C_DGREC,	REC_DGREC>,-	;  Datagram received
+		<PPD$C_CNFREC,	REC_CNFREC>,-	;  Confirm received
+		<PPD$C_MCNFREC,	REC_MCNFREC>,-	;  Maint confirm received
+		<PPD$C_IDREC,	REC_IDREC>,-	;  Received ID
+		<PPD$C_DATREC,	REC_DATREC>,-	;  Data received
+		<PPD$C_MDATREC,	REC_MDATREC>,-	;  Maint data received
+		<PPD$C_SNDLB,	REC_SNDLB>,-	;  Loopback dg sent
+		<PPD$C_LBREC,	REC_LBREC>,-	;  Loopback dg received
+		<PPD$C_INVTC,	REC_INVTC>,-	;  Invalidate xlation cache
+		>
+						; End of giant dispatch
+INV_OPCODE:					; Fall through to undefined
+						;  opcode
+
+;
+; Messages not handled for one reason or another:
+;
+
+REC_SNDDAT:				; No success response ever requested
+REC_RETCNF:				; No success response ever requested
+REC_REQDAT:				; No success response ever requested
+REC_REQMDAT:				; Command never issued
+REC_RETDAT:				; No success response ever requested
+REC_SNDMDAT:				; Command never issued
+REC_MCNFREC:				; Command never issued
+REC_MDATREC:				; Command never issued
+REC_SNDLB:				; No success response ever requested
+
+	BRW	RSP_CRASH_PORT		; Go init port crash
+
+	.DSABL	LSB
+
+	.SBTTL	HANDLERS FOR RESPONSES WITH GOOD STATUS
+	.SBTTL	-	REC_CNFREC,	SEND DATA IS COMPLETE
+	.SBTTL	-	REC_DATREC,	REQUEST DATA IS COMPLETE
+
+;+
+; These routines perform the same steps.
+;
+; First, the CONID portion of the XCT_ID is verified and converted
+; to CDT address.  The RSPID portion of the XCT_ID is converted to the
+; response descriptor address and the CDRP address extracted from the
+; RD.  The RSPID and message buffer containing the CNFREC/DATREC
+; are then deallocated.  Finally, the context of the suspended SYSAP
+; is restored and the SYSAP called back at the PC following the
+; call to send/request data.
+;
+; Inputs:
+;
+;	R2			-Addr of message
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R3			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_DATREC:
+
+REC_CNFREC:
+
+	.IF	DF PA$DEBUG		; Debug facility
+	BSBW	TRC$LOGMSG		; Log message
+	.ENDC				;
+
+	BSBW	INT$CHK_XCONID		; Verify transaction ID/CONID
+					;  and get CDT addr
+	BLBC	R0,20$			; Branch if stale CDT
+	INCW	CDT$W_SEND(R3)		; Add implied credit of 1
+	MOVZWL	PPD$Q_XCT_ID+4(R2),R1	; Get RSPID index
+	MOVL	G^SCS$GL_RDT,R0		; Get base of RD table
+	MOVAQ	(R0)[R1],R1		; Get RD address
+	CMPW	RD$W_SEQNUM(R1),-	; Verify 
+		PPD$Q_XCT_ID+6(R2)	;  sequence number
+	BNEQ	RD_SEQ_ERR		; Branch if bad sequence number
+	MOVL	RD$L_CDRP(R1),R5	; Get CDRP addr
+	PUSHL	R2			; Save volatile register
+	DEALLOC_RSPID			; Deallocate RSPID
+	POPL	R2			; Restore register
+	JSB	G^FPC$DEALLMSG2		; Deallocate msg buffer and
+					;  do flow control
+	MOVQ	R3,-(SP)		; Save CDT & PDT addr
+	MOVQ	CDRP$L_FR3(R5),R3	; Restore SYSAP's R3,R4
+	MOVZWL	#SS$_NORMAL,R0		; Set status to success
+	JSB	@CDRP$L_FPC(R5)		; Call SYSAP back
+	MOVQ	(SP)+,R3		; Restore CDT & PDT addr
+	BRW	CHK_CRWAIT		; Join common code in REC_MSGREC
+					;  to start anyone waiting for
+					;  send credit, then go for next
+					;  response
+
+20$:	BRW	REM_NEXT_RSP		; Get next pkt from response queue
+
+RD_SEQ_ERR:				 
+
+	BRW	RSP_CRASH_PORT		; Go init port crash 
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_DGREC,	PROCESS RECEIVED DG
+
+;+
+; If the PPD type of the received datagram is not SCS_DG, then the datagram
+; is assumed to be a start handshake datagram and is given to the CONFIG
+; module, routine CNF$DGREC, to process.  Otherwise, REC_DGREC verifies
+; the destination connection ID and checks that the connection has at
+; least one datagram queued for receive.  If the connection has no datagrams
+; queued for receive, then the datagram is discarded to the free queue and not
+; given to the SYSAP.  Otherwise, the SYSAP's datagram input address is called. 
+; Upon return from the SYSAP, branch is taken to REM_NEXT_RSP to get the
+; next response.
+;
+; Inputs:
+;
+;	R2			-Addr of message
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R1			-Length of application data
+;	R0,R2,R3,R5		-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_DGREC:
+
+	.IF	DF PA$DEBUG		; Debug facility
+	BSBW	TRC$LOGMSG		; Log datagram
+	.ENDC				;
+
+	CMPW	PPD$W_MTYPE(R2),-	; Is PPD msg type = SCS?
+		#PPD$C_SCS_DG		;
+	BEQL	10$			; Branch if so
+	BSBW	CNF$DGREC		; Else pass msg to configuration
+	BRW	REM_NEXT_RSP		; Get next response
+	
+10$:	BSBW	INT$CHK_DCONID		; Verify destination CONID in 
+					;  SCS header
+	BLBC	R0,20$			; Branch if bad CONID
+	TSTW	CDT$W_DGREC(R3)		; Check DG receive count
+	BEQL	30$			; Branch if none
+	DECW	CDT$W_DGREC(R3)		; Decrement DG receive count
+	SUBW3	#<SCS$C_APPL_BASE - PPD$C_LENGTH>,-
+		SCS$W_LENGTH(R2),R1	; Application data = DG length -
+					;  SCS header size
+	MOVZWL	R1,R1			; Expand to longword
+	ADDL	PDT$L_DGHDRSZ(R4),R2	; Compute addr of application data
+	CLRL	R0			; Set flag to show DGREC
+	PUSHL	R4			; Save R4(PDT) for REM_NEXT_RSP
+	JSB	@CDT$L_DGINPUT(R3)	; Call SYSAP dg input addr
+	POPL	R4			; Restore R4
+20$:	BRW	REM_NEXT_RSP		; Get next response
+
+30$:	BSBW	SCS$DISCARD_DG		;
+	INCL	CDT$L_BADRSP(R3)	;*** Step dg discard count
+	BRW	REM_NEXT_RSP		; Get next response
+	
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_IDREC,	PROCESS RECEIVED ID
+
+;+
+; If the transaction ID = 0, then this ID packet is either unsolicited
+; or a response to the configuration poller and it is given to the CONFIG
+; module, entry CNF$IDREC.  
+;
+;
+; Inputs:
+;
+;	R2			-Addr of message
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R3,R5		-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_IDREC:
+
+	TSTL	PPD$Q_XCT_ID(R2)	; Check l.o. XCT_ID
+	BNEQ	10$			; Branch if non-zero
+	TSTL	PPD$Q_XCT_ID+4(R2)	; Check h.o. XCT_ID
+	BNEQ	10$			; Branch if non-zero
+	BSBW	CNF$IDREC		; Else call config module
+	BRB	20$			; Get next response
+
+10$:	BSBW	SCS$DISCARD_DG		; Return buffer to free
+					;  queue and ignore
+
+20$:	BRW	REM_NEXT_RSP		; Get next response
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_LBREC,	PROCESS RECEIVED LB DG
+
+;+
+; The loopback datagram is verified and discarded by CNF$LBREC
+;
+; Inputs:
+;
+;	R2			-Addr of LB dg
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_LBREC:
+
+	BSBW	CNF$LBREC		; Call routine in PACONFIG 
+	BRW	REM_NEXT_RSP		; Get next response
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_MSGREC,	PROCESS RECEIVED MESSAGE
+
+;+
+; REC_MSGREC checks the SCS message type field.  If the type code
+; is SCS$C_APPL_MSG, then processing continues.  Otherwise, the messge
+; is an SCS control message and routine SCS$REC_SCSMSG in module PASCSCTL
+; is called.
+;
+; For application messages, REC_MSGREC checks that the connection
+; ID is legal.  If not, the message buffer is discarded (returned to
+; the free queue) and processing ends.  Otherwise, the connection credit
+; bookkeeping is done and the SYSAP's message input address is called.
+; The SYSAP is responsible for disposing of the message buffer.  Upon 
+; return from the SYSAP, REC_MSGREC branches to REM_NEXT_RSP.
+;
+; Inputs:
+;
+;	R2			-Addr of message
+;	R4			-Addr of PDT
+;	R5			-Addr of UCB 0
+;
+; Outputs:
+;
+;	R0-R3,R5		-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_MSGREC:
+
+	.IF	DF PA$DEBUG		; Debug facility
+	BSBW	TRC$LOGMSG		; Log message
+	.ENDC				;
+
+	CMPW	SCS$W_MTYPE(R2),-	; Is this an application
+		#SCS$C_APPL_MSG		;  message?
+	BEQL	10$			; Branch if yes
+	PUSHL	R4			; Save R4(PDT) for REM_NEXT_RSP
+	BSBW	SCS$REC_SCSMSG		; Message is SCS control --
+					;  go handle
+	POPL	R4			; Restore
+	BRW	REM_NEXT_RSP		; Get next response
+	
+10$:	BSBW	INT$CHK_DCONID		; Verify destination CONID
+	BLBC	R0,30$			; Branch if invalid
+	DECW	CDT$W_REC(R3)		; Decrement send credit held
+					;  by remote
+	ADDW	SCS$W_CREDIT(R2),-	; Add credit extended by remote to
+		CDT$W_SEND(R3)		;  to send credit
+	SUBW3	#<SCS$C_APPL_BASE - PPD$C_LENGTH>,-
+		SCS$W_LENGTH(R2),R1	; Set size of applicaton data
+	MOVZWL	R1,R1			;  for SYSAP
+	ADDL	PDT$L_MSGHDRSZ(R4),R2	; Compute addr of application data
+	MOVQ	R3,-(SP)		; Save CDT & PDT address
+	JSB	@CDT$L_MSGINPUT(R3)	; Call SYSAP message input address
+	MOVQ	(SP)+,R3		; Retreive CDT & PDT address
+
+CHK_CRWAIT:
+
+	TSTW	CDT$W_SEND(R3)		; Any send credit?
+	BEQL	30$			; Branch if not
+	$RESUME_FP	-		; Else, resume next waiter,
+		@CDT$L_CRWAITQFL(R3),-	;
+		QEMPTY=30$		;  branching if none.
+	BRB	CHK_CRWAIT		; Check for more credit
+
+30$:	BRW	REM_NEXT_RSP		; Get next response
+
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_RDCNT,	PORT COUNTERS READ
+
+;+
+; REC_RDCNT returns the received buffer of port counters to the
+; SYSAP that owns the port counters currently.  If the SYSAP specifed
+; a release of the counters, then the counters busy flag is cleared.
+;
+; Inputs:
+;
+;	R2			-Addr of dg buffer containing counters
+;	R4			-Addr of PDT
+;
+;	PDT$L_CNTCDRP(R4)	-CDRP holding suspended SYSAP context
+;
+; Outputs:
+;
+;	R0-R3,R5		-Destroyed
+;
+;	Other registers		-Preserved
+;
+;	PDT$W_FLAGS(R4)		-If PDT$M_CNTRLS is set, then PDT$M_CNTRLS
+;				 and PDT$M_CNTBSY are both cleared
+;-
+
+	.ENABL	LSB
+
+REC_RDCNT:
+
+	BBCC	#PDT$V_CNTRLS,-		; Branch if no release of
+		PDT$W_FLAGS(R4),10$	;  counters is pending
+	BICW	#PDT$M_CNTBSY,-		; Else this is a release --
+		PDT$W_FLAGS(R4)		;  clear counters busy
+
+10$:	MOVL	PDT$L_CNTCDRP(R4),R5	; Get SYSAP's CDRP
+	MOVZWL	#SS$_NORMAL,R0		; Set success status for SYSAP
+	PUSHL	R4			; Save PDT addr
+	MOVQ	CDRP$L_FR3(R5),R3	; Get SYSAP's saved R3, R4
+	JSB	@CDRP$L_FPC(R5)		; Call SYSAP back with results
+	POPL	R4			; Retreive PDT addr
+	BRW	REM_NEXT_RSP		; Go for next response
+
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_SETCKT,	SET CIRCUIT DONE
+
+;+
+; The only SETCKT issued for which a success notification is requested is
+; in ERR$CRASHVC_MSG/PB which closes a VC on which a software-detected error
+; has occurred.  REC_SETCKT calls ERR$CLOSEDVC_MSG to continue the failure
+; process of notifying all SYSAP's with connections on the failing circuit
+; and possibly deleting the path block if the SYSAP's all DISCONNECT promptly.
+; All other SETCKT's with RETFLAG = TRUE are intended to simply return
+; the datagram buffer to pool.
+;
+; 
+; Inputs:
+;
+;	R2			-Addr of SETCKT dg
+;	R4			-Addr of PDT
+;	R5			-Addr of UCB 0
+;
+; Outputs:
+;
+;	R0,R1			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_SETCKT:
+
+	.IF	DF PA$DEBUG		; Debug facility
+	BSBW	TRC$LOGMSG		; Log set circuit
+	.ENDC				;
+
+	BBC	#PPD$V_DISPOSE,-	; If notification not requested,
+		PPD$B_SWFLAG(R2),10$	;  branch around it
+	MOVZWL	#SS$_POWERFAIL,R1	; Set aux status to power failure
+					;  (a fib, but lets SYSAP know that
+					;  recovery will happen.)
+	BSBW	ERR$VCCLOSED_MSG	; Go lookup PB and notify
+					;  all SYSAP's with connections
+	BRW	REM_NEXT_RSP		; Go for next response
+
+10$:	BSBW	SCS$DEAL_DG		; Return dg buffer to pool
+	BRW	REM_NEXT_RSP		; Go for next response
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_SNDDG,	PROCESS SENT DATAGRAM
+	.SBTTL	-	INT$DISP_SENDDG,DISPATCH A SENT DG
+
+;+
+; REC_SNDDG checks the datagram disposal flag, PPD$M_DISPOSE in
+; PPD$B_SWFLAG.  If the flag is 0, then the datagram buffer is
+; deallocated to nonpaged pool  If the flag is set, then the sent
+; datagram is passed to the SYSAP with R0 set to indicated that
+; the datagram is a sent dg rather than a new received dg.
+;
+; Inputs:
+;
+;	R2			-Addr of message
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R1			-Length of application data
+;	R0,R2,R3,R5		-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_SNDDG:
+
+	.IF	DF PA$DEBUG		; Debug facility
+	BSBW	TRC$LOGMSG		; Log datagram
+	.ENDC				;
+
+	BSBB	INT$DISP_SENDDG		; Call routine to dispatch
+					;  datagram
+	BRW	REM_NEXT_RSP		; Go get next response
+
+
+INT$DISP_SENDDG::
+
+	CMPW	PPD$W_MTYPE(R2),-	; Is PPD type = SCS?
+		#PPD$C_SCS_DG		;  (If not, PPD dg is assumed)
+	BNEQ	20$			; Branch if not since returned
+					;  PPD dg's always go back to pool
+	BSBW	INT$CHK_SCONID		; Verify sending connection ID
+	BLBC	R0,30$			; Branch if invalid
+	BITB	#PPD$M_DISPOSE,-	; Is disposal flag set?
+		PPD$B_SWFLAG(R2)	;
+	BEQL	20$			; Branch if clear, dg --> pool
+	MOVZBL	#1,R0			; Set flag to indicate DGSNT
+	SUBW3	#<SCS$C_APPL_BASE - PPD$C_LENGTH>,-
+		SCS$W_LENGTH(R2),R1	; Application data = DG length -
+					;  SCS header size
+	MOVZWL	R1,R1			; Expand to longword
+	ADDL	PDT$L_DGHDRSZ(R4),R2	; Compute addr of appliation
+					;  data
+	PUSHL	R4			; Save R4(PDT) for REM_NEXT_RSP
+	JSB	@CDT$L_DGINPUT(R3)	; Call SYSAP  to dispose of dg buffer
+	POPL	R4			; Restore
+	RSB				; Return
+
+20$:	BSBW	SCS$DEAL_DG		; Deallocate dg to pool
+	RSB				; Return
+
+30$:	BRW	RSP_CRASH_PORT		; Go init port crash
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_SNDMSG,	PROCESS SENT MESSAGE
+
+;+
+; REC_SNDMSG simply calls FPC$DEALLMSG2 to deallocate the sent message.
+; The deallocate takes care of flow control and may deallocate the
+; buffer to the free queue if the free queue is low, or to pool.
+;
+; Inputs:
+;
+;	R2			-Addr of message
+;	R4			-Addr of PDT
+;	R5			-Addr of UCB 0
+;
+; Outputs:
+;
+;	R0-R3,R5		-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_SNDMSG:
+
+	.IF	DF PA$DEBUG		; Debug facility
+	BSBW	TRC$LOGMSG		; Log message
+	.ENDC				;
+
+	BSBW	INT$CHK_SCONID		; Verify source 
+	BLBC	R0,20$			;  connect ID
+	BSBW	FPC$DEALLMSG2		; Deallocate buffer
+	BRW	REM_NEXT_RSP		; Get next response
+
+20$:	BRW	RSP_CRASH_PORT		; Go init port crash
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_REQID,	ID REQUESTED
+	.SBTTL	-	REC_SNDRST,	RESET SENT
+	.SBTTL	-	REC_SNDSTRT	START SENT
+
+;+
+; Request ID's sent with RETFLAG = TRUE come here.  They are simply
+; deallocated to nonpaged pool.  It is immaterial whether the REQID 
+; packet incurred an error or not.
+;
+; Maintenance reset and start are always sent with RETFLAG = TRUE in
+; order that their buffers can be reclaimed for pool.
+;
+; Inputs:
+;
+;	R2			-Addr of datagram
+;	R4			-Addr of PDT
+;	R5			-Addr of UCB 0
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_INVTC:
+REC_REQID:
+REC_SNDRST:
+REC_SNDSTRT:
+
+	BSBW	SCS$DEAL_DG		; Return buffer to pool
+	BRW	REM_NEXT_RSP		; Get next response
+
+	.DSABL	LSB
+
+	.SBTTL	PROCESSING OF ERROR STATUS IN RESPONSE
+
+;+
+; Branch to RSP_ERROR on all types of response status error, i.e.,
+; PPD$M_ERR not 0.  There are several error strategies depending
+; upon the severity of the error and on whose fault it is most likely
+; to be:
+;
+; -Crash the VC if this is a new error on this VC deemed to be
+;  the fault of the remote system or port.
+;
+; -Drain (or process) the response if the VC closure has already been
+;  initiated, e.g., if the status is 'virtual circuit closed.'
+;
+; -Bugcheck if this is an error can only be the fault of the local 
+;  software.
+;
+; -Crash (reinit) the port and all VC's on it by simulation of a 
+;  power fail recovery if this might be a local port failure or if
+;  this is a potential transient software failure.
+;
+; Dispatch first on the status type field as follows:
+;
+;	Type value		Action
+;
+;	PPD$C_TYPOK		Go to PATH_FAIL.  Only one path
+;				failed, the transmission succeeded,
+;				so PATH_FAIL has no effect on the VC.
+;
+;	PPD$C_TYPVCC		Virtual circuit closed due to 
+;				previously reported error.  In this
+;				case, go to RSP_VC_CLOSED to dispatch
+;				on opcode/ppd type code.
+;
+;	PPD$C_TYPINVBN		Invalid buffer name. Crash port.
+;
+;	PPD$C_TYPBLV		Local buffer length violation. 
+;				Crash port.
+;
+;	PPD$C_TYPACCV		Block xfer local access control 
+;				violation. Crash port.
+;
+;	PPD$C_TYPNP		No path left.  Go to RSP_NO_PATH
+;				to dispatch on opcode/ppd type.
+;
+;	PPD$C_TYPBMSE		Buffer memory system error. 
+;				Crash port.
+;
+;	PPD$C_TYPOTHER		Other error defined by the subtype.
+;				Go to RSP_SUBTYP_CHK to dispatch
+;				on subtype code.
+;
+;
+; At RSP_SUBTYP, the subtype error status is picked up and dispatched on
+; as follows:
+;
+;	Subtype code		Action
+;
+;	PPD$C_STPSV		Pkt size violation.  Go to RSP_PKTSIZ_VIO
+;				to dispatch on opcode and ppd type
+;				since some opcodes represent errors
+;				generatied at the remote side and some 
+;				represent local errors.
+;
+;	PPD$C_STURP		Unrecognized packet.  These are
+;				packets with invalid information
+;				received from remote systems.  Go
+;				to RESP_UNREC_PKT to log and discard.
+;
+;	PPD$C_STINVDP		Invalid destination port. Crash port.
+;
+;	PPD$C_STURC		Unrecognized local command. Crash port.
+;
+;	PPD$C_STABO		Aborted command.  This status is returned
+;				upon an orderly (host requested) disable 
+;				of the port.  Since this disable is currently
+;				never requested by PADRIVER, this status is 
+;				illegal and causes a port crash.
+;
+; Inputs:
+;
+;	R2			-Addr of response pkt
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R4			-Preserved
+;
+;	Branch back to REM_NEXT_RSP
+;	unless port is crashed in which
+;	case return is taken to the fork
+;	dispatcher.
+;-
+
+
+	.SBTTL	-	MACROS TO DEFINE ACTION TABLE
+
+;+
+; Each status requiring opcode/ppd type specific action has a
+; table of opcodes, PPD types, and an action routine to call for
+; each opcode-ppd type combination.  The format of the table is as
+; follows:
+;
+;	.BYTE	opcode
+;	.BYTE	link to next opcode, 0 if no more
+;	.WORD	ppd type, -1 if any ppd type ok
+;	.WORD	offset to action routine
+;	...
+;
+;	.BYTE 	opcode
+;	...
+;
+; Note that for each opcode-ppd type pair, only one action routine
+; is allowed.  There may be several possible ppd types for a given
+; opcode, each specifying a different action routine, but the list
+; of ppd types should end with ppd type of OTHER to handle all other
+; values of ppd type.
+;
+; The following macros define entries in the action tables:
+;
+; OPCODE opcode,[rtn],[last]		; Defines the opcode byte and
+;					;  link to next opcode.  Link
+;					;  is -1 if last not specified.
+; 					;  If rtn is specified, then
+;					;  PPDTYPE ANY, and ACTION RTN
+;					;  are also invoked.
+;
+; PPDTYPE typc				; Defines the ppd type field,
+;					;  -1 if typc = ANY or OTHER.
+;
+; ACTION rtn				; Defines the offset to the
+;					;  action routine relative to
+;					;  the ppd type code.
+;-
+
+;
+; Define OPCODE opcode,[rtn],[last] macro:
+;
+
+	.MACRO	OPCODE	OPC,RTN,LAST
+	 
+	 $$$=.				; Save start of this entry
+	 .BYTE	PPD$C_'OPC'		; Opcode
+	 .IF	NE $$$LAST_OPC		; If there was a previous
+	 .=$$$LAST_OPC+EOA$B_NEXTOPC	;  opcode entry, go back and
+	 .BYTE $$$-$$$LAST_OPC		;  fill in its fwd link
+	 .=$$$+EOA$B_NEXTOPC		;  and reset ptr to this entry
+	 .ENDC				;
+
+	 .BYTE	0			; Set fwd link to no more for now
+
+	 $$$LAST_OPC=$$$		; Redefine last opcode to this
+	
+	 .IF	NB LAST			; If this is last opcode in
+	 $$$LAST_OPC=0			;  in action table, then reset
+	 .ENDC				;  last opcode to 0
+
+	 .IF	NB RTN			; If action routine specified,
+	 PPDTYP	ANY			;  the set ppd type to any ok
+	 ACTION	RTN			;  and fill in action routine offset
+	 .ENDC				;
+
+	.ENDM	OPCODE
+
+$$$LAST_OPC = 0				; Initialize addr of last opcode entry
+
+;
+; Define macro to specify PPD type:
+;
+
+	.MACRO	PPDTYP	TYPC
+
+	 $$$=.				; Save start of this entry
+	 .IF	IDN TYPC,ANY		; If any ppd type ok,
+	 .WORD	-1			;  set ppd type to -1
+	 .ENDC
+	 .IF	IDN TYPC,OTHER		; If any ppd type ok,
+	 .WORD	-1			;  set ppd type to -1
+	 .ENDC
+	 .IF	DIF TYPC,ANY		; If neither any nor
+	 .IF	DIF TYPC,OTHER		;  other is specified, then
+	 .WORD	PPD$C_'TYPC'		;  set specified ppd type code
+	 .ENDC
+	 .ENDC
+
+	.ENDM	PPDTYP
+
+;
+; Define ACTION macro to define offset to action routine to call:
+;
+
+	.MACRO	ACTION	RTN
+
+	 .WORD	RTN-$$$			; Offset = routine addr -
+					;  ppd type code addr
+
+	.ENDM	ACTION
+
+;
+; Define symbolic offsets to the opcode entry in the error-opcode
+; action table (EOA) and to the ppd action entry (PPA):
+;
+
+EOA$B_OPC	=0			; Opcode
+EOA$B_NEXTOPC	=1			; Link to next opcode, 0 if none
+EOA$W_PPDTYP	=2			; 1st ppd type code for this opcode
+
+PPA$W_PPDTYP	=0			; PPD type code
+PPA$W_RTN	=2			; Action routine offset
+PPA$C_LENGTH	=4			; Length of PPD action entry
+
+	.SBTTL	-	OPCODE-DEPENDENT ERROR ACTION TABLE
+
+;
+; Define the opcode/ppd type specifie handling for the three
+; kinds of error that require opcode examination:
+;
+
+ACT_NO_PATH:				; No path status
+
+	OPCODE	SNDDG
+
+	 PPDTYP	SCS_DG
+	 ACTION	RSP_CRASH_VC
+
+	 PPDTYP	OTHER
+	 ACTION	RSP_IGNORE_ERR
+
+	OPCODE	SNDMSG
+
+	  PPDTYP SCS_MSG
+	  ACTION RSP_CLOSED_VC
+
+	  PPDTYP CACHECLR
+	  ACTION ERR$CACHECLR
+
+	  PPDTYP OTHER
+	  ACTION RSP_CRASH_PORT
+	
+	OPCODE	SNDDAT, RTN=RSP_CLOSED_VC
+
+	OPCODE	RETDAT, RTN=RSP_CLOSED_VC
+
+	OPCODE	RETCNF, RTN=RSP_CLOSED_VC
+
+	OPCODE	REQDAT, RTN=RSP_CLOSED_VC
+
+	OPCODE	SNDLB, RTN=RSP_DISCARD_ERR
+
+	OPCODE	REQID, RTN=RSP_PATH_FAIL
+
+	OPCODE	SNDRST, RTN=RSP_CRASH_VC
+
+	OPCODE	SNDSTRT, RTN=RSP_CRASH_VC,-
+			LAST=TRUE
+
+
+ACT_PKTSIZ_VIO:
+
+	OPCODE	SNDDG, RTN=RSP_CRASH_PORT
+
+	OPCODE	SNDMSG, RTN=RSP_CRASH_PORT
+
+	OPCODE	SNDDAT, RTN=RSP_CRASH_PORT
+
+	OPCODE	DATREC, RTN=RSP_CRASH_PORT
+
+	OPCODE	SNDLB,	RTN=RSP_CRASH_PORT
+
+	OPCODE	LBREC, RTN=RSP_CRASH_PORT
+
+	OPCODE	MSGREC, RTN=RSP_CLOSED_VC
+
+	OPCODE	RETDAT, RTN=RSP_CLOSED_VC
+
+	OPCODE	RETCNF, RTN=RSP_CLOSED_VC
+
+	OPCODE	DGREC, LAST=TRUE
+
+	 PPDTYP	SCS_DG
+	 ACTION	RSP_CRASH_VC
+
+	 PPDTYP	OTHER
+	 ACTION	RSP_IGNORE_ERR
+
+
+
+ACT_VC_CLOSED:				; VC closed status
+
+	OPCODE	SNDMSG
+
+	 PPDTYP	SCS_MSG
+	 ACTION	RSP_DRAIN_ERR
+
+	 PPDTYP	CACHECLR
+	 ACTION	ERR$CACHECLR
+
+	 PPDTYP	OTHER
+	 ACTION	RSP_CRASH_PORT
+
+	OPCODE	SNDDAT, RTN=RSP_DRAIN_ERR
+
+	OPCODE	RETDAT, RTN=RSP_DRAIN_ERR
+
+	OPCODE	RETCNF,	RTN=RSP_DRAIN_ERR
+
+	OPCODE	REQDAT, RTN=RSP_DRAIN_ERR,-
+			LAST=TRUE
+
+	.SBTTL	-	RSP_ERROR,	DISPATCH ON ERROR
+	.SBTTL	-			TYPE
+
+;+
+; RSP_ERROR is branched to when a response packet with any sort
+; of error is dequeued.  RSP_ERROR dispatches on the error type and 
+; subtype fields in the status.
+;-
+
+	.ENABL	LSB
+
+RSP_ERROR:
+
+	EXTZV	#PPD$V_STSTYP,-			; Extract type code
+		#PPD$S_STSTYP,-			;  from response
+		PPD$B_STATUS(R2),R1		;
+
+	$DISPATCH	R1,TYPE=B,-		; Dispatch on type code:
+		<-				;
+		<PPD$C_TYPOK,	RSP_PATH_FAIL>,-;  A path failed
+		<PPD$C_TYPVCC,	RSP_VC_CLOSED>,-;  VC closed
+		<PPD$C_TYPINVBN,RSP_CRASH_PORT>,-;  Invalid buffer name
+		<PPD$C_TYPBLV,	RSP_CRASH_PORT>,-;  Buffer length violation
+		<PPD$C_TYPACCV,	RSP_CRASH_PORT>,-;  Access control violation
+		<PPD$C_TYPNP,	RSP_NO_PATH>,-	 ;  No path left
+		<PPD$C_TYPBMSE,	RSP_CRASH_PORT>,-;  Buffer memory system error
+		<PPD$C_TYPOTHER,RSP_SUBTYP_CHK>,-; Other error
+		>				;
+
+RSP_SUBTYP_CHK:
+
+	EXTZV	#PPD$V_STSST,-			; Extract subtype
+		#PPD$S_STSST,-			;  from response status
+		PPD$B_STATUS(R2),R1		;
+
+	$DISPATCH	R1,TYPE=B,-		; Dispatch on subtype:
+		<-				;
+		<PPD$C_STPSV,	RSP_PKTSIZ_VIO>,-; Pkt size violation,
+		<PPD$C_STURP,	RSP_UNREC_PKT>,-;  Unrecognized rec'd pkt
+		<PPD$C_STINVDP,	RSP_CRASH_PORT>,-;  Invalid destination port
+		<PPD$C_STURC,	RSP_CRASH_PORT>,-;  Unrecognized command
+		<PPD$C_STABO,	RSP_CRASH_PORT>,-;  Aborted command
+		>				;
+
+UNIMP_FCN_ERR:
+
+	BRW	RSP_CRASH_PORT			; Go init port crash
+
+	.DSABL	LSB
+
+	.SBTTL	-	RSP_PATH_FAIL,	PROCESS SINGLE PATH
+	.SBTTL	-			FAILURE
+
+;+
+; RSP_PATH_FAIL records path failures in the configuration
+; database, logs the error if necessary. If the received response
+; was REQID, then there is a possibility that there are no
+; good paths left.  If no good paths remain, branch to  RSP_CRASH_VC
+; to crash the VC. If there is still a good path, return the response
+; pkt to the msg/dg free queue if that is what the response bit in the
+; locally executed command directed the port to do.  I.e., if the 
+; response bit is 0, then, except for the path failure, the port
+; would have put the command buffer on the free queue and this is
+; what is reflected in the connection credit bookkeeping.
+; Continue processing the response since it is ok except for the path failure.
+;
+; Inputs:
+;
+;	R2			-Response addr
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R0,R1			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+RSP_PATH_FAIL:
+
+	BSBW	CNF$LKP_PB_MSG		; Get associated path block
+	BLBC	R0,30$			; Branch if didn't get it
+	CLRL	R0			; Assume path 0 bad
+	BITB	#PPD$M_P0STS,-		; Any error code set in
+		PPD$B_STATUS(R2)	;  in path 0 status?
+	BNEQ	10$			; Branch if not
+	INCL	R0			; Else assume it's path 1 bad
+
+10$:	MOVAB	PB$B_P0_STS(R1)[R0],R0	; Get addr of path status byte
+	BLBC	(R0),20$		; Branch if previous status bad
+					; ***Else log change
+	
+20$:	BICB	#PB$M_CUR_PS,(R0)	; Set current path status bad
+	BISB3	PB$B_P0_STS(R1),-	; OR both path statuses 
+		PB$B_P1_STS(R1),R0	;  together
+	BLBS	R0,30$			; Branch if one path still ok
+	BRW	RSP_CRASH_VC		; Else crash VC
+
+30$:	BBS	#PPD$V_RSP,-		; If response bit is set (response
+		PPD$B_FLAGS(R2),40$	;  requested), branch to process pkt
+	BSBW	INT$INS_FREEQ		; Else insert pkt on appropriate
+					;  free queue
+	BRW	REM_NEXT_RSP		;  and go for next response
+
+40$:	BRW	OPCODE_DISP		; Go process response
+
+	.DSABL	LSB
+
+	.SBTTL	-	RSP_UNREC_PKT,	PROCESS RECEIPT OF
+	.SBTTL	-			UNRECOGNIZED PKT
+
+;+
+; RSP_UNREC_PKT logs the unrecognized packet, disables datagram receipt
+; from the remote port, and discards the packet to the datagdram free
+; queue. 
+;
+; Inputs:
+;
+;	R2			-Response addr
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R0-R3			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+RSP_UNREC_PKT:
+
+	PUSHL	R2			; Save bad command addr
+					; ***Log unrecognized pkt
+	BSBW	CNF$LKP_PB_MSG		; Have we a VC open to this node?
+	BLBC	R0,5$			; Branch if not
+	BSBW	ERR$CRASHVC_MSG		; Else crash the VC
+	BRB	10$			; Dispose of dg
+
+5$:	BSBW	SCS$ALLOC_DG		; Allocate a buffer to do SETCKT
+	BLBC	R0,10$			; Branch if none
+	$SETCKT	-			; Tell port to mark
+		PORT=PPD$B_PORT(R2),-	;  VC closed and to
+		PRIORITY=HIGH,-		;  inhibit datagram reception
+		MASK=#PPD$M_DQI,-
+		MVAL=#PPD$M_DQI,-	;  from this remote port
+		RETFLAG=TRUE,-		;
+		DQI=TRUE		;
+
+10$:	POPL	R2			; Retreive bad command addr
+	BSBW	SCS$DISCARD_DG		; Return datagram entry to free queue
+	BRW	REM_NEXT_RSP		; Go for next response
+
+	.DSABL	LSB
+
+	.SBTTL	-	RSP_NO_PATH,	PROCESS NO PATH
+	.SBTTL	-			STATUS
+	.SBTTL	-	RSP_PKTSIZ_VIO,	PROCESS PACKET SIZE
+	.SBTTL	-			VIOLATION STATUS
+	.SBTTL	-	RSP_VC_CLOSED,	PROCESS VC CLOSED
+	.SBTTL	-			STATUS
+
+;+
+; These three error status types require examination of the opcode and,
+; in some cases, the PPD type code to determine proper error handling.
+;
+; Each of the three entries pick up the address of the appropriate error action
+; table.  Further processing consists fo searching the opcodes in the action 
+; table for a match.  Failure to find a match results in a port crash since this
+; may be an error in software processing or a garbaged response. When the
+; correct opcode is located, then the PPD type is matched if required, and
+; the specified action routine is branched to.
+;
+; Register usage throughout is as follows:
+;
+;	R2			-Response pkt addr
+;	R3			-Addr of current PPD entry in action table
+;	R4			-PDT addr
+;	R5			-Addr of current opcode entry in action table
+;
+; Inputs:
+;
+;	R2			-Response pkt addr
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	Other registers		-Preserved
+;
+;	Branch to REM_NEXT_RSP
+;-
+
+	.ENABL	LSB
+
+RSP_NO_PATH:
+
+	MOVAL	ACT_NO_PATH,R0		; Get no path action table
+	BRB	10$			; Join common code
+
+RSP_PKTSIZ_VIO:
+
+	MOVAL	ACT_PKTSIZ_VIO,R0	; Get pkt size violation act table
+	BRB	10$			; Join common code
+
+RSP_VC_CLOSED:
+
+	MOVAL	ACT_VC_CLOSED,R0	; Get VC closed action table
+
+10$:	MOVL	R0,R5			; Get action table addr
+
+CMP_OPCODE:
+
+	CMPB	EOA$B_OPC(R5),-		; Does this opcode entry match
+		PPD$B_OPC(R2)		;  opcode in response?
+	BNEQ	NXT_OPCODE		; Branch if not
+	MOVAL	EOA$W_PPDTYP(R5),R3	; Init R3 to 1st PPD type entry
+
+CHK_ANY_PPD:
+
+	CMPW	(R3),#-1		; Any PPD type valid?
+	BEQL	CALL_ACTION		; Branch if yes
+
+CMP_PPD:				; Else check for right type
+
+	CMPW	(R3),PPD$W_MTYPE(R2)	; Right PPD type?
+	BEQL	CALL_ACTION		; Branch if so
+	MOVAL	PPA$C_LENGTH(R3),R3	; Else step to next PPD type
+	BRB	CHK_ANY_PPD		;  and check it
+
+CALL_ACTION:
+
+	CVTWL	PPA$W_RTN(R3),R0	; Get offset to routine
+	JMP	(R3)[R0]		; Call routine to process and
+					;  and dispose of response pkt
+
+NXT_OPCODE:
+
+	CVTBL	EOA$B_NEXTOPC(R5),R0	; Get link to next opcode
+	BNEQ	20$			; Branch if got one
+	BRW	RSP_CRASH_PORT		; Go init port crash
+
+20$:	ADDL	R0,R5			; Else step to next opcode entry
+	BRB	CMP_OPCODE		; Go see if it's right
+
+	.DSABL	LSB
+
+	.SBTTL	-	ACTION ROUTINES
+	.SBTTL	-		RSP_CLOSED_VC
+
+;+
+; RSP_CLOSED_VC handles errors that resulted in the port closing the
+; virtual circuit.  It calls ERR$CLOSEDVC_MSG to notify SYSAP's 
+; owning connections on this VC.  It then branches to RSP_DRAIN_ERR
+; to dispose of the response contianing error status.
+;
+; Inputs:
+;
+;	R2			-Response addr
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+RSP_CLOSED_VC:
+
+	MOVZWL	#SS$_VCCLOSED,R1	; Set status to give SYSAP
+	BSBW	ERR$VCCLOSED_MSG	; Call VC closed handler
+					; ***Log error
+	BRB	RSP_DRAIN_ERR		; Go dispose of response
+
+	.DSABL	LSB
+
+	.SBTTL	-		RSP_CRASH_PORT
+
+;+
+; RSP_CRASH_PORT crashes the port by calling ERR$CRASH_PORT and
+; then draining the response currently held.
+;
+; Inputs:
+;
+;	R2			-Response addr
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+RSP_CRASH_PORT:
+
+	BSBW	ERR$CRASH_PORT		; Force port to crash
+					;***Log event
+	BRB	RSP_DRAIN_ERR		; Go dispose of response
+
+	.DSABL	LSB
+
+
+	.SBTTL	-		RSP_CRASH_VC
+
+;+
+; RSP_CRASH_VC calls ERR$CRASHVC_MSG to initialize VC closure on an
+; open VC and then branches to RSP_DRAIN_ERR to dispose of the error 
+; response.  Return is taken from RSP_DRAIN_ERR.
+;
+; Inputs:
+;
+;	R2			-Response addr
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+RSP_CRASH_VC:
+
+	MOVZWL	#SS$_POWERFAIL,R1	; Set aux status for SYSAP --
+					;  it isn't accurate, but gives
+					;  SYSAP right info about severity
+	BSBW	ERR$CRASHVC_MSG		; Initiated crash
+					;***Log event
+	BRB	RSP_DRAIN_ERR		; Go dispose of response
+
+	.DSABL	LSB
+
+		.SBTTL	-		RSP_DRAIN_ERR
+
+;+
+; RSP_DRAIN_ERR is called to dispose of a response once appropriate
+; virtual circuit crash/sysap notification action has been taken. 
+; If the response bit is 0, then this packet is either a sent command
+; intended to be returned to the free queue or a response occupying a
+; free queue entry.  The buffer is returned to the appropriate free queue.
+; If the response bit is set, then this is a sent command with requested
+; response regardless of success or failure.  In this case, the buffer
+; is returned to pool unless it is a SNDDG in which case it is processed
+; as if no error occurred.  Thus SNDDG's can be returned to the SYSAP if
+; requested by the SYSAP.
+;
+; Inputs:
+;
+;	R2			-Response addr
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+RSP_DRAIN_ERR:
+
+	BBS	#PPD$V_RSP,-		; If response bit set,
+		PPD$B_FLAGS(R2),20$	;  go return to pool
+	BSBW	INT$INS_FREEQ		; Put response back on appropriate
+					;  free queue
+	BRW	REM_NEXT_RSP		; Go for next response
+
+20$:	CMPB	PPD$B_OPC(R2),-		; Is this a datagram?
+		#PPD$C_SNDDG		;
+	BEQL	RSP_IGNORE_ERR		; Branch if so to ignore error
+	BSBW	SCS$DEAL_PKT		; Deallocate msg/dg to pool
+	CLRL	R2			; Show pkt gone (debug aid)
+	BRW	REM_NEXT_RSP		; Go for next response
+
+	.DSABL	LSB
+
+	.SBTTL	-		RSP_IGNORE_ERR
+	.SBTTL	-		RSP_DISCARD_ERR
+
+;+
+; RSP_IGNORE_ERR is branched to by the error action dispatcher.  In this
+; case, the error is ok and we want to clear the stack and go to the
+; opcode dispatch to process the response as if there were no error.
+;
+; RSP_DISCARD_ERR is used for error responses that sohould be
+; ignored and returned to pool without any processing.
+;
+; Inputs:
+;
+;	R2			-Response addr
+;	R4			-PDT addr
+;
+;	(SP)			-Return to fork dispatcher
+;
+; Outputs:
+;
+;	none
+;-
+
+	.ENABL	LSB
+
+RSP_IGNORE_ERR:
+
+	BRW	OPCODE_DISP		; Go process response normally
+
+RSP_DISCARD_ERR:
+
+	BSBW	SCS$DEAL_PKT		; Deallocate msg or datagram
+	BRW	REM_NEXT_RSP		; Go for next response
+
+	.DSABL	LSB
+
+	.SBTTL	MISC. ROUTINES
+	.SBTTL	-	INT$CHK_SCONID,	CHECK SENDER CONID
+	.SBTTL	-	INT$CHK_DCONID,	CHECK DESTINATION CONID
+	.SBTTL	-	INT$CHK_XCONID,	CHECK CONID IN XCT_ID
+
+;+
+; INT$CHK_SCONID -- Verifies the sender connection ID in the SCS
+;		    header and returns the address of the CDT
+; INT$CHK_DCONID -- Verifies the destination connection ID in the SCS
+;		    header and returns the address of the CDT
+; INT$CHK_XCONID -- Verifies the connection ID in the CONID portion
+;		    of an XCT_ID in a block xfer message. (First
+;		    longword of XCT_ID)
+;
+; The connection ID index (l.o. word) is extracted and compared
+; with the maximum index number.  If it exceeds the maximum index,
+; return error.  Else, compute the CDT address from the index.  
+; Check the sequence # in the CDT.  If they agree, return success. 
+; Else return error.
+;
+; Inputs:
+;
+;	R2			-Addr of message/datagram buffer
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-1/0 for success/fail
+;	R1			-Destroyed
+;	R3			-Addr of CDT if success
+;	R1			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+INT$CHK_SCONID::
+
+	MOVL	SCS$L_SRC_CONID(R2),R0	; Get source connection ID
+	BRB	10$			; Join common code
+
+INT$CHK_XCONID::
+
+	MOVL	PPD$Q_XCT_ID(R2),R0	; Extract CONID from message
+	BRB	10$			; Join common code
+
+INT$CHK_DCONID::
+
+	MOVL	SCS$L_DST_CONID(R2),R0	; Get destination connection ID
+
+10$:	MOVZWL	R0,R1			; Extract index
+	MOVL	G^SCS$GL_CDL,R3		; Get addr of connx descriptor list
+	CMPW	R1,CDL$W_MAXCONIDX(R3)	; Compare index with maximum
+	BGTRU	BAD_CONID		; Branch if index is too big
+	MOVL	(R3)[R1],R3		; Turn index to CDT address
+	CMPL	CDT$L_LCONID(R3),R0	; ID in msg/dg matches ID in CDT?
+	BNEQ	BAD_CONID		; Branch if not
+	MOVZWL	#SS$_NORMAL,R0		; Else success status
+	RSB				; Return
+
+BAD_CONID:
+
+	CMPW	SCS$W_MTYPE(R2),-	; Is this an application message?
+		#SCS$C_APPL_MSG		;
+	BNEQ	20$			; Branch if not
+	$INS_MFREEQ			; Return message buffer to free queue
+	BRB	30$			; Join common exit
+
+20$:	$INS_DFREEQ			; Return dg buffer to free queue
+
+30$:	CLRL	R0			; Set status to failure
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	INT$FATALQ_IDFQ, ERROR INSERTING ON DFQ
+	.SBTTL	-	INT$FATALQ_IMFQ, ERROR INSERTING ON MFQ
+	.SBTTL	-	INT$FATALQ_CQL,  ERROR INSERTING ON COMQL
+	.SBTTL	-	INT$FATALQ_CQH,  ERROR INSERTING ON COMQH
+	.SBTTL	-	INT$FATALQ_RSPQ, ERROR REMOVING FROM RSPQ
+	.SBTTL	-	INT$FATALQ_RDFQ, ERROR REMOVING FROM DFQ
+	.SBTTL	-	INT$FATALQ_RMFQ, ERROR REMOVING FROM MFQ
+
+;+
+; These routine are BSBW'ed to when the interlocked queue instruction
+; fails to obtain the interlock after EXE$GL_LOCKRTRY.  On insert
+; instructions recovery action is to dispose of the buffer in hand,
+; call ERR$CRASH_PORT to initialte crash of the port, clear Z bit
+; to inhibit port notification and return to caller.  On remove 
+; instructions, recovery consists of calling ERR$CRASH_PORT to initiate
+; crashing of the port, setting the V bit to show nothing removed,
+; and return to caller.
+;
+; Inputs:
+;
+;	R2			-Addr of packet to insert (IDFQ,
+;				 IMFQ, CQL, CQH)
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;
+;	Other registers		-Preserved
+;
+;	Z bit			-Clear
+;	V bit			-Set
+;-
+
+	.ENABL	LSB
+
+INT$FATALQ_IDFQ::
+
+INT$FATALQ_IMFQ::
+
+INT$FATALQ_CQL::
+
+INT$FATALQ_CQH::
+
+					;***Log event
+
+	BRB	20$			; Join common processing
+
+INT$FATALQ_RSPQ::
+
+INT$FATALQ_RDFQ::
+
+INT$FATALQ_RMFQ::
+
+					;***Log
+
+	BRB	30$			; Join common processing
+
+20$:	BSBW	ERR$DISP_ENTRY		; Dispose of buffer
+
+30$:	PUSHL	R1			; Save caller's R1
+	BSBW	ERR$CRASH_PORT		; Init port crash
+	POPL	R1			; Restore caller's R1
+	MOVB	#^X7F,R0		; Clear Z bit
+	INCB	R0			;  and set overflow
+	RSB				; Return to caller
+
+	.DSABL	LSB
+
+	.SBTTL	-	INT$INS_FREEQ,	DETERMINE IF PKT
+	.SBTTL	-			IS MSG OR DG AND
+	.SBTTL	-			INSERT OF FREE QUEUE
+
+;+
+; INT$INS_FREEQ examines the software structure type to determine if 
+; this packet is a CU message or datagram.  It inserts messages on
+; the message free queue and datagrams on the datagram free queue.
+;
+; Inputs:
+;
+;	R2			-Packet addr
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;	R2			-Zero (debug aid)
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+INT$INS_FREEQ::
+
+	CMPB	PPD$B_TYPE(R2),-	; Is this a 
+		#DYN$C_CIDG		;  datagram?
+	BEQL	20$			; Branch if not
+	$INS_MFREEQ			; Return pkt to msg free queue
+10$:	CLRL	R2			; Show packet gone
+	RSB				; Return
+
+20$:	$INS_DFREEQ			; Insert packet on dg free queue
+	BRB	10$			; Join common code
+
+	.DSABL	LSB
+
+
+
+
+	.END

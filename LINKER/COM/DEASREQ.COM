@@ -1,0 +1,10 @@
+$ deassign prefix
+$ deassign datbas
+$ deassign isgenc
+$ deassign tiraux
+$ deassign lnkmsgdef
+$ deassign crfmdl
+$ deassign starletl32
+$ deassign libl32
+$ deassign climacl32
+$ deassign tpamacl32

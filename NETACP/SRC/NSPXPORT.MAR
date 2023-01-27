@@ -1,0 +1,1434 @@
+	.TITLE	NSPXPORT  - Transport Layer For DECnet
+	.IDENT	'V03-000'
+
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;++
+; FACILITY:
+;
+;	VAX/VMS NETDRIVER
+;
+; ABSTRACT:
+;
+;	This module controls the DECnet Transport packet switching function.
+;
+; AUTHOR:
+;
+;	A.ELDRIDGE	19-Mar-80
+;
+; MODIFIED BY:
+;
+;	V03-11	ADE0016		A.Eldridge	02-Mar-1982
+;		CXB$L_ENDACTION has been moved to the datalink impure 
+;		area of the CXB.  Therefore, save this routine address in 
+;		IRP$L_SAVD_RTN since the datalink driver will not touch it
+;		there.   Also, call end-action routine with CXB pointer in
+;		R4.
+;
+;	V03-10	ADE0015		A.Eldridge	16-Feb-1982
+;		Add conditionally assembled code to support message
+;		journalling.
+;
+;	V03-09	ADE0014		A.Eldridge	13-Jan-1982
+;		Fix bugs in receiver "buffail" code.
+;
+;	V03-08	ADE0013		A.Eldridge	31-Dec-1981
+;		Added support for datalinks which do buffered I/O on
+;		transmission
+;
+;	V03-07	ADE0012		A.Eldridge	29-Dec-1981
+;		R3 was used as the IRP pointer just after TR$REACT_RCV.
+;		Change this to R5 since the IRP has just come from IOPOST.
+;
+;	V03-06	ADE0011		A.Eldridge	 9-Dec-1981
+;		On transmissions, CXB$L_ENDACTION is now setup by the layer
+;		which builds the datagram.  It used to be passed in R4 and
+;		setup by Transport.
+;
+;	V03-05	ADE0003		A.Eldridge	 8-Dec-1981
+;		Added support for the requirement that buffers be in CXB
+;		format.
+;
+;	V03-04	ADE0002		A.Eldridge	28-Nov-1981
+;		Added support for VMS performance monitoring by updating
+;		selected PMS$L... cells.
+;
+;	V03-03	ADE0001		A.Eldridge	28-Nov-1981
+;		Consolidated all changes to date.
+;
+;--
+
+;
+;  EXTERNAL SYMBOLS
+;
+	$AQBDEF			; ACP Queue Block
+	$CADEF			; Conditionally turn on performance monitoring
+	$CXBDEF			; Complex chained buffer
+	$IPLDEF			; Define interrupt priority levels
+
+;
+; MACROS
+;
+
+.MACRO	INCPMS	PMS_CELL			; Increment PMS cell
+	.IF DF	CA$_MEASURE			;
+	.IF NE	CA$_MEASURE			; Conditional assembly
+		INCL	G^PMS$GL_'PMS_CELL'	; Bump the counter
+	.ENDC					;
+	.ENDC					;
+.ENDM	INCPMS					; 
+	$IRPDEF			; I/O Request Packet
+	$UCBDEF			; Fork Block 
+	$VADEF			; Virtual address symbols
+	$XMDEF			; DMC-11 Driver symbols
+
+	$NETSYMDEF		; Miscellaneous symbols
+	$NETMSGDEF		; ACP receive buffer symbols
+	$NETUPDDEF		; LPD 'update' function codes
+	
+	$LPDDEF			; Logical Path Descriptor
+	$RCBDEF			; Routining Control Block
+	$WQEDEF			; Work Queue Element	
+
+
+	TR$C_PH2_NOP	= ^X<08>		;&
+	TR$C_PH2_STR	= ^X<58>		;&
+	TR$V_PH2_RTHDR	= 6			;&put in library
+	TR$C_PH3_HELLO	= 5
+	TR$C_PH3_RTHDR  = 2			;
+	TR$V_RTH_RQS	= 3			; Request return to sender
+	TR$V_RTH_RTS	= 4			; On return trip
+
+;	JNX$$$ = 1				; Enables journalling
+
+
+	.PSECT	$$$115_DRIVER,LONG,EXE,RD,WRT
+
+	.SBTTL	TR$INIT_RCV	- Initiate receive sequence on data link
+;+
+; TR$UPDATE  -	Update according to datalink state transition
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; For R0 = NETUPD$_DLL_ON
+;
+; Allocate and initialize a "receive" IRP for a particular LPD and introduce
+; it into the network pool.  This operation happens once each time an LPD
+; becomes available for network traffic.
+;
+; For R0 = NETUPD$_DLL_OFF
+;
+; Reactivate all suspended fork processes associated with the LPD.
+;
+;
+; INPUTS:	R5	NETDRIVER UCB pointer
+;		R4,R3	Scratch
+;		R2	RCB pointer
+;		R1	LPD pointer
+;		R0	Scratch
+;
+; OUTPUTS:	R5	Preserved
+;		R4,R3	Garbage
+;		R2,R1	Preserved
+;		R0	LBS if successful, else LBC
+;
+;-
+			.ENABL	LSB
+TR$UPDATE::					; Update LPD
+	CMPL	R0,#NETUPD$_DLL_ON		; Datalink starting?
+	BEQL	INIT_RCV			; If EQL then yes
+	CMPL	R0,#NETUPD$_DLL_DLE		; Datalink up for direct access
+	BEQL	INIT_DLE			; If EQL yes
+	CMPL	R0,#NETUPD$_REACT_RCV		; Reactivating a receiver ?
+	BEQL	REACT_RCV			; If NEQ then unknown fct
+	CLRL	R0				; Indicate error
+	RSB
+
+REACT_RCV:
+	MOVL	LPD$L_RCV_IRP(R1),R3		; Get IRP
+	CLRL	LPD$L_RCV_IRP(R1)		; No longer attached to LPD
+	MOVAB	TR$REACT_RCV,IRP$L_PID(R3)	; Setup return address
+	BRB	20$				; Continue in common
+
+INIT_DLE:					; Link up for service functions
+	MOVAB	W^TR$RCV_DLE,R5			; Setup IRP return address
+	BRB	5$				; Continue
+INIT_RCV:					; Queue receive to data link
+	MOVAB	W^TR$RCV_DATA,R5		; Setup IRP return address 
+5$:	MOVZWL	#SS$_DEVACTIVE,R0		; Assume error
+	ASSUME	LPD$V_ACTIVE  EQ  0		;
+	BLBS	LPD$W_STS(R1),40$		; Br if already active
+	BSBW	TR$ALLOC_IRP			; Allocate the IRP
+	BLBC	R0,40$				; Br on error
+	INCW	RCB$W_TRANS(R2)			; Account for IRP
+	MOVAB	IRP$L_PID(R3),R4		; Setup ptr to build IRP
+
+	ASSUME	IRP$L_AST	EQ 4+IRP$L_PID
+	ASSUME	IRP$L_ASTPRM	EQ 4+IRP$L_AST
+	ASSUME	IRP$L_WIND	EQ 4+IRP$L_ASTPRM
+	ASSUME	IRP$L_UCB	EQ 4+IRP$L_WIND
+
+	MOVL	R5,(R4)+			; Move return address into PID
+	MOVQ	R1,(R4)+			; LPD,RCB ptrs into AST,ASTPRM
+	MOVQ	LPD$L_WIND(R1),(R4)+		; Enter WIND and UCB ptrs
+	MOVL	LPD$L_UCB(R1),R5		; Setup UCB ptr
+
+	ASSUME	IRP$W_FUNC	EQ 4+IRP$L_UCB
+	ASSUME	IRP$B_EFN	EQ 2+IRP$W_FUNC
+	ASSUME	IRP$B_PRI	EQ 1+IRP$B_EFN
+	ASSUME	IRP$L_IOSB	EQ 1+IRP$B_PRI
+	ASSUME	IRP$W_CHAN	EQ 4+IRP$L_IOSB
+
+	CLRQ	(R4)+				; Clear FUNC,EFN,PRI,IOSB
+	MNEGW	LPD$W_CHAN(R1),(R4)+		; Enter CHAN
+
+	ASSUME	IRP$W_STS	EQ 2+IRP$W_CHAN
+	ASSUME	IRP$L_SVAPTE	EQ 2+IRP$W_STS
+	ASSUME	IRP$W_BOFF	EQ 4+IRP$L_SVAPTE
+	ASSUME	IRP$W_BCNT	EQ 2+IRP$W_BOFF
+
+	MOVW	#<IRP$M_FUNC!IRP$M_BUFIO>,(R4)+	; Setup STS
+	CLRQ	(R4)+				; Clear SVAPTE, BOFF, W_BCNT
+	MOVW	#^X<3FFF>,-2(R4)		; Setup W_BCNT
+
+	ASSUME	IRP$L_BCNT	EQ 0+IRP$W_BCNT
+	ASSUME	IRP$L_IOST1	EQ 6+IRP$L_BCNT
+	ASSUME	IRP$L_IOST2	EQ 4+IRP$L_IOST1
+
+	CLRQ	(R4)+				; Clear high word L_BCNT, next
+						;  reserved word, and IOST1 
+	BBSS	#XM$V_STS_ACTIVE,(R4),10$	; Indicate device active
+10$:	BISW	#LPD$M_ACTIVE,LPD$W_STS(R1)	; Mark LPD active
+20$:	BSBW	POST				; Start the cycle by sending
+						; the IRP thru IOPOST
+30$:	MOVL	#1,R0				; Indicate success
+40$:	RSB
+			.DSABL LSB
+
+;+
+; TR$DEL_SETSTA	-  Set LPD substate
+;
+; INPUTS:	R2	RCB address
+;		R1	New substate value
+;		R0	LPD index
+;
+; OUTPUTS:	R0	Garbage
+;
+;		All other registers have been preserved.
+;
+;-
+TR$DLE_SETSTA::	
+	CMPB	R0,RCB$B_MAX_LPD(R2)	; Path index within range?
+	BGTRU	100$			; If GTRU then no
+	MULL	#LPD$C_LENGTH,R0	; Get LPD vector offset
+	ADDL	RCB$L_PTR_LPD(R2),R0	; Add in base
+	SUBL	#LPD$C_LENGTH-12,R0	; Subtract out bias (first LPD starts 
+					; 12 bytes in and is for path index 1)
+	MOVB	R1,LPD$B_SUB_STA(R0)	; Setup the substate	
+	RSB				; Done
+
+100$:	BUG_CHECK  NETNOSTATE,FATAL	; LPD index too large
+
+
+;+
+; TR$KILL_LOC_LPD - Mark local LPD inactive
+; TR$LPD_DOWN     - Mark LPD inactive
+;
+; FUNCTIONAL DESCRIPTION
+;
+; The LPD is marked inactive.  All suspended fork processes waiting to 
+; transmit over the data link are reactivate with their request to xmit
+; denied.
+;
+; INPUTS:	R6	     LPD address (TR$LPD_DOWN only)
+;		R2	     RCB address
+;
+; OUTPUTS:	R0,R3,R5     Destroyed
+;
+;		All other registers are unchanged.
+;
+;-
+TR$TIMER::					; Entered every clock tick
+	PUSHR	#^M<R2,R3,R4,R5,R6,R7>		; Save regs
+
+	FRKBLKSIZ = 4*6
+
+	SUBL	#FRKBLKSIZ,SP			; Create context block on stack
+						; for the "TALKER" routine
+	MOVZBL	RCB$B_MAX_LPD(R2),R7		; Get number of LPDs
+	BEQL	100$				; If EQL then node
+	MOVL	RCB$L_PTR_LPD(R2),R6		; Get LPD vector header
+	MOVAB	12(R6),R6			; Get LPD #1 cell
+10$:	MOVL	SP,R5				; Point to fork block on stack
+	BBC	#LPD$V_RUN,LPD$W_STS(R6),50$	; If BC then no need to talk
+
+	;
+	;   Process talker timer
+	;
+	DECW	LPD$W_TIM_TLK(R6)		; Tick the talk timer
+	BGTR	40$				; Not expired if GTR
+	MOVW	#1,LPD$W_TIM_TLK(R6)		; Set to 1 for retry in 1 sec
+						; if TALKER resource failure
+	PUSHR	#^M<R2,R5,R6>			; Save vulnerable regs
+	BSBB	TALKER				; Subroutine call is needed
+						; here since the called 
+						; routines modify the stack.
+	POPR	#^M<R2,R5,R6>			; Restore regs
+	;
+	;   Process listener timer
+	;
+40$:	BBS	#LPD$V_PH2,LPD$W_STS(R6),50$	; If BS then phase II
+	DECW	LPD$W_TIM_LSN(R6)		; Tick the listner timer
+	BNEQ	50$				; Not expired if NEQ
+	PUSHL	R2				; Save RCB address
+	ASSUME	IRP$C_LENGTH  GE  WQE$C_LENGTH
+	MOVL	#IRP$C_LENGTH,R1		; Setup buffer size
+	BSBW	TR$ALLOCATE			; Get the buffer
+	MOVL	R2,R5				; Copy buffer for subr call
+	POPL	R2				; Restore RQB address
+	BLBC	R0,45$				; If LBC then didn't get one
+	MOVB	#NETMSG$C_LSN,WQE$B_EVT(R5)	; Setup "listner" event
+	BSBW	TR$QUE_WQE_AQB			; Pass it to the ACP
+	BRB	50$				; Done
+45$:	INCW	LPD$W_TIM_LSN(R6)		; Try again in 1 second
+	;
+	;   Advance to next cell and loop
+	;
+50$:	MOVAB	LPD$C_LENGTH(R6),R6		; Advance to next cell
+	SOBGTR	R7,10$				; Loop for each cell
+100$:	ADDL	#FRKBLKSIZ,SP			; Restore the stack
+	POPR	#^M<R2,R3,R4,R5,R6,R7>		; Restore regs
+	RSB
+
+TALKER:	;
+	;   Fork block on stack (ptr in R5) provides context for the next call
+	;
+	BSBW	SOL_NW				; Solicit permission to xmit
+						; -- don't wait
+	BLBC	R0,10$				; Permission denied if LBC
+	MOVB	#TR$C_PH2_NOP,(R3)+		; Enter Phase II msg header
+	BBS	#LPD$V_PH2,LPD$W_STS(R6),5$	; If BS then phase II
+	MOVAB	-7(R3),R3			; Backup to route-header
+	MOVB	#TR$C_PH3_HELLO,(R3)+		; Enter msg type
+	MOVW	RCB$W_ADDR(R2),(R3)+		; Enter local address
+	MOVB	#2,(R3)+			; Enter count of next field
+	MOVW	#^X<AAAA>,(R3)+			; Enter alternating 1's and 0's
+5$:	MOVL	IRP$L_IOSB(R1),R4		; Get the CXB address
+	MOVAB	W^RTRN_TLK,-			; Enter end-action pointer for
+		CXB$L_ENDACTION(R4)		; I/O completion
+10$:	CLRL	R2				; No "quick solicit" wanted
+	RSB
+
+TR$KILL_LOC_LPD::				; Deactivate local LPD
+	PUSHR	#^M<R4,R5,R6>			; Save regs
+	CLRW	RCB$W_MAX_PKT(R2)		; Force IRP queue to empty
+	BSBW	TR$ADJUST_IRP			; Purge it 
+	CLRL	R0				; Assume we must wait
+	TSTW	RCB$W_CUR_PKT(R2)		; Empty yet?
+	BNEQ	10$				; If not, postpone shutdown
+	REMQUE	@RCB$Q_LOC_RCV(R2),R5		; Get Local receive IRP
+	BVS	10$				; If VS then its not there
+	MOVL	RCB$L_LOC_LPD(R2),R6		; Get LPD address
+	BICW	#XM$M_STS_ACTIVE,IRP$L_IOST2(R5); Signal inactive device
+	BSBW	TR$QUE_RIRP_AQB			; Pass the IRP to the ACP
+	BSBB	TR$LPD_DOWN			; Shut down the LPD
+	MOVL	#1,R0				; Indicate success
+10$:	POPR	#^M<R4,R5,R6>			; Restore regs
+	RSB					; Return status in R0
+
+TR$LPD_DOWN:					; Deactivate an LPD
+	BICW	#LPD$M_ACTIVE!LPD$M_RUN,-	;
+		 LPD$W_STS(R6)			; Mark LPD inactive
+	PUSHR	#^M<R1,R2,R4,R7,R8>		; Save regs
+	;
+	;   Mark all nodes unreachable which were to use this line
+	;
+	MOVZWL	RCB$W_MAX_ADDR(R2),R0		; Get max node address
+	MOVZBL	LPD$B_PTH_INX(R6),R1		; Get LPD's path index
+	MOVL	RCB$L_DSP_OL(R2),R3		; Get zero indexed dispatch
+						; vector address
+10$:	CMPB	(R3)+,R1			; Node using this path ?
+	BNEQ	20$				; If NEQ then no
+	CLRB	-1(R3)				; Mark node unreachable
+20$:	SOBGEQ	R0,10$				; Loop for each node
+	;
+	;   Reactivate all IRP waitors associated with this LPD
+	;
+	MOVAB	RCB$Q_IRP_WAIT(R2),R7		; Get listhead
+	MOVL	R7,R5				; Make copy
+30$:	MOVL	R5,R8				; Advance last fork block ptr
+40$:	MOVL	(R8),R5				; Get next fork block
+	CMPL	R5,R7				; Listhead?
+	BEQL	50$				; If EQL then done
+	CMPL	UCB$L_FR3(R5),R6		; Associated with this LPD?
+	BNEQ	30$				; If NEQ then no
+	REMQUE	(R5),R5				; Deque it
+	INCB	LPD$B_AVL_XMT(R6)		; Return slot on xmt queue
+	INCB	LPD$B_AVL_SLT(R6)		; Return request slot
+	BSBW	DENY				; Reactivate with failure
+	BRB	40$				; Loop
+	;
+	;   Reactivate all waitors for permission to transmit
+	;
+50$:	REMQUE	@LPD$Q_REQ_WAIT(R6),R5		; Get next fork block
+	BVS	60$				; If VS then none
+	BSBW	DENY				; Reactivate with failure
+	BRB	50$				; Loop
+60$:	POPR	#^M<R1,R2,R4,R7,R8>		; Restore regs
+70$:	BSBW	TR$ADJUST_IRP			; Adjust IRP count
+	RSB
+
+;+
+; TR$GIVE_TO_ACP	- ECL entry to queue a buffer to the ACP
+; TR$QUE_WQE_AQB	- Queue WQE to AQB
+; TR$QUE_RIRP_AQB	- Queue Rcv IRP to AQB - RCB$W_TRANS was already inc'd
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; Setup the common fields in the WQE and queue it to the AQB.
+;
+; The action here is to fork before queueing the IRP since SCH$WAKE may
+; have to be called.  SCH$WAKE assumes it is called at IPL$_SYNC
+;
+; INPUTS:	R6	LPD address
+;		R5	WQE address
+;		R2	RCB address
+; 		R1	Not used
+;		R0	Scratch
+;
+; OUTPUTS:	R5,R0 clobbered, all others are preserved
+;
+;-
+	;& NET buffer restrictions must be published (need fork block + 4)
+
+	;& ASSUME,  ETC
+				.ENABL	LSB
+TR$QUE_WQE_AQB:					; Queue WQE to AQB
+	MOVW	LPD$W_PTH(R6),WQE$W_REQIDT(R5)	; Remember datalink i.d.
+TR$GIVE_TO_ACP::				; ECL entry to pass a buffer
+						; to the ACP
+	INCW	RCB$W_TRANS(R2)			; Another new transaction
+	BRB	5$
+TR$QUE_RIRP_AQB:				; Queue Rcv IRP (as WQE) to AQB
+	CLRL	LPD$L_RCV_IRP(R6)		; This rcv IRP is being retired,
+						; ...zero its possible pointer
+	MOVAB	IRP$L_IOST1(R5),WQE$L_PM2(R5)	; Store IOSB image quadword
+	MOVB	#NETMSG$C_IRP,WQE$B_EVT(R5)	; Setup the event
+	MOVW	LPD$W_PTH(R6),WQE$W_REQIDT(R5)	; Remember datalink i.d.
+5$:	PUSHR	#^M<R1,R2,R3,R4>		; Save regs
+	MOVB	S^#DYN$C_NET,WQE$B_TYPE(R5)	; Convert the IRP to a WQE
+	CLRL	WQE$L_ACTION(R5)		; Nullify action routine
+	MOVL	RCB$L_AQB(R2),WQE$L_PM2+4(R5)	; Store AQB address
+	BSBB	10$				; Create fork process
+	POPR	#^M<R1,R2,R3,R4>
+	RSB
+
+10$:	MOVB	#IPL$_QUEUEAST,IRP$B_RMOD(R5)	; Setup fork IPL
+	MOVQ	UCB$L_FR3(R5),R3		; Prevent EXE$FORK from 
+						; destroying these fields
+	JSB	G^EXE$FORK			; Create fork
+	MOVL	WQE$L_PM2+4(R5),R4		; We're back - get AQB ptr
+	DSBINT	#IPL$_SYNCH			; Raise to SCH$WAKE's IPL
+	INSQUE	(R5),@4(R4)			; Queue the IRP
+	BNEQ	20$				; Br unless first
+	MOVL	AQB$L_ACPPID(R4),R1		; Get PID
+	JSB	G^SCH$WAKE			; Wake the ACP
+20$:	ENBINT					; Restore IPL
+	RSB
+				.DSABL	LSB
+
+;+
+; TR$RCV_DATA - Receive data from data link layer
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The IRP is being returned by the data link driver after a receive operation.
+; Statistics are taken and the packet is routed to its appropriate destination.
+;
+; The action is to remove the buffer from the IRP and to requeue the IRP to the
+; same device for another receive.  The route-header in the message is parsed
+; to determine the logical path over which the message is to be forwarded.  A
+; transmit IRP is allocated in order to shuttle the buffer to the device.  This
+; design is both faster (because fewer IRP fields need to be written) and 
+; cleaner (because receives and transmits are kept separate) than a design 
+; based) reusing the receive IRP to queue the buffer for transmit.
+;
+; INPUTS:	R5	"Internal" IRP address
+;		R4-R0	Scratch
+;
+;		IPL	IPL$_IOPOST
+;
+; OUPUTS:	R5-R0	Garbage
+;
+;		IPL	IPL$_IOPOST
+;-
+
+;
+; <0000 1000>	Phase II NOP
+; <0101 1000>	Phase II Start
+;
+; <0100 xx10>	Phase II route header
+; <000x x010>	Phase III route header
+;
+; <0000 0001>	Phase III init
+; <0000 0011>	Phase III verification
+; <0000 0101>	Phase III hello message
+; <0000 0111>	Phase III routing message
+;
+;
+;  All ECL message type codes are currently constrained to have their low
+;  two bits clear so that they may be distinguished from Transport message
+;  headers.
+; 
+;
+TR$RCV_DLE::					; Rcv data on link used for
+						; service functions
+	TSTW	IRP$L_IOST1(R5)			; Is there valid status code?
+	BEQL	RECYCLE				; If not recycle IRP (probably
+						; part of circuit startup)
+	DSBINT	#NET$C_IPL			; Raise IPL
+	PUSHR	#^M<R6,R7,R8>			; Save regs
+	MOVL	IRP$L_AST(R5),R6		; Get address of IRP's LPD
+	MOVL	IRP$L_ASTPRM(R5),R2		; Get RCB pointer
+	BUMP	L,LPD$L_CNT_APR(R6)		; Update 'arriving pkts rcvd'
+	INCPMS	ARRLOCPK			; ..and in the PMS database too
+	MOVZBL	LPD$B_PTH_INX(R6),R8		; Setup LPD index
+	BSBW	DLE$RCV_MSG			; Tell Datalink service 
+	POPR	#^M<R6,R7,R8>			; Restore regs
+	ENBINT					; Restore IPL
+						;
+	BLBC	R0,RECYCLE			; If LBS then IRP's been taken
+	RSB					; Done
+
+
+TR$RCV_DLE_DONE::				; Datalink service is done with
+						; the service mode rcv IRP
+	PUSHR	#^M<R1,R2,R3,R4,R5>		; Save regs
+	MOVL	R1,R5				; Move IRP ptr to standard reg
+	BSBB	RECYCLE				; Recycle it
+	POPR	#^M<R1,R2,R3,R4,R5>		; Restore regs
+	RSB					; Done
+
+
+TR$REACT_RCV::
+	MOVAB	B^TR$RCV_DATA,IRP$L_PID(R5)	; Setup return address
+	BBSC	#XM$V_STS_BUFFAIL,-		; Clear error flag
+		    IRP$L_IOST2(R5),RECYCLE	;
+	BUG_CHECK   NETNOSTATE,FATAL		; If BC then IRP's been
+						; processed already.
+RECYCLE:					;
+	CLRL	IRP$L_IOST1(R5)			; Prepare to recycle IRP
+						;
+TR$RCV_DATA::					; Rcv data from data link
+	DSBINT	#NET$C_IPL			; Raise IPL
+	PUSHR	#^M<R6,R7,R8>			; Save regs
+	MOVL	IRP$L_SVAPTE(R5),R8		; Get buffer address
+	MOVZWL	IRP$L_IOST1+2(R5),R7		; Get transfer size
+	BLBS	IRP$L_IOST1(R5),10$		; Br if I/O was successful
+	CLRL	R7				; Else, indicate failure
+10$:	BBC	#XM$V_STS_BUFFAIL,-		; If BS then DLL receive has
+		    IRP$L_IOST2(R5),30$		; run out of receive buffers
+	MOVL	IRP$L_AST(R5),R6		; Get address of IRP's LPD
+	MOVL	R5,LPD$L_RCV_IRP(R6)		; Save the IRP address  -- its
+						; presence also serves as a flag
+	INCPMS	RCVBUFFL			; Update the PMS counter
+	CLRL	IRP$L_SVAPTE(R5)		; Indicate no buffer
+30$:	MOVL	IRP$L_AST(R5),R6		; Get address of IRP's LPD
+40$:	MOVL	IRP$L_ASTPRM(R5),R2		; Get RCB address
+	BBS	#XM$V_STS_ACTIVE,-		; If BC device has shut down
+		    IRP$L_IOST2(R5),50$		; 
+	;
+	;   The Datalink has gone inactive.  Requeue the IRP to the ACP to 
+	;   inform it of this event and dellocate the I/O buffer.
+	;
+	BSBW	TR$QUE_RIRP_AQB			; Queue it to the AQB
+	BSBW	TR$LPD_DOWN			; LPD is shutting down
+	BSBW	DEAL_BUF			; Deallocate R8 buffer
+	BRW	200$				; Done
+	;
+	;
+	;   Process the received message by dispatching to the appropriate
+	;   action routine.  The most frequent case is a message with a 
+	;   Phase III route-header.
+	;
+	;   Call with:
+	;		R8	= message buffer pointer
+	;		R7	= total bytes in message
+	;		R6	= LPD ptr
+	;		R5	= msg type code
+	;		R4,R3	= Scratch
+	;		R2	= RCB ptr
+	;		R1,R0	= Scratch
+	;   On retrun:
+	;		R8	= Address of buffer to deallocate
+	;			  0 if no buffer is to be deallocated
+	;
+	;		All other registers are scratch
+	;
+50$:	PUSHL	R5				; Save IRP address
+	TSTL	R7				; Any data ?
+	BEQL	150$				; If not, branch
+	MOVB	#DYN$C_CXB,IRP$B_TYPE(R8)	; Store standard buffer type
+	MOVL	(R8),R4				; Get msg address
+	MOVW	LPD$W_INT_LSN(R6),-		;
+		LPD$W_TIM_LSN(R6) 		; Reset "listen" interval
+
+	.IF DF JNX$$$
+	MOVL	R4,R1				; Get msg address
+	MOVL	R5,R3				; Setup IRP address
+	MNEGB	#1,R0				; Setup journal record type
+	BSBW	FILL_JNX			; Call journalling routine
+	.ENDC
+
+	PUSHAB	B^150$				; Set up for return
+	MOVZBL	(R4)+,R5			; Get message type flag
+	BLBS	R5,95$				; If LBS then control msg
+	BBS	#1,R5,RTHDR			; If BS then route header
+	CMPB	R5,#TR$C_PH2_NOP		; NOP message ?
+	BEQL	RCV_NOP				; If so, dispatch
+	CMPB	R5,#TR$C_PH2_STR		; Is it a Start message ?
+	BEQL	95$				; NEQ => ECL layer message
+	BRW	ECL
+95$:						; Transport layer control msg
+	CMPB	#^X<05>,R5			; "Hello" msg ?
+	BEQL	RCV_NOP				; If EQL then treat as NOP
+	BRW	UNK				; Else message type unknown
+						; (could be a control message)
+	;
+	;    Requeue the receive
+	;
+150$:	POPL	R3				; Recover IRP address, fix stack
+	PUSHAB	B^200$				; Setup return address
+	MOVL	IRP$L_AST(R3),R6		; Get address of IRP's LPD
+	CLRL	LPD$L_RCV_IRP(R6)		; IRP no longer attached to LPD
+	MOVW	S^#IO$_READLBLK,IRP$W_FUNC(R3)	; Reset I/O function code
+	MOVW	#^X<3FFF>,IRP$W_BCNT(R3)	; Reset Byte count
+	MOVL	IRP$L_UCB(R3),R5		; Get UCB address
+	BEQL	170$				; If EQL then "local" datalink
+	MOVL	R8,IRP$L_SVAPTE(R3)		; Send buffer back with IRP (R8
+						; is either zero or a buff ptr)
+	JMP	G^EXE$ALTQUEPKT			; Reque the receive
+170$:	BSBW	DEAL_BUF			; Deallocate R8 buffer
+	BRW	TR$LOC_DLL_RCV			; Reque the receive
+200$:	;
+	;    Done.  The IRP has been requeued.  Return empty-handed to the EXEC
+	;
+	POPR	#^M<R6,R7,R8>			; Restore regs
+	ENBINT					; Restore IPL
+	RSB					; Return to Exec
+
+
+RCV_NOP:					; Process rcv'd NOP msg
+	RSB					; Ignore it
+
+
+DEAL_BUF:
+	MOVL	R8,R0				; Get message buffer address
+	BEQL	10$				; If EQL then no
+	JSB	G^COM$DRVDEALMEM		; Deallocate it
+10$:	RSB
+
+
+RTHDR:	BBS	#TR$V_PH2_RTHDR,R5,PH2RTH	; Br if Phase II rt. header
+	;
+	;   Process Phase III route header
+	;
+	MOVZWL	(R4)+,R0			; Get dst node address
+	MOVW	(R4)+,R3			; Enter the source node address
+	CMPW	RCB$W_ADDR(R2),R0		; Is this for the local node?
+	BEQL	5$				; If EQL then 
+	TSTW	R0				; We boot with address 0
+	BNEQ	10$				; If NEQ then route-thru
+5$:	TSTB	(R4)+				; Skip over VISIT field
+	SUBW	#6,R7				; Account for bytes parsed
+	BGTR	ECL1				; Continue in common
+	BRB	PFE				; Format error if LEQ
+10$:	BUMP	L,LPD$L_CNT_TPR(R6)		; Bump 'transit packets rcvd'
+	INCPMS	ARRTRAPK			; ..and in the PMS database too
+	TSTL	LPD$L_RCV_IRP(R6)		; Does datalink's receiver want
+						; the buffer back
+	BNEQ	20$				; If NEQ then yes
+	BSBW	RTHRU				; Re-route the packet
+	TSTL	R8				; Was buffer queued?
+	BEQL	20$				; If EQL then yes
+	MOVL	RCB$L_LOC_LPD(R2),R6		; Use local LPD for now in case
+						; src node was the local node
+	MOVL	(R8),R4				; Get message address
+	MOVZBL	(R4)+,R5			; Get control flags
+	ROTL	#16,(R4),(R4)			; Swap src, dst node addresses
+	BBCC	#TR$V_RTH_RQS,-1(R4),20$	; Br if return not requested
+	BBCS	#TR$V_RTH_RTS,-1(R4),RTHDR	; Resubmit unless already being
+20$:	RSB					; returned
+	;
+	;   Process Phase II header
+	;
+PH2RTH:	MOVZBL	(R4)+,R0			; Get size of dest. node name
+	ADDL	R0,R4				; Advance to src node name
+	SUBW	R0,R7				; Subtract from total
+	MOVZBL	(R4)+,R0			; Get size of src node name
+	SUBW	R0,R7				; Subtract from total
+	ADDL	R0,R4				; Advance pointer
+	SUBW	#3,R7				; Account for count field and
+						; msg type bytes
+	BGTR	ECL2				; If LEQ then illegal message
+PFE:	BUMP	B,RCB$B_CNT_PFE(R2)		; Update packet format errors
+	MOVB	#NETMSG$C_PFE,R0		; Setup event code
+	BRW	TO_ACP				; Give it to the ACP
+	;
+	;   Give the message to the End Communications Layer
+	;
+ECL:	MOVL	(R8),R4				; Point to first msg byte
+ECL2:	MOVW	LPD$W_PNA(R6),R3		; Store adjacent node address
+ECL1:	BUMP	L,LPD$L_CNT_APR(R6)		; Update 'arriving pkts rcvd'
+	INCPMS	ARRLOCPK			; ..and in the PMS database too
+	MOVL	RCB$L_IRP_ECL(R2),R1		; Use local IRP
+	MOVL	R8,IRP$L_IOSB(R1)		; Store buffer address
+	CLRB	IRP$B_EFN(R1)			; Assume buffer may be taken
+	TSTL	LPD$L_RCV_IRP(R6)		; Are we in a "buffail" state?
+	BEQL	10$				; If EQL then no
+	BBS	#LPD$V_PH2,LPD$W_STS(R6),10$	; If Phase II ignore "buffail"
+	INCB	IRP$B_EFN(R1)			; Set "buffail" flag
+10$:	MOVAB	IRP$L_SVAPTE(R1),R0		; Get base register
+	MOVL	R4,(R0)+			; Store ECL (NSP) msg address
+	ASSUME	IRP$W_BOFF  EQ  4+IRP$L_SVAPTE	;
+	TSTW	(R0)+				; Skip over BOFF
+	ASSUME	IRP$W_BCNT  EQ  2+IRP$W_BOFF	;
+	ASSUME	IRP$L_BCNT  EQ  0+IRP$W_BCNT	;
+	MOVW	R7,(R0)+			; Store size of ECL msg
+	CLRL	(R0)+				; Clear high order of word of
+						;  L_BCNT and following
+						;  reserved word.
+	ASSUME	IRP$L_IOST1 EQ  6+IRP$L_BCNT	;
+	MOVZBL	LPD$B_PTH_INX(R6),(R0)+		; Setup receive path number
+	MOVW	R3,(R0)+			; Store adjacent node address 
+	MOVW	RCB$W_ADDR(R2),(R0)		; Store ECL's node address
+	BSBW	NET$UNSOL_INTR			; Pass message to ECL layer
+	MOVL	IRP$L_IOSB(R1),R8		; Get the buffer address
+	RSB					; (zero if none)
+
+		.ENABL	LSB
+TST_RTS:
+	;
+	;   Process the VISIT field to prevent infinite packet looping
+	;
+	BBC	#TR$V_RTH_RTS,R5,10$	; If BC then packet is not being 
+					; returned to its original sender
+	MULB3	#2,RCB$B_MAX_VISIT(R2),-(SP) ; Else allow twice MAX_VISITS
+	CMPB	(R4),(SP)+		; 
+	BLSS	20$			; If LSS then continue
+10$:	DECB	(R4)			; Repair VISIT field, it will be INC'd
+					; again if packet is resubmitted
+	BRW	AGED			; Else discard the packet
+
+RTHRU:	INCB	(R4)			; Bump the VISIT field
+	CMPB	RCB$B_MAX_VISIT(R2),(R4); Within VISIT range ?
+	BLEQU	TST_RTS			; If LEQU then possible visit error
+	;
+	;    Determine the output line for the packet
+	;
+20$:	CMPW	R0,RCB$W_MAX_ADDR(R2)	; Within range?
+	BGTRU	RANGE			; If GTRU then out of range
+	CVTBL	@RCB$L_DSP_OL(R2)[R0],R0; Get the output path index
+					; Don't clobber R6 yet in case LEQ
+	BLEQ	REACH			; If EQL then unreachable
+					; If LSS then actually a bug since a
+					; check was already made for dst=local
+	MULL3	#LPD$C_LENGTH,R0,R6	; Multiply by cell size
+	ADDL	 RCB$L_PTR_LPD(R2),R6	; Add to the start of the LPD vector
+	SUBL	#LPD$C_LENGTH-12,R6	; Subtract out the bias
+	BBC	#LPD$V_RUN,-		; Br if LPD is not in use for data
+		 LPD$W_STS(R6),REACH	; messages
+	TSTB	 LPD$B_AVL_XMT(R6)	; Is the output queue full?
+	BLEQ	 OFLW			; If LEQ then queue is full
+	CMPW	R7,LPD$W_XMTBUFSIZ(R6)	; Is the message too big for partner?
+	BGTRU	OPL			; If GTRU then oversized
+30$:	REMQUE	@RCB$Q_IRP_FREE(R2),R3	; Get an IRP
+	BVC	100$			; If VC then got one
+	BSBW	TR$ADJUST_IRP		; Replenish the IRP queue
+	BLBS	R0,30$			; If LBS then there's an IRP
+	BRB	RSRC			; Report resource error
+
+	;
+	;   Update statistics for packet about to be discarded
+	;
+OFLW:					; Update output queue congestion loss
+RSRC:	BUMP	W,LPD$W_CNT_TCL(R6)	; Update resource error packet loss
+	INCPMS	TRCNGLOS		; ..and in the PMS database too
+	RSB
+
+OPL:	BUMP	B,RCB$B_CNT_OPL(R2)	; Update oversized packet loss
+	MOVB	#NETMSG$C_OPL,R0	; Setup event code
+	BRB	TO_ACP			; Pass the buffer to the ACP
+AGED:	BUMP	B,RCB$B_CNT_APL(R2)	; Update aged packet loss
+	MOVB	#NETMSG$C_APL,R0	; Setup event code
+	BRB	TO_ACP			; Pass it to the ACP
+REACH:	BUMP	W,RCB$W_CNT_NUL(R2)	; Update node unreachable loss
+	MOVB	#NETMSG$C_NUL,R0	; Setup event code
+	BRB	TO_ACP			; Pass it to the ACP
+RANGE:	BUMP	B,RCB$B_CNT_NOL(R2)	; Update node address out of range loss
+	MOVB	#NETMSG$C_NOL,R0	; Setup event code
+	BRB	TO_ACP			; Pass it to the ACP
+UNK:					; Unknown message type
+	MOVB	#NETMSG$C_UNK,R0	; Set up event code
+	MOVW	R7,WQE$L_PM2+2(R8)	; Setup size of msg
+TO_ACP:	SUBW3	R8,(R8),WQE$L_PM2(R8)	; Setup offset to msg
+	MOVB	R0,WQE$B_EVT(R8)	; Setup event code
+	MOVL	R8,R5			; Get buffer address
+	CLRL	R8			; Flag it as gone
+	BSBW	TR$QUE_WQE_AQB		; Queue it to the AQB
+	RSB
+
+
+	;
+	;   Build the IRP, attach the buffer, queue to communications driver
+	;
+100$:	MOVAB	IRP$L_PID(R3),R0	; Point to PID field
+	DECB	LPD$B_AVL_XMT(R6)	; Consume slot on the queue
+	MOVAB	RTRN_RTHRU,(R0)+	; Setup return address
+
+	ASSUME	IRP$L_AST     EQ  4+IRP$L_PID
+	ASSUME	IRP$L_ASTPRM  EQ  4+IRP$L_AST
+
+	MOVL	R6,(R0)+		; LPD address into AST field
+	MOVL	R2,(R0)+		; RCB address into ASTPRM
+
+	ASSUME	IRP$L_WIND  EQ 4+IRP$L_ASTPRM
+	ASSUME	IRP$L_UCB   EQ 4+IRP$L_WIND
+
+	MOVQ	LPD$L_WIND(R6),(R0)+	; Fill WIND,UCB fields
+	MOVL	LPD$L_UCB(R6),R5	; Get comm driver UCB
+
+	ASSUME	IRP$W_FUNC  EQ 4+IRP$L_UCB
+	ASSUME	IRP$B_EFN   EQ 2+IRP$W_FUNC
+	ASSUME	IRP$B_PRI   EQ 1+IRP$B_EFN
+	ASSUME	IRP$L_IOSB  EQ 1+IRP$B_PRI
+
+	MOVL	S^#IO$_WRITELBLK,(R0)+	; Fill FUNC, clear EFN and PRI
+	MOVB	#31,-1(R0)		; Use lowest priority
+	MOVL	R8,(R0)+		; Buffer address into IOSB
+
+	ASSUME	IRP$W_CHAN  EQ 4+IRP$L_IOSB
+	ASSUME	IRP$W_STS   EQ 2+IRP$W_CHAN
+	ASSUME	IRP$L_SVAPTE EQ 2+IRP$W_STS
+	ASSUME	IRP$W_BOFF   EQ 4+IRP$L_SVAPTE
+
+	MNEGW	LPD$W_CHAN(R6),(R0)+	; Enter CHAN
+	BBC	#LPD$V_XBF,-		; If BC the I/O xmitter I/O is direct
+		 LPD$W_STS(R6),120$	;
+	;
+	;   Xmitter I/O is buffered
+	;
+	MOVW	#IRP$M_BUFIO,(R0)+	; Enter STS field
+	MOVL	R8,(R0)+		; Setup buffer ptr in SVAPTE
+	CLRW	(R0)+			; Clear BOFF
+	BRB	140$			; Continue
+120$:	;
+	;   Xmitter I/O is direct
+	;
+	CLRW	(R0)+			; Clear STS
+	MOVL	(R8),R4			; Get msg address
+	MOVL	G^MMG$GL_SPTBASE,R8	; Get system page table base
+	EXTZV	S^#VA$V_VPN,-		; Get Virtual page frame number
+		S^#VA$S_VPN,R4,R1
+	MOVAL	(R8)[R1],(R0)+		; Enter SVAPTE
+	BICW3	#^C<VA$M_BYTE>,R4,(R0)+	; Enter page offset of msg in BOFF
+140$:	;
+	;   Complete the IRP and queue it to the device
+	;
+	ASSUME	IRP$W_BCNT   EQ 2+IRP$W_BOFF
+	ASSUME	IRP$L_BCNT   EQ 0+IRP$W_BCNT
+
+	MOVZWL	R7,(R0)			; Enter BCNT
+	CLRL	R8			; Prevent buffer deallocation
+	JMP	G^EXE$ALTQUEPKT		; Queue the packet, return to caller
+
+		.DSABL	LSB
+
+	;
+	;   End-action after xmit has completed
+	;
+	;	INPUTS:	R5	IRP ptr
+	;		R4-R0	Scratch
+	;
+	;		IPL	4
+	;
+	;	OUPUTS:	R5-R0	Garbage
+	;
+	;		IPL	4
+	;
+			.ENABL	LSB
+RTRN_RTHRU:				; Route-thru I/O completion
+	MOVL	R5,R1			; Get IRP address
+	DSBINT	#NET$C_IPL		; Raise to driver IPL
+	PUSHL	R6			; Save reg
+	MOVL	IRP$L_ASTPRM(R1),R2	; Get RCB address
+	MOVL	IRP$L_AST(R1),R6	; Get LPD address
+	BLBC	IRP$L_IOST1(R1),25$	; Br on I/O error
+	BUMP	L,LPD$L_CNT_TPS(R6)	; Update 'transit packets sent'
+	BRB	25$			; Continue in common
+
+RTRN_XMT:				; ECL xmt I/O completion
+	MOVL	R5,R1			; Copy IRP address
+	DSBINT	#NET$C_IPL		; Raise IPL
+	PUSHL	R6			; Save reg
+	MOVL	IRP$L_ASTPRM(R1),R2	; Get RCB pointer
+	MOVL	IRP$L_IOSB(R1),R4	; Get buffer
+	BEQL	20$			; If EQL then from "local" DLL
+	JSB	@IRP$L_SAVD_RTN(R1)	; Notify sender
+					; Does not destroy R1,R2
+20$:	MOVL	IRP$L_AST(R1),R6	; Get LPD pointer
+	INCB	LPD$B_AVL_SLT(R6)	; Return "request" slot
+	BLBC	IRP$L_IOST1(R1),25$	; Br unless success
+	BUMP	L,LPD$L_CNT_DPS(R6)	; Bump 'departing pkts sent'
+	INCPMS	DEPLOCPK		; ..and in the PMS database too
+25$:	BBS	#XM$V_STS_ACTIVE,-	; Br if device is still active
+		IRP$L_IOST2(R1),30$	;
+	BSBW	TR$LPD_DOWN		; Make LPD inactive
+30$:					;
+	BSBW	TR$RTRN_IRP		; Return IRP
+	POPL	R6			; Restore reg
+	ENBINT				; Restore IPL
+	RSB				; Return to Exec
+
+RTRN_TLK:				; Return from "hello" msg xmission
+	CLRW	IRP$L_IOST1(R1)		; Prevent inc of "departing pkts sent"
+	RSB
+			.DSABL	LSB
+
+;+
+; TR$RTRN_IRP	- Return XMT IRP
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The used resources are returned.  If a fork process is awaiting any of these 
+; resources its wait state is advanced and may be reactivated.
+;
+; INPUTS:	R6	LPD pointer
+;		R2	RCB pointer
+;		R1	IRP pointer
+;
+; OUTPUTS:	R6-R0	Garbage
+;
+;-
+TR$RTRN_IRP::				; Return used and idle IRP
+	MOVW	LPD$W_INT_TLK(R6),-	; Reset talker interval
+		LPD$W_TIM_TLK(R6)	;
+TR$RTRN_IRPU::				; Return unused and idle IRP
+	MOVL	IRP$L_IOSB(R1),R0	; Get buffer
+	BEQL	10$			; If EQL then none
+	JSB	G^COM$DRVDEALMEM	; Deallocate it
+10$:	CLRL	IRP$L_IOSB(R1)		; Detach buffer from IRP
+	INCB	LPD$B_AVL_XMT(R6)	; Return the queue space
+	BLEQ	30$			; If LEQ then still no space
+					; (the max queue size has been
+					;  adjusted asynchronously)
+	TSTB	LPD$B_AVL_SLT(R6)	; Any request slots left ?
+	BLEQ	30$			; If LEQ then no
+	REMQUE	@LPD$Q_REQ_WAIT(R6),R0	; Get the waiting process
+	BVS	30$			; If VS then none
+	DECB	LPD$B_AVL_SLT(R6)	; Take the request slot
+	DECB	LPD$B_AVL_XMT(R6)	; Take the slot on the queue
+	INSQUE	(R0),@RCB$Q_IRP_WAIT+4(R2)	; Move to IRP wait state
+30$:	REMQUE	@RCB$Q_IRP_WAIT(R2),R5	; Get oldest waiting process
+	BVC	50$			; If VC then got one
+	INSQUE	(R1),RCB$Q_IRP_FREE(R2)	; Queue the IRP
+	CMPW	RCB$W_CUR_PKT(R2),-	; Does IRP pool need adjusting?
+		RCB$W_MAX_PKT(R2)	;
+	BNEQ	40$			; If NEQ yes
+	RSB				; Else return
+
+40$:	BRW	TR$ADJUST_IRP		; Adjust IRP pool if needed
+
+50$:	MOVL	UCB$L_FR3(R5),R6	; Get LPD address
+	BRW	TR$GRANT		; Restart solicitor
+
+
+	.SBTTL	TR$SOLICIT	- Process ECL request to xmit into the network
+;+
+; TR$SOLICIT	- Process ECL request to xmit into the network
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; An ECL (e.g. NSP) is requesting to xmit into the network.  The appropriate
+; logical path (LPD) is found, either because it was explicitly specified or
+; because the specified destination node address maps to it.
+;
+; If the LPD is associated with a data link then the requestor is entered onto
+; a wait queue until a free "request" slot becomes available - at which time
+; the requestor is reactivated.  If the LPD is associated with a local ECL
+; then the request is honored immediately.
+;
+; INPUTS:	R5	Fork block address
+;			The FPC,FR3,FR4 fields are all scratch
+;		R4	Source node address in high order word
+;			Destination node address in low order word
+;		R3	Only the low byte is valid
+;			Path i.d. to xmit over or 0 if Transport is to
+;			choose the path
+;		R2	RCB address
+;		R1	Minimum required buffer size
+;		R0	Function code (TR$_XMIT)
+;
+; OUTPUTS:	See parameters returned when reactivating process
+;
+;-
+			.ENABL LSB
+TR$SOLICIT::					; Process ECL request to xmit
+	;
+	;   Setup the fork block and pop the stack to simplify the code
+	;   in case the requestor needs to be suspended.
+	;
+	POPL	UCB$L_FPC(R5)			; Save return addr, pop stack
+	MOVL	R4,UCB$L_FR4(R5)		; Save src,dst node addresses
+	PUSHL	R6				; Save req used for LPD address
+	BSBB	10$				; Process request
+	POPL	R6				; Restore reg
+	RSB
+
+	;
+	;   Determine the LPD address from the path i.d. in the low byte of
+	;   R3.  If the path i.d. is zero then determine output LLD from the
+	;   destination node address.
+	;
+10$:	CVTBL	R3,R6				; Get path index
+	BEQL	30$				; If EQL determine path for the
+						; remote node address
+	BGTR	40$				; If GTR then use it
+20$:	MOVL	RCB$L_LOC_LPD(R2),R6		; If LSS then use local path
+	BRB	50$				; Continue
+30$:	CMPW	R4,RCB$W_MAX_ADDR(R2)		; Is the node within bounds?
+	BGTRU	80$				; If GTRU then no
+	MOVZWL	R4,R6				; Get remote node address
+	CVTBL	@RCB$L_DSP_OL(R2)[R6],R6	; Get output path index
+	BLSS	20$				; If LSS then use local path
+	BEQL	80$				; If EQL then unreachable
+40$:	CMPB	R6,RCB$B_MAX_LPD(R2)		; Path index within range?
+	BGTRU	80$				; If GTRU then no
+	MULL	#LPD$C_LENGTH,R6		; Get LPD vector offset
+	ADDL	RCB$L_PTR_LPD(R2),R6		; Add in base
+	SUBL	#LPD$C_LENGTH-12,R6		; Subtract out bias (first LPD
+						; starts 12 bytes in and is for
+						; path index 1)
+	;
+	;   Need "request" slot, room on output queue, and IRP to proceed
+	;
+50$:	ASSUME	LPD$V_ACTIVE  EQ  0		;
+	BLBC	LPD$W_STS(R6),80$		; Br if line is inactive
+	MOVL	R6,UCB$L_FR3(R5)		; Save LPD address
+QUICK_SOL:					; Quick solicit entry
+					;&any guarentees that FR3 is valid?
+	TSTB	LPD$B_AVL_SLT(R6)		; Any request slots
+	BLEQ	70$				; If LEQ then no
+	TSTB	LPD$B_AVL_XMT(R6)		; Room on queue ?
+	BLEQ	70$				; If LEQ then no
+	DECB	LPD$B_AVL_XMT(R6)		; Consume spot on output queue
+	DECB	LPD$B_AVL_SLT(R6)		; Consume request slot
+60$:	REMQUE	@RCB$Q_IRP_FREE(R2),R1		; Get a free IRP
+	BVC	TR$GRANT			; If VC then got one
+	BSBW	TR$ADJUST_IRP			; Adjust IRP count if possible
+	BLBS	R0,60$				; Br if any new IRPs were
+						; allocated
+	INSQUE	(R5),@RCB$Q_IRP_WAIT+4(R2)	; Suspend the requestor
+	RSB
+
+70$:	INSQUE	(R5),@LPD$Q_REQ_WAIT+4(R6)	; Insert on wait queue
+	RSB
+
+80$:	BSBW	DENY				; Indicate request denied
+	RSB
+			.DSABL	LSB
+
+	;
+	;   Setup the IRP for eventual xmission.  
+	;
+SOL_NW:						; Solict - do not wait
+	CLRL	R0				; Assume no resources
+	TSTB	LPD$B_AVL_SLT(R6)		; Any request slots
+	BLEQ	30$				; If LEQ then no
+	TSTB	LPD$B_AVL_XMT(R6)		; Room on queue ?
+	BLEQ	30$				; If LEQ then no
+20$:	REMQUE	@RCB$Q_IRP_FREE(R2),R1		; Get a free IRP
+	BVC	40$				; If VC then got one
+	BSBW	TR$ADJUST_IRP			; Adjust IRP count if possible
+	BLBS	R0,20$				; Br if any new IRPs were
+30$:	RSB					; Return with LBC in R0
+
+40$:	POPL	UCB$L_FPC(R5)			; Setup return address
+	DECB	LPD$B_AVL_XMT(R6)		; Consume spot on output queue
+	DECB	LPD$B_AVL_SLT(R6)		; Consume request slot
+
+
+			.ENABL	LSB
+TR$GRANT:					; Grant permission to xmit
+	;
+	;   The R5 fork process cannot be suspended beyond this point
+	;
+	ASSUME	IRP$L_AST	EQ 4+IRP$L_PID
+	ASSUME	IRP$L_ASTPRM	EQ 4+IRP$L_AST
+	ASSUME	IRP$L_WIND	EQ 4+IRP$L_ASTPRM
+	ASSUME	IRP$L_UCB	EQ 4+IRP$L_WIND
+	ASSUME	IRP$W_FUNC	EQ 4+IRP$L_UCB
+	ASSUME	IRP$B_EFN	EQ 2+IRP$W_FUNC
+	ASSUME	IRP$B_PRI	EQ 1+IRP$B_EFN
+
+	MOVAB	IRP$L_PID(R1),R4		; Prepare to build IRP
+	MOVAB	W^RTRN_XMT,(R4)+		; Setup end-action address
+	MOVL	R6,(R4)+			; Enter LPD address
+	MOVL	R2,(R4)+			; Enter RCB address
+	MOVQ	LPD$L_WIND(R6),(R4)+		; Enter dst WIND,UCB
+	MOVZWL	S^#IO$_WRITELBLK,(R4)+		; Enter FUNC, clear EFN,PRI
+	MOVB	#31,-1(R4)			; Use lowest priority
+	;
+	;    Allocate a buffer
+	;
+	ASSUME	IRP$L_IOSB	EQ 1+IRP$B_PRI
+
+	MOVZWL	RCB$W_TOTBUFSIZ(R2),R1		; Get size of buffer
+	BSBW	TR$ALLOCATE			; Allocate and init it
+	MOVAB	-IRP$L_IOSB(R4),R1		; Recover IRP address
+	MOVL	R2,R3				; R3 is used below as buffer ptr
+	MOVL	IRP$L_ASTPRM(R1),R2		; Recover RCB pointer
+	BLBS	R0,10$				; If LBS then successful
+	BRW	DENY_1				; Tell requestor the bad news
+10$:	;
+	;   Setup the buffer and call back the requestor to complete the msg
+	;
+	ASSUME	IRP$L_IOSB	EQ 1+IRP$B_PRI
+	ASSUME	IRP$W_CHAN	EQ 4+IRP$L_IOSB
+
+	MOVL	R3,(R4)+			; Store buffer address in IOSB
+20$:	MNEGW	LPD$W_CHAN(R6),(R4)+		; Enter CHAN
+	MOVAB	CXB$C_HEADER(R3),(R3)		; Store message pointer
+	MOVL	(R3),R3				; Get route header pointer
+	BITW	#LPD$M_PH2!-			; Does message need a route
+		 LPD$M_DLE,LPD$W_STS(R6)	; header
+	BNEQ	30$				; If NEQ then no
+	;
+	;   Build the route-header
+	;
+	MOVB	#TR$C_PH3_RTHDR,(R3)+		; Enter Transport msg type
+	MOVL	UCB$L_FR4(R5),(R3)+		; Enter dst,src addresses
+	CLRB	(R3)+				; Init the VISIT field
+	;+
+	;
+	;   Reactivate the soliciting fork process with the following:
+	;
+	;	R5	Fork block address
+	;	R4	Garbage
+	;	R3	Garbage
+	;	R2	RCB address
+	;	R1	IRP address if R0 has low bit set
+	;	R0	Low bit set if successful, else low bit clear
+	;
+	;	IRP$L_SVAPTE(R1) points to NSP buffer area
+	;	IRP$L_IOSB(R1)	 points to the CXB containing the message
+	;	CXB$L_ENDACTION	 to be filled with address of routine to which
+	;			 I/O completion is to be delivered
+	;	CXB$L_IRP	 to be filled with data interpreted by the end-
+	;			 action routine when during I/O completion
+	;
+	;-
+30$:	ASSUME	IRP$W_STS	EQ 2+IRP$W_CHAN
+	ASSUME	IRP$L_SVAPTE	EQ 2+IRP$W_STS
+
+	MOVL	R3,2(R4)			; Move NSP buffer to SVAPTE
+	MOVZBL	#1,R0				; Indicate success
+	JSB	@UCB$L_FPC(R5)			; Reactivate solicitor
+	BLBC	R0,32$				; If LBC then xmit aborted
+	MOVL	IRP$L_IOSB(R1),R0		; Get buffer address
+	MOVL	CXB$L_ENDACTION(R0),-		; Copy end-action routine to
+		IRP$L_SAVD_RTN(R1)		; safe area
+	MOVL	R2,R5				; "Quick solicit" requested ?
+	BEQL	35$				; If EQL then no
+	PUSHL	R5				; Remember block's address
+	PUSHL	IRP$L_ASTPRM(R1)		; Remember RCB address
+	BSBB	35$				; Continue
+	POPR	#^M<R2,R5>			; Setup R2,R5 (R6 point to LPD)
+	BRW	QUICK_SOL			; Perform "quick solicit"
+32$:	BRW	60$				; Return IRP unused
+35$:	;
+	;   Setup buffer descriptor in IRP according to type of I/O
+	;
+	ASSUME	IRP$W_STS	EQ 2+IRP$W_CHAN
+	ASSUME	IRP$L_SVAPTE	EQ 2+IRP$W_STS
+	ASSUME	IRP$W_BOFF	EQ 4+IRP$L_SVAPTE
+
+	MOVAB	IRP$W_STS(R1),R4		; Get base reg
+	MOVL	(R0),R2				; Get msg address
+	BBS	#LPD$V_XBF,LPD$W_STS(R6),37$	; If BS then buffered I/O
+	CLRW	(R4)+				; Setup STS for direct I/O
+	MOVL	G^MMG$GL_SPTBASE,R0		; Get system page table base
+	EXTZV	S^#VA$V_VPN,S^#VA$S_VPN,R2,R5	; Get virtural page frame number
+	MOVAL	(R0)[R5],(R4)+			; Enter SVAPTE for direct I/O
+	BICW3	#^C<VA$M_BYTE>,R2,(R4)+		; Enter page offset
+	BRB	38$				; Continue
+37$:	MOVW	#IRP$M_BUFIO,(R4)+		; Setup STS for buffered I/O
+	MOVL	R0,(R4)+			; Point SVAPTE to buffer
+	CLRW	(R4)+				; Clear BOFF
+38$:	;
+	;   Complete the IRP and queue it to the datalink for xmission
+	;
+	ASSUME	IRP$W_BCNT	EQ 2+IRP$W_BOFF
+	ASSUME	IRP$L_BCNT	EQ 0+IRP$W_BCNT
+	ASSUME	IRP$L_IOST1	EQ 6+IRP$L_BCNT
+
+	SUBW3	R2,R3,(R4)+			; Enter BCNT
+	CLRL	(R4)				; Clear high word of L_BCNT
+	MOVL	LPD$L_UCB(R6),R5		; Get UCB
+	BEQL	50$				; If EQL then "local" DLL
+	MOVL	R1,R3				; Copy IRP address
+
+	.IF DF JNX$$$
+	MOVL	IRP$L_ASTPRM(R1),R2		; Get RCB pointer
+	MOVL	@IRP$L_IOSB(R3),R1		; Get msg address
+	MNEGB	#1,R0				; Setup journal record type
+	BSBW	FILL_JNX			; Call journalling co-routine
+	.ENDC
+
+40$:	JSB	G^EXE$ALTQUEPKT			; Send packet to Datalink driver
+	RSB
+	;
+	;   Deliver xmit complete status now since the "local" DLL removes
+	;   the buffer from the IRP and thus the ECL context stored in the
+	;   buffer is lost.
+	;
+50$:	MOVAB	IRP$L_IOST1(R1),R3		; Address status block
+	MOVW	S^#SS$_NORMAL,(R3)+		; Enter status
+	MOVW	IRP$W_BCNT(R1),(R3)+		; Enter bytes moved
+	MOVL	#XM$M_STS_ACTIVE,(R3)		; Enter device status
+	MOVL	IRP$L_IOSB(R1),R4		; Get buffer address
+	MOVL	IRP$L_ASTPRM(R1),R2		; Setup RCB address
+	JSB	@IRP$L_SAVD_RTN(R1)		; Deliver I/O status 
+	BSBB	TR$LOC_DLL_XMT			; Send it to the driver
+	RSB
+
+DENY_1:	BSBB	DENY				; Deny request
+60$:	MOVL	IRP$L_ASTPRM(R1),R2		; Recover RCB address
+	INCB	LPD$B_AVL_SLT(R6)		; Return "request" slot
+	BSBW	TR$RTRN_IRPU			; Recycle unused the IRP
+	RSB
+			.DSABL	LSB
+DENY:	CLRB	R0				; Indicate request denied
+	JSB	@UCB$L_FPC(R5)			; Tell requestor
+	RSB
+
+;+
+; TR$LOC_DLL_XMT  - "Local" datalink driver transmit
+; TR$LOC_DLL_RCV  - "Local" datalink driver receive
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine simulates a datalink driver.  It is used to allow the Transport
+; layer to handle IRPs for ECL-ECL communication in a manner consistent with
+; the remainder of the Datalink layer.  It appears as a line constantly in
+; "loopback".
+;
+; INPUTS:	R3		IRP address if RCV
+;		R1		IRP address if XMT
+;
+;		IRP$L_IOSB	Zero for RCVs,      buffer pointer for XMTs
+;		IRP$L_SVAPTE	Zero for RCVs,      garbage for XMTs
+;		IRP$L_IOST1,2	Scratch for RCVs,   normal I/O status for XMTs
+;
+; OUTPUTS:	R5-R0		Garbage
+;
+;		IRP$L_IOSB	Zeroed for XMTs,    unchanged for RCVs
+;		IRP$L_SVAPTE	Unchanged for XMTs, buffer pointer for RCVs
+;		IRP$L_IOST1,2	Unchanged for XMTs, normal I/O status for RCVs
+;
+;-
+TR$LOC_DLL_XMT:				; "Local" datalink driver transmit
+	MOVL	IRP$L_ASTPRM(R1),R2	; Get RCB
+	REMQUE	@RCB$Q_LOC_RCV(R2),R3	; Get a waiting receive
+	BVC	XFER			; If VC then got one
+	INSQUE	(R1),@RCB$Q_LOC_XMT+4(R2) ; Else queue the IRP
+	RSB
+
+TR$LOC_DLL_RCV:				; "Local datalink driver receive
+	MOVL	IRP$L_ASTPRM(R3),R2	; Get RCB
+	REMQUE	@RCB$Q_LOC_XMT(R2),R1	; Get a waiting transmit
+	BVC	XFER			; If VC then got one
+	INSQUE	(R3),@RCB$Q_LOC_RCV+4(R2) ; Else queue the IRP
+	RSB
+
+XFER:	MOVQ	IRP$L_IOST1(R1),-	; Xfer XMT status to RCV IRP
+		IRP$L_IOST1(R3)
+	MOVL	IRP$L_IOSB(R1),-	; Xfer buffer pointer
+		IRP$L_SVAPTE(R3)
+	CLRL	IRP$L_IOSB(R1)		; Indicate that the buffer is gone
+	BSBB	POST			; Post the RCV IRP
+	MOVL	R1,R3			; Get the XMT IRP
+POST:	CMPB	S^#DYN$C_IRP,IRP$B_TYPE(R3) ; IRP ?
+	BNEQ	70$			; If not, bug
+	MOVAB	G^IOC$GL_PSBL,R0	; Get address of I/O post back pointer
+	INSQUE	(R3),@(R0)+		; Queue the IRP
+	SOFTINT	#IPL$_IOPOST		; ALWAYS Post an interrupt due to an
+					; obscure system bug
+60$:	RSB				; Done
+
+70$:	BUG_CHECK NETNOSTATE,FATAL	; Bugcheck 
+
+;+
+; TR$ADJUST_IRP	- Adjust the number of IRPs in the pool
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The number of free IRPs are adjusted in whatever direction necessary to 
+; bring  RCB$W_CUR_PKT  closer to  RCB$W_MAX_PKT.
+;
+; INPUTS:	R2	RCB pointer
+;
+; OUTPUTS:	R0	Low bit clear if free queue is empty.
+;			Low bit set otherwise.
+;
+;
+;		All other registers are preserved.
+;
+;-
+	ASSUME	RCB$Q_IRP_FREE EQ 0
+
+TR$ADJUST_IRP:				; Adjust IRP pool
+	MOVL	RCB$L_IRP_ECL(R2),R0	; Get "local" IRP
+	MOVL	R2,IRP$L_ASTPRM(R0)	; Stuff the RCB	
+	PUSHL	R3			; Save reg
+10$:	CMPW	RCB$W_CUR_PKT(R2),-	; See what adjustments are needed
+		RCB$W_MAX_PKT(R2)	;
+	BEQL	50$			; Br if none
+	BGTRU	30$			; Br if decrease is needed
+	BSBB	TR$ALLOC_IRP		; Get an IRP if possible
+	BLBC	R0,50$			; Br on failure
+	INSQUE	(R3),@(R2)		; Insert the IRP onto the free list
+	INCW	RCB$W_CUR_PKT(R2)	; Account for IRP
+	INCW	RCB$W_TRANS(R2)		; Here, too
+	BRB	10$			; Try again
+30$:	REMQUE	@(R2),R0		; Get IRP if any
+	BVS	50$			; If VS then none
+	DECW	RCB$W_CUR_PKT(R2)	; Account for the IRP
+	DECW	RCB$W_TRANS(R2)		; Account for it here, too
+	JSB	G^COM$DRVDEALMEM	; Deallocate it
+	BRB	10$			; Try again
+50$:	POPL	R3			; Restore reg
+	CMPL	R2,(R2)			; Is queue empty?
+	BEQL	60$			; If so, branch
+	MOVB	#1,R0			; Indicate non empty
+	RSB
+60$:	CLRB	R0			; Indicate empty
+	RSB
+;+
+; TR$ALLOC_IRP	- Allocate IRP
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; An IRP is allocated and its header is initialized.
+;
+; INPUTS:	R5	UCB address  	;&& is it?
+;		R2	RCB pointer
+;
+; OUTPUTS:	R3	IRP pointer if successful
+;		R0	Status code
+;
+;		All other registers are preserved
+;-
+TR$ALLOC_IRP:				; Allocate Transport IRP
+	MOVQ	R1,-(SP)		; Save regs
+	MOVZBL	#IRP$C_LENGTH,R1	; Setup IRP size
+	JSB	G^EXE$ALONONPAGED	; Get the block
+	BLBC	R0,10$			; Br on error
+	MOVL	R2,R3			; Copy block address
+	;
+	;&  zero the entire IRP for now to catch access violations
+	;&  eventually, only the IRP$L_IOSB field (buffer ptr) will
+	;&  need to be zeroed
+	;
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>
+	MOVC5	#0,(SP),#0,#IRP$C_LENGTH,(R3)
+	POPR	#^M<R0,R1,R2,R3,R4,R5>
+
+	ADDL	#IRP$W_SIZE,R2		; Advance to size field
+
+	ASSUME	IRP$B_TYPE EQ <2+IRP$W_SIZE>
+	ASSUME	IRP$B_RMOD EQ <1+IRP$B_TYPE>
+
+	MOVW	R1,(R2)+		; Enter size for deallocation
+	MOVB	S^#DYN$C_IRP,(R2)+	; Enter buffer type
+	MOVB	#NET$C_IPL,(R2)		; Enter driver IPL
+10$:	MOVQ	(SP)+,R1		; Restore regs
+	RSB				; Return 
+;+
+; TR$ALLOCATE	- Allocate and init Transport buffer
+;
+; FUNCTIONAL DESCRIPTION
+;
+; A buffer is allocated and initialized
+;
+; INPUTS:	R1	Size of buffer
+;
+; OUTPUTS:	R2	Ptr to buffer if successful
+;		R1	Garbage
+;		R0	Status
+;-
+TR$ALLOCATE:				; Allocate memory block
+	PUSHL	R3			; Save reg
+	JSB	G^EXE$ALONONPAGED	; Get buffer
+	BLBC	R0,50$			; Br on error
+	MOVW	R1,UCB$W_SIZE(R2)	; Setup size
+	MOVB	S^#DYN$C_CXB,UCB$B_TYPE(R2) ; And type
+50$:	POPL	R3			; Restore reg
+	RSB
+
+	.IF DF JNX$$$
+;
+; FILL_JNX - If journalling is enabled, fill journal record.
+;
+	JNL_REC_SIZ = 32
+FILL_JNX:
+	PUSHL	R5			; Save reg
+	MOVL	RCB$L_LOC_LPD(R2),R5	;&get local LPD
+	MOVL	LPD$L_WIND(R5),R5	;&get jnl buffer
+	BEQL	100$			; If EQL then no buffer
+	CMPW	#JNL_REC_SIZ,6(R5)	; Enough space left?
+	BGEQU	100$			; If GEQU then yes
+	BSBB	200$			; Record data
+100$:	POPL	R5			; Restore reg
+	RSB
+
+200$:	PUSHR	#^M<R0,R1,R2,R3,R4>	; Save regs
+	SUBW	#JNL_REC_SIZ,6(R5)	; Acquire space to be used
+	MOVL	(R5),R4			; Get output pointer
+	ADDL	#JNL_REC_SIZ,(R5)	; Bump output pointer
+	MOVB	R0,(R4)+		; Enter record type
+	MOVB	LPD$B_PTH_INX(R6),(R4)+	; Enter line i.d.
+	MOVW	IRP$W_BCNT(R3),(R4)+	; Enter total message size
+	MOVC5	IRP$W_BCNT(R3),(R1),#0,-
+		#JNL_REC_SIZ-4,(R4)	; Enter begining of message
+	POPR	#^M<R0,R1,R2,R3,R4>	; Restore regs
+	RSB				; Return to caller
+
+	.ENDC
+
+NET$END::
+
+.END
+

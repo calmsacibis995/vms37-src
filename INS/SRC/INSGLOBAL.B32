@@ -1,0 +1,863 @@
+MODULE INS_GLOBAL (				! List Global Sections
+			IDENT = 'V03-000',
+			ADDRESSING_MODE(EXTERNAL = GENERAL)
+		 ) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  Install
+!
+! ABSTRACT:
+!
+!	This module controls listing.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system.
+!
+! AUTHOR:  Bob Grosso, September 1981
+!
+! Modified by:
+!
+!	V03-001	RPG0001		Bob Grosso		28-Dec-1981
+!		Clean up code.
+!
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';		! VAX/VMS system definitions
+
+REQUIRE
+	'SRC$:INSPREFIX.REQ';
+REQUIRE
+	'LIB$:INSDEF.B32';
+
+
+%SBTTL  'Declarations';
+!
+! Table of contents
+!
+
+LINKAGE
+    call_s_4 = CALL (STANDARD, REGISTER=4),	! for calling copy routines which execute in kernel mode
+    jsb_0_4 = JSB (REGISTER=0, REGISTER=4) :	! For mutex handling routines
+		NOPRESERVE (1,2,3);
+
+LINKAGE
+    JSB_4_5_G6_10 = JSB (REGISTER = 4, REGISTER = 5, REGISTER = 10) : 
+			GLOBAL (gsd_ptr = 6) NOPRESERVE (2,3);
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    ins_faol,				! Format ASCII output line
+    lib$get_vm,				! Allocate buffer in virtual memory
+    lib$free_vm,			! Deallocate buffer in virtual memory
+    lib$put_output,			! Print contents of formatted buffer
+    mmg$getnxtgsd : JSB_4_5_G6_10,	! get address of next used GSD in memory
+    mmg$validategsd : JSB_4_5_G6_10,	! Check if GSD is in use
+    output_faobuf,			! Print contents of formatted buffer
+    sch$lockr	: JSB_0_4,		! Lock a Mutex for read access
+    sch$unlock	: JSB_0_4;		! Unlock a Mutex
+
+EXTERNAL
+    exe$gl_gsddelfl,			! delete pending list
+    exe$gl_gsdgrpfl,			! group list
+    exe$gl_gsdsysfl,			! system list
+    exe$gl_shblist,			! SHB listhead
+    exe$gl_gsdmtx,			! Global Section Descriptor Mutex
+    ins$faooutbuf,			! address of output buffer
+    ins$faobufdesc : BBLOCK [dsc$c_s_bln],
+    ins$gl_outrab : BBLOCK,		! Output record access block
+    mmg$gl_sysphd,			! address of system process header
+    sgn$gl_maxgpgct;			! Maximum global page count
+
+FORWARD ROUTINE
+    copy_lists,			! Kernel mode routine dispatcher 
+    copy_gsd_lists : CALL_S_4,  ! Copy Global Section Descriptors to user buffer
+    list_gsds,			! list Global Section Descriptors
+    copy_shm_lists : CALL_S_4,	! Copy shared memory lists to user buffer
+    list_shms,			! list shared memory lists
+    decode_flags;		! Decode flags and buffer their ASCII symbols
+
+OWN
+    ins$a_buffer : VECTOR [2,LONG],	! User buffer for copying GSD's to while in kernel mode
+					! so the information can be formatted later while in user mode
+    ins$l_bufsiz,			! Last size tried for buffer.
+    gsd$w_size2 : WORD INITIAL ($BYTEOFFSET(gsd$w_size) + 2),
+    modeaddr : BYTE INITIAL (0);
+
+EXTERNAL LITERAL
+    ins$c_faobuflen;			! Size of the output print buffer
+
+LITERAL
+    ins$c_bufsiz = 8,			! size for first attempt to buffer kfi list
+    ins$c_ctlflgstr = 6,		! Number of entries in flags string array
+    ins$c_numgsdlsts = 4;		! Four lists; system, group, delete pending and multiported memory
+
+BUILTIN
+    PROBEW;				! Check that buffer is writeable so we don't take an access violation in kernel mode
+
+BIND
+    !
+    !	FAO control strings to format the data
+    !
+    fao_system		= $descriptor ('    '),
+    fao_group		= $descriptor ('=!OB'),
+    fao_pagcnt		= $descriptor (' Pagcnt/Refcnt=!UL/!UL'),
+    fao_pagpfn		= $descriptor (' Pagcnt/Basepfn=!UL/!XL'),
+    fao_summary		= $descriptor ('!/    !UL Global Section!%S Used,  !UL Global Page!%S Used,  !UL Global Page!%S Unused'),
+    fao_systitle	= $descriptor (' !/!_System Global Sections!/'),
+    fao_grptitle	= $descriptor (' !/!_Group Global Sections!/'),
+    fao_deltitle	= $descriptor (' !/!_Delete Pending Global Sections!/');
+
+
+
+%SBTTL  'process_global';
+
+GLOBAL ROUTINE process_global =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Process the qualifier /GLOBAL by printing the system, group, delete
+!	pending and multiport memory global section lists.  Enter kernel mode
+!	to access the lists, copying them to a user buffer, which can then be
+!	formatted for output.  Print the output to sys$output.
+!
+!  INPUT:
+!
+!	none
+!
+!  IMPLICITS INPUT:
+!
+!	An output channel to sys$output has been opened and ins$gl_outrab
+!	locates the record access block.
+!
+!  OUTPUT:
+!
+!	The formatted global section lists to sys$output.
+!
+!  ROUTINE VALUE:
+!
+!	Success or a service error.
+!---
+LOCAL
+    status;
+
+status = copy_lists (copy_gsd_lists);	! Copy the system, group and delete pending global section lists from system
+					! space to the user buffer.
+IF NOT .status THEN RETURN .status;
+
+!
+!   Get an output buffer and store address in ins$faooutbuf, where the 
+!   global formatting and output routines will access it.
+!
+execute ( lib$get_vm (%REF(ins$c_faobuflen), ins$faooutbuf) );
+
+!
+!   Initialize the buffer and it's descriptor
+!
+CH$FILL (%C' ',ins$c_faobuflen, .ins$faooutbuf);
+ins$faobufdesc [dsc$w_length] = ins$c_faobuflen;
+ins$faobufdesc [dsc$a_pointer] = .ins$faooutbuf;
+ins$gl_outrab [rab$l_rbf] = .ins$faooutbuf;
+
+
+status = list_gsds (.ins$a_buffer);	! Format the info in the user buffer and print it out.
+IF NOT .status 
+THEN 
+    BEGIN
+    execute ( lib$free_vm (%REF(ins$c_faobuflen), ins$faooutbuf) );  ! Return the buffer
+    RETURN .status;
+    END;
+
+status = copy_lists (copy_shm_lists);	! Copy the multiport memory global section lists to user buffer.
+IF NOT .status 
+THEN 
+    BEGIN
+    execute ( lib$free_vm (%REF(ins$c_faobuflen), ins$faooutbuf) );  ! Return the buffer
+    RETURN .status;
+    END;
+
+!
+!   Initialize the buffer and it's descriptor
+!
+CH$FILL (%C' ',ins$c_faobuflen, .ins$faooutbuf);
+ins$faobufdesc [dsc$w_length] = ins$c_faobuflen;
+ins$faobufdesc [dsc$a_pointer] = .ins$faooutbuf;
+ins$gl_outrab [rab$l_rbf] = .ins$faooutbuf;
+
+status = list_shms (.ins$a_buffer);	! Format the info in the user buffer and print it out.
+
+execute ( lib$free_vm (%REF(ins$c_faobuflen), ins$faooutbuf) );  ! Return the buffer
+
+RETURN .status;
+END;	! routine  process_global
+
+
+%SBTTL  'copy_lists';
+
+ROUTINE copy_lists ( copy__routine ) =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!	Set up the arguement list for the call to change mode dispatcher.
+!
+!  INPUT:
+!	copy__routine =	Name of routine which will execute in kernel mode.
+!
+!---
+BIND ROUTINE
+    copy_routine = .copy__routine : CALL_S_4;
+
+LOCAL
+    cmk_arglst : VECTOR [2,LONG],
+    cmk_status;						! status from $CMKRNL call
+
+!
+!   copy the GSD data base to user buffer so that it need not be processed in kernal mode
+!
+cmk_arglst [0] = 1;
+ins$l_bufsiz = ins$c_bufsiz;					! buffer size for first copy attempt
+report ( $EXPREG ( pagcnt = ins$c_bufsiz, retadr = ins$a_buffer));
+cmk_arglst [1] = .ins$a_buffer;
+
+WHILE (cmk_status = 
+	$CMKRNL (ROUTIN = copy_routine, ARGLST = cmk_arglst)
+      )	EQL ss$_accvio DO					! if buffer too small
+    BEGIN							! double the size of the buffer and try again
+    report ($DELTVA ( inadr = ins$a_buffer ) );	! return the buffer
+    ins$l_bufsiz = 2 * .ins$l_bufsiz;				! double the allocation size
+    report ($EXPREG ( pagcnt = .ins$l_bufsiz, retadr = ins$a_buffer));
+    cmk_arglst [1] = .ins$a_buffer;
+    END;
+
+IF NOT .cmk_status THEN RETURN .cmk_status;
+RETURN true;
+END	! routine  copy_lists
+
+
+%SBTTL  'copy_gsd_lists';
+
+ROUTINE copy_gsd_lists (buf, pcb_adr) : CALL_S_4 =
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!	Execute in Kernal mode to copy GSD data base to user buffer.
+!
+!  INPUT:
+!	buf	= address of user buffer to copy GSD data to
+!	pcb_adr	= address of process control block, courtesy of the change mode
+!		  dispatcher
+!
+!  ROUTINE VALUE:
+!	ss$_accvio :	user buffer was too small
+!	success	:	lists were copied to buffer
+!--
+BEGIN
+
+LABEL 
+    locked;		! Exit block with error status so mutex can be unlocked
+
+!
+!   Table of pointers to the GSD lists
+!
+OWN
+    gsd_lists :	VECTOR [ins$c_numgsdlsts] INITIAL (
+		exe$gl_gsdsysfl,
+		exe$gl_gsdgrpfl,
+		exe$gl_gsddelfl,
+		0);
+
+LOCAL
+    gblsec_tab : REF VECTOR [,LONG],		! global section table
+    probe_len : WORD,				! length for PROBEW
+    status;
+
+MAP 
+    mmg$gl_sysphd : REF BBLOCK;			! System process header
+
+SCH$LOCKR (exe$gl_gsdmtx, .pcb_adr);		! Lock the mutex
+
+LOCKED:
+BEGIN				! block LOCKED: permits unlocking of mutex on error exit
+status = ss$_normal;		! preset success status
+
+gblsec_tab = .mmg$gl_sysphd  + .mmg$gl_sysphd [phd$l_pstbasoff];  ! Base address of global section table
+
+INCR i FROM 0 TO ins$c_numgsdlsts-2 BY 1 DO	! For each global section list
+    BEGIN
+    LOCAL
+	gsd_entry : REF BBLOCK,			! Global section descriptor entry
+	gsd_lsthead;				! GSD listhead
+
+    gsd_lsthead = .gsd_lists [.i];
+
+    IF PROBEW ( modeaddr, gsd$w_size2, .buf)	! room in the buffer for list marker?
+    THEN
+	buf = CH$FILL( -1, .gsd$w_size2, .buf)	! Mark beginning of new list
+    ELSE
+	LEAVE LOCKED WITH (status = ss$_accvio);
+
+    gsd_entry = ..gsd_lsthead;			! first entry in list
+    WHILE .gsd_entry NEQ .gsd_lsthead DO	! follow list until back to listhead
+	BEGIN
+	IF .gsd_entry [gsd$b_type] EQL dyn$c_extgsd 	! Is this an extended GSD?
+	THEN
+	    BEGIN
+	    !
+	    !	Extended GSD
+	    !
+	    probe_len = gsd$c_extgsdlng + 4;		! size of GSD and longword for section table index value
+	    IF PROBEW ( modeaddr, probe_len, .buf)
+	    THEN
+		buf = CH$COPY (gsd$c_extgsdlng, .gsd_entry, 0, ! copy the entry and fill last longword with 0's
+				.probe_len, .buf)
+	    ELSE
+		LEAVE LOCKED WITH (status = ss$_accvio);
+	    END				! extended GSD
+	ELSE
+	    !
+	    !   Not an extended GSD
+	    !
+	    BEGIN
+	    LOCAL
+		gst_entry_adr,
+		gst_index;
+
+	    probe_len = gsd$c_length + 4 + sec$c_length;	! Check if there is room for GSD, global section table entry
+	    IF NOT PROBEW ( modeaddr, probe_len, .buf)		!   address, and global section table entry
+	    THEN LEAVE LOCKED WITH (status = ss$_accvio);
+	    buf = CH$MOVE (gsd$c_length, .gsd_entry, .buf);
+
+	    !
+	    !   Get Global Section Table Index
+	    ! 	WORD must be sign extended
+	    !
+	    gst_index = .(gsd_entry [gsd$w_gstx])<0,16,1>; 
+
+	    gst_entry_adr = gblsec_tab [.gst_index];		! address of global section table entry
+	    .buf = .gst_entry_adr;				! buffer address of GST entry
+	    buf = .buf + 4;					! skip over storage of GST entry address
+
+	    buf = CH$MOVE (sec$c_length, .gst_entry_adr, .buf);	! copy the GST entry
+	    END;	! non extended GSD
+	gsd_entry = ..gsd_entry;
+	END;		! WHILE traversing list
+    END;		! INCRementing through list heads
+
+    !
+    !	Check if there is room in the buffer to pad the end with zeros
+    !	to mark end of lists.
+    !
+    IF PROBEW ( modeaddr, gsd$w_size2, .buf)
+    THEN
+	buf = CH$FILL( 0, .gsd$w_size2, .buf)
+    ELSE
+	LEAVE LOCKED WITH (status = ss$_accvio);
+
+END;	! block LOCKED:
+
+SCH$UNLOCK (exe$gl_gsdmtx, .pcb_adr);	! Unlock the mutex
+
+RETURN .status;
+END;	! routine copy_gsd_lists
+
+
+%SBTTL 'list_gsds';
+
+ROUTINE list_gsds (gsd_buffer) =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!	format the Global section information in the user buffer and
+!	print it to sys$output.
+!
+!  INPUT:
+!	gsb_buffer =	address of user buffer which contains GSD info.
+!
+!  OUTPUT:
+!	Format and put to sys$output the system, group and delete pending
+!	global section lists.
+!
+!---
+
+OWN
+    !
+    !	Table of control strings to print the list name
+    !
+    title_descs :	VECTOR [3] INITIAL (
+		fao_systitle,
+		fao_grptitle,
+		fao_deltitle);
+
+LOCAL
+    buffer : REF BBLOCK,
+    gpt_entries,	! Number of GPT entries used in a list
+    gpt_unused,		! Number of GPT entries unused in a list
+    sections,		! Count of global sections
+    status,
+    title;		! Index of which title to use
+
+
+buffer = .gsd_buffer;
+
+!
+!    Initialize counters
+!
+sections = 0;
+gpt_entries = 0;
+title = 0;
+
+!
+!   Zeros in the size field signal the end of the buffered data.
+!   Minus ones signal the start of a new list.
+!
+UNTIL .buffer [gsd$w_size] EQL 0 DO
+    BEGIN
+
+    buffer = .buffer + $BYTEOFFSET(gsd$w_size) + 2;	! Skip over minus ones
+    !
+    !	Output appropriate title
+    !
+    IF .(buffer [gsd$w_size])<0,16,1> GTR 0 		! if this list isn't empty
+    THEN
+	BEGIN
+	BIND
+	    title_desc = title_descs [.title];
+
+	ins_faol ( .title_desc);			! Load title into output buffer
+	output_faobuf ();				! print the title line
+	END;
+    title = .title + 1;					! Increment title to index next title descriptor
+
+    WHILE .(buffer [gsd$w_size])<0,16,1> GTR 0 DO	! For each entry in this list
+	BEGIN
+	LOCAL
+	    gste_adr : REF BBLOCK,			! address in buffer of Global section table entry
+	    pages;
+
+	sections = .sections + 1;			! Count the global sections
+
+	decode_flags (.buffer);				! Format the ASCII symbols for the flags
+
+	ins_faol (					! print either SYS or GRP
+		( IF (.buffer [gsd$w_flags] AND sec$m_sysgbl) NEQ 0
+			THEN fao_system	
+			ELSE fao_group )
+		, .buffer [gsd$w_pcbgrp]);
+
+	
+	IF .buffer [gsd$b_type] EQL dyn$c_extgsd	! Extended GSD?
+	THEN
+	    BEGIN	! Extended GSD
+	    pages = .buffer [gsd$l_pages];		! Pages in section
+	    gpt_entries = .gpt_entries + ((.pages + 3) AND NOT 1); 	! Count 2 zero GPT entries and round up to an
+									!  even number of longwords.
+	    ins_faol ( fao_pagpfn, .pages, .buffer [gsd$l_basepfn]);
+	    output_faobuf ();
+
+	    buffer = .buffer + gsd$c_extgsdlng + 4;	! skip 4 bytes for the empty Section Table entry address
+	    END
+	ELSE
+	    BEGIN	! non-extended
+	    gste_adr = .buffer + gsd$c_length + 4;
+	    pages = .gste_adr [sec$l_pagcnt];
+	    gpt_entries = .gpt_entries + ((.pages + 3) AND NOT 1);	! Count 2 zero GPT entries and round up to an
+									!  even number of longwords.
+	    ins_faol ( fao_pagcnt, .pages, .gste_adr [sec$l_refcnt]);
+	    output_faobuf ();
+	    buffer = .buffer + gsd$c_length + 4 + sec$c_length;
+	    END;
+
+	END;		! While entries in this list
+
+    END;
+
+!
+!   Print the summary lines
+!
+gpt_unused = .sgn$gl_maxgpgct - .gpt_entries;			! Number of unused = max available - count of those used
+ins_faol ( fao_summary, .sections, .gpt_entries, .gpt_unused);
+output_faobuf ();
+
+RETURN true;
+END;		! routine  list_gsds
+
+
+%SBTTL  'copy_shm_lists';
+
+ROUTINE copy_shm_lists (buf, pcb_adr) : CALL_S_4 =
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!	Execute in Kernal mode to copy SHM data base to user buffer.
+!
+!  INPUT:
+!	buf	= address of user buffer to copy GSD data to
+!	pcb_adr	= address of process control block, courtesy of the change mode
+!		  dispatcher
+!
+!  ROUTINE VALUE:
+!	ss$_accvio :	user buffer was too small
+!	success	:	lists were copied to buffer
+!--
+BEGIN
+
+GLOBAL REGISTER
+    gsd_ptr = 6 : REF BBLOCK;
+
+LOCAL
+    com_data_page : REF BBLOCK,		! store commom data page address
+    name,
+    probe_len : WORD,			! length for PROBEW
+    shm_ctlblk : REF BBLOCK,		! shared memory control block
+    status;
+
+shm_ctlblk = exe$gl_shblist;
+
+!
+!   Loop thru all the shared memories
+!
+WHILE ((shm_ctlblk = ..shm_ctlblk) NEQ 0) DO
+    BEGIN
+
+    !
+    !	Check if enough room in buffer and mark start of new list by
+    !	filling size field with minus ones.
+    !
+    IF PROBEW ( modeaddr, gsd$w_size2, .buf)
+    THEN
+	buf = CH$FILL (-1, .gsd$w_size2, .buf)
+    ELSE
+	RETURN ss$_accvio;
+
+    !
+    !    If this shared memory is not connected, then skip it
+    !
+    IF (shb$m_connect AND .shm_ctlblk [shb$b_flags]) NEQ 0
+    THEN
+	BEGIN		! shared memory is connected
+
+	!
+	!    Check if there is room in the buffer for
+	!	longword for port number
+	!	longword for number of global pages
+	!	longword for maximum number of GSD's in this list
+	!	16 bytes for the name of the shared memory
+	!    and move them in.
+	!
+	probe_len = 4 + 4 + 4 + 16;
+	IF NOT PROBEW ( modeaddr, probe_len, .buf)
+	THEN RETURN ss$_accvio;
+
+	.buf = .shm_ctlblk [shb$b_port];
+	buf = .buf + 4;
+
+	com_data_page = .shm_ctlblk [shb$l_datapage];
+
+	.buf = .com_data_page [shd$l_gspagcnt];
+	buf = .buf + 4;
+
+	.buf = .com_data_page [shd$w_gsdmax];
+	buf = .buf + 4;
+
+	name = .com_data_page + $BYTEOFFSET(shd$t_name);
+	buf = CH$MOVE (16, .name, .buf);
+
+	!
+	!   Get address of first gsd in this shared memory
+	!   and check if it is in use.
+	!
+	gsd_ptr = .com_data_page [shd$l_gsdptr] + .com_data_page;
+	status = mmg$validategsd ( .shm_ctlblk, .com_data_page, .name);
+
+	!
+	!   For all the used GSDs
+	!
+	WHILE (.gsd_ptr NEQ 0) DO
+	    BEGIN
+	    !
+	    !	get info on each gsd
+	    !
+
+	    probe_len = .gsd_ptr [gsd$w_size];
+	    IF NOT PROBEW ( modeaddr, probe_len, .buf)
+	    THEN RETURN ss$_accvio;
+
+	    buf = CH$MOVE (.probe_len, .gsd_ptr, .buf);	! Copy the GSD
+
+	    !
+	    !	Get the address of the next used GSD in shared memory
+	    !
+	    status = mmg$getnxtgsd ( .shm_ctlblk, .com_data_page, .name);
+	    END;
+	!
+	!   Mark end of GSDs for this port
+	!
+	IF NOT PROBEW ( modeaddr, gsd$w_size2, .buf)
+	THEN RETURN ss$_accvio;
+	buf = CH$FILL (0, .gsd$w_size2, .buf);
+
+	END;	! IF connected
+    END;	! While there are more Shared Memory Control Blocks
+
+!
+!   Fill size field with zeros to mark the end of the buffer
+!
+IF NOT PROBEW ( modeaddr, gsd$w_size2, .buf)
+THEN RETURN ss$_accvio;
+buf = CH$FILL (0, .gsd$w_size2, .buf);
+
+RETURN ss$_normal;
+END;	! routine copy_shm_lists
+
+
+%SBTTL  'lists_shms';
+
+ROUTINE list_shms (shm_buffer) =
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!	Format and display to sys$output the shared memory GSD's
+!
+!  INPUT:
+!	shm_buffer =	buffer containing copies of shared memory GSD list
+!
+!---
+BEGIN
+OWN
+    spaces : LONG INITIAL (CSTRING ('        ')),
+    delpend : LONG INITIAL (CSTRING (' DELPEND'));
+
+LOCAL
+    buffer : REF BBLOCK,
+    gpt_entries,
+    gsd_max,
+    gsp_unused,		! Count of pages for global sections
+    port_number,	! Number of memory port
+    sections,		! Number of global sections
+    status;
+
+BIND
+    fao_shmtitle	= $descriptor (' !/!_Global Sections in Multiport Memory "!AC"!/'),
+    fao_crport		= $descriptor (' !AC Creator Port=!UB'),
+    fao_basepfn		= $descriptor ('!_Basepfn/Pagcnt=!XL/!UL'),
+    fao_proccnt		= $descriptor ('!_Port !UB PTE Refcnt=!UL'),
+    fao_summary1	= $descriptor ('!/    !UL Global Page!%S Used,  !UL Global Page!%S Unused'),
+    fao_summary2	= $descriptor ('    !UL Global Section!%S Used,  !UL Global Section!%S Unused');
+
+
+buffer = .shm_buffer;
+
+!
+!   If there were no shared memories then return success
+!
+IF .(buffer [gsd$w_size])<0,16,1> EQL 0 THEN RETURN true;
+
+!
+!   For each shared memory
+!
+UNTIL .(buffer [gsd$w_size])<0,16,1> EQL 0 DO	! <0,16,1> Ensures signed compare
+    BEGIN
+    buffer = .buffer + $BYTEOFFSET(gsd$w_size) + 2;  ! skip over -1's
+
+    sections = 0;
+    gpt_entries = 0;
+
+    port_number = ..buffer;
+    buffer = .buffer + 4;
+
+    gsp_unused = ..buffer;
+    buffer = .buffer + 4;
+
+    gsd_max = ..buffer;
+    buffer = .buffer + 4;
+
+    ins_faol ( fao_shmtitle, .buffer);	! print header with Shared Memory Name
+    output_faobuf ();
+    buffer = .buffer + 16;		! skip past name
+
+    UNTIL .(buffer [gsd$w_size])<0,16,1>  EQL 0 DO	! loop through all GSD's
+	BEGIN
+	LOCAL
+	    baspfnadr,
+	    port,
+	    proc_ref_cnts,
+	    ptecntadr;
+
+	sections = .sections + 1;
+	decode_flags (.buffer);
+	ins_faol (fao_crport, 
+		(IF .buffer [gsd$v_delpend]
+		THEN .delpend
+		ELSE .spaces ),
+		.buffer [gsd$b_creatport]);
+	output_faobuf ();
+
+	baspfnadr = buffer [gsd$l_baspfn1];		! Address of first PFN base
+	INCR i FROM 0 to gsd$c_pfnbasmax - 1 DO		! For the maximum number of PFN bases allowed
+	    BEGIN
+	    BIND
+		pfn_base = .baspfnadr,			! PFN base
+		base_cnt = .baspfnadr + 4;		! count of pages at this base
+
+	    IF .base_cnt  EQL 0 THEN EXITLOOP;
+	    gpt_entries = .gpt_entries + .base_cnt;	! count of global section pages used
+	    ins_faol (fao_basepfn, .pfn_base, .base_cnt);
+	    output_faobuf ();
+	    baspfnadr = .baspfnadr + 8;			! skip over count to next PFN base
+	    END;
+
+	proc_ref_cnts = .buffer [gsd$b_proccnt];	! Processor reference counts
+	ptecntadr = buffer [gsd$l_ptecnt1];		! Address of first reference count
+	port = 0;
+	WHILE (proc_ref_cnts = .proc_ref_cnts - 1) GEQ 0 DO	! For all active ports
+	    BEGIN
+	    LOCAL
+		pte_cnt;
+
+	    pte_cnt = ..ptecntadr;			! get processor reference count
+	    IF .port EQL .port_number			! Is this the port for this processor ?
+	    THEN pte_cnt = .pte_cnt - 1;		!   Then subtract one for the GSD lock
+	    IF .pte_cnt GTR 0				! skip if none mapped to section
+	    THEN
+		BEGIN					! output processor reference count line
+		ins_faol (fao_proccnt, .port, .pte_cnt);
+		output_faobuf ();
+		END;
+
+	    ptecntadr = .ptecntadr + 4;			! Go to address of next processor reference count
+	    port = .port + 1;				! Do for all active ports
+	    END;
+
+	buffer = .buffer + .buffer [gsd$w_size];
+	END;		! Until no more GSD's
+
+    buffer = .buffer + .buffer [gsd$w_size];	! skip over zeros
+    END;
+
+!
+!   Print summary lines
+!
+gsp_unused = .gsp_unused - .gpt_entries;
+ins_faol ( fao_summary1, .gpt_entries, .gsp_unused);
+output_faobuf ();
+ins_faol ( fao_summary2, .sections, (.gsd_max - .sections));
+output_faobuf ();
+
+RETURN true;
+END;	! Routine  list_shms
+
+
+
+%SBTTL  'Decode_flags';
+
+ROUTINE decode_flags ( gsd ) =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!	Format the ASCII symbols in the output buffer 
+!	for the gsd flags that are set.
+!
+!  INPUT:
+!	gsd = address in buffer of GSD flags word
+!
+!---
+MAP 
+    gsd : REF BBLOCK;
+
+!
+!   Indices to ctlflg_array
+!
+LITERAL
+    sec_i_wrt = 0,
+    sec_i_crf = 2,
+    sec_i_dzro = 4,
+    sec_i_prm = 6,
+    sec_i_tmp = 7,
+    sec_i_sys = 8,
+    sec_i_grp = 9;
+
+OWN
+
+    !
+    !   Table of counted ASCII strings, one string to be output
+    !	if flag is set, another if it is not set
+    !
+    ctlflag_array : VECTOR [2 * ins$c_ctlflgstr]  INITIAL (
+		CSTRING ('WRT'), CSTRING ('   '),
+		CSTRING ('CRF'), CSTRING ('   '),
+		CSTRING ('DZRO'), CSTRING ('    '),
+		CSTRING ('PRM'), CSTRING ('TMP'),
+		CSTRING ('SYS'), CSTRING ('GRP')
+		),
+    pfn_cstr : LONG INITIAL( CSTRING ('PFN '));
+
+BIND
+    fao_gblnam		= $descriptor ('!15AC(!XL) !AC !AC !AC !AC !AC');
+
+!
+!   Place the correct ASCII symbols in the output buffer.
+!
+ins_faol ( fao_gblnam, gsd [gsd$t_gsdnam], .gsd [gsd$l_ident],
+	(IF (.gsd [gsd$w_flags] AND sec$m_wrt) NEQ 0 
+		THEN .ctlflag_array [sec_i_wrt]
+		ELSE .ctlflag_array [sec_i_wrt + 1]),
+	(IF (.gsd [gsd$w_flags] AND sec$m_crf) NEQ 0 
+		THEN .ctlflag_array [sec_i_crf]
+		ELSE .ctlflag_array [sec_i_crf + 1]),
+	(IF (.gsd [gsd$w_flags] AND sec$m_dzro) NEQ 0 
+		THEN
+		    BEGIN
+		    IF .gsd [gsd$b_type] EQL dyn$c_extgsd
+		    THEN .pfn_cstr
+		    ELSE .ctlflag_array [sec_i_dzro]
+		    END
+		ELSE .ctlflag_array [sec_i_dzro + 1]),
+	(IF (.gsd [gsd$w_flags] AND sec$m_perm) NEQ 0 
+		THEN .ctlflag_array [sec_i_prm]
+		ELSE .ctlflag_array [sec_i_tmp]),
+	(IF (.gsd [gsd$w_flags] AND sec$m_sysgbl) NEQ 0 
+		THEN .ctlflag_array [sec_i_sys]
+		ELSE .ctlflag_array [sec_i_grp])	);
+
+RETURN true;
+END;
+
+END
+ELUDOM

@@ -1,0 +1,2289 @@
+	.TITLE	PASCSCTL
+	.IDENT	'V03-003'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1981, 1982                                                *
+;*  BY DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASS.			    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND  COPIED  *
+;*  ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH  LICENSE AND WITH THE  *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR  ANY  OTHER  *
+;*  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY  *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE  IS  HEREBY  *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE  WITHOUT  NOTICE  *
+;*  AND  SHOULD  NOT  BE  CONSTRUED  AS  A COMMITMENT BY DIGITAL EQUIPMENT  *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF  ITS  *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; FACILITY:
+;
+;	VAX/VMS EXECUTIVE, I/O DRIVERS
+;
+; ABSTRACT:  SCS CONTROL INCLUDING CONNECTION MANAGEMENT, PROCESSING
+;	     RECEIVED CREDIT MESSAGES, AND SHARING OF THE SINGLE
+;	     SCS SEND BUFFER PER PATH.
+;
+; AUTHOR:  N. KRONENBERG,  MAY 1981
+;
+; MODIFIED BY:
+;
+;	V03-003	NPK2019		N. Kronenberg		6-Apr-1982
+;		Change BAD_DATABASE to crash port instead of bugcheck.
+;
+;	V03-002	NPK2018		N. Kronenberg		25-Mar-1982
+;		Added routine SCS$ALLOC_DGPPD to allocate short dgs.
+;		Removed test code from SCS$DEAL_DG.
+;
+;	V03-001	NPK2016		N. Kronenberg		18-Mar-1982
+;		Fixed .TITLE
+;
+;--
+
+	.SBTTL	DEFINITIONS
+
+;
+; Set PSECT to driver code:
+;
+
+	.PSECT	$$$115_DRIVER,LONG
+
+
+;
+; System definitions (LIB.MLB):
+;
+
+	$CDLDEF				; Connection Descriptor List format
+	$CDTDEF				; Connection Descriptor Table format
+	$CDRPDEF			; Class Driver Request Pkt format
+	$DYNDEF				; Data structure type, subtype codes
+	$PBDEF				; Path Block format
+	$PDTDEF				; Port Descriptor Table format
+	$SCSDEF				; SCS message format
+
+;
+; PADRIVER definitions (PALIB.MLB):
+;
+
+	$PAPDTDEF			; CI extension to PDT
+	$PAREGDEF			; CI register definitions
+	$PPDDEF				; PPD layer of msg/dg header
+
+
+	.SBTTL	DATA
+
+;+
+; Tables to convert SCS status codes to corresponding VMS status codes.
+;-
+;
+; SCS status codes:
+;
+
+SCS_STATUS_TAB:
+
+	.WORD	SCS$C_STNOMAT		; No matching listener
+	.WORD	SCS$C_STNORS		; No resources in listener
+	.WORD	SCS$C_STNORMAL		; General success status
+	.WORD	SCS$C_STDISC		; CDT disconnected
+
+SCS_STATUS_LEN = .-SCS_STATUS_TAB	; # bytes in SCS status table
+
+;
+; VMS status codes corresponding to SCS codes.  This table must
+; follow above table.
+;
+
+VMS_STATUS_TAB:
+
+	.WORD	SS$_NOLISTENER		; No matching listener
+	.WORD	SS$_REMRSRC		; No resources in listener
+	.WORD	SS$_NORMAL		; Success
+	.WORD	SS$_DISCONNECT		; CDT disconnected
+
+	.SBTTL	PROCESS REC'D SCS CONTROL MESSAGES
+;+
+; This routine is called by module PAINTR when a message is received which is
+; message type other than SCS$C_APPL_MSG.  This routine dispatches
+; on the various message types that are possible to routines that
+; process the received messages.
+;
+; Inputs:
+;
+;	R2			-Addr of received message
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R4			-Preserved
+;	other registers		-Destroyed
+;-
+
+;
+; Message format assumptions:
+;
+
+ASSUME	SCS$C_CON_REQ	EQ 0
+ASSUME	SCS$C_CON_RSP	EQ 1
+ASSUME	SCS$C_ACCP_REQ	EQ 2
+ASSUME 	SCS$C_ACCP_RSP	EQ 3
+ASSUME	SCS$C_REJ_REQ	EQ 4
+ASSUME	SCS$C_REJ_RSP	EQ 5
+ASSUME	SCS$C_DISC_REQ	EQ 6
+ASSUME	SCS$C_DISC_RSP	EQ 7
+ASSUME	SCS$C_CR_REQ	EQ 8
+ASSUME	SCS$C_CR_RSP	EQ 9
+
+
+	.ENABL	LSB
+
+SCS$REC_SCSMSG::
+	
+	TSTW	SCS$W_MTYPE(R2)		; Connect request?
+	BEQL	10$			; If so, skip CDT addr calculation
+	BSBW	SCS$CHK_CONIDX		; Check destination CONID
+					;  and get CDT addr
+	BLBC	R0,CONID_FAIL		; Branch if bad CONID
+
+10$:	CASE	SCS$W_MTYPE(R2),<-	; Dispatch to routine based on msg type:
+		REC_CON_REQ,-		;  CONNECT_REQ
+		REC_CON_RSP,-		;  CONNECT_RSP
+		REC_ACCP_REQ,-		;  ACCEPT_REQ
+		REC_ACCP_RSP,-		;  ACCEPT_RSP
+		REC_REJ_REQ,-		;  REJECT_REQ
+		REC_REJ_RSP,-		;  REJECT_RSP
+		REC_DISC_REQ,-		;  DISCONNECT_REQ
+		REC_DISC_RSP,-		;  DISCONNECT_RSP
+		REC_CR_REQ,-		;  CREDIT_REQ
+		REC_CR_RSP>		;  CREDIT_RSP
+	BRW	BREAK_VC		; Other types are illegal
+
+CONID_FAIL:
+
+	BSBW	SCS$QUEUE_MSG		; Discard msg by returning it
+					;  to free queue
+	RSB				; Return to interrupt service
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_CR_REQ,	PROCESS REC'D CREDIT REQUEST
+
+;+
+; This routine processes a credit request (received separately from
+; an appliction message).  The algorithm is:
+;
+; For positive credit field:
+;
+;	CDT$W_SEND(R3) = CDT$W_SEND(R3) + credit
+;
+; For negative credit field (credits being retracted):
+;
+;	Maximum returnable credit = Maximum of 0 or
+;				    (CDT$W_SEND - CDT$W_MIN_SEND)
+;
+;	Number to return = Minimum of (Max returnable) or (-credit field)
+;
+; Inputs:
+;
+;	R2			-Addr of credit message
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0,R1			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_CR_REQ:
+
+	MOVW	SCS$W_CREDIT(R2),R1	; Get # credits extended
+	BGEQ	UPDATE_SEND		; Branch if positive
+	SUBW3	CDT$W_MINSEND(R3),-	; Compute # we can return
+		CDT$W_SEND(R3),R0	;
+	BGEQ	10$			; Branch if not negative
+	CLRW	R0			; Else # we can return = 0
+
+10$:	MNEGW	R1,R1			; Compute -(credit field)
+	CMPW	R1,R0			; Is it less than, or equal to 
+					;  maximum returnable?
+	BLEQU	20$			; Branch if so
+	MOVW	R0,R1			; Else choose max returnable
+20$:	MNEGW	R1,R1			; Calc -Min(max returnable,-credit)
+
+UPDATE_SEND:
+
+	ADDW	R1,CDT$W_SEND(R3)	; Update our send credit
+	BSBW	SEND_CR_RSP		; Turn messge around for RSP
+
+30$:	TSTW	CDT$W_SEND(R3)		; Any send credits now?
+	BEQL	40$			; Branch if not
+	$RESUME_FP	-		; Else resume 
+		@CDT$L_CRWAITQFL(R3),-	;  next waiter
+		QEMPTY=40$		;  branching if none
+	BRB	30$			; Check if more credit
+
+40$:	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_CR_RSP,	PROCESS REC'D CREDIT RESPONSE
+
+;+
+; This routine is called upon receipt of a response to a previously
+; sent CREDIT_REQ.  REC_CR_RSP updates the record of the number
+; of sent credits held by the remote SCS (CDT$W_REC) and then
+; resumes the SCS message send process in case any connection
+; is waiting for the SCS send buffer.
+;
+; Inputs:
+;
+;	R2			-Addr of credit response message
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_CR_RSP:
+
+	MOVW	SCS$W_CREDIT(R2),R0	; Get credit confirmed
+	BLSS	10$			; Branch if negative
+	BSBW	SCS$RESUM_SEND		; Resume SCS send waiter, if any
+	RSB				; Return
+
+10$:	BRW	BREAK_VC		; Negative credit--> remote SCS
+					;  thinks we asked for credit
+					;  back and we never do that.
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_CON_REQ,	PROCESS REC'D CONNECT REQUEST
+
+;+
+; 
+; Inputs:
+;
+;	R2			-Addr of msg buffer containing CONNECT_REQ
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+
+	.ENABL	LSB
+
+REC_CON_REQ:
+
+	MOVAL	SCS$T_DST_PROC(R2),R1	; Get addr of target process name
+	JSB	G^SCS$LOCLOOKUP		; Look it up in the directory
+	BLBC	R0,NO_MATCH		; Branch if failed
+	$DISPATCH -
+		CDT$W_STATE(R3),-		; Dispatch on state:
+		<-				;
+		<CDT$C_CON_REC,	NO_RESOURCE>,-	;  CONNECT in progress
+		<CDT$C_REJ_SENT,NO_RESOURCE>,-	;  CONNECT in progress
+		<CDT$C_LISTEN,	CON_LISTEN>,-	;  Just listening
+		>
+
+	BRW	BREAK_VC			; Illegal state
+
+CON_LISTEN:
+
+	PUSHL	R2			; Save addr of CONNECT_REQ
+	BSBW	SCS$ALL_SCSREC		; Allocate SCS buffer to listening CDT
+	POPL	R2			; Retreive addr of CONNECT_REQ
+	BLBC	R0,NO_RESOURCE		; Branch if no pool
+	BSBW	SCS$COPY_ACCP		; Copy info about remote to CDT
+	BSBW	SCS$SAVE_REQ		; Copy connect request to listener
+					;  SCS buffer.
+	BSBW	CNF$LKP_PB_MSG		; Look up path block given PDT and
+	BLBC	R0,BAD_DATABASE		; Branch if couldn't find PB --
+					;  shouldn't get seq msg unless
+					;  there is a PB (VC open)
+	MOVL	R1,CDT$L_PB(R3)		; Save PB addr in listen CDT
+	MOVZBL	PPD$B_PORT(R2),-	; Also save remote station addr,
+		CDT$B_RSTATION(R3)	;
+	CLRW	CDT$B_RSTATION+4(R3)	;
+	MOVL	R4,CDT$L_PDT(R3)	;  and PDT addr in listen CDT
+	MOVW	#CDT$C_CON_REC,-	; Move connection state from
+		CDT$W_STATE(R3)		;  listen to connect received
+	MOVL	PB$L_CDTLST(R1),-	; Insert listening CDT on PB list
+		CDT$L_CDTLST(R3)	;  of CDT's in case of VC or
+	MOVL	R3,PB$L_CDTLST(R1)	;  power failure
+	MOVW	#SCS$C_STNORMAL,R0	; Set status to match successful
+	BSBW	SCS$SEND_RSP		; Generate response
+	MOVL	CDT$L_SCSMSG(R3),R2	; Get addr of copy of msg
+	MOVAB	SCS$T_DST_PROC(R2),R2	; Compute addr of part SYSAP wants
+	JSB	@CDT$L_MSGINPUT(R3)	; Call listener input addr
+	RSB				; Return to PAINIT to dequeue
+					;  more responses
+
+NO_MATCH:
+
+	MOVW	#SCS$C_STNOMAT,R0	; Set status to no matching process
+	BRB	10$			; Join common code
+
+NO_RESOURCE:
+
+	MOVW	#SCS$C_STNORS,R0	; Set status to no resources
+
+10$:	BSBW	SCS$SEND_RSP		; Send response
+	RSB				; Return
+
+BAD_DATABASE:
+
+					;***Log error
+	BSBW	SCS$DISCARD_MSG		; Put SCS receive buffer back
+					;  on free queue
+	BSBW	ERR$CRASH_PORT		; Init port crash
+	RSB				; Return to interrupt service
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_CON_RSP,	PROCESS REC'D CONNECT RESPONSE
+
+;+
+; This routine is called upon receipt of a CONNECT_RSP.  Action is as
+; follows:
+;
+;	CONNECT_RSP STATUS	CDT STATE	ACTION
+;
+;	Match			CON_SENT	Move state to CON_ACK.
+;						Resume SCS send wait queue.
+;
+;	No match,		CON_SENT	Deallocate CDT and all its
+;	No resources				buffers.  Resume SYSAP with
+;						error status.  Resume SCS
+;						send wait queue.
+;
+; Inputs:
+;
+;	R2			-Addr of CONNECT_RSP message
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	other registers		-Preserved (if connect acknowleged)
+;	R3			-Destroyed if connect not acknowleged
+
+;-
+
+	.ENABL	LSB
+
+REC_CON_RSP:
+
+	$CHK_CDTSTATE -			; Verify CDT state is
+		CON_SENT,-		;  connect sent;  if not,
+		ERROR=BREAK_VC		;  fatal state error
+	CMPW	SCS$W_STATUS(R2),-	; Was connect acknowleged?
+		#SCS$C_STNORMAL		;
+	BNEQ	CONNECT_FAIL		; Branch if not
+	MOVW	#CDT$C_CON_ACK,-	; Move CDT state to connect ack'ed
+		CDT$W_STATE(R3)		;
+	BRB	10$			; Join common finish
+
+CONNECT_FAIL:
+
+	BSBW	SCS$DEAL_ALLBUF		; Deallocate all CDT's buffers
+	BSBW	SCS$MAP_SCSSTS		; Map SCS status to VMS
+	PUSHL	R0			;  and save on stack
+	BSBW	SCS$RESUM_SEND		; Resume SCS send queue
+	MOVL	CDT$L_FR5(R3),R5	; Restore SYSAP's context: R5
+	PUSHL	CDT$L_FPC(R3)		;  and PC from CDT
+	JSB	G^SCS$DEALL_CDT		; Deallocate CDT too
+	MOVL	4(SP),R0		; Retreive VMS status
+	MOVL	R4,4(SP)		; Save PDT addr over status
+	JSB	@(SP)+			; Call SYSAP with error status
+	POPL	R4			; Retreive PDT address
+	RSB				; Return
+
+10$:	BSBW	SCS$RESUM_SEND		; Resume SCS send queue
+	RSB				; Return
+
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_ACCP_REQ,	PROCESS REC'D ACCEPT REQUEST
+
+;+
+; this routine is called upon receipt or an ACCEPT_REQ message.  Action
+; is as follows:
+;
+;	CDT State		Action
+;
+;	CON_ACK			Copy accept message and parameters
+;				to CDT;  Set CDT state open.
+;				Send ACCEPT_RSP.  Resume SYSAP 
+;				with success status.
+;
+;	Sequence # check	Send back a response that tells
+;	fails			remote SCS this CDT went away.
+;
+; Inputs:
+;
+;	R2			-Addr of CONNECT_RSP message
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_ACCP_REQ:
+
+	BSBW	SCS$CHK_SEQNUM		; Check that this is our CDT
+	BLBC	R0,CDT_CLOSED		; Branch if not-- we must have
+					;  done a unilateral disconnect
+	$CHK_CDTSTATE	-		; Verify that the CDT state is
+		CON_ACK,-		;  CONNECT ack'ed;  if not,
+		ERROR=BREAK_VC		;  fatal state error
+	BSBW	SCS$SAVE_REQ		; Save copy of ACCEPT_REQ message
+	BSBW	SCS$COPY_ACCP		; Copy info from ACCEPT_REQ msg
+					;  to local CDT
+	MOVW	#CDT$C_OPEN,-		; Set CDT state open
+		CDT$W_STATE(R3)		;
+	MOVW	#SCS$C_STNORMAL,R0	; Set to send success response
+	BSBW	SCS$SEND_RSP		; Send ACCEPT response to remote
+	MOVZWL	#SS$_NORMAL,R0		; Set to return success
+	MOVL	CDT$L_SCSMSG(R3),R2	; Get addr of success message
+	MOVAL	SCS$T_DST_PROC(R2),R2	; Step R2 past SCS header
+	BRW	RESUME_CONCALL		; Resume SYSAP 
+
+CDT_CLOSED:
+
+	MOVW	#SCS$C_STDISC,R0	; Set response status to error
+	BSBW	SCS$SEND_RSP		;  and send the response
+	RSB				; Done handling ACCEPT_REQ.
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_ACCP_RSP,	PROCESS REC'D ACCEPT RESPONSE
+
+;+
+; This routine is called upon receipt of an ACCEPT_RSP message.  Action
+; is as follows:
+;
+;	CDT State		Action
+;
+;	ACCP_SENT		If the ACCEPT_RSP has success status,
+;				set CDT state open.  Resume SCS
+;				send wait queue.  Resume SYSAP.
+;				If the ACCEPT_RSP has fail status,
+;				then clean up the CDT and return
+;				the RSP error status to the SYSAP.
+;
+; Inputs:
+;
+;	R2			-Addr of ACCEPT_RSP message
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_ACCP_RSP:
+
+	$CHK_CDTSTATE -			; Verify that CDT state is
+		ACCP_SENT,-		;  accept sent;  if not,
+		ERROR=BREAK_VC		;  fatal state error
+	MOVW	#CDT$C_OPEN,-		; Move state to open
+		CDT$W_STATE(R3)		;
+	MOVL	CDT$L_SCSMSG(R3),R0	; Get CONNECT_REQ msg buffer
+	PUSHL	R3			; Save addr of accepting CDT
+	MOVL	SCS$L_DST_CONID(R0),R3	; Get addr of listening CDT
+					;  saved by ACCEPT call
+	BSBW	SCS$FREE_LISTEN		; Put listener back in listen state
+	POPL	R3			; Retreive addr of accepting CDT
+	BSBW	SCS$MAP_SCSSTS		; Map SCS status to VMS
+	PUSHL	R0			; Save translated status
+	BSBW	SCS$RESUM_SEND		; Resume SCS send wait queue
+	POPL	R0			; Restore saved VMS status
+	CMPW	R0,#SS$_NORMAL		; Was ACCEPT ok?
+	BNEQ	ACCP_ABORT		; Branch if not
+	BRW	RESUME_CONCALL		; Resume SYSAP
+
+ACCP_ABORT:
+
+	BRW	SCS$CLOSE_CDT		; Clean up the CDT that went
+					;  with the ACCEPT request and
+					;  notify caller that ACCEPT failed
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_REJ_REQ,	PROCESS REC'D REJECT REQUEST
+
+;+
+; This routine is called upon receipt of a REJECT_REQ message.  Action
+; is as follows:
+;
+;	CDT State		Action
+;
+;	CON_ACK			Save reject reason and send REJECT_RSP.
+;				Deallocate all buffers owned by CDT.
+;				Deallocate CDT.  Resume SYSAP with
+;				error status and reject reason.
+;
+;	Sequence # check	Send back a response that tells
+;	fails			remote SCS that this CDT went away
+;				via a unilateral DISCONNECT
+;
+; Inputs:
+;
+;	R2			-Addr of REJECT_REQ message
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_REJ_REQ:
+
+	BSBW	SCS$CHK_SEQNUM		; Check if CDT is ours
+	BLBC	R0,CDT_CLOSED		; Branch if not -- we must have
+					;  done a unilateral DISCONNECT
+	$CHK_CDTSTATE	-		; Verify that CDT state is
+		CON_ACK,-		;  CONNECT ack'ed;  if not,
+		ERROR=BREAK_VC		;  fatal state error
+	BSBW	SCS$MAP_SCSSTS		; Translate SCS reason code to VMS
+	PUSHL	R0			; Save reject reason
+	MOVL	CDT$L_FR5(R3),R5	; Restore SYSAP's context: R5,
+	PUSHL	CDT$L_FPC(R3)		;  and PC from CDT
+	MOVZWL	#SCS$C_STNORMAL,R0	; Set for success status in RSP
+	BSBW	SCS$SEND_RSP		; Send reject response
+	BSBW	SCS$DEAL_ALLBUF		; Deallocate all buffers owned by CDT
+	JSB	G^SCS$DEALL_CDT		; Deallocate the CDT
+	MOVL	4(SP),R1		; Get reject reason again
+	MOVZWL	#SS$_REJECT,R0		; Set main status = reject
+	MOVL	R4,4(SP)		; Save PDT addr over reject reason
+	JSB	@(SP)+			; Call SYSAP with error status
+	POPL	R4			; Retreive PDT addr
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_REJ_RSP,	PROCESS REC'D REJECT RESPONSE
+
+;+
+; This routine is called upon receipt of a REJECT_RSP message.  Action
+; is as follows:
+;
+;	CDT State (listener)		Action
+;
+;	CON_REC				Return state to listen.  Resume
+;					SCS send wait queue.  Resume
+;					SYSAP with success regardless of the
+;					status in the REJECT_RSP.
+;
+; Inputs:
+;
+;	R2			-Addr of REJECT_RSP message
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	other registers		-Preserved
+;;-
+
+	.ENABL	LSB
+
+REC_REJ_RSP:
+
+	$CHK_CDTSTATE -			; Verify that CDT state is
+		REJ_SENT,-		;  is connect received;  if not,
+		ERROR=BREAK_VC		;  fatal state error
+	BSBW	SCS$DEAL_SCSREC		; Deallocate the SCS receive buffer
+	BSBW	SCS$FREE_LISTEN		; Put listener back in listen state
+	BSBW	SCS$RESUM_SEND		; Resume SCS send wait queue
+	MOVZWL	#SS$_NORMAL,R0		; Set status to success
+	BRW	RESUME_CONCALL		; Resume SYSAP
+
+	.DSABL	LSB
+
+	.SBTTL	-	REC_DISC_REQ,	PROCESS REC'D DISCONNECT REQUEST
+
+;+
+; This routine is called upon receipt or a DISCONNECT_REQ message.  It is 
+; valid for several CDT states and action is as follows:
+;
+;	CDT State			Action
+;
+;	OPEN				Set state to disconnect received.
+;					Save disconnect reason.  Send
+;					DISCONNECT_RSP.  Call SYSAP error
+;					address with error status and reason
+;					code.
+;
+;	DISC_ACK			This is a matching DISCONNECT.
+;					Send RSP.  Retreive saved SYSAP
+;					context from CDT.  Deallocate 
+;					CDT and receive buffers.  Complete
+;					SYSAP's DISCONNECT call with 
+;					success status.
+;
+;	DISC_SENT			This is a matching DISCONNECT
+;					that crossed ours in the mail.
+;					Send RSP and move CDT state to
+;					DISC_MTCH.
+;
+;	Sequence # check		Send RSP with success status.
+;	fails
+;
+; Inputs:
+;
+;	R2			-Addr of DISCONNECT_REQ message
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_DISC_REQ:
+
+	BSBW	SCS$CHK_SEQNUM		; Verify that the CDT is still ours
+	BLBC	R0,REC_DISC_CLOSED	; Branch if not-- must have done a
+					;  unilateral DISCONNECT
+	$DISPATCH -
+		CDT$W_STATE(R3),-		; Dispatch on current state
+		<-				;
+		<CDT$C_OPEN,	REC_DISC_OPEN>,-;  OPEN,
+		<CDT$C_DISC_ACK,REC_DISC_ACK>,-	;  DISCONNECT ack'ed,
+		<CDT$C_DISC_SENT,REC_DISC_SENT>,- ;  DISCONNECT sent
+		>
+
+	BRW	BREAK_VC			; Fatal error if other state
+
+REC_DISC_OPEN:
+
+	MOVW	#CDT$C_DISC_REC,-	; Move state to disconnect received
+		CDT$W_STATE(R3)		; 
+	BSBW	SCS$MAP_SCSSTS		; Convert SCS status to VMS
+	PUSHL	R0			;  and save it
+	BSBW	SCS$SEND_RSP		; Send DISCONNECT response
+	POPL	R1			; Restore disconnect reason
+	MOVZWL	#SS$_DISCONNECT,R0	; Set status to disconnected
+	PUSHL	R4			; Save R4
+	JSB	@CDT$L_ERRADDR(R3)	; Call SYSAP error addr
+	POPL	R4			; Restore R4
+	RSB				; Return
+	
+REC_DISC_ACK:
+
+	MOVW	#SCS$C_STDISC,R0	; Set response status
+	BSBW	SCS$SEND_RSP		; Send response to DISCONNECT
+	MOVZWL	#SS$_NORMAL,R0		; Set status of SYSAP call
+	BSBW	SCS$CLOSE_CDT		; Complete SYSAP DISCONNECT call
+	RSB				; Return
+
+REC_DISC_CLOSED:
+
+	MOVW	#SCS$C_STDISC,R0		; Set response status
+	BSBW	SCS$SEND_RSP		; Send response to DISCONNECT
+	RSB				; Return
+
+REC_DISC_SENT:
+
+	MOVW	#SCS$C_STNORMAL,R0	; Set response status
+	BSBW	SCS$SEND_RSP		; Send response
+	MOVW	#CDT$C_DISC_MTCH,-	; Move CDT state to matching
+		CDT$W_STATE(R3)		;  DISCONNECT received
+	RSB				; Return
+	.DSABL	LSB
+
+	.SBTTL	-	REC_DISC_RSP,	PROCESS REC'D DISCONNECT RESPONSE
+
+;+
+; This routine is called upon receipt of a DISCONNECT_RSP.  It is
+; valid in more than one state and action is as follows:
+;
+;	CDT State			Action
+;
+;	DISC_SENT			This is a response to a
+;					previously sent DISCONNECT.
+;					Move CDT state to DISC_ACK
+;					and exit.
+;
+;	DISC_MTCH			This is a response to a 
+;					DISCONNECT sent that crossed
+;					a received DISCONNECT in the
+;					mail.  It is time to close the
+;					CDT and notify the SYSAP that
+;					its DISCONNECT is done.
+;
+; Inputs:
+;
+;	R2			-Addr of DISCONNECT_RSP message
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+REC_DISC_RSP:
+
+	$DISPATCH -
+		CDT$W_STATE(R3),-		; Check for legal state:
+		<-				;
+		<CDT$C_DISC_SENT,RSP_DISC_SENT>,- ;  DISCONNECT sent,
+		<CDT$C_DISC_MTCH,RSP_DISC_MTCH>,- ;  Matching DISC rec'd
+		>
+
+	BRW	BREAK_VC		; Other state is fatal
+	
+RSP_DISC_SENT:
+
+	MOVW	#CDT$C_DISC_ACK,-	; Move CDT state to
+		CDT$W_STATE(R3)		;  DISCONNECT ack'ed
+	BSBW	SCS$RESUM_SEND		; Resume anyone waiting
+					;  for SCS send buffer
+	RSB				; Return
+
+RSP_DISC_MTCH:
+
+	BSBW	SCS$RESUM_SEND		; Resume anyone waiting
+					;  for SCS send buffer
+	MOVZWL	#SS$_NORMAL,R0		; Set status to success
+	BSBW	SCS$CLOSE_CDT		;  and complete SYSAP DISCONNECT call
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	CONNECTION AND SCS CONTROL SUBROUTINES
+	.SBTTL	-	SCS$REQ_SCSSEND, REQUEST SEND OF SCS CONTROL 
+	.SBTTL	-			MESSAGE
+
+;+
+; SCS$REQ_SCSSEND is called when an SCS control message is to be sent.  The
+; block state defines the kind of control message to send:  CREDIT_REQ,
+; CONNECT_REQ, REJECT_REQ, ACCEPT_REQ, DISC_REQ, or final
+; CREDIT followed by DISCONNECT.  The CDT contains sufficient
+; information to format the outgoing control message.
+;
+; Since a single SCS message buffer is available for each path to a
+; remote system, SYSAP's may have to wait for the buffer to become available.
+; The wait queue is a linked list of CDT's (linked via CDT$L_WAITQFL/BL) with
+; listhead in the path block.  A CDT is removed from the wait queue as
+; soon as it receives control of the SCS send message.  The SCS message
+; address in the path block is used to determine if the send message
+; buffer is currently available. (0/non-0 --> not avail/avail.)
+;
+; Only one block state may be in effect at a time for a CDT and therefore
+; the CDT will never need to appear more than once on the wait queue.
+; The CDT$W_BLKSTATE field can be used to determine if the
+; CDT is already on the SCS send wait queue.  CDT$W_BLKSTATE is 0
+; unless it is on the wait queue or a DISCONNECT/CREDIT transmit is
+; in progress.
+;
+; If the SCS send buffer is free, then the control message is sent immediately.
+; Otherwise, the CDT is inserted on the tail of the wait queue.
+;
+; Inputs:
+;
+;	R0			-Block state code (l.o. 16 bits)
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$REQ_SCSSEND::
+
+	MOVL	CDT$L_PB(R3),R1		; Get path block addr
+	MOVL	PB$L_SCSMSG(R1),R2	; Get addr of SCS msg buffer
+	BNEQ	SEND_NEXT_SEND		; Branch if buffer available
+	MOVW	R0,CDT$W_BLKSTATE(R3)	; Save block state
+	INSQUE	CDT$L_WAITQFL(R3),-	; Link CDT to end of
+		@PB$L_WAITQBL(R1)	;  SCS send wait queue
+	RSB				; Return to caller (msg not
+					;  yet sent)
+
+;
+; The SEND_NEXT_SEND entry is called when the SCS send message buffer
+; is available to send a new control message.  The inputs to this entry:
+;
+;	R0			-Block state
+;	R1			-Addr of PB
+;	R2			-Addr of SCS message buffer
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+
+;
+; Block state value assumptions:
+;
+
+ASSUME	CDT$C_CON_PEND	EQ 1
+ASSUME	CDT$C_ACCP_PEND	EQ 2
+ASSUME	CDT$C_REJ_PEND	EQ 3
+ASSUME	CDT$C_DISC_PEND	EQ 4
+ASSUME	CDT$C_CR_PEND	EQ 5
+ASSUME	CDT$C_DCR_PEND	EQ 6
+
+SEND_NEXT_SEND:
+
+	CLRL	PB$L_SCSMSG(R1)		; Show SCS send buffer unavail
+	CASE	R0,<-			; Dispathc on block state:
+		BLK_ST_ERR,-		;  undefined
+		SEND_CONNECT,-		;  Send CONNECT_REQ
+		SEND_ACCEPT,-		;  Send ACCEPT_REQ
+		SEND_REJECT,-		;  Send REJECT_REQ
+		SEND_DISCONNECT,-	;  Send DISCONNECT_REQ
+		SEND_CREDIT,-		;  Send CREDIT_REQ
+		SEND_CREDIT>		;  Send CREDIT_REQ+DISCONNECT_REQ
+
+BLK_ST_ERR:
+
+	BUGCHECK CIPORT			; Inconsistent CDT state field
+
+	.DSABL	LSB
+
+	.SBTTL	-	SEND_CREDIT,	SEND A CREDIT REQUEST
+
+;+
+; SEND_CREDIT -- Format and send a credit message.
+;
+; Inputs:
+;
+;	R0			-Block state
+;	R1			-Addr of PB
+;	R2			-Addr of message buffer
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0,R1			-Destroyed
+;	other registers		-Preserved
+;-
+
+;
+; Message format and CDT offset assumptions:
+;
+
+ASSUME	SCS$L_DST_CONID+4 EQ SCS$L_SRC_CONID
+ASSUME	CDT$L_RCONID+4	  EQ CDT$L_LCONID
+
+	.ENABL	LSB
+
+SEND_CREDIT:
+
+	CMPW	R0,#CDT$C_DCR_PEND	; Is this part of DISCONNECT?
+	BNEQ	10$			; Branch if not
+	INSQUE	CDT$L_WAITQFL(R3),-	; Else requeue CDT for 
+		@PB$L_WAITQBL(R1)	;  DISCONNECT
+	MOVW	#CDT$C_DISC_PEND,-	;  and move CDT state to
+		CDT$W_BLKSTATE(R3)	;  DISCONNECT pending
+
+10$:	MOVW	#SCS$C_CR_REQL,-	; Set length of CREDIT_REQ msg
+		SCS$W_LENGTH(R2)	;
+	MOVW	#SCS$C_CR_REQ,-		; Set SCS message type
+		SCS$W_MTYPE(R2)		;
+
+FMT_SCS_CREDIT:				; Entry for finishing SCS msg w/credit
+
+	MOVW	CDT$W_PENDREC(R3),-	; Copy pending receive
+		SCS$W_CREDIT(R2)	;  credit to message
+	ADDW	CDT$W_PENDREC(R3),-	; Move pending recv credit to
+		CDT$W_REC(R3)		;  receive credit
+	CLRW	CDT$W_PENDREC(R3)	; Pending recv credit --> 0
+	
+FMT_SCS:				; Entry for finishing SCS w.o. credit
+
+	MOVQ	CDT$L_RCONID(R3),-	; Set source connection ID
+		SCS$L_DST_CONID(R2)	;  and remote connection ID
+	$SNDMSG	RETFLAG=FALSE		; Send message and return msg
+					;  buffer to free queue for
+					;  corresponding RSP
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SEND_CONNECT,	SEND A CONNECT_REQ
+
+;+
+; SEND_CONNECT -- Format and send a CONNECT_REQ message.
+; COMMON_CONNECT -- Complete formatting and transmission of a CONNECT_REQ
+;		    or ACCEPT_REQ message
+;
+; Inputs:
+;
+;	R1			-Addr of PB
+;	R2			-Addr of start of message buffer
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+;	Connecting/Accepting CDT:
+;
+;	CDT$L_RPROCNAM		-Addr of remote proc name
+;	      LPROCNAM		-Addr of local proc name
+;	      CONDAT		-Addr of connect data from local
+;	      INITREC		-Initial credit to extend
+;	      RCONID		-Remote connection ID
+;	      LCONID		-Local connection ID
+;	      MINSEND		-Minimum send credit req'd by local SYSAP
+;	      PDT		-PDT
+;	      SCSMSG		-Addr of message buffer holding CONNECT_REQ
+;
+; Outputs:
+;
+;	R0,R1			-Destroyed
+;	other registers		-Preserved
+;-
+
+;
+; Message and data structure adjacency assumptions.  These also apply
+; to the following routine, SEND_ACCEPT.
+;
+
+ASSUME	SCS$W_MTYPE+2	EQ SCS$W_CREDIT
+ASSUME	SCS$W_CREDIT+2	EQ SCS$L_DST_CONID
+ASSUME	SCS$L_DST_CONID+4 EQ SCS$L_SRC_CONID
+ASSUME	SCS$L_SRC_CONID+4 EQ SCS$W_MIN_CR
+ASSUME	SCS$W_MIN_CR+2	EQ SCS$W_STATUS
+ASSUME	SCS$W_STATUS+2	EQ SCS$T_DST_PROC
+ASSUME	SCS$T_DST_PROC+16 EQ SCS$T_SRC_PROC
+ASSUME	SCS$T_SRC_PROC+16 EQ SCS$B_CON_DAT
+
+ASSUME	CDT$L_RCONID+4	EQ CDT$L_LCONID
+
+ASSUME	CDT$L_RPROCNAM+4 EQ CDT$L_LPROCNAM
+ASSUME	CDT$L_LPROCNAM+4 EQ CDT$L_CONDAT
+
+	.ENABL	LSB
+
+SEND_CONNECT:
+
+	MOVW	#SCS$C_CON_REQL,-	; Set length of CONNECT_REQ msg
+		SCS$W_LENGTH(R2)	;
+	MOVAW	SCS$W_MTYPE(R2),R0	; Get addr of SCS msg type code
+	MOVW	#SCS$C_CON_REQ,(R0)+	; Set type code
+
+COMMON_CONNECT:
+
+	MOVW	CDT$W_PENDREC(R3),(R0)+  ; Copy initial recv credit to msg
+	MOVW	CDT$W_PENDREC(R3),-	; Copy initial to current recv credit
+		CDT$W_REC(R3)		;  tally in CDT
+	CLRW	CDT$W_PENDREC(R3)	; Zero pending receive
+	MOVQ	CDT$L_RCONID(R3),(R0)+	; Copy remote (0) & local connx ID's
+	MOVZWL	CDT$W_MINSEND(R3),(R0)+	; Copy min send credit req'd
+	MOVAL	CDT$L_RPROCNAM(R3),R4	; Get addr of destination process name
+	BSBB	MOV_PROCDATA		; Copy dest process name to msg
+	BSBB	MOV_PROCDATA		;  Also, source process name,
+	BSBB	MOV_PROCDATA		;  and connect data.
+	MOVL	CDT$L_PDT(R3),R4	; Restore R4
+	$SNDMSG	RETFLAG=FALSE		; Send msg and return buffer to
+					;  free queue for corresponding response
+	RSB				; Return
+
+
+;
+; Subroutine to move 16 bytes of data from source address pointed
+; to by R4 to destination address in R0.
+;
+
+MOV_PROCDATA:
+
+	MOVL	(R4)+,R1		; Get addr of source of data
+	MOVQ	(R1)+,(R0)+		; Copy 16 bytes from source to
+	MOVQ	(R1)+,(R0)+		;  message buffer
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SEND_ACCEPT,	SEND AN ACCEPT_REQ
+
+;+
+; SEND_ACCEPT -- Format and send an ACCEPT_REQ
+;
+; Inputs:
+;
+;	R1			-Addr of PB
+;	R2			-Addr of start of message buffer
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+;	Accepting CDT:
+;
+;	CDT$L_RPROCNAM		-Addr of remote proc name
+;	      LPROCNAM		-Addr of local proc name
+;	      CONDAT		-Addr of connect data from local
+;	      INITREC		-Initial credit to extend
+;	      RCONID		-Remote connection ID
+;	      LCONID		-Local connection ID
+;	      MINSEND		-Minimum send credit req'd by local SYSAP
+;	      PDT		-PDT
+;
+; Outputs:
+;
+;	R0,R1			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SEND_ACCEPT:
+
+	MOVW	#SCS$C_ACCP_REQL,-	; Set length of ACCEPT_REQ msg
+		SCS$W_LENGTH(R2)	;
+	MOVAW	SCS$W_MTYPE(R2),R0	; Get addr of SCS msg type
+	MOVW	#SCS$C_ACCP_REQ,(R0)+	; Set SCS msg type
+	BRB	COMMON_CONNECT		; Join code common with CONNECT
+
+	.DSABL	LSB
+
+	.SBTTL	-	SEND_REJECT,	SEND A REJECT_REQ
+
+;+
+; SEND_REJECT -- Send a REJECT_REQ message
+;
+; Inputs:
+;
+;	R1			-Addr of PB
+;	R2			-Addr of start of message buffer
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0,R1			-Destroyed
+;	other registers 	-Preserved
+;-
+
+	.ENABL	LSB
+
+SEND_REJECT:
+
+	MOVW	#SCS$C_REJ_REQL,-	; Set REJECT_REQ msg length
+		SCS$W_LENGTH(R2)	;
+	MOVZWL	#SCS$C_REJ_REQ,-	; Set SCS msg type
+		SCS$W_MTYPE(R2)		;  and zero credit field
+	CLRW	SCS$W_MIN_CR(R2)	; Zero minimum credit field
+	MOVW	CDT$W_REASON(R3),-	; Copy reject reason 
+		SCS$W_STATUS(R2)	;  to status
+	BRW	FMT_SCS			; Finish up and send msg
+
+	.DSABL	LSB
+
+	.SBTTL	-	SEND_DISCONNECT, SEND A DISCONNECT_REQ
+
+;+
+; SEND_DISCONNECT -- Format and send (at low priority) a DISCONNECT_REQ.
+;
+; Inputs:
+;
+;	R1			-Addr of PB
+;	R2			-Addr of start of message buffer
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0,R1			-Destroyed
+;	other registers		-Preserved
+;-
+
+;
+; Message and CDT format assumptions:
+;
+
+ASSUME	SCS$W_MTYPE+2	EQ SCS$W_CREDIT
+ASSUME 	SCS$L_DST_CONID+4 EQ SCS$L_SRC_CONID
+
+ASSUME	CDT$L_RCONID+4	EQ CDT$L_LCONID
+
+	.ENABL	LSB
+
+SEND_DISCONNECT:
+
+	MOVW	#SCS$C_DISC_REQL,-	; Set DISCONNECT_REQ length
+		SCS$W_LENGTH(R2)	;
+	MOVZWL	#SCS$C_DISC_REQ,-	;  and msg type;  and
+		SCS$W_MTYPE(R2)		;  zero credit field
+	CLRW	SCS$W_MIN_CR(R2)	; Zero minimum credit
+	MOVW	CDT$W_REASON(R3),-	; Copy saved DISCONNECT
+		SCS$W_STATUS(R2)	;  reason to status
+	MOVQ	CDT$L_RCONID(R3),-	; Copy dest, src connx ID's
+		SCS$L_DST_CONID(R2)	;
+	$SNDMSG	RETFLAG=FALSE,-		; Send off message at low
+		PRIORITY=LOW		;  priority behind all other
+					;  currently queued msgs and
+					;  block transfers
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$RESUM_SEND, RESUME SCS CONTROL MESSAGE
+	.SBTTL	-			 SEND QUEUE
+
+;+
+; This routine is called when an SCS control message response is received.
+; Receipt of the response indicates that the SCS send buffer is now free
+; and a new SCS control message may be sent to the remote system.  The 
+; response message buffer is used for the next send.
+;
+; The wait queue (listhead PB$L_WAITQFL) is checked for waiting CDT's.
+; If any CDT is waiting, then it is dequeued and its SCS control message
+; sent.  If no CDT is waiting, then the buffer containing the response
+; is linked to the path block for future use.
+;
+; Inputs:
+;
+;	R2			-Addr of SCS response message buffer
+;	R3			-Addr of CDT receiving SCS RSP message
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$RESUM_SEND::
+
+	MOVL	CDT$L_PB(R3),R1		; Get path block addr
+	PUSHL	R3			; Save CDT receiving response
+	REMQUE	@PB$L_WAITQFL(R1),R3	; Get CDT waiting to send
+	BVS	20$			; Branch if nobody waiting
+	SUBL	#CDT$L_WAITQFL,R3	; Back up to start of CDT
+	MOVW	CDT$W_BLKSTATE(R3),R0	; Get block state
+	CLRW	CDT$W_BLKSTATE(R3)	; Zero block state of resumed CDT
+	BSBW	SEND_NEXT_SEND		; Go send the message
+	BRB	30$			; Join common exit
+
+20$:	MOVL	R2,PB$L_SCSMSG(R1)	; Save SCS msg addr for future
+	
+30$:	POPL	R3			; Restore CDT receiving response
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$SEND_RSP,	TURN SCS REQ AROUND INTO
+	.SBTTL	-			SCS RESPONSE
+
+;+
+; One receive message buffer per port-port virtual circuit is reserved
+; for receipt of SCS REQ control messages by all connections on the
+; VC.  This routine is called with the reserved receive buffer 
+; occupied by an SCS REQ.  SCS$SEND_RSP modified the REQ type message
+; into its corresponding RSP and sends it to the remote system.  The
+; RSP message is sent with RETFLAG false so that the message buffer is
+; returned to the free queue to receive a new SCS REQ. 
+;
+; Note that certain SCS commands must be retained by the caller
+; for further processing by the SYSAP.  These are CONNECT_REQ and
+; ACCEPT_REQ.  the caller is expected om these cases to have copied
+; the REQ message into the SCS buffer allocated for each CDT 
+; (CDT$L_SCSMSG).
+;
+; Inputs:
+;
+;	R0			-Status to send out with RSP, 0 if none
+;	R1			-Credit to confirm if applicable
+;	R2			-Addr of SCS REQ message
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0,R1			-Destroyed
+;	other registers		-Preserved
+;-
+
+;
+; Message format assumptions:
+;
+
+ASSUME	SCS$C_CON_REQ	EQ 0
+ASSUME	SCS$C_CON_RSP	EQ 1
+ASSUME	SCS$C_ACCP_REQ	EQ 2
+ASSUME	SCS$C_ACCP_RSP	EQ 3
+ASSUME	SCS$C_REJ_REQ	EQ 4
+ASSUME	SCS$C_REJ_RSP	EQ 5
+ASSUME	SCS$C_DISC_REQ	EQ 6
+ASSUME	SCS$C_DISC_RSP	EQ 7
+ASSUME	SCS$C_CR_REQ	EQ 8
+ASSUME	SCS$C_CR_RSP	EQ 9
+
+ASSUME	SCS$C_REJ_RSPL	EQ SCS$C_DISC_RSPL
+
+	.ENABL	LSB
+
+SCS$SEND_RSP::
+
+	CASE	SCS$W_MTYPE(R2),<-	; Dispatch on request type
+		SEND_CON_RSP,-		;  CONNECT_REQ
+		ILLMSGTYP,-		;  CONNECT_RSP illegal
+		SEND_ACCP_RSP,-		;  ACCEPT_REQ
+		ILLMSGTYP,-		;  ACCEPT_RSP illegal
+		SEND_REJ_RSP,-		;  REJECT_REQ
+		ILLMSGTYP,-		;  REJECT_RSP illegal
+		SEND_DISC_RSP>		;  DISCONNECT_REQ
+
+ILLMSGTYP:
+
+	BUGCHECK  CIPORT		; Any other type is illegal
+
+SEND_ACCP_RSP:
+
+	MOVW	#SCS$C_ACCP_RSPL,-	; Set response message length
+		SCS$W_LENGTH(R2)	;
+	BRB	COMMON_RSP2		; Join common formatting
+
+SEND_REJ_RSP:
+SEND_DISC_RSP:
+
+	MOVW	#SCS$C_REJ_RSPL,-	; Set response message length
+		SCS$W_LENGTH(R2)	;
+	BRB	COMMON_RSP2		; Join common formatting
+
+SEND_CON_RSP:
+
+	MOVW	#SCS$C_CON_RSPL,-	; Set CONNECT_RSP length
+		SCS$W_LENGTH(R2)	;
+	CLRW	SCS$W_MIN_CR(R2)	; Zero minimum credit
+	BRB	COMMON_RSP2		; Join common code
+
+SEND_CR_RSP:
+
+	MOVW	#SCS$C_CR_RSPL,-	; Set credit RSP length
+		SCS$W_LENGTH(R2)	;
+
+COMMON_RSP1:
+
+	INCW	SCS$W_MTYPE(R2)		; Convert type from REQ to RSP
+	MOVL	SCS$L_DST_CONID(R2),R0	; Swap destination
+	MOVL	SCS$L_SRC_CONID(R2),-	;  and
+		SCS$L_DST_CONID(R2)	;  source
+	MOVL	R0,SCS$L_SRC_CONID(R2)	;  connection ID's
+	$TURNMSG RETFLAG=FALSE		; Send off message
+	RSB				; Return
+
+COMMON_RSP2:
+
+	CLRW	SCS$W_CREDIT(R2)	; Credit = 0
+	MOVW	R0,SCS$W_STATUS(R2)	; Status = caller-specified value
+	BRB	COMMON_RSP1		; Join common completion
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$COPY_ACCP, COPY CONNECTION PARAMETERS
+	.SBTTL	-			 FROM ACCEPT MESSAGE TO CDT
+
+;+
+; SCS$COPY_ACCP copies the credit, sender's connect ID, and minimum
+; credit from the CONNECT_REQ or ACCEPT_REQ message to the SEND credit,
+; RCONID, and MINSEND fields of the CDT.
+;
+; Inputs:
+;
+;	R2			-Addr of message contianing CONNECT_REQ
+;				 or ACCEPT_REQ 
+;	R3			-Addr of CDT
+;
+; Outputs:
+;
+;	All registers		-Preserved
+;
+;-
+
+	.ENABL	LSB
+
+SCS$COPY_ACCP::
+
+	MOVW	SCS$W_CREDIT(R2),-	; Copy extended credit to CDT
+		CDT$W_SEND(R3)		;
+	MOVL	SCS$L_SRC_CONID(R2),-	; Copy remote CONID to CDT
+		CDT$L_RCONID(R3)	;
+	MOVW	SCS$W_MIN_CR(R2),-	; Copy remote SYSAP's minimum
+		CDT$W_MINREC(R3)	;  send credit to CDT
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$SAVE_REQ,	COPY SCS REQUEST TO SECOND
+	.SBTTL	-			MESSAGE BUFFER
+
+;+
+; SCS$SAVE_REQ copies a received SCS request to an SCS message buffer
+; attached to a CDT.  This routine is called when a copy of the request
+; must be retained while the initial message is turned around into an
+; SCS response.
+;
+; Inputs:
+;
+;	R2			-Addr of SCS buffer containing request
+;	R3			-Addr of CDT
+;	CDT$L_SCSMSG		-Addr of CDT's SCS msg buffer
+;
+; Outputs:
+;
+;	R0,R1			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$SAVE_REQ::
+
+	MOVZWL	G^SCS$GW_MAXMSG,R0	; Compute total message size
+	ADDW	PDT$L_MSGHDRSZ(R4),R0	;  including PPD and SCS overhead
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers
+	MOVC3	R0,(R2),@CDT$L_SCSMSG(R3)  ; Copy message
+	POPR	#^M<R2,R3,R4,R5>	; Restore registers
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	MESSAGE AND DATAGRAM BUFFER ALLOCATION
+	.SBTTL	-	SCS$ALL_ALLBUF,	ALLOCATE ALL BUFFERS NEEDED
+	.SBTTL	-			FOR A NEW CONNECTION
+
+;+
+; SCS$ALL_ALLBUF allocated from nonpaged pool:
+;
+;	1 SCS buffer for connect request storage, linked to CDT$L_SCSMSG
+;	Initial receive credit worth of message buffers
+;	Initial dg receive count of datagram buffers.
+;
+; The message buffers and datagram buffers are inserted on the
+; port free queues for receiving messages and datagrams.
+;
+; Entry SCS$ALL_ALLBUF2 is called to allocate all except the SCS receive buffer.
+;
+; Inputs:
+;
+;	R3			-Addr of CDT getting buffers
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-Status:  SS$_NORMAL, SS$INSFMEM
+;				 (If insufficient pool, everything
+;				  allocated so far is deallocated.)
+;	R1,R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$ALL_ALLBUF::
+
+	BSBB	SCS$ALL_SCSREC		; Allocate SCS recv buffer
+	BLBC	R0,40$			; Branch if error
+
+SCS$ALL_ALLBUF2::
+
+	MOVW	CDT$W_INITLREC(R3),-	; Copy initial receive count to
+		CDT$W_PENDREC(R3)	;  pending credit to remote
+	CLRW	CDT$W_REC(R3)		; Clear current receive count
+	BSBW	SCS$ALL_MSGREC		; Allocate message buffers
+	BLBC	R0,30$			; Branch if error
+	BSBW	SCS$ALL_DGREC		; Allocate datagram buffers
+	BLBC	R0,20$			; Branch if error
+	RSB				; Return success
+20$:	BSBW	SCS$DEAL_MSGREC		; Deallocate message buffers
+30$:	BSBW	SCS$DEAL_SCSREC		; Deallocate SCS recv buffer
+
+40$:	MOVZWL	#SS$_INSFMEM,R0		; Set error status
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$ALL_SCSREC,	ALLOCATE A MESSAGE BUFFER FOR
+	.SBTTL	-			HOLDING COPY OF SCS REQUESTS
+
+;+
+; This routine allocates one message buffer and links it to the
+; CDT$L_SCSMSG.
+;
+; Inputs:
+;
+;	R3			-Addr of CDT getting buffer
+;
+; Outputs:
+;
+;	R0			-Status:  SS$_NORMAL,  SS$_INSFMEM
+;	R1,R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$ALL_SCSREC::
+
+	BSBW	SCS$ALLOC_MSG		; Allocate 1 message buffer from pool
+	BLBC	R0,NO_MSG_MEM		; Branch if didn't get it
+	MOVL	R2,CDT$L_SCSMSG(R3)	; Save its address in CDT
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$ALL_MSGREC,	ALLOCATE BUFFERS FOR RECEIVING
+	.SBTTL	-			APPLICATION MESSAGES
+	.SBTTL	-	SCS$ALL_FRMSGS,	ALLOCATE MESSAGE BUFFERS AND
+	.SBTTL	-			PUT ON PORT FREE QUEUE
+
+;+
+; This routine allocates the number of message buffers specified in 
+; CDT$W_INITLREC or R0, linking them together as they are allocated.
+; If all are allocated successfully, then they are inserted on the
+; port free message queue and successful return is taken.
+; If there is an allocate failure, then the buffers allocated already
+; are returned to pool and error is returned to the caller.
+;
+; Inputs:
+;
+;	R0			-# buffers to allocate (SCS$ALL_FRMSGS)
+;	R3			-Addr of CDT (SCS$ALL_MSGREC entry)
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-Status:  SS$_NORMAL, SS$_INSFMEM
+;	R1,R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$ALL_FRMSGS::
+
+	TSTL	R0			; Any buffers to allocate?
+	BRB	5$			; Join common code
+
+SCS$ALL_MSGREC::
+
+	MOVZWL	CDT$W_INITLREC(R3),R0	; Get # buffers to allocate
+5$:	BEQL	40$			; Branch if 0
+	PUSHL	R5			; Save R5
+	PUSHL	R3			;  and R3 
+	MOVL	R0,R3			; R3 will be buffer counter
+	CLRL	R5			; Set link to next buffer = 0
+
+10$:	BSBW	SCS$ALLOC_MSG		; Allocate next buffer
+	BLBC	R0,50$			; Branch if failed
+	MOVL	R5,(R2)			; Link this buffer to last allocated
+	MOVL	R2,R5			; Set R5 to point to this buffer
+	SOBGTR	R3,10$			; Branch if more to allocate
+	POPL	R3			; Restore R3
+	
+20$:	MOVL	R5,R2			; Get addr of next buffer
+	BEQL	30$			; Branch if no more
+	MOVL	(R2),R5			; Update ptr to next buffer
+	$INS_MFREEQ 			; Insert buffer on port free queue
+	BRB	20$			; Branch for next buffer
+
+30$:	POPL	R5			; Restore saved register
+
+40$:	MOVZWL	#SS$_NORMAL,R0		; Set status to success
+	RSB				; Return
+
+50$:	MOVL	R5,R2			; Get addr of next buffer
+	BEQL	NO_MSG_MEM		; Branch if done
+	MOVL	(R2),R5			; Update ptr to next buffer
+	BSBW	SCS$DEAL_MSG		; Return buffer to pool
+	BRB	50$			; Check for more buffers
+
+NO_MSG_MEM:
+
+	MOVZWL	#SS$_INSFMEM,R0		; Set status to fail
+	POPL	R3			; Restore registers 
+	POPL	R5			;
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$ALL_DGREC,	ALLOCATE BUFFERS FOR RECEIVING
+	.SBTTL	-			APPLICATION DATAGRAMS
+	.SBTTL	-	SCS$ALL_FRDGS,	ALLOCATE FREE DATAGRAMS AND 
+	.SBTTL	-			PUT ON PORT QUEUE
+
+;+
+; This routine allocates the number of datagrams specified in
+; CDT$W_DGREC or R0, linking them together as allocated.  If all are allocated
+; successfully, then they are inserted on the port free datagram queue.
+; Otherwise, the buffers allocated already are returned to pool and error
+; is returned to the caller.
+;
+; Inputs:
+;
+;	R0			-# datagram buffers to allocate
+;				 (SCS$ALL_FRDGS entry)
+;	R3			-Addr of CDT (SCS$ALL_DGREC entry)
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-Status:  SS$_NORMAL, SS$INSFMEM
+;	R1,R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$ALL_FRDGS::
+
+	TSTL	R0			; Any datagrams to get?
+	BRB	5$			; Join common code
+
+SCS$ALL_DGREC::
+
+	MOVZWL	CDT$W_DGREC(R3),R0	; Get # buffers to allocate
+5$:	BEQL	40$			; Branch if 0
+	PUSHL	R5			; Save R5
+	PUSHL	R3			;  and R3
+	MOVL	R0,R3			; R3 will be buffer counter
+	CLRL	R5			; Set link to next buffer = 0
+
+10$:	BSBW	SCS$ALLOC_DG		; Allocate next buffer
+	BLBC	R0,50$			; Branch if failed
+	MOVL	R5,(R2)			; Link this buffer to last allocated
+	MOVL	R2,R5			; Set R5 to point to this buffer
+	SOBGTR	R3,10$			; Branch if more to allocate
+	POPL	R3			; Retreive R3
+
+20$:	MOVL	R5,R2			; Get addr of next buffer
+	BEQL	30$			; Branch if no more
+	MOVL	(R2),R5			; Update ptr to next buffer
+	$INS_DFREEQ 			; Insert buffer on port free queue
+	BRB	20$			; Branch for next buffer
+
+30$:	POPL	R5			; Restore saved register
+
+40$:	MOVZWL	#SS$_NORMAL,R0		; Set status to success
+	RSB				; Return
+
+50$:	MOVL	R5,R2			; Get addr of next buffer
+	BEQL	60$			; Branch if no more
+	MOVL	(R2),R5			; Update ptr to next buffer
+	BSBW	SCS$DEAL_DG		; Return buffer to pool
+	BRB	50$			; Check for more buffers
+
+60$:	BRW	NO_MSG_MEM		; Join common exit
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$DEAL_ALLBUF, DEALLOCATE ALL BUFFERS NEEDED
+	.SBTTL	-			 FOR A CONNECTION
+
+;+
+; DEALL_BUF deallocates the following to nonpaged pool:
+;
+;	1 SCS message buffer (linked to CDT$L_SCSMSG)
+;	Initial receive credit worth of message buffers
+;	DG receive count of datagram buffers
+;
+; It is the caller's responsibility to guarantee that all the message 
+; buffers and datagram buffers claimed to be on the port free queue
+; are actually there.
+;
+; Inputs:
+;
+;	R3			-Addr of CDT returning buffers
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$DEAL_ALLBUF::
+
+	BSBB	SCS$DEAL_SCSREC		; Deallocate the SCS buffer
+					;  attached to the CDT
+	BSBW	SCS$DEAL_MSGREC		; Deallocate the message buffers
+					;  attached to the port free queue
+	BSBW	SCS$DEAL_DGREC		; Deallocate the dg buffers
+					;  attached to the port free queue
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$DEAL_SCSREC, DEALLOCATE SCS RECEIVE BUFFER
+
+;+
+; SCS$DEAL_SCSREC deallocates to nonpaged pool the message buffer,
+; if any, pointed to by CDT$L_SCSMSG.
+;
+; Inputs:
+;
+;	R3			-Addr of the CDT returning the buffer
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$DEAL_SCSREC::
+
+	MOVL	CDT$L_SCSMSG(R3),R0	; Get buffer address
+	BEQL	10$			; Branch if none
+	JSB	G^COM$DRVDEALMEM	; Return to pool
+	CLRL	CDT$L_SCSMSG(R3)	; Show no SCS buffer in CDT
+
+10$:	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$DEAL_MSGREC, DEALLOCATE BUFFERS QUEUED TO
+	.SBTTL	-			PORT FOR RECEIVING APPLICATION
+	.SBTTL	-			MESSAGES
+
+;+
+; SCS$DEAL_MSGREC extracts the current recv credit worth of message buffers
+; from the port free queue and returns them to pool.
+;
+; Inputs:
+;
+;	R3			-Addr of CDT returning buffers
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;	other registers		-Preserved
+;	
+;	CDT$W_REC(R3)		-0
+;-
+
+	.ENABL	LSB
+
+SCS$DEAL_MSGREC::
+
+	PUSHL	R2			; Save register
+	ADDW	CDT$W_PENDREC(R3),-	; Compute total credit = pending
+		CDT$W_REC(R3)		;  + receives given to remote
+
+10$:	TSTW	CDT$W_REC(R3)		; Any buffers left to deallocate?
+	BEQL	20$			; Branch if not
+	$REM_MFREEQ			; Else remove another from port
+	BVS	20$			; Branch if no more -- normally does't
+					;  happen except during power fail recov
+	BSBW	SCS$DEAL_MSG		; Return buffer to pool
+	DECW	CDT$W_REC(R3)		; Decr count of # buffers left
+	BRB	10$			; Deallocate again
+
+20$:	POPL	R2			; Restore register
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$DEAL_DGBUF, DEALLOCATE BUFFERS QUEUED TO PORT
+	.SBTTL	-			FOR RECEIVING DATAGRAMS
+
+;+
+; SCS$DEAL_DGREC extracts the current number of datagrams contributed by
+; this connection to the free queue and returns them to nonpaged pool
+;
+; Inputs:
+;
+;	R3			-Addr of CDT returning datagrams
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$DEAL_DGREC::
+
+	PUSHL	R2			; Save register
+
+10$:	TSTW	CDT$W_DGREC(R3)		; Any buffers left to deallocate?
+	BEQL	20$			; Branch if not
+	$REM_DFREEQ			; Remove another buffer
+	BVS	20$			; Branch if no more-- normally doesn't
+					;  happen except on power fail recovery
+	BSBW	SCS$DEAL_DG		; Return the buffer to pool
+	DECW	CDT$W_DGREC(R3)		; Decr count of # dgs contributed
+					;  by this connection
+	BRB	10$			; Deallocate again
+
+20$:	POPL	R2			; Restore register
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$ALLOC_MSG,	ALLOCATE A MSG BUFFER FROM POOL
+	.SBTTL	-	SCS$ALLOC_DG,	ALLOCATE A DG BUFFER FROM POOL
+	.SBTTL	-	SCS$ALLOC_DGPPD,ALLOCATE A BUFFER FOR 
+	.SBTTL	-			PPD COMMAND
+;+
+; These routines allocate a single message or datagram buffer
+; from nonpaged pool.
+;
+; Message format is simply the PPD/SCS header (PDT$L_MSGHDRSZ(R4))
+; followed by application data (SCS$GW_MAXMSG bytes.)
+;
+; Datagram format is complex.  It consists of a network overhead
+; area used by the network SYSAP followed by the PPD/SCS header
+; (PDT$L_DGHDRSZ(R4) bytes) followed by the application data.
+; The sum of the network overhead and the PPD/SCS header is
+; stored  in PDT$L_DGOVRHD(R4).  Both the network overhead area
+; and the PPD header begin with a standard VMS header including
+; the structure type of DYN$C_CIDG.  Note that all SYSAP's must
+; use the full datagram format even though they may have no use
+; for the network header area.
+;
+; PPD datagram format is the same as SCS datagram, except that
+; the space following the network overhead is large enough only
+; for a CKTSET or smaller PPD message.   The total size of the
+; buffer allocated is:  PDT$L_DGNETHD(R4) + PPD$W_LENGTH + 3*4.
+; THE network header is unused, but is present in case of error
+; recovery which returns the packet to pool via SCS$DEAL_PKT/DG.
+; PPD datagrams can be used only for commands issued with the response
+; bit set.  They must never by recycled to the free queue.
+;
+; Inputs:
+;
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-Status:  LBC/LBS for fail/success
+;	R1			-Destroyed
+;	R2			-Addr of buffer if status = success
+;	other registers		-Preserved
+;
+;	PPD$B_TYPE(R2)		-DYN$C_CIMSG/DYN$C_CIDG
+;	PPD$B_TYPE+1(R2)	-0
+;	PPD$W_SIZE(R2)		-(SCS$GW_MAXMSG) or (SCS$GW_MAXDG)
+;-
+
+	.ENABL	LSB
+
+SCS$ALLOC_MSG::
+
+	PUSHL	R3			; Save R3
+	MOVZWL	G^SCS$GW_MAXMSG,R1	; Get message size
+	ADDL	PDT$L_MSGHDRSZ(R4),R1	;  including PPD/SCS header
+	JSB	G^EXE$ALONONPAGED	; Allocate the message
+	BLBC	R0,30$			; Branch if didn't get it
+	MOVW	R1,PPD$W_SIZE(R2)	; Set structure size,
+	MOVW	#DYN$C_CIMSG,-		;  structure type and
+		PPD$B_TYPE(R2)		;  zero adjacent byte
+	BRB	30$			; Join common exit
+
+SCS$ALLOC_PPDDG::
+
+	PUSHL	R3			; Save R3
+	MOVL	PDT$L_DGNETHD(R4),R1	; Get size of net header
+	MOVAL	PPD$W_LENGTH+<3*4>(R1),R1  ;  + port header + start dg size
+	BRB	20$			; Go allocate
+
+SCS$ALLOC_DG::
+
+	PUSHL	R3			; Save R3
+	MOVZWL	G^SCS$GW_MAXDG,R1	; Get datagram size
+	ADDL	PDT$L_DGOVRHD(R4),R1	;  including PPD/SCS header
+					;  and net header
+
+20$:	JSB	G^EXE$ALONONPAGED	; Allocate the datagram 
+	BLBC	R0,30$			; Branch if didn't get it
+	MOVW	R1,PPD$W_SIZE(R2)	; Set structure size,
+	MOVW	#DYN$C_CIDG,-		;  structure type and
+		PPD$B_TYPE(R2)		;  zero adjacent byte
+					;  at buffer top
+	ADDL	PDT$L_DGNETHD(R4),R2	; Step to addr of PPD header
+	SUBL	PDT$L_DGNETHD(R4),R1	; Compute size of remainder
+	MOVW	R1,PPD$W_SIZE(R2)	; Save size and
+	MOVW	#DYN$C_CIDG,-		;  structure in PPD header
+		PPD$B_TYPE(R2)		;
+
+30$:	POPL	R3			; Restore R3
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$DEAL_MSG,	DEALLOCATE A MESSAGE BUFFER
+	.SBTTL	-	SCS$DEAL_DG,	DEALLOCATE A DATAGRAM BUFFER
+	.SBTTL	-	SCS$DEAL_PKT,	DEALLOCATE A DG OR MSG 
+
+;+
+; SCS$DEAL_MSG/DG is called to deallocate a message or datagram buffer
+; to nonpaged pool.  Messages can simply be returned to pool  because
+; the PPD layer is at the start of the buffer.  Datagrams must be
+; backed up past the network header to the true top of the buffer before
+; being deallocated.
+;
+; SCS$DEAL_PKT examines the type code in the PPD header.  If this
+; is not a datagram, branch to SCS$DEAL_MSG.  Otherwise, fall through
+; to SCS$DEAL_DG.
+;
+; Inputs:
+;
+;	R2			-Addr of PPD layer with structure, and
+;				 size set to the size of the buffer
+;	R4			-Addr of PDT (SCS$DEAL_DG)
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$DEAL_PKT::
+
+	CMPB	PPD$B_TYPE(R2),-	; Is this a datagram?
+		#DYN$C_CIDG		;
+	BNEQ	SCS$DEAL_MSG		; Branch if not
+
+SCS$DEAL_DG::
+
+	SUBL	PDT$L_DGNETHD(R4),R2	; Back up to top of buffer
+
+SCS$DEAL_MSG::
+
+	MOVL	R2,R0			; Set addr of buffer
+	JSB	G^COM$DRVDEALMEM	; Deallocate nonpaged pool
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$DISCARD_DG,	DISCARD DATAGRAM BY
+	.SBTTL	-			RETURNING TO FREE QUEUE
+	.SBTTL	-	SCS$QUEUE_DG,	QUEUE A DG BUFFER TO
+	.SBTTL	-			FREE QUEUE
+
+;+
+; SCS$DISCARD_DG and SCS$QUEUE_DG are identical.  They both insert
+; the specified datagram buffer on the free queue and return.
+;
+; Inputs:
+;
+;	R2			-Addr of buffer
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;	Other registers		-Presserved
+;-
+
+	.ENABL	LSB
+
+SCS$DISCARD_DG::
+SCS$QUEUE_DG::
+
+	$INS_DFREEQ			; Insert it on the free queue
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$DISCARD_MSG, DISCARD A MESSAGE BY
+	.SBTTL	-			 RETURNING TO FREE QUEUE
+	.SBTTL	-	SCS$QUEUE_MSG,   QUEUE A MESSAGE TO THE
+	.SBTTL	-			 FREE QUEUE
+
+;+
+; SCS$DISCARD_MSG and SCS$QUEUE_MSG are identical.  They both insert 
+; the specified buffer on the free queue and return.
+;
+; Inputs:
+;
+;	R2			-Addr of the buffer
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$DISCARD_MSG::
+SCS$QUEUE_MSG::
+
+	$INS_MFREEQ			; Insert on free queue
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	MISC ROUTINES
+	.SBTTL	-	BREAK_VC,	CRASH A VIRTUAL CIRCUIT
+
+;+
+; BREAK_VC is branched to from various SCS message receive routines
+; when an SCS control message is received which is inappropriate
+; to the current CDT state, has an illegal SCS message type, or performs
+; unexpected action.  The remote system is assumed to have a broken SCS.
+; The error is logged.  Routine ERR$CRASHVC_MSG is called to look up the path 
+; block associated with the message and close the virtual circuit to the
+; remote.  The message in hand is occupying either: (1) the SCS send buffer
+; in which virtual circuit failure expects to find it either in PB$L_SCSMSG
+; or on the free queue, or (2) the SCS receive buffer in which case 
+; virtual circuit failure expects to find it on the free queue.  Action
+; here is to return it to the free queue regardless of whether it is the
+; SCS send or receive buffer.  Return is to interrupt service to dequeue
+; the next response.
+;
+; Inputs:
+;
+;	R2			-SCS message addr
+;	R3			-CDT addr
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	Other registers		-Perserved
+;-
+
+	.ENABL	LSB
+
+BREAK_VC:
+
+					;***Log error
+	BSBW	ERR$CRASHVC_MSG		; Call error handler to init
+					;  close of VC
+	BSBB	SCS$QUEUE_MSG		; Put msg back on free queue to
+					;  be reclaimed when it is time
+					;  to delete the path block
+	RSB				; Return to interrupt service
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$FREE_LISTEN,PUT BUSY LISTEN CDT
+	.SBTTL	-			BACK IN LISTEN STATE
+
+;+
+; SCS$FREE_LISTEN deallocates the SCS receive buffer, if any, held
+; by the specified CDT, searches for the CDT in the path block
+; CDT list, removes the CDT from the list, and sets the CDT state
+; to LISTEN.
+;
+; Inputs:
+;
+;	R3			-Addr of CDT 
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;
+;	Other registers		-Preserved
+;
+;	CDT$W_STATE(R3)		-LISTEN state
+;-
+
+	.DSABL	LSB
+
+SCS$FREE_LISTEN::
+
+	PUSHL	R1			; Save caller's R1
+	BSBW	SCS$DEAL_SCSREC		; Deallocate SCS recv buffer, if any
+	MOVL	CDT$L_PB(R3),R1		; Get PB associdated with CDT
+	MOVAL	PB$L_CDTLST(R1),R1	; Get addr of 1st fwd link
+
+10$:	MOVL	(R1),R0			; Get next CDT
+	BEQL	30$			; Branch if no more
+	CMPL	R0,R3			; CDT we are looking for?
+	BEQL	20$			; Branch if so
+	MOVAL	CDT$L_CDTLST(R0),R1	; Save addr of this link
+	BRB	10$			; Go for another CDT
+
+20$:	MOVL	CDT$L_CDTLST(R0),(R1)	; Unlink this CDT from list
+	
+30$:	MOVW	#CDT$C_LISTEN,-		; Put CDT in listen state
+		CDT$W_STATE(R3)		;
+	POPL	R1			; Restore caller's R1
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	RESUME_CONCALL,	RESUME A CONNECTION
+	.SBTTL	-			MANAGEMENT CALL
+
+;+
+; RESUME_CONCALL resumes the fork process context saved in the CDT
+; during a CONNECT, ACCEPT, or REJECT call.
+;
+; Inputs:
+;
+;	R0			-Completion status of connection
+;				 management call
+;	R1			-Other status, if applicable
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;	(SP)			-Return to PAINIT, interrupt service
+;
+; Outputs:
+;
+;	R0-R3,R5		-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+RESUME_CONCALL:
+
+	MOVL	CDT$L_FR5(R3),R5	; Restore SYSAP R5
+	PUSHL	R4			; Save R4
+	JSB	@CDT$L_FPC(R3)		; Call SYSAP back
+	POPL	R4			; Restore R4
+	RSB				; Return to interrupt service
+					;  to dequeue more responses
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$CHK_CONIDX,	CHECK DESTINATION
+	.SBTTL	-			CONID INDEX AND
+	.SBTTL	-			COMPUTE CDT ADDRESS
+
+;+
+; SCS$CHK_CONIDX verifies that the index in the destination connection
+; ID in the specifed message does not exceed our maximum index.  If it
+; does, failure is returned (without any action on the message containing
+; the bad index.)  Otherwise, the index is used to look up the CDT
+; address in the CDL and success is returned.
+;
+; Inputs:
+;
+;	R2			-Address of message/dg
+;
+; Outputs:
+;
+;	R0			-Status:  LBC/S for bad/good index
+;	R3			-Addr of CDT if success
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$CHK_CONIDX::
+
+	MOVZWL	SCS$L_DST_CONID(R2),R0	; Extract index from msg
+	MOVL	G^SCS$GL_CDL,R3		; Get base of CDT list
+	CMPW	R0,CDL$W_MAXCONIDX(R3)	; Index too large?
+	BGTRU	BAD_CONIDX		; Branch if so
+	MOVL	(R3)[R0],R3		; Turn index to CDT addr
+	MOVZWL	#SS$_NORMAL,R0		; Set status to success
+	RSB				; Return
+
+BAD_CONIDX:
+
+	CLRL	R0			; Set status to fail
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$CHK_SEQNUM,	CHECK FOR VALID
+	.SBTTL	-			SEQUENCE # IN 
+	.SBTTL	-			CONNECTION ID
+
+;+
+; SCS$CHK_SEQNUM compares the sequence number fields in the
+; destination connection ID in a specifed SCS message and specified
+; CDT.  If they are equal, then the CDT is current for this message
+; and success is returned.  If they are not equal, then this CDT was
+; unilaterally closed sometime in the past and does not belong to
+; a current CDT and fail status is returned.
+;
+; Inputs:
+;
+;	R2			-Addr of message/dg
+;	R3			-Addr of CDT
+;
+; Outputs:
+;
+;	R0			-Status:  LBS/C for CDT OK/invalid
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$CHK_SEQNUM::
+
+	CLRL	R0			; Assume failure
+	CMPW	SCS$L_DST_CONID+2(R2),-	; Compare seq # in dest conid
+		CDT$L_LCONID+2(R3)	;  and in conid in CDT
+	BNEQ	10$			; Branch if not the same (fail)
+	INCL	R0			; Else set status to success
+
+10$:	RSB				; Return status
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$CLOSE_CDT,	CLEANUP CDT AND COMPLETE
+	.SBTTL	-			PENDING CONNX MGMT CALL
+
+;+
+; SCS$CLOSE_CDT retreives the saved SYSAP context from the specified CDT
+; for a pending CONNECT/ACCEPT/REJECT/DISCONNECT call, deallocates the
+; CDT and msgs/dgs queued for receive, and completes the SYSAP's pending
+; call.
+;
+; Inputs:
+;
+;	R0			-VMS status to complete pending call
+;	R1			-Aux status, if any
+;	R3			-CDT to clean up
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R3			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$CLOSE_CDT::
+
+	MOVQ	R4,-(SP)		; Save R4, R5
+	MOVL	CDT$L_FR5(R3),R5	; Get SYSAP context, R5
+	PUSHL	CDT$L_FPC(R3)		;  and PC
+	MOVQ	R0,-(SP)		; Save status
+	BSBW	SCS$DEAL_ALLBUF		; Deallocate receive buffers 
+	JSB	G^SCS$DEALL_CDT		;  and CDT
+	MOVQ	(SP)+,R0		; Retreive status
+	JSB	@(SP)+			; Call SYSAP's return addr
+	MOVQ	(SP)+,R4		; Restore R4, R5
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SCS$MAP_SCSSTS	MAP SCS STATUS TO 
+	.SBTTL	-			VMS STATUS
+
+;+
+; SCS$MAP_SCSSTS gets the SCS status contained in the SCS
+; message pointed to by R2.  The corresponding VMS status is looked
+; up and returned in R0.  (The status tables are contained in 
+; SCS_STATUS_TAB and VMS_STATUS_TAB.)  If the SCS status is not
+; in the translation table, it is returned as is.
+;
+; Inputs:
+;
+;	R2			-SCS message address
+;
+; Outputs:
+;
+;	R0			-L.o. word:  converted status
+;				 or SYSAP-specific status.  H.o.
+;				 word = 0.
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$MAP_SCSSTS:
+
+	PUSHR	#^M<R1,R2,R3>		; Save registers
+	MATCHC	#2,SCS$W_STATUS(R2),-	; Look up status in
+		#SCS_STATUS_LEN,-	;  SCS status list
+		SCS_STATUS_TAB		;
+	BNEQ	20$			; Branch if did not find it
+	MOVZWL	SCS_STATUS_LEN-2(R3),R0	; Get corresponding VMS status
+	POPR	#^M<R1,R2,R3>		; Restore registers
+	RSB				; Return
+
+20$:	POPR	#^M<R1,R2,R3>		; Restore registers
+	MOVZWL	SCS$W_STATUS(R2),R0	; Return original status
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	SCS$MAP_VMSSTS,	MAP VMS STATUS TO SCS
+
+;+
+; SCS$MAP_VMSSTS converts a VMS status code to the corresponding SCS
+; code.  If the VMS code is not in the conversion table, then the VMS
+; code is returned unchanged.
+;
+; Inputs:
+;
+;	R0			-VMS code (l.o. 16 bits only)
+;	
+; Outputs:
+;
+;	R0			-SCS code, if conversion is successful,
+;				 otherwise, VMS code
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SCS$MAP_VMSSTS::
+
+	PUSHR	#^M<R0,R1,R2,R3>	; Save caller's registers
+	MATCHC	#2,(SP),#SCS_STATUS_LEN,-  ; Look up R0 status in table
+		VMS_STATUS_TAB		;
+	BNEQ	20$			; Branch if didn't find it
+	MOVZWL	-SCS_STATUS_LEN(R3),R0	; Get corresponding SCS code
+	TSTL	(SP)+			; Discard caller's R0
+	POPR	#^M<R1,R2,R3>		; Restore other registers
+	RSB				; Return
+
+20$:	POPR	#^M<R0,R1,R2,R3>	; Restore all caller's registers
+	RSB				; Return
+
+	.DSABL	LSB
+ 
+
+
+
+
+	.END

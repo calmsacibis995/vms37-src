@@ -1,0 +1,580 @@
+	$BEGIN	NT0BLKIO,028,NF$NETWORK,<NETWORK BLOCK I/O>
+
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: RMS
+;
+; Abstract:
+;
+;	This module communicates with the File Access Listener (FAL) at the
+;	remote node to perform read, write, and space block I/O operations.
+;
+; Environment: VAX/VMS, executive mode
+;
+; Author: James A. Krycka,	Creation Date:	18-APR-1978
+;
+; Modified By:
+;
+;	V02-028	JAK0071		J A Krycka	05-FEB-1982
+;		In accordance with a clarification to the DAP specification,
+;		eliminate the padding of a short block with zeroes on a $WRITE
+;		operation.
+;
+;	V02-027	JAK0063		J A Krycka	26-AUG-1981
+;		If a $WRITE operation fails at the remote node, send a DAP
+;		Continue Transfer message to direct FAL to restart the message
+;		stream.
+;
+;	V02-026	JAK0063		J A Krycka	24-AUG-1981
+;		Return RFA value on $READ and $WRITE.
+;
+;
+;	V02-025	JAK0050		J A Krycka	22-NOV-1980
+;		Fix bug in handling of end-of-file condition when not in DAP
+;		file transfer mode.
+;
+;	V02-024	REFORMAT	J A Krycka	26-JUL-1980
+;
+;--
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+
+	$BDBDEF				; Define BDB symbols
+	$DAPPLGDEF			; Define DAP prologue symbols
+	$DAPHDRDEF			; Define DAP message header
+	$DAPCNFDEF			; Define DAP Configuration message
+	$DAPCTLDEF			; Define DAP Control message
+	$DAPDATDEF			; Define DAP Data message
+	$DAPSTSDEF			; Define DAP Status message
+	$IFBDEF				; Define IFAB symbols
+	$IRBDEF				; Define IRAB symbols
+	$NWADEF				; Define Network Work Area symbols
+	$RABDEF				; Define Record Access Block symbols
+
+;
+; Macros:
+;
+;	None
+;
+; Equated Symbols:
+;
+
+	ASSUME	DAP$Q_DCODE_FLG EQ 0
+	ASSUME	NWA$Q_FLG EQ 0
+
+;
+; Own Storage:
+;
+;	None
+;
+
+	.SBTTL	NT$READ - PERFORM NETWORK READ BLOCK FUNCTION
+
+;++
+; NT$READ - engages in a DAP dialogue with the remote FAL to read the
+;	specified blocks.
+;
+; Calling Sequence:
+;
+;	BSBW	NT$READ
+;
+; Input Parameters:
+;
+;	R4	BDB address
+;	R5	VBN of 1st block for transfer
+;	R8	RAB address
+;	R9	IRAB address
+;	R10	IFAB address
+;	R11	Impure Area address
+;
+; Implicit Inputs:
+;
+;	BDB$L_ADDR
+;	BDB$W_NUMB
+;	BDB$W_SIZE
+;	BDB$L_VBN
+;	DAP$L_CRC_RSLT
+;	DAP$V_DAPCRC
+;	DAP$V_GEQ_V56
+;	IFB$V_SQO
+;	NWA$V_FTM_EOF
+;	NWA$V_FTM_INIT
+;	NWA$V_FTM_STORE
+;	NWA$Q_XMT
+;
+; Output Parameters:
+;
+;	R0	Status code (RMS)
+;	R1-R3	Destroyed
+;	AP	Destroyed
+;
+; Implicit Outputs:
+;
+;	BDB buffer contents
+;	BDB$W_NUMB
+;	BDB$B_REL_VBN destroyed
+;	DAP$L_CRC_RSLT
+;	NWA$V_FTM_EOF
+;	NWA$V_FTM_INIT cleared
+;	NWA$V_FTM_RETRV
+;	RAB$W_RFA
+;
+; Completion Codes:
+;
+;	Standard RMS completion codes
+;
+; Side Effects:
+;
+;	None
+;
+;--
+
+NT$READ::				; Entry point
+	$TSTPT	NTREAD			;
+	PUSHR	#^M<R4,R5,R6,R7>	; Save registers
+	MOVL	R4,R6			; Copy address of BDB
+	MOVL	IFB$L_NWA_PTR(R10),R7	; Get address of NWA (and DAP)
+	CLRW	BDB$W_NUMB(R6)		; Zero # bytes in BDB buffer count
+					; Note: BDB$W_NUMB = BDB$W_SIZE on input
+	CLRB	BDB$B_REL_VBN(R6)	; Zero relative VBN to start of buffer
+	BBS	#NWA$V_FTM_STORE,(R7),10$;$READ after $WRITE illegal in FTM
+	BBC	#NWA$V_FTM_EOF,(R7),-	; Check for EOF received while in FTM
+		READ_LOOP		;  from a previous $READ
+	BRW	ERREOF			; Branch aid
+10$:	BRW	ERRFTM			; Branch aid
+
+;+
+; Start of loop to read next block and append it to the user buffer.
+;
+; Note:	The data access protocol allows only one block to be transferred per
+;	block I/O request. Therefore, a multi-block user request is performed
+;	via several one-block DAP requests.
+;-
+
+READ_LOOP:				; 
+	BBS	#IFB$V_SQO,(R10),10$	; Branch if sequential-only specified
+	MOVZBL	#DAP$K_BLK_VBN,R1	; Set RAC for DAP message
+	BRB	READ_SEND_CTL		; Join common code
+10$:	BBCC	#NWA$V_FTM_INIT,(R7),-	; Branch if no Control message required
+		READ_BLOCK		;  and turn off single-shot flag
+	$SETBIT	#NWA$V_FTM_RETRV,(R7)	; Set file transfer mode retrieval flag
+	MOVZBL	#DAP$K_BLK_FILE,R1	; Set RAC for DAP message
+
+;+
+; Build and send DAP Control message to partner.
+;-
+
+READ_SEND_CTL:				;
+	$SETBIT	#NWA$V_LAST_MSG,(R7)	; Declare this last message to block
+	MOVL	#DAP$K_CTL_MSG,R0	; Get message type value
+	BSBW	NT$BUILD_HEAD		; Construct message header
+	MOVB	#DAP$K_GET_READ,(R5)+	; Store CTLFUNC field
+	MOVB	#<<DAP$M_RAC>!-		; Store CTLMENU field
+		  <DAP$M_KEY>!-		;
+		0>,(R5)+		;
+	MOVB	R1,(R5)+		; Store RAC field
+	MOVZBL	BDB$B_REL_VBN(R6),R0	; Get relative VBN to start of buffer
+	ADDL3	R0,BDB$L_VBN(R6),R1	; Compute next VBN to request
+	BSBW	NT$CVT_BN4_IMG		; Store KEY as an image field
+	BSBW	NT$BUILD_TAIL		; Finish building message
+	BSBW	NT$TRANSMIT		; Send Control message to FAL
+	BLBS	R0,READ_BLOCK		; Branch on success
+	BRW	EXIT			; Branch aid
+
+;+
+; Receive DAP Data message from partner containing the requested block.
+;-
+
+READ_BLOCK:				;
+	$SETBIT	#DAP$K_DAT_MSG,DAP$L_MSG_MASK(R7)
+					; Expect response of Data message
+	BSBW	NT$RECEIVE		; Read block
+	BLBC	R0,CHKEOF		; Branch on failure
+	BBC	#DAP$V_DAPCRC,-		; Branch if partner does not support
+		DAP$Q_SYSCAP(R7),10$	;  file level CRC checksum
+	MOVQ	DAP$Q_FILEDATA(R7),R2	; Put descriptor of block in <R2,R3>
+	CRC	W^NT$CRC_TABLE,-	; Compute CRC (destroying R0-R3)
+		DAP$L_CRC_RSLT(R7),-	;  using result of previous CRC
+		R2,(R3)			;  calculation as initial CRC value
+	MOVL	R0,DAP$L_CRC_RSLT(R7)	; Store CRC resultant value
+10$:	MOVQ	DAP$Q_FILEDATA(R7),R2	; Put descriptor of block in <R2,R3>
+	MOVZWL	BDB$W_NUMB(R6),R0	; Get # bytes already in BDB buffer
+	ADDW3	R0,R2,R1		; Compute projected total
+	CMPW	R1,BDB$W_SIZE(R6)	; Will this overflow BDB buffer?
+	BLEQU	20$			; Branch if not
+	SUBW3	R0,BDB$W_SIZE(R6),R2	; Compute # free bytes in BDB buffer
+20$:	ADDW2	R2,BDB$W_NUMB(R6)	; Update byte count in BDB
+	MOVC3	R2,(R3),-		; Append new block to BDB buffer
+		@BDB$L_ADDR(R6)[R0]	;
+
+;+
+; Receive DAP Status message from partner if we are not in file transfer mode
+; and return record file address of the first block accessed.
+;-
+
+READ_RECV_STS:				;
+	RMSSUC				; Anticipate success
+	BBS	#IFB$V_SQO,(R10),CHK1	; Branch if in file transfer mode
+	BBC	#DAP$V_GEQ_V56,(R7),CHK1; Branch if partner uses DAP before V5.6
+; *****	$SETBIT	#DAP$K_STS_MSG,DAP$L_MSG_MASK(R7); Implied for receive
+	BSBW	NT$RECEIVE		; Obtain status of read request
+	BLBC	R0,EXIT			; Branch on failure
+	TSTB	BDB$B_REL_VBN(R6)	; Return RFA value to user RAB on
+	BNEQ	CHK1			;  first pass thru loop as RFA refers
+	BSBW	NT$RET_RFA		;  to the first block read
+
+;
+; Determine whether or not user block I/O request has been completed.
+;
+
+CHK1:	CMPW	BDB$W_NUMB(R6),-	; Check # bytes received against
+		BDB$W_SIZE(R6)		;  # bytes requested
+	BGEQU	EXIT			; Branch if user request satisfied
+	INCB	BDB$B_REL_VBN(R6)	; Update relative VBN for next time thru
+	BRW	READ_LOOP		; Branch to read next block
+
+;
+; Check for end-of-file.
+;
+
+CHKEOF:	CMPW	R0,#<RMS$_EOF&^XFFFF>	; Is it an end-of-file?
+	BNEQ	EXIT			; Branch if not
+	BBC	#IFB$V_SQO,(R10),10$	; Branch if not file transfer mode
+	$SETBIT	#NWA$V_FTM_EOF,(R7)	; Denote that end-of-file has been
+	BRB	EXIT			;  reached so that EOF status will be
+					;  returned on next read attempt;
+					;  also it's an input to NT$CLOSE
+10$:	TSTW	BDB$W_NUMB(R6)		; If no data was received from FAL
+	BEQL	EXIT			;  then return an EOF condition,
+	RMSSUC				;  else return success with the data
+	BRB	EXIT			;  (which will cause BDB$L_VBN to be
+					;  updated on next entry to NT$READ)
+
+;+
+; Common exit code for $READ and $WRITE.
+;-
+
+ERRFTM:	RMSERR	FTM			; Declare file transfer mode error
+	BRB	EXIT			;
+ERREOF:	RMSERR	EOF			; Declare end-of-file
+EXIT:	POPR	#^M<R4,R5,R6,R7>	; Restore registers
+	RSB				; Exit with RMS code in R0
+
+	.SBTTL	NT$WRITE - PERFORM NETWORK WRITE BLOCK FUNCTION
+
+;++
+; NT$WRITE - engages in a DAP dialogue with the remote FAL to write the
+;	specified blocks.
+;
+; Calling Sequence:
+;
+;	BSBW	NT$WRITE
+;
+; Input Parameters:
+;
+;	R4	BDB address
+;	R5	VBN of 1st block for transfer
+;	R8	RAB address
+;	R9	IRAB address
+;	R10	IFAB address
+;	R11	Impure Area address
+;
+; Implicit Inputs:
+;
+;	BDB buffer contents
+;	BDB$L_ADDR
+;	BDB$W_NUMB
+;	BDB$W_SIZE
+;	BDB$L_VBN
+;	DAP$L_CRC_RSLT
+;	DAP$V_DAPCRC
+;	DAP$V_GEQ_V56
+;	IFB$V_SQO
+;	NWA$V_FTM_INIT
+;	NWA$V_FTM_RETRV
+;	NWA$Q_XMT
+;
+; Output Parameters:
+;
+;	R0	Status code (RMS)
+;	R1-R3	Destroyed
+;	AP	Destroyed
+;
+; Implicit Outputs:
+;
+;	BDB$W_NUMB
+;	BDB$B_REL_VBN destroyed
+;	DAP$L_CRC_RSLT
+;	NWA$V_FTM_INTI cleared
+;	NWA$V_FTM_STORE
+;	RAB$W_RFA
+;
+; Completion Codes:
+;
+;	Standard RMS completion codes
+;
+; Side Effects:
+;
+;	None
+;
+;--
+
+NT$WRITE::				; Entry point
+	$TSTPT	NTWRITE			;
+	PUSHR	#^M<R4,R5,R6,R7>	; Save registers
+	MOVL	R4,R6			; Copy address of BDB
+	MOVL	IFB$L_NWA_PTR(R10),R7	; Get address of NWA (and DAP)
+	BBS	#NWA$V_FTM_RETRV,(R7),-	; $WRITE after $READ illegal in FTM
+		ERRFTM			;
+	CLRW	BDB$W_NUMB(R6)		; Zero # bytes in BDB buffer count
+					; Note: BDB$W_NUMB = BDB$W_SIZE on input
+	CLRB	BDB$B_REL_VBN(R6)	; Zero relative VBN to start of buffer
+
+;+
+; Start of loop to write next block and append it to the user buffer.
+;
+; Note:	The data access protocol allows only one block to be transferred per
+;	block I/O request. Therefore, a multi-block user request is performed
+;	via several one-block DAP requests.
+;-
+
+WRITE_LOOP:				; 
+	BBS	#IFB$V_SQO,(R10),10$	; Branch if sequential-only specified
+	MOVZBL	#DAP$K_BLK_VBN,R1	; Set RAC for DAP message
+	BRB	WRITE_SEND_CTL		; Join common code
+10$:	BBCC	#NWA$V_FTM_INIT,(R7),-	; Branch if no Control message required
+		WRITE_BLOCK		;  and turn off single-shot flag
+	$SETBIT	#NWA$V_FTM_STORE,(R7)	; Set file transfer mode storage flag
+	MOVZBL	#DAP$K_BLK_FILE,R1	; Set RAC for DAP message
+
+;+
+; Build and send DAP Control message to partner.
+;-
+
+WRITE_SEND_CTL:				;
+	MOVL	#DAP$K_CTL_MSG,R0	; Get message type value
+	BSBW	NT$BUILD_HEAD		; Construct message header
+	MOVB	#DAP$K_PUT_WRITE,(R5)+	; Store CTLFUNC field
+	MOVB	#<<DAP$M_RAC>!-		; Store CTLMENU field
+		  <DAP$M_KEY>!-		;
+		0>,(R5)+		;
+	MOVB	R1,(R5)+		; Store RAC field
+	MOVZBL	BDB$B_REL_VBN(R6),R0	; Get relative VBN to start of buffer
+	ADDL3	R0,BDB$L_VBN(R6),R1	; Compute next VBN to request
+	BSBW	NT$CVT_BN4_IMG		; Store KEY as an image field
+	BSBW	NT$BUILD_TAIL		; Finish building message
+	BSBW	NT$TRANSMIT		; Send Control message to FAL
+	BLBS	R0,WRITE_BLOCK		; Branch on success
+	BRW	EXIT			; Branch aid
+
+;+
+; Build and send DAP Data message to partner containing the next block.
+;-
+
+WRITE_BLOCK:				;
+; *****	BBS	#IFB$V_SQO,(R10),10$	; Branch if sequential-only specified
+	$SETBIT	#NWA$V_LAST_MSG,(R7)	; Declare this last message to block
+10$:	MOVL	#DAP$K_DAT_MSG,R0	; Get message type value
+	BSBW	NT$BUILD_HEAD		; Construct message header
+	MOVL	NWA$Q_XMT+4(R7),R4	; Get address of transmit buffer
+	MOVZBL	BDB$B_REL_VBN(R6),R0	; Get relative VBN to start of buffer
+	ADDL3	R0,BDB$L_VBN(R6),R1	; Compute next VBN to request
+	BSBW	NT$CVT_BN4_IMG		; Store RECNUM as an image field
+	MOVL	R5,R3			; Save next byte pointer
+	MOVZWL	BDB$W_NUMB(R6),R0	; Get # bytes already sent from BDB buf
+	SUBW3	R0,BDB$W_SIZE(R6),R2	; Compute # bytes remaining to send
+	CMPW	R2,#512			; Is it more than one block?
+	BLEQU	20$			; Branch if not
+	MOVW	#512,R2			; Send exactly one block
+20$:	ADDW2	R2,BDB$W_NUMB(R6)	; Update byte count in BDB for next time
+	SUBL3	R4,R5,R1		; Compute # DAP overhead bytes in msg
+	ADDL3	R2,R1,R5		; Compute projected size of DAP message
+	CMPW	R5,NWA$W_DAPBUFSIZ(R7)	; Make sure message will fit in buffer
+	BGTRU	ERRRSZ			; Branch if record is too big
+	MOVQ	R2,NWA$Q_SAVE_DESC(R7)	; Save descriptor of user block
+	PUSHR	#^M<R2,R5>		; Save registers
+	MOVC3	R2,@BDB$L_ADDR(R6)[R0],(R3); Move block into DAP message
+	POPR	#^M<R2,R5>		; Restore registers
+
+;+
+; The following code segment to pad a short block with zeroes has been disabled
+; to comply with a clarification to the DAP V6.0 specification. However, the
+; code has not been removed in the event the old behavior (with its associated
+; problems) must be restored.
+;-
+
+	BRB	30$			; ***** Start of special code segment
+	BBS	#DAP$V_VAXVMS,(R7),30$	; Branch if partner is VAX/VMS
+	CMPW	R2,#512			; Check for full block
+	BEQL	30$			; Branch if exactly one block
+	SUBL3	R2,#512,R0		; Calculate how many short
+	ADDL2	R0,R5			; Update message size
+	CMPW	R5,NWA$W_DAPBUFSIZ(R7)	; Make sure message will fit in buffer
+	BGTRU	ERRRSZ			; Branch if record is too big
+	$ZERO_FILL-			; Zero fill rest of block
+		DST=(R3)-		;
+		SIZE=R0			;
+30$:					; ***** End of special code segment
+
+	MOVL	R3,R5			; Save next byte pointer
+	BSBW	NT$BUILD_TAIL		; Finish building message
+	BBC	#DAP$V_DAPCRC,-		; Branch if partner does not support
+		DAP$Q_SYSCAP(R7),40$	;  file level CRC checksum
+	MOVQ	NWA$Q_SAVE_DESC(R7),R2	; Put descriptor of block in <R2,R3>
+	CRC	W^NT$CRC_TABLE,-	; Compute CRC (destroying R0-R3)
+		DAP$L_CRC_RSLT(R7),-	;  using result of previous CRC
+		R2,(R3)			;  calculation as initial CRC value
+	MOVL	R0,DAP$L_CRC_RSLT(R7)	; Store CRC resultant value
+40$:	BSBW	NT$TRANSMIT		; Write block
+	BLBC	R0,CHKSTS		; Branch on failure
+
+;+
+; Receive DAP Status message from partner if we are not in file transfer mode
+; and return record file address of the first block accessed.
+;-
+
+WRITE_RECV_STS:				;
+	BBS	#IFB$V_SQO,(R10),CHK2	; Branch if in file transfer mode
+	BBC	#DAP$V_GEQ_V56,(R7),CHK2; Branch if partner uses DAP before V5.6
+; *****	$SETBIT	#DAP$K_STS_MSG,DAP$L_MSG_MASK(R7); Implied for receive
+	BSBW	NT$RECEIVE		; Obtain status of write request
+	BLBC	R0,CHKSTS		; Branch on failure
+	TSTB	BDB$B_REL_VBN(R6)	; Return RFA value to user RAB on
+	BNEQ	CHK2			;  first pass thru loop as RFA refers
+	BSBW	NT$RET_RFA		;  to the first block written
+
+;
+; Determine whether or not user block I/O request has been completed.
+;
+
+CHK2:	CMPW	BDB$W_NUMB(R6),-	; Check # bytes transmitted against
+		BDB$W_SIZE(R6)		;  # bytes requested
+	BGEQU	EXIT1			; Branch if user request satisfied
+	INCB	BDB$B_REL_VBN(R6)	; Update relative VBN for next time thru
+	BRW	WRITE_LOOP		; Branch to write next block
+
+;+
+; Error processing and exit paths.
+;-
+
+CHKSTS:	BSBW	NT$RESUME_FAL		; Tell FAL what to do on write error
+	BRB	EXIT1			;  reported via Status message
+ERRRSZ:	RMSERR	RSZ			; Invalid record size
+EXIT1:	BRW	EXIT			; Branch aid
+
+	.SBTTL	NT$SPACE - PERFORM NETWORK SPACE BLOCK FUNCTION
+
+;++
+; NT$space - engages in a DAP dialogue with the remote FAL to space the
+;	file forward or backward the specified number of blocks.
+;
+; Calling Sequence:
+;
+;	BSBW	NT$SPACE
+;
+; Input Parameters:
+;
+;	R1	# blocks to space as a signed number
+;	R8	RAB address
+;	R9	IRAB address
+;	R10	IFAB address
+;	R11	Impure Area address
+;
+; Implicit Inputs:
+;
+;	None
+;
+; Output Parameters:
+;
+;	R0	Status code (RMS)
+;	R1-R5	Destroyed
+;	R6	Actual # blocks spaced as an unsigned number
+;	R7	Destroyed
+;	AP	Destroyed
+;
+; Implicit Outputs:
+;
+;	None
+;
+; Completion Codes:
+;
+;	Standard RMS completion codes
+;
+; Side Effects:
+;
+;	None
+;
+;--
+
+NT$SPACE::				; Entry point
+	$TSTPT	NTSPACE			;
+	CLRL	R6			; Zero # blocks spaced
+	BBS	#IFB$V_SQO,(R10),ERRFTM2; Network space function not allowed
+					;  if file transfer mode selected
+	MOVL	IFB$L_NWA_PTR(R10),R7	; Get address of NWA (and DAP)
+
+;+
+; Build and send DAP Control message to partner.
+;-
+
+SPACE_SEND_CTL:				;
+	$SETBIT	#NWA$V_LAST_MSG,(R7)	; Declare this last message to block
+	MOVL	#DAP$K_CTL_MSG,R0	; Get message type value
+	BSBW	NT$BUILD_HEAD		; Construct message header
+	TSTL	R1			; Space foreward request?
+	BLSS	10$			; Branch if not
+	MOVB	#DAP$K_SPACE_FW,(R5)+	; Store CTLFUNC field
+	BRB	20$			;
+10$:	MOVB	#DAP$K_SPACE_BW,(R5)+	; Store CTLFUNC field
+	MNEGL	R1,R1			; Make value positive
+20$:	MOVB	#DAP$M_KEY,(R5)+	; Store CTLMENU field
+	BSBW	NT$CVT_BN4_IMG		; Store KEY as an image field
+	BSBW	NT$BUILD_TAIL		; Finish building message
+	BSBW	NT$TRANSMIT		; Send Control message to FAL
+	BLBC	R0,FAIL2		; Branch on failure
+
+;+
+; Receive DAP Status message from partner to obtain actual number of blocks
+; spaced.
+;-
+
+SPACE_RECV_STS:				;
+; *****	$SETBIT	#DAP$K_STS_MSG,DAP$L_MSG_MASK(R7); Implied for receive
+					; Expect response of Status message
+	BSBW	NT$RECEIVE		; Receive status of space request
+	MOVL	DAP$L_RECNUM2(R7),R6	; Get # blocks actually spaced
+					;  as an unsigned number
+FAIL2:	RSB				; Exit with RMS code in R0
+ERRFTM2:RMSERR	FTM			; Declare file transfer mode error
+	RSB				; Exit with RMS code in R0
+
+	.END				; End of module

@@ -1,0 +1,1306 @@
+%title 'BASICCMDS - Basic Phone Commands'
+	module basiccmds (
+			ident='V03-001') = begin
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! Facility:	VAX/VMS Telephone Facility, Basic Phone Commands
+!
+! Abstract:	This module handles the basic essential user commands:
+!			DIAL	Call someone on the phone.
+!			ANSWER	Answer the phone.
+!			REJECT	Reject a call.
+!			HANGUP	Hang up the phone.
+!
+!
+! Environment:
+!
+! Author: Paul C. Anagnostopoulos, Creation Date: 12 November 1980
+!
+! Modified By:
+!
+!	V03-001	PCA0040		Paul Anagnostopoulos	26-Mar-1982
+!		Major changes to convert from process name to user name.
+!--
+
+%sbttl 'Module Declarations'
+!
+! Libraries and Requires:
+!
+
+library 'sys$library:starlet.l32';
+require 'phonereq';
+
+!
+! Table of Contents:
+!
+
+forward routine
+	phn$dial_cmd: novalue,
+	phn$ring_out: novalue,
+	phn$local_jangle,
+	phn$rang_in: novalue,
+	phn$jangle_string,
+	phn$answer_cmd: novalue,
+	phn$answered: novalue,
+	phn$reject_cmd: novalue,
+	phn$rejected: novalue,
+	phn$busy: novalue,
+	phn$talk: novalue,
+	phn$listen: novalue,
+	phn$hangup_cmd: novalue,
+	phn$hungup: novalue;
+
+
+!
+! External References:
+!
+
+external routine
+	phn$break_call,
+	phn$break_link,
+	phn$cmp_target,
+	phn$estab_link,
+	phn$exit_cmd,
+	phn$force_links,
+	phn$fresh_screen,
+	phn$inform,
+	phn$make_tsb,
+	phn$prepare_users_target,
+	phn$queue_smb,
+	phn$read_slave,
+	phn$redundant,
+	phn$send_smb,
+	phn$show_text,
+	phn$term_characteristic;
+
+!
+! Own Variables:
+!
+
+%sbttl 'PHN$DIAL_CMD - Call Someone on the Phone'
+!++
+! Functional Description:
+!	This routines handles the DIAL command, used to call someone on the
+!	phone.
+!
+! Formal Parameters:
+!	target		Address of descriptor of the argument to the DIAL
+!			command as entered by the user.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$dial_cmd(target): novalue = begin
+
+local
+	status: long,
+	op: ref pub,			! Points to our PUB.
+	tp: ref pub;			! Points to target's PUB.
+local
+	local_described_buffer(prepared_target,nam$c_maxrss);
+
+
+! We begin by making sure that our phone is not busy receiving a call
+! from someone else.
+
+op = .phn$gq_pubhead[0];
+if .op[pub_v_answering] then (
+	phn$inform(phn$_phonebusy);
+	return;
+);
+
+! Now we will prepare the target specified by the user.  This gets it
+! ready for use in establishing a link to the person.
+
+phn$prepare_users_target(.target,false,prepared_target);
+
+! We now attempt to establish a link to the target person.  If this fails,
+! we will get a status back that we can use to display a message.
+
+status = phn$estab_link(prepared_target,tp);
+if .status nequ phn$_ok then (
+	phn$inform(.status);
+	return;
+);
+
+! Now we have to see if we are establishing a redundant link, that is,
+! a link to someone we are already linked to.  If so, forget it.
+
+if phn$redundant(.tp) then (
+	phn$break_link(.tp,smb__busy);
+	phn$inform(phn$_ivreduncall);
+	return;
+);
+
+! Finally, we set up our PUB so we'll know who we're calling. We also queue
+! a steering message to do a first-time ring of the person's phone.
+
+op[pub_v_calling] = true;
+op[pub_l_busylink] = .tp;
+phn$queue_smb(smb__ring_out,describe(%char(true)));
+
+return;
+
+end;
+
+%sbttl 'PHN$RING_OUT - Ring Someones Phone'
+!++
+! Functional Description:
+!	This steering message routine is called to ring someone's
+!	telephone.  We have to distinguish between first-time rings
+!	and subsequent rings, as described below.
+!
+! Formal Parameters:
+!	first_ring		The address of a descriptor of a byte flag:
+!					true	First-time ring.
+!					false	Subsequent ring.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$ring_out(first_ring): novalue = begin
+
+bind
+	first_ring_dsc  = .first_ring: descriptor,
+	first_ring_flag = .first_ring_dsc[ptr]: byte;
+
+local
+	status: long,
+	op: ref pub,			! Points to our PUB.
+	tp: ref pub;			! Points to target's PUB.
+
+
+! This little routine is the timer AST.  A timer goes off when we need
+! to do subsequent rings of a person's phone.  Just queue another ring_out
+! steering message with a flag that says "subsequent ring".
+
+routine timer_ast: novalue = begin
+
+phn$queue_smb(smb__ring_out,describe(%char(false)));
+return;
+
+end;
+
+! First we have to ensure that we really are still trying to call someone.
+
+op = .phn$gq_pubhead[0];
+if (not .op[pub_v_calling]) or (.op[pub_l_busylink] eqla 0) then
+	return;
+
+! Now we split up depending on whether this is a local or remote ring.
+
+tp = .op[pub_l_busylink];
+begin
+	bind target_tsb = tp[pub_b_tsb]: tsb;
+
+if not .target_tsb[tsb_v_remote] then (
+
+	! We are ringing a local phone.  Call a routine to do it, and then
+	! check the status.  If bad, we break the call and tell the user why.
+
+	status = phn$local_jangle(.tp,.first_ring_flag);
+	if .status nequ phn$_ok then (
+		phn$break_call();
+		phn$inform(.status);
+		return;
+	);
+
+) else (
+
+	! It appears we are ringing a remote node, which we obviously can't
+	! do ourselves.  Send a steering message to the remote slave, who
+	! will try to ring the person.  It will send us back a status.
+
+	local
+		local_described_buffer(ring_status,4);
+
+	phn$send_smb(.tp,smb__rang_in,first_ring_dsc);
+	status = phn$read_slave(.tp[pub_w_channel],ring_status,true);
+	if .status nequ phn$_ok then (
+		phn$break_call();
+		phn$inform(.status);
+		return;
+	);
+	if ..ring_status[ptr] nequ phn$_ok then (
+		phn$break_call();
+		phn$inform(..ring_status[ptr]);
+		return;
+	);
+);		       
+
+! Finally, we inform the user that we rang the person's phone, and we set
+! a timer for 10 seconds.  When the timer goes off, we'll ring the guy again.
+
+phn$inform(phn$_justrang,target_tsb[tsb_q_tkndsc,
+				    .target_tsb[tsb_w_tkncount]]);
+status = $setimr(daytim=uplit long(-10*10000000,-1),
+		 astadr=timer_ast);
+check (.status);
+return;
+end;
+
+end;
+
+%sbttl 'PHN$LOCAL_JANGLE - Produce Actual Phone Ring'
+!++
+! Functional Description:
+!	This routine is called to actually ring the phone of a local person.
+!	This includes both broadcasting a ring and sending a ring message to
+!	the person's mailbox.
+!
+! Formal Parameters:
+!	target_pub	Address of the PUB describing the person to be rung.
+!	first_ring_flag	A flag to say if this is the first ring:
+!				true	First-time ring.
+!				false	Subsequent ring.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	phn$_loggedoff	The person has logged off the system.
+!	phn$_cantreach	The person can't be reached for some reason.
+!	phn$_targterm	None of the person's terminals are usable by PHONE.
+!	phn$_unplugged	The person has /NOBROADCAST set on all terminals.
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$local_jangle(target_pub,first_ring_flag) = begin
+
+bind
+	tp = .target_pub: pub,
+	target_tsb = tp[pub_b_tsb]: tsb,
+	target_name = target_tsb[tsb_q_tkndsc,.target_tsb[tsb_w_tkncount]]: descriptor;
+
+own
+	process_pid: long,
+	own_described_buffer(user_name,12),
+	parent_pid: long,
+	own_described_buffer(term_number,7),
+	own_described_buffer(image_name,nam$c_maxrss);
+bind
+	get_proc = uplit(word(4),word(jpi$_pid),
+			 long(process_pid),
+			 long(0),
+			 word(12),word(jpi$_username),
+			 long(user_name+8),
+			 long(user_name),
+			 word(4),word(jpi$_owner),
+			 long(parent_pid),
+			 long(0),
+			 word(7),word(jpi$_terminal),
+			 long(term_number+8),
+			 long(term_number),
+			 long(0)),
+	get_image = uplit(word(nam$c_maxrss),word(jpi$_imagname),
+			  long(image_name+8),
+			  long(image_name),
+			  long(0));
+
+local
+	status: long,
+	wild_pid: long,
+	potential: long, usable: long, jangled: long, active: long;
+
+
+! We are doing a single local phone ring.  This requires us to find all
+! the processes for the target user and ring each one that we can.
+
+potential = usable = jangled = active = 0;
+wild_pid = -1;
+loop (
+
+	! Get the information on the next process.  If there aren't any
+	! more, then we are done.
+
+	status = $getjpi(efn=phn$k_getjpiefn,
+			 pidadr=wild_pid,
+			 itmlst=get_proc);
+
+exitif (.status eqlu ss$_nomoreproc);
+
+	! If we got a process, then determine if it is a detached
+	! interactive process owned by the target.
+
+	if .status eqlu ss$_normal then (
+		status = $waitfr(efn=phn$k_getjpiefn);
+		check (.status);
+
+		if ch$eql(.target_name[len],.target_name[ptr], .user_name[len],.user_name[ptr],' ') and
+		   .parent_pid eqlu 0 and
+		   .term_number[len] nequ 0 then (
+
+			! We got a potential candidate.  Make sure that
+			! their terminal is usable by PHONE.
+
+			inc (potential);
+			if phn$term_characteristic(term_number,tt$m_scope) then (
+				inc (usable);
+
+				! An interesting process.  If they aren't
+				! running PHONE, try to broadcast a ring
+				! message to them.  If they are, just remember
+				! that fact.
+
+				status = $getjpi(efn=phn$k_getjpiefn,
+						 pidadr=process_pid,
+						 itmlst=get_image);
+				if .status eqlu ss$_normal then (
+					status = $waitfr(efn=phn$k_getjpiefn);
+					check (.status);
+					if ch$find_sub(.image_name[len],.image_name[ptr],
+						       9,uplit byte('PHONE.EXE')) 	eqla 0 then (
+						if phn$jangle_string(.phn$gq_pubhead[0],term_number) then
+							inc (jangled);
+					) else
+						inc (active);
+				);
+			);
+		);
+	);
+);
+
+! Now we just return if there was some trouble.  Various statuses are
+! returned depending on the exact problem.
+
+if .potential eqlu 0 then
+	return phn$_loggedoff;
+if .usable eqlu 0 then
+	return phn$_targterm;
+if .jangled + .active eqlu 0 then
+	return phn$_unplugged;
+	
+! OK.  Now we may need to send a rang_in message to the target's
+! receive mailbox.  This is always done on the first ring, so that
+! no matter what they're doing, PHONE will get our ring.  Also, on
+! each subsequent ring, we want to send a message if they are now
+! running PHONE, so they'll get another buzz.
+
+if .first_ring_flag or .active nequ 0 then (
+
+	local
+		first_ring_dsc: descriptor;
+
+	first_ring_dsc[len] = 1;
+	first_ring_dsc[ptr] = first_ring_flag;
+	phn$send_smb(tp,smb__rang_in,first_ring_dsc);
+);
+
+return phn$_ok;
+
+end;
+
+%sbttl 'PHN$RANG_IN - Handle a Ring on Our Phone'
+!++
+! Functional Description:
+!	This steering message routine handles the rang_in steering message,
+!	which someone sends us when they want to ring our phone.  We have
+!	to make sure our phone is not busy, and then we can display a
+!	nice message to the user.
+!
+! Formal Parameters:
+!	message		The complete node/user name spec of the person
+!			calling us.  Ends with an eofrom character.
+!			This is followed by a flag which is set if this
+!			is the first ring, clear otherwise.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$rang_in(message): novalue = begin
+
+bind
+	message_dsc = .message: descriptor;
+
+local
+	status: long,
+	first_ring_flag: byte,
+	caller_tsb: tsb,		! TSB to parse caller's spec.
+	op: ref pub,			! Pointer to our PUB.
+	tp: ref pub;			! Pointer to caller's PUB.
+
+
+! We begin by isolating the caller's spec and making a TSB to parse it.
+! We also isolate the first-ring flag.
+
+	first_ring_flag = ch$rchar(.message_dsc[ptr]+.message_dsc[len]-1);
+	message_dsc[len] = .message_dsc[len] - 2;
+	status = phn$make_tsb(message_dsc,caller_tsb);
+	check (.status);
+
+! Now we see if we are calling ourselves.  In this case we just answer the
+! phone immediately.  There are two reasons for this action.  First, we can't
+! require the user to enter an ANSWER command, because the act of typing the
+! "A" will cancel the original call.  Second, why the hell would people call
+! themselves if they didn't want to answer the phone?  That's like arguing
+! with yourself and losing the argument!
+
+op = .phn$gq_pubhead[0];
+if phn$cmp_target(caller_tsb,op[pub_b_tsb]) then (
+	if .first_ring_flag then (
+		op[pub_v_answering] = true;
+		phn$answer_cmd();
+	);
+	return;
+);
+
+! Someone else is calling us.  This is rather complicated, because there are
+! really 9 distinct cases.  The first case is when we're calling someone else
+! and our phone is busy.  The other 8 cases are all combinations of the
+! following boolean variables:  whether we are currently answering the phone,
+! whether this is a first-time ring, and whether this caller is the same as
+! the person who rang us last time.
+
+if .op[pub_v_calling] or
+   (.op[pub_v_answering] and .first_ring_flag) then (
+
+	! Either we're placing a call now, or we're already answering the
+	! phone and someone else sends us a first-time ring.  In this case we
+	! make a temporary link to the caller and tell them we're busy.
+
+	status = phn$estab_link(message_dsc,tp);
+	check (.status);
+	status = phn$break_link(.tp,smb__busy);
+	check (.status);
+	return;
+);
+
+if not .op[pub_v_answering] and .first_ring_flag then (
+
+	! We're not answering and it's a first-time ring.  We have a new
+	! caller, so establish a link to them.  Set up our PUB so we'll
+	! know who's calling.  Display a ring message to the user.
+
+	status = phn$estab_link(message_dsc,tp);
+	check (.status);
+	op[pub_v_answering] = true;
+	op[pub_l_busylink] = .tp;
+	phn$jangle_string(.tp);
+	return;
+);
+
+if (tp = .op[pub_l_busylink]) neqa 0 then
+	if .op[pub_v_answering] and not .first_ring_flag and
+	   phn$cmp_target(caller_tsb,tp[pub_b_tsb])		then (
+
+		! We're answering, it's a subsequent ring, and it's from the
+		! same person.  Again display a ring message to the user.
+
+		phn$jangle_string(.tp);
+		return;
+	);
+
+! What the hell?!??!  Can't imagine what's going on at this point, so
+! just ignore the message.
+
+return;
+
+end;
+
+%sbttl 'PHN$JANGLE_STRING - Build and Display Ring Message'
+!++
+! Functional Description:
+!	This routine is called to build and display a ring message.
+!	There are two cases:
+!		1.	We are calling someone else and they are not
+!			currently using the PHONE facility.  In this case
+!			we have to broadcast the message to them.
+!		2.	Someone is calling us.  In this case we have to
+!			display the message on our message line.
+!
+! Formal Parameters:
+!	caller_pub	The address of the PUB of the person who is placing
+!			the call.  In case 1, it is our PUB.  In case 2,
+!			it's the PUB of the person calling us.
+!	terminal	This argument is only supplied in case 1, and is the
+!			terminal number of the person we are calling.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	A boolean, true if we could do it, false if not.
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$jangle_string(caller_pub,terminal) = begin
+
+bind
+	cp = .caller_pub: pub,
+	caller_tsb = cp[pub_b_tsb]: tsb,
+	terminal_dsc = .terminal: descriptor;
+
+local
+	status: long,
+	on_node_length: long;
+
+builtin
+	nullparameter;
+
+
+! We begin by determining if we are on a VAX running DECnet.  If so, we will
+! include the word "on" and the target's node in the ring message.
+
+on_node_length = (if .phn$gq_node_name[len] eqlu 0 then 0 else .phn$gq_node_name[len] + 3);
+
+! Now we determine if we are to broadcast the ring message.  If so, we get
+! the message text, $fao the various pieces into it, and broadcast it to
+! the terminal.
+
+if not nullparameter(2) then (
+	local
+		local_described_buffer(msg_buf,79);
+
+	! Get the ring message template.
+
+	status = $getmsg(msgid=phn$_ring,
+			 msglen=msg_buf[len],
+			 bufadr=msg_buf,
+			 flags=%b'0001');
+	check (.status);
+
+	! Build the ring message.
+
+	begin
+	local
+		local_described_buffer(fao_buf,79);
+
+	status = $fao(msg_buf,
+		      fao_buf[len],
+		      fao_buf,
+		      caller_tsb[tsb_q_tkndsc,.caller_tsb[tsb_w_tkncount]-1],
+		      caller_tsb[tsb_q_tkndsc,.caller_tsb[tsb_w_tkncount]],
+		      .on_node_length,
+		      phn$gq_node_name,
+		      0);
+	check (.status);
+
+	! Broadcast the ring message to the person's terminal.
+
+	status = $brdcst(msgbuf=fao_buf,
+			 devnam=terminal_dsc);
+	return .status;
+	end;
+);
+
+! Well, it appears that we have case 2, and we want to display a ring
+! message to the user.
+
+phn$inform(phn$_ring,
+	   caller_tsb[tsb_q_tkndsc,.caller_tsb[tsb_w_tkncount]-1],
+	   caller_tsb[tsb_q_tkndsc,.caller_tsb[tsb_w_tkncount]],
+	   .on_node_length,
+	   phn$gq_node_name,
+	   0);
+return phn$_ok;
+
+end;
+
+%sbttl 'PHN$ANSWER_CMD - Answer the Phone'
+!++
+! Functional Description:
+!	This routine handles the ANSWER command, used to answer a call
+!	on our phone.  We have to check for various illegal situations,
+!	and then we can make the PUB of the caller permanent, and set up
+!	a viewport.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$answer_cmd: novalue = begin
+
+local
+	status: long,
+	op: ref pub,			! Pointer to our PUB.
+	cp: ref pub;			! Pointer to caller's PUB.
+
+
+! If the answering flag in our PUB is not set, then the user has entered
+! a spurious ANSWER command.
+
+op = .phn$gq_pubhead[0];
+if not .op[pub_v_answering] or (.op[pub_l_busylink] eqla 0) then (
+	phn$inform(phn$_nocall);
+	return;
+);
+
+! Yes, we can answer the phone.  Clear the answering flag and the busylink
+! in our PUB, since we will now have answered.
+
+op[pub_v_answering] = false;
+cp = .op[pub_l_busylink];
+op[pub_l_busylink] = 0;
+
+! Now we have to see if we are about to establish a redundant conversation,
+! that is, a conversation with someone we are already talking to.  The
+! caller should have prevented this, but let's hear it for robustness!
+
+if phn$redundant(.cp) then (
+	phn$break_link(.cp,smb__busy);
+	phn$inform(phn$_ivredunans);
+	return;
+);
+
+! OK, now we can send an answered message to the caller so they'll know
+! that we have answered their call.
+
+phn$send_smb(.cp,smb__answered);
+
+! Now we see if the call we are answering is from ourselves.  If so,
+! we're done.  The PUB will be made permanent by PHN$ANSWERED when it
+! receives our answered message.  But we must re-establish the busylink.
+
+if phn$cmp_target(cp[pub_b_tsb],op[pub_b_tsb]) then (
+	op[pub_l_busylink] = .cp;
+	return;
+);
+
+! We are answering a call from someone else.  In order to be able to 
+! talk, we have to make their PUB permanent and assign them a viewport.
+
+cp[pub_v_temporary] = false;
+status = phn$fresh_screen(false);
+if .status nequ phn$_ok then (
+	phn$break_link(.cp,smb__busy);
+	phn$inform(.status);
+);
+return;
+
+end;
+
+%sbttl 'PHN$ANSWERED - Handle Someone Answering Us'
+!++
+! Functional Description:
+!	This steering message routine handles the answered message, which
+!	is set to us when someone answers a call we placed.  This message
+!	forces us to make their PUB permanent and assign a viewport.
+!
+! Formal Parameters:
+!	from_msg	Address of descriptor of the node/user name spec
+!			of the person who sent the message.  It is followed
+!			by an eofrom character.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$answered(from_msg): novalue = begin
+
+bind
+	from_msg_dsc = .from_msg: descriptor;
+
+local
+	status: long,
+	op: ref pub,			! Pointer to our PUB.
+	spec_tsb: tsb,			! TSB to parse answerer's spec.
+	tp: ref pub;			! Pointer to answerer's PUB.
+
+
+! We begin by ensuring that we are actually calling someone.  If not,
+! it's a spurious message.
+
+op = .phn$gq_pubhead[0];
+if not .op[pub_v_calling] or (.op[pub_l_busylink] eqla 0) then 
+	return;
+
+! Now we will create a TSB so we can parse the spec of the person answering.
+! We need to ensure that it really is the person we are calling.
+
+dec (from_msg_dsc[len]);
+status = phn$make_tsb(from_msg_dsc,spec_tsb);
+check (.status);
+tp = .op[pub_l_busylink];
+if not phn$cmp_target(spec_tsb,tp[pub_b_tsb]) then
+	return;
+
+! It appears that the call is complete.  Clean up calling info in our PUB.
+
+op[pub_v_calling] = false;
+op[pub_l_busylink] = 0;
+
+! Now we can make the person's PUB permanent and assign them a viewport.
+
+tp[pub_v_temporary] = false;
+status = phn$fresh_screen(false);
+if .status nequ phn$_ok then (
+	phn$break_link(.tp,smb__hungup);
+	phn$inform(.status);
+	return;
+);
+
+! Last but not least, we have to force links between the new person and
+! anyone else we might be talking to, creating a conference call.
+! Finally!  We're ready to talk to the person.
+
+phn$force_links(.tp);
+phn$inform(phn$_answered);
+return;
+
+end;
+
+%sbttl 'PHN$REJECT_CMD - Handle REJECT Command'
+!++
+! Functional Description:
+!	This routine handles the REJECT command, which the user enters
+!	to reject a phone call.  We have to send the caller a rejected
+!	message so the ringing will stop.
+!
+! Formal Parameters:
+!	parameter	If the user specifies the optional EXIT parameter,
+!			we will exit after the rejection.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$reject_cmd(parameter): novalue = begin
+
+bind
+	parameter_dsc = .parameter: descriptor;
+
+local
+	op: ref pub,			! Pointer to our PUB.
+	cp: ref pub;			! Pointer to caller's PUB.
+
+
+! First we must ensure that someone is actually calling us.  If not, the
+! user must be confused.
+
+op = .phn$gq_pubhead[0];
+if not .op[pub_v_answering] or (.op[pub_l_busylink] eqla 0) then (
+	phn$inform(phn$_nocall);
+	return;
+);
+
+! Now we can break the link to the caller, sending them a rejected message.
+
+op[pub_v_answering] = false;
+cp = .op[pub_l_busylink];
+op[pub_l_busylink] = 0;
+phn$break_link(.cp,smb__rejected);
+
+! Now we will check for the EXIT parameter.  If present, we will force
+! an exit command.  Garbage will cause an error message.
+
+if .parameter_dsc[len] gtru 0 then (
+	if ch$eql(.parameter_dsc[len],.parameter_dsc[ptr],
+		  minu(.parameter_dsc[len],4),uplit byte ('EXIT'),' ') then
+		phn$exit_cmd()
+	else
+		phn$inform(phn$_rejectjunk,parameter_dsc);
+);
+
+return;
+
+end;
+
+%sbttl 'PHN$REJECTED - Handle Rejected Message'
+!++
+! Functional Description:
+!	This steering message routine handles the rejected message,
+!	which someone sends us when they reject our phone call.
+!	This message forces us to cancel the call.
+!
+! Formal Parameters:
+!	from_msg	The address of the descriptor of the node/user name
+!			spec of the person rejecting our call.  It is
+!			followed by an eofrom character.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$rejected(from_msg): novalue = begin
+
+bind
+	from_msg_dsc = .from_msg: descriptor;
+
+local
+	status: long,
+	op: ref pub,			! Pointer to our PUB.
+	spec_tsb: tsb,			! TSB to parse answerer's spec.
+	tp: ref pub;			! Pointer to answerer's PUB.
+
+
+! We begin by ensuring that we are actually calling someone.  If not,
+! it's a spurious message.
+
+op = .phn$gq_pubhead[0];
+if not .op[pub_v_calling] or (.op[pub_l_busylink] eqla 0) then 
+	return;
+
+! Now we will create a TSB so we can parse the spec of the person rejecting.
+! We need to ensure that it really is the person we are calling.
+
+dec (from_msg_dsc[len]);
+status = phn$make_tsb(from_msg_dsc,spec_tsb);
+check (.status);
+tp = .op[pub_l_busylink];
+if not phn$cmp_target(spec_tsb,tp[pub_b_tsb]) then
+	return;
+
+! Now we can break the call to the person.  Also inform the user.
+
+phn$break_call();
+phn$inform(phn$_rejected);
+return;
+
+end;
+
+%sbttl 'PHN$BUSY - Handle Busy Message'
+!++
+! Functional Description:
+!	This steering message routine handles the busy message, which
+!	someone sends us when they are busy and can't continue.
+!	This message usually comes from someone we are calling, but in
+!	very bizarre circumstances can also come from someone calling us.
+!
+! Formal Parameters:
+!	from_msg	The address of the descriptor of the node/user name
+!			spec of the person who is busy.  It is followed by
+!			an eofrom character.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$busy(from_msg): novalue = begin
+
+bind
+	from_msg_dsc = .from_msg: descriptor;
+
+local
+	status: long,
+	op: ref pub,			! Points to our PUB.
+	spec_tsb: tsb,			! TSB to parse busy person's spec.
+	tp: ref pub;			! Points to busy person's PUB.
+
+
+! First we ensure that we are either calling or answering someone.  If not
+! ignore the message.
+
+op = .phn$gq_pubhead[0];
+if .op[pub_l_busylink] eqla 0 then
+	return;
+
+! Now we will create a TSB so we can parse the spec of the busy person.
+! We need to ensure that it really is the person we are calling/answering.
+
+dec (from_msg_dsc[len]);
+status = phn$make_tsb(from_msg_dsc,spec_tsb);
+check (.status);
+tp = .op[pub_l_busylink];
+if not phn$cmp_target(spec_tsb,tp[pub_b_tsb]) then
+	return;
+
+! Now if we are calling the busy person, we better break the call.
+! If they are calling us, just assume something went wrong and forget it.
+
+if .op[pub_v_calling] then (
+	phn$break_call();
+	phn$inform(phn$_busycall);
+);
+if .op[pub_v_answering] then (
+	op[pub_v_answering] = false;
+	op[pub_l_busylink] = 0;
+	phn$break_link(.tp,smb__busy);
+	phn$inform(phn$_dead);
+);
+return;
+
+end;
+
+%sbttl 'PHN$TALK - Handle Conversation Text We Typed'
+!++
+! Functional Description:
+!	This steering message routines handles the talk message, which
+!	contains conversation text that we typed.  The text has to be 
+!	displayed in our viewport and sent to everyone we are talking
+!	to now.
+!
+! Formal Parameters:
+!	text		The address of the descriptor of the text we typed.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$talk(text): novalue = begin
+
+local
+	p: ref pub;
+
+
+! We now scan the PUB chain (but not our PUB), looking for people we are
+! talking to.  We send them the text.
+
+p = ..phn$gq_pubhead[0];
+until .p eqla phn$gq_pubhead do (
+	if not .p[pub_v_temporary] and
+	   not .p[pub_v_uhaveheld] and
+	   not .p[pub_v_hasuheld]	then
+
+		phn$send_smb(.p,smb__listen,.text);
+
+	p = .p[pub_l_flink];
+);
+
+! Now we can actually display the text in our own viewport.  This was done
+! last because I think it gives the user a better feel for response time.
+
+phn$show_text(.phn$gq_pubhead[0],.text);
+return;
+
+end;
+
+%sbttl 'PHN$LISTEN - Handle Conversation Text Someone Else Typed'
+!++
+! Functional Description:
+!	This steering message routine handles the listen message, which
+!	someone sends us when they type conversation text for us to see.
+!
+! Formal Parameters:
+!	text_msg	Address of descriptor of two strings, separated
+!			by an eofrom character:
+!				1. The node/user name spec of the sender.
+!				2. The text they want us to see.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$listen(text_msg): novalue = begin
+
+bind
+	text_msg_dsc = .text_msg: descriptor;
+
+local
+	status: long,
+	text_dsc: descriptor,
+	spec_tsb: tsb,
+	p: ref pub;
+
+
+! We begin by rebuilding the message descriptor so that it only describes
+! the sender's spec.  We build a second descriptor for the text itself.
+
+text_dsc[ptr] = ch$find_ch(.text_msg_dsc[len],.text_msg_dsc[ptr],eofrom) + 1;
+text_dsc[len] = .text_msg_dsc[len] - (.text_dsc[ptr] - .text_msg_dsc[ptr]);
+text_msg_dsc[len] = .text_dsc[ptr] - .text_msg_dsc[ptr] - 1;
+
+! Now we make a TSB to parse the sender's spec.
+
+status = phn$make_tsb(text_msg_dsc,spec_tsb);
+check (.status);
+
+! Now we look through the PUB chain, looking for PUBs that represent the
+! person who sent us the text.  The text is displayed in their viewport.
+
+p = ..phn$gq_pubhead[0];
+until .p eqla phn$gq_pubhead do (
+	if not .p[pub_v_temporary] and
+	   not .p[pub_v_uhaveheld] and
+	   not .p[pub_v_hasuheld]	then
+
+		if phn$cmp_target(p[pub_b_tsb],spec_tsb) then
+			phn$show_text(.p,text_dsc);
+
+	p = .p[pub_l_flink];
+);
+
+return;
+
+end;
+
+%sbttl 'PHN$HANGUP_CMD - Handle HANGUP Command'
+!++
+! Functional Description:
+!	This routine handles the HANGUP command, by which the user hangs
+!	up the phone.  This cancels any and all conversations currently
+!	in progress or being initiated.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$hangup_cmd: novalue = begin
+
+local
+	p: ref pub, p2: ref pub;
+
+
+! First we scan all the PUBs (but not our own) and break the link to
+! absolutely all of them.
+
+p = ..phn$gq_pubhead[0];
+until .p eqla phn$gq_pubhead do (
+	p2 = .p[pub_l_flink];
+	phn$break_link(.p,smb__hungup);
+	p = .p2;
+);
+
+! Now we have to clear the calling/answering information in our PUB,
+! because we just cancelled any such activities.  Also refresh the screen.
+
+p = .phn$gq_pubhead[0];
+p[pub_v_calling] = false;
+p[pub_v_answering] = false;
+p[pub_l_busylink] = 0;
+phn$fresh_screen(false);
+
+return;
+
+end;
+
+%sbttl 'PHN$HUNGUP - Person Hung Up on Us'
+!++
+! Functional Description:
+!	This steering message routine handles the hungup message,
+!	which someone sends us when they hang up on us.  We break
+!	any links we might have with that person.
+!
+! Formal Parameters:
+!	from_msg	Address of descriptor of complete node/user name
+!			spec of the person hanging up, followed by eofrom.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$hungup(from_msg): novalue = begin
+
+bind
+	from_msg_dsc = .from_msg: descriptor;
+
+local
+	status: long,
+	spec_tsb: tsb,
+	p: ref pub, p2: ref pub,
+	op: ref pub,			! Pointer to our PUB.
+	refresh: byte;
+
+
+! First we parse the sender's spec by making a TSB.
+
+dec (from_msg_dsc[len]);
+status = phn$make_tsb(from_msg_dsc,spec_tsb);
+check (.status);
+
+! Now we loop through all of the PUBs (but not our own) and find ones
+! that represent the person who just hung up on us.
+
+op = .phn$gq_pubhead[0];
+p = ..phn$gq_pubhead[0];
+refresh = false;
+until .p eqla phn$gq_pubhead do (
+	p2 = .p[pub_l_flink];
+	if phn$cmp_target(p[pub_b_tsb],spec_tsb) then
+		if .p eqla .op[pub_l_busylink] then (
+
+			! We are busy with this person.  If we're calling
+			! them, cancel the call.  If they're calling us,
+			! return the favor.
+
+			if .op[pub_v_calling] then (
+				phn$break_call();
+				phn$inform(phn$_dead);
+			);
+			if .op[pub_v_answering] then (
+				op[pub_v_answering] = false;
+				op[pub_l_busylink] = 0;
+				phn$break_link(.p,smb__hungup);
+				phn$inform(phn$_cancall);
+			);
+		) else (
+
+			! We're already talking to this person.  Return
+			! the favor, and remember we have to refresh screen.
+
+			phn$break_link(.p,smb__hungup);
+			refresh = true;
+		);
+
+	p = .p2;
+);
+
+! If we broke any links with this person that actually represented a
+! conversation, we need to refresh the screen and tell the user.
+
+if .refresh then (
+	phn$fresh_screen(false);
+	phn$inform(phn$_hungup,spec_tsb[tsb_q_tkndsc,
+				        .spec_tsb[tsb_w_tkncount]]);
+);
+
+return;
+
+end;
+
+end eludom

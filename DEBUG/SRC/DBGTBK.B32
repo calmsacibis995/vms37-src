@@ -1,0 +1,379 @@
+MODULE DBGTBK (	IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	DEBUG (DBG)
+!
+! ABSTRACT:	traces program back from an error. Called from DEBUG,
+!		COMMON OTS.
+!
+! Version:	1.07
+!
+! ENVIRONMENT:	Runs in user mode, ASTs enabled, reentrant, shared
+!
+! AUTHOR:	Carol Peters, CREATION DATE: September 20, 1977
+!
+! MODIFIED BY:
+!		Mike Candela,	28 January 1980
+!		
+! 1.01	25-SEP-78	MCC	Deleted require file SYSLIT
+! 1.02	 9-OCT-78	MCC	Traceback reporting corrected to terminate when
+!				current FP = addr of DBG$FINAL_HANDL (bug-fix)
+! 1.03	02-NOV-78	DAR	Removed check for FORTRAN_MODULE from dbg$traceback.
+!				Also put in explicit field lengths into FAO strings.
+! 1.04	03-NOV-78	DAR	Traceback also stops if the PC is DBG$PSEUDO_PROG
+! 1.05	30-NOV-79	JBD	Put in statement number support.
+! 1.06	28-JAN-80	MCC	Fixed out_traceback to correctly format 31
+!				routine and module names for SHOW CALLS
+!
+! 1.07  19-apr-80	ala	Added additional parameter to output routines
+!				to allow access to output buffer's address
+!
+!--
+
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	dbg$traceback,				! traces calls through the stack
+	out_traceback : NOVALUE;		! outputs a single line of traceback information
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'src$:dbgprolog.req';
+REQUIRE 'SRC$:DBGGEN.REQ';	! general DEBUG  definitions
+REQUIRE 'SRC$:SYSSER.REQ';	! I/O and FAO definitions
+
+!
+! MACROS:
+!
+
+MACRO
+	cfp$l_handler	= 0, 0, 32, 0%,		! handler address
+	cfp$l_old_fp	= 12, 0, 32, 0%,	! address of previous FP
+	cfp$l_return_pc	= 16, 0, 32, 0%;	! return address of caller
+
+!
+! EQUATED SYMBOLS:
+!
+
+!
+! OWN STORAGE:
+!
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+	dbg$rst_type,
+	dbg$rst_name_addr,
+	dbg$fao_put : novalue,			! format output lines.
+	dbg$final_handl,			! call frame exception handler
+	dbg$out_put : novalue,			! flush output lines.
+	dbg$pc_to_line,				! translates a PC to a line number
+	dbg$val_to_sym;				! translates a value to an RST pointer.
+
+EXTERNAL
+	dbg$cp_out_str : vector[,byte],		! points to current output buffer.
+	dbg$gl_buf_siz,				! size of output buffer.
+	dbg$gl_runframe : REF BLOCK [, BYTE],	! pointer to current user registers
+	dbg$pseudo_exit;			! point to which CALL returns
+
+
+GLOBAL ROUTINE dbg$traceback(initial_pc,fp_pointer,exception_name,num_levels) =
+!++
+! Functional description:
+!
+!	This routine collects the symbolic information describing each
+!	stack frame starting at the stack frame pointed to by the user's
+!	FP, and proceeding through the frame with which the user program
+!	was called by CLI, by the OTS, or by DEBUG.
+!
+!	Once the symbolic information for a frame is collected, a routine
+!	is called to output this information to DBG$OUTPUT.
+!
+!	The num_levels parameter is either -1, or it is the
+!	number of call frames which the uses has specifically
+!	requested (via SHOW CALLS N).
+!
+! Formal parameters:
+!
+!	initial_pc	- PC of user program when traceback occurs
+!	fp_pointer	- FP of user program when traceback occurs
+!	exception_name	- type of exception where
+!			  1 - trap type exception
+!			  2 - fault or abort type exception
+!	num_levels	-The number of frames the user wants to see,
+!			 or -1 which implies "show them all".
+!
+! Implicit inputs:
+!
+!	The contents of the RST and the DST.
+!
+! Implicit outputs:
+!
+!	none
+!
+! Routine value:
+!
+!	true or false
+!
+! Side effects:
+!
+!	none
+!
+!--
+
+    BEGIN
+    BUILTIN PROBER;
+
+    LOCAL
+	current_fp : REF BLOCK[,BYTE],	! value of FP of working stack frame
+	current_pc,			! current PC in writable variable
+	exc_type,			! type of exception
+	sym_rstptr : REF rst$entry,	! pointer to RST entry from VAL_TO_SYM
+	sym_dstptr : REF dst$record,	! pointer to corresponding DST entry
+	mod_rstptr : REF rst$entry,	! pointer to RST entry for outermost scope
+	rtn_rstptr : REF rst$entry,	! pointer to RST entry for routine
+	stmt_number,			! matching statement number
+	line_number,			! matching line number
+	starting_pc;			! PC of start of routine or module
+    !+
+    ! If the user doesn't want to see any frames just return. Otherwise check
+    ! that some call frames are active,  get values of PC and FP to use,  and
+    ! set up the exception type.
+    !
+
+    IF .num_levels EQL 0 THEN RETURN (false);
+
+    IF (current_pc = .initial_pc) EQL 0 THEN SIGNAL(dbg$_nocalls);
+
+    current_fp = .fp_pointer;
+    exc_type = .exception_name;
+
+    $fao_tt_out('module name     routine name                     line      rel PC    abs PC!/');
+    !+
+    ! The following loop translates the current PC into a routine name and then
+    ! prints the name of the surrounding module,  the name of the routine,  the
+    ! line number,  and the relative and absolute PC values for each user stack
+    ! frame.
+    !-
+    DECR depth FROM MINU(.num_levels,1000)-1 TO 0 DO
+	BEGIN
+
+	IF PROBER(%REF(0),%REF(20),current_fp[cfp$l_handler]) EQL 0
+	THEN
+	    BEGIN
+	    $fao_tt_out('%DEBUG-W-BADSTACK Stack corrupted - no further data available');
+	    RETURN (false);
+	    END;
+
+	!+
+	! Stop if the return address is to DEBUGs call frame exception handler.
+	!-
+	IF .current_fp[cfp$l_handler] EQL dbg$final_handl
+	OR .current_pc EQL dbg$pseudo_exit
+	THEN	
+	    RETURN (false);
+	!+
+	! Obtain the name of the innermost routine that surrounds the address.
+	!-
+	IF NOT dbg$val_to_sym(.current_pc,sym_rstptr)
+	THEN
+	    out_traceback (0, 0, 0, 0, 0, .current_pc)
+	ELSE
+	    BEGIN
+	    IF (sym_dstptr = .sym_rstptr[rst$l_dstptr]) EQL 0
+	    THEN
+		BEGIN
+		SIGNAL (dbg$_rsterr);
+		RETURN (false);
+		END;
+	    IF .sym_rstptr[rst$v_global]
+	    THEN
+		!+
+		! Routine found in GST rather than in RST. (This is the case if
+		! the module containing the routine is not set). Just print the
+		! routine name and the relative and absolute PC values.
+		!-
+		out_traceback (0, dbg$rst_name_addr(.sym_rstptr), 0, 0,
+			(.current_pc - .sym_dstptr[dst$l_value]), .current_pc)
+	    ELSE
+		BEGIN
+		!+
+		! Search for the surrounding routine and module entries.
+		!-
+		rtn_rstptr = 0;
+		mod_rstptr = .sym_rstptr;
+		WHILE .mod_rstptr NEQ 0 DO
+		    BEGIN
+		    CASE .mod_rstptr[rst$b_kind] FROM rst$k_type_minimum to rst$k_type_maximum
+		     OF SET
+			[rst$k_module]:
+			    EXITLOOP;
+			[rst$k_routine]:
+			    IF .rtn_rstptr EQL 0
+			    THEN
+				BEGIN
+				sym_rstptr =  rtn_rstptr = .mod_rstptr;
+				sym_dstptr = .mod_rstptr[rst$l_dstptr];
+				END;
+			[rst$k_entry,rst$k_block,
+			 rst$k_line,rst$k_label]:
+			     0;
+			 [INRANGE,OUTRANGE] :
+			     SIGNAL(dbg$_rsterr);
+			TES;
+
+		    IF (mod_rstptr = .mod_rstptr[rst$l_upscopeptr]) EQL 0
+		    THEN
+			SIGNAL(dbg$_rsterr);
+		    END;
+
+		rtn_rstptr = .sym_rstptr;
+		starting_pc = .sym_dstptr[dst$l_value];
+	
+		IF NOT dbg$pc_to_line(.current_pc - (.exc_type NEQ fault_exc),
+				      .starting_pc, lookup_exc,
+				      line_number, stmt_number, rtn_rstptr)
+		THEN
+		    line_number = stmt_number = 0;	! There is no line number.
+
+		out_traceback(dbg$rst_name_addr(.mod_rstptr),
+			      dbg$rst_name_addr(.sym_rstptr),
+			      .line_number, .stmt_number,
+			      .current_pc - .starting_pc, .current_pc);
+		END;
+	    END;
+
+	!+
+	! Update current_pc and current_fp to the previous frame.
+	!-
+	exc_type = trap_exc;
+	current_pc = .current_fp[cfp$l_return_pc];
+	current_fp = .current_fp[cfp$l_old_fp];
+	END;
+    RETURN (true);
+    END;
+
+ROUTINE out_traceback (mod_nam, lab_nam, line_num, stmt_num,
+		       rel_pc, abs_pc) : NOVALUE =	! outputs a line of traceback
+
+!++
+! Functional description:
+!
+!	This routine actually calls FAO and DEBUG's output routine to
+!	format and output a line of traceback information.
+!
+! Formal parameters:
+!
+!	mod_nam		- address of counted string that is module name
+!	lab_nam		- address of counted string that is label name
+!	line_num	- line number matching PC
+!	stmt_num	- statement number within line
+!	rel_pc		- relative PC value from beginning of label
+!	abs_pc		- PC matching line number
+!
+! Implicit inputs:
+!
+!	An OPEN and CONNECT has been done on DBG$OUTPUT
+!
+! Implicit outputs:
+!
+!	none
+!
+! Routine value:
+!
+!	novalue
+!
+! Side effects:
+!
+!	a line is output to the output device associated with DBG$OUTPUT.
+!
+!--
+
+	BEGIN
+
+	MAP
+		mod_nam	: CS_POINTER,
+		lab_nam	: CS_POINTER;
+
+	LOCAL
+		string_ptr    : CS_POINTER,
+		output_buffer : vector[tty_out_width+1,BYTE];
+	
+	BIND	null_string = UPLIT BYTE (0);
+
+	! Set up for standard DEBUG I/O.
+
+	dbg$gl_buf_siz = 0;
+	dbg$cp_out_str = output_buffer+1;
+
+	! Print the module name, if we have one
+
+	string_ptr = (IF .mod_nam NEQ 0 THEN .mod_nam ELSE null_string);
+
+	dbg$fao_put(output_buffer, UPLIT(%ASCIC '!15AC '), .string_ptr);
+
+	string_ptr = (IF .lab_nam NEQ 0 THEN .lab_nam ELSE null_string);
+
+	IF .string_ptr[0] GTRU 31
+	THEN
+		BEGIN
+		dbg$fao_put(output_buffer, UPLIT(%ASCIC '!64AC'), .string_ptr);
+		dbg$out_put(output_buffer);
+		dbg$gl_buf_siz = 0;
+		dbg$cp_out_str = output_buffer+1;
+		dbg$fao_put(output_buffer, UPLIT(%ASCIC '!48* '));
+		END
+	ELSE
+		dbg$fao_put(output_buffer, UPLIT(%ASCIC '!32AC'), .string_ptr);
+
+	IF .line_num NEQ 0
+	THEN
+		dbg$fao_put(output_buffer, UPLIT(%ASCIC '!5UL'), .line_num)
+	ELSE
+		dbg$fao_put(output_buffer, UPLIT(%ASCIC '!5* '));
+
+	IF .stmt_num NEQ 0
+	THEN
+		dbg$fao_put(output_buffer, UPLIT(%ASCIC '.!2ZL'), .stmt_num)
+	ELSE
+		dbg$fao_put(output_buffer, UPLIT(%ASCIC '!3* '));
+
+	dbg$fao_put(output_buffer, UPLIT(%ASCIC '!10XL!10XL'), .rel_pc, .abs_pc);
+
+	dbg$out_put(output_buffer);	! Cause the current buffer to be output.
+
+END;
+
+END
+ELUDOM

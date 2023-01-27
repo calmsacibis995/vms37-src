@@ -1,0 +1,939 @@
+MODULE INS_LIST (			! Process /LIST and /FULL qualifiers
+		IDENT = 'V03-000',
+		ADDRESSING_MODE(EXTERNAL = GENERAL)
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  Install
+!
+! ABSTRACT:
+!
+!	Print the contents of a KFI entry or of all the entries.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system.
+!
+! AUTHOR:  Bob Grosso, July 1981
+!
+! Modified by:
+!
+!	V02-003	RPG0003		Bob Grosso		18-Jan-1982
+!		Cleanup listing format.
+!OP
+!	V02-002	RPG0002		Bob Grosso		11-Jan-1982
+!		Improve treatment of error occurring during file
+!		version number lookup.
+!
+!	V02-001	RPG0001		Bob Grosso		28-Dec-1981
+!		Clean up code and support P1 kfi.
+!
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';		! VAX/VMS system definitions
+
+REQUIRE
+	'SRC$:INSPREFIX.REQ';
+REQUIRE
+	'LIB$:INSDEF.B32';
+
+
+%SBTTL  'Declarations';
+!
+! Table of contents
+!
+
+LINKAGE
+    call_s_s_4 = CALL (STANDARD, STANDARD, REGISTER=4), ! for calling copy_kfi_lists from change mode dispatcher
+    jsb_0_4 = JSB (REGISTER=0, REGISTER=4)		! for calling mutex locking and unlocking routines.
+		: NOPRESERVE (1,2,3),
+    jsb_3_7 = JSB (REGISTER=3, REGISTER=7);		! for calling move_kfi_entry
+
+FORWARD ROUTINE
+    copy_kfi_lists : CALL_S_S_4,	! execute in kernel mode to copy the KFI lists to a user buffer
+    move_kfi_entry : JSB_3_7,		! move a specific entry to the user buffer
+    list_kfi_entries,			! List the KFIs in the user buffer
+    print_privs,			! Print the ASCII keywords for the bits set in a quadword privilege mask
+    ins_faol,				! Format ASCII output into an output buffer.
+    output_faobuf;			! Print the contents of the output buffer and re-initialize it.
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    lib$get_vm,					! get virtual memory
+    lib$free_vm,				! return virtual memory
+    lib$put_output,
+    sch$lockr	: JSB_0_4,			! Lock the mutex for Read access
+    sch$unlock	: JSB_0_4,			! Unlock the mutex
+    SYS$DASSGN : ADDRESSING_MODE (GENERAL),	! Deassign channel allocated by QIO call
+    SYS$FAOL : ADDRESSING_MODE (GENERAL),	! Format ASCII output
+    SYS$QIOW : ADDRESSING_MODE (GENERAL);	! Obtain version number given a file id
+
+EXTERNAL
+    ctl$gl_knownfil,				! Process pointer to the Known file list pointer block
+    exe$gl_knownfil,				! Exec pointer to the Known file list pointer block
+    exe$gl_kfimtx,				! Known file mutex
+    ins$gl_ctlmsk : BLOCK [1],			! INSTALL control flags
+    ins$gl_outrab : BBLOCK,			! Record output block for output buffer
+    prv$ab_names;				! ASCII list of privileges
+
+EXTERNAL LITERAL
+    ins$_nover;					! Error obtaining file version
+
+GLOBAL
+    ins$faooutbuf,				! Output buffer
+    ins$faobufdesc : BBLOCK [dsc$c_s_bln];	! Descriptor of output buffer
+
+OWN	
+    ins$a_buffer : VECTOR [2,LONG],		! Get start and end address of user buffer returned form $EXPREG
+    ins$l_bufsiz;				! Size of user buffer
+
+LITERAL
+    ins$c_bufsiz = 2;			! size for first attempt to get user buffer for kfi list
+
+GLOBAL LITERAL
+    ins$c_faobuflen = 132;		! size of output buffer
+
+BUILTIN
+    PROBEW;				! look ahead and be sure we can write into buffer
+
+!
+!   Extension of data returned for each KFI in the user buffer
+!
+MACRO
+    kfx_l_kfiadr = 0,0,32,0%,
+    kfx_q_fid = 4,0,0,0%,
+    kfx_s_fid = 8%,
+    kfx_w_windowsiz = 12,0,16,0%,
+    kfx_w_imghdrsiz = 14,0,16,0%,
+    kfx_c_length = 16%;
+
+BIND
+    !
+    !	Control strings for FAO
+    !
+    faoctl_name		= $descriptor ('!AC:[!AC]!AC.!AC'),
+    faoctl_version	= $descriptor (';!UW'),
+    faoctl_flags	= $descriptor ('!AC'),
+    faoctl_run_cnt	= $descriptor ('    Access count    = !UL'),
+    faoctl_privhd	= $descriptor ('    Privileges      = '),
+    faoctl_privhd2	= $descriptor ('                      '),
+    faoctl_priv		= $descriptor ('!AC '),
+    faoctl_kfientry	= $descriptor ('    Entry  adr/size = !XL/!UW'),
+    faoctl_window	= $descriptor ('    Window adr/size = !XL/!UW'),
+    faoctl_header	= $descriptor ('    Header adr/size = !XL/!UW'),
+    faoctl_compat_typ	= $descriptor ('    Compatability type = !XW');
+
+
+%SBTTL  'process_list';
+
+GLOBAL ROUTINE process_list ( kfi_addr ) =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Print the contents of either a specific KFI or all the KFI's.
+!
+!  INPUT:
+!
+!	kfi_addr = 0 : list all the KFI entries in all the lists.
+!		 = n : List the KFI entry at address "n".
+!
+!  IMPLICIT INPUT:
+!
+!	ins$gl_ctlmsk :	INSTALL control flags determine whether to give an
+!			abreviated or FULL listing.
+!	ins$gl_outrab :	Record access block for output stream.
+!
+!  OUTPUT:
+!
+!	List the known file image list for a single entry 
+!	or for every entry in all the lists.
+!
+!  IMPLICIT OUTPUT:
+!
+!	none
+!
+!  ROUTINE VALUE:
+!
+!---
+
+LOCAL
+    cmk_arglst : VECTOR [3,LONG],			! Arguement list for change mode to kernel call
+    cmk_status,						! status from $CMKRNL call
+    status;
+
+!+++
+!
+!   Copy the kfi data base to user buffer so that
+!   it need not be processed in kernal mode
+!
+!---
+
+cmk_arglst [0] = 2;						! number of arguements
+cmk_arglst [1] = .kfi_addr;					! address of KFI entry to list, list all if zero
+ins$l_bufsiz = ins$c_bufsiz;					! buffer size for first copy attempt
+!
+!   Allocate the user buffer from the end of the virtual address space to ensure that 
+!   PROBEW will work correctly,  must do an Expand Region rather than a lib$get_vm.
+!
+report ( $EXPREG ( pagcnt = ins$c_bufsiz, retadr = ins$a_buffer));
+cmk_arglst [2] = .ins$a_buffer;					! Address of user buffer
+WHILE (cmk_status = 						! While the buffer was large enough for the entire copy operation
+	$CMKRNL (ROUTIN = copy_kfi_lists, ARGLST = cmk_arglst)	! Copy the KFI or KFI's
+      )	EQL ss$_accvio DO					! if buffer too small
+
+    BEGIN
+    !
+    !	Buffer was too small, return it,
+    !   double the size of the buffer and try again
+    !
+    report ($DELTVA ( inadr = ins$a_buffer ) );				! return the buffer
+    ins$l_bufsiz = 2 * .ins$l_bufsiz;					! double the allocation size  
+    report ($EXPREG ( pagcnt = .ins$l_bufsiz, retadr = ins$a_buffer));	! and allocate another buffer
+    cmk_arglst [2] = .ins$a_buffer;
+    END;
+
+IF NOT .cmk_status
+THEN
+    status = .cmk_status			! Return an error
+ELSE
+    BEGIN
+
+    !+++
+    !
+    !	Format and print the contents of the buffer
+    !
+    !---
+    !
+    !   Allocate a buffer and initialize it, and descriptor of it
+    !
+    execute ( lib$get_vm (%REF(ins$c_faobuflen), ins$faooutbuf) );
+    CH$FILL (%C' ',ins$c_faobuflen, .ins$faooutbuf);
+    ins$faobufdesc [dsc$w_length] = ins$c_faobuflen;
+    ins$faobufdesc [dsc$a_pointer] = .ins$faooutbuf;
+    ins$gl_outrab [rab$l_rbf] = .ins$faooutbuf;	! set the record access block to point to the buffer
+
+    !
+    !	 Format and print the user buffer contents
+    !
+    status = list_kfi_entries (.ins$a_buffer);
+
+    execute ( lib$free_vm (%REF(ins$c_faobuflen), ins$faooutbuf) );	! Return the buffer
+    END;
+
+
+report ($DELTVA ( inadr = ins$a_buffer ) );	! return the buffer
+RETURN .status;
+END;	! routine  process_list
+
+
+%SBTTL  'copy_kfi_lists';
+
+ROUTINE copy_kfi_lists (knownfile, buf, pcb_adr) : CALL_S_S_4 =
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Execute in Kernal mode to copy KFI data base to user buffer.
+!
+!  INPUT:
+!
+!	knownfile =	Address of KFI if listing single entry, or zero if listing all entries
+!	buf =		Address of user buffer to copy KFI entries too
+!	pcb_adr =	Process control block address, courtesy of change mode dispatcher
+!
+!  OUTPUT:
+!
+!	none
+!
+!  IMPLICIT OUTPUT:
+!
+!	buf is filled in with contents of KFI or KFI's.
+!
+!  ROUTINE VALUE:
+!
+!--
+BEGIN
+
+MAP
+    knownfile : REF BBLOCK;		! pointer to KFI entry block
+
+LABEL
+    multi,				! block to process copying all KFI's
+    single;				! block to copy a single KFI specified
+
+OWN
+    kfi$w_size2 : WORD INITIAL ($BYTEOFFSET(kfi$w_size) + 2),
+    modeaddr : BYTE INITIAL (0);	! Mode for the PROBE
+
+LOCAL
+    entry,			! Pointer to KFI entry
+    list_head,
+    kf_que_ptr,
+    kf_ptrblk_que_adr : REF BBLOCK,
+    kfilist_index,
+    knownfil_hdr,
+    status;
+
+
+status = ss$_normal;
+
+IF NOT .ins$gl_ctlmsk [ins$v_process]
+THEN
+    SCH$LOCKR (exe$gl_kfimtx, .pcb_adr);
+
+IF .ins$gl_ctlmsk [ins$v_process]	! if process KFI
+THEN
+    knownfil_hdr = .ctl$gl_knownfil	! then use listhead in P1 space
+ELSE
+    knownfil_hdr = .exe$gl_knownfil;	! else use system listhead
+
+IF .knownfile EQL 0
+THEN 
+
+!+++
+!
+!   Copy all the KFI entries to the buffer
+!
+!---
+multi:
+    BEGIN
+    IF .knownfil_hdr NEQ 0			! If there is a Known file header block
+    THEN
+        BEGIN
+	kf_ptrblk_que_adr = .knownfil_hdr; 	! Location of que pointers
+	!
+	!   Get the number of KFI queues in header block
+	!   And follow each que pointer to a listhead entry
+	!
+	kfilist_index = .kf_ptrblk_que_adr [$BYTEOFFSET(kfp$b_quecount) - $BYTEOFFSET(kfp$l_que0),0,8,0];
+	IF .kfilist_index NEQ 0 		! While there are still more queues in the header block
+	THEN
+	    BEGIN
+	    WHILE .kfilist_index NEQ 0 DO 
+		BEGIN
+		list_head = ..kf_ptrblk_que_adr;
+		IF .list_head NEQ 0
+		THEN
+		    BEGIN
+		    entry = ..list_head;		! first entry in KFI list
+		    WHILE .entry NEQ .list_head DO	! Traverse whole circular list, quit when back to head
+			BEGIN
+			status = move_kfi_entry (buf, .entry);	! Copy the entry to the buffer
+			IF NOT .status THEN LEAVE multi;	! Quit if there was an error
+			entry = ..entry;			! Follow forward link to next entry
+			END;
+		    END;
+		kf_ptrblk_que_adr = .kf_ptrblk_que_adr + 4;	!Drop down to next list pointer
+		kfilist_index = .kfilist_index - 1;
+		END;
+	    IF PROBEW ( modeaddr, kfi$w_size2, .buf)		! Make sure buffer if large enough for next write
+	    THEN
+		CH$FILL (0, .kfi$w_size2, .buf)			! Zero the next size field in buffer to signal end 
+	    ELSE
+		status = ss$_accvio;
+	    END;
+	END;
+    END
+ELSE
+
+!+++
+!
+!   Copy only the request entry to the user buffer
+!
+!---
+
+single:
+    BEGIN
+    knownfile = .knownfile AND NOT kfi$m_kfiseq;	! Mask out the low byte which may contain success bit from previous routine
+    !
+    !	Take the quenum in the specified KFI entry and use it as a longword offset
+    !	from the start of the que pointers in the Known file header block loacated 
+    !	by knownfil_hdr, to find the address of the que pointer which points to
+    !	the listhead which contains the specified KFI.  The ASCIC strings at the 
+    !	end of that listhead will be the device, directory and file type for the
+    !   the specified KFI.
+    !
+    kf_que_ptr = .knownfil_hdr + (4 * .knownfile [kfi$b_kfiqnum]);
+    status = move_kfi_entry (buf, ...kf_que_ptr);
+    IF .status
+    THEN 
+	status = move_kfi_entry (buf, .knownfile);	! Now buffer the specified KFI entry
+
+    !
+    !	If that move was successful, then zero the size field to signal the end
+    !
+    IF .status
+    THEN
+	IF PROBEW ( modeaddr, kfi$w_size2, .buf)
+	THEN
+	    CH$FILL (0, .kfi$w_size2, .buf)
+	ELSE
+	    status = ss$_accvio;
+    END;
+
+IF NOT .ins$gl_ctlmsk [ins$v_process]
+THEN
+    SCH$UNLOCK (exe$gl_kfimtx, .pcb_adr);
+
+RETURN .status;
+END;	! routine copy_kfi_lists
+
+
+%SBTTL  'move_kfi_entry';
+
+ROUTINE move_kfi_entry (bufptr, kfi_entry) : JSB_3_7 =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!	Copy the information related to a KFI entry to
+!	a user buffer for later access.
+!
+!  INPUT:
+!	bufptr =	pointer to the start of the user buffer
+!	kfi_entry =	address of the known file entry for which info
+!			is to be copied to buffer.
+!---
+
+MAP
+    kfi_entry : REF BBLOCK;
+
+OWN
+    modeaddr : BYTE INITIAL (0);
+
+LOCAL
+    probe_len : WORD,
+    status;
+
+!
+!   To be sure we don't take an Access violation in Kernel mode,
+!   check that the buffer is writeable for the length of the info
+!   to be stored.  Store the size of the KFI plus the extension
+!   of additional info.
+!
+probe_len = kfx_c_length + .kfi_entry [kfi$w_size];
+IF PROBEW ( modeaddr, probe_len, ..bufptr)
+	THEN
+	    CH$MOVE (.kfi_entry [kfi$w_size], .kfi_entry, ..bufptr) ! copy the entry
+	ELSE RETURN ss$_accvio;
+
+.bufptr = ..bufptr + .kfi_entry [kfi$w_size];	! Skip over what was just copied
+
+    BEGIN	! bind block
+    LOCAL
+	fcb : REF BBLOCK,	! File control block
+	window : REF BBLOCK;	! Window control block
+    BIND
+	buffer = .bufptr : REF BBLOCK;
+
+    buffer [kfx_l_kfiadr] = .kfi_entry;			! store the KFI address in the info extension
+    CH$FILL (0, kfx_s_fid, buffer [kfx_q_fid]);		! Zero the File id field
+    buffer [kfx_w_windowsiz] = 0;
+    buffer [kfx_w_imghdrsiz] = 0;
+
+
+    IF NOT .kfi_entry [kfi$v_kfihd]
+    THEN
+	BEGIN
+
+	!+++
+	!
+	!   If this is not a List header block
+	!
+	!---
+
+	IF .kfi_entry [kfi$v_filidopen] 
+	THEN
+	    BEGIN
+	    !
+	    !	For open files, record the file id 
+	    !
+	    CH$MOVE(kfx_s_fid, .kfi_entry + $BYTEOFFSET( kfi$w_fid ),
+			.buffer + $BYTEOFFSET( kfx_q_fid ) );
+	    END
+	ELSE
+	    BEGIN
+	    IF .kfi_entry [kfi$v_donotopen]
+	    THEN
+		BEGIN
+		window = .kfi_entry [kfi$l_window];	! Window control block
+		IF .window NEQ 0
+		THEN
+		    BEGIN
+		    fcb = .window [wcb$l_fcb];		! get file control block to get the file id
+		    IF .fcb LSS 0
+		    THEN
+			CH$MOVE (kfx_s_fid, .fcb + $BYTEOFFSET( fcb$w_fid ),
+				.buffer + $BYTEOFFSET( kfx_q_fid ));
+		    buffer [kfx_w_windowsiz] = .window [wcb$w_size];	! get window control block size
+		    END;
+		END;
+	    END;
+	IF .kfi_entry [kfi$v_is_reshdr]
+	THEN
+	    BEGIN
+	    !
+	    !	If known file image is header resident, get size of image header
+	    !
+	    BIND
+		header = .kfi_entry [kfi$l_imghdr] - kfh$c_length : REF BBLOCK;
+	    buffer [kfx_w_imghdrsiz] = .header [kfh$w_size];
+	    END;
+	END;
+    END;	! bind block
+.bufptr = ..bufptr + kfx_c_length;	! Skip over extension for extra info
+
+RETURN ss$_normal;
+END;		! routine  move_kfi_entry
+
+%SBTTL 'list_kfi_entries';
+
+ROUTINE list_kfi_entries (kfibuffer) =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Format the information in the kfibuffer and print it to sys$output.
+!
+!  INPUT:
+!
+!	kfibuffer =	address of buffer containing KFI entry information
+!
+!---
+
+!
+!   Constants for setting file information block to get the file version
+!   number returned via a call to QIO.
+!
+LITERAL
+    fib_c_fid = 10,
+    fib_c_did = 12,
+    fib_s_fid = 8,
+    ins$c_ctlflgstr = 8;
+
+OWN
+    filver : LONG,					! Address to return file version
+    atrctlblk : BBLOCK [12]				! Attribute control block to get version number from QIO
+		PRESET	([atr$w_size] = atr$s_filver,
+			 [atr$w_type] = atr$c_filver,	! request file version
+			 [atr$l_addr] = filver
+			),
+
+    !
+    !	Control flag array to translate KFI flags to the ASCII
+    !	to be formatted for output.
+    !
+    ctlflg_array : VECTOR [2*ins$c_ctlflgstr] INITIAL (
+		kfi$m_is_shared, CSTRING ('Shar '),
+		kfi$m_is_reshdr, CSTRING ('Head '),
+		kfi$m_procpriv, CSTRING ('Priv '),
+		(kfi$m_donotopen)^ 16, CSTRING ('Open '),
+		kfi$m_compatmod, CSTRING ('Compat '),
+		kfi$m_protect, CSTRING ('Pro '),
+		kfi$m_shmident, CSTRING ('Shm '),
+		kfi$m_lim, CSTRING ('Noexe')
+		),
+
+    fib : BBLOCK [fib_c_did],
+    fib_desc : BBLOCK [dsc$c_s_bln]
+		PRESET ([dsc$w_length] = fib_c_fid,
+			[dsc$a_pointer] = fib ),
+    string_array : VECTOR [4];
+LOCAL
+    buffer : REF BBLOCK,
+    kfi_size,
+    status,
+    qio_status;
+
+BIND
+    str_devnam = string_array [0],
+    str_dirnam = string_array [1],
+    str_filnam = string_array [2],
+    str_typnam = string_array [3];
+
+
+buffer = .kfibuffer;		! Point to beginning of buffer
+
+!
+!   A zero size field marks the end of the buffer
+!
+WHILE (kfi_size = .buffer [kfi$w_size]) NEQ 0  DO
+    BEGIN
+    LOCAL
+	ctlflag,
+	entry_ext : REF BBLOCK,
+	kfictl : BYTE,
+	kfiflags : WORD;
+
+    qio_status = true;		! Process KFI info even if no call to QIOW
+
+    !
+    !	After the entry in the buffer is an information
+    !	extension of additional info about that entry.
+    !	The size of the entry is marked in the entry size field.
+    !	The info extension is a fixed size
+    !
+    entry_ext = .buffer + .kfi_size;		! Mark the start of the info extension
+
+    kfictl = .buffer [kfi$b_kfictl];		! KFI control flags byte
+    kfiflags = .buffer [kfi$w_flags];		! KFI flags word
+
+    !
+    !   At the end of the entry are counted ASCII strings.
+    !	Each list contains entries with the same device, directory 
+    !	and file type.  They are stored only once therefore, in the
+    !	listhead entry.
+    !   For a regualar entry, only the file name is stored.
+    !
+    !	loop thru strings.   If the string is present, then
+    !	record it's location.
+    !
+    IF .buffer [kfi$b_devnam] NEQ 0
+    THEN str_devnam = .buffer + .buffer [kfi$b_devnam];
+    IF .buffer [kfi$b_dirnam] NEQ 0
+    THEN str_dirnam = .buffer + .buffer [kfi$b_dirnam];
+    IF .buffer [kfi$b_filnam] NEQ 0
+    THEN str_filnam = .buffer + .buffer [kfi$b_filnam];
+    IF .buffer [kfi$b_typnam] NEQ 0
+    THEN str_typnam = .buffer + .buffer [kfi$b_typnam];
+
+    !
+    !	For a KFI list header entry, the information of interest
+    !	is the strings.  Report more info for regular KFI entry.
+    !
+    IF NOT .buffer [kfi$v_kfihd]	! If this is not a header entry
+    THEN
+	BEGIN
+	! convert file name
+	LOCAL
+	    pad;		! Number of spaces to pad buffer with
+
+	ins_faol ( faoctl_name, 	! format the file name
+		.str_devnam,.str_dirnam,.str_filnam,.str_typnam );
+
+	!
+	!   If the file id field is filled in
+	!   then the file version can be obtained via 
+	!   a call to QIO.
+	!
+	IF NOT CH$FAIL (CH$FIND_NOT_CH (fib_s_fid, entry_ext [kfx_q_fid], 0))
+	THEN
+	    BEGIN
+	    BIND
+		devnam_adr = .str_devnam + 1;
+	    LOCAL
+		devnam_len : BYTE,
+		channel : WORD,
+		devnam_desc : BBLOCK [dsc$c_s_bln],
+		iosb : BBLOCK [8];
+
+	    CH$MOVE (fib_s_fid, entry_ext [kfx_q_fid],
+			fib [fib$w_fid] );
+	    !
+	    !	make descriptor of device name string
+	    !
+	    devnam_len = ..str_devnam;
+	    devnam_desc [dsc$w_length] = .devnam_len;
+	    devnam_desc [dsc$a_pointer] = devnam_adr;
+
+	    !
+	    !	Assign a channel so QIO can be called to get file version
+	    !
+	    status = $assign ( devnam = devnam_desc, chan = channel);
+	    IF NOT .status THEN RETURN .status;
+	    filver = 0;
+	    qio_status = $QIOW (func = io$_access, chan = .channel,		! Get the file version
+			   iosb = iosb, P1 = fib_desc, P5 = atrctlblk);
+
+	    execute ($DASSGN (chan = .channel) );	! Deassign the channel
+
+	    IF NOT .iosb
+	    THEN
+		BEGIN
+		! 
+		!   Build a descriptor of the file name which is now in 
+		!   the output buffer and signal the file not found
+		!
+		LOCAL
+		    errfilnam_dsc : BBLOCK [dsc$c_s_bln];
+
+		errfilnam_dsc [dsc$a_pointer] = .ins$faooutbuf;
+		errfilnam_dsc [dsc$w_length] = ins$c_faobuflen - .ins$faobufdesc [dsc$w_length];
+		signal ( ins$_nover, 1, errfilnam_dsc, .iosb);
+		END
+
+	    ELSE
+		BEGIN
+		ins_faol (faoctl_version, .filver );	! Format the version into output buffer
+		END;
+	    END;
+
+
+	!
+	!   Pad the buffer out to 40 characters
+	!
+	pad = 40 - (ins$c_faobuflen - .ins$faobufdesc [dsc$w_length]);
+	IF .pad LEQ 0 THEN pad = 1;		! if greater than 40 then pad with one blank
+	ins$faobufdesc [dsc$w_length] = .ins$faobufdesc [dsc$w_length] - .pad; !length is size left in buffer
+	ins$faobufdesc [dsc$a_pointer] = .ins$faobufdesc [dsc$a_pointer] + .pad;
+
+	!
+	!   build a longword of an empty byte, the ctl byte and the flags word
+	!
+	ctlflag = (.kfictl ^ 16) OR .kfiflags;	! shift ctl byte by a word length
+	!
+	!   Search the table, if the mask is set in the composite control 
+	!   flags  longword, then call FAOL with the corresponding descriptor 
+	!
+	INCR i FROM 0 TO (2 * ins$c_ctlflgstr  -1) BY 2 DO
+	    BEGIN
+		BIND
+		mask = ctlflg_array [.i],
+		cstrng = ctlflg_array [.i] + 4,
+		padlen = .cstrng : BYTE;
+
+	    IF (.mask AND .ctlflag) NEQ 0
+	    THEN
+		BEGIN
+		ins_faol (faoctl_flags, .cstrng);
+		END
+	    ELSE
+		BEGIN
+		ins$faobufdesc [dsc$w_length] = .ins$faobufdesc [dsc$w_length] - .padlen;
+		ins$faobufdesc [dsc$a_pointer] = .ins$faobufdesc [dsc$a_pointer] + .padlen;
+		END;
+	    END;
+	output_faobuf ();
+
+	!+++
+	!
+	!   /FULL requested
+	!
+	!---
+
+	IF .ins$gl_ctlmsk [ins$v_full]
+	THEN
+	    BEGIN
+	    BIND
+		priv1 = .buffer + $BYTEOFFSET(kfi$q_procpriv),
+		priv2 = .buffer + $BYTEOFFSET(kfi$q_procpriv) + 4;
+
+	    IF .buffer [kfi$v_compatmod]	! Mark as compatibility mode image
+	    THEN
+		BEGIN
+		ins_faol (faoctl_compat_typ, .buffer [kfi$w_amecod]);
+		output_faobuf ();
+		END;
+
+	    ins_faol (faoctl_run_cnt, .buffer [kfi$l_usecnt]);
+	    output_faobuf ();
+
+	    IF .buffer [kfi$v_procpriv]		! If installed with privileges
+	    THEN
+		BEGIN
+		print_privs ( priv1 );		! Print the ASCII privilege symbols
+		END;
+
+	    ins_faol (faoctl_kfientry, .entry_ext [kfx_l_kfiadr], .buffer [kfi$w_size]);
+	    output_faobuf ();
+
+	    IF .buffer [kfi$v_donotopen]	! If not open, print info on window
+	    THEN
+		BEGIN
+		ins_faol (faoctl_window, .buffer [kfi$l_window], .entry_ext [kfx_w_windowsiz]);
+		output_faobuf ();
+		END;
+
+	    IF .buffer [kfi$v_is_reshdr]	! If header resident
+	    THEN
+		BEGIN
+		ins_faol (faoctl_header, .buffer [kfi$l_imghdr], .entry_ext [kfx_w_imghdrsiz]);
+		output_faobuf ();
+		END;
+	    END;
+	END;
+
+    buffer = .buffer + .buffer [kfi$w_size] + kfx_c_length;
+    END;
+
+RETURN true;
+END;		! routine  list_kfi_entries
+
+
+%SBTTL 'print_privs';
+
+ROUTINE print_privs (priv_adr) =
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!	Print the ASCII symbol for each privilege bit set in the quadword
+!	privilege mask, priv_adr.
+!
+!  INPUT:
+!	priv_adr = address of quadword privilege mask
+!
+!___
+BEGIN
+LOCAL
+    place_hldr,
+    prvs_to_print,
+    symbol_len,
+    priv_msk;
+
+place_hldr = prv$ab_names;		! point to start of privilege name table
+prvs_to_print = false;			! record status of buffer
+ins_faol ( faoctl_privhd );		! init buffer with header info and indentation
+
+
+WHILE .(.place_hldr) <0,8> NEQ 0 DO	! Traverse down the table
+    BEGIN
+    place_hldr = .place_hldr + 1;	! Second byte is privilege mask
+    priv_msk = .(.place_hldr) <0,8>;
+    place_hldr = .place_hldr + 1;	! Third byte is ASCII string count
+    symbol_len =.(.place_hldr) <0,8>;
+
+    IF .(.priv_adr) <.priv_msk,1>	! Check if bit is set in quadword
+    THEN
+	BEGIN
+	!
+	!    The bit is set, put ASCII in buffer
+	!
+	prvs_to_print = true;		! Remember that something is in buffer
+	ins_faol ( faoctl_priv, .place_hldr);
+	IF ins$c_faobuflen - .ins$faobufdesc [dsc$w_length] GTR 70
+	THEN
+	    BEGIN
+	    !
+	    !	Avoid too long a line.  If it is, print what we have and
+	    !	start a new line with a blank header offset
+	    !
+	    output_faobuf ();
+	    prvs_to_print = false;		! Currently no privs in buffer
+	    ins_faol ( faoctl_privhd2 );
+	    END;
+	END;
+
+    !
+    !	skip past count byte and ASCII privilege symbol
+    !
+    place_hldr = .place_hldr + 1 + .symbol_len;
+
+    END;	! while
+
+
+IF .prvs_to_print	! If there is something other than the header in the buffer
+THEN output_faobuf ()	! Then print it
+ELSE 
+    BEGIN		! otherwise reset buffer to forget about unused priv header
+    ins$faobufdesc [dsc$w_length] = ins$c_faobuflen;
+    ins$faobufdesc [dsc$a_pointer] = .ins$faooutbuf;
+    END;
+
+RETURN true;
+END;	! routine  print_privs
+
+
+%SBTTL  'output routines';
+
+GLOBAL ROUTINE ins_faol (fao_string, parameter_list) =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!	Format an ASCII string and stuff it into the output buffer.
+!	Update the buffer pointers to reflect the new stuff in the
+!	buffer.
+!
+!  INPUT:
+!	fao_string =	Formatted Ascii Output control string for FAO
+!	parameter_list= List of stuff to have formatted into buffer.
+!
+!  IMPLICIT INPUT:
+!	Output buffer has been allocated and ins$faobufdesc is the
+!	descriptor for it.
+!
+!  OUTPUT:
+!	none
+!
+!  ROUTINE VALUE
+!	Success, or error status from SYS$FAOL
+!---
+LOCAL
+    outlen : WORD;
+
+execute ( SYS$FAOL (.fao_string, outlen, ins$faobufdesc, parameter_list));	! Format the buffer
+ins$faobufdesc [dsc$w_length] = .ins$faobufdesc [dsc$w_length] - .outlen;	! decrement space left in buffer
+ins$faobufdesc [dsc$a_pointer] = .ins$faobufdesc [dsc$a_pointer] + .outlen;	! Point to unused space left in buffer
+RETURN true;
+END;		! routine  ins_faol
+
+GLOBAL ROUTINE output_faobuf =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!	Print the contents of the output buffer to sys$output and re-initialize
+!	the descriptor of the buffer, and zero the buffer.
+!
+!  INPUT:
+!	none
+!
+!  IMPLICIT INPUT:
+!	Output buffer has been allocated and ins$faobufdesc is the
+!	descriptor for it.
+!
+!  OUTPUT:
+!	Output the contents of ins$faooutbuf to sys$output
+!
+!  ROUTINE VALUE
+!	status from $PUT
+!---
+
+LOCAL
+    status;
+
+ins$gl_outrab [rab$w_rsz] = ins$c_faobuflen - .ins$faobufdesc [dsc$w_length];
+status = $PUT (rab = ins$gl_outrab);
+ins$faobufdesc [dsc$w_length] = ins$c_faobuflen;
+ins$faobufdesc [dsc$a_pointer] = .ins$faooutbuf;
+CH$FILL (%C' ', ins$c_faobuflen, .ins$faooutbuf);
+RETURN .status;
+END;		! Routine  output_faobuf
+
+END		! Module instalcmd
+ELUDOM

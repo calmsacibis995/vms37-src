@@ -1,0 +1,373 @@
+MODULE GETREQ (
+		LANGUAGE (BLISS32),
+		ADDRESSING_MODE (EXTERNAL = GENERAL),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This routine gets the next I/O request from the ACP queue.
+!	If no requests are queued, it hibernates.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines. This routine must be called
+!	in kernel mode.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  19-Dec-1976  17:26
+!
+! MODIFIED BY:
+!
+!	V02-008	LMP0003		L. Mark Pilant,		 9-Dec-1981  13:30
+!		Make external references use general mode addressing
+!
+!	V02-007	ACG38100	Andrew C. Goldstein,	3-Jun-1981  12:00
+!		Fix granting of SYSPRV to volume owner
+!
+!	V02-006	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:26
+!		Previous revision history moved to F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	GET_REQUEST,			! get next FCP request
+	GET_CCB;			! get address of CCB of channel
+
+GLOBAL ROUTINE GET_REQUEST =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine gets the next I/O request from the ACP queue.
+!	If no requests are queued, it hibernates.
+!
+! CALLING SEQUENCE:
+!	GET_REQUEST ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	QUEUE_HEAD: address of ACP queue block
+!	IO_CHANNEL: I/O channel number
+!	PREV_CHANNEL: secondary channel number
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	CURRENT_UCB: address of UCB of request
+!	CURRENT_VCB: address of VCB of request
+!	CURRENT_WINDOW: window of file if accessed
+!	PRIMARY_FCB: FCB of file if accessed
+!
+! ROUTINE VALUE:
+!	address of request I/O packet
+!
+! SIDE EFFECTS:
+!	I/O channel assigned to device of request
+!
+!--
+
+BEGIN
+
+! Note that the ACP queue header must be referenced through an explicit
+! register. This is to ensure that the REMQUE expression in fact produces
+! an single REMQUE instruction, and is not broken into an instruction
+! sequence that is not interlocked.
+!
+REGISTER
+	QUEUE_POINTER	: REF BBLOCK;
+
+LOCAL
+	P		: REF BBLOCK,	! pointer to chase AQB list
+	CCB		: REF BBLOCK,	! pointer to CCB of i/o channel
+	ABD		: REF BBLOCKVECTOR [,ABD$C_LENGTH],
+					! pointer to buffer descriptor packet
+	PACKET		: REF BBLOCK;	! address of new I/O packet
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	QUEUE_HEAD	: REF BBLOCK,	! ACP queue list head
+	DISK_UCB	: REF BBLOCK,	! UCB of device 'SYS$DISK'
+	DISK_UCB2	: REF BBLOCK,	! UCB of device 'SYS$DISK'
+	CURRENT_UCB	: REF BBLOCK,	! address of current UCB
+	CURRENT_VCB	: REF BBLOCK,	! address of current VCB
+	CURRENT_RVT	: REF BBLOCK,	! address of current RVT or UCB
+	CURRENT_WINDOW	: REF BBLOCK,	! address of file window
+	PRIMARY_FCB	: REF BBLOCK,	! address of file FCB
+	CURRENT_FIB	: REF BBLOCK,	! FIB for current operation
+	LOCAL_FIB	: BBLOCK,	! copy of user fib
+	LOCAL_ARB	: BBLOCK,	! local copy of caller's ARB
+	CURRENT_RVN,			! RVN of volume in use
+	IO_CHANNEL,			! channel for I/O
+	PREV_CHANNEL,			! secondary I/O channel
+	IOC$GL_AQBLIST	: REF BBLOCK ADDRESSING_MODE (ABSOLUTE),
+					! system AQB listhead
+	EXE$GL_SYSUIC	: ADDRESSING_MODE (ABSOLUTE);
+					! highest SYSTEM UIC
+
+EXTERNAL ROUTINE
+	LOCK_IODB,			! interlock system I/O database
+	UNLOCK_IODB,			! unlock system I/O database
+	DEALLOCATE;			! deallocate system dynamic memory
+
+! Attempt to dequeue a packet. If unsuccessful, hibernate and try again.
+!
+
+WHILE 1 DO
+    BEGIN
+    QUEUE_POINTER = .QUEUE_HEAD;
+    IF NOT REMQUE (.QUEUE_POINTER[AQB$L_ACPQFL], PACKET)
+    THEN EXITLOOP;
+
+    IF .QUEUE_POINTER[AQB$B_MNTCNT] EQL 0
+    THEN
+
+! If the REMQUE failed and the mount count in the AQB is zero, this ACP is
+! potentially idle. Interlock the I/O database and check the queue and the
+! count again. If the ACP is no longer idle, proceed as if nothing had happened.
+! If it still is, unhook the AQB from the system AQB list. Once unhooked, the
+! ACP can no longer be found by anyone. Then restore the original UCB of our
+! I/O channel, deassign the channel, and go away.
+!
+
+	BEGIN
+	LOCK_IODB ();
+	IF .QUEUE_POINTER[AQB$B_MNTCNT] EQL 0
+	AND .QUEUE_POINTER[AQB$L_ACPQFL] EQL QUEUE_POINTER[AQB$L_ACPQFL]
+	THEN
+	    BEGIN
+	    P = .IOC$GL_AQBLIST;
+	    IF .P EQL .QUEUE_POINTER
+	    THEN IOC$GL_AQBLIST = .QUEUE_POINTER[AQB$L_LINK]
+	    ELSE
+		BEGIN
+		UNTIL .P[AQB$L_LINK] EQL .QUEUE_POINTER
+		DO P = .P[AQB$L_LINK];
+		P[AQB$L_LINK] = .QUEUE_POINTER[AQB$L_LINK];
+		END;
+	    UNLOCK_IODB ();
+	    DEALLOCATE (.QUEUE_POINTER);
+	    CCB = GET_CCB (.IO_CHANNEL);
+	    CCB[CCB$L_UCB] = .DISK_UCB;
+	    $DASSGN (CHAN = .IO_CHANNEL);
+	    CCB = GET_CCB (.PREV_CHANNEL);
+	    CCB[CCB$L_UCB] = .DISK_UCB2;
+	    $DASSGN (CHAN = .PREV_CHANNEL);
+	    $DELPRC ();
+	    END
+	ELSE
+	    UNLOCK_IODB ();
+	END;
+
+    $HIBER;
+    END;				! end of ACP wait loop
+
+! First check the type code in the packet.
+!
+
+IF .PACKET[IRP$B_TYPE] NEQ DYN$C_IRP
+THEN BUG_CHECK (NOTIRPAQB, FATAL, 'Not IRP pointer in AQB');
+
+! Set up the UCB and VCB pointers and assign the I/O channel to the UCB.
+! Check the type codes on all packets and control blocks.
+!
+
+CURRENT_UCB = .PACKET[IRP$L_UCB];
+IF .CURRENT_UCB[UCB$B_TYPE] NEQ DYN$C_UCB
+THEN BUG_CHECK (NOTUCBIRP, FATAL, 'Not UCB pointer in IRP');
+
+CURRENT_FIB = LOCAL_FIB;
+
+! Get the window and FCB addresses if there is a file open on the channel.
+! If the low bit of the window pointer is on, ignore the pointer (deaccess pending).
+!
+
+CURRENT_WINDOW = .PACKET[IRP$L_WIND];
+IF .(PACKET[IRP$L_WIND])<0,1>
+THEN CURRENT_WINDOW = 0;
+IF .(PACKET[IRP$L_WIND])<1,2> NEQ 0
+THEN BUG_CHECK (BADWCBPT, FATAL, 'Bad WCB pointer in IRP');
+
+IF .CURRENT_WINDOW NEQ 0
+THEN
+    BEGIN
+    IF .CURRENT_WINDOW[WCB$B_TYPE] NEQ DYN$C_WCB
+    THEN BUG_CHECK (NOTWCBIRP, FATAL, 'Not WCB Pointer in IRP');
+
+    IF .CURRENT_WINDOW[WCB$V_NOTFCP]
+    THEN BUG_CHECK (NOTFCPWCB, FATAL, 'Not FCP window in IRP');
+
+    CURRENT_UCB = .CURRENT_WINDOW[WCB$L_ORGUCB];
+    IF .CURRENT_UCB[UCB$B_TYPE] NEQ DYN$C_UCB
+    THEN BUG_CHECK (NOTUCBWCB, FATAL, 'Bad UCB pointer in window');
+
+    PRIMARY_FCB = .CURRENT_WINDOW[WCB$L_FCB];
+    IF .PRIMARY_FCB[FCB$B_TYPE] NEQ DYN$C_FCB
+    THEN BUG_CHECK (NOTFCBWCB, FATAL, 'Bad FCB pointer in window');
+
+    CH$MOVE (FID$C_LENGTH, PRIMARY_FCB[FCB$W_FID], LOCAL_FIB[FIB$W_FID]);
+    END;
+
+CURRENT_VCB = .CURRENT_UCB[UCB$L_VCB];
+IF .CURRENT_VCB[VCB$B_TYPE] NEQ DYN$C_VCB
+THEN BUG_CHECK (NOTVCBUCB, FATAL, 'Not VCB pointer in UCB');
+
+CURRENT_RVT = .CURRENT_VCB[VCB$L_RVT];
+IF .CURRENT_RVT[RVT$B_TYPE] NEQ DYN$C_RVT
+AND .CURRENT_RVT[RVT$B_TYPE] NEQ DYN$C_UCB
+THEN BUG_CHECK (NOTRVTVCB, FATAL, 'Not RVT pointer in VCB');
+
+CURRENT_RVN = .CURRENT_VCB[VCB$W_RVN];
+
+CCB = GET_CCB (.IO_CHANNEL);
+CCB[CCB$L_UCB] = .CURRENT_UCB;		! and assign it by stuffing UCB
+
+! If this is a normal file processor request (as opposed to a window turn),
+! clear the byte count in the descriptor for the channel window pointer
+! to inhibit write-back. Set the spool file bit is this is I/O to a spool file.
+! This is denoted for ACP functions by noting that IRP$L_UCB is different
+! from IRP$L_MEDIA (the latter containing the spooled device UCB address.
+!
+
+IF .PACKET[IRP$V_COMPLX]
+THEN
+    BEGIN
+    ABD = .BBLOCK [.PACKET[IRP$L_SVAPTE], AIB$L_DESCRIPT];
+    ABD[ABD$C_WINDOW, ABD$W_COUNT] = 0;
+    IF .PACKET[IRP$L_UCB] NEQ .PACKET[IRP$L_MEDIA]
+    THEN CLEANUP_FLAGS[CLF_SPOOLFILE] = 1;
+    END
+
+! If there is no buffer packet, the function must be an ACP control function.
+!
+
+ELSE
+    BEGIN
+    IF .PACKET[IRP$V_FCODE] GTRU IO$_LOGICAL
+    AND .PACKET[IRP$V_FCODE] NEQ IO$_ACPCONTROL
+    THEN BUG_CHECK (NOBUFPCKT, FATAL, 'Required buffer packet not present');
+    END;
+
+! Set the system privilege flag bit, based on the caller's UIC and
+! privileges.
+!
+
+CH$MOVE (ARB$C_LENGTH, .PACKET[IRP$L_ARB], LOCAL_ARB);
+IF .BBLOCK [LOCAL_ARB[ARB$Q_PRIV], PRV$V_SYSPRV]
+OR .BBLOCK [LOCAL_ARB[ARB$Q_PRIV], PRV$V_BYPASS]
+OR .(LOCAL_ARB[ARB$L_UIC])<16,16> LEQU .EXE$GL_SYSUIC
+OR .LOCAL_ARB[ARB$L_UIC] EQL .CURRENT_UCB[UCB$L_OWNUIC]
+THEN
+    BEGIN
+    CLEANUP_FLAGS[CLF_SYSPRV] = 1;
+    BBLOCK [LOCAL_ARB[ARB$Q_PRIV], PRV$V_SYSPRV] = 1;
+    END;
+
+RETURN .PACKET;
+
+END;					! end of routine GETREQ
+
+GLOBAL ROUTINE GET_CCB (CHANNEL) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns the address of the channel control block
+!	associated with the given channel.
+!
+!
+! CALLING SEQUENCE:
+!	GET_CCB (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: channel number
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	address of CCB
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+
+BEGIN
+
+LINKAGE
+	L_VERIFYCHAN	= JSB (REGISTER = 0) :
+			  GLOBAL (CCB = 1)
+			  NOPRESERVE (2, 3, 4, 5);
+
+GLOBAL REGISTER
+	CCB		= 1 : REF BBLOCK; ! CCB address returned
+
+LOCAL
+	STATUS,				! status of system call
+	CCB_BASE	: REF BBLOCK;	! other copy of CCB address, due to
+					! faulty flow analysis in BLISS
+
+EXTERNAL ROUTINE
+	IOC$VERIFYCHAN	: L_VERIFYCHAN ADDRESSING_MODE (ABSOLUTE);
+					! exec routine to find CCB
+
+STATUS = IOC$VERIFYCHAN (.CHANNEL);
+CCB_BASE = .CCB;
+IF NOT .STATUS
+THEN BUG_CHECK (INVCHAN, FATAL, 'Invalid ACP channel number');
+
+RETURN .CCB_BASE;
+
+END;					! end of routine GET_CCB
+
+END
+ELUDOM

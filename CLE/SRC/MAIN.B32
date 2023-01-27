@@ -1,0 +1,903 @@
+MODULE main (IDENT = 'V03-000', MAIN = start) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  Command language editor
+!
+! ABSTRACT:
+!
+!	This facility is used to enhance the command language
+!	and allow user-written commands to be available in the
+!	language.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. unprivileged user mode,
+!
+! AUTHOR:  Tim Halvorsen, Feb 1980
+!
+! Modified by:
+!
+!	V011	DWT0031		David Thiel	26-Feb-1982
+!		Default /SYM, /OBJECT, and /LIST output
+!		files to first input file and make these
+!		work correctly when input file is wildcarded.
+!		Default module name to first input file name.
+!		Disallow eliminating tables with
+!		SET COMMAND /NOTAB.
+!
+!	V010	DWT0027		David Thiel	05-Feb-1982
+!		Correct handling of optional /SYMBOL value.
+!
+!	V009	DWT0017		David Thiel	31-Dec-1981
+!		Avoid conflicting uses of desc in start.
+!
+!	V008	DWT0014		David Thiel	24-Dec-1981
+!		Prohibit /OUTPUT unless /TABLES also specified.
+!
+!	V007	BLS0089		Benn Schreiber	15-Oct-1981
+!		Add MCR support
+!
+!	V006	TMH0006		Tim Halvorsen	20-Mar-1981
+!		Do not default module_name when opening input file,
+!		but instead save input file name away in case module
+!		name is never specified, and let object do defaulting.
+!
+!	V005	TMH0005		Tim Halvorsen	13-Feb-1981
+!		Accept foreign commands without letting CLI$GET_VALUE
+!		prompt for a value from the user.
+!
+!	V004	TMH0004		Tim Halvorsen	05-Jan-1981
+!		Accept /OBJECT without a value - use related defaulting
+!
+!	V003	TMH0003		Tim Halvorsen	23-Dec-1980
+!		Do not write output tables if /OBJECT was specified.
+!
+!	V002	TMH0002		Tim Halvorsen	19-Dec-1980
+!		Clean up bootstrap code which allows this program to
+!		add a command to the per-process tables even though
+!		its syntax is not defined and the entities cannot be
+!		obtained.
+!
+!	V001	TMH0001		Tim Halvorsen	13-Nov-1980
+!		Process a /OBJECT qualifier to produce an object module
+!		containing the command tables.
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET.L32';	! VAX/VMS common definitions
+
+LIBRARY	'SYS$LIBRARY:CLIMAC.L32';	! CLI macros
+
+LIBRARY 'SYS$LIBRARY:TPAMAC.L32';	! TPARSE macros
+
+SWITCHES LIST(REQUIRE);			! Print require file
+REQUIRE 'SRC$:CLEDEF.REQ';		! Definitions for this utility
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    start,				! Main routine
+    rms_error,				! RMS general error routine
+    search_error,			! Signal error searching for file
+    do_file,				! Process each input file
+    get_file_name,			! Get file name from filespec
+    call_tparse,			! Call TPARSE
+    set_clitype: NOVALUE,		! Set /cli type
+    handler;				! Signal handler
+
+!
+! Define command line entity name strings
+!
+
+BIND
+    cliqual = $DESCRIPTOR('CLI'),
+    oldfile = $DESCRIPTOR('OLDFILE'),
+    newfile = $DESCRIPTOR('NEWFILE'),
+    delete = $DESCRIPTOR('DELETE'),
+    source = $DESCRIPTOR('SOURCE'),
+    listing = $DESCRIPTOR('LISTING'),
+    object = $DESCRIPTOR('OBJECT'),
+    symbols = $DESCRIPTOR('SYMBOLS');
+
+!
+! OWN storage
+!
+
+LITERAL
+    buffer_size = 512;			! Length of record buffer
+
+GLOBAL
+    worst_error: INITIAL(ss$_normal)	! Worst error encountered
+		BBLOCK[4],
+    module_name: VECTOR [2],		! Module name
+    file_name:	VECTOR [2],		! First input file name
+    clitype:	BYTE,			! CLI type from command or tables
+    foreign_command: BYTE INITIAL(false); ! True if invoked via foreign command
+
+!
+!	Command definition input file
+!
+
+OWN
+    first_input,			! flag to distinguish first input file
+    saved_rsname:			! Saved result file name buffer
+	VECTOR [nam$c_maxrss,BYTE],
+
+    saved_nam:	$NAM(),			! File name block after first input opened
+
+    record_buffer:
+	VECTOR [buffer_size,BYTE],	! Input record buffer
+    input_rsname:			! Input result file name buffer
+	VECTOR [nam$c_maxrss,BYTE],
+    input_exname:			! Input expanded file name buffer
+	VECTOR [nam$c_maxrss,BYTE],
+
+    rel_nam:	$NAM(			! Dummy NAM for stickyness
+		RSA = input_exname),
+    input_nam:	$NAM(			! File name block
+		RSA = input_rsname,	! Result string buffer
+		RSS = nam$c_maxrss,
+		ESA = input_exname,	! Expanded string buffer
+		ESS = nam$c_maxrss,
+		RLF = rel_nam),		! Related NAM block
+    input_xabdat: $XABDAT();		! Date/time block
+GLOBAL
+    input_fab:	$FAB(			! Input file FAB
+		DNA = UPLIT('.CLD'),	! Default file name
+		DNS = 4,
+		FAC = GET,		! Allow only $GET operations
+		NAM = input_nam,	! NAM block
+		XAB = input_xabdat),	! Creation date for listing title
+    input_rab:	$RAB(			! Input file RAB
+		FAB = input_fab,
+		UBF = record_buffer,	! Record buffer
+		USZ = buffer_size);
+!
+!	Previous command language data base file
+!
+OWN
+    oldfil_rsname:
+	VECTOR [nam$c_maxrss,BYTE],	! Result file name buffer
+    oldfil_exname:
+	VECTOR [nam$c_maxrss,BYTE],	! Expanded file name buffer
+    oldfil_nam:	$NAM(
+		ESA = oldfil_exname,	! Expanded string buffer
+		ESS = nam$c_maxrss,
+		RSA = oldfil_rsname,	! Result string buffer
+		RSS = nam$c_maxrss),
+    oldfil_fab:	$FAB(			! New data file FAB
+		DNA = UPLIT('.EXE'),
+		DNS = 4,
+		FAC = (GET,BRO),	! Allow GET's and block I/O
+		SHR = GET,		! Allow others to read file
+		NAM = oldfil_nam),
+    oldfil_rab:	$RAB(			! New data file RAB
+		USZ = 512,		! Size of user read buffer
+		FAB = oldfil_fab),
+!
+!	New command language data base file
+!
+    newfil_rsname:
+	VECTOR [nam$c_maxrss,BYTE],	! Result file name buffer
+    newfil_exname:
+	VECTOR [nam$c_maxrss,BYTE],	! Expanded file name buffer
+    newfil_nam:	$NAM(
+		ESA = newfil_exname,	! Expanded string buffer
+		ESS = nam$c_maxrss,
+		RSA = newfil_rsname,	! Result string buffer
+		RSS = nam$c_maxrss,
+		RLF = oldfil_nam),	! Related NAM block
+    newfil_fab:	$FAB(			! New data file FAB
+		DNA = UPLIT('.EXE'),
+		DNS = 4,
+		FAC = (PUT,BRO),	! Allow PUT's and block I/O
+		FOP = (OFP,CBT),	! Output file parse; contig best try
+		RFM = FIX,		! Fixed length records
+		MRS = 512,		! 512 bytes long
+		NAM = newfil_nam),
+    newfil_rab:	$RAB(			! New data file RAB
+		FAB = newfil_fab),
+!
+!	Listing file
+!
+    listing_rsname:
+	VECTOR [nam$c_maxrss,BYTE],	! Result file name buffer
+    listing_exname:
+	VECTOR [nam$c_maxrss,BYTE],	! Expanded file name buffer
+    listing_nam: $NAM(
+		ESA = listing_exname,	! Expanded string buffer
+		ESS = nam$c_maxrss,
+		RSA = listing_rsname,	! Result string buffer
+		RSS = nam$c_maxrss,
+		RLF = saved_nam);	! Related NAM block
+GLOBAL
+    listing_fab: $FAB(			! Listing file FAB
+		DNA = UPLIT('.LIS'),	! Default file name
+		DNS = 4,
+		NAM = listing_nam,	! Address of NAM block
+		FAC = PUT,		! Allow PUT's only
+		FOP = OFP,		! Output file parse
+		RAT = CR,		! Carriage return format
+		RFM = VAR),		! Variable length records
+    listing_rab: $RAB(			! Listing file RAB
+		FAB = listing_fab,
+		ROP = WBH);		! Overlap I/O if possible
+
+!
+!	Symbol table file
+!
+OWN
+    symbols_rsname:
+	VECTOR [nam$c_maxrss,BYTE],	! Result file name buffer
+    symbols_exname:
+	VECTOR [nam$c_maxrss,BYTE],	! Expanded file name buffer
+    symbols_nam: $NAM(			! Symbol table file NAM
+		ESA = symbols_exname,	! Expanded name string
+		ESS = nam$c_maxrss,
+		RSA = symbols_rsname,	! Result name string
+		RSS = nam$c_maxrss,
+		RLF = saved_nam);
+GLOBAL
+    symbols_fab: $FAB(			! Symbol table file FAB
+		DNA = UPLIT('.STB'),	! Default name string
+		FOP = OFP,		! Output file parse
+		DNS = 4,
+		NAM = symbols_nam),
+    symbols_rab: $RAB(			! Symbol table file RAB
+		FAB = symbols_fab);
+
+
+!
+!	Object module file
+!
+OWN
+    object_rsname:
+	VECTOR [nam$c_maxrss,BYTE],	! Result file name buffer
+    object_exname:
+	VECTOR [nam$c_maxrss,BYTE],	! Expanded file name buffer
+    object_nam: $NAM(			! Object module file NAM
+		ESA = object_exname,	! Expanded name string
+		ESS = nam$c_maxrss,
+		RSA = object_rsname,	! Result name string
+		RSS = nam$c_maxrss,
+		RLF = saved_nam);
+GLOBAL
+    object_fab: $FAB(			! Object module file FAB
+		DNA = UPLIT('.OBJ'),	! Default name string
+		FOP = OFP,		! Output file parse
+		DNS = 4,
+		NAM = object_nam),
+    object_rab: $RAB(			! Object module file RAB
+		FAB = object_fab);
+
+!
+!	Output file generated as a result of /EXTRACT
+!
+GLOBAL
+    output_fab:	$FAB(			! Output file FAB
+		FNM='SYS$OUTPUT:',	! File name
+		RAT = CR,		! Carriage return format
+		RFM = VAR),		! Variable length records
+    output_rab:	$RAB(			! Output file RAB
+		FAB = output_fab);
+
+!
+! External storage
+!
+
+EXTERNAL
+    num_files;				! Number of files parsed
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    create_database,			! Create new command language tables
+    read_database,			! Read command language tables
+    write_database,			! Write command language tables
+    read_current,			! Read current command tables
+    write_current,			! Write current command tables
+    delete_command,			! Delete a specified command
+    parse_file,				! Parse input file
+    output_symbols,			! Output global symbol table file
+    output_object,			! Output object module file
+    cli$present: ADDRESSING_MODE(GENERAL),	! Check if entity is present
+    cli$get_value: ADDRESSING_MODE(GENERAL),	! Get next entity value
+    lib$file_scan: ADDRESSING_MODE(GENERAL),	! Search wildcard sequence
+    lib$tparse: ADDRESSING_MODE(GENERAL),	! Table driven parser
+    sys$cli: ADDRESSING_MODE(GENERAL);		! CLI services
+!
+! TPARSE tables for /CLI qualifier
+!
+$INIT_STATE(cli_states,cli_keys);
+
+$STATE(,
+    ('DCL',tpa$_exit,set_clitype,,,vec_c_dcl),
+    ('MCR',tpa$_exit,set_clitype,,,vec_c_mcr));
+
+ROUTINE start =
+
+!---
+!
+!	This is the main routine of the command language editor.
+!	It obtains the command parameters and qualifiers, opens
+!	the appropriate files and calls the parser to accept the
+!	command definition language.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	Worst status encountered
+!---
+
+BEGIN
+
+BUILTIN FP;
+
+LOCAL
+    desc:	BBLOCK [dsc$c_d_bln],	! String descriptor
+    req_desc:	BBLOCK [cli$c_reqdesc],	! Request descriptor block
+    save_clitype,
+    status;
+
+!
+!	Set signal handler
+!
+
+.fp = handler;				! Enable condition handler
+
+desc [dsc$b_class] = dsc$k_class_d;	! Set to dynamic string
+desc [dsc$a_pointer] = 0;		! Clear any existing string
+
+!
+! If we are invoked via a foreign command (i.e. CLE := $CLEDITOR),
+! then attempt to extract the filespec off the command line so that
+! the user can boot up without having to have the SET command.
+!
+
+CH$FILL(0, cli$c_reqdesc, req_desc);	! Zero request descriptor block
+req_desc [cli$b_rqtype] = cli$k_getcmd;	! Set request type
+IF SYS$CLI(req_desc)			! Get verb type
+    AND (.req_desc [cli$b_rqstat] EQL cli$k_verb_fore	! If foreign verb,
+	OR .req_desc [cli$b_rqstat] EQL cli$k_verb_mcr)	! or MCR command,
+THEN
+    BEGIN
+    input_fab [fab$b_fns] = .req_desc [cli$w_rqsize];	! Copy into FNM
+    input_fab [fab$l_fna] = .req_desc [cli$a_rqaddr];
+
+    IF .input_fab [fab$b_fns] NEQ 0	! If nonblank,
+	AND $PARSE(FAB = input_fab)	! and if its a valid filespec
+    THEN
+	BEGIN
+	foreign_command = true;		! Mark we are in foreign command
+	IF NOT read_current()		! Use current command tables
+	THEN
+	    RETURN .worst_error;	! if error, exit
+	lib$file_scan(input_fab,	! Search all wildcard files
+		do_file,		! calling here if file is found
+		search_error);		! calling here if error occurs
+	IF .worst_error			! If no errors so far,
+	THEN
+	    write_current();		! then modify current tables
+	RETURN .worst_error;		! and exit without further ado
+	END;
+    END;
+
+!
+! Get the /CLI qualifier value
+!
+IF cli$present(cliqual)
+THEN
+    BEGIN
+    IF cli$get_value(cliqual,desc)
+	THEN IF NOT call_tparse(desc,cli_states,cli_keys)
+	    THEN SIGNAL(emsg(badvalue),1,desc);
+    END;
+
+save_clitype = .clitype;
+!
+!	Open the input data base file
+!
+
+IF NOT cli$present(oldfile)		! If no input tables,
+    OR cli$present(object)		! or if object module output desired,
+THEN
+    BEGIN
+    IF NOT create_database()		! Create new command tables
+    THEN
+	RETURN .worst_error;		! if error, exit
+    END
+ELSE
+IF NOT cli$get_value(oldfile,desc)	! If no value on input tables,
+THEN
+    BEGIN
+    IF NOT read_current()		! Use current command tables
+    THEN
+	RETURN .worst_error;		! if error, exit
+    IF cli$present(cliqual)		! If /cli specified
+	AND .clitype NEQ .save_clitype	!  and it differs from found in tables
+    THEN
+	RETURN (SIGNAL(emsg(cliqual)); .worst_error);
+    END
+ELSE
+    BEGIN
+    oldfil_fab [fab$b_fns] = .desc [dsc$w_length];	! Copy into FNM
+    oldfil_fab [fab$l_fna] = .desc [dsc$a_pointer];
+    IF NOT read_database(oldfil_rab)	! Read data base into memory
+    THEN
+	RETURN .worst_error;		! then exit immediately
+    IF cli$present(cliqual)		! If /cli specified
+	AND .clitype NEQ .save_clitype	!  and it differs from found in tables
+    THEN
+	RETURN (SIGNAL(emsg(cliqual)); .worst_error);
+    END;
+
+!
+!	If /DELETE specified, then attempt to delete the specified
+!	verb(s).
+!
+
+IF cli$present(delete)			! If verb deletion requested,
+THEN
+    BEGIN
+    WHILE cli$get_value(delete,desc)	! While more verbs listed to delete,
+    DO
+        delete_command(desc);		! Attempt to delete the verb,
+    END;
+
+!
+!	If input command definitions are to be processed, use
+!	output_fab for SYS$OUTPUT to report errors from input parsing.
+!
+
+IF cli$present(source)			! If input files to be processed,
+THEN
+    BEGIN
+    status = $CREATE(FAB = output_fab);	! Open SYS$OUTPUT
+    IF NOT .status THEN rms_error(emsg(openout),output_fab);
+    status = $CONNECT(RAB = output_rab);
+    IF NOT .status THEN rms_error(emsg(openout),output_fab,output_rab);
+    END;
+
+!
+!	Process each file in the input list
+!
+
+first_input = true;			! Flag to save first input file NAM
+WHILE cli$get_value(source,desc)	! For each input file,
+DO
+    BEGIN
+    input_fab [fab$b_fns] = .desc [dsc$w_length];	! Copy into FNM
+    input_fab [fab$l_fna] = .desc [dsc$a_pointer];
+    lib$file_scan(input_fab,		! Search all wildcard files
+		do_file,		! calling here if file is found
+		search_error);		! calling here if error occurs
+    END;
+
+!
+!	Output a global symbol table file
+!
+
+IF cli$present(symbols)			! If symbol table requested,
+    AND .worst_error			! and no errors so far,
+THEN
+    BEGIN
+    cli$get_value(symbols,desc);	! Get object module filespec
+    symbols_fab [fab$b_fns] = .desc [dsc$w_length];	! Copy into FNM
+    symbols_fab [fab$l_fna] = .desc [dsc$a_pointer];
+    output_symbols();			! Output symbol table file
+    END;
+
+!
+!	Output an object module file containing the resultant command tables.
+!
+
+IF cli$present(object)			! If object module requested,
+    AND .worst_error			! and no errors so far,
+THEN
+    BEGIN
+    cli$get_value(object,desc);		! Get object module filespec
+    object_fab [fab$b_fns] = .desc [dsc$w_length];	! Copy into FNM
+    object_fab [fab$l_fna] = .desc [dsc$a_pointer];
+    output_object();			! Output object module file
+    END;
+
+!
+!	Generate the new command data base file
+!	(This cli$present call must be the last cli interface call because
+!	the tables may no longer be the same).
+!
+
+IF cli$present(newfile) 		! If generating output tables,
+    AND NOT cli$present(object)		! and if no object module output desired,
+THEN
+IF NOT cli$get_value(newfile,desc)	! If output tables has no value,
+THEN
+    BEGIN
+    IF NOT cli$present(oldfile)		! If no tables were given as input,
+	AND NOT cli$present(source)	! and no .CLDs were input
+    THEN
+	SIGNAL(emsg(noinptab))		! signal not possible at the moment
+    ELSE IF .worst_error		! If no errors so far,
+    THEN
+	write_current();		! then modify current tables
+    END
+ELSE
+    BEGIN
+
+    LOCAL
+	desc2:	BBLOCK [dsc$c_d_bln];	! String descriptor
+
+    desc2 [dsc$b_class] = dsc$k_class_d;	! Set to dynamic string
+    desc2 [dsc$a_pointer] = 0;		! Clear any existing string
+    newfil_fab [fab$b_fns] = .desc [dsc$w_length];	! Copy into FNM
+    newfil_fab [fab$l_fna] = .desc [dsc$a_pointer];
+    IF NOT cli$present(oldfile)		! If no tables were given as input,
+	OR NOT cli$get_value(oldfile,desc2)
+    THEN
+	SIGNAL(emsg(noinptab))		! signal not possible at the moment
+    ELSE
+        IF .worst_error			! If no errors so far,
+        THEN
+	    write_database(oldfil_rab,newfil_rab); ! Output new data base
+    END;
+
+RETURN .worst_error;			! Return worst error encountered
+
+END;
+
+ROUTINE do_file =
+
+!---
+!
+!	This routine is called once for each file specified
+!	in the input file list.
+!
+! Inputs:
+!
+!	input_fab = Input FAB
+!	input_rab = Input RAB
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+LOCAL
+    status,parse_status;		! Status codes
+
+status = $OPEN (FAB = input_fab);	! Open the input file
+IF NOT .status				! If error found,
+THEN
+    BEGIN
+    rms_error (emsg(openin), input_fab); ! then signal the error
+    RETURN .status;
+    END;
+
+status = $CONNECT (RAB = input_rab);	! and connect the input stream
+IF NOT .status				! If error found,
+THEN
+    BEGIN
+    rms_error (emsg(openin), input_fab, input_rab); ! then signal the error
+    RETURN .status;
+    END;
+
+IF .first_input
+THEN
+    BEGIN
+
+    first_input = false;
+
+    !
+    !	Get the file name from the input file specification
+    !	in case we have to default the module name.
+    !
+    get_file_name(input_fab,file_name);	! Save input file name
+
+    !
+    !   Make saved_nam a copy of input_nam, including the resultant
+    !   file name.
+    !
+    CH$MOVE (nam$c_bln, input_nam, saved_nam);
+    CH$MOVE (nam$c_maxrss, input_rsname, saved_rsname);
+    saved_nam [nam$l_rsa] = saved_rsname;
+
+    END;
+
+!
+!	If the listing file has not yet been opened, open
+!	it now.  This is done after the input file open so
+!	that the name will be sticky with the input file name.
+!
+
+IF NOT .foreign_command			! If not invoked via foreign command,
+    AND CLI$PRESENT(listing)		! and if listing requested,
+    AND .listing_fab [fab$w_ifi] EQL 0	! and not already opened
+THEN
+    BEGIN
+    LOCAL desc: BBLOCK [dsc$c_d_bln];
+    desc [dsc$b_class] = dsc$k_class_d;		! Set to dynamic descriptor
+    desc [dsc$a_pointer] = 0;
+    CLI$GET_VALUE(listing,desc);		! Get listing filespec
+    listing_fab [fab$b_fns] = .desc [dsc$w_length];	! Copy into FNM
+    listing_fab [fab$l_fna] = .desc [dsc$a_pointer];
+    status = $CREATE (FAB = listing_fab);	! Create the listing file
+    IF NOT .status THEN rms_error (emsg(openout),listing_fab);
+    status = $CONNECT (RAB = listing_rab);
+    IF NOT .status THEN rms_error (emsg(openout),listing_fab,listing_rab);
+    END;
+
+parse_status = parse_file();		! Parse the input file
+
+status = $CLOSE (FAB = input_fab);	! Close the input file
+IF NOT .status				! If error found,
+THEN
+    rms_error (emsg(closedel), input_fab); ! then signal the error
+
+RETURN .parse_status;			! Return with parse status
+
+END;
+
+GLOBAL ROUTINE rms_error (message, fab_block, rab_block) =
+
+!---
+!
+!	This routine issues a multi-line error associated
+!	with an RMS operation.  The first parameter is the
+!	first message to be issued.  The second and third
+!	parameter is the address of the FAB and/or the RAB block
+!	which contains the error codes and the file name.
+!	If the third parameter is present, the RAB is assumed
+!	to contain the error status.
+!
+! Inputs:
+!
+!	message = First message code to be output
+!	fab_block = Address of FAB block
+!	rab_block = Address of RAB block
+!
+! Outputs:
+!
+!	The message is signaled.
+!---
+
+BEGIN
+
+BUILTIN
+    NULLPARAMETER;			! True if parameter unspecified
+
+MAP
+    fab_block:	REF BBLOCK,		! Define FAB structure
+    rab_block:	REF BBLOCK;		! Define RAB structure
+
+LOCAL
+    nam_block:	REF BBLOCK,		! Define NAM structure
+    desc:	VECTOR[2];		! Temp. string descriptor
+
+nam_block = .fab_block [fab$l_nam];	! Get address of NAM block
+IF .nam_block EQL 0			! If no NAM block present,
+THEN
+    BEGIN
+    desc [0] = .fab_block [fab$b_fns];	! then use original file string
+    desc [1] = .fab_block [fab$l_fna];
+    END
+ELSE IF .nam_block [nam$b_rsl] NEQ 0	! If result string nonblank,
+THEN
+    BEGIN
+    desc [0] = .nam_block [nam$b_rsl];	! then use it
+    desc [1] = .nam_block [nam$l_rsa];
+    END
+ELSE IF .nam_block [nam$b_esl] NEQ 0	! If expanded string nonblank,
+THEN
+    BEGIN
+    desc [0] = .nam_block [nam$b_esl];	! then use it
+    desc [1] = .nam_block [nam$l_esa];
+    END
+ELSE
+    BEGIN
+    desc [0] = .fab_block [fab$b_fns];	! Else, use original file string
+    desc [1] = .fab_block [fab$l_fna];
+    END;
+
+IF NOT NULLPARAMETER(3)			! If RAB argument specified,
+THEN
+    SIGNAL(.message,1,desc,		! Signal error
+		.rab_block [rab$l_sts],	! with RMS error code from RAB
+		.rab_block [rab$l_stv])	! and secondary code
+ELSE
+    SIGNAL(.message,1,desc,		! Signal error
+		.fab_block [fab$l_sts],	! with RMS error code from FAB
+		.fab_block [fab$l_stv]);! and secondary code
+
+RETURN true;
+
+END;
+
+ROUTINE search_error (fab) =
+
+!---
+!
+!	Signal an error searching for an input file.
+!
+! Inputs:
+!
+!	fab = Address of FAB used during searching
+!
+! Outputs:
+!
+!	None
+!---
+
+rms_error (emsg(searchfail),.fab);
+
+GLOBAL ROUTINE get_file_name (fab, file_name) =
+
+!---
+!
+!	This routine figures out the file name portion
+!	of a given file specification.
+!
+! Inputs:
+!
+!	fab = Address of FAB for file (NAM block assumed)
+!	file_name = Place to store descriptor of file name
+!
+! Outputs:
+!
+!	file_name = Descriptor of module name string
+!	r0 = status (unsignaled)
+!---
+
+BEGIN
+
+MAP
+    fab:	REF BBLOCK,		! Address of FAB block
+    file_name:	REF VECTOR;		! Address of file name descriptor
+
+LOCAL
+    nam:	REF BBLOCK;		! Address of NAM block
+
+nam = .fab [fab$l_nam];			! Get NAM address
+file_name [0] = .nam [nam$b_name];	! Get name length
+file_name [1] = .nam [nam$l_name];	! Get name address
+
+RETURN true;
+
+END;
+
+ROUTINE call_tparse(string,states,keys) =
+BEGIN
+!
+! This routine calls tparse given the string, states and keys
+!
+! Inputs:
+!
+!	string		address of string descriptor for string to parse
+!	states		address of tparse states table
+!	keys		address of tparse keys table
+!
+MAP
+    string : REF BBLOCK;
+
+LOCAL
+    tpablock : BBLOCK[tpa$k_length0];
+
+!
+! Initialize the tparse block
+!
+CH$FILL(0,tpa$k_length0,tpablock);
+tpablock[tpa$l_count] = tpa$k_count0;
+tpablock[tpa$l_options] = tpa$m_abbrev;
+tpablock[tpa$l_stringcnt] = .string[dsc$w_length];
+tpablock[tpa$l_stringptr] = .string[dsc$a_pointer];
+
+RETURN lib$tparse(tpablock,.states,.keys)
+
+END;
+
+ROUTINE set_clitype: NOVALUE =
+
+!---
+!
+!	This routine sets the cli type from the /CLI qualifier
+!
+! Inputs:
+!
+!	AP points to the tparse block
+!
+! Outputs:
+!
+!	cell clitype contains the cli type
+!---
+
+BEGIN
+
+BUILTIN AP;
+MAP
+    AP : REF BBLOCK;
+
+clitype = .AP [tpa$l_param];
+RETURN;
+END;
+
+ROUTINE handler (signal_args, mechanism_args) =
+
+!---
+!
+!	This condition handler gets control on any signalled
+!	condition in order to save the highest severity error
+!	to be returned by exit from the image.
+!
+! Inputs:
+!
+!	signal_args = Address of signal argument list
+!	mechanism_args = Address of mechanism argument list
+!
+! Outputs:
+!
+!	worst_error is updated with highest severity error.
+!
+!---
+
+BEGIN
+
+MAP
+    signal_args: REF BBLOCK,			! Address of signal arg list
+    mechanism_args: REF BBLOCK;			! Address of mechanism arg list
+
+LOCAL
+    code: BBLOCK [LONG];			! Condition code (longword)
+
+code = .signal_args [chf$l_sig_name];		! Get condition code
+
+IF .code ^ -16 EQL 3				! &&& If "no such entity",
+THEN
+    RETURN ss$_continue;			! &&& Return to caller of CLINT
+
+IF .code [sts$v_severity] GTR .worst_error [sts$v_severity]
+THEN
+    worst_error = .code OR sts$m_inhib_msg;	! Set new worst error
+
+ss$_resignal					! Continue signalling
+
+END;
+
+
+END
+ELUDOM

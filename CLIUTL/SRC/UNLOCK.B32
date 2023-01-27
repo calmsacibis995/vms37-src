@@ -1,0 +1,830 @@
+MODULE unlock ( IDENT = 'V03-000', 
+		ADDRESSING_MODE (EXTERNAL = GENERAL),
+		MAIN = unlock) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  UNLOCK Command
+!
+! ABSTRACT:
+!
+!	This utility unlocks files and directories.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. unprivileged user mode,
+!
+! AUTHOR:  Greg Robert, Nov 1979
+!
+!
+! Modified by:
+!
+!	V02-005	MLJ0066		Martin L. Jack,	29-Dec-1981  12:56
+!		Integrate new LIB$UNLOCK_FILE (formerly LIB$UNLOCK).
+!
+!	V204	GRR2004		G. R. Robert		17-Nov-1981
+!		Fixed messages to display full filespecs with passwords
+!		suppressed on errors and logging.
+!
+!	V203	GRR2003		G. R. Robert		16-Nov-1981
+!		Made all external references addressing mode general.
+!
+!	V202	GRR2002		G. R. Robert		14-Sep-1981
+!		Fixed improper descriptor initialization in confirm_action
+!		by making them OWN instead of LOCAL.
+!
+!	V201	GRR2001		G. R. Robert		12-JUN-1981
+!		Made UNLOCKDEF.REQ a permanent part of this file
+!		to clean up the master disk.
+!
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET.L32';	! VAX/VMS common definitions
+
+LIBRARY	'SYS$LIBRARY:CLIMAC.L32';	! CLI macros
+
+!
+! Common definitions for the UNLOCK command
+!
+
+!
+!	DEFINE VMS BLOCK STRUCTURES
+!
+
+STRUCTURE
+	BBLOCK [O, P, S, E; N] =
+		[N]
+		(BBLOCK+O)<P,S,E>;
+
+MACRO
+!
+! A) Macro to describe a string
+! B) Macro to generate a quadword string descriptor
+! C) Macro to generate the address of a string descriptor
+
+    PRIMDESC (str) = %CHARCOUNT (str), UPLIT (%ASCII str)%,
+    INITDESC (str) = BBLOCK [DSC$C_S_BLN] INITIAL (PRIMDESC (str))%,
+    ADDRDESC (str) = UPLIT (PRIMDESC (str))%,
+
+!
+!	Macro to signal a condition to the handler
+!
+
+    write_message(msg) =
+	SIGNAL(msg			! Pass the message code
+	%IF %LENGTH GTR 1		! and if more than 1 arg
+	    %THEN ,%REMAINING %FI) %,	! then the rest too
+
+!
+! $SHR_MESSAGES - a macro which defines facility-specific message codes
+!	which are based on the system-wide shared message codes.
+!
+!	$SHR_MESSAGES( name, code, (msg,severity), ... )
+!
+!	where:
+!	    "name" is the name of the facility (e.g., COPY)
+!	    "code" is the corresponding facility code (e.g., 103)
+!	    "msg" is the name of the shared message (e.g., BEGIN)
+!	    "severity" is the desired message severity (e.g., 1, 0, 2)
+!
+
+    $SHR_MESSAGES( FACILITY_NAME, FACILITY_CODE ) =
+	LITERAL
+	SHR$MSG_IDS( FACILITY_NAME, FACILITY_CODE, %REMAINING ); %,
+
+    SHR$MSG_IDS( FACILITY_NAME, FACILITY_CODE) [ VALUE ] =
+	SHR$MSG_CALC( FACILITY_NAME, FACILITY_CODE, %REMOVE(VALUE) ) %,
+
+    SHR$MSG_CALC( FACILITY_NAME, FACILITY_CODE, MSG_ID, SEVERITY ) =
+	%NAME(FACILITY_NAME,'$_',MSG_ID) = %NAME('SHR$_',MSG_ID) + FACILITY_CODE*65536 +
+	    %IF %DECLARED(%NAME('STS$K_',SEVERITY))
+		%THEN %NAME('STS$K_',SEVERITY)
+		%ELSE SEVERITY %FI %;
+
+!
+!	Define message codes.
+!
+
+$shr_messages(msg,146,
+	(notlocked,info),	! File not locked in the first place
+	(unlocked,info),	! File unlocked
+	(searchfail,error),	! Could not find file
+	);
+
+!
+!	EQUATED SYMBOLS
+!
+
+LITERAL
+    TRUE	= 1,			! BOOLEAN TRUE
+    FALSE	= 0,			! BOOLEAN FALSE
+    OK		= 1,			! SUCCESS RETURN CODE
+    ERROR	= 2;			! ERROR RETURN CODE
+
+
+
+!
+!	Define CLI qualifier bit flag numbers (see unlock$flags)
+!
+
+LITERAL
+    $EQULST (QUAL_,,0,1,
+	(log,),			! /LOG
+	(confirm,));		! /CONFIRM
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    unlock,				! Main unlock routine
+    unlock_action,			! Called for each unlock action
+    get_output_file,			! Get next output file
+    confirm_action,			! Interrogate user
+    log_results,			! Inform user of results
+    get_unlockqls,			! Get command qualifiers
+    handler,				! Condition handler
+    search_error,			! LIB$FILE_SCAN error handler
+    cli_error;				! Handler for CLI errors
+
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    sys$fao,			! Expands Formatted ascii messages
+    lib$get_command,		! Talk to SYS$COMMAND
+    lib$file_scan,		! Implements wildcarding and stickiness
+    lib$unlock_file;		! Unlocks files
+
+
+!
+! Storage definitions
+!
+
+OWN
+    unlock$cli_util,			! Address of CLI service rout.
+    unlock$flags	: BITVECTOR[32]	! General DCL flagword
+	INITIAL(0),			! Initially none present
+    qualifier$flags	: BITVECTOR[32] ! Qualifier presence bitmap
+	INITIAL(0),			! Initially clear
+    unlock$cli_work:
+	VECTOR [cli$c_workarea,BYTE],	! CLI work area
+    worst_error: BBLOCK[4]		! Worst error encountered
+		INITIAL(ss$_normal);	! Initially normal status
+
+!
+! Define RMS blocks
+!
+
+OWN
+
+    output_nam_result:			! Resultant output name
+		VECTOR [nam$c_maxrss,BYTE],
+
+    output_nam_expanded:		! Expanded output name
+		VECTOR [nam$c_maxrss,BYTE],
+
+    output_rlf:	$NAM(			! Related file name block
+	),
+
+    output_nam:	$NAM(			! File name block
+	RLF = output_rlf,		! Related file name
+	ESA = output_nam_expanded,	! File name before open
+	ESS = nam$c_maxrss,
+	RSA = output_nam_result,	! File name after open
+	RSS = nam$c_maxrss),
+
+    output_fab:	$FAB(			! FAB for output
+	NAM = output_nam);		! Address of name block
+
+!
+!	Define CLI qualifier flags (see qualifier$flags)
+!
+
+$CLIQUALCODES (unlock,
+		confirm,
+		log);
+
+!
+! Command qualifier descriptor list
+!
+
+OWN
+
+    confirm_desc:
+	$CLIQUALDESC(QDCODE = confirm,
+		     SETLST = qual_confirm),
+
+    log_desc:
+	$CLIQUALDESC(QDCODE = log,
+		     SETLST = qual_log),
+
+    end_qual_desc:
+	$CLIQUALEND;
+
+!
+! CLI control blocks and work areas
+!
+
+
+OWN
+    initial_desc:			! CLI initialization descriptor
+	$CLIREQDESC(RQTYPE = initprs,
+		    RQFLGS = absadr,
+		    ERRACT = cli_error),
+
+    qual_desc:				! Parse all command qualifiers
+	$CLIREQDESC(RQTYPE = getqual,
+		    RQFLGS = absadr,
+		    ERRACT = cli_error,
+		    QUALST = confirm_desc),
+
+    output_desc:			! Get primary output file
+	$CLIREQDESC(RQTYPE = input1,
+		    RQFLGS = absadr,
+		    ERRACT = cli_error),
+
+    cleanup_desc:			! CLI cleanup request
+	$CLIREQDESC(RQTYPE = endprm1,
+		    RQFLGS = absadr,
+		    ERRACT = cli_error);
+
+ROUTINE unlock =			! unlock Main routine
+
+!++
+! Functional description
+!
+!	This is the main control routine for the unlock command.
+!	It is called from the command language interpreter to 
+!	unlock files and directories.
+!
+! Calling sequence
+!
+!	unlock() from the Command Language Interpreter
+!
+! Input parameters
+!
+!	AP = Address of argument list passed from CLI
+!
+! Output parameters
+!
+!	None
+!
+! Routine value
+!
+!	Worst error encountered during processing or SS$_NORMAL.
+!
+!----
+
+BEGIN
+
+LOCAL
+    status;				! Status return
+
+BUILTIN
+    AP,					! Define register AP
+    FP;					! Define register FP
+
+BIND cli_params = AP: REF BBLOCK;	! Define parameter block
+
+!
+!	Declare signal handler in order to record the most severe
+!	error message issued, to be returned on exit of image.
+!
+.fp = handler;				! Set condition handler
+!
+!	Save the address of the CLI call-back service routine
+!
+unlock$cli_util = .cli_params[cli$a_utilserv];
+
+!
+!	Parse command qualifiers
+!
+
+get_unlockqls();			! Get command qualifiers
+
+!
+!	Initialize for file processing loop
+!
+
+output_desc[cli$v_concatinp] = true;	! Initialize get_file routine
+!
+! Begin the main loop of the program
+! Process each file in the input list
+!
+
+WHILE get_output_file () DO		! For each output file
+    BEGIN
+	!
+	! Call lib$file_scan to handle wildcarding and stickiness
+	! lib$file_scan will call unlock_action for each successful
+	! file match and search_error for any failures
+	!
+
+	lib$file_scan (			! Call file scanner with
+		output_fab,		!  -fab address
+		unlock_action,		!  -success routine
+		search_error)		!  -error routine
+    END;				! End of WHILE domain
+
+
+RETURN .worst_error;
+
+END;
+
+ROUTINE unlock_action (fab)  =
+
+!----
+!
+! Functional description
+!
+!	This routine is called from lib$file_scan whenever
+!	a successsful file match occurs
+!
+! Input parameters
+!
+!	fab = Address of block describing the file
+!	fab$l_nam = pointer to name block
+!
+! Output parameters
+!
+!	None
+!
+!----
+
+BEGIN
+
+MAP fab: REF BBLOCK;			! Define fab block format
+BIND nam = .fab[fab$l_nam]: BBLOCK;	! Define name block
+
+LOCAL desc: VECTOR[2];			! Temporary string descriptor
+LOCAL status;				! Receives status
+
+!
+! If /CONFIRM was set by the user then interrogate him to see if 
+! this file is to be unlocked
+!
+
+IF (.qualifier$flags[qual_confirm])	! If confirmation requested
+THEN
+	IF NOT (confirm_action (	! Call confirmation rout. with
+		.fab))			!  -address of fab
+	   THEN return(false);		! If not confirmed then exit
+
+!
+! Now load the local descriptor with the file name size and address
+! from the nam block
+!
+
+desc[0] = .nam[nam$b_rsl];		! Resultant file name size
+desc[1] = .nam[nam$l_rsa];		! Resultant file name address
+
+IF .nam [nam$b_rsl] EQL 0		! If the resultant name is null
+THEN BEGIN				! then use the expanded name:
+     desc [0] = .nam[nam$b_esl];	!    expanded file name size
+     desc [1] = .nam[nam$l_esa];	!    expanded file name address
+     END;
+
+
+!
+! Call LIB$UNLOCK_FILE to unlock the file
+!
+
+IF NOT (status = lib$unlock_file(desc))	! Call unlock with file name
+THEN
+	BEGIN
+	write_message(.status);		! Inform the user
+	return(.status);		! Return to caller
+	END;
+
+!
+! Check to see if unlock worked.  SS$_WASSET indicates the file
+! was unlocked.  SS$_WASCLR indicates the file was already unlocked
+! and no other error occurred
+!
+
+IF (.status EQL SS$_WASCLR)		! If file not locked
+    THEN
+	write_message(			! Tell the user
+		msg$_notlocked,		!   that the file wasn't locked
+		1,			!   (one FAO arguement),
+		desc)			!   and name the file
+    ELSE					! File was unlocked
+	IF (.qualifier$flags[qual_log])		! If logging requested
+	THEN log_results (.fab);		!  then call the logger
+
+RETURN(true);					! Both returns above
+						!   are ok!
+
+END;
+
+ROUTINE get_output_file =
+
+!----
+! Functional Description
+!
+!	Obtain the next file specification from the output file
+!	list and perform the initial parsing to ensure legality.
+!
+! output Parameters
+!
+!	unlock$cli_util = Address of CLI call-back routine
+!
+! Output Parameters
+!
+!	output_fab = FAB initialized for current file name
+!	output_nam = NAM block associated with FAB
+!
+!----
+
+BEGIN
+
+!
+!	If the output file list is depleted, then call back
+!	CLI to perform cleanups and exit without filename.
+!
+
+IF NOT .output_desc[cli$v_concatinp]
+THEN
+    BEGIN
+    (.unlock$cli_util)(cleanup_desc,
+		    unlock$cli_work,
+		    unlock$flags);
+    RETURN false;
+    END;
+
+!
+!	Get the next output file from CLI
+!
+
+(.unlock$cli_util)(output_desc,
+		unlock$cli_work,
+		unlock$flags);
+
+!
+!	Initialize the FAB for initial parsing
+!
+
+output_fab[fab$l_fna] = .output_desc[cli$a_rqaddr];
+output_fab[fab$b_fns] = .output_desc[cli$w_rqsize];
+
+RETURN true;
+
+END;
+
+ROUTINE confirm_action (fab) =
+
+!----
+!
+! Functional description
+!
+!	This routine is called from the main loop whenever
+!	confirmation is requested.
+!
+! Input parameters
+!
+!	fab = Address of block describing the file
+!	fab$l_nam = pointer to name block
+!
+! Output parameters
+!
+!		TRUE	--> Action should be taken
+!		FALSE	--> Action should be cancelled
+!
+!
+!----
+
+BEGIN
+
+MAP fab: REF BBLOCK;			! Define fab block format
+BIND nam = .fab[fab$l_nam]: BBLOCK;	! Define name block
+
+OWN
+    file_desc:	BBLOCK[dsc$c_s_bln],	! file_descriptor for file name
+    fao_desc:	BBLOCK[dsc$c_s_bln],	! FAO work area descriptor
+    reply_desc:	BBLOCK[dsc$c_s_bln]	! Buffer desc. for reply
+		INITIAL (
+		WORD (0),		!  -size = 0
+		BYTE (dsc$k_dtype_t),	!  -arguement type = ascii
+		BYTE (dsc$k_class_d),	!  -class = dynamic
+		LONG (0));		!  -pointer = 0
+LOCAL
+    status:	BLOCK[1],		! Recieves status
+    length : 	WORD,			! Length of resultant message
+    char,				! Character work area
+    fao_buffer:	VECTOR[512,BYTE];	! FAO work area
+
+
+!
+! Initialize descriptors with:
+!	1) file name	-->	file_desc
+!	2) FAO buffer	-->	fao_desc
+!
+
+file_desc[dsc$w_length] = .nam[nam$b_rsl];	! Resultant file name length
+file_desc[dsc$a_pointer] = .nam[nam$l_rsa];	! Resultant file name address
+
+IF .nam[nam$b_rsl] EQL 0			! If no resultant name
+THEN BEGIN					! then use expanded name:
+     file_desc[dsc$w_length] = .nam[nam$b_esl];	!    expanded file name length
+     file_desc[dsc$a_pointer] = .nam[nam$l_esa];!    expanded file name address
+     END;
+
+fao_desc[dsc$w_length] = 512;			! FAO work area size
+fao_desc[dsc$a_pointer] = fao_buffer;		! FAO work area address
+
+
+!
+! Now call SYS$FAO to expand message
+!
+
+IF NOT (status = SYS$FAO (		! Call system service with
+					!  -messages desc. address
+		addrdesc('!AS, unlock? (Y or N): '),
+		length,			!  -place to put result length
+		fao_desc,		!  -descriptor of a work area
+		file_desc))		!  -one FAO arguement
+   THEN
+	BEGIN
+	write_message (.status);	! Tell the user
+	return (.status);		! Return to the caller
+	END;
+
+!
+! Now question user by calling LIB$GET_COMMAND using the result
+! of the FAO call as a prompt string
+!
+
+fao_desc[dsc$w_length] = .length;	! Move in prompt string size
+
+IF NOT (status = LIB$GET_COMMAND (	! Call library routine with
+		reply_desc,		!  -reply buffer desc. addr.
+		fao_desc))		!  -prompt string desc. addr.
+   THEN
+	BEGIN
+	IF (.status EQL rms$_eof)	! If this was end of file then
+	THEN status[sts$v_severity] =	!  make it a severe (i.e. non-
+		sts$k_severe;		!  returnable) error
+	write_message (.status);	! Tell the user
+	return (.status);		! Return to the caller
+	END;
+
+!
+! Now retrieve one charater from the buffer and set the return 
+! status depending on its value
+!
+
+IF (.reply_desc[dsc$w_length] EQL 0)	! Did user hit <CR>?
+THEN return (false);			! Yes, return false
+
+char = CH$RCHAR (CH$PTR (.reply_desc[dsc$a_pointer]));
+
+IF (.char EQL 'Y' OR			! If user responded 'Y'
+    .char EQL 'y' OR			!    or 'y'
+    .char EQL 'T' OR			!    or 'T' (TRUE)
+    .char EQL 't')			!    or 't'
+THEN return (true)			! Return 'TAKE ACTION'
+ELSE return (false);			! Return 'CANCEL ACTION'
+
+END;
+
+ROUTINE log_results (fab)  =
+
+!----
+!
+! Functional description
+!
+!	This routine is called from the main loop whenever
+!	logging is requested
+!
+! Input parameters
+!
+!	fab = Address of block describing the file
+!	fab$l_nam = pointer to name block
+!
+! Output parameters
+!
+!	None
+!
+!----
+
+BEGIN
+
+MAP fab: REF BBLOCK;			! Define fab block format
+BIND nam = .fab[fab$l_nam]: BBLOCK;	! Define name block
+
+LOCAL desc: VECTOR[2];			! Temporary string descriptor
+
+IF .nam[nam$b_rsl] NEQ 0		! IF result string nonblank,
+THEN BEGIN
+    desc[0] = .nam[nam$b_rsl];		! then display it
+    desc[1] = .nam[nam$l_rsa];
+    END
+ELSE IF .nam[nam$b_esl] NEQ 0		! Or if expanded name nonblank
+THEN BEGIN
+    desc[0] = .nam[nam$b_esl];		! then display it
+    desc[1] = .nam[nam$l_esa];
+    END
+ELSE BEGIN
+    desc[0] = .fab[fab$b_fns];		! Otherwise, use original
+    desc[1] = .fab[fab$l_fna];		! name string in FAB
+    END;
+
+write_message(msg$_unlocked,		! Inform the user
+		1,			! With one arguement
+		desc);			! Which is the file name
+
+RETURN (true);
+
+END;
+
+ROUTINE get_unlockqls  =
+
+!----
+!
+! Functional description
+!
+!	This routine calls CLI to obtain the command line and
+!	then all command qualifiers.
+!
+! Input parameters
+!
+!	None
+!
+! Output parameters
+!
+!	qualifier$flags	= Bitmap indicating which qualifiers are present
+!
+!----
+
+BEGIN
+
+!
+!	Initialize CLI for result parsing
+!
+
+(.unlock$cli_util)(initial_desc,	! Initialize the CLI
+	unlock$cli_work,
+	qualifier$flags);
+
+!
+!	Parse the command qualifiers
+!
+
+(.unlock$cli_util)(qual_desc,		! Parse qualifiers
+	 unlock$cli_work,		! with a work area, and
+	 qualifier$flags);		! the address of a bitmap
+
+return true;
+END;
+
+ROUTINE handler (signal_args, mechanism_args) =
+
+!---
+!
+!	This condition handler gets control on any signalled
+!	condition in order to save the highest severity error
+!	to be returned by exit from the image.
+!
+! Inputs:
+!
+!	signal_args = Address of signal argument list
+!	mechanism_args = Address of mechanism argument list
+!
+! Outputs:
+!
+!	worst_error is updated with highest severity error.
+!
+!---
+
+BEGIN
+
+MAP
+    signal_args: REF BBLOCK,			! Adr of signal arg list
+    mechanism_args: REF BBLOCK;			! Adr of mech. arg list
+
+LOCAL
+    code: BBLOCK [LONG];			! Condition code (longword)
+
+code = .signal_args [chf$l_sig_name];		! Get condition code
+
+IF .code [sts$v_severity] GTR .worst_error [sts$v_severity]
+THEN
+    worst_error = .code OR sts$m_inhib_msg;	! Set new worst error
+
+ss$_resignal					! Continue signalling
+
+END;
+
+ROUTINE search_error (fab)  =
+
+!----
+!
+! Functional description
+!
+!	This routine is called from RMS whenever an error
+!	occurs during an RMS file function call.
+!
+! Input parameters
+!
+!	fab = Address of block used in the RMS call.
+!	fab$l_nam = pointer to name block
+!
+! Output parameters
+!
+!	None
+!
+!----
+
+BEGIN
+
+MAP fab: REF BBLOCK;			! Define fab block format
+BIND nam = .fab[fab$l_nam]: BBLOCK;	! Define name block
+
+LOCAL desc: VECTOR[2];			! Temporary string descriptor
+
+IF .nam[nam$b_rsl] NEQ 0		! IF result string nonblank,
+THEN BEGIN
+    desc[0] = .nam[nam$b_rsl];		! then display it
+    desc[1] = .nam[nam$l_rsa];
+    END
+ELSE IF .nam[nam$b_esl] NEQ 0		! Or if expanded name nonblank
+THEN BEGIN
+    desc[0] = .nam[nam$b_esl];		! then display it
+    desc[1] = .nam[nam$l_esa];
+    END
+ELSE BEGIN
+    desc[0] = .fab[fab$b_fns];		! Otherwise, use original
+    desc[1] = .fab[fab$l_fna];		! name string in FAB
+    END;
+
+write_message(msg$_searchfail,1,DESC,	! Output an error message
+		.fab[fab$l_sts],	! with fab error code
+		.fab[fab$l_stv]);	! and secondary code
+
+RETURN (.fab[fab$l_sts]);		! Pass along the error
+
+END;
+
+ROUTINE cli_error (cli_block,error) =
+
+!----
+!
+! Functional description
+!
+!	This routine is called as an error handler for
+!	CLI errors.
+!
+! Input parameters
+!
+!	cli_block = Address of CLI request block
+!	error = CLI error message
+!
+! Output parameters
+!
+!	None
+!
+!----
+
+BEGIN
+
+MAP cli_block: REF BBLOCK;		! Define CLI request block
+
+signal_stop(.error);			! Tell the user
+
+RETURN (.error);			! Pass along the error
+
+END;
+
+END
+ELUDOM

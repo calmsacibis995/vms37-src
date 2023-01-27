@@ -1,0 +1,835 @@
+MODULE sdlgen ( IDENT = 'V03-002' ) =
+
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+!
+! FACILITY:
+!	Message Compiler
+!
+! ABSTRACT:
+!	The Message Compiler translates message definition language
+! 	into object modules.  This module is called by the parser
+!	to generate an SDL file.
+!
+! ENVIRONMENT:
+!	VAX/VMS operating system, unprivileged user mode.
+!
+! AUTHOR:
+!	Jim Teague, November 1981
+!
+!  Modified by:
+!
+!	V03-002	BLS0168		Benn Schreiber	 2-Apr-1982
+!		Rename SDLGEN.REQ to SDLGENREQ.REQ
+!
+!	V03-001	JWT0026		Jim Teague	23-Mar-1982
+!		Make sdlgen flexible enough to accept different tags.
+!
+!
+!--
+
+!
+!  Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';		! VMS common definitions
+
+REQUIRE 'SRC$:MSG.REQ';			! Message common definitions
+
+REQUIRE 'SRC$:SDLGENREQ.REQ';		! Structure for comment blocks
+!
+! Table of Contents
+!
+
+FORWARD ROUTINE
+	sdl_start_mod,			! Beginnings of an SDL module
+	sdl_define_constant,		! Defines message or literal constant
+	sdl_end_mod,			! Endings of SDL module
+	sdl_comment,			! Output a comment
+	sdl_put_record;			! Outputs a line to SDL file
+
+!
+! Macros used within sdlgen...
+!
+MACRO
+
+! Create descriptor for a string
+
+    DESC ( string ) =
+	%CHARCOUNT ( string ), UPLIT BYTE ( string )%,
+
+! Concatenate 2 or more strings
+ 
+    CONCAT ( result, source ) [] =
+	CH$MOVE ( .source, .(source+4), .result[0] + .result[1]);
+	result[0] = .result[0] + .source;
+	CONCAT ( result, %REMAINING )%;
+
+!
+! Literals
+!
+LITERAL
+    system_bit = 1,		! /SYSTEM facility qualifier flag
+    prefix_bit = 2,		! /PREFIX facility qualifier flag
+    macro_bit  = 3,		! /MACRO facility qualifier flag
+    dectohex_switch = %X'FFFF',	! Value at which to switch from
+				!   decimal to hexadecimal
+    mod_offset = 1,		! column for SDL stmt "MODULE"
+    con_offset = 4,		! column for SDL stmt "CONSTANT"
+    equals_offset = 22,		! column for SDL stmt "EQUALS"
+    pre_offset = 40,		! column for SDL stmt "PREFIX"
+    cname_offset = 7,		! column for constant names
+    facil_offset = 8,		! column for "FACILITY"
+    line_size = 132,		! Length of output record buffer
+    comment_skip = 5;		! columns to skip for sameline comment
+
+!
+! Storage definitions
+!
+OWN
+
+! pointer to head of SCB (Sdl Comment Block)
+    scb_head,
+
+! pointer to most recently created SCB
+    last_scb,
+
+! flag to indicate whether SCB's are saved for this module
+    scbs_saved:		BYTE INITIAL(false),
+
+! variable to keep track of current offset for SDL comment records
+    current_offset:	INITIAL ( 0 ),
+
+! module initialized flag
+    mod_init:		BYTE INITIAL(false),	
+
+! flag to indicate that comments appear within constant definitions
+    comment_const:	BYTE INITIAL(false),
+
+! tag buffer
+    tagbuf:		VECTOR[line_size,BYTE],
+
+! tag descriptor
+    tag:		VECTOR [2] INITIAL (0, tagbuf),
+
+! prefix buffer
+    prefix:		VECTOR[line_size,BYTE], 
+
+! symbol name prefix descriptor
+    prefix_desc:	VECTOR [2] INITIAL (0, prefix),
+
+! output buffer
+    output_buffer:	VECTOR [line_size, BYTE],
+
+! descriptor of output buffer
+    output_desc:	VECTOR [2] INITIAL (0,output_buffer);
+
+!
+! Strings for use in building SDL output file
+!
+OWN
+
+    xl           :	VECTOR [2]
+			INITIAL(DESC(%STRING(' EQUALS %X','!XL',' '))),
+    ul           : 	VECTOR [2]
+			INITIAL(DESC(%STRING(' EQUALS ',  '!UL',' ')));
+BIND
+
+    blank        =	$descriptor( ' ' ),
+    def		 =	$descriptor( 'DEF' ),
+    start_module =	$descriptor( 'MODULE ' ),
+    const        =	$descriptor( 'CONSTANT' ),
+    pre		 =	$descriptor( 'PREFIX ' ),
+    dollar       = 	$descriptor( '$' ),
+    normal_tag   =	$descriptor( ' TAG ""' ),
+    comma        =	$descriptor( ',' ),
+    semicolon    =	$descriptor( ';' ),
+    endmodule    =	$descriptor( 'END_MODULE;' ),
+    facility     =	$descriptor( 'FACILITY' ),
+    sdlcomment   =	$descriptor( '/*' );
+
+!
+! External storage
+!
+EXTERNAL
+	sdl_rab : BBLOCK,		! SDL output file RAB
+	sdl_fab : BBLOCK;		! SDL output file FAB
+
+!
+! External routines
+!
+EXTERNAL ROUTINE
+	syntax_error,			! signal syntax error
+	rms_error,			! signal RMS-type error
+	LIB$GET_VM:  ADDRESSING_MODE(GENERAL),
+	LIB$FREE_VM: ADDRESSING_MODE(GENERAL);
+
+GLOBAL ROUTINE sdl_start_mod (facility_desc, facility_number,
+			      macro_desc, facility_flags )    =
+
+!++
+!
+!
+!   	This routine will (1)produce an SDL module definition,
+!	(2)dump comments (if any) which appeared prior to the
+!	.FACILITY definition in the MSG file, (3)start a constant
+!	list, and (4) define the facility number.  The module name
+!	is determined by either /PREFIX or the facility name.
+!	The macro suffix is defined only if /MACRO is specified,
+!	and is "DEF" otherwise.  The constant prefix, is defined
+!	by /PREFIX or the facility name, depending on which is
+!	present.  A "$" is added to the end of the constant prefix
+!	if the /SYSTEM qualifier is present.  The tag field will
+!	always be null, resulting in a tag field of "_".
+!
+!    Inputs:
+!
+!	facility_desc:
+!		 address of descriptor of facility name.
+!		/PREFIX qualifier is used if present.
+!
+!	facility_number:
+!		 facility number passed by value
+!
+!	macro_desc:
+!		address of descriptor of string
+!		specified by the /MACRO qualifier
+!
+!	facility_flags:		
+!		bitvector indicating which facility
+!		qualifiers are present	
+!
+!	Outputs:
+!		none
+!
+!
+!--
+
+BEGIN
+
+MAP
+    normal_tag    :  VECTOR,
+    def		  :  VECTOR,
+    facility_desc :  REF VECTOR,
+    macro_desc    :  REF VECTOR,
+    facility_flags:  REF BITVECTOR;
+
+LOCAL
+    buffer	:	VECTOR [line_size, BYTE],
+    mod_desc    :       VECTOR [2],
+    buffer_desc	:	VECTOR [2],
+    faoout_buf	:	VECTOR [line_size, BYTE],
+    faoout_desc	:	VECTOR [2],
+    suffix_desc	:	VECTOR [2];
+
+mod_init = true;
+
+!
+! Take whatever prefix we receive (facility name or explicit prefix)
+!
+prefix_desc [0] = .facility_desc [0];
+prefix_desc [1] = .facility_desc [1];
+
+!
+!  If prefix supplied, remove "_" from the specified prefix
+!
+IF .facility_flags [prefix_bit]
+THEN
+    prefix_desc [0] = .prefix_desc [0] - 1
+
+!
+!
+! If no prefix supplied, use prefix from facility name;
+!   	add "$" only if /SYSTEM specified
+!
+!
+ELSE
+    IF .facility_flags [system_bit]
+    THEN
+	(CONCAT ( prefix_desc, dollar ));
+
+sdl_put_record ( UPLIT ( DESC (' ')));
+
+current_offset = mod_offset;
+buffer_desc [0] = mod_offset;
+buffer_desc [1] = buffer;
+
+CH$FILL ( ' ', mod_offset, buffer);
+
+mod_desc [0] = .prefix_desc [0] - 1;
+mod_desc [1] = .prefix_desc [1];
+suffix_desc [0] = 3;
+suffix_desc [1] = .def [1];
+
+IF .facility_flags [macro_bit]
+THEN
+    !
+    ! If /MACRO name is specified, use it for the module name after
+    !	first removing the $ (the $ is added below)
+    !   There will be no DEF suffix, either.
+    !
+    BEGIN
+    suffix_desc [0] = 0;
+    mod_desc [0] = .macro_desc [0] - 1;
+    mod_desc [1] = .macro_desc [1] + 1;
+    END;
+
+CONCAT ( buffer_desc,
+         start_module,
+         dollar,
+         mod_desc,
+         suffix_desc,
+         semicolon     );
+
+sdl_put_record ( buffer_desc );
+sdl_put_record ( UPLIT ( DESC (' ')));
+
+!
+! If comments were saved, dump them NOW
+!
+IF .scbs_saved
+THEN
+    BEGIN
+    LOCAL
+        com_desc:	VECTOR [2],		! Temporary comment descriptor
+        CBLOCK:		REF BLOCK [,BYTE],	! For Sdl Comment Blocks
+	LAST_CBLOCK:	REF BLOCK [,BYTE];	! For freeing vm
+	
+    !
+    ! Set comment block ptr to first in list
+    !
+    CBLOCK = .scb_head;
+
+    !
+    ! As long as there is a forward link...
+    !
+    WHILE .CBLOCK NEQ 0 DO
+
+        BEGIN
+	LOCAL
+	    status;
+
+        com_desc [0] = .CBLOCK [SCB$B_CLEN];	! Set up temporary
+        com_desc [1] =  CBLOCK [SCB$T_CTXT];	!          descriptor
+
+        sdl_put_record ( com_desc );		! Output comment line
+
+	LAST_CBLOCK = .CBLOCK;			! Save block address
+
+        CBLOCK = .CBLOCK [SCB$L_NXTSCB];	! Move ptr forward
+
+	!
+	! Free vm for last comment block
+	!
+	IF NOT ( status = LIB$FREE_VM(%REF(SCB$C_LENGTH + .com_desc [0]),
+				      LAST_CBLOCK ) )
+	THEN
+	    SIGNAL ( .status );
+
+        END;
+END;
+
+current_offset = con_offset;
+buffer_desc[0] = con_offset ;
+CH$FILL (' ',con_offset, buffer);
+
+CONCAT ( buffer_desc,
+         const       );
+
+sdl_put_record ( buffer_desc );
+
+current_offset = cname_offset;
+buffer_desc [0] = facil_offset ;
+CH$FILL ( ' ', pre_offset, buffer );
+
+CONCAT ( buffer_desc,
+         facility      );
+
+buffer_desc [0] = equals_offset;
+
+CONCAT ( buffer_desc,
+         ul           );
+
+buffer_desc [0] = pre_offset;
+
+tag [0] = .normal_tag [0];
+tag [1] = .normal_tag [1];
+
+CONCAT ( buffer_desc,
+         pre,
+         prefix_desc,
+         tag         );
+
+faoout_desc [0] = line_size;
+faoout_desc [1] = faoout_buf;
+
+$FAO ( buffer_desc, faoout_desc [0], faoout_desc, .facility_number);
+
+sdl_put_record ( faoout_desc);
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE sdl_define_constant ( name_desc, value, msg_flag, tparse) =
+
+!++
+!
+!	This routine outputs a constant definition as follows
+!
+!		symbol_name EQUALS symbol_value PREFIX prefix TAG ""
+!
+!	This routine is capable of handling message symbols or
+!	literals.  In the latter case, it checks to be sure that
+!	the literal name is consistent with the MODULE statement.
+!	If there are inconsistencies, a warning is issued and the
+!	literal is omitted.
+!
+!
+!    Inputs:
+!
+!	name_desc:
+!		address of descriptor of symbol name
+!
+!	value:
+!		symbol value
+!
+!	msg_flag:
+!		set if a message symbol and not a literal
+!
+!	tparse:
+!		address of tparse block, when present
+!
+!    Outputs:
+!
+!	none
+!		
+!
+!--
+
+BEGIN
+
+MAP
+    normal_tag  :	VECTOR,
+    comma	:	VECTOR,
+    blank	:	VECTOR,
+    name_desc	:	REF VECTOR;
+
+LOCAL
+    delim_desc	:	VECTOR [2],
+    buffer	:	VECTOR [line_size, BYTE],
+    buffer_desc	:	VECTOR [2],
+    faoout_desc	:	VECTOR [2],
+    faoout_buf	:	VECTOR [line_size, BYTE],
+    symbol_desc	:	VECTOR [2];
+    
+!
+! Make sure that we're not outside a module def'n
+!
+IF NOT .mod_init
+THEN
+    BEGIN
+    syntax_error(.tparse, emsg(nofacil)) ;
+    RETURN true;
+    END;
+
+!
+! Store new symbol name locally
+!
+symbol_desc [0] = .name_desc [0];
+symbol_desc [1] = .name_desc [1];
+buffer_desc [1] = buffer;
+
+!
+! Delimiter is a comma
+!
+delim_desc [0] = 1;
+delim_desc [1] = .comma [1];
+
+!
+! Assume no special tag
+!
+tag [0] = .normal_tag [0];
+tag [1] = .normal_tag [1];
+
+!
+! Check to see if it's a message def'n or not
+!
+IF NOT .msg_flag
+THEN
+    BEGIN
+    LOCAL
+	checklen;
+
+    !
+    ! Compare prefix and first part of symbol all the way up to the
+    ! 		first underscore
+    !
+    checklen = CH$FIND_CH( .symbol_desc [0], .symbol_desc [1], '_')
+				- .symbol_desc [1];
+    IF CH$NEQ( .prefix_desc [0], .prefix_desc [1],
+	       .checklen , .symbol_desc [1], '_' )
+    THEN
+	!
+	! They didn't match -- we have a nonstandard tag here
+	!
+	BEGIN
+	LOCAL
+	    taglen;
+
+	taglen = .checklen - .prefix_desc [0];			! How long was the tag?
+	tag [0] = .taglen + 7;					! Start setting up new tag descriptor
+	tag [1] = tagbuf;
+	CH$MOVE( 6, .normal_tag [1], tagbuf);			! Move in TAG "
+	CH$MOVE( .taglen, .symbol_desc [1] + .checklen - .taglen, tagbuf + 6);	! Now move tag itself
+	tagbuf [6 + .taglen] = '"';						!    and final "
+	symbol_desc [0] = .symbol_desc [0] - .taglen;		! Remove excess tag from symbol so that the sdl constant
+	symbol_desc [1] = .symbol_desc [1] + .taglen;		!    will work out evenly after the underscore  adjustment
+	END;
+
+    symbol_desc [0] = .symbol_desc [0] - .prefix_desc [0] - 1;	! Remove underscore from constant name since sdl says we
+    symbol_desc [1] = .symbol_desc [1] + .prefix_desc [0] + 1;	!     MUST have an underscore even for a null tag
+    END;
+
+IF .comment_const
+THEN
+    BEGIN							! Tack on comment if there is one...
+    delim_desc [0] = 1;
+    delim_desc [1] = .blank [1];
+    CH$FILL(' ', con_offset, buffer);
+    buffer_desc [0] = con_offset;
+    CONCAT ( buffer_desc, const );
+    sdl_put_record ( buffer_desc );
+    comment_const = false;
+    END;
+
+buffer_desc [0] = cname_offset;
+
+CH$FILL ( ' ', pre_offset, buffer );
+
+CONCAT ( buffer_desc,					! Start setting up output buffer
+         delim_desc,
+         symbol_desc  );
+
+buffer_desc [0] = equals_offset ;
+
+IF ..value LEQU dectohex_switch
+THEN
+    (CONCAT (buffer_desc, ul ))
+
+ELSE
+    (CONCAT (buffer_desc, xl ));
+
+buffer_desc [0] = pre_offset ;
+
+CONCAT ( buffer_desc, pre, prefix_desc, tag );		! Put sdl constant together
+
+faoout_desc [0] = line_size ;
+faoout_desc [1] = faoout_buf;
+
+$FAO ( buffer_desc, faoout_desc [0],
+       faoout_desc, ..value   );
+
+sdl_put_record( faoout_desc );
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE sdl_end_mod =
+
+!++
+!
+!
+!	This routine outputs a semicolon and an END_MODULE statement
+!	to the sdl file to end the constant definitions for a
+!	facility.  Note that if the flag comment_const is true,
+!	a semicolon has already delimited a constant string, so
+!	simply output END_MODULE.  This routine also resets
+!	flags to prepare for more facility definitions.
+!
+!    Inputs:
+!
+!	none
+!
+!    Outputs:
+!
+!	none
+!
+!--
+
+BEGIN
+
+LOCAL
+    buffer	:	VECTOR [line_size, BYTE],
+    buffer_desc	:	VECTOR [2];
+!
+! If this is the first facility, simply return.
+!
+IF NOT .mod_init 
+THEN
+    RETURN true;
+
+!
+! Reset flags to prepare for a new module
+!
+mod_init = false;	! Currently no active modules,
+current_offset = 0;	!    restore indentation level for sdl output,
+scbs_saved = false;	!    there are no saved SDL comment blocks.
+
+buffer_desc [1] = buffer;
+
+CH$FILL ( ' ', cname_offset, buffer );
+
+!
+! If the facility didn't end with comments, we need to add a semicolon
+!    to delimit the constants
+! 
+IF NOT .comment_const
+THEN
+    BEGIN
+    buffer_desc [0] = cname_offset;
+    CONCAT ( buffer_desc, semicolon );
+    sdl_put_record ( buffer_desc );
+    END;
+
+!
+! Now add the END_MODULE
+!
+buffer_desc [0] = mod_offset ;
+CONCAT ( buffer_desc, endmodule );
+sdl_put_record ( buffer_desc );
+sdl_put_record ( UPLIT ( DESC (' ')));
+
+!
+! Reset the comment_const flag now that we're done with it
+!
+comment_const = false;
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE sdl_comment ( comment_desc, new_line_flag ) =
+
+!++
+!
+!
+!	This routine outputs a line of comment into the SDL file.
+!	If the current comment comes between two SDL constants,
+!	the constant list must be ended for the comment and
+!	resumed when there are no more comments.
+!
+!
+!    Inputs:
+!
+!	comment_desc:
+!		descriptor for comment line
+!
+!	new_line_flag:
+!		set if comment should be placed on a new line
+!
+!    Outputs:
+!
+!	none
+!
+!--
+
+BEGIN
+
+MAP
+    comment_desc	: REF VECTOR;
+
+LOCAL
+    buffer		: VECTOR [line_size, BYTE],
+    buffer_desc		: VECTOR [2];
+
+buffer_desc [1] = buffer;
+!
+!  Can't intermix comments and constant expressions in SDL:
+!    if the variable "current_offset" has a value > 4 then
+!    sdlgen is in the middle of defining constants.
+!    
+!
+IF (.current_offset GTR 4) AND (NOT .comment_const)
+THEN
+    BEGIN
+    CH$FILL( ' ', .current_offset, buffer);
+    buffer_desc [0] = .current_offset;
+    CONCAT( buffer_desc, semicolon );
+    comment_const = true;
+    sdl_put_record (buffer_desc);
+    END;
+  
+buffer_desc [0] = 0;
+
+IF NOT .new_line_flag
+THEN
+    BEGIN
+    buffer_desc [0] = comment_skip;
+    CH$FILL ( ' ', comment_skip, buffer);
+    END;
+
+CONCAT ( buffer_desc, sdlcomment, .comment_desc );
+    
+!
+!  If the module is not yet initialized, then the comment just
+!	encountered must be saved until a module declaration can be
+!	made.  Set up a linked list to save the comments.
+!
+
+IF NOT .mod_init
+THEN
+    BEGIN
+
+    LOCAL
+        status,
+        CBLOCK: REF BLOCK[,BYTE];
+  
+    status = LIB$GET_VM(%REF(SCB$C_LENGTH + .buffer_desc[0]), CBLOCK);
+    IF .status
+    THEN
+        BEGIN
+
+        !
+        ! This is the first comment encountered--set up linked list
+        !
+        IF NOT .scbs_saved
+        THEN
+            BEGIN
+            scb_head    = .CBLOCK;
+            last_scb    = .CBLOCK;
+            scbs_saved  = true;
+            END
+
+        !
+        ! Else this is at least the second comment link--set the
+        ! 	forward ptr of the last block to point here.
+        !	
+        ELSE
+            BEGIN
+            .last_scb = .CBLOCK;	! Setpointer of last block to this block
+             last_scb = .CBLOCK;	! Now point to this block
+             END;
+
+        !
+        ! Now set the current next link to 0;
+        !	fill in this scb with the current comment string
+        ! 
+        CBLOCK [SCB$L_NXTSCB] = 0;
+        CBLOCK [SCB$B_CLEN]   = .buffer_desc [0];
+        CH$MOVE (.buffer_desc [0],
+	         .buffer_desc [1],
+	         CBLOCK [SCB$T_CTXT] );
+        END
+
+    !
+    !  If no virtual memory available in which to save comments
+    !	  (hopefully a rare occurrence) then signal that condition
+    !
+    ELSE
+       SIGNAL ( .status );
+
+    END
+
+!
+! If module has been declared and we're not in the midst of a
+!	string of constants, output the comment.
+!
+ELSE
+
+    sdl_put_record ( buffer_desc,
+	         IF NOT .new_line_flag THEN true  ELSE false );
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE sdl_put_record ( record_desc, append_to_buffer_flag ) =
+
+!++
+!
+!	This routine outputs a record to the SDL file.
+!
+!    Inputs:
+!
+!	record_desc:
+!		descriptor of the record to be buffered
+!
+!	append_to_buffer_flag:
+!		set if buffer should be lengthened.
+!
+!
+!    Outputs:
+!
+!	none
+!
+!--
+
+BEGIN
+
+MAP
+    record_desc	:	REF VECTOR;
+
+BUILTIN
+    NULLPARAMETER;
+
+LOCAL
+    status;			! status code
+
+IF .sdl_fab [fab$w_ifi] EQL 0	! if file unopened, then exit
+THEN
+    RETURN true;
+
+IF NULLPARAMETER(2)		! new line flag not input or null
+THEN
+    BEGIN
+    sdl_rab [rab$w_rsz] = .output_desc [0];	! output and reset buffer
+    sdl_rab [rab$l_rbf] = .output_desc [1];
+
+    status = $PUT (RAB = sdl_rab);		! output line
+
+    IF NOT .status
+    THEN
+	rms_error (emsg(writeerr), sdl_fab, sdl_rab);	! if error, report it
+
+    output_desc [0] = .record_desc [0];
+    CH$MOVE ( .record_desc [0], .record_desc [1], .output_desc [1]);
+
+    RETURN status;
+    END
+
+ELSE
+    BEGIN					! modify buffer by
+    CONCAT ( output_desc, .record_desc );	!   appending new record
+    RETURN true;
+    END;
+
+END;
+END
+ELUDOM

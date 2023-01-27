@@ -1,0 +1,743 @@
+MODULE DBGNSHOW (IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY: DEBUG
+!
+! ABSTRACT:
+!
+!	This module contains the ATN parse network and the command execution network
+!	to support the SHOW ... command. The parse network constructs a command
+!	execution tree consisting of a verb node as the head, and 0 or more noun
+!	nodes and adverb nodes. The execution network uses the command execution
+!	tree as input and performs the corresponding semantic actions.
+!
+! ENVIRONMENT:	VAX/VMS
+!
+! AUTHOR:	David Plummer, CREATION DATE:	3/31/80
+!
+! VERSION:	V02.2-001
+!
+! MODIFIED BY:
+!
+!	Richard Title	16-Sep-81
+!	Sid Maxwell	 3-Dec-81
+!
+! REVISION HISTORY:
+!
+! 3.01	16-SEP-81	RT	Implemented SHOW SOURCE
+! 3.02	 9-OCT-81	RT	Implemented SHOW MARGINS and SHOW MAX_SOURCE_FILES
+! 3.03	21-Oct-81	RT	Implemented SHOW SEARCH
+! 3.04	 3-Dec-81	SRM	Changed SHOW CALLS to check AT_FAULT instead
+!				of AT_BREAK and AT_STEP_END
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	DBG$NPARSE_SHOW,			! Parse network for SHOW command
+	DBG$NEXECUTE_SHOW,			! Execution network for SHOW command
+    	DBG$NSHOW_MARGINS : NOVALUE,		! Displays margin settings
+    	DBG$NSHOW_MAX_SOURCE_FILES : NOVALUE,	! Displays max_source_file setting
+	DBG$NSHOW_OUTPUT : NOVALUE;		! Displays output configuration of debugger
+!
+! REQUIRE FILES:
+!
+
+REQUIRE 'SRC$:DBGPROLOG.REQ';
+
+REQUIRE 'SRC$:DBGGEN.REQ';
+REQUIRE 'SRC$:SYSSER.REQ';
+REQUIRE 'SRC$:COMTER.REQ';
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+
+	! composite verb literals
+	!
+	show_break 		= 1,
+	show_calls 		= 2,
+	show_calls_digit 	= 3,
+	show_language 		= 4,
+	show_log 		= 5,
+	show_mode 		= 6,
+	show_module 		= 7,
+	show_output 		= 8,
+	show_scope 		= 9,
+	show_step 		= 10,
+	show_trace 		= 11,
+	show_type 		= 12,
+	show_type_override 	= 13,
+	show_watch 		= 14,
+    	show_source		= 15,
+    	show_margins		= 16,
+    	show_max_source_files	= 17,
+    	show_search		= 18;
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+	DBG$SHOW_TYPE,			! Displays default and override types
+	DBG$SHOW_MODE,			! Displays mode
+	DBG$SHOW_MODULE,		! Outputs the module chain
+	DBG$SHOW_BPTS,			! Displays user set xpoints
+    	DBG$SHOW_SEARCH : NOVALUE,	! Displays search settings
+	DBG$SHOW_STEP,			! Outputs user defined step settings
+	DBG$RST_SHOWSCOPE,		! Outputs user set scopes
+	DBG$TRACEBACK,			! Shows current runframe nesting
+	DBG$NNEXT_WORD,			! Isolates next word of input for syntax errors
+	DBG$NSYNTAX_ERROR,		! Outputs a syntax error
+	DBG$NMAKE_ARG_VECT,		! Constructs a message argument vector
+	DBG$NSAVE_DECIMAL_INTEGER,	! Converts input ascii to integer
+	DBG$NLIST_FREEZ,		! Allocates listed dynamic storage
+	DBG$LANGUAGE,			! Returns language setting
+    	DBG$SRC_SHOW_SOURCE : NOVALUE,	! Implements the SHOW SOURCE command
+    	DBG$FAO_PUT : NOVALUE,		! formatted ascii output
+    	DBG$OUT_PUT : NOVALUE,		! flush the DBG$FAO_PUT buffer
+	DBG$NMATCH;			! Counted string matching routine for parsing
+
+EXTERNAL
+	DBG$GL_RUNFRAME : REF BLOCK [,BYTE],	! User runframe
+	DBG$GB_LANGUAGE : BYTE,			! Language index
+	DBG$GL_LOGFAB 	: BLOCK [,BYTE],	! FAB for LOG file
+	DBG$GL_LOGNAM 	: REF $NAM_DECL,	! NAM block for LOG file
+	DBG$GL_CONTEXT 	: BITVECTOR,		! Version 2 context vector
+	DBG$GB_DEF_OUT 	: VECTOR [,BYTE], 	! Vector for output configuration
+    	DBG$CP_OUT_STR,				! Buffer pointer for DBG$FAO_PUT
+    	DBG$GL_BUF_SIZ,				! Buffer length for DBGFAO_PUT
+    	DBG$SRC_LEFT_MARGIN,			! Margin 
+    	DBG$SRC_RIGHT_MARGIN,			! settings.
+    	DBG$SRC_MAX_FILES;			! Maximum number of open source
+    						! files (DBGSOURCE)
+
+
+GLOBAL ROUTINE DBG$NPARSE_SHOW (INPUT_DESC, VERB_NODE, MESSAGE_VECT) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine comprises the ATN parse network for the SHOW command. The
+!	network constructs a command execution tree consisting of a linked list
+!	of verb, noun, and possibly adverb nodes which the exectuion network accepts
+!	as input.
+!
+! FORMAL PARAMETERS:
+!
+!	input_desc -		Descriptor which points to the command input buffer
+!
+!	verb_node -		The head node in the command execution tree
+!
+!	message_vect - 		The address of a longword to contain the address
+!				of a message argument vector
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	The command execution (parse) tree is constructed and linked to the verb
+!	node.
+!
+! ROUTINE VALUE:	
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	sts$k_severe (4) -	Parsing error encountered
+!
+!	sts$k_success (1) - 	Successful parse and construction of the command
+!				exectuion tree.
+!
+! SIDE EFFECTS:
+!
+!	None
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	NOUN_NODE : REF dbg$noun_node;
+
+    ! Define string recognized at this level of parsing
+    !
+    BIND
+	DBG$CS_BREAK 	= UPLIT BYTE (5, 'BREAK'),
+	DBG$CS_CALLS	= UPLIT BYTE (5, 'CALLS'),
+	DBG$CS_LANGUAGE = UPLIT BYTE (8, 'LANGUAGE'),
+	DBG$CS_LOG 	= UPLIT BYTE (3, 'LOG'),
+    	DBG$CS_MARGINS	= UPLIT BYTE (7, 'MARGINS'),
+    	DBG$CS_MAX_SOURCE_FILES =
+    			  UPLIT BYTE (16, 'MAX_SOURCE_FILES'),
+	DBG$CS_MODE	= UPLIT BYTE (4, 'MODE'),
+	DBG$CS_MODULE 	= UPLIT BYTE (6,'MODULE'), 
+	DBG$CS_OUTPUT 	= UPLIT BYTE (6, 'OUTPUT'),
+	DBG$CS_SCOPE	= UPLIT BYTE (5, 'SCOPE'),
+    	DBG$CS_SEARCH	= UPLIT BYTE (6, 'SEARCH'),
+    	DBG$CS_SOURCE	= UPLIT BYTE (6, 'SOURCE'),
+	DBG$CS_STEP 	= UPLIT BYTE (4, 'STEP'),
+	DBG$CS_TRACE 	= UPLIT BYTE (5, 'TRACE'),
+	DBG$CS_TYPE	= UPLIT BYTE (4, 'TYPE'),
+	DBG$CS_WATCH 	= UPLIT BYTE (5, 'WATCH'),
+	DBG$CS_CR 	= UPLIT BYTE (1, dbg$k_car_return);
+
+    MAP
+	VERB_NODE : REF dbg$verb_node;
+
+
+    ! Recognize keyword
+    !
+    SELECTONE true
+	    OF
+	    SET
+
+	    [dbg$nmatch (.input_desc, dbg$cs_break, 1)] :
+		BEGIN
+		verb_node [dbg$b_verb_composite] = show_break;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_calls, 1)] :
+		BEGIN
+		verb_node [dbg$b_verb_composite] = show_calls;
+
+		! May have to accept an integer. In any case, we need a noun node.
+
+		IF NOT dbg$nlist_freez (dbg$k_noun_node_size, noun_node, .message_vect)
+		THEN
+		    RETURN sts$k_severe;
+
+		verb_node [dbg$l_verb_object_ptr] = .noun_node;
+
+
+		! Start out with -1 for the value of the integer. If the input
+		! line is not null, then we will try to obtain an integer.
+		!
+		IF dbg$nmatch (.input_desc, dbg$cs_cr, 1)
+		THEN
+		    BEGIN
+		    noun_node [dbg$l_noun_value] = -1;
+		    END
+		ELSE
+		    BEGIN
+		    IF NOT dbg$nsave_decimal_integer (.input_desc,
+						      noun_node [dbg$l_noun_value],
+						      .message_vect)
+		    THEN
+			RETURN sts$k_severe;
+		    END;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_language, 2)] :
+		BEGIN
+		verb_node [dbg$b_verb_composite] = show_language;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_log, 2)] :
+		BEGIN
+		verb_node [dbg$b_verb_composite] = show_log;
+		END;
+
+    	    [dbg$nmatch (.input_desc, dbg$cs_margins, 3)] :
+    		BEGIN
+    		verb_node [dbg$b_verb_composite] = show_margins;
+    		END;
+
+    	    [dbg$nmatch (.input_desc, dbg$cs_max_source_files, 3)] :
+    		BEGIN
+    		verb_node [dbg$b_verb_composite] = show_max_source_files;
+    		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_mode, 1)] :
+		BEGIN
+		verb_node [dbg$b_verb_composite] = show_mode;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_module, 4)] :
+		BEGIN
+		verb_node [dbg$b_verb_composite] = show_module;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_output, 1)] :
+		BEGIN
+		verb_node [dbg$b_verb_composite] = show_output;
+		END;
+	    [dbg$nmatch (.input_desc, dbg$cs_scope, 2)] :
+		BEGIN
+		verb_node [dbg$b_verb_composite] = show_scope;
+		END;
+
+    	    [dbg$nmatch (.input_desc, dbg$cs_search, 2)] :
+    		BEGIN
+    		verb_node [dbg$b_verb_composite] = show_search;
+    		END;
+
+    	    [dbg$nmatch (.input_desc, dbg$cs_source, 2)] :
+    		BEGIN
+    		verb_node[dbg$b_verb_composite] = show_source;
+    		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_step, 1)] :
+		BEGIN
+		verb_node [dbg$b_verb_composite] = show_step;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_trace, 1)] :
+		BEGIN
+		verb_node [dbg$b_verb_composite] = show_trace;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_type, 2)] :
+		BEGIN
+
+
+		! We may have SHOW TYPE or SHOW TYPE/OVERRIDE
+		!
+		BIND
+		    DBG$CS_SLASH	= UPLIT BYTE (1, dbg$k_slash),
+		    DBG$CS_OVERRIDE	= UPLIT BYTE (8, 'OVERRIDE');
+
+
+		! Check for slash
+		!
+		IF dbg$nmatch (.input_desc, dbg$cs_slash, 1)
+		THEN
+		    BEGIN
+
+		    IF NOT dbg$nmatch (.input_desc, dbg$cs_override, 1)
+		    THEN
+			BEGIN
+			.message_vect =
+			(IF dbg$nmatch (.input_desc, dbg$cs_cr, 1)
+			THEN
+			    dbg$nmake_arg_vect (dbg$_needmore)
+			ELSE
+			    dbg$nsyntax_error (dbg$nnext_word (.input_desc)));
+			RETURN sts$k_severe;
+			END;
+		    verb_node [dbg$b_verb_composite] = show_type_override;
+		    END
+		ELSE
+		    BEGIN
+		    verb_node [dbg$b_verb_composite] = show_type;
+		    END;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_watch, 1)] :
+		BEGIN
+		verb_node [dbg$b_verb_composite] = show_watch;
+		END;
+
+	    [OTHERWISE] : ! Parsing error
+		BEGIN
+		IF dbg$nmatch (.input_desc, dbg$cs_cr, 1)
+		THEN
+		    .message_vect = dbg$nmake_arg_vect (dbg$_needmore)
+		ELSE
+		    .message_vect = dbg$nsyntax_error (dbg$nnext_word (.input_desc));
+		RETURN sts$k_severe;
+		END;
+
+	    TES;
+
+    RETURN sts$k_success;
+
+    END;			! End of dbg$nparse_show
+
+
+GLOBAL ROUTINE DBG$NEXECUTE_SHOW (VERB_NODE, MESSAGE_VECT) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine accepts a command execution tree as input and performs the
+!	semantic actions associated with the SHOW command. Version 2 debugger
+!	routines and data structures are utilyzed during command execution.
+!
+! FORMAL PARAMETERS:
+!
+!	verb_node -		The first node in the command execution tree
+!
+!	message_vect - 		The address of a longword to contain the address
+!				of a message argument vector
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	Semantic actions corresponding to the input command are performed. That
+!	is, various states of the debugger are displayed.
+!
+! ROUTINE VALUE:	unsigned longword integer completion code
+!
+! COMPLETION CODES:
+!
+!	sts$k_severe (4) - 	The command could not be executed.
+!
+!	sts$k_success (1) - 	The parsed command was executed.
+!
+! SIDE EFFECTS:
+!
+!	Output concerning the state of the debugger is displayed to the user.
+!
+!--
+
+    BEGIN
+
+    MAP
+	VERB_NODE : REF dbg$verb_node;
+
+
+    ! Transfer control to a subnetwork on the basis of the composite verb
+    !
+    CASE .verb_node [dbg$b_verb_composite] 
+    	FROM show_break TO show_search
+	    OF
+	    SET
+
+	    [show_break] :
+		BEGIN
+		dbg$gl_context [dbg$k_break] = true;
+		IF NOT dbg$show_bpts (.message_vect)
+		THEN
+		    RETURN sts$k_severe;
+		END;
+
+	    [show_calls] :
+		BEGIN
+		LOCAL
+		    EXC_TYPE,		! Exception type (trap=1, fault=2)
+		    NOUN_NODE : REF dbg$noun_node;
+
+		noun_node = .verb_node [dbg$l_verb_object_ptr];
+
+		! exception type is based on whether the last exception
+		! was a fault, break or step-end
+		!
+		IF	.dbg$gl_runframe [dbg$v_at_fault] OR
+			.dbg$gl_runframe [dbg$v_at_break] OR
+			.dbg$gl_runframe [dbg$v_at_step_end]
+		THEN	exc_type = fault_exc
+		ELSE	exc_type = trap_exc;
+
+		dbg$traceback (.dbg$gl_runframe [dbg$l_user_pc],
+			       .dbg$gl_runframe [dbg$l_user_fp],
+			       .EXC_TYPE, .NOUN_NODE[DBG$L_NOUN_VALUE]);
+		END;
+
+	    [show_language] :
+		BEGIN
+		$fao_tt_out ('language: !AC', dbg$language (.dbg$gb_language));
+		END;
+
+	    [show_log] :
+		BEGIN
+		dbg$nshow_output (2);     ! 2 stands for "show log" parameter
+		END;
+
+    	    [show_margins] :
+    		BEGIN
+    		dbg$nshow_margins();
+    		END;
+
+    	    [show_max_source_files] :
+    		BEGIN
+    		dbg$nshow_max_source_files();
+    		END;
+
+	    [show_mode] :
+		BEGIN
+		dbg$show_mode ();
+		END;
+
+	    [show_module] :
+		BEGIN
+		dbg$show_module ();
+		END;
+
+	    [show_output] :
+		BEGIN
+		dbg$nshow_output (1);     ! 1 stands for "full rep"
+		END;
+
+	    [show_scope] :
+		BEGIN
+		dbg$rst_showscope ();
+		END;
+
+    	    [show_search] :
+    		BEGIN
+    		dbg$show_search ();
+    		END;
+
+    	    [show_source] :
+    		BEGIN
+    		dbg$src_show_source();
+    		END;
+
+	    [show_step] :
+		BEGIN
+		dbg$show_step ();
+		END;
+
+	    [show_trace] :
+		BEGIN
+		dbg$gl_context [dbg$k_trace] = true;
+		IF NOT dbg$show_bpts (.message_vect)
+		THEN
+		    RETURN sts$k_severe;
+		END;
+
+	    [show_type] :
+		BEGIN
+		dbg$show_type (default);
+		END;
+
+	    [show_type_override] :
+		BEGIN
+		dbg$show_type (override);
+		END;
+
+	    [show_watch] :
+		BEGIN
+		dbg$gl_context [dbg$k_watch] = true;
+		IF NOT dbg$show_bpts (.message_vect)
+		THEN
+		    RETURN sts$k_severe;
+		END;
+
+	    [INRANGE, OUTRANGE] :
+		BEGIN
+		.message_vect = dbg$nmake_arg_vect (dbg$_notimplan, 1,
+		 				    UPLIT BYTE (17, 
+						    'full verb support'));
+		RETURN sts$k_severe;
+		END;
+
+	    TES;
+
+    RETURN sts$k_success;
+
+    END;			! End of dbg$nexecute_show
+
+
+GLOBAL ROUTINE DBG$NSHOW_MARGINS : NOVALUE =
+!++
+! FUNCTION
+!
+!	This routine implements the SHOW MARGINS command.
+!
+! INPUTS
+!
+!	The global variables DBG$SRC_LEFT_MARGIN and DBG$SRC_RIGHT_MARGIN.
+!
+! OUTPUTS
+!
+!	Margin settings are displayed at the terminal.
+!
+!--
+    BEGIN
+    LOCAL
+    	buffer : VECTOR [140, BYTE];
+
+    ! Set up the output buffer
+    !
+    dbg$cp_out_str = buffer[1];
+    dbg$gl_buf_siz = 0;
+
+    dbg$fao_put (buffer, 
+    		 UPLIT BYTE(%ASCIC 'left margin: !UL , right margin: !UL'),
+    		 .dbg$src_left_margin, .dbg$src_right_margin);
+    dbg$out_put (buffer);
+
+    END; ! dbg$nshow_margins
+
+GLOBAL ROUTINE DBG$NSHOW_MAX_SOURCE_FILES : NOVALUE =
+!++
+! FUNCTION
+!
+!	This routine implements the SHOW MAX_SOURCE_FILES command.
+!
+! INPUTS
+!
+!	The global variable DBG$SRC_MAX_SOURCE_FILES.
+!
+! OUTPUTS
+!
+!	The value is displayed at the terminal.
+!
+!--
+    BEGIN
+    LOCAL
+    	buffer : VECTOR [120, BYTE];
+
+    ! Set up the output buffer
+    !
+    dbg$cp_out_str = buffer[1];
+    dbg$gl_buf_siz = 0;
+
+    dbg$fao_put (buffer,
+    		 UPLIT BYTE(%ASCIC 'max_source_files: !UL'),
+    		 .dbg$src_max_files);
+    dbg$out_put (buffer);
+
+    END; ! dbg$nshow_max_source_files
+
+GLOBAL ROUTINE DBG$NSHOW_OUTPUT (FULL_REP) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION:  
+!	Action routine to show OUTPUT configuration
+!
+! FORMAL PARAMETERS:
+!	full_rep    equals 1 for a full report (i.e. "SHOW OUTPUT")
+!		           2 for just "SHOW LOG"
+!
+! IMPLICIT INPUTS:
+!
+!	dbg$gb_def_out -	output configuration vector
+!
+!	dbg$gl_log_fab - 	FAB for LOG file
+!
+!	dbg$gl_lognam -		NAM block for LOG file
+!
+! IMPLICIT OUTPUTS:
+!	none
+!
+! ROUTINE VALUE:
+! 	none
+!
+! SIDE EFFECTS:
+! 	A message is generated that displays the current output configuration
+!	and the log file name
+!--
+    BEGIN
+
+    BIND
+	DEFLOG_NAME = UPLIT BYTE ('DEBUG.LOG'),
+	DEFLOG_SIZE = %CHARCOUNT ('DEBUG.LOG');
+
+    LOCAL
+	VERIFY_CS    :	REF VECTOR [,BYTE],
+	TERM_CS      :	REF VECTOR [,BYTE],
+	log_cs       :	REF VECTOR [,BYTE],
+	no_count     : 	WORD,
+	string_count :	WORD;			! count of chars in output string
+
+    no_count = 0;				! count of "no" characters
+
+    IF .full_rep 
+    THEN
+	BEGIN
+	IF .dbg$gb_def_out [out_verify]
+	THEN
+	    verify_cs = UPLIT(%ASCIC '')
+	ELSE
+	    BEGIN
+	    verify_cs = UPLIT(%ASCIC 'no');
+	    no_count = .no_count + 2;
+	    END;
+	
+	IF .dbg$gb_def_out [out_term]
+	THEN
+	    term_cs = UPLIT(%ASCIC '')
+	ELSE
+	    BEGIN
+	    term_cs = UPLIT(%ASCIC 'no');
+	    no_count = .no_count + 2
+	    END;
+	END;
+
+    IF .dbg$gb_def_out [out_log]
+    THEN
+	log_cs = UPLIT(%ASCIC '')
+    ELSE
+	BEGIN
+	log_cs = UPLIT(%ASCIC 'not ');
+	no_count = .no_count + 3;
+	END;
+
+
+    ! If a LOG file is open report the filespec in the NAM block, otherwise
+    ! use the default filespec
+    !
+    IF .dbg$gl_logfab [fab$w_ifi] LEQ 0
+    THEN
+	IF .full_rep
+	THEN
+	    $fao_tt_out('output: !ACverify, !ACterminal, !AClogging to !AD', 
+		.verify_cs, .term_cs, .log_cs, deflog_size, deflog_name) 
+	ELSE
+	    $fao_tt_out('!AClogging to !AD',.log_cs, deflog_size, deflog_name)
+
+    ELSE
+	IF .full_rep
+	THEN
+	    BEGIN
+
+
+            ! string count is initialized to the no. of characters in the output
+            ! string (not counting "no"s and the log filespec).
+	    !
+	    string_count = 38;
+	    string_count = .string_count + .no_count + .dbg$gl_lognam[nam$b_rsl];
+
+
+	    ! If we exceed the max record length, output two lines
+	    !
+	    IF .string_count LEQ tty_out_width
+	    THEN
+	        $fao_tt_out('output: !ACverify, !ACterminal, !AClogging to !AD', 
+	        .verify_cs, .term_cs, .log_cs, .dbg$gl_lognam[nam$b_rsl], .dbg$gl_lognam[nam$l_rsa])
+	
+	    ELSE
+     		BEGIN
+	        $fao_tt_out('output: !ACverify, !ACterminal, !AClogging to :', 
+			.verify_cs, .term_cs, .log_cs); 
+		$fao_tt_out('!AD', .dbg$gl_lognam[nam$b_rsl], .dbg$gl_lognam[nam$l_rsa]);
+		END;
+	    END
+	
+	ELSE
+	    $fao_tt_out('!AClogging to !AD', .log_cs, .dbg$gl_lognam[nam$b_rsl],
+		        .dbg$gl_lognam[nam$l_rsa]);
+
+    END;
+
+
+END		! End of module
+ELUDOM

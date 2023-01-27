@@ -1,0 +1,1857 @@
+	.TITLE	CONINTERR - Connect to interrupt driver
+	.IDENT	'V03-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; FACILITY:
+;
+;	VAX/VMS Connect to Interrupt Driver
+;
+; ABSTRACT:
+;
+;	This driver has the following pieces:
+;
+;		An FDT routine to process the IO$_CONINTREAD and
+;			IO$_CONINTWRITE functions
+;		A skeletal start device routine
+;		A skeletal device initialization routine
+;		A skeletal interrupt service routine
+;		A skeletal cancel I/O routine
+;
+; AUTHOR:
+;
+;	Carol Peters	20-Aug-1979
+;
+; REVISION HISTORY:
+;
+;	V05	RKS004		R. SPITZ	11-MAR-1980
+;		-Save and restore R9 in CI_ALLOC_ASTS
+;		-Convert argument in R1 to long in CI_ALLOC_ASTS
+;		-Reorder ACB manipulation sequence
+;	V04	NPK0003		N. Kronenberg 	26-Feb-1980
+;		-Remove unnecessary SETIPL 2 in the FDT routine;
+;		-Return SS$_BADPARAM on shared buffer size greater
+;		 than 65767 bytes.
+;		-Fixed failure to allocate ACB's in case AST only
+;		 (no efn) specified. (fix to previous fix)
+;		-Fixed no ACB's now allocated to exit with disconnect
+;		 error instead of success;
+;
+;	V03	NPK0002		N. Kronenberg	22-Feb-1980
+;		-Fixed failure to deallocate more than 1 spte at a time;
+;		-Removed debug hooks;
+;		-Return error on QIO connect while connect in progress;
+;		-Fixed error returns in fork process;
+;		-Fixed comment about IPL in FDT routine.
+;
+;	V02	NPK0001		N. Kronenberg	1-Dec-1979
+;		-Fixed calculation of # of SPTE's to map to process;
+;		-Corrected EXE$DEAL_SPTS to preserve R0;
+;		-Removed requeuing of ACB to device following 
+;		 SCH$QAST failure.
+;		-Fixed bug in storing of AST mode.
+;		-Fixed bug in return of ACB to ACB list.
+;		-Corrected driver name in prologue table.
+;		-Fixed to permit preallocated ACB's when efn
+;		 only (no AST) is specified on interrupt.
+;
+;--
+
+	.SBTTL	External and local symbol definitions
+
+;
+; External symbols
+;
+
+	$ACBDEF				; AST control block
+	$CINDEF				; Connect to interrupt offsets
+	$CRBDEF				; Channel request block
+	$DDBDEF				; Device data block
+	$DPTDEF				; Device prologue table fields
+	$DYNDEF				; Control block types
+	$IDBDEF				; Interrupt data block
+	$IODEF				; I/O function codes
+	$IPLDEF				; Hardware IPL definitions
+	$IRPDEF				; I/O request packet
+	$PCBDEF				; Process control block fields
+	$PRIDEF				; Process priorities
+	$PRVDEF				; User privilege codes
+	$PSLDEF				; Program status longword
+	$PTEDEF				; Page table entry definitions
+	$RBMDEF				; Realtime bit map block
+	$SSDEF				; System status codes
+	$UCBDEF				; Unit control block
+	$VADEF				; Virtual address fields
+	$VECDEF				; Interrupt vector block
+
+;
+; Local symbols
+;
+
+;
+; Argument list (AP) offsets for device-dependent QIO parameters
+;
+
+P1		= 0			; First QIO parameter
+P2		= 4			; Second QIO parameter
+P3		= 8			; Third QIO parameter
+P4		= 12			; Fourth QIO parameter
+P5		= 16			; Fifth QIO parameter
+P6		= 20			; Sixth QIO parameter
+
+BUFFER_DESC	= P1			; Address of descriptor for the
+					; connect to interrupt buffer.
+ENTRY_LIST	= P2			; List of entry points.
+FLAGS		= P3			; Connect to interrupt flags.
+AST_ROUTINE	= P4			; Address of associated AST
+					; routine.
+AST_PARAMETER	= P5			; Address of AST parameter.
+AST_COUNT	= P6			; Number of AST control blocks
+					; to preallocate.
+
+;
+; Added UCB fields for connect to interrupt functions.
+;
+
+	$DEFINI	UCB
+
+	.	= UCB$L_DEVDEPEND	; Set to device dependent field.
+
+$VIELD	UCB,0,<-			; Define characteristics:
+		<CI_EFN,,M>,-		; Set event flag on interrupt.
+		<CI_USECAL,,M>,-	; Use CALL interface.
+		<CI_REPEAT,,M>,-	; Repeat delivery of interrupts.
+		<CI_AST,,M>,-		; Queue AST on interrupt.
+		<CI_INIDEV,,M>,-	; Device init routine present.
+		<CI_START,,M>,-		; Start device routine present.
+		<CI_ISR,,M>,-		; ISR routine present.
+		<CI_CANCEL,,M>,-	; Cancel I/O routine present.
+		<CI_UCBFRK,,M>,-	; Fork on UCB has occurred.
+	>
+
+	.	= UCB$K_LENGTH		; Set offset to end of standard
+					; UCB.
+
+$DEF	UCB$Q_CI_BUFDSC			; Buffer descriptor parameter.
+		.BLKL	1
+		.BLKL	1
+$DEF	UCB$B_CI_ASTMOD			; Mode at which to deliver AST.
+		.BLKB	1
+$DEF	UCB$B_CI_SPARE			; Spare byte.
+		.BLKB	1
+$DEF	UCB$W_CI_EFNUM			; Event flag number.
+		.BLKW	1
+$DEF	UCB$L_CI_AST			; Address of AST routine.
+		.BLKL	1
+$DEF	UCB$L_CI_ASTPRM			; AST parameter.
+		.BLKL	1
+$DEF	UCB$W_CI_ACBCNT			; Number of AST blocks to
+		.BLKW	1		; preallocate.
+$DEF	UCB$W_CI_ACBNOW			; Count of AST blocks currently
+		.BLKW	1		; allocated.
+$DEF	UCB$L_CI_AFLINK			; Forward link to ACB list.
+		.BLKL	1
+$DEF	UCB$L_CI_ABLINK			; Backward link to ACB list.
+		.BLKL	1
+$DEF	UCB$L_CI_PCB			; Address of process' PCB.
+		.BLKL	1
+$DEF	UCB$Q_CI_SPTDSC			; System page table descriptor
+		.BLKL	1		; for user buffer mapping.
+		.BLKL	1		; Stores SPT count and VPN
+					; of starting page of buffer.
+$DEF	UCB$L_CI_INIDEV			; Address of user-specified
+		.BLKL	1		; device initialization routine.
+$DEF	UCB$L_CI_START			; Address of user-specified
+		.BLKL	1		; start device routine.
+$DEF	UCB$L_CI_STACAL			; Address of user-specified
+		.BLKL	1		; start device routine using
+					; CALL interface.
+$DEF	UCB$L_CI_ISR			; Address of user-specified
+		.BLKL	1		; interrupt service routine.
+$DEF	UCB$L_CI_ISRCAL			; Address of user-specified
+		.BLKL	1		; interrupt service routine
+					; using CALL interface.
+$DEF	UCB$L_CI_CANCEL			; Address of user-specified
+		.BLKL	1		; cancel I/O routine.
+
+;
+; The next set of fields must be in exactly the order you see them.
+;
+
+$EQU	UCB$K_CI_STARGC	4		; Number of arguments for
+					; start device routine.
+$DEF	UCB$L_CI_STARGC			; Argument count for start
+		.BLKL	1		; device routine.
+$DEF	UCB$L_CI_STARG1			; First start device argument.
+		.BLKL	1
+$DEF	UCB$L_CI_STARG2			; Second start device argument.
+		.BLKL	1
+$DEF	UCB$L_CI_STARG3			; Third start device argument.
+		.BLKL	1
+$DEF	UCB$L_CI_STARG4			; Fourth start device argument.
+		.BLKL	1
+
+;
+; The next set of fields must be in exactly the order you see them.
+;
+
+$EQU	UCB$K_CI_ISARGC	5		; Number of arguments for
+					; interrupt service routine.
+$DEF	UCB$L_CI_ISARGC			; Argument count for ISR.
+		.BLKL	1
+$DEF	UCB$L_CI_ISARG1			; First argument for ISR.
+		.BLKL	1
+$DEF	UCB$L_CI_ISARG2			; Second argument for ISR.
+		.BLKL	1
+$DEF	UCB$L_CI_ISARG3			; Third argument for ISR.
+		.BLKL	1
+$DEF	UCB$L_CI_ISARG4			; Fourth argument for ISR.
+		.BLKL	1
+$DEF	UCB$L_CI_ISARG5			; Fifth argument for ISR.
+		.BLKL	1
+
+$DEF	UCB$K_CI_LENGTH			; Length of CI UCB.
+
+	$DEFEND	UCB
+
+;
+; Other constants
+;
+
+	.SBTTL	Standard tables
+
+;
+; Driver prologue table
+;
+
+	DPTAB	-				; DPT-creation macro
+		END=CI_END,-			; End of driver label
+		ADAPTER=UBA,-			; Adapter type
+		UCBSIZE=<UCB$K_CI_LENGTH>,-	; Length of UCB
+		NAME=CONINTERR		; Driver name
+	DPT_STORE INIT				; Start of load
+						; initialization table
+	DPT_STORE UCB,UCB$B_FIPL,B,6		; Driver fork IPL
+	DPT_STORE UCB,UCB$B_DIPL,B,22		; Device interrupt IPL
+	DPT_STORE UCB,UCB$L_DEVDEPEND,L,0	; Clear device dependent
+						; bits.
+
+	DPT_STORE REINIT			; Start of reload
+						; initialization table
+	DPT_STORE DDB,DDB$L_DDT,D,CI$DDT	; Address of DDT
+	DPT_STORE CRB,CRB$L_INTD+4,D,-		; Address of interrupt
+		CI_INTERRUPT			; service routine
+	DPT_STORE CRB,-				; Address of controller
+		CRB$L_INTD+VEC$L_INITIAL,-	; initialization routine
+		D,CI_INIT_DEVICE
+	DPT_STORE UCB,UCB$L_CI_INIDEV,D,-	; Address of user's
+		CI_DUMMY_RSB			; device initialization
+						; routine.
+	DPT_STORE UCB,UCB$L_CI_START,D,-	; Address of user's
+		CI_DUMMY_RSB			; start I/O routine.
+	DPT_STORE UCB,UCB$L_CI_ISR,D,-		; Address of user's
+		CI_DUMMY_RSB			; interrupt service
+						; routine.
+	DPT_STORE UCB,UCB$L_CI_CANCEL,D,-	; Address of user's
+		CI_DUMMY_RSB			; cancel I/O routine.
+
+	DPT_STORE END				; End of initialization
+						; tables.
+
+;
+; Driver dispatch table
+;
+
+	DDTAB	-				; DDT-creation macro
+		DEVNAM=CI,-			; Name of device
+		START=CI_START,-		; Start I/O routine
+		FUNCTB=CI_FUNCTABLE,-		; FDT address
+		CANCEL=CI_CANCEL		; Cancel I/O routine
+
+;
+; Function dispatch table
+;
+
+CI_FUNCTABLE:					; FDT for driver
+	FUNCTAB	,-				; Valid I/O functions
+		<CONINTREAD,-			; Connect to interrrupt
+		 CONINTWRITE>			; read and write codes.
+	FUNCTAB	,
+	FUNCTAB	CI_CONNECT,-			; FDT connect to
+		<CONINTREAD,-			; interrupt readonly
+		 CONINTWRITE>			; and write.
+
+	.SHOW	EXPANSIONS
+
+	.SBTTL	CI_INIT_DEVICE, Controller initialization routine
+
+;++
+; CI_INIT_DEVICE, Readies controller for I/O operations
+;
+; Functional description:
+;
+;	The operating system calls this routine in 3 places:
+;
+;		at system startup
+;		during driver loading and reloading
+;		during recovery from a power failure
+;
+;	This routine sets the device online, and marks the device
+;	as the owner of the controller. Then the routine calls a
+;	user-specified device initialization routine. The FDT routine
+;	CI_CONNECT loads a user-specified routine address into the
+;	relevant UCB field.
+;
+;	The selection of the CALLS or JSB path is via a bit setting
+;	in the UCB. When the user's routine is called, R0 contains the
+;	address of the UCB; registers R4-R8 are unchanged; for a CALL
+;	interface, the argument list is as follows:
+;
+;		 0(AP)	- argument count of #5.
+;		 4(AP)	- the address of the CSR
+;		 8(AP)	- the address of the IDB
+;		12(AP)	- the address of the DDB
+;		16(AP)	- the address of the CRB
+;		20(AP)	- the address of the UCB
+;
+; Inputs:
+;
+;	R4	- address of the CSR (controller status register)
+;	R5	- address of the IDB (interrupt data block)
+;	R6	- address of the DDB (device data block)
+;	R8	- address of the CRB (channel request block)
+;
+; Implicit inputs:
+;
+;	UCB$V_CI_USECAL bit is set in UCB$L_DEVDEPEND if the CALLS
+;	interface is desired.
+;
+;	UCB$L_CI_INIDEV contains the address of the user-specified
+;	device initialization routine.
+;
+; Outputs:
+;
+;	The routine must preserve all registers except R0-R3.
+;
+;--
+
+CI_INIT_DEVICE:				; Initialize controller
+
+;
+; Mark the device as online in the UCB, and indicate in the IDB that
+; the device is the owner of the controller.
+;
+
+	MOVL	DDB$L_UCB(R6),R0	; Get address of UCB.
+	BISW	#UCB$M_ONLINE,-		; Mark device online.
+		UCB$W_STS(R0)
+	MOVL	R0,IDB$L_OWNER(R5)	; Set device as controller
+					; owner.
+
+;
+; Now call the user-specified device initialization routine.
+;
+
+	BBC	#UCB$V_CI_USECAL,-	; Branch to JSB code if user
+		UCB$L_DEVDEPEND(R0),10$	; didn't request CALL interface.
+
+;
+; Load the input registers onto the argument stack and CALLS the
+; user-specified initialization routine.
+;
+
+	PUSHL	R0			; Push address of UCB.
+	PUSHL	R8			; Push address of CRB.
+	PUSHL	R6			; Push address of DDB.
+	PUSHL	R5			; Push address of IDB.
+	PUSHL	R4			; Push address of CSR.
+	CALLS	#5,@UCB$L_CI_INIDEV(R0)	; Call user-specified device
+					; initialization routine.
+	RSB				; Return.
+
+;
+; Just JSB to the user-specified initialization routine.
+;
+
+10$:					; JSB path.
+	JSB	@UCB$L_CI_INIDEV(R0)	; JSB to user-specified device
+					; initialization routine.
+	RSB				; Return.
+
+	.SBTTL	CI_CONNECT, Connect the process to an interrupt
+
+;++
+; CI_CONNECT, FDT routine that establishes an interrupt handler
+;
+; Functional description:
+;
+;	This routine gains control at IPL IPL$_ASTDEL.
+;
+;	This routine puts the process in control of the device in the
+;	following steps:
+;
+;	1. Validate and clear the event flag.
+;	2. If the buffer descriptor describes a non-zero length buffer,
+;	   check access to entry point list, confirm that process has
+;	   CMKRNL privilege, and lock buffer pages in memory.
+;	3. Double map the buffer to system space.
+;	4. Setup for CIDRIVER calling of process-supplied kernel mode
+;	   routines for device control.
+;	5. If the address of an AST routine is supplied, allocate
+;	   and initialize a specified number of AST control blocks.
+;	6. Queue the IRP to the driver; this activates the driver's
+;	   start I/O routine, which passes control to the process-start
+;	   I/O routine (if any).
+;
+; Inputs:
+;
+;	R0-R2	- scratch registers
+;	R3	- address of the IRP (I/O request packet)
+;	R4	- address of the PCB (process control block)
+;	R5	- address of the UCB (unit control block)
+;	R6	- address of the CCB (channel control block)
+;	R7	- bit number of the I/O function code
+;	R8	- address of the FDT table entry for this routine
+;	R9-R11	- scratch registers
+;	AP	- address of the 1st function dependent QIO parameter
+;
+;	6 parameters can be specified; they are as follows:
+;
+;		BUFFER_DESC(AP)		- buffer descriptor
+;		ENTRY_LIST(AP)		- address of entry point list
+;		FLAGS(AP)		- flags
+;			low word is pure flags
+;			high word is event flag number
+;		AST_ROUTINE(AP)		- AST address
+;		AST_PARAMETER(AP)	- AST parameter
+;		AST_COUNT(AP)		- count of AST control blocks
+;					  to preallocate
+;
+;	The ENTRY_LIST parameter is the address of a 4-longword block
+;	that contains offsets into the user buffer:
+;
+;		CIN$L_INIDEV	- offset to device init routine
+;		CIN$L_START	- offset to start device routine
+;		CIN$L_ISR	- offset to interrupt service routine
+;		CIN$L_CANCEL	- offset to cancel I/O routine
+;
+;	The FLAGS parameter has the following flags settings:
+;
+;		CIN$M_EFN	- set event flag on interrupt
+;		CIN$M_USECAL	- use a CALLS interface to user routines
+;		CIN$M_REPEAT	- repeatedly report interrupts
+;		CIN$M_AST	- queue AST on interrupt
+;		CIN$M_INIDEV	- initialize device routine in buffer
+;		CIN$M_START	- start device routine in buffer
+;		CIN$M_ISR	- interrupt service routine in buffer
+;		CIN$M_CANCEL	- cancel I/O routine in buffer
+;
+;		CIN$V_EFNUM	- offset to event flag number
+;		CIN$S_EFNUM	- size of event flag number field
+;
+; Outputs:
+;
+;	The routine must preserve all registers except R0-R2, and
+;	R9-R11.
+;
+;--
+
+CI_CONNECT:				; Establish a handler.
+	MOVZWL	#SS$_DISCONNECT,R0	; Assume connect in progress
+	BBS	#UCB$V_BSY,-		; Branch if connect
+		UCB$W_STS(R5),10$	; is in progress.
+	MOVL	R4,UCB$L_CI_PCB(R5)	; Save the process PCB.
+	MOVW	FLAGS(AP),-		; Store flags bits in the UCB.
+		UCB$L_DEVDEPEND(R5)
+
+;
+; Force the AST wanted flag to agree with whether an AST address
+; was specified by the caller.
+;
+
+	BICW	#UCB$M_CI_AST,-		; Assume AST's not wanted.
+		UCB$L_DEVDEPEND(R5)	;
+	TSTL	AST_ROUTINE(AP)		; AST addr specified?
+	BEQL	5$			; Branch if not.
+	BISW	#UCB$M_CI_AST,-		; Else force AST bit set.
+		UCB$L_DEVDEPEND(R5)	;
+
+5$:
+
+;
+; If the user specified an event flag to be posted in the event of an
+; interrupt, clear the event flag, thereby checking for an invalid
+; event flag specification.
+;
+
+	BBC	#CIN$V_EFN,FLAGS(AP),-	; Don't check event flag unless
+		20$			; requested.
+	PUSHR	#^M<R3>			; Save the IRP address.
+	EXTZV	#CIN$V_EFNUM,-		; Extract the event flag
+		#CIN$S_EFNUM,-		; number from the high flags
+		FLAGS(AP),R3		; word.
+	MOVW	R3,UCB$W_CI_EFNUM(R5)	; Store event flag number in
+					; the UCB.
+	JSB	G^SCH$CLREF		; Clear and test event flag.
+	POPR	#^M<R3>			; Restore IRP address.
+	BLBS	R0,20$			; Branch forward on success.
+10$:	BRW	ERROR			; Stop with error.
+
+;
+; See if the user specified a buffer. If yes, and the buffer is of
+; a finite length, go on to look at the entry point list. Otherwise,
+; just proceed to AST setup code.
+;
+
+20$:
+	CLRQ	UCB$Q_CI_SPTDSC(R5)	; Clear buffer descriptor in
+					; UCB.
+	MOVL	BUFFER_DESC(AP),R10	; Get buffer descriptor.
+	BEQL	30$			; Branch if no descriptor.
+	TSTW	(R10)			; Is buffer non zero length?
+	BNEQ	40$			; Yes. Go check entry list.
+
+30$:
+	BRW	SETUP_ASTS		; Skip access checks if length
+
+;
+; Return error if buffer size exceeds 65767 bytes.
+;
+
+40$:
+	MOVZWL	#SS$_BADPARAM,R0	; Assume error.
+	CMPL	(R10),#^XFFFF		; Byte count .ge. 65767?
+	BGTR	10$			; Branch if so.
+
+;
+; Validate read access to the entry point list.
+;
+
+	MOVZWL	#SS$_ACCVIO,R0		; Assume read access failure.
+	MOVL	ENTRY_LIST(AP),R11	; Get address of entry list.
+	IFRD	#4*4,(R11),50$		; Branch forward if process has
+					; read access to list.
+	BRW	ERROR			; Otherwise, stop with error.
+
+;
+; Check for change mode to kernel privilege, without which, executing
+; a routine in kernel mode (either as an ISR, device initialization,
+; etc.) is not permitted.
+;
+
+50$:
+	MOVZWL	#SS$_NOPRIV,R0		; Assume privilege violation.
+	IFPRIV	CMKRNL,LOCK_PAGES	; If process is sufficiently
+					; privileged, proceed.
+	BRW	ERROR			; Otherwise, stop now.
+
+;
+; Lock down the user pages so they can't be paged out during interrupt
+; servicing.
+;
+; The register setup before calling VMS to lock the pages is as follows:
+;
+;	R0	- buffer address
+;	R1	- buffer length in bytes
+;	R3	- address of the IRP
+;	R4	- address of the PCB
+;	R6	- address of the CCB
+;	R11	- entry list address
+;
+; The locking routines return the address of the page table entry for
+; the first page in the user's buffer in R1 and in IRP$L_SVAPTE.
+;
+
+LOCK_PAGES:
+	MOVZWL	(R10),R1		; Get buffer length.
+	MOVL	4(R10),R0		; Get buffer address.
+	EXTZV	#IRP$V_FCODE,-		; Get the function code.
+		#IRP$S_FCODE,-
+		IRP$W_FUNC(R3),R9
+	CMPL	#IO$_CONINTWRITE,R9	; Is it a write?
+	BEQL	10$			; Yes, branch to write lock.
+	JSB	G^EXE$WRITELOCK		; Otherwise, check for read
+					; access and lock pages.
+	BRB	DOUBLE_MAP		; The routine only returns if
+					; successful; branch forward.
+
+10$:
+	JSB	G^EXE$MODIFYLOCK	; Check for modify access and
+					; lock pages. Only return is
+					; success. Failure aborts or
+					; backs out I/O request to wait
+					; for paging activity.
+
+;
+; Double map the buffer into system page table entries. If SPTs are not
+; available, return with error (I/O post will unlock the pages).
+;
+
+DOUBLE_MAP:
+	MOVAB	UCB$Q_CI_SPTDSC(R5),R2	; Get address in UCB where
+					; the SPT descriptor will go.
+	MOVZWL	(R10),R0		; Get # bytes to double map
+	EXTZV	#0,#9,4(R10),R1		; Get byte offset of buffer
+	MOVAB	^X1FF(R0)[R1],R0	; Compute # of bytes to map
+	ASHL	#-9,R0,-		; Convert # bytes to pages
+		CIN$L_SPTCOUNT(R2)	;
+
+10$:
+	DSBINT	UCB$B_FIPL(R5)		; Raise to driver fork IPL.
+	JSB	G^EXE$ALLOC_SPTS	; Allocate the SPTs.
+	BLBS	R0,20$			; Branch forward on success.
+	ENBINT				; Drop IPL back down.
+	BRW	ERROR			; Otherwise, stop with error.
+
+;
+; R2 now contains a descriptor:
+;
+;	CIN$L_SPTCOUNT(R2)	- number of SPTs allocated
+;	CIN$L_STARTVPN(R2)	- starting virtual page number (VPN)
+;
+; Set up the SPTs to address the user buffer. Any errors from now on
+; must unlock pages and deallocate the SPTs.
+;
+
+20$:
+	MOVL	4(R10),R1		; Get address of user buffer.
+	MOVL	#<PTE$C_KW>,R0		; Set write access mask.
+	CMPL	R4,#IO$_CONINTREAD	; Is this a read?
+	BNEQ	30$			; No. Branch forward.
+	MOVL	#<PTE$C_KR>,R0		; Otherwise, restrict to kernel
+					; read.
+
+30$:
+	BISL	#PTE$M_VALID,R0		; Set valid bit too.
+	JSB	G^EXE$SETUP_SPTS	; Set up the SPTs.
+	ENBINT				; Drop IPL back down.
+
+;
+; IPL is now back at 0.
+;
+; Get system-mapped address of the user buffer. Registers are:
+;
+;	R1	- process address of the user's buffer
+;	R2	- quadword-descriptor of the SPT count and starting VPN
+;	
+
+	ASHL	#9,CIN$L_STARTVPN(R2),-	; Convert VPN to system
+		R9			; virtual address.
+	INSV	R1,#VA$V_BYTE,-		; Add byte offset into page.
+		#VA$S_BYTE,R9
+	BISL	#VA$M_SYSTEM,R9		; Set the system bit.
+
+;
+; Write proper addresses into driver's
+;
+;	device initialization routine
+;	start device routine
+;	interrupt service routine
+;	cancel I/O routine
+;
+; Registers used in the following setup are as listed below:
+;
+;	R2	- offset to routine in user buffer
+;	R4	- address of the CRB
+;	R5	- address of the UCB
+;	R9	- system-mapped address of the user buffer
+;	R11	- address of the entry point list
+;
+
+SETUP_ENTRIES:
+	MOVL	UCB$L_CRB(R5),R4	; Get CRB address.
+
+;
+; Set up for device initialization routine.
+;
+
+	BBC	#CIN$V_INIDEV,-		; Branch forward if no device
+		FLAGS(AP),10$		; initialization specified.
+	ADDL3	CIN$L_INIDEV(R11),R9,-	; Set up device initialization
+		UCB$L_CI_INIDEV(R5)	; routine address.
+
+;
+; Set up for start I/O routine.
+;
+
+10$:
+	BBC	#CIN$V_START,-		; Branch forward if no start
+		FLAGS(AP),40$		; device routine specified.
+	BBC	#CIN$V_USECAL,-		; Branch forward if not a
+		FLAGS(AP),20$		; CALL interface.
+	ADDL3	CIN$L_START(R11),R9,-	; Otherwise, store user start
+		UCB$L_CI_STACAL(R5)	; device address.
+	MOVAB	CI_START_CALL,-		; And store internal label as
+		UCB$L_CI_START(R5)	; JSB address.
+	BRB	30$			; Go create argument list.
+
+20$:					; Normal JSB setup.
+	ADDL3	CIN$L_START(R11),R9,-	; Set up device start up
+		UCB$L_CI_START(R5)	; routine address.
+
+;
+; Setup canned argument list for the start device routine.
+;
+
+30$:
+	MOVL	#UCB$K_CI_STARGC,-	; Save count of canned
+		UCB$L_CI_STARGC(R5)	; argument list.
+	MOVL	R9,UCB$L_CI_STARG1(R5)	; Start I/O canned list is:
+	MOVL	R3,UCB$L_CI_STARG2(R5)	;	buffer address, IRP
+	MOVL	@CRB$L_INTD+VEC$L_IDB(R4),-;	address, device CSR
+		UCB$L_CI_STARG3(R5)	;	address, and
+	MOVL	R5,UCB$L_CI_STARG4(R5)	;	the UCB address.
+
+;
+; Setup for interrupt service routine.
+;
+
+40$:
+	BBC	#CIN$V_ISR,FLAGS(AP),-	; Branch forward if no ISR
+		70$			; was specified.
+	BBC	#CIN$V_USECAL,-		; Branch forward if not a
+		FLAGS(AP),50$		; CALL interface.
+	ADDL3	CIN$L_ISR(R11),R9,-	; Otherwise, store user ISR
+		UCB$L_CI_ISRCAL(R5)	; address.
+	MOVAB	CI_ISR_CALL,-		; And store internal label as
+		UCB$L_CI_ISR(R5)	; JSB address.
+	BRB	60$			; Branch to build argument list.
+
+50$:					; Normal JSB setup.
+	ADDL3	CIN$L_ISR(R11),R9,-	; Set up interrupt service
+		UCB$L_CI_ISR(R5)	; routine address.
+
+;
+; Setup the canned argument list for the interrupt service routine.
+;
+
+60$:
+	MOVL	#UCB$K_CI_ISARGC,-	; Load count for the canned
+		UCB$L_CI_ISARGC(R5)	; argument list; then load
+	MOVL	R9,UCB$L_CI_ISARG1(R5)	;	buffer address,
+	MOVAL	UCB$L_CI_ASTPRM(R5),-	;	AST parameter address,
+		UCB$L_CI_ISARG2(R5)
+
+	.NOSHOW	EXPANSIONS
+
+	ASSUME	IDB$L_CSR EQ 0
+	MOVL	@CRB$L_INTD+VEC$L_IDB(R4),-
+		UCB$L_CI_ISARG3(R5)	;	device CSR address,
+
+	.SHOW	EXPANSIONS
+
+	MOVL	CRB$L_INTD+VEC$L_IDB(R4),-;	the IDB address,
+		UCB$L_CI_ISARG4(R5)	;	and
+	MOVL	R5,UCB$L_CI_ISARG5(R5)	;	the UCB address.
+
+;
+; Setup for the cancel I/O routine.
+;
+
+70$:
+	BBC	#CIN$V_CANCEL,-		; Branch forward if no cancel
+		FLAGS(AP),80$		; I/O routine was specified.
+	ADDL3	CIN$L_CANCEL(R11),R9,-	; Set up device cancel I/O
+		UCB$L_CI_CANCEL(R5)	; routine address.
+
+80$:
+	MOVQ	@BUFFER_DESC(AP),-	; Store process-mapped buffer
+		UCB$Q_CI_BUFDSC(R5)	; descriptor too.
+
+;
+; Allocate some blocks to be used as AST control blocks. The allocation
+; raises IPL to IPL$_ASTDEL to prevent process deletion and subsequent
+; loss of pool.
+;
+
+SETUP_ASTS:
+
+	.NOSHOW	EXPANSIONS
+
+	ASSUME	UCB$W_CI_ACBNOW EQ UCB$W_CI_ACBCNT+2
+	CLRL	UCB$W_CI_ACBCNT(R5)	; Note that no ACBs are needed
+					; or allocated at present.
+
+	.SHOW	EXPANSIONS
+
+	MOVAB	UCB$L_CI_AFLINK(R5),-	; Initialize the UCB AST block
+		UCB$L_CI_AFLINK(R5)	; queue to point to itself.
+	MOVAB	UCB$L_CI_AFLINK(R5),-	; Ditto.
+		UCB$L_CI_ABLINK(R5)
+	BITW	#UCB$M_CI_EFN!UCB$M_CI_AST,- ; Efn or AST
+		UCB$L_DEVDEPEND(R5)	; requested?
+	BEQL	QUEUE_PACKET		; Branch if not.
+	MOVZWL	#SS$_BADPARAM,R0	; Assume error in AST count.
+	MOVZWL	AST_COUNT(AP),R1	; Get AST count.
+	CMPL	AST_COUNT(AP),R1	; Value within word boundaries?
+	BEQL	10$			; Yes. Branch forward.
+	BRW	ERROR_DEALSPTS		; Otherwise, exit with error.
+
+10$:
+	TSTL	R1			; See if error count valid.
+	BGEQ	20$			; Branch if positive or zero.
+	BRW	ERROR_DEALSPTS		; Don't allow negative count.
+
+20$:
+	BGTR	30$			; Branch if positive count.
+	MOVL	#1,R1			; Otherwise, assume 1 AST block.
+30$:
+	BISW	#UCB$M_CI_REPEAT,-	; Set the repeat bit in the UCB.
+		UCB$L_DEVDEPEND(R5)
+	MOVZWL	#SS$_EXQUOTA,R0		; Assume AST quota is too low.
+	MOVL	UCB$L_CI_PCB(R5),R4	; Restore PCB address.
+	CMPW	R1,PCB$W_ASTCNT(R4)	; Compare AST count with
+					; quota left.
+	BLEQ	40$			; Branch forward if enough.
+	BRW	ERROR_DEALSPTS		; Otherwise, stop with error.
+
+;
+; Save the mode of the requesting mode in the UCB. Then allocate and
+; initialize all the AST packets.
+;
+
+40$:
+	MOVPSL	R0			; Get the PSL.
+	EXTZV	#PSL$V_PRVMOD,-		; Get process' mode from the
+		#PSL$S_PRVMOD,R0,R0	; Get process' mode from PSL
+	MOVB	R0,UCB$B_CI_ASTMOD(R5)	; and store in the UCB.
+
+	.NOSHOW	EXPANSIONS
+
+	ASSUME	AST_PARAMETER EQ AST_ROUTINE+4
+	MOVQ	AST_ROUTINE(AP),-	; Save the address of the AST
+		UCB$L_CI_AST(R5)	; routine and parameter in the
+					; UCB.
+
+	.SHOW	EXPANSIONS
+
+	MOVW	R1,UCB$W_CI_ACBCNT(R5)	; Save the number of ACBs
+					; requested.
+	BSBW	CI_ALLOC_ASTS		; Allocate and initialize all
+					; AST control blocks.
+	BLBS	R0,QUEUE_PACKET		; Branch forward on error.
+
+;
+; If AST allocation and initialization failed, let it go unless the
+; failure prevented even a single packet from being allocated. In the
+; latter case, exit with error status from the connect.
+;
+
+	CMPL	AST_COUNT(AP),R1	; Any AST blocks allocated?
+	BEQL	ERROR_DEALSPTS		; No. Exit with error.
+
+;
+; Transfer control to an executive routine that queues the IRP or
+; starts the driver in its start I/O routine. When the driver RSBs,
+; the QIO completes by returning a success status to the process.
+;
+
+QUEUE_PACKET:				; Queue packet to driver.
+	MOVL	UCB$L_CI_PCB(R5),R4	; Restore PCB address.
+	JMP	G^EXE$QIODRVPKT		; Send packet to driver.
+
+;
+; Error return. The instructions below assumes that an error status
+; code is stored in R0.
+;
+; This outermost error condition happens after SPTs are allocated. The
+; SPTs must be deallocated.
+;
+
+ERROR_DEALSPTS:
+	MOVAQ	UCB$Q_CI_SPTDSC(R5),R2	; Get SPT descriptor.
+	DSBINT	UCB$B_FIPL(R5)		; Raise to driver fork IPL.
+	JSB	G^EXE$DEAL_SPTS		; Deallocate SPTs.
+	ENBINT				; Drop IPL back down.
+
+;
+; This is a simple error. Just restore registers and return to caller
+; with status.
+;
+
+ERROR:
+	MOVL	UCB$L_CI_PCB(R5),R4	; Restore PCB address.
+	JMP	G^EXE$ABORTIO		; Exit to QIO common code.
+
+	.SBTTL	CI_ALLOC_ASTS, Obtain and setup ASTs for process.
+
+;++
+; CI_ALLOC_ASTS - Set up some AST control blocks
+;
+; Functional description:
+;
+;	This routine gains control at IPL$_ASTDEL or at driver fork
+;	IPL.
+;
+;	This subroutine allocates and writes initial values into AST
+;	control blocks. Both the FDT routine and the driver fork process
+;	call this subroutine.
+;
+; Inputs:
+;
+;	R1	- number of AST control blocks to set up
+;	R4	- address of the process' PCB
+;	R5	- address of the UCB
+;
+; Implicit inputs:
+;
+;	UCB$L_CI_ABLINK	- backward link into the UCB AST queue
+;	UCB$B_FIPL	- fork IPL of the driver
+;	PCB$W_ASTCNT	- number of ASTs left in process' quota
+;
+;	#ACB$K_LENGTH	- length of an ACB
+;	#DYN$C_ACB	- block type of an ACB
+;
+; Outputs:
+;
+;	R0	- status code:
+;
+;			SS$_NORMAL	- success
+;			SS$_INSFMEM	- insufficient nonpaged pool
+;
+;	R1	- number of blocks not allocated
+;	R2	- Contents destroyed
+;
+;	The subroutine preserves the contents of all other registers.
+;
+; Implicit outputs:
+;
+;	UCB$W_CI_ACBNOW records the number of ACBs currently allocated
+;	to the process.
+;
+;--
+
+CI_ALLOC_ASTS:
+	PUSHR	#^M<R3,R9>		;Save volital registers
+	MOVZWL	R1,R9			;Convert to long number blocks to get
+
+;
+; If quota permits, try to allocate another block. Exit on failure.
+;
+
+LOOP:
+	MOVZWL	#SS$_EXQUOTA,R0		; Assume quota exhaustion error.
+	TSTW	PCB$W_ASTCNT(R4)	; Any AST quota left?
+	BEQL	10$			; No. Return with error.
+	MOVL	#ACB$K_LENGTH,R1	; Set up block size.
+	JSB	G^EXE$ALONONPAGED	; Allocate that block.
+	BLBC	R0,10$			; Branch forward if error.
+
+;
+; A block is allocated. Decrement quota; increment count allocated in
+; the UCB, link the block into the ACB queue, and initialize the block.
+;
+
+	DECW	PCB$W_ASTCNT(R4)	; Decrement AST quota.
+	MOVB	#DYN$C_ACB,-		;LOAD ACB TYPE FIELD
+		ACB$B_TYPE(R2)
+	MOVB	UCB$B_FIPL(R5),-	;LOAD FORK IPL
+		ACB$B_RMOD(R2)
+	INSQUE	ACB$L_ASTQFL(R2),-	;INSERT NEW ACB IN THE QUE
+		@UCB$L_CI_ABLINK(R5)	;
+	INCW	UCB$W_CI_ACBNOW(R5)	;INCR NUMBER ALLOCATED
+
+;
+; See if more blocks to initialize. If not, just return to caller.
+;
+
+	SOBGTR	R9,LOOP			; Loop back if not done yet.
+	MOVZWL	#SS$_NORMAL,R0		; Set up success status code.
+
+10$:
+	MOVL	R9,R1			;Restore number of blocks left
+	POPR	#^M<R3,R9>		;Restore saved registers
+	RSB				; Return.
+
+	.SBTTL	CI_START, Start I/O routine
+
+;++
+; CI_START - Start the device.
+;
+; Functional description:
+;
+;	When this routine gains control, IPL is at driver fork level.
+;
+;	This routine obtains the address of an argument list from the
+;	UCB, and then JSBs to a user-specified start device routine.
+;	If the user requested a CALL interface, the JSB transfers
+;	control to the label CI_START_CALL (in this routine), which
+;	actually executes the CALLG to the user-specified routine.
+;		
+;	When the user routine is called, the following inputs apply:
+;
+;		R2	- points to counted argument list
+;		R3	- address of the IRP
+;		R5	- address of the UCB
+;
+;		the counted argument list is as follows:
+;
+;		 0(R2)	- the argument count (4)
+;		 4(R2)	- the system-mapped user buffer address
+;		 8(R2)	- the IRP address
+;		12(R2)	- the system-mapped address of the device's CSR
+;		16(R2)	- the UCB address
+;
+; Inputs:
+;
+;	R3	- address of the IRP (I/O request packet)
+;	R5	- address of the UCB (unit control block)
+;
+; Implicit inputs:
+;
+;	The prepared argument list for a CALLG is at UCB$L_CI_STARGC.
+;
+;	The address of the user-specified start device routine needing
+;	a CALL interface is at UCB$L_CI_STACAL.
+;
+; Outputs:
+;
+;	R0	- 1st longword of I/O status: contains status code and
+;		  number of bytes transferred
+;	R1	- 2nd longword of I/O status: device-dependent
+;
+;	The routine must preserve all registers except R0-R2 and R4.
+;
+;--
+
+CI_START:				; Start the device.
+	MOVAB	UCB$L_CI_STARGC(R5),R2	; Get address of argument block.
+	JSB	@UCB$L_CI_START(R5)	; JSB indirect through UCB to
+					; a start device routine.
+	RSB				; Then return.
+
+;
+; Use the CALL interface.
+;
+
+CI_START_CALL:
+	CALLG	(R2),-			; Call the user's start device
+		@UCB$L_CI_STACAL(R5)	; routine.
+					; routine.
+	RSB				; Return.
+
+	.SBTTL	CI_INTERRUPT, Interrupt service routine
+
+;++
+; CI_INTERRUPT, Analyzes interrupts, processes solicited interrupts
+;
+; Functional description:
+;
+;	When this routine gains control, IPL is at device fork level.
+;
+;	This routine obtains the address of an argument list from the
+;	UCB, and then JSBs to a user-specified interrupt service 
+;	routine. If the user requested a CALL interface, the JSB
+;	transfers control to the label CI_ISR_CALL (in this routine),
+;	which actually executes the CALLG to the user-specified routine.
+;
+;	When the user's interrupt service routine gains control, the
+;	following inputs apply:
+;
+;		R2	- address of counted argument list
+;		R4	- address of the IDB
+;		R5	- address of the UCB
+;
+;		the counted argument list is as follows:
+;
+;		 0(R2)	- count of arguments (5)
+;		 4(R2)	- the system-mapped address of the user buffer
+;		 8(R2)	- the address of the AST parameter
+;		12(R2)	- the system-mapped address of the device's CSR
+;		16(R2)	- the address of the IDB
+;		20(R2)	- the address of the UCB
+;
+;	When the user's interrupt service routine returns, this ISR
+;	checks the status code in R0. A success status results in the
+;	creation of a fork process to set an event flag or queue an AST
+;	to the process. A low-bit-clear status causes immediate
+;	dismissal of the interrupt.
+;
+;	The fork block queued is either an ACB from the queue in the
+;	UCB, or the UCB itself. In the latter case, a bit is set to
+;	force a disconnect from the interrupt since no ACBs are left to
+;	permit further forking or further AST queuing.
+;
+;	The fork process is described further below.
+;
+; Inputs:
+;
+;	 0(SP)	- pointer to the address of the IDB (interrupt data
+;		  block)
+;	 4(SP)	- saved R0
+;	 8(SP)	- saved R1
+;	12(SP)	- saved R2
+;	16(SP)	- saved R3
+;	20(SP)	- saved R4
+;	24(SP)	- saved R5
+;	28(SP)	- saved PSL (program status longword)
+;	32(SP)	- saved PC
+;
+;	The IDB contains the CSR address and the UCB address.
+;
+; Implicit inputs:
+;
+;	The prepared argument list for a CALLG is at UCB$L_CI_ISARGC.
+;
+;	The address of the user-specified interrupt service routine
+;	needing a CALL interface is at UCB$L_ISRCAL.
+;
+; Outputs:
+;
+;	The routine must preserve all registers except R0-R5.
+;
+;--
+
+CI_INTERRUPT:				; Service device interrupt
+	MOVL	@(SP)+,R4		; Get address of IDB and remove
+					; pointer from stack.
+	MOVL	IDB$L_OWNER(R4),R5	; Get address of device owner's
+					; UCB.
+	MOVAB	UCB$L_CI_ISARGC(R5),R2	; Get argument list address.
+	JSB	@UCB$L_CI_ISR(R5)	; JSB to user-routine.
+	BLBS	R0,CHECK_AST		; Branch to fork on success.
+
+;
+; Restore registers and dismiss the interrupt.
+;
+
+DISMISS_INT:
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore 6 registers.
+	REI				; Return from interrupt.
+
+;
+; Use the CALL interface. The return is to the JSB 5 lines earlier.
+;
+
+CI_ISR_CALL:
+	CALLG	(R2),-			; Call the user's ISR.
+		@UCB$L_CI_ISRCAL(R5)
+	RSB				; Return to JSB caller above.
+
+;
+; See whether an AST delivery is required.
+;
+
+CHECK_AST:
+	BITW	#UCB$M_CI_AST!UCB$M_CI_EFN,- ; AST or efn requested?
+		UCB$L_DEVDEPEND(R5)	
+	BEQL	DISMISS_INT		; Branch if not.
+
+10$:
+	MOVL	R5,R3			; Save UCB address.
+	REMQUE	@UCB$L_CI_AFLINK(R3),R5	; Get the address of an ACB.
+	BVC	20$			; If ACB found, branch forward.
+	MOVL	R3,R5			; Restore UCB address to R5.
+	BBSS	#UCB$V_CI_UCBFRK,-	; Set the "forking on UCB" bit
+		UCB$L_DEVDEPEND(R5),-	; in UCB, and, if already set,
+		DISMISS_INT		; just go dismiss the interrupt.
+
+;
+; Create the fork process.
+;
+
+20$:
+	PUSHAB	DISMISS_INT		; Put a return address on stack.
+	FORK				; Create a fork process.
+
+	.SBTTL	CI_FORK_PROCESS - Queues ASTs and sets event flags
+
+;++
+; CI_FORK_PROCESS - Fork process created after an interrupt
+;
+; Functional description:
+;
+;	The fork process, according to flag settings in the UCB, queues
+;	an AST to the process, sets an event flag for the process,
+;	replenishes the ACB supply to anticipate future interrupts,
+;	and, in the event of errors, disconnects the device from the
+;	process.
+;
+; Inputs:
+;
+;	R3	- address of the UCB
+;	R5	- address of the AST/fork control block
+;
+; Outputs:
+;
+;	The routine may destroy R0-R5, but must preserve all other
+;	registers.
+;
+;	In the event of an error, this routine sets up the following
+;	registers and branches into the cancel I/O code:
+;
+;		R3	- address of the IRP
+;		R4	- address of the PCB
+;		R5	- address of the UCB
+;
+;--
+
+CI_FORK_PROCESS:
+	MOVL	UCB$L_CI_PCB(R3),R4	; Get address of owner PCB.
+	CMPB	#DYN$C_UCB,-		; Is this a UCB fork block?
+		ACB$B_TYPE(R5)
+	BNEQ	10$			; Branch if not.
+	BRW	70$			; Else go disconnect device
+					; from process
+10$:
+	BBC	#UCB$V_CI_AST,-		; If no AST needs queuing,
+		UCB$L_DEVDEPEND(R3),20$	; just branch forward.
+
+;
+; Set up the AST control block and queue the AST to the process.
+;
+
+	MOVL	#PRI$_IOCOM,R2		; Set priority increment class.
+	MOVB	UCB$B_CI_ASTMOD(R3),-	; Load AST delivery mode into
+		ACB$B_RMOD(R5)		; AST block.
+	BISB	#ACB$M_QUOTA,-		; Set the bit that causes AST
+		ACB$B_RMOD(R5)		; delivery code to return quota.
+	MOVL	PCB$L_PID(R4),-		; Store PID in the AST block.
+		ACB$L_PID(R5)
+
+	.NOSHOW	EXPANSIONS
+
+	ASSUME	UCB$L_CI_ASTPRM EQ UCB$L_CI_AST+4
+	ASSUME	ACB$L_ASTPRM EQ ACB$L_AST+4
+	MOVQ	UCB$L_CI_AST(R3),-	; Store AST routine address and
+		ACB$L_AST(R5)		; parameter.
+
+	.SHOW	EXPANSIONS
+
+	PUSHR	#^M<R3,R4>		; Save UCB and PCB addresses.
+	JSB	G^SCH$QAST		; Queue the AST to the process.
+	POPR	#^M<R3,R4>		; Restore UCB and PCB addresses.
+	BLBS	R0,15$			; Branch forward on success.
+
+;
+; AST QUEUING FAILED.  DISCONNECT DEVICE FROM PROCESS.
+;
+
+	MOVL	R3,R5			; Load UCB address into R5.
+	BRB	IO_COMPLETE		; Go disconnect device.
+
+15$:					; An AST was actually queued.
+	DECW	UCB$W_CI_ACBNOW(R3)	; Decrement current ACB count.
+
+;
+; If an event flag was specified, post the event flag.
+;
+
+20$:
+	PUSHL	R5			; Save fork block address.
+	MOVL	R3,R5			; Move UCB address into R5.
+	BBC	#UCB$V_CI_EFN,-		; Any event flag specified?
+		UCB$L_DEVDEPEND(R5),30$	; Branch forward if none.
+	MOVL	#PRI$_IOCOM,R2		; Set priority increment class.
+	MOVL	PCB$L_PID(R4),R1	; Get PID address.
+	MOVZWL	UCB$W_CI_EFNUM(R5),R3	; Get event flag number.
+	JSB	G^SCH$POSTEF		; Go set the event flag.
+	BLBS	R0,30$			; Branch if efn post succeeded
+	BRB	90$			; Else disconnect process.
+
+;
+; If the user only asked for a single AST delivery or a single
+; interrupt, go disconnect the device from the process, and thus
+; complete the connect to interrupt I/O request.
+;
+
+30$:	
+	BBC	#UCB$V_CI_REPEAT,-	; Branch if user specified
+		UCB$L_DEVDEPEND(R5),80$	; only one AST/event flag
+					; be delivered.
+	POPL	R0			; Restore fork block addr.
+
+;
+; If the AST was queued to the process, then go ahead and allocate
+; a replacement block. Otherwise, relink the ACB used as a fork block
+; back into the UCB ACB queue.
+;
+
+	BBS	#UCB$V_CI_AST,-		; Branch forward if an AST
+		UCB$L_DEVDEPEND(R5),50$	; was queued.
+	INSQUE	ACB$L_ASTQFL(R0),-	; Otherwise, relink the ACB
+		@UCB$L_CI_ABLINK(R5)	; back into the UCB queue.
+	RSB				; And exit from fork process.
+
+;
+; Replenish the number of available ACBs, and initialize them. If no
+; pool is available, let the replenishment happen on the next interrupt.
+; If no ACBs are left, the next interrupt will force an I/O completion
+; because only one fork on the UCB is possible.
+;
+
+50$:
+	SUBW3	UCB$W_CI_ACBNOW(R5),-	; See how many ACBs need to be
+		UCB$W_CI_ACBCNT(R5),R1	; allocated.
+	BSBW	CI_ALLOC_ASTS		; Initialize the blocks.
+	BLBS	R0,60$			; Branch forward on success.
+
+;
+; Some failure occurred in attempting to replenish the ACBs. If no ACBs
+; are currently allocated, disconnect the device from the process
+; because no other interrupts can be handled.
+;
+
+	TSTW	UCB$W_CI_ACBNOW(R5)	; Any ACBs allocated?
+	BEQL	70$			; No. Disconnect the process.
+
+60$:
+	RSB				; Return.
+
+;
+; The UCB was used as a fork block. Load the disconnect error code into
+; R0 before disconnecting the process.
+;
+
+70$:
+	MOVZWL	#SS$_DISCONNECT,R0	; Setup status code.
+	BRB	IO_COMPLETE		; Complete disconnect.
+
+;
+; Only a single AST or event flag was requested.  Set status
+; to success, clean stack, and disconnect.
+;
+
+80$:	MOVZWL	#SS$_NORMAL,R0		; Set status to success.
+
+;
+; Event flag posting failed.  Status is in R0.  Clear stack,
+; and disconnect.
+;
+
+90$:	POPL	R4			; Clear stack of fork blk
+					; address
+
+;
+; Complete the I/O, thereby disconnecting the process from the device.
+; This is necessary if the UCB was used as a fork block to prevent
+; the single UCB from being used many times simultaneously as a fork
+; block.
+
+IO_COMPLETE:
+	MOVL	UCB$L_CI_PCB(R5),R4	; Set up PCB address.
+	MOVL	UCB$L_IRP(R5),R3	; Set up IRP address.
+	BRB	CI_FORCE_CANCEL		; Fall through to join the
+					; cancel I/O code.
+
+	.SBTTL	CI_CANCEL, Cancel I/O routine
+
+;++
+; CI_CANCEL, Cancels an I/O operation in progress
+;
+; Functional description:
+;
+;	When this routine gains control, IPL is at driver fork level.
+;
+;	This routine calls IOC$CANCELIO to set the cancel bit in the
+;	UCB status word if:
+;
+;		the device is busy,
+;		the IRP's process ID matches the cancel process ID,
+;		the IRP channel matches the cancel channel.
+;
+;	If IOC$CANCELIO sets the cancel bit, then this driver routine
+;	calls a user-specified cancel I/O routine. The call interface
+;	is JSB or CALLS depending on a bit setting in the UCB. On
+;	entry to the user routine, the register settings are unchanged.
+;	For the CALL interface, the argument list is as follows:
+;
+;		 0(AP)	- argument count
+;		 4(AP)	- negated value of the channel index number
+;		 8(AP)	- address of the IRP (I/O request packet)
+;		12(AP)	- address of the PCB (process control block) for
+;			  the process canceling I/O
+;		16(AP)	- address of the UCB (unit control block)
+;
+; Inputs:
+;
+;	R2	- negated value of the channel index number
+;	R3	- address of the current IRP (I/O request packet)
+;	R4	- address of the PCB (process control block) for the
+;		  process canceling I/O
+;	R5	- address of the UCB (unit control block)
+;
+; Implicit inputs:
+;
+;	UCB$V_CI_USECAL is set in UCB$L_DEVDEPEND if the CALLS
+;	interface was requested.
+;
+; Outputs:
+;
+;	The routine must preserve all registers except R0-R3.
+;
+;	The routine may set the UCB$M_CANCEL bit in UCB$W_STS.
+;
+;--
+
+CI_CANCEL:				; Cancel an I/O operation
+	JSB	G^IOC$CANCELIO		; Set cancel bit if appropriate.
+	BBC	#UCB$V_CANCEL,-		; If the cancel bit is not set,
+		UCB$W_STS(R5),-		; just return.
+		CANCEL_EXIT
+
+;
+; Device-dependent cancel operations go next.
+;
+
+CI_FORCE_CANCEL:
+	BBC	#UCB$V_BSY,-		; Branch forward if device does
+		UCB$W_STS(R5),20$	; not have IRP associated.
+	BBC	#UCB$V_CI_USECAL,-	; Branch to JSB code if user
+		UCB$L_DEVDEPEND(R5),10$	; didn't request CALL interface.
+
+;
+; Load the input registers onto the argument stack and CALLS the
+; user-specified cancel I/O routine.
+;
+
+	PUSHL	R5			; Push address of UCB.
+	PUSHL	R4			; Push address of PCB.
+	PUSHL	R3			; Push address of IRP.
+	PUSHL	R2			; Push negated channel index.
+	CALLS	#4,@UCB$L_CI_CANCEL(R5)	; Call user's cancel I/O
+					; routine.
+	BRB	20$			; Go disconnect device.
+
+;
+; Just JSB to the user-specified cancel I/O routine.
+;
+
+10$:					; JSB path.
+	JSB	@UCB$L_CI_CANCEL(R5)	; JSB to user's cancel I/O
+					; routine.
+
+;
+; Now disconnect the process from the interrupt by restoring the dummy
+; device handling routine addresses and completing the I/O.
+;
+
+20$:
+	BSBB	CI_DISCONNECT		; Disconnect device from
+					; process.
+
+;
+; A simple return if the cancel does not apply.
+;
+
+CANCEL_EXIT:
+	RSB				; Return.
+
+	.SBTTL	CI_DISCONNECT, Disconnect the process from the device
+
+;++
+; CI_DISCONNECT, Restores the device to a null-driver state
+;
+; Functional description:
+;
+;	When this routine gains control, IPL is at driver fork level.
+;
+;	This subroutine performs a disconnect in the following steps:
+;
+;		Restores the dummy routine address to the four
+;			possible process-supplied kernel mode routines
+;		Deallocates the realtime SPTs reserved to the process.
+;		Deallocates unused AST control blocks
+;		Completes the QIO request, if one is outstanding
+;
+; Inputs:
+;
+;	R0	- I/O completion status from user's cancel routine
+;	R1	- more completion status
+;	R4	- address of the process' PCB
+;	R5	- address of the device's UCB
+;
+; Outputs:
+;
+;	The routine preserves all registers.
+;
+;--
+
+CI_DISCONNECT:
+	PUSHR	#^M<R0,R1,R2,R3>	; Save registers.
+	CLRW	UCB$L_DEVDEPEND(R5)	; Clear the flags word.
+	MOVAL	CI_DUMMY_RSB,-		; Restore dummy device
+		UCB$L_CI_INIDEV(R5)	; initialization routine addr.
+	MOVAL	CI_DUMMY_RSB,-		; Restore dummy start device
+		UCB$L_CI_START(R5)	; routine address.
+	MOVAL	CI_DUMMY_RSB,-		; Restore dummy interrupt
+		UCB$L_CI_ISR(R5)	; service routine address.
+	MOVAL	CI_DUMMY_RSB,-		; Restore dummy cancel I/O
+		UCB$L_CI_CANCEL(R5)	; routine address.
+
+;
+; Deallocate the SPTs that are double mapping the user buffer in
+; system address space.
+;
+
+	MOVAQ	UCB$Q_CI_SPTDSC(R5),R2	; Get SPT descriptor.
+	TSTL	CIN$L_SPTCOUNT(R2)	; Any allocated?
+	BEQL	10$			; No. Branch forward.
+	JSB	G^EXE$DEAL_SPTS		; Yes. Deallocate them.
+	CLRQ	UCB$Q_CI_SPTDSC(R5)	; Clear out SPT descriptor.
+
+;
+; For each AST control block in the UCB queue, deallocate the space.
+; Then restore process quota for these blocks.
+;
+
+10$:
+	REMQUE	@UCB$L_CI_AFLINK(R5),R0	; Get the address of an AST
+					; control block.
+	BVS	20$			; Branch if no more exist.
+	JSB	G^EXE$DEANONPAGED	; Deallocate the block.
+	INCW	PCB$W_ASTCNT(R4)	; Increment AST quota.
+	DECW	UCB$W_CI_ACBNOW(R5)	; Decrement ACBs allocated.
+	BRB	10$			; Go look for another.
+
+;
+; Check the UCB to see if the device has an IRP associated with it.
+; If not, just return. Otherwise, complete the I/O request by a
+; transfer of control to VMS. The I/O completion disconnects the
+; process from the interrupt.
+;
+
+20$:
+	POPR	#^M<R0,R1,R2,R3>	; Restore I/O status.
+	BBS	#UCB$V_BSY,-		; Branch forward if device is
+		UCB$W_STS(R5),30$	; connected to a process.
+	RSB				; Otherwise, just return.
+
+30$:
+	REQCOM				; Complete the I/O.
+
+	.SBTTL	CI_DUMMY_RSB and CI_DUMMY_RET
+
+;++
+; CI_DUMMY_RSB and CI_DUMMY_RET - nop routines
+;
+; Functional description:
+;
+;	The routines return to caller with a RET or RSB instruction.
+;
+; Inputs:
+;
+;	none
+;
+; Outputs:
+;
+;	R0 contains the SS$_NORMAL status code.
+;
+;--
+
+CI_DUMMY_RSB:
+	MOVZWL	#SS$_NORMAL,R0		; Load success status.
+	RSB				; Return.
+
+CI_DUMMY_RET:
+	.WORD	0			; Register save mask.
+	MOVZWL	#SS$_NORMAL,R0		; Load success status.
+	RET				; Return.
+
+	.SBTTL	EXE$ALLOC_SPTS, Allocate a contiguous set of SPTs
+
+;++
+; EXE$ALLOC_SPTS - Allocate SPTs to double map the user's buffer
+;
+; Functional description:
+;
+;	When this routine gains control, IPL is at driver fork level.
+;
+;	Using a bit map whose address is stored in the control block
+;	addressed by EXE$GL_RTBITMAP, try to allocate "n" contiguous
+;	SPTs.
+;
+; Inputs:
+;
+;	R2	- address of a quadword descriptor:
+;
+;			CIN$L_SPTCOUNT(R2)	- count of SPTs needed
+;			CIN$L_STARTVPN(R2)	- zero
+;
+; Implicit inputs:
+;
+;	EXE$GL_RTBITMAP	- address of SPT bit map control block
+;
+;		----------------------------------
+;		|          starting VPN          |
+;		----------------------------------
+;		|       number of SPTs left      |
+;		----------------------------------
+;		|       |  type  |      size     |
+;		----------------------------------
+;		|                                |
+;		|             bitmap             |
+;		|                                |
+;		----------------------------------
+;
+; Outputs:
+;
+;	R0	- status code:
+;
+;			SS$_NORMAL	- success
+;			SS$_INSFSPTS	- not enough contiguous SPTs
+;
+;	R2	- address of the quadword descriptor:
+;
+;			0(R2)	- count of SPTs allocated
+;			4(R2)	- starting VPN
+;
+;	Registers R1, R3, R4, and R5 are preserved.
+;
+;--
+
+EXE$ALLOC_SPTS::
+	PUSHR	#^M<R1,R3,R4,R5>	; Save registers.
+	MOVZWL	#SS$_INSFSPTS,R0	; Assume allocation failure.
+	MOVL	CIN$L_SPTCOUNT(R2),R3	; Get number of SPTs needed.
+	MOVL	G^EXE$GL_RTBITMAP,R1	; Get address of bit map
+					; control block.
+	BEQL	60$			; If none, no SPTs available.
+	CMPL	R3,RBM$L_FREECOUNT(R1)	; Are there enough SPTs left?
+	BGTR	60$			; No. Return with failure.
+	CLRL	R4			; Clear starting bit position.
+
+10$:
+	ADDL3	R3,R4,R5		; Calculate highest bit 
+					; position needed in scan.
+	CMPL	R5,G^EXE$GL_RTIMESPT	; Is it higher than allowed?
+	BGTR	60$			; Yes. Return with failure.
+	FFS	R4,#32,-		; Look for a free SPT (a set
+		RBM$L_BITMAP(R1),R4	; bit).
+	BEQL	10$			; If none, go to next longword.
+	ADDL3	R3,R4,R5		; Again, calculate highest bit
+					; position needed in scan.
+	MOVL	R4,CIN$L_STARTBIT(R2)	; Save starting bit number.
+
+20$:
+	FFC	R4,#32,-		; Find first allocated SPT (a
+		RBM$L_BITMAP(R1),R4	; clear bit).
+	CMPL	R4,R5			; Past the highest bit needed?
+	BGEQ	30$			; Yes. Branch with success.
+	BBS	R4,RBM$L_BITMAP(R1),20$	; If no clear bit found yet,
+					; continue this scan.
+	BRB	10$			; Otherwise, restart scan.
+
+30$:
+	MOVL	CIN$L_STARTBIT(R2),R0	; Get starting bit number.
+	ADDL3	R0,RBM$L_STARTVPN(R1),-	; Calculate the VPN of the
+		CIN$L_STARTVPN(R2)	; first SPT allocated.
+
+;
+; Allocate the SPTs by clearing the appropriate bits in the SPT bit
+; map.
+;
+; Registers are as follows:
+;
+;	R0	- starting bit number
+;	R1	- address of the real time bit map
+;	R2	- address of the quadword descriptor
+;	R3	- number of bits to alter
+;
+
+40$:
+	CMPL	#32,R3			; Get number of bits to alter.
+	BGEQ	50$			; Branch if 32 or less.
+	INSV	#0,R0,#32,-		; Allocate the bits (by
+		RBM$L_BITMAP(R1)	; clearing them).
+	ADDL	#32,R0			; Move to next longword.
+	SUBL	#32,R3			; Subtract out number of bits
+					; altered.
+	BRB	40$			; Go alter more bits.
+	
+50$:
+	INSV	#0,R0,R3,-		; Allocate the bits (by
+		RBM$L_BITMAP(R1)	; clearing them.
+
+;
+; Return with success.
+;
+
+	SUBL	CIN$L_SPTCOUNT(R2),-	; Reduce free count by number
+		RBM$L_FREECOUNT(R1)	; allocated.
+	MOVZWL	#SS$_NORMAL,R0		; Set success status code.
+
+60$:
+	POPR	#^M<R1,R3,R4,R5>	; Restore registers.
+	RSB				; Return.
+
+	.SBTTL	EXE$SETUP_SPTS, Validate and set access rights to SPTs
+
+;++
+; EXE$SETUP_SPTS - Initialize SPTs to double map user's buffer
+;
+; Functional description:
+;
+;	When this routine gains control, IPL is at driver fork level.
+;
+;	This routine sets the valid bits and requested access bits in
+;	a contiguous set of SPTs.
+;
+; Inputs:
+;
+;	R0	- access mask for pages
+;	R1	- process address of the user's buffer
+;	R2	- address of quadword descriptor of SPTs:
+;
+;			CIN$L_SPTCOUNT(R2) - number of SPTs to validate
+;			CIN$L_STARTVPN(R2) - starting VPN
+;
+; Outputs:
+;
+;	The routine preserves all registers.
+;
+;--
+
+EXE$SETUP_SPTS::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6>; Save some registers.
+	MOVL	CIN$L_STARTVPN(R2),R4	; Get starting VPN.
+	MOVL	CIN$L_SPTCOUNT(R2),R6	; Get number of SPTs to setup.
+	MOVL	R1,R2			; Move process address.
+
+;
+; Calculate the address of the system page table entry that corresponds
+; to the starting VPN of the system-mapped buffer.
+;
+
+	MOVL	G^MMG$GL_SPTBASE,R3	; Get base of system page table.
+	MOVAL	(R3)[R4],R1		; Get address of SPT for VPN.
+
+;
+; Obtain the process page table entry of the next page in the user's
+; buffer.
+;
+
+	MOVL	UCB$L_CI_PCB(R5),R4	; Get process PCB address.
+	MOVL	PCB$L_PHD(R4),R5	; Get process PHD address.
+
+10$:
+	JSB	G^MMG$PTEADRCHK		; Get process PTE for this page.
+
+;
+; Register usage is now the following:
+;
+;	R0	- status from MMG$PTEADRCHK
+;	R1	- preserved; address of SPT for current VPN
+;	R2	- preserved; process virtual address
+;	R3	- system virtual address of process page table entry
+;	R4	- preserved; address of the PCB (process control block)
+;	R5	- preserved; address of the PHD (process header block)
+;	R6	- preserved; count of SPTs left to setup
+;
+;	(SP)	- preserved; mask of page validation for the page
+;
+
+	BLBC	R0,20$			; Branch to exit on error.
+
+;
+; Get the physical page frame number from the process page table entry
+; for the page. Insert this and the validation mask in the SPT.
+;
+
+	EXTZV	#PTE$V_PFN,-		; Extract the page frame number
+		#PTE$S_PFN,(R3),R3	; of this page.
+	BISL3	(SP),R3,(R1)+		; Set up page table entry.
+
+;
+; See if more SPTs to setup. If not, invalidate the translation buffer,
+; and return to caller with success status.
+;
+
+	ADDL	#^X200,R2		; Increment process address by
+					; one page.
+	SOBGTR	R6,10$			; Loop if more to do.
+	INVALID				; Clear translation buffer.
+
+20$:
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6>
+	RSB				; Restore registers and return.
+
+	.SBTTL	EXE$DEAL_SPTS, Deallocate real time SPTs
+
+;++
+; EXE$DEAL_SPTS - Deallocate SPTs used to double map process buffer
+;
+; Functional description:
+;
+;	When this routine gains control, IPL is at driver fork level.
+;
+;	Using a bit map whose address is stored in the control block
+;	addressed by EXE$GL_RTBITMAP, deallocate "n" contiguous SPTs.
+;
+; Inputs:
+;
+;	R2	- address of a quadword descriptor:
+;
+;			CIN$L_SPTCOUNT(R2) - number of SPTs allocated
+;			CIN$L_STARTVPN(R2) - starting VPN
+;
+; Implicit inputs:
+;
+;	EXE$GL_RTBITMAP - address of SPT bit map control block.
+;
+;	In the bit map, unset bits are allocated SPTs.
+;
+; Outputs:
+;
+;	The routine preserves all registers except R0.
+;
+;--
+
+EXE$DEAL_SPTS::
+	PUSHR	#^M<R0,R1,R3>		; Save registers.
+	MOVL	G^EXE$GL_RTBITMAP,R1	; Get address of bit map
+					; control block.
+	SUBL3	RBM$L_STARTVPN(R1),-	; Calculate the starting bit
+		CIN$L_STARTVPN(R2),R0	; number of the allocated bits.
+	MOVL	CIN$L_SPTCOUNT(R2),R3	; Get number of bits.
+
+10$:
+	CMPL	#32,R3			; Branch if number of bits left
+	BGEQ	20$			; to alter is 32 or less.
+	INSV	#-1,R0,#32,-		; Deallocate the bits by 32.
+		RBM$L_BITMAP(R1)
+	ADDL	#32,R0			; Move to next longword.
+	SUBL	#32,R3			; Subtract out number of bits
+					; altered.
+	BRB	10$			; Try for more.
+
+20$:
+	INSV	#-1,R0,R3,-		; Deallocate the remaining bits.
+		RBM$L_BITMAP(R1)
+	ADDL	CIN$L_SPTCOUNT(R2),-	; Recalculate number of free
+		RBM$L_FREECOUNT(R1)	; SPTs.
+	POPR	#^M<R0,R1,R3>		; RESTORE REGISTERS
+	RSB				; Return to caller.
+
+	.SBTTL	CI_END, End of driver
+
+;++
+; Label that marks the end of the driver
+;--
+
+CI_END:					; Last location in driver
+	.END

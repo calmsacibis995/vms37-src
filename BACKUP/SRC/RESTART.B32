@@ -1,0 +1,1011 @@
+MODULE RESTART	(%TITLE	'Reel Checkpoint and Restart'
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	Backup/Restore
+!
+! ABSTRACT:
+!	This module contains the routines that checkpoint and restart a save
+!	operation from the beginning of a reel.
+!
+! ENVIRONMENT:
+!	VAX/VMS user mode.
+!--
+!
+! AUTHOR: M. Jack, CREATION DATE: 9-May-1981
+!
+! MODIFIED BY:
+!
+!	V02-002	MLJ0075		Martin L. Jack,	28-Jan-1982  20:33
+!		Use FIB$V_NORECORD.
+!
+!	V02-001	MLJ0054		Martin L. Jack,	20-Oct-1981  2:55
+!		Implement restart for INPUT_PLACEMENT and INPUT_VBN_LIST.
+!		Implement /IGNORE=INTERLOCK.  Move STAACP globals to common.
+!		Integrate GET_VM and FREE_VM jacket routines.
+!
+!**
+
+REQUIRE 'SRC$:COMMON';
+LIBRARY 'SYS$LIBRARY:LIB';
+REQUIRE 'LIB$:BACKDEF';
+
+
+FORWARD ROUTINE
+	GET_DYN_SPACE:	NOVALUE,	! Get area of dynamic memory
+	GET_COPY:	NOVALUE,	! Copy area to dynamic memory
+	REEL_CHECKPOINT:NOVALUE,	! Checkpoint at beginning of reel
+	RESTORE_COPY:	NOVALUE,	! Restore copy of dynamic memory
+	REEL_RESTART:	NOVALUE;	! Restart from beginning of reel
+
+
+EXTERNAL ROUTINE
+	FREE_VM:	NOVALUE,	! Free virtual memory
+	GET_VM,				! Allocate virtual memory
+	GET_ZERO_VM,			! Allocate and clear virtual memory
+	CHECKPOINT_M:	NOVALUE,	! Checkpoint machine state
+	RESTART_M:	NOVALUE,	! Restart from checkpointed state
+	ASSIGN_INPUT_CHANNEL,		! Assign channel to input volume set
+	FILE_ERROR:	NOVALUE,	! Signal file-related error
+	FREE_BUFFER:	NOVALUE,	! Free a buffer
+	WAIT:		NOVALUE,	! Wait for I/O completion on a buffer
+	FREE_DIR_DATA:	NOVALUE,	! Release directory context
+	INIT_DIR_SCAN:	NOVALUE,	! Initialize directory context
+	FIND_NEXT,			! Find next file
+	RESET_DIR_SPEC:	NOVALUE;	! Change selection filespec
+
+
+EXTERNAL LITERAL
+	BACKUP$_CONTINUE,
+	BACKUP$_OPENIN;
+
+
+G$DEFINE();			! Define global area
+
+
+BUILTIN
+	CALLG,
+	INSQUE,
+	REMQUE;
+
+! Define table to drive checkpointing operation.
+!
+LITERAL
+
+	! Action codes.
+	!
+	EXIT=		0,	! Exit from operation
+	COPY=		1,	! Copy variable
+	COPYDYN=	2,	! Copy dynamic area pointed to by variable,
+				! where length is given by second parameter
+	SPECIAL_1=	3,	! Copy dynamic volume information area
+	SPECIAL_2=	4,	! Copy index file bitmaps
+	SPECIAL_3=	5,	! Copy RMS info for input file
+	SPECIAL_4=	6,	! Copy directory positions
+	SPECIAL_5=	7,	! Copy FASTSCAN buffer info
+	SPECIAL_6=	8;	! Copy file placement blocks
+
+
+COMPILETIME
+	VARS_SIZE=	0;	! Size of area to be allocated
+
+
+MACRO
+
+	! Macro to generate one table entry:
+	!	Byte of action code
+	!	Word of length
+	!	Word of address relative to GLOBAL_BASE
+	!
+	! Parameters:
+	!	A = action code
+	!	B = length, when required
+	!	C = variable name
+	!
+	T_[A,B,C]=
+
+	    %PRINT('Storage for ', C, ' at offset ', %NUMBER(VARS_SIZE))
+
+	    A,
+
+	    WORD(
+	    %IF A EQL COPY OR A EQL SPECIAL_3 OR A EQL SPECIAL_4
+	    %THEN
+		%IF %NULL(B)
+		%THEN
+		    %ALLOCATION(C)
+		    %ASSIGN(VARS_SIZE, VARS_SIZE + %ALLOCATION(C))
+		%ELSE
+		    B
+		    %ASSIGN(VARS_SIZE, VARS_SIZE + B)
+		%FI
+
+	    %ELSE %IF A EQL COPYDYN
+	    %THEN
+		B
+		%ASSIGN(VARS_SIZE, VARS_SIZE + 8)
+
+	    %ELSE %IF A EQL SPECIAL_1 OR A EQL SPECIAL_2 OR A EQL SPECIAL_5 OR A EQL SPECIAL_6
+	    %THEN
+		0
+		%ASSIGN(VARS_SIZE, VARS_SIZE + 8)
+
+	    %FI %FI %FI
+	    )
+
+	    , WORD(C - GLOBAL_BASE)
+	    %;
+
+BIND
+
+	! Checkpoint and restart parameter table.  Note well:  COM_I_SETCOUNT
+	! and FAST_IMAP_SIZE must retain their existing values until after
+	! FAST_IMAP is restored, so they must follow it in the table.  Same
+	! for FAST_BUFFER_SIZE vs. FAST_BUFFER.
+	!
+	CHKPT_TABLE = UPLIT BYTE (T_(
+		COPY,		2,			RWSV_VOL_NUMBER,
+		COPY,		2,			RWSV_SEG_NUMBER,
+		COPY,		,			RWSV_SAVE_QUAL,
+		COPY,		,			RWSV_IN_SEQ,
+		COPY,		,			RWSV_IN_SEQ_0,
+		COPY,		,			RWSV_IN_VBN,
+		COPY,		,			RWSV_IN_VBN_0,
+		COPY,		,			RWSV_IN_XOR_SEQ,
+		COPY,		,			RWSV_OUT_SEQ,
+		COPY,		,			RWSV_OUT_VBN,
+		COPY,		,			COM_FLAGS,
+		COPY,		,			COM_I_STRUCNAME,
+		COPY,		,			COM_BUFF_COUNT,
+		COPY,		,			FAST_STRUCLEV,
+		COPY,		INPUT_END-INPUT_BEG,	INPUT_BEG,
+		COPY,		,			INPUT_PROC_LIST,
+		COPY,		OUTPUT_END-OUTPUT_BEG,	OUTPUT_BEG,
+		COPY,		,			VERIFY_USE_COUNT,
+		COPY,		,			VERIFY_QUAL,
+		SPECIAL_2,	,			FAST_IMAP,
+		SPECIAL_5,	,			FAST_BUFFER,
+		COPY,		,			FAST_BUFFER_SIZE,
+		SPECIAL_1,	,			FAST_IMAP_SIZE,
+		SPECIAL_1,	,			FAST_HDR_OFFSET,
+		SPECIAL_1,	,			FAST_BOOT_LBN,
+		COPYDYN,	512,			JOUR_BUFFER,
+		COPYDYN,	BJL$C_DIR_LEN+1,	JOUR_DIR,
+		COPY,		,			JOUR_EFBLK,
+		COPY,		,			JOUR_FFBYTE,
+		COPY,		,			JOUR_COUNT,
+		SPECIAL_3,	NAM$C_BLN+NAM$C_MAXRSS,	INPUT_FAB,
+		COPY,		,			FAST_RVN,
+		SPECIAL_4,	D_K_NLEVELS*%UPVAL,	DIR_STACK,
+		COPY,		,			COM_I_SETCOUNT,
+		COPY,		,			INPUT_PLACE_LEN,
+		SPECIAL_6,	,			INPUT_PLACEMENT,
+		SPECIAL_6,	,			INPUT_VBN_LIST
+	    ), LONG(0));
+
+ROUTINE GET_DYN_SPACE(SRC_LENGTH,SRC_ADDR,DST_DESC): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine allocates dynamic memory if required.
+!
+! INPUT PARAMETERS:
+!	SRC_LENGTH	- Length of area to be copied.
+!	SRC_ADDR	- Pointer to area to be copied (tested for 0).
+!	DST_DESC	- Address of descriptor for dynamic area.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	Dynamic memory allocated.
+!
+!--
+
+BEGIN
+MAP
+	DST_DESC:	REF VECTOR;	! Pointer to descriptor
+
+
+! Provided it exists, free the old copy of the dynamic area if it is the wrong
+! size or if there is no source data.
+!
+IF
+    .DST_DESC[1] NEQ 0 AND
+    (.SRC_ADDR EQL 0 OR .DST_DESC[0] NEQ .SRC_LENGTH)
+THEN
+    BEGIN
+    FREE_VM(.DST_DESC[0], .DST_DESC[1]);
+    DST_DESC[0] = 0;
+    DST_DESC[1] = 0;
+    END;
+
+
+! If the source area exists, and no dynamic area exists, allocate one.
+!
+IF .SRC_ADDR NEQ 0 AND .SRC_LENGTH NEQ 0 AND .DST_DESC[1] EQL 0
+THEN
+    BEGIN
+    DST_DESC[0] = .SRC_LENGTH;
+    DST_DESC[1] = GET_VM(.SRC_LENGTH);
+    END;
+END;
+
+ROUTINE GET_COPY(SRC_LENGTH,SRC_ADDR,DST_DESC): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine allocates dynamic memory if required and copies a
+!	specified area of memory to it.
+!
+! INPUT PARAMETERS:
+!	SRC_LENGTH	- Length of area to be copied.
+!	SRC_ADDR	- Pointer to area to be copied.
+!	DST_DESC	- Address of descriptor for dynamic area.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	Dynamic memory allocated.
+!
+!--
+
+BEGIN
+MAP
+	DST_DESC:	REF VECTOR;	! Pointer to descriptor
+BUILTIN
+	AP;
+
+
+! Get dynamic space if required.
+!
+CALLG(.AP, GET_DYN_SPACE);
+
+
+! If the source area exists, copy new data.
+!
+IF .DST_DESC[1] NEQ 0
+THEN
+    CH$MOVE(.SRC_LENGTH, .SRC_ADDR, .DST_DESC[1]);
+END;
+
+GLOBAL ROUTINE REEL_CHECKPOINT: NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine takes a checkpoint at the beginning of a reel.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	T,				! Cursor for CHKPT_TABLE
+	INPU:		REF BBLOCK,	! Cursor for input qualifiers area
+	P:		REF VECTOR;	! Cursor for dynamic area
+
+
+! Determine if a checkpoint at this time is valid.
+!
+COM_FLAGS[COM_DSBL_RSTRT] = .COM_FLAGS[COM_DSBL_CHKPT];
+IF .COM_FLAGS[COM_DSBL_CHKPT] THEN RETURN;
+
+
+! Checkpoint the value of QUAL_USE_COUNT in the input qualifiers blocks.
+!
+INPU = .QUAL[QUAL_INPU_LIST];
+WHILE .INPU NEQ 0 DO
+    BEGIN
+    INPU[QUAL_USE_CHKPT] = .INPU[QUAL_USE_COUNT];
+    INPU = .INPU[QUAL_NEXT];
+    END;
+
+
+! Allocate a dynamic area to hold saved variables if none exists.
+!
+IF .CHKPT_VARS EQL 0 THEN CHKPT_VARS = GET_ZERO_VM(VARS_SIZE);
+
+
+! Interpret the table.
+!
+T = CHKPT_TABLE;
+P = .CHKPT_VARS;
+WHILE TRUE DO
+    BEGIN
+    LOCAL
+	A,				! Local copy of A byte
+	B,				! Local copy of B byte
+	C:	REF VECTOR;		! Local copy of address
+
+
+    ! Establish the three table parameters.
+    !
+    A = .(.T)<0,8>;			T = .T + 1;
+    B = .(.T)<0,16>;			T = .T + 2;
+    C = GLOBAL_BASE + .(.T)<0,16>;	T = .T + 2;
+
+
+    ! Case on the action code to execute the action.
+    !
+    CASE .A FROM EXIT TO SPECIAL_6 OF
+	SET
+
+
+	[EXIT]:
+	    EXITLOOP;
+
+
+	[COPY]:
+	    P = CH$MOVE(.B, .C, .P);	! Move variable to area
+
+
+	[COPYDYN]:
+	    BEGIN
+	    GET_COPY(.B, ..C, .P);
+	    P = .P + 8;
+	    END;
+
+
+	[SPECIAL_1]:
+	    BEGIN
+	    GET_COPY(.COM_I_SETCOUNT*%UPVAL, ..C, .P);
+	    P = .P + 8;
+	    END;
+
+
+	[SPECIAL_2]:
+	    BEGIN
+	    LOCAL
+		Q;
+
+	    GET_DYN_SPACE(.COM_I_SETCOUNT*2*%UPVAL, ..C, .P);
+	    Q = .P[1];
+	    IF .Q NEQ 0
+	    THEN
+		BEGIN
+		CH$FILL(0, .COM_I_SETCOUNT*2*%UPVAL, .Q);
+		INCR I FROM 0 TO .COM_I_SETCOUNT-1 DO
+		    BEGIN
+		    GET_COPY(.FAST_IMAP_SIZE[.I]*512, .FAST_IMAP[.I], .Q);
+		    Q = .Q + 8;
+		    END;
+		END;		
+	    P = .P + 8;
+	    END;
+
+
+	[SPECIAL_3]:
+	    BEGIN
+	    IF .INPUT_FAB NEQ 0
+	    THEN
+		BEGIN
+	        CH$MOVE(NAM$C_BLN, INPUT_FAB[FC_NAM], .P);
+	        CH$MOVE(NAM$C_MAXRSS, INPUT_FAB[FC_RSA], .P + NAM$C_BLN);
+		END;
+	    P = .P + NAM$C_BLN + NAM$C_MAXRSS;
+	    END;
+
+
+	[SPECIAL_4]:
+	    BEGIN
+	    INCRA D FROM DIR_STACK TO DIR_STACK+D_K_NLEVELS*D_S_ENTRY-D_S_ENTRY BY D_S_ENTRY DO
+		BEGIN
+		MAP D: REF BBLOCK;
+		.P = .D[D_VER];
+		P = .P + 4;
+		END;
+	    END;
+
+
+	[SPECIAL_5]:
+	    BEGIN
+	    GET_COPY(.FAST_BUFFER_SIZE, ..C, .P);
+	    P = .P + 8;
+	    END;
+
+
+	[SPECIAL_6]:
+	    BEGIN
+	    LOCAL
+		Q:	REF BBLOCK,
+		R:	REF BBLOCK,
+		T:	REF BBLOCK;
+
+	    IF .C[0] EQL 0 THEN C[0] = C[1] = C[0];
+	    IF .P[0] EQL 0 THEN P[0] = P[1] = P[0];
+	    UNTIL REMQUE(.P[0], T) DO
+		BEGIN
+		FREE_VM(.T[PLC_SIZE], .T);
+		END;
+	    Q = .C[0];
+	    UNTIL .Q EQL C[0] DO
+		BEGIN
+		R = GET_VM(.Q[PLC_SIZE]);
+		CH$MOVE(.Q[PLC_SIZE], .Q, .R);
+		INSQUE(.R, .P[1]);
+		Q = .Q[PLC_FLINK];
+		END;
+	    P = .P + 8;
+	    END;
+
+
+	TES;
+    END;
+
+
+! Free previous saved machine state if required.
+!
+IF .CHKPT_STACK NEQ 0
+THEN
+    FREE_VM(.CHKPT_HIGH_SP - .CHKPT_LOW_SP, .CHKPT_STACK);
+
+
+! Checkpoint the machine state.  Execution also continues here after a call to
+! REEL_RESTART.
+!
+CHECKPOINT_M(.CHKPT_HIGH_SP, CHKPT_STACK, CHKPT_LOW_SP);
+END;
+
+ROUTINE RESTORE_COPY(SRC_DESC,DST_LENGTH,DST_PTR_ADDR): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine restores a saved copy of dynamic memory.
+!
+! INPUT PARAMETERS:
+!	SRC_DESC	- Address of descriptor for dynamic area.
+!	DST_LENGTH	- Length of area to be copied.
+!	DST_PTR_ADDR	- Pointer to pointer to area to be restored.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	Dynamic memory allocated.
+!
+!--
+
+BEGIN
+MAP
+	SRC_DESC:	REF VECTOR;	! Pointer to descriptor
+
+
+! Provided it exists, free the old copy of the dynamic area if it is the wrong
+! size or if there is no source data.
+!
+IF
+    ..DST_PTR_ADDR NEQ 0 AND
+    (.SRC_DESC[1] EQL 0 OR .SRC_DESC[0] NEQ .DST_LENGTH)
+THEN
+    BEGIN
+    FREE_VM(.DST_LENGTH, ..DST_PTR_ADDR);
+    .DST_PTR_ADDR = 0;
+    END;
+
+
+! If the source area exists, copy new data.
+!
+IF .SRC_DESC[1] NEQ 0
+THEN
+    BEGIN
+
+    ! Allocate a dynamic area if none currently exists.
+    !
+    IF ..DST_PTR_ADDR EQL 0 THEN .DST_PTR_ADDR = GET_VM(.SRC_DESC[0]);
+
+
+    ! Restore the data.
+    !
+    CH$MOVE(.SRC_DESC[0], .SRC_DESC[1], ..DST_PTR_ADDR);
+    END;
+END;
+
+GLOBAL ROUTINE REEL_RESTART: NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine restarts from the last checkpoint.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	STATUS,				! Status variable
+	T,				! Cursor for CHKPT_TABLE
+	P:		REF BBLOCK,	! Cursor for dynamic area
+	SAVE_PROC_LIST:	REF BBLOCK,	! Save for INPUT_PROC_LIST
+	SAVE_D_VER:	REF VECTOR;	! Pointer to saved D_VER values
+
+EXTERNAL ROUTINE
+	STA_DISMOUNT;			! Dismount volume via stand-alone ACP
+
+
+! Restore the value of QUAL_USE_COUNT in the input qualifiers blocks.
+!
+P = .QUAL[QUAL_INPU_LIST];
+WHILE .P NEQ 0 DO
+    BEGIN
+    P[QUAL_USE_COUNT] = .P[QUAL_USE_CHKPT];
+    P = .P[QUAL_NEXT];
+    END;
+
+QUAL[QUAL_COMP] = 0;
+
+! Wait on all pending I/O's.  Reattach all buffers to the free list.
+!
+UNTIL REMQUE(.INPUT_WAIT[0], P) DO
+    BEGIN
+    P[BCB_FAIL_ACT] = 0;
+    P[BCB_SUCC_ACT] = 0;
+    WAIT(.P);
+    FREE_BUFFER(.P);
+    END;
+UNTIL REMQUE(.REREAD_WAIT[0], P) DO
+    BEGIN
+    P[BCB_FAIL_ACT] = 0;
+    P[BCB_SUCC_ACT] = 0;
+    WAIT(.P);
+    FREE_BUFFER(.P);
+    END;
+UNTIL REMQUE(.OUTPUT_WAIT[0], P) DO
+    BEGIN
+    P[BCB_FAIL_ACT] = 0;
+    P[BCB_SUCC_ACT] = 0;
+    WAIT(.P);
+    FREE_BUFFER(.P);
+    END;
+
+
+! Deal with buffers that do not have I/O pending.
+!
+UNTIL REMQUE(.RWSV_HOLD_LIST[0], P) DO
+    BEGIN
+    FREE_BUFFER(.P);
+    END;
+IF .RWSV_XOR_BCB NEQ 0
+THEN
+    BEGIN
+    FREE_BUFFER(.RWSV_XOR_BCB);
+    RWSV_XOR_BCB = 0;
+    END;
+IF .COMPARE_BCB NEQ 0
+THEN
+    BEGIN
+    FREE_BUFFER(.COMPARE_BCB);
+    COMPARE_BCB = 0;
+    END;
+IF .INPUT_BCB NEQ 0
+THEN
+    BEGIN
+    FREE_BUFFER(.INPUT_BCB);
+    INPUT_BCB = 0;
+    END;
+IF .OUTPUT_BCB NEQ 0
+THEN
+    BEGIN
+    FREE_BUFFER(.OUTPUT_BCB);
+    OUTPUT_BCB = 0;
+    END;
+
+
+! Deassign channels.
+! Close save set if open as a file.
+!
+IF .QUAL[QUAL_SS_FILE]
+THEN
+    BEGIN
+    IF .RWSV_SAVE_FAB NEQ 0 THEN IF .RWSV_SAVE_FAB[FAB$W_IFI] NEQ 0
+    THEN
+	$CLOSE(FAB=.RWSV_SAVE_FAB);
+    END
+
+! Deassign save set channel.
+!
+ELSE
+    BEGIN
+    IF .RWSV_CHAN NEQ 0
+    THEN
+	BEGIN
+	IF .RWSV_CHAN LSSU 1^16
+	THEN
+	    BEGIN
+	    $DASSGN(CHAN=.RWSV_CHAN);
+	    RWSV_CHAN = 0;
+	    END
+
+! Close file and dismount volume if save set is open via stand-alone ACP.
+!
+	ELSE
+	    BEGIN
+	    IF .RWSV_CHAN EQL STA_IN_CHAN
+	    THEN CURRENT_MTL = .INPUT_MTL
+	    ELSE CURRENT_MTL = .OUTPUT_MTL;
+	    S$QIOW (CHAN = .RWSV_CHAN,
+		    FUNC = IO$_DEACCESS
+		    );
+	    STA_DISMOUNT (.RWSV_VOL_NUMBER);
+	    END;
+	END;
+    END;
+IF .INPUT_CHAN NEQ 0
+THEN
+    BEGIN
+    $QIOW(
+	FUNC=IO$_DEACCESS,
+	CHAN=.INPUT_CHAN);
+    $DASSGN(CHAN=.INPUT_CHAN);
+    INPUT_CHAN = 0;
+    END;
+IF .OUTPUT_CHAN NEQ 0
+THEN
+    BEGIN
+    $QIOW(
+	FUNC=IO$_DEACCESS,
+	CHAN=.OUTPUT_CHAN);
+    $DASSGN(CHAN=.OUTPUT_CHAN);
+    OUTPUT_CHAN = 0;
+    END;
+
+
+! Save globals prior to restoration.
+!
+SAVE_PROC_LIST = .INPUT_PROC_LIST;
+
+
+! Interpret the table to restore global storage.
+!
+T = CHKPT_TABLE;
+P = .CHKPT_VARS;
+WHILE TRUE DO
+    BEGIN
+    LOCAL
+	A,				! Local copy of A byte
+	B,				! Local copy of B byte
+	C:	REF VECTOR;		! Local copy of address
+
+
+    ! Establish the three table parameters.
+    !
+    A = .(.T)<0,8>;			T = .T + 1;
+    B = .(.T)<0,16>;			T = .T + 2;
+    C = GLOBAL_BASE + .(.T)<0,16>;	T = .T + 2;
+
+
+    ! Case on the action code to execute the action.
+    !
+    CASE .A FROM EXIT TO SPECIAL_6 OF
+	SET
+
+
+	[EXIT]:
+	    EXITLOOP;
+
+
+	[COPY]:
+	    BEGIN
+	    CH$MOVE(.B, .P, .C);	! Move area to variable
+	    P = .P + .B;		! Update pointer
+	    END;
+
+
+	[COPYDYN]:
+	    BEGIN
+	    RESTORE_COPY(.P, .B, .C);
+	    P = .P + 8;
+	    END;
+
+
+	[SPECIAL_1]:
+	    BEGIN
+	    RESTORE_COPY(.P, .COM_I_SETCOUNT*%UPVAL, .C);
+	    P = .P + 8;
+	    END;
+
+
+	[SPECIAL_2]:
+	    BEGIN
+	    IF (.P[DSC$A_POINTER] EQL 0 OR .COM_I_SETCOUNT NEQ .P[DSC$W_LENGTH]/(2*%UPVAL)) AND .FAST_IMAP NEQ 0
+	    THEN
+		BEGIN
+		INCR I FROM 1 TO .COM_I_SETCOUNT DO
+		    BEGIN
+		    IF .FAST_IMAP[.I-1] NEQ 0
+		    THEN
+			FREE_VM(.FAST_IMAP_SIZE[.I-1] * 512, .FAST_IMAP[.I-1]);
+		    END;
+		FREE_VM(.COM_I_SETCOUNT*%UPVAL, .FAST_IMAP);
+		FAST_IMAP = 0;
+		END;
+	    IF .P[DSC$A_POINTER] NEQ 0
+	    THEN
+		BEGIN LOCAL Q;
+		IF .FAST_IMAP EQL 0
+		THEN
+		    BEGIN
+		    FAST_IMAP = GET_ZERO_VM(.P[DSC$W_LENGTH]/2);
+		    END;
+		Q = .P[DSC$A_POINTER];
+		INCR I FROM 1 TO .COM_I_SETCOUNT DO
+		    BEGIN
+		    RESTORE_COPY(
+			.Q,
+			(IF .FAST_IMAP_SIZE EQL 0
+			    THEN 0
+			    ELSE .FAST_IMAP_SIZE[.I-1]),
+			FAST_IMAP[.I-1]);
+		    Q = .Q + 8;
+		    END;
+		END;		
+	    P = .P + 8;
+	    END;
+
+
+
+
+	[SPECIAL_3]:
+	    BEGIN
+	    IF .INPUT_FAB NEQ 0
+	    THEN
+		BEGIN
+	        CH$MOVE(NAM$C_BLN, .P, INPUT_FAB[FC_NAM]);
+	        CH$MOVE(NAM$C_MAXRSS, .P + NAM$C_BLN, INPUT_FAB[FC_RSA]);
+		END;
+	    P = .P + NAM$C_BLN + NAM$C_MAXRSS;
+	    END;
+
+
+	[SPECIAL_4]:
+	    BEGIN
+	    SAVE_D_VER = .P;
+	    P = .P + D_K_NLEVELS*%UPVAL;
+	    END;
+
+
+	[SPECIAL_5]:
+	    BEGIN
+	    RESTORE_COPY(.P, .FAST_BUFFER_SIZE, .C);
+	    P = .P + 8;
+	    END;
+
+
+	[SPECIAL_6]:
+	    BEGIN
+	    LOCAL
+		Q:	REF BBLOCK,
+		R:	REF BBLOCK,
+		T:	REF BBLOCK;
+	    MAP
+		P:	REF VECTOR;
+
+	    IF .C[0] EQL 0 THEN C[0] = C[1] = C[0];
+	    IF .P[0] EQL 0 THEN P[0] = P[1] = P[0];
+	    UNTIL REMQUE(.C[0], T) DO
+		BEGIN
+		FREE_VM(.T[PLC_SIZE], .T);
+		END;
+	    Q = .P[0];
+	    UNTIL .Q EQL P[0] DO
+		BEGIN
+		R = GET_VM(.Q[PLC_SIZE]);
+		CH$MOVE(.Q[PLC_SIZE], .Q, .R);
+		INSQUE(.R, .C[1]);
+		Q = .Q[PLC_FLINK];
+		END;
+	    P = .P + 8;
+	    END;
+
+
+	TES;
+    END;
+
+
+! Reassign channels.
+!
+IF .INPUT_CHAN NEQ 0
+THEN
+    BEGIN
+    STATUS = ASSIGN_INPUT_CHANNEL(INPUT_QUAL[QUAL_DEV_DESC], INPUT_CHAN, 0, 0);
+    IF NOT .STATUS
+    THEN
+	FILE_ERROR(
+	    BACKUP$_OPENIN + STS$K_SEVERE,
+	    .INPUT_FAB,
+	    .STATUS);
+    END;
+
+
+! Prune INPUT_PROC_LIST back to its prior state.
+!
+WHILE .SAVE_PROC_LIST NEQ .INPUT_PROC_LIST DO
+    BEGIN
+    LOCAL
+	T;
+
+    T = .SAVE_PROC_LIST;
+    SAVE_PROC_LIST = .SAVE_PROC_LIST[REC_NEXT];
+    FREE_VM(REC_S_ENTRY, .T);
+    END;
+
+
+! Restart file scan.
+!
+IF NOT .QUAL[QUAL_PHYS] THEN
+IF .INPUT_NAM NEQ 0 THEN
+IF .INPUT_NAM[NAM$B_RSL] NEQ 0
+THEN
+    BEGIN
+    IF .INPUT_NAM[NAM$B_DIR] NEQ 2
+    THEN
+	BEGIN
+	LOCAL
+	    RSA:	VECTOR[NAM$C_MAXRSS,BYTE],	! Copy of filename
+	    DESC:	VECTOR[2];			! File name descriptor
+
+	FREE_DIR_DATA();
+	DESC[0] = .INPUT_NAM[NAM$B_RSL];
+	DESC[1] = RSA;
+	CH$MOVE(.DESC[0], .INPUT_NAM[NAM$L_RSA], RSA);
+	INIT_DIR_SCAN(
+	    .INPUT_CHAN,
+	    .INPUT_NAM,
+	    INPUT_QUAL[QUAL_DEV_DESC],
+	    DESC,
+	    %B'10',
+	    .FAST_RVN,
+	    .SAVE_D_VER);
+	IF NOT FIND_NEXT()
+	THEN
+	    BEGIN
+	    INPUT_NAM[NAM$B_RSL] = .DESC[0];
+	    CH$MOVE(.DESC[0], RSA, .INPUT_NAM[NAM$L_RSA]);
+	    COM_FLAGS[COM_FAIL_RSTRT] = TRUE;
+	    CHKPT_STATUS = SS$_NOSUCHFILE;
+	    END;
+	RESET_DIR_SPEC(
+	    INPUT_QUAL[QUAL_EXP_DESC],
+	    .QUAL[QUAL_IMAG]);
+	END;
+
+
+    ! If necessary, re-access the file that was accessed at the end of the
+    ! previous reel.
+    !
+    IF
+	.INPUT_FLAGS[INPUT_OPEN] AND
+	NOT .QUAL[QUAL_VERI] AND
+	NOT .COM_FLAGS[COM_FAIL_RSTRT]
+    THEN
+	BEGIN
+	LOCAL
+	    FIB:	BBLOCK[10],	! FIB
+	    FIB_DESC:	VECTOR[2],	! Descriptor for FIB
+	    IOSB:	VECTOR[4,WORD];	! I/O status block
+
+
+	FIB[FIB$L_ACCTL] = FIB$M_NOWRITE OR FIB$M_NORECORD;
+	IF .INPUT_FLAGS[INPUT_IGNO_INTE] THEN FIB[FIB$L_ACCTL] = FIB$M_NOLOCK OR FIB$M_NORECORD;
+	FIB[FIB$W_FID_NUM] = .INPUT_NAM[NAM$W_FID_NUM];
+	FIB[FIB$W_FID_SEQ] = .INPUT_NAM[NAM$W_FID_SEQ];
+	FIB[FIB$W_FID_RVN] = .INPUT_NAM[NAM$W_FID_RVN];
+	FIB_DESC[0] = 10;
+	FIB_DESC[1] = FIB;
+	STATUS = $QIOW(
+	    FUNC=IO$_ACCESS OR IO$M_ACCESS,
+	    CHAN=.INPUT_CHAN,
+	    IOSB=IOSB,
+	    P1=FIB_DESC);
+	IF .STATUS THEN STATUS = .IOSB[0];
+	IF NOT .STATUS
+	THEN
+	    BEGIN
+	    COM_FLAGS[COM_FAIL_RSTRT] = TRUE;
+	    CHKPT_STATUS = .STATUS;
+	    END;
+	END;
+    END;
+
+
+! Restart from the saved machine state.  Execution continues in routine
+! REEL_CHECKPOINT.
+!
+RESTART_M(.CHKPT_LOW_SP, .CHKPT_HIGH_SP, CHKPT_STACK);
+END;
+
+END
+ELUDOM

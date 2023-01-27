@@ -1,0 +1,606 @@
+	.TITLE	DEADLOCK - DEADLOCK DETECTION AND RESOLUTION
+	.IDENT	'V03-000'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY: EXECUTIVE, SYSTEM SERVICES
+;
+; ABSTRACT: 
+;	This module implements deadlock detection (and resolution)
+;	for the VMS lock manager system services ($ENQ and $DEQ).
+;
+; ENVIRONMENT: VAX/VMS
+;
+; AUTHOR: Steve Beckhardt,	 CREATION DATE: 15-Jul-1981
+;
+; MODIFIED BY:
+;
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+;
+; EXTERNAL SYMBOLS:
+;
+
+	$CADEF				; Conditional assembly switches
+	$DYNDEF				; Structure type code definitions
+	$LCKDEF				; LCK definitions
+	$LKBDEF				; LKB offsets
+	$PCBDEF				; PCB offsets
+	$RSBDEF				; RSB offsets
+
+;
+; MACROS:
+;
+
+;
+; EQUATED SYMBOLS:
+;
+
+LOCKFRAME = 24				; Number of bytes pushed onto
+					; stack for each recursive call
+					; of SEARCH_RESDLCK  (5 registers
+					; plus return address).  This
+					; cannot be changes without making
+					; corresponding coding changes
+
+;
+; OWN STORAGE:
+;
+
+	.PSECT	LOCKMGR
+
+	.SBTTL	LCK$SEARCHDLCK - Search and break deadlocks
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is the top level routine for identifying and resolving
+;	deadlocks.  Identifying deadlocks is performed by two separate
+;	routines.  One identifies conversion deadlocks (is only called
+;	if this request is a conversion) and the other identifies multiple
+;	resource deadlocks.  When a deadlock is found, one of the locks
+;	forming the deadlock is selected as the "victim".  This lock
+;	receives the status SS$_DEADLOCK in its LKSB and the lock request
+;	is denied.  Multiple deadlocks are handled in the following way.
+;	This routine quits after it finds and breaks one deadlock.  However,
+;	in this case, if the original lock (R6) is not the victim, then it is
+;	not removed from the lock timeout queue.  The next time that the 
+;	timeout queue is examined this lock will again be searched for
+;	deadlock.  This	is repeated until either no deadlock is found for this 
+;	lock or	it is taken off the timer queue for another reason (for 
+;	example, it gets granted)
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	LCK$SEARCHDLCK
+;
+; INPUT PARAMETERS:
+;
+;	R6	Address of LKB to determine if in deadlock cycle
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 - R4 are destroyed
+;--
+	.PAGE
+
+	ASSUME	LKB$K_CONVERT  EQ  0
+	ASSUME	LKB$K_WAITING  EQ  -1
+
+LCK$SEARCHDLCK::
+	PUSHR	#^M<R5,R6,R7,R8,R9,R10,R11>
+
+	.IF NE	CA$_MEASURE
+	INCL	W^PMS$GL_DLCKSRCH
+	.ENDC
+
+	MOVZWL	LKB$L_PID(R6),R0	; Get process index
+	MOVL	@W^SCH$GL_PCBVEC[R0],R4	; Convert to PCB address
+	TSTB	LKB$B_STATE(R6)		; Is this lock on the conversion queue?
+	BNEQ	10$			; No, must be on wait queue
+	BSBW	SEARCH_CVTDLCK		; Yes, search for conversion deadlocks
+	TSTL	R1			; Is there a victim?
+	BNEQ	BREAK_DEADLOCK		; Yes, go no further
+
+10$:	; We didn't have a conversion deadlock so now we have to search 
+	; for multiple resource deadlocks.
+
+	MOVL	SP,R10			; Save current stack pointer
+	ADDL3	W^LCK$GL_EXTRASTK,-	; Compute upper bound for stack
+		W^EXE$GL_INTSTKLM,R11	; (allow LCK$GL_EXTRASTK plus one
+	ADDL	#LOCKFRAME,R11		; lock frame)
+	MOVL	R4,R8			; Save PCB address
+	MOVL	W^LCK$GL_PRCMAP,R7	; Get address of process bitmap
+	MOVC5	#0,(R7),#0,-8(R7),(R7)	; and clear it
+	MOVAL	PCB$L_LOCKQFL(R8),R4	; Make R4 point to lock queue in PCB
+
+	; Register usage at this point:
+	;
+	;	R4	Address of current PCB  + PCB$L_LOCKQFL
+	;	R6	Address of current LKB
+	;	R7	Address of process bitmap
+	;	R8	Address of current PCB
+	;	R10	Current stack pointer
+	;	R11	Top of useable stack (there is some extra space)
+
+	BSBW	SEARCH_RESDLCK		; Search for multiple resource deadlocks
+	TSTL	R1			; Do we have a victim?
+	BNEQ	BREAK_DEADLOCK		; Yes
+
+	; No deadlock was found.  Remove this lock from the timeout queue.
+
+	REMQUE	LKB$L_ASTQFL(R6),R0	; Remove from queue
+	BICW	#LKB$M_TIMOUTQ,-	; Clear status bit indicating
+		LKB$W_STATUS(R6)	; lock was on timeout queue
+	BRB	EXIT			; Return
+
+
+BREAK_DEADLOCK:
+	; Come here to break a deadlock.  If the lock was a new lock
+	; request, then it is dequeued.  If the lock was a conversion,
+	; then it is regranted at its old lock mode.  In either case
+	; the completion status (in the LKSB) is SS$_DEADLOCK.
+	; Note that if the original lock we started with (in R6) is 
+	; the victim it is not removed from the timeout queue here.
+	; Instead this happens automatically when the lock is
+	; queued for a completion AST.  
+	; Also note that the lock database may change as a result 
+	; of the victim lock being dequeued (or regranted).  For example,
+	; when a lock is dequeued, it is possible for other locks to
+	; be granted (possibly the original lock we started with in R6).
+
+	.IF NE	CA$_MEASURE
+	INCL	W^PMS$GL_DLCKFND
+	.ENDC
+
+	MOVL	R1,R6			; Put victim LKB ptr in R6
+	MOVZWL	#SS$_DEADLOCK,R7	; Needed for LCK$DEQLOCK
+	TSTB	LKB$B_STATE(R6)		; Is lock on the conversion queue?
+	BEQL	50$			; Yes
+	BGTR	LKB_GRANTED		; No - its granted; bugcheck!
+	BSBW	LCK$DEQLOCK		; Lock is on wait queue - dequeue it
+	BLBS	R0,EXIT			; Success - return
+	BRB	DEQ_ERROR		; Error - bugcheck
+
+50$:	; Lock is on conversion queue.  This case is more complicated
+	; than locks on the wait queue because the lock must become
+	; granted again.  Furthermore, if the lock was at the head
+	; of the conversion queue we may be able to grant some additional
+	; locks.
+
+	MOVL	R7,LKB$L_LKST1(R6)	; Store SS$_DEADLOCK status
+	MOVL	LKB$L_RSB(R6),R8	; Get address of RSB
+	SUBL3	#LKB$L_SQFL,-		; Save address of lock at head
+		RSB$L_CVTQFL(R8),R10	; of conversion queue
+	REMQUE	LKB$L_SQFL(R6),R0	; Remove this lock from conversion queue
+	MOVZBL	LKB$B_GRMODE(R6),R1	; Get granted mode
+	BSBW	LCK$REGRANTLOCK		; Regrant it
+	CMPL	R6,R10			; Was this lock at the head of the queue?
+	BNEQ	EXIT			; No, no point trying to grant more
+
+	; We have regranted a lock that was at the head of the conversion 
+	; queue.  Therefore, it is necessary to try to grant additional 
+	; locks.  Also, this will reset the conversion grant mode if we 
+	; set it incorrectly below.
+
+	MOVZBL	RSB$B_GGMODE(R8),R5	; Get group grant mode
+	MOVB	R5,RSB$B_CGMODE(R8)	; and set conv. grant mode equal to it
+	BSBW	LCK$GRANTCVTS		; Try granting more locks
+
+EXIT:	POPR	#^M<R5,R6,R7,R8,R9,R10,R11>
+	RSB
+
+DEQ_ERROR:
+	BUG_CHECK	DEQSUBLCKS,FATAL
+
+LKB_GRANTED:
+	BUG_CHECK	LKBGRANTED,FATAL
+
+	.SBTTL	SEARCH_CVTDLCK - Search for conversion deadlocks
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine searches for conversion deadlocks and selects a victim
+;	if one is found.  A conversion deadlock is one in which a conversion
+;	request has a granted mode incompatible with the requested mode
+;	of another conversion request ahead of it in the conversion 
+;	queue.  For example, assume there are two PR
+;	locks on a resource.  One PR lock tries to convert to EX and
+;	therefore must wait.  Then the second PR lock tries to convert to
+;	EX and it too must wait.  However, the first will never get granted
+;	since its requested mode (EX) is incompatible with the second's
+;	granted mode (PR).  The second will never get granted since 
+;	it's waiting behind the first.
+;	To find conversion deadlocks it is sufficient to check all locks
+;	ahead of this lock on the conversion queue to see if their
+;	requested modes are incompatible with this lock's granted mode.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	SEARCH_CVTDLCK
+;
+; INPUT PARAMETERS:
+;
+;	R4	Address of PCB of lock in R6
+;	R6	Address of LKB to search for conversion deadlocks
+;
+; OUTPUT PARAMETERS:
+;
+;	R1	Address of victim lock or 0 if no deadlock is found.
+;
+; SIDE EFFECTS:
+;
+;	R0, R1, R2, and R8 are destroyed
+;--
+
+SEARCH_CVTDLCK:
+	ADDL3	LKB$L_RSB(R6),-		; Point to head of conversion queue
+		#RSB$L_CVTQFL,R8
+	MOVZBL	LKB$B_GRMODE(R6),R2	; Get granted mode of current lock
+	MOVL	R6,R1			; Address of current lock
+10$:	MOVL	LKB$L_SQBL(R1),R1	; Get previous lock in queue
+	CMPL	R1,R8			; Reached the queue head yet?
+	BEQL	80$			; Yes
+	SUBL	#LKB$L_SQFL,R1		; Back up to start of LKB
+	MOVZBL	LKB$B_RQMODE(R1),R0	; Get requested mode
+	BBS	R0,W^LCK$COMPAT_TBL[R2],10$ ; Branch if compatible
+
+	; Have a conversion deadlock.  The victim is the one with the lower
+	; deadlock priority.
+
+	MOVZWL	LKB$L_PID(R1),R0	; Get process index
+	MOVL	@W^SCH$GL_PCBVEC[R0],R0	; and translate to PCB address
+	CMPL	PCB$L_DLCKPRI(R0),-	; Compare the deadlock priorities
+		PCB$L_DLCKPRI(R4)
+	BLSSU	30$			; Branch if original lock is higher
+	MOVL	R6,R1			; Original lock is victim
+30$:	RSB
+
+80$:	CLRL	R1			; No deadlock found
+	RSB
+
+	.SBTTL	SEARCH_RESDLCK - Search for resource deadlocks
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine searches for multiple resource deadlocks and selects
+;	a victim if one is found.  A multiple resource deadlock is one
+;	in which a circular list of processes are each waiting for one
+;	another on two or more resources.  For example, assume process A
+;	locks resource 1, process B locks resource 2, then process A
+;	locks resource 2 (and waits), and finally process B locks
+;	resource 1 (and waits).  A and B are each waiting for the other on
+;	different resources.  This type of deadlock must involve two or
+;	more resources unless one process locks the same resource twice.
+;	(Normally, it is senseless for one process to lock the
+;	same resource twice but this does make sense if the process
+;	is multi-threaded).
+;	To find multiple resource deadlocks a recursive algorithm is used.
+;	The basis of this algorithm is for each process with a lock on 
+;	the current resource blocking the current lock, find any waiting
+;	locks that process has and recursively see what processes are
+;	blocking those locks.  As we do this, see if we can find a path
+;	back to the current process.  In other words, we are travelling
+;	a graph of waiting processes searching for a path back to our
+;	starting point.  If we find one, then the stack consists of a 
+;	list of waiting processes and locks forming a deadlock.  The lock
+;	with the minimum deadlock priority is selected as a victim
+;	and we return.  Multiple deadlocks are handled by calling this 
+;	routine again.
+;	To prevent this algorithm from looping on a deadlock cycle that
+;	doesn't include the original process (R8), a bitmap representing
+;	each process in the system is used.  Whenever a particular
+;	process is visited, the corresponding bit is set.  If the bit
+;	is already set, then we won't visit that process after all.  Note
+;	that when we leave a process, the corresponding bit is NOT cleared.
+;	The result of this is that deadlock cycles not involving the original
+;	process are not found (yet).  Instead, they are ignored by this
+;	deadlock search, but will be found later when a lock in that 
+;	cycle times out.  The reason for not clearing the bitmap is that
+;	this drastically improves the worst-case  behavior of the
+;	algorithm by not visiting a process if it has been visited before.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	SEARCH_RESDLCK
+;
+; INPUT PARAMETERS:
+;
+;	R4	Address of PCB + PCB$L_LOCKQFL (to determine who is blocking)
+;	R6	Address of LKB (to determine who is blocking)
+;	R7	Address of process bitmap (one bit for each process in system)
+;	R8	Address of original PCB (our starting point)
+;	R10	Bottom of deadlock stack
+;	R11	Top of useable stack (so that we don't overflow the stack)
+;
+; OUTPUT PARAMETERS:
+;
+;	R1	Address of victim LKB or 0 if no deadlock
+;
+; SIDE EFFECTS:
+;
+;	R0 is destroyed
+;--
+
+; Note:  The following are the register conventions used by this routine.
+;	 R0 and R1 may be used as scratch registers.  Each time this
+;	 routine is called (recursively) R2 - R6 are saved on the stack.  
+;	 R7 - R11  remain constant during the recursive calls.  Registers
+;	 are used as follows:
+;
+;		R2	Maximum lock mode computed so far
+;		R3	Address of queue header in RSB
+;		R4	Address of PCB + PCB$L_LOCKQFL (address of queue header)
+;		R5	Address of LKB blocking LKB in R6
+;		R6	Address of LKB to determine who is blocking
+;		R7	Address of process bitmap
+;		R8	Ultimate PCB we're searching for
+;		R10	Bottom of deadlock stack
+;		R11	Top of useable stack
+;
+;	Note that there are several assumptions made in the code about
+;	what registers are used for what and the order in which they
+;	are saved on the stack.  Specifically, the loop that selects
+;	the deadlock victim assumes both the number of resisters saved
+;	and their relative positions on the stack.  See also the
+;	definition of the symbol LOCKFRAME at the beginning of this module.
+
+
+SEARCH_RESDLCK:
+	PUSHR	#^M<R2,R3,R4,R5,R6>	; Can't change this without also
+					; changing value of LOCKFRAME and
+					; deadlock resolution code
+
+	; First run through all locks waiting ahead of this lock
+	; maximizing the requested modes and checking all locks
+	; incompatible with the current "maxmode".  If this lock is
+	; on the wait queue then we do the wait queue first and
+	; the converison queue next.  If this lock is on the
+	; conversion queue then we do only the conversion queue.
+	; Later we'll do all the granted locks.
+
+	ASSUME	LKB$K_GRANTED  EQ  1
+	ASSUME	LKB$K_CONVERT  EQ  0
+	ASSUME	LKB$K_WAITING  EQ  -1
+	ASSUME	RSB$L_CVTQFL  EQ  RSB$L_GRQFL+8
+	ASSUME	RSB$L_WTQFL  EQ  RSB$L_CVTQFL+8
+
+	MOVZBL	LKB$B_RQMODE(R6),R2	; R2 = this lock's requested mode
+	ADDL3	#RSB$L_CVTQFL,-		; R3 = Addr. of cvt. queue header
+		LKB$L_RSB(R6),R3
+	TSTB	LKB$B_STATE(R6)		; Which queue is lock on?	
+	BEQL	10$			; Conversion queue
+	BGTR	LKB_GRANTED		; Granted queue - bugcheck!
+	ADDL	#8,R3			; Wait queue - point to wait queue hdr
+10$:	MOVL	R6,R5			; R5 will point to other LKB's
+					; in front of the one pointed to by R6
+
+20$:	MOVL	LKB$L_SQBL(R5),R5	; Get previous lock on state queue
+	CMPL	R5,R3			; Reached head of queue yet?
+	BEQL	50$			; Yes
+	SUBL	#LKB$L_SQFL,R5		; Back up to point to start of LKB
+	MOVZBL	LKB$B_RQMODE(R5),R0	; R0 = requested mode
+	MOVL	R2,R1			; Save old maxmode
+
+	; Maximize lock modes (in R0 and R2) and see if this lock (R5) is
+	; incompatible with (the previous) maxmode.  The maximization function 
+	; is a simple arithmetic maximum except if the two modes are CW and PR.
+	; In that case the maximum of CW and PR is PW.  PW is incompatible
+	; with everything either CW or PR is incompatible with.
+
+	CMPB	R0,R2			; Current mode greater than maxmode?
+	BEQL	25$			; No, they're equal
+	BGTRU	21$			; Yes, compute new maxmode
+	CMPB	R0,#LCK$K_CWMODE	; No, is current mode CW?
+	BNEQ	25$			; No, maxmode = R2
+	CMPB	R2,#LCK$K_PRMODE	; Yes, is maxmode PR?
+	BNEQ	25$			; No, maxmode = R2
+	BRB	22$			; Yes, new maxmode is PW
+21$:	CMPB	R2,#LCK$K_CWMODE	; Is maxmode CW?
+	BNEQ	23$			; No, maxmode = R0
+	CMPB	R0,#LCK$K_PRMODE	; Yes, is current mode PR?
+	BNEQ	23$			; No, maxmode = R0
+22$:	MOVB	#LCK$K_PWMODE,R2	; Have CW and PR; maxmode = PW
+	BRB	25$
+23$:	MOVB	R0,R2			; Maxmode = R0
+
+25$:	BBS	R0,-			; Branch if compatible with 
+		W^LCK$COMPAT_TBL[R1],20$; saved maxmode
+
+	; Have a lock incompatible with maxmode.  First see
+	; if the process owning the lock (in R5) is the process we
+	; started with (in R8).  If it is, then we have deadlock.  If not,
+	; then see if the process has any other waiting locks.  If it
+	; does then we have to recurse down a level.  If it doesn't then
+	; we can continue at this level.
+
+	MOVZWL	LKB$L_PID(R5),R0	; Get process index
+	MOVL	@W^SCH$GL_PCBVEC[R0],R4	; Convert to PCB address
+	CMPL	R4,R8			; Is this the original PCB?
+	BEQL	65$			; Yes, have a deadlock
+	BBSS	R0,(R7),20$		; Br. if we've already done this process
+	MOVAL	PCB$L_LOCKQFL(R4),R4	; Point to lock queue header
+	MOVL	4(R4),R6		; Get last lock in list
+30$:	MOVAL	-LKB$L_OWNQFL(R6),R6	; Point to start of LKB
+	CMPL	R5,R6			; Is this the one we have in R5?
+	BEQL	35$			; Yes, move on to next one
+	TSTB	LKB$B_STATE(R6)		; Is this lock granted?
+	BGTR	20$			; Yes, done with this PCB
+	CMPL	SP,R11			; No, is there enough stack to recurse?
+	BLSSU	DEADLOCK_FOUND		; No, have to assume deadlock
+	BSBW	SEARCH_RESDLCK		; Yes, recursively search
+35$:	MOVL	LKB$L_OWNQBL(R6),R6	; Get previous lock
+	CMPL	R6,R4			; Reached end of list?
+	BNEQ	30$			; No, get next lock in PCB (inner loop)
+40$:	BRB	20$			; Yes, get next lock in RSB (outer loop)
+
+50$:	; Reached the queue header.  Back up R3 to point to the previous
+	; queue header in the RSB.  If R3 is pointing to the granted
+	; queue, then we are done with this loop and we continue with
+	; the granted queue.  Otherwise, we repeat this loop for the
+	; conversion queue.
+
+	SUBL	#8,R3			; Back up R3 one queue header
+	MOVAB	-LKB$L_SQFL(R3),R5	; Prepare to process that queue
+	MOVL	16(SP),R6		; Restore R6
+	ADDL3	#RSB$L_GRQFL,-		; R0 = address of granted queue
+		LKB$L_RSB(R6),R0
+	CMPL	R3,R0			; Have we reached the granted queue?
+	BNEQ	40$			; No, repeat for conversion queue
+
+	; Now repeat a similar procedure for all locks on the granted
+	; queue whose granted mode is incompatible with the maxmode
+	; in R2.
+
+60$:	MOVL	LKB$L_SQFL(R5),R5	; Get next lock in granted queue
+	CMPL	R5,R3			; Reached end of queue?
+	BEQL	90$			; Yes, no deadlock
+	SUBL	#LKB$L_SQFL,R5		; Back up to point to start of LKB
+	MOVZBL	LKB$B_GRMODE(R5),R0	; Get granted mode
+	BBS	R0,W^LCK$COMPAT_TBL[R2],60$ ; Branch if compatible
+
+	; Have an incompatible lock on the granted queue.  First see
+	; if the process owning the lock (in R5) is the process we
+	; started with (in R8).  If it is, then we have deadlock.  If not,
+	; then see if the process has any waiting locks.  If it
+	; does then we have to recurse down a level.  If it doesn't then
+	; we can continue at this level.
+
+	MOVZWL	LKB$L_PID(R5),R0	; Get process index
+	MOVL	@W^SCH$GL_PCBVEC[R0],R4	; Convert to PCB address
+	CMPL	R4,R8			; Is this the original PCB?
+65$:	BEQL	DEADLOCK_FOUND		; Yes, have a deadlock
+	BBSS	R0,(R7),60$		; Br. if we've already done this process
+	MOVAL	PCB$L_LOCKQFL(R4),R4	; Point to lock queue header
+	MOVL	4(R4),R6		; Get last lock in list
+70$:	TSTB	LKB$B_STATE-LKB$L_OWNQFL(R6) ; Is this lock granted?
+	BGTR	60$			; Yes, done with this PCB 
+	MOVAL	-LKB$L_OWNQFL(R6),R6	; No, back up to start of LKB
+	CMPL	SP,R11			; Is there enough stack to recurse?
+	BLSSU	DEADLOCK_FOUND		; No, have to assume deadlock
+	BSBW	SEARCH_RESDLCK		; Yes, recursively search
+	MOVL	LKB$L_OWNQBL(R6),R6	; Get previous lock
+	BRB	70$			; Repeat inner loop - Note we don't 
+					; check for end of queue since there 
+					; must be at least one granted lock
+
+90$:	CLRL	R1			; No deadlock found
+
+SEARCH_EXIT:
+	POPR	#^M<R2,R3,R4,R5,R6>
+	RSB
+
+DEADLOCK_FOUND:
+;	 Come here if we found a deadlock.  The stack consists of
+;	 a series of stack frames, one for each lock involved in
+;	 the deadlock.  Each stack frame consists of the 5 saved
+;	 registers (R2 - R6) and a return address.  Note that in
+;	 each stack frame the saved R6 points to the lock and the
+;	 saved R4 points to the respective PCB lock queue.  The
+;	 stack frames are bounded by R10 and the current SP.
+;	 The following diagram shows the stack with three frames.
+;	
+;	
+;	  SP -> +---------------+	     .  +-----------------------+
+;		|---------------|	   .	|       Saved R2        |
+;		|---------------|        .	|                       |
+;		|---------------|      .	+-----------------------+
+;		|---------------|    .		|       Saved R3        |
+;		|---------------|  .		|                       |
+;		+---------------+.		+-----------------------+
+;		|---------------|		|       Saved R4        |
+;		|---------------|		| (PCB + PCB$L_LOCKQFL) |
+;		|---------------|		+-----------------------+
+;		|---------------|		|       Saved R5        |
+;		|---------------|.		|                       |
+;		+---------------+  .            +-----------------------+
+;		|---------------|    .		|       Saved R6        |
+;		|---------------|      .	|    (Address of LKB)   |
+;		|---------------|	 .	+-----------------------+
+;		|---------------|	   .	|     Return Address    |
+;		|---------------|	     .  |                       |
+;	 	+---------------+	        +-----------------------+
+;	 R10 ->
+;	
+;	 We will now search the frames looking for the process with
+;	 the smallest deadlock priority.  When found, the respective
+;	 lock will be selected as the deadlock victim and the
+;	 stack will be trimmed back so that we will return to
+;	 the original caller.  Note that a deadlock priority of zero 
+;	 causes an immediate exit from the loop.  Register usage will be:
+;	
+;		R0	Current deadlock priority
+;		R1	Current lock frame pointer
+;		R2	Minimum deadlock priority, so far
+;		R3	Best victim frame, so far
+;		R4	Address of PCB lock queue (current frame)
+;		R10	Bottom of stack (start search here)
+;		SP	Top of stack (end search here)
+;	
+;	 Note that the following code makes a number of assumptions
+;	 regarding the order of registers saved on the stack and their
+;	 contents.
+
+	SUBL3	#LOCKFRAME,R10,R1	; Initialize current frame pointer
+	MOVL	R1,R3			; Initialize "best" frame pointer
+	MNEGL	#1,R2			; Initialize "best" deadlock priority
+10$:	MOVL	8(R1),R4		; Get pointer to PCB lock queue
+	MOVL	PCB$L_DLCKPRI-PCB$L_LOCKQFL(R4),R0 ; Get current deadlock pri.
+	BEQL	30$			; Branch if zero - have best victim
+	CMPL	R0,R2			; Compare current priority with 
+	BGEQU	20$			; previous minimum.
+	MOVQ	R0,R2			; This frame becomes "best so far"
+20$:	SUBL	#LOCKFRAME,R1		; Move to next frame
+	CMPL	R1,SP			; Reached top of stack yet?
+	BGEQU	10$			; No, repeat for next frame
+	MOVL	R3,R1			; Yes, R1 points to victim frame
+
+30$:	; R1 now points to the frame containing the victim lock.
+
+	MOVL	16(R1),R1		; R1 = address of victim LKB
+	CMPB	LKB$B_TYPE(R1),-	; Make sure it's a LKB
+		#DYN$C_LKB
+	BNEQ	90$			; Bugcheck
+	SUBL3	#LOCKFRAME,R10,SP	; Remove all frames but one from stack
+	BRB	SEARCH_EXIT		; Return to original caller
+
+90$:	BUG_CHECK	NOTLKB,FATAL
+
+
+
+
+	.END
+

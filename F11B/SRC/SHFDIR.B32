@@ -1,0 +1,591 @@
+MODULE SHFDIR (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-001'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This routine either extends or compresses a directory file.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  15-Apr-1977  13:25
+!
+! MODIFIED BY:
+!
+!	V03-001	ACG0271		Andrew C. Goldstein,	23-Mar-1982  9:57
+!		Return unique error on directory allocation failure
+!
+!	V02-007	ACG0208		Andrew C. Goldstein,	15-Oct-1981  18:31
+!		Add segmented directory record support
+!
+!	V02-006	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:26
+!		Previous revision history moved to F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	SHUFFLE_DIR	: NOVALUE,	! extend or compress directory file
+	FIX_HEADER	: NOVALUE,	! update directory file header & FCB
+	HANDLER;			! local condition handler
+
+GLOBAL ROUTINE SHUFFLE_DIR (DIRECTION) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine extends or compresses a directory file. It is called
+!	to make free space in a block which is full or to squish out a block
+!	which is completely empty. If allocated but unused blocks are present
+!	at the end of the directory or if a squish is being done, the
+!	blocks are shuffled in place. Physically extending the directory
+!	requires reallocating and copying.
+!
+! CALLING SEQUENCE:
+!	SHUFFLE_DIR (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: +1 to extend the directory
+!	      -1 to squish
+!
+! IMPLICIT INPUTS:
+!	DIR_FCB: FCB of directory file
+!	DIR_VBN: current VBN of directory
+!	DIR_BUFFER: address of current directory block
+!	DIR_ENTRY: address of current directory record
+!	DIR_VERSION: address of version within record
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	(for extension only)
+!	DIR_VBN: current VBN of directory, updated
+!	DIR_BUFFER: address of current directory block, updated
+!	DIR_ENTRY: address of current directory record, updated
+!	DIR_VERSION: address of version within record, updated
+!	DIR_END: address of end of data in dirrectory block, updated
+!	(for compression)
+!	DIR_ENTRY: 0
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	directory extended, storage map altered, directory FCB altered
+!
+!--
+
+BEGIN
+
+LINKAGE
+	L_MAKE_POINTER	= CALL :
+			  GLOBAL (MAP_POINTER = 9);
+
+BUILTIN
+	FP;
+
+LABEL
+	COPY_BLOCK;			! directory block copy code
+
+GLOBAL REGISTER
+	MAP_POINTER	= 9 : REF BBLOCK; ! pointer to current retrieval pointer
+
+LOCAL
+	FIB		: REF BBLOCK,	! address of FIB for this operation
+	FCB		: REF BBLOCK,	! address of FCB for directory
+	HEADER		: REF BBLOCK,	! address of directory file header
+	IN_PLACE,			! in place copy flag
+	NEW_SIZE,			! size to extend directory to
+	NEW_LBN,			! starting LBN of new space
+	BUFFER		: REF BBLOCK,	! buffer address of current directory block
+	COMP_BUFFER,			! buffer address used for compression
+	NEW_BUFFER,			! address of newly read expanded block
+	OFFSET,				! VBN offset in shuffle copy
+	P1		: REF BBLOCK,	! directory record pointer
+	END_POINT	: REF BBLOCK,	! pointer to end of data in block
+	REC_OFFSET,			! block offset of current record
+	VER_OFFSET;			! block offset of current version
+
+EXTERNAL
+	CURRENT_RVN,			! RVN of current volume
+	LOCAL_FIB	: BBLOCK,	! FIB for main file operation
+	SECOND_FIB	: BBLOCK,	! FIB for secondary operations
+	DIR_FCB		: REF BBLOCK,	! address of directory FCB
+	DIR_CONTEXT	: BBLOCK,	! directory context block
+	PRIMARY_FCB	: REF BBLOCK,	! FCB of file in process
+	UNREC_COUNT,			! count of unrecorded blocks
+	UNREC_LBN,			! starting LBN of unrecorded blocks
+	UNREC_RVN;			! RVN of above
+
+DIR_CONTEXT_DEF;
+
+EXTERNAL ROUTINE
+	SAVE_CONTEXT,			! save reentrant context area
+	RESTORE_CONTEXT,		! restore reentrant context area
+	READ_HEADER,			! read file header
+	CHARGE_QUOTA,			! charge space to user's quota
+	ALLOC_BLOCKS,			! allocate blocks from storage map
+	MAKE_POINTER	: L_MAKE_POINTER, ! build header map pointer
+	READ_BLOCK,			! read a disk block
+	RESET_LBN,			! assign new LBN to buffer
+	WRITE_BLOCK,			! write block to disk
+	CREATE_BLOCK,			! fabricate a block buffer
+	INVALIDATE,			! invalidate a block buffer
+	NEXT_REC,			! get next directory record
+	TRUNCATE_HEADER,		! truncate file header
+	ZERO_WINDOWS;			! invalidate related file windows
+
+
+! First save the current context, since this is a secondary file operation.
+! Set up the secondary context pointers. Then read the directory file header.
+!
+
+SAVE_CONTEXT ();
+PRIMARY_FCB = FCB = .DIR_FCB;
+FIB = SECOND_FIB;
+CH$MOVE (FIB$S_FID, LOCAL_FIB[FIB$W_DID], FIB[FIB$W_FID]);
+
+HEADER = READ_HEADER (0, .FCB);
+
+! If the directory is being expanded, see if space is available. If not,
+! allocate a new larger area. The next VBN to use is the current directory
+! EOF block number. If the block is not present in the file, the directory
+! must be physically extended.
+!
+
+COPY_BLOCK: BEGIN
+IN_PLACE = 1;				! assume in place shuffle
+IF .DIRECTION GTR 0
+THEN
+    BEGIN
+    IF .FCB[FCB$L_EFBLK] + 1 GTRU .FCB[FCB$L_FILESIZE]
+    THEN
+	BEGIN
+
+! Compute the number of blocks needed (50% of the current directory size)
+! and allocate the new space contiguously. Limit the number of blocks
+! allocated to what will fit in the map area of the header.
+!
+
+	IN_PLACE = 0;
+	NEW_SIZE = .FCB[FCB$L_FILESIZE] + MAXU (.FCB[FCB$L_FILESIZE]/2, 1);
+	IF .FCB[FCB$L_FILESIZE] GEQU 1024 THEN ERR_EXIT (SS$_DIRFULL);
+	IF .NEW_SIZE GTRU 1024 THEN NEW_SIZE = 1024;
+	CHARGE_QUOTA (.HEADER[FH2$L_FILEOWNER], .NEW_SIZE - .FCB[FCB$L_FILESIZE],
+			BITLIST (QUOTA_CHECK));
+
+	FIB[FIB$V_ALCON] = 1;
+	FIB[FIB$V_FILCON] = 1;
+	IF NOT ALLOC_BLOCKS (.FIB, .NEW_SIZE, NEW_LBN, NEW_SIZE)
+	THEN ERR_EXIT (SS$_DIRALLOC);
+	UNREC_COUNT = .NEW_SIZE;
+	UNREC_LBN = .NEW_LBN;
+	UNREC_RVN = .CURRENT_RVN;
+	END
+    ELSE
+	NEW_LBN = .FCB[FCB$L_STLBN];	! use existing space
+
+! Now copy the directory blocks (following code is for expansion). For
+! maximum safety, we copy in reverse order, so that if the operation fails
+! or the system crashes, we have duplicate, rather than missing, directory
+! entries. We update the file header after the first block has been
+! written in an in place copy for the same reason.
+!
+
+    OFFSET = 0;				! shuffle offset
+    DECR VBN FROM .FCB[FCB$L_EFBLK] TO 1 DO
+	BEGIN
+	BUFFER = READ_BLOCK (.VBN+.FCB[FCB$L_STLBN]-1, 1, DIRECTORY_TYPE);
+
+! When we reach the VBN at which the shuffler was called, we split the
+! block.
+! We find the first record past the midpoint (past the 3/4 mark if
+! this is the last block) and split into two buffers. Note that this logic
+! depends on the availability from the buffer manager two blocks of
+! adjacent LBN's referenced in direct sequence.
+!
+
+	IF .VBN EQL .DIR_VBN
+	THEN
+	    BEGIN
+	    LOCAL P2, BUFFER2 : REF BBLOCK, LIMIT, HEADER_LENGTH;
+	    REC_OFFSET = .DIR_ENTRY - .DIR_BUFFER;
+	    VER_OFFSET = .DIR_VERSION - .DIR_BUFFER;
+
+	    P1 = .BUFFER;
+	    LIMIT = .BUFFER + 256;
+	    IF .DIR_VBN EQL .FCB[FCB$L_EFBLK]
+	    THEN LIMIT = .LIMIT + 128;
+
+	    UNTIL .P1 GEQA .LIMIT DO
+		BEGIN
+		P2 = .P1;
+		P1 = NEXT_REC (.P1);
+		END;
+
+! The point at which we split depends on the the relation between the
+! location of the new entry and the two split pointers.
+!
+!		+---------------+--------+-----------------+
+!		|               | record |                 |
+!		+---------------+--------+-----------------+
+!				P2       P1
+!
+! P1 is now at the record boundary just past the half (or 3/4) mark,
+! and P2 is at the previous record boundary. If the new entry precedes
+! P2, we split at P2 and the entry goes into the former block. If the
+! new entry is at P1 or later, we split at P1 and the entry goes into
+! the latter block. If the entry is a new version of the record at P2,
+! we split at P1 unless the record is already the last in its block, in
+! which case we split at P2. Finally, if we discover that P1 is at the
+! end of the block and P2 is at the beginning (i.e., the block contains
+! one large record), we have to split the record instead. Got it?
+!
+
+	    IF .REC_OFFSET + .BUFFER GTRA .P2
+	    THEN
+		BEGIN
+		P2 = .P1;
+		REC_OFFSET = .REC_OFFSET + .BUFFER - .P2;
+		VER_OFFSET = .VER_OFFSET + .BUFFER - .P2;
+		DIR_VBN = .DIR_VBN + 1;
+		END
+
+	    ELSE IF .REC_OFFSET + .BUFFER EQL .P2
+	    AND .DIR_VERSION NEQ 0
+	    THEN
+		BEGIN
+		IF .P1[DIR$W_SIZE] EQL 65535
+		THEN
+		    BEGIN
+		    IF .P2 EQL .BUFFER
+		    THEN
+			P2 = 0		! flag need for record split
+		    ELSE
+			BEGIN
+			REC_OFFSET = .REC_OFFSET + .BUFFER - .P2;
+			VER_OFFSET = .VER_OFFSET + .BUFFER - .P2;
+			DIR_VBN = .DIR_VBN + 1;
+			END;
+		    END
+		ELSE
+		    P2 = .P1;
+		END;
+
+! We now do either a block or record split; the latter is flagged here
+! by P2 set to zero. The block split is performed by allocating a new
+! buffer and copying the records past the split point (now denoted by P2)
+! into the new buffer, and then erasing the copied records from the
+! first buffer.
+!
+
+	    IF .P2 NEQ 0
+	    THEN
+		BEGIN
+		P1 = .P2 - .BUFFER;		! save split offset point
+		BUFFER2 = CREATE_BLOCK (.VBN+.FCB[FCB$L_STLBN], 1, DIRECTORY_TYPE);
+		CH$MOVE (512-.P1, .P2, .BUFFER2);
+		CH$COPY (2, UPLIT WORD (-1), 0, 512-.P1, .P2);
+		END
+
+! Otherwise we do a record split. The principle is similar to the block
+! split, except that we always split at the point of version insertion.
+! Assumptions: the current directory buffer contains only one record,
+! which fills it, and we are adding a new version. Allocate a buffer and
+! duplicate the block in it to set up the record header. Then carve out
+! the appropriate set of versions from each record and flag the records.
+!
+
+	    ELSE
+		BEGIN
+		P1 = .P1 - .BUFFER;
+		HEADER_LENGTH = (.BUFFER[DIR$B_NAMECOUNT] + 1 AND NOT 1) + DIR$C_LENGTH;
+
+		BUFFER2 = CREATE_BLOCK (.VBN+.FCB[FCB$L_STLBN], 1, DIRECTORY_TYPE);
+		CH$MOVE (512, .BUFFER, .BUFFER2);
+		CH$COPY (2, UPLIT WORD (-1), 0,
+			 512-.VER_OFFSET, .BUFFER+.VER_OFFSET);
+		CH$COPY (.P1-.VER_OFFSET+2, .BUFFER2+.VER_OFFSET, 0,
+			 512-.HEADER_LENGTH, .BUFFER2+.HEADER_LENGTH);
+
+		BUFFER[DIR$W_SIZE] = .VER_OFFSET - 2;
+		BUFFER2[DIR$W_SIZE] = .P1 - .VER_OFFSET + .HEADER_LENGTH - 2;
+
+! Pick the record to contain the new entry. We use the smaller of the
+! two.
+!
+
+		IF .VER_OFFSET - .HEADER_LENGTH GTRU .P1 - .VER_OFFSET
+		THEN
+		    BEGIN
+		    DIR_VBN = .DIR_VBN + 1;
+		    VER_OFFSET = .HEADER_LENGTH;
+		    END;
+		END;
+
+! Set the higher block to its new LBN and write it. Bump the offset so
+! that subsequent file to file copies now go to corresponding VBN's.
+! If this is an in place copy then fix up the header now.
+!
+
+	    RESET_LBN (.BUFFER2, .VBN+.NEW_LBN);
+	    OFFSET = -1;
+	    WRITE_BLOCK (.BUFFER2);
+	    IF .IN_PLACE AND .VBN EQL .FCB[FCB$L_EFBLK]
+	    THEN FIX_HEADER (.HEADER, 1);
+	    END;			! end of block split condition
+
+! For the rest of the copy loop, assign the output LBN to the buffer and
+! write it. On an in place copy, kick out of the loop after we have done
+! the block split. Otherwise, fix the header after the first write.
+!
+
+	RESET_LBN (.BUFFER, .VBN+.NEW_LBN+.OFFSET);
+	WRITE_BLOCK (.BUFFER);
+	IF .IN_PLACE
+	THEN
+	    BEGIN
+	    IF .OFFSET NEQ 0
+	    THEN LEAVE COPY_BLOCK
+	    ELSE IF .VBN EQL .FCB[FCB$L_EFBLK]
+	    THEN FIX_HEADER (.HEADER, 1);
+	    END;
+	END;				! of in place copy loop
+
+! Now deallocate the old directory blocks. Then build retrieval pointers
+! for the new blocks in the file header. Do the truncation with a local
+! condition handler enabled for special error recovery.
+!
+
+    .FP = HANDLER;
+    TRUNCATE_HEADER (.FIB, .HEADER);
+    .FP = 0;
+
+    HEADER[FH2$B_MAP_INUSE] = 0;
+    CH$FILL (0, (.HEADER[FH2$B_ACOFFSET] - .HEADER[FH2$B_MPOFFSET]) * 2,
+	    .HEADER + .HEADER[FH2$B_MPOFFSET]*2);
+    MAP_POINTER = .HEADER + .HEADER[FH2$B_MPOFFSET]*2;
+    MAKE_POINTER (.NEW_SIZE, .NEW_LBN, .HEADER);
+
+    UNREC_COUNT = 0;
+    KERNEL_CALL (ZERO_WINDOWS, .FCB);
+    CHARGE_QUOTA (.HEADER[FH2$L_FILEOWNER], .NEW_SIZE - .FCB[FCB$L_FILESIZE],
+		BITLIST (QUOTA_CHARGE));
+
+    END				! of expansion conditional
+
+! For an inplace compression, we copy the blocks in forward order, again
+! for maximum safety.
+!
+
+ELSE
+    BEGIN
+    DIR_ENTRY = 0;			! indicate no block resident
+    INVALIDATE (.DIR_BUFFER);		! punt the block being squished out
+    INCR VBN FROM .DIR_VBN+1 TO .FCB[FCB$L_EFBLK] DO
+	BEGIN
+	COMP_BUFFER = READ_BLOCK (.VBN+.FCB[FCB$L_STLBN]-1, 1, DIRECTORY_TYPE);
+	RESET_LBN (.COMP_BUFFER, .VBN+.FCB[FCB$L_STLBN]-2);
+	WRITE_BLOCK (.COMP_BUFFER);
+	END;
+    END;
+
+! Now, for an extension copy or a compression, update the file header.
+!
+
+FIX_HEADER (.HEADER, .DIRECTION);
+
+END;					! end of block COPY_BLOCK
+
+! For an extension, read back the block where the new entry will go
+! and update the lookup pointers. For a compression, save the pointer
+! in offset form so it can be used by the remove cleanup in case of error.
+!
+
+IF .DIRECTION GTR 0
+THEN
+    BEGIN
+    NEW_BUFFER = READ_BLOCK (.DIR_VBN+.FCB[FCB$L_STLBN]-1, 1, DIRECTORY_TYPE);
+    DIR_BUFFER = .NEW_BUFFER;
+    DIR_ENTRY = .REC_OFFSET + .NEW_BUFFER;
+    IF .DIR_VERSION NEQ 0
+    THEN DIR_VERSION = .NEW_BUFFER + .VER_OFFSET;
+
+    END_POINT = .NEW_BUFFER;
+    UNTIL .END_POINT[DIR$W_SIZE] EQL 65535 DO
+    END_POINT = NEXT_REC (.END_POINT);
+    DIR_END = .END_POINT + 2;
+    END;
+
+! Finally switch back to primary context.
+!
+
+RESTORE_CONTEXT ();
+
+END;					! end of routine EXTEND_DIR
+
+ROUTINE FIX_HEADER (HEADER, DIRECTION) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine updates the file header of the directory being
+!	extended or compressed, and also updates the directory FCB.
+!
+!
+! CALLING SEQUENCE:
+!	FIX_HEADER (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of file header
+!	ARG2: +1 for extension
+!	      -1 for compression
+!
+! IMPLICIT INPUTS:
+!	DIR_VBN: VBN of directory being split or compressed out
+!	DIR_FCB: address of directory FCB
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	file header updated, FCB updated
+!
+!--
+
+BEGIN
+
+MAP
+	HEADER		: REF BBLOCK;	! file header arg
+
+EXTERNAL
+	DIR_FCB		: REF BBLOCK;	! directory FCB
+
+EXTERNAL ROUTINE
+	INIT_FCB2,			! initialize FCB
+	ZERO_IDX,			! initialize directory index
+	CHECKSUM,			! compute file header checksum
+	WRITE_HEADER;			! write file header
+
+
+! Update the end of file mark in the header and the FCB. Then adjust the
+! directory index in the FCB. Finally checksum and write the file header.
+!
+
+BBLOCK [HEADER[FH2$W_RECATTR], FAT$W_EFBLKL] = 
+	.BBLOCK [HEADER[FH2$W_RECATTR], FAT$W_EFBLKL] + .DIRECTION;
+KERNEL_CALL (INIT_FCB2, .DIR_FCB, .HEADER);
+BBLOCK [HEADER[FH2$W_RECATTR], FAT$W_HIBLKL] = .DIR_FCB[FCB$L_FILESIZE];
+KERNEL_CALL (ZERO_IDX);
+
+CHECKSUM (.HEADER);
+WRITE_HEADER ();
+
+END;					! end of routine FIX_HEADER
+
+ROUTINE HANDLER (SIGNAL, MECHANISM) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is the condition handler for directory extension. It is
+!	enabled only during the truncate call (deallocating the old directory
+!	blocks). Normal error handling would cause the entire directory to
+!	be dropped on the floor. Since we already have a new good copy, we
+!	should forge ahead. Note that no error status is returned to the user,
+!	although we will log a system error.
+!
+!
+! CALLING SEQUENCE:
+!	HANDLER (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of signal array
+!	ARG2: address of mechanism array
+!
+! IMPLICIT INPUTS:
+!	FILE_HEADER: address of directory file header
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	SS$_RESIGNAL or none if unwind
+!
+! SIDE EFFECTS:
+!	file header map area cleaned out
+!
+!--
+
+BEGIN
+
+MAP
+	SIGNAL		: REF BBLOCK,	! signal array arg
+	MECHANISM	: REF BBLOCK;	! mechanism array arg
+
+
+! Check the condition code for FCP error exit. Then initialize the header's
+! map area and unwind. On other signals we simply resignal.
+!
+
+IF .SIGNAL[CHF$L_SIG_NAME] EQL SS$_CMODUSER
+THEN $UNWIND (DEPADR = MECHANISM[CHF$L_MCH_DEPTH]);
+
+RETURN SS$_RESIGNAL;			! status is irrelevant if unwind
+
+END;					! end of routine handler
+
+END
+ELUDOM

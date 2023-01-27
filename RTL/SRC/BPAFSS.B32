@@ -1,0 +1,2204 @@
+MODULE bpa$fss (				! File string scan
+		IDENT = '1-005'		! File: BPAFSS.B32, Edit: PLL1005
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!<blf/uppercase_key>
+!<blf/lowercase_user>
+!
+
+!++
+! FACILITY: VAX-11 BASIC RTL SUPPORT
+!
+! ABSTRACT:
+!
+!	Main routine BPA$FSS and associated routines parse a
+!	RSTS- or VMS-type filespec.
+!
+! ENVIRONMENT: Native mode VAX processor, User mode.
+!
+! AUTHOR: Jim Ibbett , CREATION DATE: 25-Oct-79
+!
+! MODIFIED BY:
+!
+! 1-002	- Repair version number, and interface to system build procedures.
+!	   JBS 02-DEC-1979
+! 1-003	- Replace MOVTUC builtin with a routine call, to avoid problems dealing
+!	   directly with registers in BLISS.  JBS 03-DEC-1979
+! 1-004	- Use RTL's standard PSECT names.  JBS 05-DEC-1979
+! 1-005 - BPA$FSS should check if a wildcard was inserted in theFIRQB and
+!	  not just if fqnam1 or fqnam2 is non-zero.  (RAD_50 wasnever
+!	  being called, instead of being omitted just in the case
+!	  of wildcards.)  Also, call RAD_50 twice, whether the filename is
+!	  six characters or not, so that garbage isn't returned to the
+!	  user.  PLL 20-Jun-81
+!
+!<blf/page>
+
+!
+! SWITCHES:
+!
+
+SWITCHES ADDRESSING_MODE (EXTERNAL = GENERAL, NONEXTERNAL = WORD_RELATIVE);
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    bpa$fss,					! Performs pre-parsing
+    find_switch,				! Parses any switches
+    rad_50,					! Converts from ascii to rad50
+    translate_dev,				! Convert RSTS device to VMS device
+    bpa$file_scan;				! Performs parsing & fills O/P blocks
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'RTLSTARLE';
+
+REQUIRE 'RTLIN:BPASTRUCT';
+
+REQUIRE 'RTLIN:BPAFSBDEF';
+
+REQUIRE 'RTLIN:BPAFQBDEF';
+
+REQUIRE 'RTLIN:RTLPSECT';
+
+!
+! MACROS:
+!
+!	NONE
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+    bpa$k_def_prot = 60;			! Default protection code if none given
+
+!
+! PSECTS:
+!
+declare_psects (bpa);
+!
+! OWN STORAGE:
+!
+
+GLOBAL
+    bpa$gb_usr_prot : BLOCK [1, BYTE],		! default prot code
+    bpa$gb_usr_real : BLOCK [1, BYTE],		! prot_real if -1
+    bpa$al_usrppn : VECTOR [2, LONG];		! user ppn string descriptor
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+    bpa$get_block,
+    bpa$free_block,
+    bpa$$movtuc : NOVALUE;
+
+!+
+! The following are the error codes used in this module:
+!-
+
+EXTERNAL LITERAL
+    bas$_illnum,				! Illegal number
+    bas$_illswiusa,				! Illegal switch usage
+    bas$_illfilnam;				! Illegal file name
+
+
+GLOBAL ROUTINE bpa$fss (fqb_ptr, fsb_ptr, buf_ptr, byt_cnt) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	On entry, a filespec is described by buf_ptr/byt_cnt.
+!	The string is pre-parsed (remove nulls/spaces, convert
+!	lowercase to uppercase, strip parity, etc) and a
+!	call made to BPA$FILE_SCAN which parses the string.
+!	On return, any switches are decoded and the FLAGWORDS,
+!	FIRQB and FSB are loaded. Status is returned to
+!	the caller.
+!
+! FORMAL PARAMETERS:
+!
+!	fqb_ptr.rla.v  -  longword address of FIRQB
+!	fsb_ptr.rla.v  -  longword address of FSB
+!	buf_ptr.rla.v  -  longword address of filespec string
+!	byt_cnt.rlu.v  -  contains the length of the filespec string
+!
+! IMPLICIT INPUTS:
+!
+!	bpa$al_usrppn    - descriptor for user ppn string
+!	bpa$gb_usr_prot  - default prot code
+!	bpa$gb_usr_real  - non-zero to indicate bpa$gb_usr_prot has
+!			   been initialised
+!
+! IMPLICIT OUTPUTS:
+!
+!	FQB  -  the FIRQB, contains information as for
+!		the RSTS/E V7 .FSS call
+!
+!	FSB  -  contains descriptor for the parsed string
+!		and 'XRB' flagwords, as shown below.
+!		(see $fsb_def for details of fields/bits)
+!
+!
+!	32		24		16		8		0
+!	+---------------+---------------+---------------+---------------+
+!	!                      filespec length                          !   0
+!	+---------------+---------------+---------------+---------------+
+!	!                      filespec address                         !   4
+!	+---------------+---------------+---------------+---------------+
+!	!        position value         !   file_off	!   prot_real   !   8
+!	+---------------+---------------+---------------+---------------+
+!	!   size MSB    !          size LSB             !   prot code   !  12
+!	+---------------+---------------+---------------+---------------+
+!	!       clustersize value       !           mode value          !  16
+!	+---------------+---------------+---------------+---------------+
+!	!  dev_name 2   !  dev_name 1   !  dev_unit #   !   unit_real   !  20
+!	+---------------+---------------+---------------+---------------+
+!	!              status bits    (from NAM$L_FNB)			!  24
+!	+---------------+---------------+---------------+---------------+
+!	!  offset to /	!  offset to <	!  offset to :	! offset to ::	!  28
+!	+---------------+---------------+---------------+---------------+
+!	!	'XRB' flagword 1	!	'XRB' flagword 2	!  32
+!	+---------------+---------------+---------------+---------------+
+!
+!
+! ROUTINE VALUE:
+!
+!	Errors as follows:
+!
+!	a) bas$_illfilnam     if parse error
+!	b) bas$_illnum	      if illegal protection or switch value
+!	c) bas$_illswiusa     if illegal switch
+!
+!	else returns ss$_normal for success.
+!
+! SIDE EFFECTS:
+!
+!	Allocates a block of dynamic memory for output string if
+!	successful. This block must be returned by the caller
+!	using BPA$FREE_BLOCK.
+!
+!--
+
+    BEGIN
+
+    MAP
+	fqb_ptr : REF $fqb_def,			! address of FIRQB
+	fsb_ptr : REF $fsb_def,			! address of FSB
+	buf_ptr : REF VECTOR [, BYTE];		! address of string buffer
+
+    LOCAL
+	op_ptr : REF VECTOR [, BYTE],		! address of MOVTUC dst buffer
+	string : REF VECTOR [, BYTE],		! input string work buffer
+	copy : REF VECTOR [, BYTE],		! xlated string buffer for $parse
+	EXPAND : REF VECTOR [, BYTE],		! expanded string  buffer
+	buffer_address : REF VECTOR [, BYTE],	! user I/P string buffer
+	ctlr_val : WORD,			! value of VMS ctlr #
+	unit_val : WORD,			! value of VMS unit #
+	prot_val : WORD,			! calculated prot code value
+	ppn_val : WORD,				! calculated ppn value
+	xlate_length : BYTE,			! length of xlated string
+	device_size : BYTE,			! length of device name
+	file_size : BYTE,			! length of filename
+	ext_size : BYTE,			! length of ext
+	log_dir_len : BYTE,			! logical directory string length
+	node_ptr,				! offset to '::'
+	dev_ptr,				! offset to ':'
+	usr_dev_ptr,				! offset to user spec'd device
+	ppn_ptr,				! offset to '[' or '<ppn'
+	ppn_end_ptr,				! offset to 'ppn>'
+	dot_ptr,				! offset to filename
+	ver_ptr,				! offset to ';'
+	prot_ptr,				! offset to '<prot'
+	swit_ptr,				! offset to '/'
+	end_part1,				! offset to end of VMS-type string
+	next_posn,				! offset to next scan position
+	next_char,				! offset to next char to examine
+	log_dir_addr,				! logical directory string address
+	parsed_address,				! address of parsed string
+	parsed_length,				! length of parsed string
+	parsed_end,				! offset to end (';' or length)
+	dst_length,				! length of MOVTUC dst buffer
+	byte_count,				! length of user I/P string
+	sts;					! return status from routines
+
+    BIND
+!+
+! The table below is a translation table and is used to pre-parse
+! the incoming user string. The method of operation is that there
+! are 256 characters in the table, associated with the 256 ascii
+! character codes. Thus if an incoming character has the ascii
+! code octal 50 (decimal 40 - a '(') it will be translated to the
+! character at offset 40 in the table, in this case a '['.
+! This table is set up to perform a number of conversions,
+! specifically strip parity, change lower to upper case, change
+! '()' to '[]', and change all non-printing characters to '0'.
+! It is used in conjunction with the MOVTUC instruction,
+! which is explained later in this code.
+!-
+	table = CH$TRANSTABLE (			! translation table
+	REP 33 OF (%O'0'),
+	%C'!',	%C'"',	%C'#',	%C'$',	%C'%',	%C'&',	%C'''',	%C'[',
+	%C']',	%C'*',	%C'+',	%C',',	%C'-',	%C'.',	%C'/',	%C'0',
+	%C'1',	%C'2',	%C'3',	%C'4',	%C'5',	%C'6',	%C'7',	%C'8',
+	%C'9',	%C':',	%C';',	%C'<',	%C'=',	%C'>',	%C'?',	%C'@',
+	%C'A',	%C'B',	%C'C',	%C'D',	%C'E',	%C'F',	%C'G',	%C'H',
+	%C'I',	%C'J',	%C'K',	%C'L',	%C'M',	%C'N',	%C'O',	%C'P',
+	%C'Q',	%C'R',	%C'S',	%C'T',	%C'U',	%C'V',	%C'W',	%C'X',
+	%C'Y',	%C'Z',	%C'[',	%C'\',	%C']',	%C'^',	%C'_',	%C'`',
+	%C'A',	%C'B',	%C'C',	%C'D',	%C'E',	%C'F',	%C'G',	%C'H',
+	%C'I',	%C'J',	%C'K',	%C'L',	%C'M',	%C'N',	%C'O',	%C'P',
+	%C'Q',	%C'R',	%C'S',	%C'T',	%C'U',	%C'V',	%C'W',	%C'X',
+	%C'Y',	%C'Z',	%C'{',	%C'|',	%C'}',	%C'~',	%O'0',
+	REP 33 OF (%O'0'),
+	%C'!',	%C'"',	%C'#',	%C'$',	%C'%',	%C'&',	%C'''',	%C'[',
+	%C']',	%C'*',	%C'+',	%C',',	%C'-',	%C'.',	%C'/',	%C'0',
+	%C'1',	%C'2',	%C'3',	%C'4',	%C'5',	%C'6',	%C'7',	%C'8',
+	%C'9',	%C':',	%C';',	%C'<',	%C'=',	%C'>',	%C'?',	%C'@',
+	%C'A',	%C'B',	%C'C',	%C'D',	%C'E',	%C'F',	%C'G',	%C'H',
+	%C'I',	%C'J',	%C'K',	%C'L',	%C'M',	%C'N',	%C'O',	%C'P',
+	%C'Q',	%C'R',	%C'S',	%C'T',	%C'U',	%C'V',	%C'W',	%C'X',
+	%C'Y',	%C'Z',	%C'[',	%C'\',	%C']',	%C'^',	%C'_',	%C'`',
+	%C'A',	%C'B',	%C'C',	%C'D',	%C'E',	%C'F',	%C'G',	%C'H',
+	%C'I',	%C'J',	%C'K',	%C'L',	%C'M',	%C'N',	%C'O',	%C'P',
+	%C'Q',	%C'R',	%C'S',	%C'T',	%C'U',	%C'V',	%C'W',	%C'X',
+	%C'Y',	%C'Z',	%C'{',	%C'|',	%C'}',	%C'~',	%O'0');
+
+!+
+! logical directory translation strings for $, #, ! and &
+!-
+
+    BIND
+	dollar_string = UPLIT BYTE('SYS$SYSTEM:'),
+	hash_string = UPLIT BYTE('BPA$DIR_HASH:'),
+	exclam_string = UPLIT BYTE('BPA$DIR_EXCLAM:'),
+	amper_string = UPLIT BYTE('BPA$DIR_AMPER:'),
+	end_string = UPLIT BYTE('0');
+
+!+
+! logical directory string lengths (from above)
+!-
+
+    LITERAL
+	dollar_string_l = hash_string - dollar_string,
+	hash_string_l = exclam_string - hash_string,
+	exclam_string_l = amper_string - exclam_string,
+	amper_string_l = end_string - amper_string;
+
+!+
+! Get parameters
+! If length is zero, just return what we can to user.
+!-
+
+    IF .byt_cnt GTRU 0
+    THEN
+	BEGIN
+	byte_count = .byt_cnt;
+	buffer_address = .buf_ptr;
+	END
+    ELSE
+	BEGIN
+	CH$FILL (0, fsb$k_length, .fsb_ptr);
+	fsb_ptr [fsb$a_fsa] = .buf_ptr;
+	fsb_ptr [fsb$l_fsl] = 0;
+	RETURN ss$_normal;
+	END;
+
+!+
+! Copy string to our buffer and use translate table to
+! convert lower- to upper-case, lose any spaces, nulls
+! and non-printing characters, and convert () to [].
+!-
+
+    IF NOT (sts = bpa$get_block (.byte_count, string)) THEN RETURN SIGNAL (.sts);
+
+!+
+! The following code performs the translation or pre-parsing
+! of the user string, via the translation table explained
+! previously. It uses the MOVTUC (MOVe Translated Until
+! Character) VAX machine instruction, which operates as follows:-
+! Each incoming character is translated via the table. If
+! the translation results in the character being converted to
+! a code of 0, MOVTUC will complete with R0, R4 and R5
+! containing values as described in the architecture handbook.
+! The rogue character is skipped over (lost) and MOVTUC continued.
+! This all continues until 'bytes_to_move' is zero (i.e. all translated).
+! When all is done, the vector 'string' contains the final
+! translated string.
+!-
+    op_ptr = .string;				! O/P buffer address
+    dst_length = nam$c_maxrss;			! O/P buffer length
+
+    WHILE .byte_count GTRU 0 DO
+	BEGIN
+
+	LOCAL
+	    esc_flag,				! 1 if MOVTUC stopped by escape
+	    esc_char,				! pointer to escape character
+	    bytes_to_move,			! number of chars not Xlated
+	    bytes_left,				! bytes left in O/P area
+	    next_dst_addr;			! addr of next byte in O/P area
+
+	bpa$$movtuc (byte_count, .buffer_address, %REF (0), table, dst_length, .op_ptr, esc_flag,
+	    bytes_to_move, esc_char, bytes_left, next_dst_addr);
+	op_ptr = .next_dst_addr;		! where to put next char
+
+	IF .esc_flag NEQU 0
+	THEN 					! '0' seen, so step over it & continue...
+	    BEGIN
+	    buffer_address = .esc_char + 1;	! next I/P char address
+	    byte_count = .bytes_to_move - 1;	! # of bytes left to do
+	    dst_length = .bytes_left;		! # of bytes left in O/P buffer
+	    END
+	ELSE
+	    byte_count = 0;			! All Xlated - force exit from 'WHILE...'
+
+	END;
+
+    xlate_length = .op_ptr - .string;		! length of Xlated string
+!+
+! Initialise fsb
+!-
+    CH$FILL (0, fsb$k_length, .fsb_ptr);
+    fsb_ptr [fsb$a_fsa] = .string;
+    fsb_ptr [fsb$l_fsl] = .xlate_length;
+!+
+! Find and mark any '::'
+!-
+    node_ptr = CH$FIND_SUB (.xlate_length, .string, 2, UPLIT BYTE('::'));
+
+    IF .node_ptr NEQU 0
+    THEN
+	BEGIN
+	node_ptr = .node_ptr - .string;
+	fsb_ptr [fsb$b_node_off] = .node_ptr;
+	usr_dev_ptr = .node_ptr + 2;
+	END
+    ELSE
+	BEGIN
+	fsb_ptr [fsb$b_node_off] = 0;
+	usr_dev_ptr = 0;
+	END;
+
+!+
+! Find and mark any ':' (following any '::')
+! NOTE: the colon MAY relate to a switch, rather
+! than be a device delimeter. We assume it is the
+! later for now, and check its offset when we look
+! for a '/'.
+!-
+
+    IF .fsb_ptr [fsb$b_node_off] NEQU 0
+    THEN
+	dev_ptr = CH$FIND_CH (.xlate_length - .fsb_ptr [fsb$b_node_off] - 2,
+	    .string + .fsb_ptr [fsb$b_node_off] + 2, %C':')
+    ELSE
+	dev_ptr = CH$FIND_CH (.xlate_length, .string, %C':');
+
+    IF .dev_ptr NEQU 0 THEN fsb_ptr [fsb$b_dev_off] = .dev_ptr - .string ELSE fsb_ptr [fsb$b_dev_off] = 0;
+
+!+
+! Find '<x' where x is numeric (i.e. protection)
+!-
+    prot_ptr = CH$FIND_CH (.xlate_length, .string, %C'<');
+
+    IF .prot_ptr NEQU 0
+    THEN 					! we found a '<', see if numeric follows
+	BEGIN
+	prot_ptr = .prot_ptr - .string;
+
+	IF (.string [.prot_ptr + 1] GEQU %C'0' AND .string [.prot_ptr + 1] LEQU %C'9')
+	THEN 					! '<prot>' found
+	    fsb_ptr [fsb$b_prot_off] = .prot_ptr
+	ELSE
+!+
+! '<' found was (probably) a directory, so scan for another '<'
+!-
+	    BEGIN
+	    prot_ptr = CH$FIND_CH (.xlate_length - .prot_ptr - 1, .string + .prot_ptr + 1, %C'<');
+
+	    IF .prot_ptr NEQU 0
+	    THEN 				! '<' found
+		BEGIN
+		prot_ptr = .prot_ptr - .string;
+
+		IF (.string [.prot_ptr + 1] GEQU %C'0' AND .string [.prot_ptr + 1] LEQU %C'9')
+		THEN 				! '<prot>' found
+		    fsb_ptr [fsb$b_prot_off] = .prot_ptr
+		ELSE
+		    BEGIN
+		    bpa$free_block (.string, .byte_count);
+		    RETURN SIGNAL (bas$_illnum);
+		    END;
+
+		END;
+
+	    END;
+
+	END;
+
+!+
+! Find first '/' (if any)
+! NOTE: If we found a ':' previously, we compare the
+! offsets of the colon & slash. If the colon offset is
+! greater then it could not have been a device
+! delimeter so we zero its stored offset.
+!-
+    swit_ptr = CH$FIND_CH (.xlate_length, .string, %C'/');
+
+    IF .swit_ptr NEQU 0
+    THEN
+	BEGIN
+	fsb_ptr [fsb$b_swit_off] = .swit_ptr - .string;
+
+	IF .fsb_ptr [fsb$b_dev_off] GTRU .fsb_ptr [fsb$b_swit_off] THEN fsb_ptr [fsb$b_dev_off] = 0;
+
+	END
+    ELSE
+	fsb_ptr [fsb$b_swit_off] = 0;
+
+!+
+! Get ptr to end of VMS-type filespec and check that
+! the <prot> is before the /switch (if both present)
+!-
+
+    IF (.fsb_ptr [fsb$b_prot_off] NEQU 0 AND .fsb_ptr [fsb$b_swit_off] NEQU 0)
+    THEN 					! both present
+
+	IF .fsb_ptr [fsb$b_prot_off] LSSU .fsb_ptr [fsb$b_swit_off]
+	THEN 					! '<' before '/'  OK
+	    end_part1 = .fsb_ptr [fsb$b_prot_off]
+	ELSE
+	    BEGIN
+	    bpa$free_block (.string, .byte_count);
+	    RETURN SIGNAL (bas$_illswiusa);	! '/' before '<'  ERROR
+	    END
+
+    ELSE
+
+	IF .fsb_ptr [fsb$b_prot_off] NEQU 0
+	THEN 					! only '<' present  OK
+	    end_part1 = .fsb_ptr [fsb$b_prot_off]
+	ELSE
+
+	    IF .fsb_ptr [fsb$b_swit_off] NEQU 0
+	    THEN 				! only '/' present  OK
+		end_part1 = .fsb_ptr [fsb$b_swit_off]
+	    ELSE
+		end_part1 = .xlate_length;	! neither  -  end = length
+
+!+
+! Find position of next char after '::' or ':'
+! (whichever is the greater)
+!-
+
+    IF .fsb_ptr [fsb$b_dev_off] GTRU .fsb_ptr [fsb$b_node_off]
+    THEN
+	next_posn = .fsb_ptr [fsb$b_dev_off]
+    ELSE
+
+	IF (.fsb_ptr [fsb$b_node_off] NEQU 0)	!
+	THEN
+	    next_posn = .fsb_ptr [fsb$b_node_off] + 1
+	ELSE
+	    next_posn = 0;
+
+    next_char = .next_posn;
+
+    IF .next_char NEQU 0 THEN next_char = .next_char + 1;
+
+!+
+! Check integrity of [...] or <...> if present, and
+! make next_char the char after the ']' or '>'
+!-
+
+    SELECTONEU .string [.next_char] OF
+	SET
+
+	[%C'['] :
+	    BEGIN
+	    next_posn = CH$FIND_CH (.xlate_length - .next_char, .string + .next_char, %C']');
+
+	    IF .next_posn NEQU 0
+	    THEN
+		BEGIN
+		next_posn = .next_posn - .string;
+		next_char = .next_posn + 1;
+		END
+	    ELSE
+		BEGIN
+		bpa$free_block (.string, .byte_count);
+		RETURN SIGNAL (bas$_illfilnam);
+		END;
+
+	    END;
+
+	[%C'<'] :
+	    BEGIN
+	    next_posn = CH$FIND_CH (.xlate_length - .next_char, .string + .next_char, %C'>');
+
+	    IF .next_posn EQLU 0
+	    THEN
+		BEGIN
+		bpa$free_block (.string, .byte_count);
+		RETURN SIGNAL (bas$_illfilnam);
+		END
+	    ELSE
+
+		IF (.string [.next_char + 1] GEQU %C'A' AND .string [.next_char + 1] LEQU %C'Z')
+		THEN
+		    BEGIN
+		    next_posn = .next_posn - .string;
+		    next_char = .next_posn + 1;
+		    END;
+
+	    END;
+
+	[OTHERWISE] :
+	    0;					! nothing to do
+	TES;
+
+!+
+! Set NFREP bit if a '%' in source string
+!-
+    fsb_ptr [fsb$b_file_off] = .next_char;
+    next_posn = .next_char;
+
+    IF (CH$FIND_CH (.end_part1 - .next_posn, .string + .next_posn, %C'%') NEQU 0)
+    THEN
+	fqb_ptr [fqb$b_nfrep] = fqb$k_nfrep;
+
+!+
+! Check to see if both '?' and '%' are present. If so error, else
+! convert any '?' to '%'
+!-
+
+    IF (CH$FIND_CH (.end_part1 - .next_posn, .string + .next_posn, %C'?') NEQU 0)
+    THEN
+	BEGIN
+
+	IF (CH$FIND_CH (.end_part1 - .next_posn, .string + .next_posn, %C'%') NEQU 0)
+	THEN
+	    BEGIN
+	    bpa$free_block (.string, .byte_count);
+	    RETURN SIGNAL (bas$_illfilnam);
+	    END
+	ELSE
+	    BEGIN
+
+	    LOCAL
+		ptr;
+
+	    UNTIL CH$FAIL (ptr = CH$FIND_CH (.end_part1 - .next_posn, .string + .next_posn, %C'?')) DO
+		CH$WCHAR (%C'%', .ptr);
+
+	    END;
+
+	END;
+
+!+
+! See if the next char is a logical directory specifier.
+! If so, load the required translation string address/length
+! and point next_posn to the following char
+!-
+
+    SELECTONEU .string [.next_char] OF
+	SET
+
+	[%C'$'] :
+	    BEGIN
+	    log_dir_addr = dollar_string;
+	    log_dir_len = dollar_string_l;
+	    next_posn = .next_posn + 1;
+	    END;
+
+	[%C'#'] :
+	    BEGIN
+	    log_dir_addr = hash_string;
+	    log_dir_len = hash_string_l;
+	    next_posn = .next_posn + 1;
+	    END;
+
+	[%C'!'] :
+	    BEGIN
+	    log_dir_addr = exclam_string;
+	    log_dir_len = exclam_string_l;
+	    next_posn = .next_posn + 1;
+	    END;
+
+	[%C'&'] :
+	    BEGIN
+	    log_dir_addr = amper_string;
+	    log_dir_len = amper_string_l;
+	    next_posn = .next_posn + 1;
+	    END;
+
+	[%C'@'] :
+	    BEGIN
+	    log_dir_addr = .bpa$al_usrppn [1];
+	    log_dir_len = .bpa$al_usrppn [0];
+	    next_posn = .next_posn + 1;
+
+	    IF .log_dir_addr EQLU 0
+	    THEN
+		BEGIN
+		log_dir_addr = end_string;
+		log_dir_len = 0;
+		END;
+
+	    END;
+
+	[OTHERWISE] :
+	    log_dir_len = 0;
+	TES;
+
+!+
+! If the above 5 chars appear further on in the string, then error
+!-
+
+    IF (CH$FIND_CH (.end_part1 - .next_posn, .string + .next_posn, %C'$') NEQU 0)	!
+	OR (CH$FIND_CH (.end_part1 - .next_posn, .string + .next_posn, %C'#') NEQU 0)	!
+	OR (CH$FIND_CH (.end_part1 - .next_posn, .string + .next_posn, %C'!') NEQU 0)	!
+	OR (CH$FIND_CH (.end_part1 - .next_posn, .string + .next_posn, %C'&') NEQU 0)	!
+	OR (CH$FIND_CH (.end_part1 - .next_posn, .string + .next_posn, %C'@') NEQU 0)
+    THEN
+	BEGIN
+	bpa$free_block (.string, .byte_count);
+	RETURN SIGNAL (bas$_illfilnam);
+	END;
+
+!+
+! If we found a logical directory specifier, then merge the
+! translation with the rest of the string
+! Get the merge buffer from free core
+! If the logical_directory_length is zero, just copy
+! 'string' to 'copy' and leave 'lengths' as they are.
+!-
+
+    IF NOT (sts = bpa$get_block (nam$c_maxrss, copy))
+    THEN
+	BEGIN
+	bpa$free_block (.string, .byte_count);
+	RETURN SIGNAL (.sts);
+	END;
+
+    IF .log_dir_len NEQU 0
+    THEN
+	BEGIN
+	CH$COPY (.next_posn - 1, .string, 	! 1st bit upto specifier
+	    .log_dir_len, .log_dir_addr, 	! translation string
+	    .end_part1 - .next_posn, .string + .next_posn, 	! last bit after specifier
+	    0, 					! fill char
+	    nam$c_maxrss, .copy);		! destination
+	xlate_length = .xlate_length + .log_dir_len - 1;	! adjust total length
+	end_part1 = .end_part1 + .log_dir_len - 1;	! adjust 'VMS-part' length
+	END
+    ELSE
+	CH$MOVE (.end_part1, .string, .copy);	! just copy the string
+
+!+
+! Setup and call bpa$file_scan
+!-
+    fsb_ptr [fsb$a_fsa] = .copy;
+    fsb_ptr [fsb$l_fsl] = .end_part1;
+
+    IF NOT (sts = bpa$file_scan (.fsb_ptr))
+    THEN
+	BEGIN
+	bpa$free_block (.string, .byte_count);
+	bpa$free_block (.copy, nam$c_maxrss);
+	RETURN SIGNAL (.sts);
+	END;
+
+!+
+! Decode the <prot> if present
+!-
+
+    IF .fsb_ptr [fsb$b_prot_off] NEQU 0
+    THEN
+	BEGIN
+	prot_ptr = .fsb_ptr [fsb$b_prot_off] + 1;
+	prot_val = 0;
+
+	WHILE (.string [.prot_ptr] GEQU %C'0' AND .string [.prot_ptr] LEQU %C'9') DO
+	    BEGIN
+	    prot_val = (.prot_val*10) + (.string [.prot_ptr] - %C'0');
+	    prot_ptr = .prot_ptr + 1;
+	    END;
+
+	IF .string [.prot_ptr] NEQU %C'>'
+	THEN
+	    BEGIN
+	    bpa$free_block (.string, .byte_count);
+	    bpa$free_block (.copy, nam$c_maxrss);
+	    RETURN SIGNAL (bas$_illnum);
+	    END;
+
+	IF .prot_val LEQU 127
+	THEN
+	    BEGIN
+	    fsb_ptr [fsb$b_prot] = .prot_val;
+	    fsb_ptr [fsb$b_prot_real] = -1;
+	    END
+	ELSE
+	    BEGIN
+	    bpa$free_block (.string, .byte_count);
+	    bpa$free_block (.copy, nam$c_maxrss);
+	    RETURN SIGNAL (bas$_illnum);
+	    END;
+
+	END;
+
+!+
+! Sort out switches (if any)
+!-
+
+    IF .fsb_ptr [fsb$b_swit_off] NEQU 0
+    THEN
+
+	IF (sts = find_switch (.fsb_ptr, .string + .fsb_ptr [fsb$b_swit_off],
+		.xlate_length - .fsb_ptr [fsb$b_swit_off])) NEQU 1
+	THEN
+	    RETURN SIGNAL (.sts);
+
+!+
+! Load up 'XRB' flagwords in FSB
+! (bpa$file_scan has already loaded some bits)
+!-
+
+    IF .fsb_ptr [fsb$b_prot_off] NEQU 0
+    THEN
+	fsb_ptr [fsb$v_prot_seen] = 1
+    ELSE
+
+	IF .bpa$gb_usr_real NEQU 0 THEN fsb_ptr [fsb$v_def_prot] = 1;
+
+    IF .fsb_ptr [fsb$b_dev_off] NEQU 0 THEN fsb_ptr [fsb$v_coln_seen] = 1;
+
+    dot_ptr = CH$FIND_CH (.end_part1 - .fsb_ptr [fsb$b_file_off], 	!
+	.string + .fsb_ptr [fsb$b_file_off], 	!
+	%C'.');
+
+    IF .dot_ptr NEQU 0
+    THEN
+	BEGIN
+	dot_ptr = .dot_ptr - .string;
+	fsb_ptr [fsb$v_dot_seen] = 1;
+	END
+    ELSE
+	dot_ptr = .end_part1;
+
+    IF (CH$FIND_CH (.end_part1 - .fsb_ptr [fsb$b_file_off], .string + .fsb_ptr [fsb$b_file_off], %C'%'))
+    THEN
+	fsb_ptr [fsb$v_name_ques] = 1;
+
+    IF (CH$FIND_CH (.end_part1 - .dot_ptr, .string + .dot_ptr, %C'%')) THEN fsb_ptr [fsb$v_ext_ques] = 1;
+
+!+
+! Copy duplicate bits from flagword 2 to flagword 1
+!-
+
+    IF .fsb_ptr [fsb$v_name_seen] THEN fsb_ptr [fsb$v_name_1] = 1;
+
+    IF .fsb_ptr [fsb$v_dot_seen] THEN fsb_ptr [fsb$v_dot_1] = 1;
+
+    IF .fsb_ptr [fsb$v_ppn_seen] THEN fsb_ptr [fsb$v_ppn_1] = 1;
+
+    IF .fsb_ptr [fsb$v_prot_seen] THEN fsb_ptr [fsb$v_prot_1] = 1;
+
+    IF .fsb_ptr [fsb$v_coln_seen] THEN fsb_ptr [fsb$v_coln_1] = 1;
+
+    IF .fsb_ptr [fsb$v_log_name] THEN fsb_ptr [fsb$v_log_1] = 1;
+
+    IF .fsb_ptr [fsb$v_status]			! If FSB indicates NFREP...
+    THEN
+	BEGIN
+	fqb_ptr [fqb$b_nfrep] = fqb$k_nfrep;	! ...set bit in FIRQB
+	fsb_ptr [fsb$v_status] = 0;		! and zero temp store
+	END;
+
+    fsb_ptr [fsb$v_status] = (.fsb_ptr [fsb$v_name_wild]	!
+    OR .fsb_ptr [fsb$v_name_ques]		!
+    OR .fsb_ptr [fsb$v_ext_wild]		!
+    OR .fsb_ptr [fsb$v_ext_ques]		!
+    OR .fsb_ptr [fsb$v_proj_wild]		!
+    OR .fsb_ptr [fsb$v_prog_wild]		!
+    OR .fsb_ptr [fsb$v_log_notr]);
+!+
+! Load up the FIRQB
+!
+! If filename or ext are wild, load rad50 of '??????' or '???'
+! into filename or ext fields
+!-
+
+    IF .fsb_ptr [fsb$v_name_wild]
+    THEN
+	BEGIN
+	fqb_ptr [fqb$w_fqnam1] = %O'134745';
+	fqb_ptr [fqb$w_fqnam2] = %O'134745';
+	END;
+
+    IF .fsb_ptr [fsb$v_ext_wild] THEN fqb_ptr [fqb$w_fqext] = %O'134745';
+
+!+
+! If numeric ppn and group or user fields are wild
+! set the field to 255 (octal -1)
+!-
+
+    IF .fsb_ptr [fsb$v_proj_wild] THEN fqb_ptr [fqb$b_proj] = -1;
+
+    IF .fsb_ptr [fsb$v_prog_wild] THEN fqb_ptr [fqb$b_prog] = -1;
+
+!+
+! Load size, mode, clustersize & position.
+!-
+    fqb_ptr [fqb$b_blkhi] = .fsb_ptr [fsb$b_blkhi];
+    fqb_ptr [fqb$w_blklo] = .fsb_ptr [fsb$w_blklo];
+    fqb_ptr [fqb$w_mode] = .fsb_ptr [fsb$w_mode];
+    fqb_ptr [fqb$w_cluster] = .fsb_ptr [fsb$w_clust];
+    fqb_ptr [fqb$w_position] = .fsb_ptr [fsb$w_position];
+!+
+! Prot_code is loaded as follows:-
+!
+! a)	the prot code specified in the filespec, or
+! b)	the user defined default prot code, or
+! c)	The basic plus default prot code (bpa$k_def_prot)
+!-
+
+    IF .fsb_ptr [fsb$v_prot_seen]
+    THEN
+	fqb_ptr [fqb$b_prot_code] = .fsb_ptr [fsb$b_prot]
+    ELSE
+
+	IF .fsb_ptr [fsb$v_def_prot]
+	THEN
+	    fqb_ptr [fqb$b_prot_code] = .bpa$gb_usr_prot
+	ELSE
+	    fqb_ptr [fqb$b_prot_code] = bpa$k_def_prot;
+
+    fqb_ptr [fqb$b_prot_real] = -1;
+!+
+! From now on we are interested in the contents of the
+! parsed string (filename, devicename, ppn, etc), so
+! we determine the offsets to the field delimeters
+! ( ::, :, [ or <, ] or >, ., and ;). This allows us to
+! find the specific parts of the string very easily.
+! We also store the offset to the filename and the
+! end of the ext.
+!-
+    parsed_address = .fsb_ptr [fsb$a_fsa];
+    parsed_length = .fsb_ptr [fsb$l_fsl];
+    next_posn = 0;
+!
+    node_ptr = CH$FIND_SUB (.parsed_length, .parsed_address, 2, UPLIT BYTE('::'));
+
+    IF .node_ptr NEQU 0
+    THEN
+	BEGIN
+	node_ptr = .node_ptr - .parsed_address;
+	next_posn = .node_ptr + 2;
+	END;
+
+!
+    dev_ptr = CH$FIND_CH (.parsed_length - .next_posn, .parsed_address + .next_posn, %C':');
+
+    IF .dev_ptr NEQU 0
+    THEN
+	BEGIN
+	dev_ptr = .dev_ptr - .parsed_address;
+	next_posn = .dev_ptr + 1;
+	END;
+
+!
+    ppn_ptr = CH$FIND_CH (.parsed_length - .next_posn, .parsed_address + .next_posn, %C'[');
+
+    IF .ppn_ptr NEQU 0
+    THEN
+	BEGIN
+	ppn_ptr = .ppn_ptr - .parsed_address;
+	next_posn = .ppn_ptr + 1;
+	END
+    ELSE
+	BEGIN
+	ppn_ptr = CH$FIND_CH (.parsed_length - .next_posn, .parsed_address + .next_posn, %C'<');
+
+	IF .ppn_ptr NEQU 0
+	THEN
+	    BEGIN
+	    ppn_ptr = .ppn_ptr - .parsed_address;
+	    next_posn = .ppn_ptr + 1;
+	    END;
+
+	END;
+
+!
+    ppn_end_ptr = CH$FIND_CH (.parsed_length - .next_posn, .parsed_address + .next_posn, %C']');
+
+    IF .ppn_end_ptr NEQU 0
+    THEN
+	BEGIN
+	ppn_end_ptr = .ppn_end_ptr - .parsed_address;
+	next_posn = .ppn_end_ptr + 1;
+	END
+    ELSE
+	BEGIN
+	ppn_end_ptr = CH$FIND_CH (.parsed_length - .next_posn, .parsed_address + .next_posn, %C'>');
+
+	IF .ppn_end_ptr NEQU 0
+	THEN
+	    BEGIN
+	    ppn_end_ptr = .ppn_end_ptr - .parsed_address;
+	    next_posn = .ppn_end_ptr + 1;
+	    END;
+
+	END;
+
+!
+    dot_ptr = CH$FIND_CH (.parsed_length - .next_posn, .parsed_address + .next_posn, %C'.');
+
+    IF .dot_ptr NEQU 0
+    THEN
+	BEGIN
+	dot_ptr = .dot_ptr - .parsed_address;
+	next_posn = .dot_ptr + 1;
+	END;
+
+!
+    ver_ptr = CH$FIND_CH (.parsed_length - .next_posn, .parsed_address + .next_posn, %C';');
+
+    IF .ver_ptr NEQU 0
+    THEN
+	BEGIN
+	ver_ptr = .ver_ptr - .parsed_address;
+	parsed_end = .ver_ptr;
+	END
+    ELSE
+	parsed_end = .parsed_length;
+
+!
+    fsb_ptr [fsb$b_file_off] = (MAXU (.node_ptr, .dev_ptr, .ppn_ptr, .ppn_end_ptr)) + 1;
+!+
+! Convert the parsed filename & ext to rad-50 & store away
+! (if already loaded with 'wild' rad50, don't overwrite)
+!
+! On entry here, dot_ptr is either an offset to the '.'
+! (if present), else the same value as parsed_end (if
+! no '.ext' is present). We can therefore calculate
+! the lengths of the filename and ext.
+!-
+    file_size = .dot_ptr - .fsb_ptr [fsb$b_file_off];
+    ext_size = .parsed_end - .dot_ptr - 1;
+!+
+! If .dot_ptr = .parsed_end, ext_size is now -1, so correct it
+!-
+
+    IF .ext_size EQL -1 THEN ext_size = 0;
+
+!+
+! Check for .file_size being LEQ 6. If FALSE we do not
+! load it to the firqb as rad-50. Same if .ext_size
+! is GTR 3 (which will be thrown out by RMS later anyway!)
+!-
+
+    IF (.file_size LEQU 6 AND .fqb_ptr [fqb$w_fqnam1] NEQ %O'134745')
+    THEN
+	
+	IF .file_size LEQU 3
+	THEN
+	    BEGIN
+	    fqb_ptr [fqb$w_fqnam1] = rad_50 (.parsed_address + .fsb_ptr [fsb$b_file_off], .file_size);
+	    fqb_ptr [fqb$w_fqnam2] = rad_50 (.parsed_address + .fsb_ptr [fsb$b_file_off] + 3, 0);
+	    END
+	ELSE
+	    BEGIN
+	    fqb_ptr [fqb$w_fqnam1] = rad_50 (.parsed_address + .fsb_ptr [fsb$b_file_off], 3);
+	    fqb_ptr [fqb$w_fqnam2] = rad_50 (.parsed_address + .fsb_ptr [fsb$b_file_off] + 3, 	!
+		.file_size - 3);
+	    END
+
+    ELSE
+
+	IF .file_size GTRU 6 THEN fqb_ptr [fqb$b_nfrep] = fqb$k_nfrep;	! Set NFREP
+
+    IF (.ext_size LEQU 3 AND .fqb_ptr [fqb$w_fqext] NEQ %O'134745')
+    THEN
+	fqb_ptr [fqb$w_fqext] = rad_50 (.parsed_address + .dot_ptr + 1, .ext_size);
+
+!+
+! If a numeric ppn is present, load the decimal values into
+! the FIRQB
+!-
+
+    IF .fsb_ptr [fsb$v_ppn_seen]
+    THEN
+	BEGIN
+
+	IF .fsb_ptr [fsb$v_proj_wild] EQLU 0
+	THEN
+	    BEGIN
+	    EXPAND = .parsed_address;
+	    next_posn = 1;
+	    ppn_val = 0;
+
+	    WHILE (.EXPAND [.ppn_ptr + .next_posn] GEQU %C'0' AND .EXPAND [.ppn_ptr + .next_posn] LEQU %C'9')
+	    DO
+		BEGIN
+		ppn_val = (.ppn_val*10) + ((.EXPAND [.ppn_ptr + .next_posn]) - %C'0');
+		next_posn = .next_posn + 1;
+		END;
+
+	    fqb_ptr [fqb$b_proj] = .ppn_val;
+	    END
+	ELSE
+	    next_posn = 2;
+
+	IF .fsb_ptr [fsb$v_prog_wild] EQLU 0
+	THEN
+	    BEGIN
+	    EXPAND = .parsed_address;
+	    next_posn = .next_posn + 1;
+	    ppn_val = 0;
+
+	    WHILE (.EXPAND [.ppn_ptr + .next_posn] GEQU %C'0' AND .EXPAND [.ppn_ptr + .next_posn] LEQU %C'9')
+	    DO
+		BEGIN
+		ppn_val = (.ppn_val*10) + ((.EXPAND [.ppn_ptr + .next_posn]) - %C'0');
+		next_posn = .next_posn + 1;
+		END;
+
+	    fqb_ptr [fqb$b_prog] = .ppn_val;
+	    END;
+
+	END;
+
+!+
+! Convert the VMS device to a RSTS-type device
+! and store the 2 device chars & unit # in the FIRQB
+!-
+    EXPAND = .parsed_address;
+
+    IF .node_ptr NEQU 0 THEN next_posn = .node_ptr + 2 ELSE next_posn = 0;
+
+    device_size = .dev_ptr - .next_posn;
+!+
+! 1st char  of device name is at offset .next_posn
+! End (:) is at offset .dev_ptr
+! .device_size is length of device name (less the colon)
+!
+! If device is a proccess permenant logical name, it
+! will have a '$' in it (e.g. SYS$INPUT:) In this case
+! we put the original 2-char devicename in the FIRQB
+! (e.g. TI or KB) with 'unit_real' zeroed, else the VMS
+! physical name is loaded into the FIRQB.
+! Note that 'usr_dev_ptr' is the offset to the user
+! specified devicename.
+!-
+    next_char = CH$FIND_CH (.device_size, .EXPAND + .next_posn, %C'$');
+
+    IF .next_char NEQU 0
+    THEN 					! retrieve user's 2-char devicename
+	BEGIN
+
+	BIND
+	    user_dev = string [.usr_dev_ptr] : WORD;
+
+	fqb_ptr [fqb$w_devnam] = .user_dev;
+
+	IF (.user_dev EQLU %ASCII'KB' OR .user_dev EQLU %ASCII'TI') THEN fqb_ptr [fqb$b_nfrep] = 0;
+
+						! Cancel NFREP bit
+	END
+    ELSE 					! assume physical name
+	BEGIN
+	fsb_ptr [fsb$b_dev_name1] = .EXPAND [.next_posn];
+	fsb_ptr [fsb$b_dev_name2] = .EXPAND [.next_posn + 1];
+
+	IF (.EXPAND [.next_posn] EQLU %C'T' AND .EXPAND [.next_posn + 1] EQLU %C'U')
+	THEN
+	    BEGIN
+	    fsb_ptr [fsb$b_dev_name2] = %C'T';
+	    unit_val = 128;
+	    END
+	ELSE
+	    unit_val = 0;
+
+	next_posn = .next_posn + 2;		! point to controller letter
+
+	IF .EXPAND [.next_posn] NEQU %C':'
+	THEN
+
+	    IF (.EXPAND [.next_posn] GEQU %C'A' AND .EXPAND [.next_posn] LEQU %C'Z')
+	    THEN
+		BEGIN
+		ctlr_val = (.EXPAND [.next_posn] - %C'A')*16;
+		next_posn = .next_posn + 1;
+		unit_val = .unit_val + (.EXPAND [.next_posn] - %C'0');
+		next_posn = .next_posn + 1;
+
+		IF .EXPAND [.next_posn] NEQU %C':'
+		THEN
+		    unit_val = (.unit_val*10) + (.EXPAND [.next_posn] - %C'0');
+
+		fsb_ptr [fsb$b_dev_unit] = .ctlr_val + .unit_val;
+		END
+	    ELSE
+		BEGIN
+
+		WHILE (.EXPAND [.next_posn] GEQU %C'0' AND .EXPAND [.next_posn] LEQU %C'9') DO
+		    BEGIN
+		    unit_val = (.unit_val*10) + (.EXPAND [.next_posn] - %C'0');
+		    next_posn = .next_posn + 1;
+		    END;
+
+		fsb_ptr [fsb$b_dev_unit] = .unit_val;
+		END
+
+	ELSE
+	    fsb_ptr [fsb$b_dev_unit] = 0;
+
+	fsb_ptr [fsb$b_unit_real] = -1;
+!+
+! Load results into FIRQB
+!-
+	(fqb_ptr [fqb$w_devnam])<0, 8> = .fsb_ptr [fsb$b_dev_name1];
+	(fqb_ptr [fqb$w_devnam])<8, 8> = .fsb_ptr [fsb$b_dev_name2];
+	fqb_ptr [fqb$b_devunit] = .fsb_ptr [fsb$b_dev_unit];
+	fqb_ptr [fqb$b_unit_real] = .fsb_ptr [fsb$b_unit_real];
+	END;
+
+    bpa$free_block (.string, .byte_count);
+    bpa$free_block (.copy, nam$c_maxrss);
+    RETURN ss$_normal;				! Return success to user
+!
+    END;					! End of routine BPA$FSS
+
+
+ROUTINE bpa$file_scan (fsb_ptr) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine parses the filespec described in the FSB
+!	via $PARSE and loads the resultant data into
+!	the FSB. It may also perform any required conversion
+!	from a RSTS-type device name to the VMS-type name.
+!
+! FORMAL PARAMETERS:
+!
+!	fsb_ptr  -  the longword address of the FSB
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	Returns error from RMS, else TRUE.
+!
+! SIDE EFFECTS:
+!
+!	If parsed OK, FSB loaded with the address & length of the
+!	expanded string, and status bits from the NAM block
+!
+!--
+
+    BEGIN
+
+    MAP
+	fsb_ptr : REF $fsb_def;			! address of FSB
+
+    LOCAL
+	fab : $fab_decl,			! File Access Block
+	nam : $nam_decl,			! Name block
+	esb : REF VECTOR [, BYTE],		! Expanded string buffer
+	length,					! Contains string length
+	sts;					! Status from routines
+
+!+
+! Get buffer from free core
+!-
+
+    IF NOT (sts = bpa$get_block (nam$c_maxrss, esb)) THEN RETURN (.sts);
+
+!+
+! Initialise fab and nam blocks
+!-
+    $fab_init (fab = fab, fna = .fsb_ptr [fsb$a_fsa], fns = .fsb_ptr [fsb$l_fsl], nam = nam);
+!
+    $nam_init (nam = nam, esa = .esb, ess = nam$c_maxrss);
+!+
+! Call $parse and check return status
+!-
+
+    IF .fsb_ptr [fsb$b_dev_off] NEQU 0		! If a device is present...
+    THEN
+	fsb_ptr [fsb$v_status] = 1;
+
+    ! ...assume VMS device so set NFREP for now
+
+    IF NOT (sts = $parse (fab = fab))
+    THEN
+
+	SELECTONEU .sts OF
+	    SET
+
+	    [rms$_dev] :
+		BEGIN
+		length = .fsb_ptr [fsb$l_fsl];
+		fsb_ptr [fsb$v_status] = 0;	! Non-VMS device so zap NFREP
+
+		IF NOT (translate_dev (.fsb_ptr [fsb$a_fsa], length))
+		THEN
+		    BEGIN
+		    bpa$free_block (.esb, nam$c_maxrss);
+		    RETURN (bas$_illfilnam);
+		    END
+		ELSE
+		    BEGIN
+		    fab [fab$l_fna] = .fsb_ptr [fsb$a_fsa];
+		    fab [fab$b_fns] = .length;
+
+		    IF NOT (sts = $parse (fab = fab))
+		    THEN
+			BEGIN
+			bpa$free_block (.esb, nam$c_maxrss);
+			RETURN (bas$_illfilnam);
+			END;
+
+		    END;
+
+		END;
+
+	    [OTHERWISE] :
+		BEGIN
+		bpa$free_block (.esb, nam$c_maxrss);
+		RETURN (bas$_illfilnam);
+		END;
+	    TES;
+
+    fsb_ptr [fsb$a_fsa] = .esb;
+    fsb_ptr [fsb$l_fsl] = .nam [nam$b_esl];
+    fsb_ptr [fsb$l_stat_bits] = .nam [nam$l_fnb];
+
+    IF .nam [nam$v_exp_name] THEN fsb_ptr [fsb$v_name_seen] = 1;
+
+    IF .nam [nam$v_wild_name] THEN fsb_ptr [fsb$v_name_wild] = 1;
+
+    IF .nam [nam$v_exp_type] THEN fsb_ptr [fsb$v_ext_seen] = 1;
+
+    IF .nam [nam$v_wild_type] THEN fsb_ptr [fsb$v_ext_wild] = 1;
+
+    IF .nam [nam$v_grp_mbr] THEN fsb_ptr [fsb$v_ppn_seen] = 1;
+
+    IF .nam [nam$v_wild_grp] THEN fsb_ptr [fsb$v_proj_wild] = 1;
+
+    IF .nam [nam$v_wild_mbr] THEN fsb_ptr [fsb$v_prog_wild] = 1;
+
+    IF .nam [nam$v_exp_dev] THEN fsb_ptr [fsb$v_dev_seen] = 1;
+
+!+
+! Set NFREP if node, non-ppn directory or version # present
+!-
+
+    IF (.nam [nam$v_node] OR (.nam [nam$v_exp_dir] AND NOT .nam [nam$v_grp_mbr]) OR .nam [nam$v_exp_ver])
+    THEN
+	fsb_ptr [fsb$v_status] = 1;
+
+    RETURN ss$_normal;
+    END;					!End of routine BPA$FILE_SCAN
+
+ROUTINE rad_50 (addr, len) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine converts an ascii string of upto 3 chars
+!	into a word of rad50. The string will be space
+!	padded upto 3 chars if passed length is less than 3.
+!	A null string will result in zero being returned as
+!	the value.
+!
+! FORMAL PARAMETERS:
+!
+!	addr  -  longword containing the address of the
+!		 1st char to be converted
+!	len   -  the length (0-3). If the length passed
+!		 is greater than 3, it will be truncated.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	Value returned is a WORD of rad50
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	chars : VECTOR [3, BYTE],
+	rad : WORD,
+	CODE : BYTE,
+	ptr : BYTE;
+
+    IF .len LEQU 3 THEN ptr = .len ELSE ptr = 3;
+
+    CH$MOVE (.ptr, .addr, chars);
+
+    WHILE .ptr LSSU 3 DO
+	BEGIN
+	chars [.ptr] = %O'40';
+	ptr = .ptr + 1;
+	END;
+
+    ptr = 0;
+    rad = 0;
+
+    INCR offset FROM 0 TO 2 DO
+	BEGIN
+	CODE = .chars [.offset];
+
+	SELECTONE .CODE OF
+	    SET
+
+	    [%C' '] :
+		CODE = 0;
+
+	    [%C'$'] :
+		CODE = 33;
+
+	    [%C'.'] :
+		CODE = 34;
+
+	    [%C'A' TO %C'Z'] :
+		CODE = .CODE - %O'100';
+
+	    [%C'0' TO %C'9'] :
+		CODE = .CODE - %O'22';
+
+	    [OTHERWISE] :
+		CODE = 0;
+	    TES;
+
+	rad = (.rad*%O'50') + .CODE;
+	END;
+
+    RETURN .rad;
+    END;					! End of routine RAD_50
+
+ROUTINE translate_dev (string, string_length) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine scans the string given and translates it to a
+!	RSTS device name, if possible.
+!	The standard RSTS device name is of the form DDnnn,
+!		where DD is the device (e.g. TT, MM, DB)
+!		and nnn is a number from 0 to 255
+!	The standard VAX device name is of the form DDCnn,
+!		where DD is the device
+!		where C is the controller id (A to ?)
+!		and nn is a number from 0 to 15
+!
+!	Special cases:
+!		TI: is translated to SYS$INPUT:
+!		KB: is translated to SYS$INPUT:
+!		SY: is translated to SYS$DISK:
+!		SY0: is translated to SYS$DISK:
+!		TT128 and greater are translated to
+!			TUA0 and greater
+!
+! FORMAL PARAMETERS:
+!	string		pointer to the string
+!	string_length	pointer to the length of the string
+!			(it will be updated with the new length)
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!	1 if success (e.g. no error found)
+!	0 otherwise
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    MAP
+	string : REF VECTOR [, BYTE];
+
+    BIND
+	sysinput = UPLIT BYTE('SYS$INPUT'),
+	sysdisk = UPLIT BYTE('SYS$DISK'),
+	end_strg = UPLIT BYTE('0');
+
+    LITERAL
+	sysinput_l = sysdisk - sysinput,
+	sysdisk_l = end_strg - sysdisk;
+
+    LOCAL
+	string_len,				! the length of the string
+	dev_len,				! the length of the device name (keeps
+						! track of how much is substituted)
+	dev_ptr,				! pointer to ':' after device name
+	start_posn,				! offset to start of device name
+	next_char,				! pointer to the next character
+	node_ptr,				! pointer to first ':' of node
+	temp_copy : REF VECTOR [, BYTE],	! pointer to temp buffer
+	sts;					! status word
+
+    string_len = ..string_length;		! set up length for easy reference
+!
+! First, find the beginning and the end of the device name
+!
+
+    IF (node_ptr = CH$FIND_SUB (.string_len, .string, 2, UPLIT BYTE('::'))) EQLU 0
+    THEN
+	BEGIN
+	start_posn = 0;
+	dev_ptr = CH$FIND_CH (.string_len, .string, %C':');
+	END
+    ELSE
+	BEGIN
+	start_posn = (.node_ptr + 2) - .string;
+	dev_ptr = CH$FIND_CH (.string_len - .start_posn, .node_ptr + 2, %C':');
+	END;
+
+!
+! Check to see if a device has been found, if not, get out (error?)
+!
+
+    IF .dev_ptr EQLU 0
+    THEN
+	RETURN 0
+    ELSE
+
+	IF .node_ptr EQLU 0 THEN dev_len = .dev_ptr - .string ELSE dev_len = .dev_ptr - .node_ptr - 2;
+
+!
+! Check for underline, and jump over it
+!
+
+    IF .string [.start_posn] EQLU %C'_' THEN start_posn = .start_posn + 1;
+
+!
+! The next block of code does a SELECT on the first two characters
+! of the device name, and then processes each of the special cases.
+! At the end, it translates the RSTS type DDnnn to the VMS type
+! DDCnn, and handles all special cases as necessary.
+!
+    BEGIN					! beginning of translate block
+
+    LOCAL
+	device_id : VECTOR [3, BYTE],		! buffer for translated device
+	substitute_addr,			! address and length of the
+	substitute_len;				! string to be substituted in
+
+!
+! Grab the first two characters of the device
+!
+
+    BIND
+	device_name = string [.start_posn] : WORD;
+
+    next_char = .start_posn + 2;		! skip the first two characters
+!
+! Select on the first two characters of the device name
+!
+
+    SELECTU .device_name OF
+	SET
+
+	[%ASCII'SY'] : 				! note that order is important, this must be first
+	    BEGIN
+
+	    IF .string [.next_char] EQLU %C':'	! "SY:"
+		OR (.string [.next_char] EQLU %C'0'	! "SY0:"
+		AND .string [.next_char + 1] EQLU %C':')
+	    THEN
+		BEGIN
+!
+! substitute 'SYS$DISK' FOR 'SY' OR 'SY0'
+!
+		substitute_addr = sysdisk;
+		substitute_len = sysdisk_l;
+		END
+	    ELSE
+		RETURN 0;
+
+	    END;
+
+	[%ASCII'KB'] :
+	    BEGIN
+
+	    IF .string [.next_char] EQLU %C':'
+	    THEN
+		BEGIN
+!
+! substitute 'SYS$INPUT' for 'KB'
+!
+		substitute_addr = sysinput;
+		substitute_len = sysinput_l;
+		END
+	    ELSE
+		BEGIN
+
+		LOCAL
+		    unit_number;		! work field for conversion
+
+!
+! This makes it easier to reference the fields of the
+! device_id
+!
+
+		BIND
+		    controller_id = device_id [0] : BYTE,
+		    unit_id = device_id [1] : VECTOR [2, BYTE];
+
+!
+! substitute 'TT' for 'KB'
+!
+		device_name = %ASCII'TT';
+!
+! and convert to VAX format
+!
+! convert nnn to binary integer
+!
+		unit_number = 0;
+
+		WHILE (.string [.next_char] GEQU %C'0' AND (.string [.next_char] LEQU %C'9')) DO
+		    BEGIN
+		    unit_number = (.unit_number*10) + .string [.next_char] - %C'0';
+		    next_char = .next_char + 1;
+		    END;
+
+!
+! check it to see if it's ok (i.e., converted all of it)
+!
+
+		IF .string [.next_char] NEQU %C':' THEN RETURN 0;
+
+!
+! if the unit_number is GTRU 255, error
+!
+
+		IF .unit_number GTRU 255 THEN RETURN 0;
+
+!
+! check for nnn greater than 127, if it is then convert TT
+! to TU, and subtract 128 from the unit number.
+! Thus, TT128 is equivalent to TU0.
+!
+
+		IF .unit_number GTRU 127
+		THEN
+		    BEGIN
+		    unit_number = .unit_number - 127;
+		    string [.start_posn + 1] = %C'U';
+		    END;
+
+!
+! now convert nnn to Cnn.
+! Do this by shifting the unit_number right 4 (to drop
+! the unit_id) and adding %C'A' to get the ASCII value
+! of the controller_id, then, AND the unit_number with
+! 15 to mask out the controller and provide the unit_id
+! (needs to be converted to ASCII still)
+!
+		controller_id = .unit_number^(-4) + %C'A';
+		unit_number = .unit_number AND 15;
+!
+! and now, convert the unit_id back to ASCII and substitute
+! for the device unit_number (note that device_name stays
+! the same)
+!
+
+		IF .unit_number GTRU 9
+		THEN
+		    BEGIN
+		    unit_id [0] = %C'1';
+		    unit_id [1] = .unit_number - 10 + %C'0';
+		    substitute_len = 3;		! remember the length
+		    END
+		ELSE
+		    BEGIN
+		    substitute_len = 2;		! remember the length
+		    unit_id [0] = .unit_number + %C'0';
+		    END;
+
+		dev_len = .dev_len - 2;		! jump over the device name
+		start_posn = .start_posn + 2;
+		substitute_addr = device_id;	! remember the address
+		END;
+
+	    END;
+
+	[%ASCII'TI'] :
+	    BEGIN
+
+	    IF .string [.next_char] EQLU %C':'
+	    THEN
+		BEGIN
+!
+! substitute 'SYS$INPUT' for 'TI'
+!
+		substitute_addr = sysinput;
+		substitute_len = sysinput_l;
+		END
+	    ELSE
+		RETURN 0;
+
+	    END;
+
+	[OTHERWISE] :
+	    BEGIN
+
+	    LOCAL
+		unit_number;			! work field for conversion
+
+!
+! This makes it easier to reference the fields of the
+! device_id
+!
+
+	    BIND
+		controller_id = device_id [0] : BYTE,
+		unit_id = device_id [1] : VECTOR [2, BYTE];
+
+!
+! convert nnn to binary integer
+!
+	    unit_number = 0;
+
+	    WHILE (.string [.next_char] GEQU %C'0' AND (.string [.next_char] LEQU %C'9')) DO
+		BEGIN
+		unit_number = (.unit_number*10) + .string [.next_char] - %C'0';
+		next_char = .next_char + 1;
+		END;
+
+!
+! check it to see if it's ok (i.e., converted all of it)
+!
+
+	    IF .string [.next_char] NEQU %C':' THEN RETURN 0;
+
+!
+! if the unit_number is GTRU 255, error
+!
+
+	    IF .unit_number GTRU 255 THEN RETURN 0;
+
+!
+! TTnnn is a special case, we must now check for
+! nnn greater than 127, if it is then convert TT to TU,
+! and subtract 128 from the unit number
+! Thus, TT128 is equivalent to TU0.
+!
+
+	    IF .device_name EQLU %ASCII'TT' AND .unit_number GTRU 127
+	    THEN
+		BEGIN
+		unit_number = .unit_number - 127;
+		string [.start_posn + 1] = %C'U';
+		END;
+
+!
+! now convert nnn to Cnn (for all devices)
+! Do this by shifting the unit_number right 4 (to drop
+! the unit_id) and adding %C'A' to get the ASCII value
+! of the controller_id, then, AND the unit_number with
+! 15 to mask out the controller and provide the unit_id
+! (needs to be converted to ASCII still)
+!
+	    controller_id = .unit_number^(-4) + %C'A';
+	    unit_number = .unit_number AND 15;
+!
+! and now, convert the unit_id back to ASCII and substitute
+! for the device unit_number (note that device_name stays
+! the same)
+!
+
+	    IF .unit_number GTRU 9
+	    THEN
+		BEGIN
+		unit_id [0] = %C'1';
+		unit_id [1] = .unit_number - 10 + %C'0';
+		substitute_len = 3;		! remember the length
+		END
+	    ELSE
+		BEGIN
+		substitute_len = 2;		! remember the length
+		unit_id [0] = .unit_number + %C'0';
+		END;
+
+	    dev_len = .dev_len - 2;		! jump over the device name
+	    start_posn = .start_posn + 2;
+	    substitute_addr = device_id;	! remember the address
+	    END;
+	TES;
+
+!
+! Get a temporary buffer from free core
+!
+
+    IF NOT (sts = bpa$get_block (nam$c_maxrss, temp_copy)) THEN RETURN 0;
+
+!
+! Now, do the substitution
+! 1) get all the bits up to the beginning of the device (start_posn)
+! 2) get the string to be substituted
+! 3) get the rest of the string from the ':' to the very end
+! 4) fill is 0
+! 5) copy into the temporary string
+!
+    CH$COPY (.start_posn, .string, .substitute_len, .substitute_addr, .string_len - (.dev_ptr - .string),
+	.dev_ptr, 0, nam$c_maxrss, .temp_copy);
+!
+! Now, copy from the temporary buffer into STRING
+! and update the length
+!
+    .string_length = .string_len - .dev_len + .substitute_len;
+    CH$MOVE (..string_length, .temp_copy, .string);
+!
+! Return the temporary buffer
+!
+    bpa$free_block (.temp_copy, nam$c_maxrss);
+    END;					! end of translate block
+    RETURN 1;
+    END;					! End of routine TRANSLATE_DEV
+
+ROUTINE find_switch (fsb, sw_string_addr, sw_string_size) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine scans the switch string to locate the
+!	following switches:-
+!
+!	/FILESIZE:n
+!	/SIZE:n
+!	/MODE:n
+!	/CLUSTERSIZE:n
+!	/POSITION:n
+!	/RONLY
+!
+!	If a match is found, the value of 'n' is determined if
+!	if relevant and checked for legality. If within limits
+!	the value is loaded into the required field in the FSB.
+!
+! FORMAL PARAMETERS:
+!
+!	fsb.ra.v		Pointer to fsb
+!	sw_string_addr.ra.v	Pointer to switch string
+!	sw_string_size.rl.v	Length of switch string
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	The appropriate switch value field in the FSB
+!	is loaded if a good match is found.
+!
+! COMPLETION CODES:
+!
+!	ss$_normal if success
+!	bas$_illswiusa if syntax error
+!	bas$_illnum if number error
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    MAP
+	fsb : REF $fsb_def,			! Pointer to FSB
+	sw_string_addr : REF VECTOR [, BYTE];	! Pointer to sw string
+
+    LOCAL
+	curr_switch : REF VECTOR [, BYTE],	! Pointer to curr switch
+	next_switch,				! Pointer to next switch
+	next_value,				! Pointer to next value
+	radix,					! Radix of switch value
+	scan_posn,				! Current scan position
+	sign_flag,				! Negative flag
+	string_length,				! Length of string left
+	sts,					! Returned status value
+	switch_length,				! # of chars in switch
+	switch_value : SIGNED;			! Value of switch
+
+!
+! Make copies of parameters to allow modification
+!
+    string_length = .sw_string_size;
+    curr_switch = .sw_string_addr;
+!
+! Loop until string is exhausted
+!
+
+    WHILE .string_length GTRU 0 DO
+	BEGIN
+	scan_posn = 0;
+!
+! Check we are really pointing to the first switch, then set up pointers
+! to the next switch and to the next colon (value separator)
+!
+
+	IF .curr_switch [.scan_posn] NEQU %C'/' THEN RETURN bas$_illswiusa;
+
+	next_switch = CH$FIND_CH (.string_length - 1, curr_switch [.scan_posn + 1], %C'/');
+	next_value = CH$FIND_CH (.string_length, curr_switch [.scan_posn], %C':');
+
+	IF .next_value EQLU 0
+	THEN
+	    BEGIN
+	    next_value = .string_length;
+
+	    IF .next_switch EQLU 0
+	    THEN
+		BEGIN
+		switch_length = .string_length;
+		next_switch = .string_length;
+		END
+	    ELSE
+		BEGIN
+		next_switch = .next_switch - curr_switch [.scan_posn];
+		switch_length = .next_switch;
+		END
+
+	    END
+	ELSE
+	    BEGIN
+	    next_value = .next_value - curr_switch [.scan_posn];
+
+	    IF .next_switch EQLU 0
+	    THEN
+		BEGIN
+		switch_length = .next_value;
+		next_switch = .string_length;
+		END
+	    ELSE
+		BEGIN
+		next_switch = .next_switch - curr_switch [.scan_posn];
+		switch_length = MINU (.next_switch, .next_value);
+		END
+
+	    END;
+
+!
+! Point to the first character of the keyword and use the first two
+! characters to index to the required switch processing routine.
+! If there is no match then an error is generated.
+!
+	scan_posn = 1;
+	BEGIN
+
+	BIND
+	    switch_name = curr_switch [.scan_posn] : WORD;	! First two chars of switch
+
+	SELECTONEU .switch_name OF
+	    SET
+
+	    [%ASCII'CL'] :
+		BEGIN
+
+		IF .fsb [fsb$v_cl_seen]		! Already had /CLUS...?
+		THEN
+		    RETURN bas$_illswiusa;
+
+		IF CH$FAIL (CH$FIND_SUB (11, 	! Check keyword
+			    UPLIT BYTE(%ASCII'CLUSTERSIZE'), .switch_length - 1, curr_switch [.scan_posn]))
+		THEN
+		    RETURN bas$_illswiusa;
+
+		IF .switch_length GTRU .next_value	! Check for value
+		THEN
+		    RETURN bas$_illnum;
+
+		scan_posn = .next_value + 1;
+
+		IF .curr_switch [.scan_posn] EQLU %C'-'
+		THEN
+		    BEGIN			! Set up for -ve values
+		    scan_posn = .scan_posn + 1;
+		    sign_flag = 1;
+		    END
+		ELSE
+		    sign_flag = 0;
+
+		IF .curr_switch [.scan_posn] EQLU %C'#'
+		THEN
+		    BEGIN			! Setup for octal/decimal radix
+		    scan_posn = .scan_posn + 1;
+		    radix = 8;
+		    END
+		ELSE
+		    radix = 10;
+
+		switch_value = 0;
+
+		WHILE (.curr_switch [.scan_posn] GEQU %C'0')	!
+		    AND (.curr_switch [.scan_posn] LSSU (.radix + %C'0'))	!
+		    AND (.scan_posn LSSU .next_switch) DO
+		    BEGIN			! Convert switch value
+		    switch_value = (.switch_value*.radix) + .curr_switch [.scan_posn] - %C'0';
+		    scan_posn = .scan_posn + 1;
+		    END;
+
+		IF .sign_flag THEN switch_value = -.switch_value;	! Negate if -ve specified
+
+		IF (.switch_value GTR 32767)	! Check value
+		    OR (.switch_value LSS -32768)	! For legality
+		THEN
+		    RETURN bas$_illnum;
+
+		IF ((.curr_switch [.scan_posn] EQLU %C'.') AND (.radix EQLU 8)) THEN RETURN bas$_illnum;
+
+						! If decimal and octal specified
+		fsb [fsb$w_clust] = .switch_value;	! Store away value
+		fsb [fsb$v_cl_seen] = 1;	! and set flag
+		string_length = .string_length - .scan_posn;
+		curr_switch = curr_switch [.scan_posn];
+
+		IF .scan_posn NEQU .next_switch THEN RETURN bas$_illnum;	! Set up for next and check
+
+						! that in correct place
+		END;
+
+	    [%ASCII'FI', %ASCII'SI'] :
+		BEGIN
+
+		IF .fsb [fsb$v_fisi_seen] THEN RETURN bas$_illswiusa;
+
+		BEGIN
+
+		LOCAL
+		    sw_name_skip;		! # chars to skip
+
+		IF .switch_name EQLU %ASCII'FI'	! Find if /FILESIZE
+		THEN 				! of /SIZE to set offset
+		    sw_name_skip = 0
+		ELSE
+		    sw_name_skip = 4;
+
+		IF CH$FAIL (CH$FIND_SUB ((8 - .sw_name_skip),
+			    (UPLIT BYTE(%ASCII'FILESIZE')
+						+.sw_name_skip), .switch_length - 1, curr_switch [.scan_posn]))
+		THEN
+		    RETURN bas$_illswiusa;
+
+		END;
+
+		IF .switch_length GTRU .next_value	! Check for value
+		THEN
+		    RETURN bas$_illnum;
+
+		scan_posn = .next_value + 1;
+
+		IF .curr_switch [.scan_posn] EQLU %C'#'
+		THEN
+		    BEGIN
+		    scan_posn = .scan_posn + 1;
+		    radix = 8;
+		    END
+		ELSE
+		    radix = 10;
+
+		switch_value = 0;
+
+		WHILE (.curr_switch [.scan_posn] GEQU %C'0')	!
+		    AND (.curr_switch [.scan_posn] LSSU (.radix + %C'0'))	!
+		    AND (.scan_posn LSSU .next_switch) DO
+		    BEGIN
+		    switch_value = (.switch_value*.radix) + .curr_switch [.scan_posn] - %C'0';
+		    scan_posn = .scan_posn + 1;
+		    END;
+
+		IF (.switch_value GTRU ((1^23) - 1)) THEN RETURN bas$_illnum;
+
+		IF ((.curr_switch [.scan_posn] EQLU %C'.') AND (.radix EQLU 8)) THEN RETURN bas$_illnum;
+
+		fsb [fsb$v_size] = .switch_value;
+		fsb [fsb$v_fisi_seen] = 1;
+		string_length = .string_length - .scan_posn;
+		curr_switch = curr_switch [.scan_posn];
+
+		IF .scan_posn NEQU .next_switch THEN RETURN bas$_illnum;
+
+		END;
+
+	    [%ASCII'MO'] :
+		BEGIN
+
+		IF .fsb [fsb$v_moro_seen] THEN RETURN bas$_illswiusa;
+
+		IF CH$FAIL (CH$FIND_SUB (4, UPLIT BYTE(%ASCII'MODE'), .switch_length - 1,
+			    curr_switch [.scan_posn]))
+		THEN
+		    RETURN bas$_illswiusa;
+
+		IF .switch_length NEQU .next_value	! Check for value
+		THEN
+		    RETURN bas$_illnum;
+
+		scan_posn = .next_value + 1;
+
+		IF .curr_switch [.scan_posn] EQLU %C'#'
+		THEN
+		    BEGIN
+		    scan_posn = .scan_posn + 1;
+		    radix = 8;
+		    END
+		ELSE
+		    radix = 10;
+
+		switch_value = 0;
+
+		WHILE (.curr_switch [.scan_posn] GEQU %C'0')	!
+		    AND (.curr_switch [.scan_posn] LSSU (.radix + %C'0'))	!
+		    AND (.scan_posn LSSU .next_switch) DO
+		    BEGIN
+		    switch_value = (.switch_value*.radix) + .curr_switch [.scan_posn] - %C'0';
+		    scan_posn = .scan_posn + 1;
+		    END;
+
+		IF (.switch_value GTRU 32767) THEN RETURN bas$_illnum;
+
+		IF ((.curr_switch [.scan_posn] EQLU %C'.') AND (.radix EQLU 8)) THEN RETURN bas$_illnum;
+
+		fsb [fsb$w_mode] = .switch_value + (1^15);
+		fsb [fsb$v_moro_seen] = 1;
+		string_length = .string_length - .scan_posn;
+		curr_switch = curr_switch [.scan_posn];
+
+		IF .scan_posn NEQU .next_switch THEN RETURN bas$_illnum;
+
+		END;
+
+	    [%ASCII'PO'] :
+		BEGIN
+
+		IF .fsb [fsb$v_pos_seen] THEN RETURN bas$_illswiusa;
+
+		IF CH$FAIL (CH$FIND_SUB (8, UPLIT BYTE(%ASCII'POSITION'), .switch_length - 1,
+			    curr_switch [.scan_posn]))
+		THEN
+		    RETURN bas$_illswiusa;
+
+		IF .switch_length GTRU .next_value	! Check for value
+		THEN
+		    RETURN bas$_illnum;
+
+		scan_posn = .next_value + 1;
+		switch_value = 0;
+
+		WHILE (.curr_switch [.scan_posn] GEQU %C'0')	!
+		    AND (.curr_switch [.scan_posn] LSSU %C'9')	!
+		    AND (.scan_posn LSSU .next_switch) DO
+		    BEGIN
+		    switch_value = (.switch_value*10) + .curr_switch [.scan_posn] - %C'0';
+		    scan_posn = .scan_posn + 1;
+		    END;
+
+		IF .switch_value GTRU 65535 THEN RETURN bas$_illnum;
+
+		fsb [fsb$w_position] = .switch_value;
+		fsb [fsb$v_pos_seen] = 1;
+		string_length = .string_length - .scan_posn;
+		curr_switch = curr_switch [.scan_posn];
+
+		IF .scan_posn NEQU .next_switch THEN RETURN bas$_illnum;
+
+		END;
+
+	    [%ASCII'RO'] :
+		BEGIN
+
+		IF .fsb [fsb$v_moro_seen] OR (.switch_length NEQU .next_switch)	! If has a value
+		THEN
+		    RETURN bas$_illswiusa;
+
+		IF CH$FAIL (CH$FIND_SUB (5, UPLIT BYTE(%ASCII'RONLY'), .switch_length - 1,
+			    curr_switch [.scan_posn]))
+		THEN
+		    RETURN bas$_illswiusa;
+
+		fsb [fsb$w_mode] = (1^15) + 8192;	! Set up ronly value
+		fsb [fsb$v_moro_seen] = 1;
+		scan_posn = .switch_length;
+		string_length = .string_length - .scan_posn;
+		curr_switch = curr_switch [.scan_posn];
+
+		IF .scan_posn NEQU .next_switch THEN RETURN bas$_illnum;
+
+		END;
+
+	    [OTHERWISE] :
+		RETURN bas$_illswiusa;		! Switch did not match
+	    TES;
+
+	END;
+	END;
+
+    RETURN ss$_normal;
+    END;					! End of routine FIND_SWITCH
+END						! End of module BPA$FSS
+
+ELUDOM

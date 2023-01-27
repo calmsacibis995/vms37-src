@@ -1,0 +1,693 @@
+MODULE DIRSCN (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This routine performs the basic directory scan, searching for the
+!	given entry.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  30-Dec-1977  11:14
+!
+! MODIFIED BY:
+!
+!	V02-008	ACG0259		Andrew C. Goldstein,	27-Jan-1982  20:16
+!		Fix counting of entries when skipping records
+!
+!	V02-006	ACG0208		Andrew C. Goldstein,	26-Oct-1981  16:27
+!		Add support for segmented directory records.
+!
+!	V02-005	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:25
+!		Previous revision history moved to F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	DIR_SCAN,			! directory scanner
+	NEXT_REC,			! get next directory record
+	UPDATE_IDX,			! update directory index entry
+	NEXT_DIR_REC;			! get next matching directory record
+
+GLOBAL ROUTINE DIR_SCAN (NAME_DESC, FILE_ID, START_BLOCK, START_REC, START_VER, START_PRED, REC_COUNT) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine scans a directory, searching for the given entry.
+!
+!
+! CALLING SEQUENCE:
+!	DIR_SCAN (ARG1, ARG2, ARG3, ARG4, ARG5, ARG6, ARG7)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of file name descriptor block
+!	ARG2: address of file ID block
+!	ARG3: relative block number to start search
+!	ARG4: address of record at which to start
+!	ARG5: address of version entry at which to start
+!	ARG6: address of predecessor record
+!	ARG7: maximum number of records to scan
+!	      (functions only with FIND_FID and a non-matching FID)
+!
+! IMPLICIT INPUTS:
+!	LAST_ENTRY: name string of last record in previous block
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	DIR_VBN: relative block + 1 of current directory buffer
+!	DIR_BUFFER: address of current directory block buffer
+!	DIR_RECORD: record number within block of found entry
+!	DIR_ENTRY: address in buffer of found record
+!	DIR_VERSION: address if buffer of found version entry
+!	DIR_PRED: predecessor record to record found
+!	LAST_ENTRY: name string of last record in previous block
+!	VERSION_LIMIT: version limit of last file name processed
+!	VERSION_COUNT: number of versions of current file name passed
+!
+! ROUTINE VALUE:
+!	1 if entry found
+!	0 if no match, in which case:
+!		DIR_ENTRY = next record in collating sequence
+!			  = 0 if whole directory scanned (name belongs off the end)
+!		DIR_VERSION = next version in collating sequence if name & type matched
+!			    = 0 if name or type did not match
+!
+! SIDE EFFECTS:
+!	directory blocks read
+!	directory index in FCB updated
+!
+!--
+
+BEGIN
+
+MAP
+	NAME_DESC	: REF BBLOCK;	! name descriptor block arg
+
+LABEL
+	SEARCH_LOOP;			! body of search code
+
+LINKAGE
+	L_MATCH_NAME	= JSB (REGISTER = 2, REGISTER = 3, REGISTER = 4, REGISTER = 5)
+			: NOTUSED (10, 11);
+
+LOCAL
+	STATUS,				! routine return status
+	K,				! cluster factor of directory index
+	COUNT,				! entry count within current block
+	BLOCK,				! relative block number
+	LAST_BLOCK,			! last block of directory to read
+	MATCHED,			! flag indicating name match encountered
+	DN		: REF BBLOCK,	! address of name descriptor block
+	ENTRY		: REF BBLOCK,	! pointer to current directory record
+	P		: REF BBLOCK,	! pointer to current directory version
+	PREV_ENTRY	: REF BBLOCK,	! pointer to previous record
+	DIR_INDEX	: REF VECTOR [,BYTE]; ! pointer to directory index
+
+EXTERNAL
+	DIR_CONTEXT	: BBLOCK,	! directory context block
+	DIR_RECORD,			! record number in block of entry
+	DIR_FCB		: REF BBLOCK,	! FCB of directory file
+	CURRENT_UCB	: REF BBLOCK;	! UCB of current volume
+
+DIR_CONTEXT_DEF;			! define directory context fields
+
+EXTERNAL ROUTINE
+	READ_BLOCK,			! read a disk block
+	MARK_DIRTY,			! mark buffer for write back
+	FMG$MATCH_NAME	: L_MATCH_NAME;	! match general wild card string
+
+
+! Initialize basic pointers. Compute the cluster factor of the directory
+! index from the directory size.
+!
+
+DN = .NAME_DESC;
+STATUS = 0;
+BLOCK = .START_BLOCK;
+ENTRY = .START_REC;
+P = .START_VER;
+PREV_ENTRY = .START_PRED;
+COUNT = .DIR_RECORD;
+MATCHED = 0;
+
+IF .BLOCK GTRU .DIR_FCB[FCB$L_EFBLK]
+THEN BLOCK = .DIR_FCB[FCB$L_EFBLK];
+DIR_INDEX = DIR_FCB[FCB$B_DIRIDX];
+K = (.DIR_FCB[FCB$L_EFBLK] + 1 + FCB$S_DIRIDX - 1) / FCB$S_DIRIDX;
+
+! If there is not a wild card name, search the index in the directory FCB
+! for the appropriate block to start the search. Also search for the block
+! in which to stop. If we are directed to start at a block that is clearly
+! past eligible entries, return failure immediately.
+!
+
+SEARCH_LOOP: BEGIN			! outer directory search loop
+
+LAST_BLOCK = .DIR_FCB[FCB$L_EFBLK] - 1;
+
+IF NOT (   CH$RCHAR (.DN[FND_STRING]) EQL '*'
+	OR CH$RCHAR (.DN[FND_STRING]) EQL '%'
+	OR .DN[FND_FIND_FID]
+	)
+AND .DIR_FCB[FCB$V_DIR]
+THEN
+    BEGIN
+    LAST_BLOCK = .K - 1;
+    UNTIL (.DIR_INDEX[(.LAST_BLOCK-.K+1)/.K] NEQ 255
+       AND .DIR_INDEX[(.LAST_BLOCK-.K+1)/.K] GTRU CH$RCHAR (.DN[FND_STRING]))
+    OR .LAST_BLOCK GEQU .DIR_FCB[FCB$L_EFBLK] - 1
+    DO
+	LAST_BLOCK = .LAST_BLOCK + 1;
+
+    UNTIL .DIR_INDEX[.BLOCK/.K] GEQU CH$RCHAR (.DN[FND_STRING])
+    DO
+	BLOCK = .BLOCK + 1;
+    END;
+
+! If checking against EOF and the directory index has changed the starting
+! block number, discard the starting record pointers, which are now irrelevant.
+!
+
+IF .BLOCK NEQ .START_BLOCK
+THEN
+    BEGIN
+    ENTRY = 0;
+    P = 0;
+    COUNT = 0;
+    PREV_ENTRY = 0;
+    LAST_ENTRY[0] = 0;
+    END;
+
+! Loop, scanning blocks of the directory until we hit EOF.
+!
+
+WHILE 1 DO
+    BEGIN
+
+    IF .BLOCK GTRU .LAST_BLOCK
+    THEN LEAVE SEARCH_LOOP;
+    IF .ENTRY EQL 0
+    THEN
+	BEGIN
+	ENTRY = READ_BLOCK (.BLOCK+.DIR_FCB[FCB$L_STLBN],
+			    .LAST_BLOCK - .BLOCK + 1,
+			    DIRECTORY_TYPE);
+	DIR_BUFFER = .ENTRY;
+	END;
+
+! Loop, scanning the records of the directory. A record size of -1 indicates
+! the end of the block. We attempt to match name and type against the entry,
+! under control of the various name control flags.
+!
+
+    WHILE 1
+    DO
+	BEGIN
+	IF .ENTRY[DIR$W_SIZE] EQL 65535
+	THEN
+	    BEGIN
+	    IF .PREV_ENTRY NEQ 0
+	    THEN CH$MOVE (.PREV_ENTRY[DIR$B_NAMECOUNT]+1,
+			  PREV_ENTRY[DIR$B_NAMECOUNT], LAST_ENTRY);
+	    PREV_ENTRY = 0;
+	    EXITLOOP;
+	    END;
+
+! Do setup and validation for the record.
+!
+
+	IF .ENTRY[DIR$W_SIZE] + .ENTRY + 2 GEQA .DIR_BUFFER + 512
+	OR .ENTRY[DIR$V_TYPE] NEQ DIR$C_FID
+	OR .ENTRY[DIR$B_NAMECOUNT] GTRU FILENAME_LENGTH
+	OR .ENTRY[DIR$B_NAMECOUNT] GTRU .ENTRY[DIR$W_SIZE] + 2 - DIR$C_LENGTH - DIR$C_VERSION
+	THEN ERR_EXIT (SS$_BADIRECTORY);
+
+! If this is a lookup for lowest version and a name has previously matched,
+! see if the name in the record has changed from the previous record. If
+! so, the previous record has the lowest version. This test is made in
+! a seemingly redundant manner with the name change test below to minimize
+! its actual execution.
+!
+
+	IF .MATCHED
+	AND .DN[FND_VERSION] EQL -32768
+	AND (IF .PREV_ENTRY EQL 0
+	    THEN CH$NEQ (.ENTRY[DIR$B_NAMECOUNT]+1,
+			  ENTRY[DIR$B_NAMECOUNT],
+			 .ENTRY[DIR$B_NAMECOUNT]+1,
+			  LAST_ENTRY)
+	    ELSE CH$NEQ (.ENTRY[DIR$B_NAMECOUNT]+1,
+			  ENTRY[DIR$B_NAMECOUNT],
+			 .ENTRY[DIR$B_NAMECOUNT]+1,
+			  PREV_ENTRY[DIR$B_NAMECOUNT])
+	    )
+	THEN LEAVE SEARCH_LOOP;
+
+! Attempt to match the name, using a simple string compare if there are
+! no wild cards, otherwise the general wild card match routine.
+!
+
+	IF
+	    BEGIN
+
+	    IF .DN[FND_FIND_FID]
+	    THEN 1
+
+	    ELSE
+		BEGIN
+		IF NOT .DN[FND_WILD]
+		THEN
+		    CASE CH$COMPARE (.ENTRY[DIR$B_NAMECOUNT],
+				      ENTRY[DIR$T_NAME],
+				     .DN[FND_COUNT],
+				     .DN[FND_STRING]
+				     )
+		    FROM -1 TO 1 OF
+			SET
+
+			[-1]:	0;	! no match - dir entry precedes name
+
+			[0]:	1;	! match
+
+			[1]:	BEGIN	! no match - dir entry is past name
+				P = 0;
+				LEAVE SEARCH_LOOP;
+				END;
+			TES
+
+		ELSE
+		    FMG$MATCH_NAME (.ENTRY[DIR$B_NAMECOUNT],
+				     ENTRY[DIR$T_NAME],
+				    .DN[FND_COUNT],
+				    .DN[FND_STRING]
+				    )
+		END
+	    END
+
+! If the name and type match on a record, loop to process the versions of
+! the record.
+!
+
+	THEN
+	    BEGIN
+	    IF .P EQL 0
+	    THEN
+		BEGIN
+		P = .ENTRY + DIR$C_LENGTH + .ENTRY[DIR$B_NAMECOUNT] + 1 AND NOT 1;
+
+		IF (IF .PREV_ENTRY EQL 0
+		    THEN CH$NEQ (.ENTRY[DIR$B_NAMECOUNT]+1,
+				  ENTRY[DIR$B_NAMECOUNT],
+				 .ENTRY[DIR$B_NAMECOUNT]+1,
+				  LAST_ENTRY)
+		    ELSE CH$NEQ (.ENTRY[DIR$B_NAMECOUNT]+1,
+				  ENTRY[DIR$B_NAMECOUNT],
+				 .ENTRY[DIR$B_NAMECOUNT]+1,
+				  PREV_ENTRY[DIR$B_NAMECOUNT])
+		    )
+		THEN
+		    BEGIN
+		    VERSION_COUNT = 0;
+		    VERSION_LIMIT = .ENTRY[DIR$W_VERLIMIT];
+		    END;
+		END;
+
+	    UNTIL .P GEQA .ENTRY + .ENTRY[DIR$W_SIZE] + 2
+	    DO
+		BEGIN
+		MATCHED = 1;
+		IF .COUNT GEQU .REC_COUNT THEN LEAVE SEARCH_LOOP;
+
+		IF
+		    BEGIN
+
+		    IF .DN[FND_FIND_FID]
+		    THEN CH$EQL (FID$C_LENGTH, .FILE_ID, FID$C_LENGTH, P[DIR$W_FID])
+
+		    ELSE IF .DN[FND_WILD_VER]
+		    OR .DN[FND_MAX_VER]
+		    OR .DN[FND_VERSION] EQL -.VERSION_COUNT
+		    THEN 1
+
+		    ELSE IF .DN[FND_VERSION] GTR .P[DIR$W_VERSION]
+		    THEN
+			BEGIN
+			IF .DN[FND_FLAGS] EQL 0
+			THEN LEAVE SEARCH_LOOP
+			ELSE EXITLOOP
+			END
+
+		    ELSE .DN[FND_VERSION] EQL .P[DIR$W_VERSION]
+
+		    END
+
+		THEN
+		    BEGIN
+		    STATUS = 1;
+		    LEAVE SEARCH_LOOP;
+		    END;
+
+		P = .P + DIR$C_VERSION;
+		COUNT = .COUNT + 1;
+		VERSION_COUNT = .VERSION_COUNT + 1;
+		END;			! end of record scanning loop
+	    END;			! end of record processing conditional
+
+! Set up the next record to process.
+!
+
+	IF .P EQL 0
+	THEN P = .ENTRY + DIR$C_LENGTH + .ENTRY[DIR$B_NAMECOUNT] + 1 AND NOT 1;
+	PREV_ENTRY = .ENTRY;
+	ENTRY = NEXT_REC (.ENTRY);
+	COUNT = .COUNT + (.ENTRY-.P) / DIR$C_VERSION;
+	P = 0;
+	END;				! end of block scanning loop
+
+! We have tripped out of the record scan loop, either because we reached
+! the end of the block or we ran out the record count. In the latter case
+! (i.e., if this was a position to record number call), we are done.
+! Otherwise update the directory index (causing it to be built on the fly)
+! and read the next block.
+!
+
+    IF .LAST_ENTRY[0] NEQ 0
+    THEN
+	BEGIN
+	IF .DIR_FCB[FCB$V_DIR]
+	AND (.BLOCK+1) MOD .K EQL 0
+	THEN KERNEL_CALL (UPDATE_IDX, .BLOCK, .LAST_ENTRY[1]);
+	END;
+
+    BLOCK = .BLOCK + 1;
+    ENTRY = 0;
+    P = 0;
+    COUNT = 0;
+    IF .REC_COUNT LSSU 63 THEN LEAVE SEARCH_LOOP;
+    END;				! end of block loop
+
+END;					! end of block SEARCH_LOOP
+
+! We are done searching the directory, and have either found the
+! desired entry or have passed the point where it should be. If we
+! matched on the name of the previous record, back up to it. Point to
+! the last version in the record if we were searching for lowest
+! version; else point off the end of the record.
+!
+
+IF NOT .STATUS
+AND .MATCHED
+AND .P EQL 0
+THEN
+    BEGIN
+    IF .PREV_ENTRY NEQ 0
+    THEN
+	BEGIN
+	ENTRY = .PREV_ENTRY;
+	END
+    ELSE
+	BEGIN
+	COUNT = 0;
+	BLOCK = .BLOCK - 1;
+	P = READ_BLOCK (.BLOCK+.DIR_FCB[FCB$L_STLBN], 1, DIRECTORY_TYPE);
+	DIR_BUFFER = .P;
+	DO
+	    BEGIN
+	    ENTRY = .P;
+	    P = NEXT_REC (.P);
+	    COUNT = .COUNT + (.P - .ENTRY - (.ENTRY[DIR$B_NAMECOUNT]+1 AND NOT 1)) / DIR$C_VERSION;
+	    END
+	UNTIL .P[DIR$W_SIZE] EQL 65535;
+	END;
+    P = .ENTRY + .ENTRY[DIR$W_SIZE] + 2;
+    IF .DN[FND_VERSION] EQL -32768
+    THEN
+	BEGIN
+	P = .P - DIR$C_VERSION;
+	VERSION_COUNT = .VERSION_COUNT - 1;
+	COUNT = .COUNT - 1;
+	STATUS = 1;
+	END;
+    END;
+
+! Return the record count and pointer in global storage and return status.
+!
+
+DIR_VBN = .BLOCK + 1;
+DIR_RECORD = .COUNT;
+DIR_ENTRY = .ENTRY;
+DIR_VERSION = .P;
+DIR_PRED = .PREV_ENTRY;
+
+RETURN .STATUS;
+
+END;					! end of routine DIR_SCAN
+
+GLOBAL ROUTINE NEXT_REC (ENTRY) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine locates the next directory record and checks it for
+!	consistency.
+!
+!
+! CALLING SEQUENCE:
+!	NEXT_REC (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of present record
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	address of next directory record
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+MAP
+	ENTRY		: REF BBLOCK;	! current directory record
+
+LOCAL
+	NEXT_ENTRY	: REF BBLOCK;	! new directory record
+
+EXTERNAL
+	DIR_CONTEXT	: BBLOCK;	! directory context block
+
+DIR_CONTEXT_DEF;
+
+! Find the next record by adding in the record size of the current entry.
+! Make sure the record is valid.
+!
+
+IF .ENTRY[DIR$W_SIZE] LSSU DIR$C_LENGTH
+THEN ERR_EXIT (SS$_BADIRECTORY);
+NEXT_ENTRY = .ENTRY + .ENTRY[DIR$W_SIZE] + 2;
+IF .NEXT_ENTRY GEQA (.ENTRY + 512 AND NOT 511)
+OR .NEXT_ENTRY<0,1>
+THEN ERR_EXIT (SS$_BADIRECTORY);
+
+RETURN .NEXT_ENTRY
+
+END;					! end of routine NEXT_REC
+
+GLOBAL ROUTINE UPDATE_IDX (BLOCK, CHARACTER) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine updates the indicated cell in the directory file index.
+!
+!
+! CALLING SEQUENCE:
+!	UPDATE_IDX (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: relative block number for which to update
+!	ARG2: character to be written
+!
+! IMPLICIT INPUTS:
+!	DIR_FCB: FCB of directory file to be updated
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1
+!
+! SIDE EFFECTS:
+!	directory index updated
+!
+!--
+
+BEGIN
+
+LOCAL
+	K,				! cluster factor of directory index
+	DIR_INDEX	: REF VECTOR [,BYTE]; ! pointer to index
+
+EXTERNAL
+	DIR_FCB		: REF BBLOCK;	! FCB of directory file
+
+
+! Compute the cluster factor of the index. If the given block is the last
+! one in its cluster, update the corresponding entry.
+!
+
+DIR_INDEX = DIR_FCB[FCB$B_DIRIDX];
+K = (.DIR_FCB[FCB$L_EFBLK] + 1 + FCB$S_DIRIDX - 1) / FCB$S_DIRIDX;
+
+IF .DIR_FCB[FCB$V_DIR]
+AND (.BLOCK+1) MOD .K EQL 0
+THEN DIR_INDEX[.BLOCK/.K] = .CHARACTER;
+
+RETURN 1;
+
+END;					! end of routine UPDATE_IDX
+
+GLOBAL ROUTINE NEXT_DIR_REC (OLD_REC, VBN) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine advances to the next directory record if the name
+!	matches the one given. Note that the directory context pointers
+!	are NOT updated.
+!
+! CALLING SEQUENCE:
+!	DIR_REC (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of current directory record
+!	ARG2: address of current VBN
+!
+! IMPLICIT INPUTS:
+!	DIR_FCB: FCB of directory file
+!
+! OUTPUT PARAMETERS:
+!	ARG2: new VBN if block read
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	address of next record or 0
+!
+! SIDE EFFECTS:
+!	directory blocks read
+!
+!--
+
+BEGIN
+
+MAP
+	OLD_REC		: REF BBLOCK;	! old directory record
+
+LOCAL
+	NAME_BUFFER	: VECTOR [FILENAME_LENGTH+1, BYTE],
+					! buffer to save file name
+	NEW_REC		: REF BBLOCK;	! address of new record
+
+EXTERNAL
+	DIR_FCB		: REF BBLOCK;	! FCB of directory file
+
+EXTERNAL ROUTINE
+	READ_BLOCK;			! read a disk block
+
+
+! Save away the name string of this record. Then advance to the next
+! record, reading the next block if necessary.
+!
+
+CH$MOVE (.OLD_REC[DIR$B_NAMECOUNT]+1, OLD_REC[DIR$B_NAMECOUNT], NAME_BUFFER);
+NEW_REC = NEXT_REC (.OLD_REC);
+IF .NEW_REC[DIR$W_SIZE] EQL 65535
+THEN
+    BEGIN
+    .VBN = ..VBN + 1;
+    IF ..VBN GTRU .DIR_FCB[FCB$L_EFBLK]
+    THEN RETURN 0;
+    NEW_REC = READ_BLOCK (..VBN-1 + .DIR_FCB[FCB$L_STLBN], 1, DIRECTORY_TYPE);
+    END;
+
+IF .NEW_REC[DIR$W_SIZE] + .NEW_REC + 2 GEQA (.NEW_REC + 512 AND NOT 511)
+OR .NEW_REC[DIR$B_NAMECOUNT] GTRU FILENAME_LENGTH
+OR .NEW_REC[DIR$B_NAMECOUNT] GTR .NEW_REC[DIR$W_SIZE] + 2 - DIR$C_LENGTH - DIR$C_VERSION
+THEN ERR_EXIT (SS$_BADIRECTORY);
+
+! Compare the name string with the old one. If it matches, return the
+! new entry; else 0.
+!
+
+IF CH$NEQ (.NEW_REC[DIR$B_NAMECOUNT]+1, NAME_BUFFER,
+	   .NEW_REC[DIR$B_NAMECOUNT]+1, NEW_REC[DIR$B_NAMECOUNT])
+THEN 0
+ELSE .NEW_REC
+
+END;					! End of routine NEXT_DIR_REC
+
+END
+ELUDOM

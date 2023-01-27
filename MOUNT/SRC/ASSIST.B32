@@ -1,0 +1,2109 @@
+MODULE ASSIST	(
+		 LANGUAGE (BLISS32),
+		 IDENT = 'V03-002'
+		) =
+
+BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:
+!
+!	MOUNT
+!
+! ABSTRACT:
+!
+!	This module contains the routines to
+!	implement operator assisted mount. 
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system.
+!
+! AUTHOR:
+!
+!	Steven T. Jeffreys
+!
+! CREATION DATE:
+!
+!	October 9, 1980
+!
+! MODIFIED BY:
+!
+!	V03-002	STJ0244		Steven T. Jeffreys	04-Apr-1982
+!		- Use common I/O routines, and make the code more
+!		  tolerant to random event flag setting and clearing.
+!		- Issue the MOUN$_RQSTDON status if the mount completes
+!		  successfully while we have an operator request outstanding.
+!
+!	V03-001	BLS0160		Benn Schreiber		18-Mar-1982
+!		Get OPCDEFTMP from SHRLIB$.
+!
+!	V02-011	STJ0229		Steven T. Jeffreys	01-Mar-1982
+!		- Set the inhibit message bit in the exit status
+!		  code if the message output via $PUTMSG.
+!
+!	V02-010	STJ0218		Steven T. Jeffreys	16-Feb-1982
+!		- Cancel exit handler before declaring it.
+!		- Clear system service failure exception mode and
+!		  restore it on exit.
+!
+!	V02-009	STJ0214		Steven T. Jeffreys	11-Feb-1982
+!		Add support for the /COMMENT switch.
+!
+!	V02-008	STJ0206		Steven T. Jeffreys	08-Feb-1982
+!		Set mailbox access rights to allow SYSTEM and OWNER
+!		read and write privileges.
+!
+!	V02-007	STJ0189		Steven T. Jeffreys	02-Feb-1982
+!		Initalize GLOBAL storage at run time, and fix various bugs.
+!
+!	V02-006 STJ174		Steven T. Jeffreys	19-Jan-1982
+!		Made most of the GLOBAL routines in to local routines.
+!
+!	V02-005 STJ162		Steven T. Jeffreys	04-Jan-1982
+!		Removed copy of INTERCEPT_SIGNAL.
+!
+!	V02-004	STJ0150		Steven T. Jeffreys
+!		Extensive rewrite to support the $MOUNT system service.
+!
+!	V02-003	STJ0112		Steven T. Jeffreys
+!		- Use general addressing mode for library routines.
+!		- Fixed SET_TARGET_MASK.
+!		- Fixed SUBMIT_REQUEST to calculate actual message size.
+!		- Added support for alternate cancellation message.
+!		- Handle REPLY/BLANK_TAPE and REPLY/INITIALIZE_TAPE operator replies.
+!
+!	V02-002	STJ0083		Steven T. Jeffreys
+!		- Changed $DELMBX call in CANCEL_REQUEST to $DASSGN to properly
+!		  delete the mailbox and free up the channel.
+!		- Changed error recovery handlers to use the physical device
+!		   name string when referring to the device.
+!		- Added logic to recover from an SS$_INCVOLLABEL error, which
+!		  occurs when the label of the volume present in the drive does
+!		  not match the volume label specified by the user.
+!
+!--
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+LIBRARY 'SYS$LIBRARY:TPAMAC';
+REQUIRE	'LIBD$:[VMSLIB.OBJ]MOUNTMSG.B32';
+REQUIRE 'LIBD$:[VMSLIB.OBJ]INITMSG.REQ';
+REQUIRE 'SHRLIB$:OPCDEFTMP.REQ';	! *** TEMPORARY
+REQUIRE	'SRC$:MOUDEF.B32';
+
+FORWARD ROUTINE
+
+	SYS$MOUNT,			! Main entry point of $MOUNT
+	INTERCEPT_SIGNAL,		! Main condition handler
+	SUBMIT_REQUEST	: NOVALUE,	! Send request to operator
+	SET_TARGET_MASK	: NOVALUE,	! Sets operator target mask
+	POST_READ_TO_MBX: NOVALUE,	! Post read to reply mailbox
+	INTERACTIVE_JOB,		! Determines if we're a batch job
+	PRINT_REPLY	: NOVALUE,	! Print the operator reply
+	PARSE_REPLY	: NOVALUE,	! Parse the oprator's reply
+	CANCEL_REQUEST	: NOVALUE,	! Cancel the operator request
+	CHECK_FOR_REPLY	: NOVALUE,	! Check for operator response
+	ALLOCFAIL_HNDLR	: NOVALUE,	! Handle device allocation failures
+	MEDOFL_HNDLR	: NOVALUE,	! Handle SS$_MEDOFL condition
+	WRONGVOL_HNDLR	: NOVALUE,	! Handle SS$_INCVOLLABEL condition
+	INVALID_COMMAND,		! Notify user/operator of invalid reply
+	EXIT_HANDLER	: NOVALUE;	! Exit handler
+
+FORWARD
+
+	STATE_TABLE	: VECTOR [0],		! TPARSE state table
+	KEY_TABLE	: VECTOR [0];		! TPARSE key table
+
+STRUCTURE
+
+	EXIT_CTRL_BLK [I ; N] =			! exit handler descriptor
+	    [(4+N)*4]				! N = # of arguments ( N <= 1)
+	    (EXIT_CTRL_BLK+I*4)<0,32,0>;	! the block is a longword array
+
+MACRO
+	!
+	! Abort the mount operation.
+	!
+	ABORT_MOUNT (CODE) = 
+		SIGNAL_STOP	(%IF NOT %NULL (CODE) %THEN CODE %ELSE 0 %FI
+				 %IF NOT %NULL (%REMAINING) %THEN , %REMAINING %FI
+				)%;
+
+MACRO
+	!
+	! Generate a static string descriptor
+	!
+	DESCRIP (STRING) =
+		BBLOCK	[DSC$K_S_BLN]
+		INITIAL	(WORD (%CHARCOUNT (STRING)),
+			 BYTE (DSC$K_DTYPE_T),
+			 BYTE (DSC$K_CLASS_S),
+			 LONG (UPLIT BYTE (STRING))
+			)%;
+
+MACRO
+	!
+	! 3 byte operator mask field definition.
+	!
+	TARGET_FIELD = $BYTEOFFSET(OPC$B_MS_TARGET), 0, 24, 0%;
+
+MACRO
+	!
+	! For documentation purposes, define a boolean variable
+	! that can only take on the values TRUE or FALSE.
+	!
+	BOOLEAN = LONG%;
+
+LITERAL
+	FAO_BUFFER_SIZE	= 512,		! Max length of FAO result string
+	MAX_DEV_LENGTH	= 63,		! Max length of device name
+	!
+	! Create the reply mailbox protection mask.  Allow only
+	! OWNER(read) and SYSTEM(read,write) access.  See documentation
+	! of the $CREMBX system service for more info.
+	!
+	MAILBOX_PROTECTION = %X'FF00',
+	!
+	! The following are boolean values that are used to make the
+	! code more readable.  They are used as input to CANCEL_REQUEST.
+	!
+	REQUEST_SATISFIED	= 1,	! The request completed w/o opertor intervention
+	REQUEST_NOT_SATISFIED	= 0,	! The request is being cancled for some reason
+	!
+	! The following are mask definitions used for retrieving specified 
+	! portions of a message via the $GETMSG system service.
+	!
+	MSG_TEXT	= 1,		! Include message text
+	MSG_ID		= 2,		! Include message identifier
+	MSG_SEVERITY	= 4,		! Include severity indicator
+	MSG_FACILITY	= 8,		! Include message facility name
+	!
+	! The following are indexes into the Exit Handler Control Block
+	!
+	XHNDLR_ADDRESS	= 1,		! exit handler address
+	XHNDLR_ARGCNT	= 2,		! exit handler argument count
+	XHNDLR_STSADDR 	= 3,		! system exit status address
+	!
+	TRUE		= 1,		! Boolean value
+	FALSE		= 0,		! Boolean value
+	!
+	WAIT		= 1,		! Enable wait for reply
+	NO_WAIT		= 0,		! Disable wait for reply
+	!
+	REPLY_FLAG	= MOUNT_EFN,	! A local event flag #
+	TIMER_FLAG	= TIMER_EFN,	! A local event flag #
+	TIMER_ID	= 999,		! Timer identification #
+	!
+	EXPECT_REPLY	= 1,		! Indicates that we expect a reply
+	NO_REPLY	= 0;		! Indecates that we don't desire a reply
+
+!
+! Define the static storage used by this module.  Note that the
+! virtual pages on which this data resides must be USER writable.
+! It is important that this data start on a page boundary, so that
+! the $SETPRT call does not make pages writable that were not meant
+! to be.
+!
+
+PSECT GLOBAL = $USER_DATA$ (WRITE, NOEXECUTE, NOSHARE, ALIGN (9));
+
+GLOBAL
+	VA_START	: VECTOR [0] ALIGN (9),			! Start of 'user data'
+	!
+	! Declare boolean variables.
+	!
+	REPLY_PENDING	: BOOLEAN VOLATILE,	! Determines if response outstanding
+	MOUNT_FAILED	: BOOLEAN VOLATILE,	! Used in conjunction with MOUNT_STATUS
+	OPERATOR_PRESENT: BOOLEAN VOLATILE,	! Determines operator presence
+	RETRY_COUNTER	: LONG VOLATILE,	! Number of retries
+	SS_FAIL_MODE	: BOOLEAN,		! System service failure mode
+	!
+	! Declare condition context variables.
+	!
+	MOUNT_STATUS	: BBLOCK[4] VOLATILE,	! Primary condition
+	PREVIOUS_STATUS	: BBLOCK[4] VOLATILE,	! Previous primary condition
+	PREVIOUS_DEV_IDX: LONG VOLATILE,	! Previous device index #
+	OPERATOR_MASK	: LONG VOLATILE,	! Mask of operators to receive requests
+	REQUEST_ID	: LONG VOLATILE,	! Operator request #
+	!
+	! Declare exit handler control block.
+	!
+	EXIT_HNDLR_DSC	: EXIT_CTRL_BLK [0],	! Define exit handler descriptor
+	!
+	! Declare storge related to the operator reply message.
+	!
+	REPLY_CHANNEL	: LONG VOLATILE,	! Channel of reply mailbox
+	REPLY_IOSB	: BBLOCK [8] VOLATILE,	! IOSB  for operator reply read
+	REPLY_BUFFER	: BBLOCK [OPC$S_MS_OTEXT+8] VOLATILE,
+	REPLY_DESC	: BBLOCK [DSC$K_S_BLN] VOLATILE
+			  INITIAL (WORD (OPC$S_MS_OTEXT+8),
+				   BYTE (DSC$K_DTYPE_T),
+				   BYTE (DSC$K_CLASS_S),
+				   LONG (REPLY_BUFFER)
+				  ),
+
+	!
+	! Define the TPARSE control block.
+	!
+	TPARSE_BLOCK	: BBLOCK [TPA$K_LENGTH0]
+			  INITIAL (TPA$K_COUNT0,TPA$M_ABBREV),
+
+	!
+	! Define the device name descriptor that is used as an implicit
+	! output to a TPARSE action routine.
+	!
+	DEVICE_DESC	: BBLOCK [DSC$K_S_BLN]	! Descriptor for device name
+			  INITIAL (WORD (MAX_DEV_LENGTH),
+				   BYTE (DSC$K_DTYPE_T),
+				   BYTE (DSC$K_CLASS_S),
+				   LONG (0)
+				  ),
+	!
+	! Declare storage for operator message and its descriptor.
+	!
+	OP_MSG_BUF	: BBLOCK [OPC$S_MS_OTEXT] ! Buffer for op. request ms
+			  INITIAL (BYTE (OPC$_RQ_RQST)),
+
+	OP_MSG_DESC	: BBLOCK [DSC$K_S_BLN]	! Descriptor for op. request
+			  INITIAL (WORD (OPC$S_MS_OTEXT),
+				   BYTE (DSC$K_DTYPE_T),
+				   BYTE (DSC$K_CLASS_S),
+				   LONG (OP_MSG_BUF)
+				  ),
+
+	CANCEL_MSG_BUF	: BBLOCK [OPC$K_HDR_SIZE]		! Cancel message
+			  INITIAL (BYTE (OPC$_X_CANCEL),	! Set cancellation code
+				   BYTE (OPC$K_UNSPEC)		! Set SCOPE unspecified
+				  ),
+
+	CANCEL_MSG_DESC	: BBLOCK [DSC$K_S_BLN]	! Cancel message descriptor
+			  INITIAL (WORD (OPC$K_HDR_SIZE),
+				   BYTE (DSC$K_DTYPE_T),
+				   BYTE	(DSC$K_CLASS_S),
+				   LONG	(CANCEL_MSG_BUF)
+				  ),
+	!
+	! Declare storage for FAO resultant string buffer and descriptor.
+	!
+	FAO_BUFFER	: BBLOCK [FAO_BUFFER_SIZE],
+	FAO_RESULT_DESC	: BBLOCK [DSC$K_S_BLN]
+			  INITIAL (WORD	(LOG$C_NAMLENGTH),
+				   BYTE	(DSC$K_DTYPE_T),
+				   BYTE	(DSC$K_CLASS_S),
+				   LONG (FAO_BUFFER)
+				  ),
+	!
+	! Define the INADR vector used in the $SETPRT call.
+	! Note that VA_RANGE is on the next virtual page after VA_END.
+	!
+	VA_END		: VECTOR [0],		! End of 'user data'
+	VA_RANGE	: VECTOR [2] INITIAL (VA_START, VA_END) ALIGN (9);
+
+	
+BIND
+	!
+	! This is the delta-time value for all timers used.
+	! The time is a quadword value, is currently set for 5 seconds.
+	!
+	DELTA_TIME	= UPLIT (-5 * 10000000, -1);
+
+GLOBAL ROUTINE SYS$MOUNT  (ITEM_LIST) =
+!++
+! Functional description:
+!
+!	This routine is the main entry point of the $MOUNT system service,
+!	and executes in the access mode of the caller.  Usually this will
+!	be USER mode.  This routine others defined in this module implement
+!	the logic for "operator assisted mount".  This code must execute
+!	in  USER mode, to allow users to CTRL\Y out of a mount request.
+!
+! Input:
+!
+!	ITEM_LIST	: Address of a $GETJPI-like item list
+!
+! Output:
+!
+!	None.
+!
+! Implicit Inputs:
+!
+!	The MOUNT data base.
+!
+! Implicit Outputs:
+!
+!	The MOUNT data base may be altered as
+!	the result of operator intervention.
+!
+!--
+
+BEGIN						! Start of OPERATOR_ASSIST
+	
+BUILTIN
+	FP,
+	AP,
+	CALLG;
+
+LOCAL
+	STATUS;
+
+EXTERNAL
+	MOUNT_OPTIONS	: BITVECTOR VOLATILE;	! Mount options bit vector
+
+EXTERNAL ROUTINE
+	$CHANGE_PROT$U	: ADDRESSING_MODE (GENERAL),	! Address of the transfer vector
+	SYS$VMOUNT$U	: ADDRESSING_MODE (GENERAL);	! Address of the transfer vector
+
+!
+! Enable a condition handler that will force the primary
+! condition code facility-code to the MOUNT facility.
+!
+ENABLE INTERCEPT_SIGNAL;
+
+!
+! Set the page protection of this module's data to allow user
+! mode read/write access.  This must be done here, since this
+! image is INSTALLed as a protected shareable image, which has
+! the effect of setting the protection to be USER read, EXEC write.
+! Note that the data sits in a specail PSECT, to avoid changing
+! the page protection on adjacent pages.
+!
+IF NOT (MOUNT_STATUS = $CHANGE_PROT$U ())
+THEN
+    RETURN (.MOUNT_STATUS);
+!
+! Initialize the necessary variables.  Most of the
+! descriptors are not significantly changed, and do
+! not have to be initialized at run time.
+!
+REPLY_PENDING = FALSE;
+MOUNT_FAILED = TRUE;
+OPERATOR_PRESENT = TRUE;
+PREVIOUS_STATUS = -1;
+PREVIOUS_DEV_IDX = -1;
+RETRY_COUNTER = 0;
+SS_FAIL_MODE = 0;
+
+!
+! Clear the system service failure exception flag, but save it's state.
+!
+STATUS = $SETSFM (ENBFLG=0);
+IF (.STATUS EQL SS$_WASSET)
+THEN
+    SS_FAIL_MODE = 1;
+
+!
+! Set up the exit handler descriptor and declare the handler.
+!
+EXIT_HNDLR_DSC[XHNDLR_ADDRESS] = EXIT_HANDLER;
+EXIT_HNDLR_DSC[XHNDLR_ARGCNT]  = 1;
+EXIT_HNDLR_DSC[XHNDLR_STSADDR] = MOUNT_STATUS;
+$CANEXH (DESBLK = EXIT_HNDLR_DSC);
+$DCLEXH (DESBLK=EXIT_HNDLR_DSC);
+
+!
+! Perform the mount request.  If it fails, attempt to recover
+! via some operator assistance.  If that is not possible, or the
+! operator or user aborts the mount, die gracefully and return the
+! status to the user.
+!
+MOUNT_STATUS = 0;
+WHILE NOT .MOUNT_STATUS DO
+    BEGIN
+    IF NOT (MOUNT_STATUS = CALLG (.AP, SYS$VMOUNT$U))
+    THEN
+	BEGIN
+	IF NOT .MOUNT_OPTIONS [OPT_ASSIST]
+	THEN
+	    EXITLOOP;
+	!
+	! SELECT an error recovery handler based on the mount status value.
+	! Use only the message number and the facility code in the comparisons.
+	!
+	SELECTONEU (.MOUNT_STATUS AND STS$M_MSG_NO) OF
+	    SET
+	    [SS$_DEVALLOC    AND STS$M_MSG_NO]	: ALLOCFAIL_HNDLR ();
+	    [SS$_MEDOFL      AND STS$M_MSG_NO]	: MEDOFL_HNDLR ();
+	    [SS$_VOLINV	     AND STS$M_MSG_NO]	: MEDOFL_HNDLR ();
+	    [SS$_NODEVAVL    AND STS$M_MSG_NO]	: ALLOCFAIL_HNDLR ();
+	    [SS$_NOSUCHDEV   AND STS$M_MSG_NO]	: ALLOCFAIL_HNDLR ();
+	    [SS$_INCVOLLABEL AND STS$M_MSG_NO]	: WRONGVOL_HNDLR ();
+	    [OTHERWISE]				: EXITLOOP;
+	    TES;
+
+	!
+	! Check for a reply to the operator request.  If it has
+	! arrived, it will be processed.  If it hasn't, wait for
+	! a few seconds and try again.
+	!
+	CHECK_FOR_REPLY ();
+	END;
+    END;
+
+!
+! Cancel the any outstanding requests and the exit handler.
+! Also restore the system service failure exception flag to its
+! original state, and disable the condition handler.
+!
+CANCEL_REQUEST (REQUEST_SATISFIED);
+$SETSFM (ENBFLG = .SS_FAIL_MODE);
+.FP = 0;
+$CANEXH (DESBLK = EXIT_HNDLR_DSC);
+
+RETURN (.MOUNT_STATUS)				! Return the status code
+
+END;						! End of SYS$MOUNT
+
+ROUTINE INTERCEPT_SIGNAL (SIGNAL, MECHANISM) =
+
+!++
+! Functional Description:
+!
+!	This routine is a conditon handler whose sole
+!	reason for existence is to force the primary
+!	conditon code's facility-code to that of the
+!	MOUNT facility.
+!
+! Input:
+!
+!	SIGNAL    = Address of the signal array
+!	MECHANISM = Address of the mechanism array
+!
+! Output:
+!
+!	The condition facility code is equal to MOUN$_FACILITY
+!--
+
+BEGIN						! Start of INTERCEPT_SIGNAL
+
+MAP
+
+	SIGNAL		: REF BBLOCK,		! Signal array
+	MECHANISM	: REF BBLOCK;		! Mechanism array
+
+EXTERNAL
+
+	MOUNT_OPTIONS	: BITVECTOR VOLATILE,	! parser option flags
+	USER_STATUS	: VECTOR;		! Status return of some routines
+
+
+IF .SIGNAL[CHF$L_SIG_NAME] NEQ SS$_UNWIND
+THEN
+    BEGIN
+    !
+    ! Make the facility code MOUN$_FCILITY.
+    !
+    IF .BBLOCK [SIGNAL[CHF$L_SIG_NAME], STS$V_FAC_NO] EQL 0
+    OR .BBLOCK [SIGNAL[CHF$L_SIG_NAME], STS$V_FAC_NO] EQL INIT$_FACILITY
+    THEN
+	BBLOCK [SIGNAL[CHF$L_SIG_NAME], STS$V_FAC_NO] = MOUN$_FACILITY;
+
+    IF .BBLOCK [SIGNAL[CHF$L_SIG_NAME], STS$V_MSG_NO] EQL 0
+    THEN
+	BBLOCK [SIGNAL[CHF$L_SIG_NAME], STS$V_MSG_NO] = .USER_STATUS [0] ^ (-$BITPOSITION (STS$V_MSG_NO));
+
+    !
+    ! If the caller requested it, print the message text associated with the message code.
+    !
+    IF .MOUNT_OPTIONS [OPT_MESSAGE]
+    THEN
+	BEGIN
+	SIGNAL [CHF$L_SIG_ARGS] = .SIGNAL [CHF$L_SIG_ARGS] - 2;
+	$PUTMSG (MSGVEC = SIGNAL [CHF$L_SIG_ARGS], ACTRTN=0, FACNAM=0);
+	SIGNAL [CHF$L_SIG_ARGS] = .SIGNAL [CHF$L_SIG_ARGS] + 2;
+	BBLOCK [SIGNAL [CHF$L_SIG_NAME], STS$V_INHIB_MSG] = 1;
+	END;
+
+    !
+    ! If the condition severity code is SEVERE or ERROR, then unwind the
+    ! stack back to the caller of the frame that established this handler.
+    ! Return the condition code in R0.
+    !
+    IF .BBLOCK [SIGNAL [CHF$L_SIG_NAME], STS$V_SEVERITY] EQL STS$K_SEVERE
+    OR .BBLOCK [SIGNAL [CHF$L_SIG_NAME], STS$V_SEVERITY] EQL STS$K_ERROR
+    THEN
+	BEGIN
+	MECHANISM [CHF$L_MCH_SAVR0] = .SIGNAL [CHF$L_SIG_NAME];
+	$UNWIND ();
+	END;
+    END;
+
+!
+! Attempt to continue the operation.
+!
+RETURN (SS$_CONTINUE);
+
+END;						! End of INTERCEPT_SIGNAL
+
+ROUTINE POST_READ_TO_MBX (MBX_CHANNEL) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine will post a read to the reply mailbox.
+!	Instead of waiting for the I/O to complete, request
+!	that an event flag be set when the I/O is finally done.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	REPLY_CHANNEL	: Channel # of channel to the reply mailbox.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	REPLY_IOSB	: Address of an I/O status block to receive the status of the I/O.
+!	REPLY_BUFFER	: Address of buffer to receive the operator's reply.
+!
+! Side effects:
+!
+!	If the $QIO fails, the user will be notified
+!	of the failure and the mount will be aborted.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of POST_READ_TO_MBX
+
+LOCAL
+	STATUS		: LONG;			! Hold status of $QIO call
+
+IF NOT (STATUS = $QIO	(FUNC = IO$_READVBLK,
+			 EFN  = REPLY_FLAG,
+			 CHAN = .REPLY_CHANNEL,
+			 IOSB = REPLY_IOSB,
+			 P1   = REPLY_BUFFER,
+			 P2   = ($BYTEOFFSET (OPC$S_MS_OTEXT) + $BYTEOFFSET (OPC$L_MS_TEXT))
+			))
+THEN
+    ABORT_MOUNT (MOUN$_MBXRDERR, 0, .STATUS);
+
+END;						! End of POST_READ_TO_MBX
+
+ROUTINE INTERACTIVE_JOB =
+
+!++
+! Functional Description:
+!
+!	This routine will determine if the current process is an
+!	interactive process, and return that information to the
+!	caller.  By definition, a process is interactive if it
+!	has a terminal associated with it.
+!
+! Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Routine Value:
+!
+!	1 if current process is an interactive process
+!	0 if current process is not an interactive process
+!--
+
+BEGIN							! Start of INTERACTIVE_JOB
+
+LOCAL
+	ITEM_LIST	: BBLOCK [16],			! Item list for $GETJPI
+	DEVICE_NAME	: BBLOCK [16],			! Device name buffer
+	NAME_LENGTH	: LONG;				! Cell for device name length
+
+!
+! Build the $GETJPI item list and get the terminal name.
+!
+NAME_LENGTH = 0;					! Zero the output cell
+ITEM_LIST [0, 0, 16, 0] = 16;				! Set buffer length
+ITEM_LIST [2, 0, 16, 0] = JPI$_TERMINAL;		! Set item code
+ITEM_LIST [4, 0, 32, 0] = DEVICE_NAME;			! Set buffer address
+ITEM_LIST [8, 0, 32, 0] = NAME_LENGTH;			! Set result length address
+ITEM_LIST [12,0, 32, 0] = 0;				! Set list terminator
+$GETJPI (ITMLST = ITEM_LIST);
+
+!
+! If a terminal is associated with the process, the terminal name
+! length should be nonzero.
+!
+IF .NAME_LENGTH NEQ 0
+THEN
+    1							! Return TRUE
+ELSE
+    0							! Return FALSE
+
+END;							! End of INTERACTIVE_JOB
+
+
+ROUTINE SUBMIT_REQUEST (MSG_DESC,REPLY_EXPECTED) : NOVALUE =
+
+!++
+! Functional Description:
+!
+!	This routine will send a request to all operators enabled
+!	to receive disk and tape messages.  All requests that are
+!	issued to the operator are echoed to the user.  Also, the
+!	request context is saved so that when the operator replies
+!	we can parse the reply in the context of the request.
+!
+! Input:
+!
+!	MSG_DESC	= Address of a quadword string descriptor.
+!			  The string is the operator request.
+!
+!	REPLY_EXPECTED	= Boolean value.  If true then an operator
+!			  response is expected.
+!
+! Output:
+!
+!	None.
+!
+! Implicit Inputs:
+!
+!	MOUNT_STATUS	= status from current mount attempt
+!
+! Implicit Outputs:
+!
+!	The request context is saved, the request is made.
+!--
+
+BEGIN						! Start of SUBMIT_REQUEST
+
+MAP
+
+	MSG_DESC	: REF BBLOCK;		! Address of request descriptor
+
+EXTERNAL
+
+	DEVICE_INDEX	: LONG VOLATILE;	! Index into device list
+
+LITERAL
+
+	BLANK		= %ASCII ' ',		! Fill character
+	ZERO		= 0;			! Handy literal
+
+LOCAL
+
+	STATUS		: LONG,			! Return status
+	MBX_CHAN	: LONG;			! Operator reply mailbox channel
+
+
+!
+! If no mailbox exists, create one.
+!
+IF .REPLY_CHANNEL EQL ZERO
+THEN
+    IF NOT (STATUS = $CREMBX (CHAN = REPLY_CHANNEL, PROMSK = MAILBOX_PROTECTION))
+    THEN
+	ABORT_MOUNT (MOUN$_MBXCRERR, 0, .STATUS);
+
+!
+! Fill in the necessary fields in the request string.
+! Copy the message string to the operator message buffer.
+! 
+REQUEST_ID = .REQUEST_ID + 1;			! Inc reqeust #
+OP_MSG_BUF[OPC$L_MS_RQSTID]= .REQUEST_ID;	! Set request #
+!
+CH$COPY	(.MSG_DESC[DSC$W_LENGTH],		! Source length
+	 .MSG_DESC[DSC$A_POINTER],		! Source pointer
+	 BLANK,					! Fill character
+	 OPC$S_MS_OTEXT-$BYTEOFFSET(OPC$L_MS_TEXT),! Destination length
+	 OP_MSG_BUF+$BYTEOFFSET(OPC$L_MS_TEXT)	! Destination pointer
+	);
+OP_MSG_DESC[DSC$W_LENGTH] = .MSG_DESC[DSC$W_LENGTH]+$BYTEOFFSET(OPC$L_MS_TEXT);
+
+IF .REPLY_EXPECTED
+THEN
+    BEGIN
+    !
+    ! An operator reply is expected.  Save the condition
+    ! context and set up the reply mailbox channel.
+    !
+    PREVIOUS_STATUS  = .MOUNT_STATUS;
+    PREVIOUS_DEV_IDX = .DEVICE_INDEX;
+    REPLY_PENDING    =  TRUE;
+    MBX_CHAN	     = .REPLY_CHANNEL;
+    END
+ELSE
+    !
+    ! An operator reply is not expected.
+    ! Indicate this to OPCOM by specifying a mailbox channel of zero.
+    !
+    MBX_CHAN = ZERO;
+
+!
+! Set the operator target mask.
+!
+SET_TARGET_MASK ();
+OP_MSG_BUF[TARGET_FIELD] = .OPERATOR_MASK;
+!
+! Send the request to the operator.
+!
+IF NOT (STATUS = $SNDOPR (MSGBUF=OP_MSG_DESC, CHAN=.MBX_CHAN))
+THEN
+    ABORT_MOUNT (MOUN$_OPRSNDERR, 0, .STATUS);
+!
+! Echo the operator request to the user.  If no operator is
+! present, do not echo the request.  This interlock is necessary
+! to prevent repeatedly issuing the request if no OPCOM process
+! is present.
+!
+IF .OPERATOR_PRESENT
+THEN
+    SIGNAL (MOUN$_OPRQST, 1, .MSG_DESC);
+!
+! An alternate request status returned by $SNDOPR is SS$_NOPERATOR,
+! which indicates that there is no operator present to service the
+! request.  Taken in this context, it means that there is no OPCOM
+! process present on the system.
+!
+IF .STATUS EQL OPC$_NOPERATOR
+THEN
+    BEGIN
+    REPLY_PENDING = FALSE;
+    IF NOT INTERACTIVE_JOB ()
+    THEN
+	!
+	! Abort the mount, as no one can service the request.
+	!
+	ABORT_MOUNT (MOUN$_BATCHNOOPR)
+    ELSE
+	BEGIN
+	!
+	! Inform the user that no operator is available to service
+	! the request.  The user then has three courses of action:
+	!   - Abort the mount via CTRL-C
+	!   - Wait for an operator to enable himself to service the request
+	!   - Service the request himself.  (Hands-on environment)
+	!
+	! Since the problem may go away in time, wait a short while after
+	! informing the user before continuing the MOUNT operation.
+	!
+	IF .OPERATOR_PRESENT
+	THEN
+	    SIGNAL (MOUN$_NOOPR);
+	OPERATOR_PRESENT = FALSE;
+	IF NOT (STATUS = $SETIMR (EFN=TIMER_FLAG, REQIDT=TIMER_ID, DAYTIM=DELTA_TIME))
+	THEN
+	    ABORT_MOUNT (.STATUS);
+	$WAITFR (EFN = TIMER_FLAG);
+	$CANTIM (REQIDT = TIMER_ID);
+	$SETEF  (EFN = TIMER_FLAG);
+	END;
+    END;
+!
+! If an operator reply is expected, then issue a read to the reply mailbox.
+!
+REPLY_IOSB = 0;
+IF .REPLY_PENDING
+THEN
+    POST_READ_TO_MBX ();
+
+END;						! End of SUBMIT_REQUEST
+
+
+ROUTINE SET_TARGET_MASK : NOVALUE =
+
+!++
+! Functional description:
+!
+!	Get the device characteristics and figure out which class
+!	of operator is to receive the request.  If the device is a
+!	tape, send the request to tape class operators.  If the
+!	device is a disk, send the request to disk class operators.
+!	If the device is neither tape or disk (ie. the user screwed
+!	up the device name on the command line) then send the
+!	request to both disk and tape class operators.  We remember
+!	the operator class mask in case we later have to cancel
+!	the request.
+!
+! Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	The MOUNT data base.  Note that:
+!	DEVICE_STRING[.DEVICE_INDEX*2] = the address of string descriptor
+!					 of the device currently being mounted.
+!
+! Implicit Output:
+!
+!	OPERATOR_MASK = mask of target operators.  Only 
+!			the low 3 bytes are significant.
+!
+!--
+
+BEGIN						! Start of SET_TARGET_MASK
+
+EXTERNAL
+	DEVICE_INDEX	: LONG VOLATILE,	! Index into aforementioned vector
+	PHYS_NAME	: VECTOR VOLATILE;	! Vector of device descriptors
+
+LOCAL
+	DEVICE_CHAR	: BBLOCK [DIB$K_LENGTH],! Primary characteristics buffer
+	DEVICE_CHAR2	: BBLOCK [DIB$K_LENGTH],! Secondary characteristics buffer
+	DEVCHAR_DESC	: BBLOCK [DSC$K_S_BLN],	! Descriptor of primary char. buffer
+	DEVCHAR_DESC2	: BBLOCK [DSC$K_S_BLN],	! Descriptor of secondary char. buffer
+	STATUS		: LONG;
+
+!
+! Set up the device characteristic buffer descriptors.
+!
+DEVCHAR_DESC [DSC$W_LENGTH]  = DIB$K_LENGTH;
+DEVCHAR_DESC [DSC$B_DTYPE]   = DSC$K_DTYPE_T;
+DEVCHAR_DESC [DSC$B_CLASS]   = DSC$K_CLASS_S;
+DEVCHAR_DESC [DSC$A_POINTER] = DEVICE_CHAR;
+DEVCHAR_DESC2 [DSC$W_LENGTH]  = DIB$K_LENGTH;
+DEVCHAR_DESC2 [DSC$B_DTYPE]   = DSC$K_DTYPE_T;
+DEVCHAR_DESC2 [DSC$B_CLASS]   = DSC$K_CLASS_S;
+DEVCHAR_DESC2 [DSC$A_POINTER] = DEVICE_CHAR2;
+OPERATOR_MASK = 0;				! Zero the operator targt mask.
+!
+! Get the device characteristics and perform some sanity checking.
+! If this device is not mountable, don't worry, the operator will be
+! notified and he'll think of something.
+!
+STATUS = $GETDEV (DEVNAM = PHYS_NAME [.DEVICE_INDEX *2],
+		  PRIBUF=DEVCHAR_DESC,
+		  SCDBUF = DEVCHAR_DESC2
+		 );
+IF (NOT .DEVICE_CHAR[DEV$V_FOD]) OR  (.STATUS EQL SS$_NOSUCHDEV)
+THEN
+    OPERATOR_MASK = (OPC$M_NM_DISKS OR OPC$M_NM_TAPES)	! Send to tape and disk operators
+ELSE
+    !
+    ! Set the operator mask according to device class.  That is, tape
+    ! requests go to TAPE operators, disk requests go to DISK operators.
+    !
+    OPERATOR_MASK = (IF .DEVICE_CHAR[DEV$V_SQD]
+		     THEN
+			 OPC$M_NM_TAPES
+		     ELSE
+			 OPC$M_NM_DISKS);
+END;						! End of SET_TARGET_MASK
+
+ROUTINE CANCEL_REQUEST (REQUEST_STATUS) : NOVALUE =
+
+!++
+! Functional Description:
+!
+!	This routine will cancel an outstanding operator request.
+!	The reply mailbox is deleted after the cancelation message
+!	is sent so there will be no stale messages lying around to
+!	confuse things later on.  The user is notified of the cancelation.
+!
+! Input:
+!
+!	REQUEST_STATUS	: A boolean value that describes the status of the
+!			  operator request.  A value of 1 indicates the request
+!			  has been successfully completed without  operator 
+!			  intervention, and the reason for the request no
+!			  longer exists.  A value of 0 indicates that the
+!			  request has not been satisfied, but is being canceled
+!			  for some reason.
+!
+! Output:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	REPLY_PENDING = TRUE if there is an outstanding operater request.
+!
+! Implicit Outputs:
+!
+!	REPLY_PENDING = FALSE
+!--
+
+BEGIN						! Start of CANCEL_REQUEST
+
+
+IF .REPLY_PENDING
+THEN
+    BEGIN
+    !
+    ! Send cancelation notice to operator
+    !
+    BBLOCK [CANCEL_MSG_BUF [OPC$L_RQ_OPTIONS], OPC$V_RQSTDONE] = .REQUEST_STATUS;
+    CANCEL_MSG_BUF[OPC$L_RQSTID] = .REQUEST_ID;
+    CANCEL_MSG_BUF[OPC$L_ATTNMASK1] = .OPERATOR_MASK;
+    $SNDOPR (MSGBUF=CANCEL_MSG_DESC, CHAN=.REPLY_CHANNEL);
+    !
+    ! Deassign the channel to the reply mailbox.  Since it
+    ! is a temporary mailbox, it will be deleted.
+    !
+    $DASSGN (CHAN = .REPLY_CHANNEL);
+    REPLY_CHANNEL = 0;
+    REPLY_PENDING = FALSE;
+    !
+    ! Clear the reply event flag.
+    !
+    $CLREF (EFN=REPLY_FLAG);
+    !
+    ! Notify the user of the cancelation.
+    !
+    IF .REQUEST_STATUS
+    THEN
+	SIGNAL (MOUN$_RQSTDON)
+    ELSE
+	SIGNAL (MOUN$_OPRQSTCAN);
+    END;
+
+END;						! End of CANCEL_REQUEST
+
+ROUTINE CHECK_FOR_REPLY : NOVALUE =
+
+!++
+! Functional Description:
+!
+!	This routine will check to see if the operator
+!	replied to a request after DELTA_TIME expired.
+!	If so, the response must be parsed and acted upon.
+!	Note that this might require undoing a successful mount.
+!	If the request is still outstanding and the mount
+!	completed successfully, then cancel the request.
+!
+! Input:
+!
+!	WAIT_ENABLED = TRUE if we are to wait, FALSE if not.
+!
+! Output:
+!
+!	None.
+!
+! Implicit Inputs:
+!
+!	REPLY_PENDING = 1 if there is an outstanding request.
+!	REPLY_DESC = string descriptor of the operator's reply.
+!	REPLY_BUFFER = buffer holding the operator's reply.
+!	MOUNT data base.
+!
+! Implicit Outputs:
+!
+!	The MOUNT data base may be updated as a result of the operator's reply.
+!--
+
+BEGIN						! Start of CHECK_FOR_REPLY
+
+LOCAL
+
+	EF_STATE	: LONG,			! State of Event flags
+	STATUS		: LONG;
+
+IF NOT .MOUNT_FAILED
+THEN
+    !
+    ! The mount succeeded.  Operator intervention is
+    ! no longer necessary, so cancel the request.
+    !
+    CANCEL_REQUEST (REQUEST_SATISFIED)
+ELSE
+    BEGIN
+    !
+    ! The mount failed (again).
+    !
+    ! If a reply was pending, wait for either the timer to go off or
+    ! for the reply to arrive, whichever comes first.  If no reply is
+    ! pending, then simply wait for the timer to go off.  Cancel the
+    ! timer on the way out, just to be thourough.
+    !
+    ! If no operator is present, only attempt to read the reply mailbox
+    ! every tenth time through this routine.  This is necessaray to prevent
+    ! prevent mount from looping rapidly through this code.
+    !
+    IF NOT (STATUS = $SETIMR (EFN=TIMER_FLAG, REQIDT=TIMER_ID, DAYTIM=DELTA_TIME))
+    THEN
+        ABORT_MOUNT (.STATUS, 0, .MOUNT_STATUS);
+
+    IF (.REPLY_PENDING AND .OPERATOR_PRESENT)
+    OR ((NOT .OPERATOR_PRESENT) AND (.RETRY_COUNTER/10) GEQ 1)
+    THEN
+	BEGIN
+	RETRY_COUNTER = 0;
+	IF (.REPLY_IOSB [0,0,16,0] NEQ 0)
+	THEN
+	    PARSE_REPLY ()
+	ELSE
+	    $WAITFR (EFN = TIMER_FLAG);
+	END
+    ELSE
+	$WAITFR (EFN = TIMER_FLAG);
+
+    $CANTIM (REQIDT = TIMER_ID);		! Cancel the timer
+    $SETEF (EFN = TIMER_FLAG);			! Set timer flag
+    END;
+RETRY_COUNTER = .RETRY_COUNTER + 1;
+END;						! End of CHECK_FOR_REPLY
+
+ROUTINE ALLOCFAIL_HNDLR : NOVALUE =
+
+!++
+! Functional Description:
+!
+!	This routine will attempt to recover from a device
+!	allocation failure.  This means that the device
+!	specified by the user (or operator) cannot be
+!	successfully allocated.  Notify the operator and
+!	try again.  Current allocation failures handled are:
+!
+!		SS$_DEVALLOC	- device allocated to another user
+!		SS$_NODEVAVL	- no devices of generic type are available
+!		SS$_NOSUCHDEV	- incorrect device specifier 
+!
+! Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	MOUNT_STATUS  = status of current mount attempt
+!	REPLY_PENDING = TRUE if an operator request is outstanding
+!	The MOUNT data base.
+!
+! Implict Output:
+!
+!	The MOUNT data base may be changed as
+!	the result of operator intervention.
+!--
+
+BEGIN						! Start of ALLOCFAIL_HNDLR
+
+EXTERNAL
+
+	COMMENT_STRING	: BBLOCK,		! User comment string
+	DEVICE_INDEX	: LONG VOLATILE,	! Index into device name vector
+	PHYS_NAME	: BBLOCK VOLATILE;	! Physical device name descriptor
+LITERAL	
+
+	FAO_CTRL_SIZ	= FAO_BUFFER_SIZE/2;	! Maximum size for FAO control string
+
+LOCAL
+
+	ALLOCFAIL_FAO	: BBLOCK [DSC$K_S_BLN],	! FAO control string descriptor
+	FAO_CTRL_BUF	: BBLOCK [FAO_CTRL_SIZ],! Buffer for FAO control string
+	STATUS		: LONG;
+
+
+!
+! If this condition is different from the one signaled previously,
+! cancel any outstanding requests before handling this condition.
+! Otherwise do nothing.
+!
+IF (.MOUNT_STATUS NEQ .PREVIOUS_STATUS) 
+OR (.DEVICE_INDEX NEQ .PREVIOUS_DEV_IDX)
+THEN
+    BEGIN
+    CANCEL_REQUEST (REQUEST_NOT_SATISFIED);
+    OPERATOR_PRESENT = TRUE;			! Assume operator present
+    !
+    ! Set up the output descriptor and get the FAO control string.
+    !
+    ALLOCFAIL_FAO [DSC$W_LENGTH]  = FAO_CTRL_SIZ;
+    ALLOCFAIL_FAO [DSC$B_DTYPE]   = DSC$K_DTYPE_T;
+    ALLOCFAIL_FAO [DSC$B_CLASS]   = DSC$K_CLASS_S;
+    ALLOCFAIL_FAO [DSC$A_POINTER] = FAO_CTRL_BUF;
+    IF NOT (STATUS = $GETMSG	(MSGID  = MOUN$_NODEVAVL,
+				 MSGLEN = ALLOCFAIL_FAO [DSC$W_LENGTH],
+				 BUFADR = ALLOCFAIL_FAO,
+				 FLAGS  = MSG_TEXT
+				))
+    THEN
+	ABORT_MOUNT (.STATUS, 0, .MOUNT_STATUS);
+    !
+    ! Set up the output descriptor and format the operator request.
+    !
+    FAO_RESULT_DESC[DSC$A_POINTER] = FAO_BUFFER;
+    FAO_RESULT_DESC[DSC$W_LENGTH]  = FAO_BUFFER_SIZE;
+    $FAO (ALLOCFAIL_FAO,
+	  FAO_RESULT_DESC [DSC$W_LENGTH],
+	  FAO_RESULT_DESC,
+	  PHYS_NAME,
+	  COMMENT_STRING
+	 );
+    !
+    ! Send the request to the operator.
+    !
+    SUBMIT_REQUEST (FAO_RESULT_DESC,EXPECT_REPLY);
+    END;
+
+END;						! End of ALLOCFAIL_HNDLR
+
+ROUTINE MEDOFL_HNDLR : NOVALUE =
+
+!++
+! Functional Description:
+!
+!	This routine will attempt to recover from a medium
+!	offline condition.  This usually means that the disk is
+!	not spun up.  Notify the operator that the device
+!	needs to be put online.
+!
+! Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	MOUNT_STATUS  = status of the current mount attempt
+!	REPLY_PENDING = TRUE if an operator request is outstanding
+!	The MOUNT data base.
+!
+! Implict Output:
+!
+!	The MOUNT data base may be changed as
+!	the result of operator intervention.
+!--
+
+BEGIN						! Start of MEDOFL_HNDLR
+
+EXTERNAL
+
+	COMMENT_STRING	: BBLOCK,		! User comment string
+	LABEL_STRING	: VECTOR VOLATILE,	! Vector of label descriptors
+	PHYS_NAME	: BBLOCK VOLATILE,	! Physical device name descriptor
+	DEVICE_INDEX	: LONG VOLATILE;	! Index into DEVICE_STRING vector
+
+LITERAL
+
+	FAO_CTRL_SIZ	= FAO_BUFFER_SIZE/2;	! FAO control string size
+
+LOCAL
+
+	MEDOFL_FAO	: BBLOCK [DSC$K_S_BLN],
+	MEDOFL_BUF	: BBLOCK [FAO_CTRL_SIZ],
+	VOLUME_FAO	: BBLOCK [DSC$K_S_BLN],
+	VOLUME_BUF	: BBLOCK [FAO_CTRL_SIZ],
+	VOLUME_DESC	: BBLOCK [DSC$K_S_BLN],
+	VOLUME_BUFFER	: BBLOCK [FAO_CTRL_SIZ],
+	STATUS		: LONG;
+
+
+
+!
+! If this condition is different from the one signaled previously,
+! cancel any outstanding requests before handling this condition.
+! Note that if the previous condition was SS$_INCVOLLABEL, we do
+! not cancel the request and issue another one.  This is to give
+! the operator a chance to remove the incorrect volume from the drive
+! and to (hopefully) insert the correct volume.
+!
+IF  ((.MOUNT_STATUS AND STS$M_COND_ID) NEQ (SS$_INCVOLLABEL AND STS$M_COND_ID))
+AND ((.PREVIOUS_STATUS AND STS$M_COND_ID) EQL (SS$_INCVOLLABEL AND STS$M_COND_ID))
+AND (.DEVICE_INDEX  EQL .PREVIOUS_DEV_IDX)
+THEN
+    BEGIN
+    PREVIOUS_STATUS = .MOUNT_STATUS;
+    END;
+
+IF (.DEVICE_INDEX NEQ .PREVIOUS_DEV_IDX)
+OR (.MOUNT_STATUS NEQ .PREVIOUS_STATUS)
+THEN
+    BEGIN
+    CANCEL_REQUEST (REQUEST_NOT_SATISFIED);
+    OPERATOR_PRESENT = TRUE;			! Assume operator present
+    END;
+!
+! If there is no outstanding request, then submit a request.
+!
+IF NOT .REPLY_PENDING
+THEN
+    BEGIN
+    !
+    ! Set up the output descriptor and format the volume label string.
+    !
+    VOLUME_DESC [DSC$W_LENGTH]  = FAO_CTRL_SIZ;
+    VOLUME_DESC [DSC$B_DTYPE]   = DSC$K_DTYPE_T;
+    VOLUME_DESC [DSC$B_CLASS]   = DSC$K_CLASS_S;
+    VOLUME_DESC [DSC$A_POINTER] = VOLUME_BUFFER;
+    IF .LABEL_STRING[.DEVICE_INDEX*2] GTR 0
+    THEN
+	BEGIN
+	!
+	! Set up the output descriptor and get the FAO control string.
+	!
+	VOLUME_FAO [DSC$W_LENGTH] = FAO_CTRL_SIZ;
+	VOLUME_FAO [DSC$B_DTYPE]  = DSC$K_DTYPE_T;
+	VOLUME_FAO [DSC$B_CLASS]  = DSC$K_CLASS_S;
+	VOLUME_FAO [DSC$A_POINTER] = VOLUME_BUF;
+	IF NOT (STATUS = $GETMSG (MSGID  = MOUN$_VOLNAME,
+				  MSGLEN = VOLUME_FAO [DSC$W_LENGTH],
+				  BUFADR = VOLUME_FAO,
+				  FLAGS  = MSG_TEXT
+				 ))
+	THEN
+	    ABORT_MOUNT (.STATUS, 0, .MOUNT_STATUS);
+	!
+	! Format the volume label string,
+	!
+	$FAO	(VOLUME_FAO,
+		 VOLUME_DESC [DSC$W_LENGTH],
+		 VOLUME_DESC,
+		 LABEL_STRING [.DEVICE_INDEX*2]
+		);
+	END
+    ELSE
+	VOLUME_DESC [DSC$W_LENGTH] = 0;		! Set volume name null
+    !
+    ! Set up the desctiptors and get the FAO control string for the message.
+    !
+    MEDOFL_FAO [DSC$W_LENGTH]	= FAO_CTRL_SIZ;
+    MEDOFL_FAO [DSC$B_DTYPE]	= DSC$K_DTYPE_T;
+    MEDOFL_FAO [DSC$B_CLASS]	= DSC$K_CLASS_S;
+    MEDOFL_FAO [DSC$A_POINTER]	= MEDOFL_BUF;
+    $GETMSG	(MSGID  = MOUN$_MOUNTDEV,
+		 MSGLEN = MEDOFL_FAO [DSC$W_LENGTH],
+		 BUFADR = MEDOFL_FAO,
+		 FLAGS  = MSG_TEXT
+		);
+    !
+    ! Set up the output descriptor and format the operator request.
+    !	
+    FAO_RESULT_DESC [DSC$W_LENGTH]  = FAO_BUFFER_SIZE;
+    FAO_RESULT_DESC [DSC$A_POINTER] = FAO_BUFFER;
+    $FAO (MEDOFL_FAO,
+	  FAO_RESULT_DESC[DSC$W_LENGTH],
+	  FAO_RESULT_DESC,
+	  VOLUME_DESC,
+	  PHYS_NAME,
+	  COMMENT_STRING
+	 );
+    !
+    ! Send the request to the operator.
+    !
+    SUBMIT_REQUEST (FAO_RESULT_DESC,EXPECT_REPLY);
+    END;
+
+END;						! End of MEDOFL_HNDLR
+
+ROUTINE WRONGVOL_HNDLR : NOVALUE =
+
+!++
+! Functional Description:
+!
+!	This routine will attempt to recover from an SS$_INCVOLLABEL
+!	condition, which implies that the label of the volume presently
+!	in the drive does not match the volume label specified by the user.
+!
+! Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	MOUNT_STATUS  = status of the current mount attempt
+!	REPLY_PENDING = TRUE if an operator request is outstanding
+!	The MOUNT data base.
+!
+! Implict Output:
+!
+!	The MOUNT data base may be changed as
+!	the result of operator intervention.
+!--
+
+BEGIN						! Start of WRONGVOL_HNDLR
+
+EXTERNAL
+
+	PHYS_NAME	: BBLOCK VOLATILE,	! Physical device name descriptor
+	DEVICE_INDEX	: LONG VOLATILE,	! Index into DEVICE_STRING vector
+	LABEL_STRING	: VECTOR VOLATILE;	! Vector of volume labels
+
+LITERAL
+
+	FAO_CTRL_SIZ	= FAO_BUFFER_SIZE/2;	! FAO control string size
+
+LOCAL
+
+	WRONGVOL_FAO	: BBLOCK [DSC$K_S_BLN],
+	WRONGVOL_BUF	: BBLOCK [FAO_CTRL_SIZ],
+	STATUS		: LONG;
+
+
+!
+! If this condition is different from the one signaled previously,
+! cancel any outstanding requests before handling this condition.
+! Otherwise do nothing.
+!
+IF (.MOUNT_STATUS NEQ .PREVIOUS_STATUS)
+OR (.DEVICE_INDEX NEQ .PREVIOUS_DEV_IDX)
+THEN
+    BEGIN
+    CANCEL_REQUEST (REQUEST_NOT_SATISFIED);
+    OPERATOR_PRESENT = TRUE;			! Assume operator present
+    !
+    ! Set up the output descriptor and get the FAO control string.
+    !
+    WRONGVOL_FAO [DSC$W_LENGTH]  = FAO_CTRL_SIZ;
+    WRONGVOL_FAO [DSC$B_DTYPE]   = DSC$K_DTYPE_T;
+    WRONGVOL_FAO [DSC$B_CLASS]   = DSC$K_CLASS_S;
+    WRONGVOL_FAO [DSC$A_POINTER] = WRONGVOL_BUF;
+    IF NOT (STATUS = $GETMSG	(MSGID  = MOUN$_WRONGVOL,
+				 MSGLEN = WRONGVOL_FAO [DSC$W_LENGTH],
+				 BUFADR = WRONGVOL_FAO,
+				 FLAGS  = MSG_TEXT
+				))
+    THEN
+	ABORT_MOUNT (.STATUS, 0, .MOUNT_STATUS);
+    !
+    ! Set up the output descriptor and format the operator request.
+    !
+    FAO_RESULT_DESC[DSC$A_POINTER] = FAO_BUFFER;
+    FAO_RESULT_DESC[DSC$W_LENGTH]  = FAO_BUFFER_SIZE;
+    $FAO (WRONGVOL_FAO,
+	  FAO_RESULT_DESC [DSC$W_LENGTH],
+	  FAO_RESULT_DESC,
+	  PHYS_NAME
+	 );
+    !
+    ! Inform the user and all interested operators that the drive contains
+    ! the wrong volume.  Note that this is just a message, and that no
+    ! reply is expected.
+    !
+    SUBMIT_REQUEST (FAO_RESULT_DESC,NO_REPLY);
+    !
+    ! Call the medium offline handler to request that the correct volume
+    ! be mounted in the specified drive.  The previous condition context
+    ! must be reset manually, as SUBMIT_REQUEST will not do so when sending
+    ! messages (instead of requests).
+    !
+    PREVIOUS_STATUS = .MOUNT_STATUS;
+    MEDOFL_HNDLR ();
+    END;
+
+END;						! End of WRONGVOL_HNDLR
+
+ROUTINE PRINT_REPLY : NOVALUE =
+
+!++
+! Funtional description:
+!
+!	This routine is a local utility routine used by PARSE_REPLY
+!	to output the operator reply the user (SYS$OUTPUT).
+!
+! Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implicit input:
+!
+!	None.
+!
+! Implicit output:
+!
+!	The operator reply, if any, is written to SYS$OUTPUT.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!
+!--
+
+BEGIN						! Start of PRINT_REPLY
+
+LOCAL
+	TEXT_DESC 	: BBLOCK [DSC$K_S_BLN];	! String descriptor
+
+!
+! If the operator reply is greater than 8 bytes, then
+! it had some text to it.  If this is the case, inform
+! the user of the operator reply.  Note that the 8 bytes
+! of message overhead are not printed.  A temporary string
+! descriptor must be used so that $FAO will not replace
+! the any nonprinting ASCII characters with blanks.
+!
+IF .REPLY_IOSB[2,0,16,0] GTR $BYTEOFFSET (OPC$L_MS_TEXT)
+THEN
+    BEGIN
+    TEXT_DESC [DSC$W_LENGTH]	= .REPLY_IOSB [2,0,16,0] - $BYTEOFFSET (OPC$L_MS_TEXT);
+    TEXT_DESC [DSC$B_DTYPE]	= DSC$K_DTYPE_T;
+    TEXT_DESC [DSC$B_CLASS]	= DSC$K_CLASS_S;
+    TEXT_DESC [DSC$A_POINTER]	= .REPLY_DESC [DSC$A_POINTER] + $BYTEOFFSET (OPC$L_MS_TEXT);
+    SIGNAL (MOUN$_OPREPLY, 1, TEXT_DESC);
+    END;
+
+END;						! End of PRINT_REPLY
+
+ROUTINE PARSE_REPLY : NOVALUE =
+
+!++
+! Functional Description:
+!
+!	This routine will parse the operator reply in the context
+!	of the conditon that spawned it, and then do the appropriate
+!	thing, based on the operator's reply.
+!
+! Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implicit Inputs:
+!
+!	REPLY_DESC = string descriptor of the operator's reply.
+!	REPLY_BUFFER = buffer holding the operator's reply.
+!	MOUNT data base.
+!
+! Implicit Outputs:
+!
+!	The MOUNT data base may be updated as a result of the operator's reply.
+!--
+
+BEGIN						! Start of PARSE_REPLY
+
+EXTERNAL ROUTINE
+
+	LIB$TPARSE	: ADDRESSING_MODE (GENERAL);	! Used to parse operator reply
+	
+PSECT	GLOBAL = $GLOBAL$;
+GLOBAL
+	NEWLINE		: DESCRIP (%CHAR (13,10));	! Descriptor for newline string
+
+BIND
+	!
+	! Create the character translation table that will be used by the
+	! CH$TRANSLATE function.  he table is sÅt up so that all lower-cañg
+	! alphabetic characters are translated to their upper-case equivalent.
+	!
+	TRANS_TABLE	= CH$TRANSTABLE
+			  (0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,
+			   20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,
+			   37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,
+			   54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,
+			   71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,
+			   88,89,90,91,92,93,94,95,96,65,66,67,68,69,70,71,72,
+			   73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,
+			   90,123,124,125,126,127
+			  );
+
+LOCAL
+
+	PTR		: LONG,				! Character pointer
+	STATUS		: LONG;
+
+!
+! Check the status of the mailbox read.  If
+! not successful, then abort the mount.
+!
+IF NOT .REPLY_IOSB[0,0,16,0]
+THEN
+    BEGIN
+    REPLY_PENDING = FALSE;
+    ABORT_MOUNT (MOUN$_MBXRDERR, 0, .REPLY_IOSB[0,0,16,0]);
+    END;
+
+!	
+! Decide what to do based on the type of operator reply.
+! The OPC$_xxxxx status codes are longer than a word, so
+! they are masked off to word size befor comparing them
+! to the reply status.
+!
+SELECTONEU .REPLY_BUFFER[OPC$W_MS_STATUS] OF
+    SET
+    [(OPC$_NOPERATOR AND %X'0FFFF')] 	: BEGIN
+					  !
+					  ! No operator was enabled to receive the request.
+					  !
+					  REPLY_PENDING = FALSE;
+					  IF NOT INTERACTIVE_JOB ()
+					  THEN
+					      !
+					      ! Abort the mount, as no one is can service the request.
+					      !
+					      ABORT_MOUNT (MOUN$_BATCHNOOPR)
+					  ELSE
+					      BEGIN
+					      !
+					      ! If this is the first time through this code for this condition
+					      ! for this device, then inform the user that no operator is enabled
+					      ! to receive the request.
+					      !
+					      IF .OPERATOR_PRESENT
+					      THEN
+						  SIGNAL (MOUN$_NOOPR);
+					      OPERATOR_PRESENT = FALSE;
+					      !
+					      ! Re-issue the request, in the hope that an operator will eventually
+					      ! be enabled to receive and service the request.
+					      !
+					      IF NOT (STATUS = $SNDOPR (MSGBUF=OP_MSG_DESC, CHAN=.REPLY_CHANNEL))
+					      THEN
+						  ABORT_MOUNT (MOUN$_OPRSNDERR, 0, .STATUS);
+					      !
+					      ! If the request was sent, re-issue a read to the reply mailbox.
+					      !
+					      IF .STATUS NEQ OPC$_NOPERATOR
+					      THEN
+						  BEGIN
+						  POST_READ_TO_MBX ();
+						  REPLY_PENDING = TRUE;
+						  END;
+					      END;
+					  END;
+
+    [(OPC$_RQSTCMPLTE AND %X'0FFFF')]	: BEGIN
+					  !
+					  ! The operator replied to our request.
+					  !
+					  PRINT_REPLY ();
+					  REPLY_PENDING = FALSE;
+					  OPERATOR_PRESENT = TRUE;
+					  !
+					  ! If there is no operator reply text, then return.
+					  !
+					  IF (.REPLY_IOSB [2,0,16,0] EQL $BYTEOFFSET (OPC$L_MS_TEXT))
+					  THEN
+					      RETURN;
+					  !
+					  ! Create a string descriptor for the operator reply text.
+					  !
+					  TPARSE_BLOCK [TPA$L_STRINGCNT] = .REPLY_IOSB [2,0,16,0] - $BYTEOFFSET (OPC$L_MS_TEXT);
+					  TPARSE_BLOCK [TPA$L_STRINGPTR] = .REPLY_DESC [DSC$A_POINTER]+$BYTEOFFSET(OPC$L_MS_TEXT);
+					  !
+					  ! The reply text may contain a NEWLINE character.  If so, the interesting reply text
+					  ! is BEFORE  the NEWLINE character.  Note that the NEWLINE character is actually
+					  ! two characters, a carriage-return followed by a line-feed (<cr><lf>).
+					  !
+					  PTR	= CH$FIND_SUB	(.TPARSE_BLOCK [TPA$L_STRINGCNT],
+								 .TPARSE_BLOCK [TPA$L_STRINGPTR],
+							   	 .NEWLINE [DSC$W_LENGTH],
+								 .NEWLINE [DSC$A_POINTER]
+								);
+					  !
+					  ! If a NEWLINE was found, set the string descriptor
+					  ! so that the text BEFORE the NEWLINE is parsed.
+					  !
+					  IF NOT CH$FAIL (.PTR)
+					  THEN
+					      TPARSE_BLOCK [TPA$L_STRINGCNT] = .PTR - .TPARSE_BLOCK [TPA$L_STRINGPTR];
+					  !
+					  ! If there is no text before the NEWLINE, then there is no operator message to parse.
+					  !
+					  IF .TPARSE_BLOCK [TPA$L_STRINGCNT] EQL 0
+					  THEN
+					      RETURN;
+					  !
+					  ! Convert the reply to upper case, so TPARSE will work correctly.
+					  !
+					  CH$TRANSLATE	(TRANS_TABLE,
+							 .TPARSE_BLOCK [TPA$L_STRINGCNT],
+							 .TPARSE_BLOCK [TPA$L_STRINGPTR],
+							 0,
+							 .TPARSE_BLOCK [TPA$L_STRINGCNT],
+							 .TPARSE_BLOCK [TPA$L_STRINGPTR]
+							);
+					  !
+					  ! Parse the operator response and perform whatever action is necessary.
+					  !
+					  IF NOT (STATUS = LIB$TPARSE (TPARSE_BLOCK, STATE_TABLE, KEY_TABLE))
+					  THEN
+					      ABORT_MOUNT (.STATUS, 0, .MOUNT_STATUS);
+					  END;
+
+    [(OPC$_RQSTPEND AND %X'0FFFF')]	: BEGIN
+					  !
+					  ! The operator did a REPLY/PENDING.  The orginal
+					  ! request is still active, so issue another read
+					  ! to the reply mailbox.
+					  !
+					  PRINT_REPLY ();
+					  OPERATOR_PRESENT = TRUE;
+					  POST_READ_TO_MBX ();
+					  END;
+
+    [(OPC$_RQSTABORT AND %X'0FFFF')]	: BEGIN
+					  !
+					  ! The operator has aborted the mount request.
+					  !
+					  PRINT_REPLY ();
+					  REPLY_PENDING = FALSE;
+					  OPERATOR_PRESENT = TRUE;
+					  ABORT_MOUNT (MOUN$_OPRABORT);
+					  END;
+
+    [(OPC$_RQSTCAN  AND %X'0FFFF'),
+     (OPC$_RQSTDONE AND %X'0FFFF')]	: BEGIN
+					  !
+					  ! The user has canceled the requst, and
+					  ! the operator is acknowledging it.
+					  !
+					  REPLY_PENDING = FALSE;
+					  OPERATOR_PRESENT = TRUE;
+					  END;
+
+    [(OPC$_BLANKTAPE AND %X'0FFFF'),
+     (OPC$_INITAPE   AND %X'0FFFF')]	: BEGIN
+					  !
+					  ! These messages may be sent by mistake.  Notify
+					  ! the interested parties, and let MOUNT try again.
+					  !
+					  REPLY_PENDING = FALSE;
+					  OPERATOR_PRESENT = TRUE;
+					  INVALID_COMMAND ();
+					  END;
+
+    [OTHERWISE]				: BEGIN
+					  !
+					  ! This is an unknown response type.
+					  ! Abort the mount and print the bad message.
+					  !
+					  REPLY_PENDING = FALSE;
+					  OPERATOR_PRESENT = TRUE;
+					  ABORT_MOUNT	(MOUN$_BADREPLY,		! Error code
+							 5,				! FAO count
+							 .REPLY_BUFFER[OPC$B_MS_TYPE],	! Message type
+							 .REPLY_BUFFER[OPC$W_MS_STATUS],! Message status
+							 .REPLY_BUFFER[OPC$L_MS_RPLYID],! Message Ident
+							 .REPLY_DESC[DSC$W_LENGTH]  - $BYTEOFFSET (OPC$L_MS_OTEXT),
+							 .REPLY_DESC[DSC$A_POINTER] + $BYTEOFFSET (OPC$L_MS_OTEXT)
+							);
+					  END;
+    TES;
+
+END;						! End of PARSE_REPLY
+
+ROUTINE SAVE_DEVICE =
+
+!++
+! Functional description:
+!
+!	This is a TPARSE action routine that is called
+!	to create a string descriptor for the token
+!	just parsed.  The token is a device name.
+!
+! Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implicit Inputs:
+!
+!	TPARSE_BLOCK = data structure defining TPARSE context.
+!
+! Implicit outputs:
+!
+!	DEVICE_DESC = string descriptor of device name.
+!
+! Routine Value:
+!
+!	1 If the device name length is within tolerance,
+!	0 if not.
+!
+!--
+
+BEGIN						! Start of SAVE_DEVICE
+
+
+EXTERNAL
+
+	DEVICE_DESC	: BBLOCK,		! Device string descriptor
+	TPARSE_BLOCK	: BBLOCK;		! TPARSE context data structure
+
+IF .TPARSE_BLOCK[TPA$L_TOKENCNT] GTR MAX_DEV_LENGTH		! Check for device name too long
+THEN
+    0								! Return failure
+ELSE
+    BEGIN
+    DEVICE_DESC[DSC$W_LENGTH]  = .TPARSE_BLOCK[TPA$L_TOKENCNT];
+    DEVICE_DESC[DSC$A_POINTER] = .TPARSE_BLOCK[TPA$L_TOKENPTR];
+    1								! Return success
+    END	
+
+END;						! End of SAVE_DEVICE
+
+ROUTINE DO_SUBSTITUTE =
+
+!++
+! Funtional desctiption:
+!
+!	This routine is merely a shell so that $COPY_INFO may be
+!	called during the TPARSE operation to copy the new device
+!	name to the mount data base.
+!
+! Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict input:
+!
+!	DEVICE_DESC	: a device name descriptor
+!	DEVICE_INDEX	: the current device index into the DEVICE_STRING vector
+!
+! Implict output:
+!
+!	The mount data base may be modified.
+!
+! Routine value:
+!
+!	See the description of $COPY_INFO.
+!--
+
+BEGIN						! Start of DO_SUBSTITUE
+
+EXTERNAL
+	DEVICE_INDEX	: LONG VOLATILE,
+	DEVICE_DESC	: BBLOCK;
+
+EXTERNAL ROUTINE
+	$COPY_INFO$U;				! Address of the transfer vector
+
+$COPY_INFO$U (.DEVICE_INDEX, DEVICE_DESC)	! Copy string and return status
+
+END;						! End of DO_SUBSTITUTE
+
+ROUTINE INVALID_COMMAND =
+
+!++
+! Functional Description:
+!
+!	This routine is the TPARSE action routine that implements
+!	invalid command handling and reporting.  If we get here,
+!	it means that TPARSE has detected a bogus operator reply.
+!	The user is notified that the operator response was invalid,
+!	and the mount operation continues.  If the condition that
+!	caused the initial error still exists, then MOUNT will issue
+!	another request to the operator.  The reason the operator is
+!	not notified of his mistake is that there is no way to target
+!	a message to specific operator.
+!
+! Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implicit Inputs:
+!
+!	None.
+!
+! Implicit Outputs:
+!
+!	The user is informed of the operator's mistake.
+!
+! Routine value:
+!
+!	Always 1.
+!--
+
+BEGIN						! Start of INVALID_COMMAND
+
+SIGNAL (MOUN$_INVLDRESP);
+
+1
+END;						! End of INVALID_COMMAND
+
+GLOBAL ROUTINE $COPY_INFO (DEV_INDEX, DEV_DESC) =
+
+!++
+! Functional description:
+!
+!	This routine provides a secure way of copying a device name
+!	string from the caller (in user mode) to MOUNT's protected
+!	data base (in EXEC mode).
+!
+! Input:
+!
+!	DEV_INDEX	: A number from 0 to .DEVICE_COUNT
+!	DEV_DESC	: Address of a device name descriptor
+!
+! Output:
+!
+!	None.
+!
+! Implicit input:
+!
+!	DEVICE_STRING	: A vector of device name descriptors
+!	DEVICE_COUNT	: The number of devices specified by the user.
+!
+! Implicit output:
+!
+!	The DEVICE_STRING vector may be modified.
+!
+! Routine value:
+!
+!	SS$_NORMAL	: Normal successful completion
+!	SS$_ACCVIO	: The specified device name cannot be read.
+!	SS$_BADPARAM	: The specified device name has a zero length,
+!			  or is longer than LOG$C_NAMLENGTH bytes, or
+!			  DEV_INDEX is not a reasonable value.
+!--
+
+BEGIN						! Start of $COPY_INFO
+
+EXTERNAL
+	DEVICE_COUNT	: LONG,			! # of drives
+	DEVICE_STRING	: VECTOR VOLATILE;	! Descriptor list
+
+BUILTIN
+	PROBER;					! Probe for read access
+
+LOCAL
+	DEV_NAME	: BBLOCK [DSC$K_S_BLN];	! Local descriptor
+
+!
+! Make sure DEV_INDEX is within a reasonable range.
+!
+IF (.DEV_INDEX LSS 0) OR (.DEV_INDEX GTR (.DEVICE_COUNT - 1))
+THEN
+    RETURN (SS$_BADPARAM);
+
+!
+! Probe the actual descriptor for read access.
+!
+IF NOT PROBER (%REF (0), %REF (DSC$K_S_BLN), .DEV_DESC)
+THEN
+    RETURN (SS$_ACCVIO);
+
+!
+! Copy the descriptor to internal storage and then probe the
+! device name for read access, and make sure that the device
+! name length is reasonable.
+!
+CH$MOVE (DSC$K_S_BLN, .DEV_DESC, DEV_NAME);
+IF (.DEV_NAME [DSC$W_LENGTH] LEQ 0)
+OR (.DEV_NAME [DSC$W_LENGTH] GTR 63)
+THEN
+    RETURN (SS$_BADPARAM);
+IF NOT PROBER (%REF (0), DEV_NAME [DSC$W_LENGTH], .DEV_NAME [DSC$A_POINTER])
+THEN
+    RETURN (SS$_ACCVIO);
+
+!
+! Copy the new device name to the mount data base,
+! and update the descriptor in DEVICE_STRING.
+!
+DEVICE_STRING [(.DEV_INDEX*2)] = .DEV_NAME [DSC$W_LENGTH];
+CH$MOVE (.DEV_NAME [DSC$W_LENGTH],
+	 .DEV_NAME [DSC$A_POINTER],
+	 .DEVICE_STRING [(.DEV_INDEX*2)+1]
+	);
+
+SS$_NORMAL
+
+END;						! End of $COPY_INFO
+
+GLOBAL ROUTINE $CHANGE_PROT =
+
+!++
+! Functional description:
+!
+!	This routine will change the page protection of this module's
+!	OWN storage so that it may be written to in USER mode.
+!
+! Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implicit input:
+!
+!	1) The current access mode is EXEC or KERNEL.
+!	2) VA_RANGE is a vector of two longword elements, containing the starting
+!	   and ending virtual addresses of the range of pages to work on.
+!
+! Implicit output:
+!
+!	The pages are made USER readable.
+!
+! Routine value:
+!
+!	Whatever status value is returned by $SETPRT.
+!--
+
+BEGIN						! Start of $CHANGE_PROT
+
+EXTERNAL
+	DATA_BASE_READY,			! Boolean
+	STORED_CONTEXT;				! Bit vector
+
+
+!
+! Initialize two important variables referenced in VMOUNT.  This
+! must be done here as they are zeroed only once per $MOUNT call,
+! and must be written too while in EXEC mode.
+!
+DATA_BASE_READY = 0;
+STORED_CONTEXT = 0;
+
+!
+! Set the page protection of this module's data to allow user
+! mode read/write access.  This must be done here, in EXEC mode, since
+! this image is INSTALLed as a protected shareable image, which has
+! the effect of setting the protection to be USER read, EXEC write.
+! Note that the data sits in a special PSECT, to avoid changing
+! the page protection on adjacent pages.
+!
+$SETPRT (INADR=VA_RANGE, PROT=PRT$C_UW)
+
+END;						! End of $CHANGE_PROT
+
+ROUTINE EXIT_HANDLER : NOVALUE =
+
+!++
+! Fucntional Description:
+!
+!	This routine is called by the OS on exit (for whatever reason) from
+!	the MOUNT facility.  This routine will clean up any mess left by MOUNT.
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+!--
+
+BEGIN						! Start of EXIT_HANDLER
+
+IF .REPLY_PENDING
+THEN
+    !
+    ! Cancel any outstanding operator requests.
+    !
+    CANCEL_REQUEST (REQUEST_NOT_SATISFIED);
+
+$SETSFM (ENBFLG = .SS_FAIL_MODE);
+
+END;						! End of EXIT_HANDLER
+
+!
+! The TPARSE tables are here because they mangle
+! PSECT definitions.
+!
+
+!
+! Define the TPARSE grammar of the possible operator replies.
+!
+$INIT_STATE	(STATE_TABLE,KEY_TABLE);
+
+!
+! Initial state
+!
+$STATE	(START,
+	((SUBSTITUTE_COMMAND),	TPA$_EXIT,	DO_SUBSTITUTE),
+	(TPA$_LAMBDA,		TPA$_EXIT,	INVALID_COMMAND)
+	);
+
+!
+! SUBSTITUTE command.  'SUBSTITUTE'<TPA$_BLANK><DEVICE><TEXT>
+!
+$STATE	(SUBSTITUTE_COMMAND,
+	('SUBSTITUTE')
+	);
+
+!$STATE	(,
+!	(TPA$_BLANK)
+!	);
+
+$STATE	(,
+	((DEVICE),		TPA$_EXIT,	SAVE_DEVICE)
+	);
+
+!$STATE	(,
+!	((TEXT),		TPA$_EXIT)
+!	);
+
+!
+! Device name.  It may be a device spec or a logical name string.
+!
+$STATE	(DEVICE,
+	(TPA$_SYMBOL)
+	);
+
+$STATE	(,
+	(':',			TPA$_EXIT),
+	(TPA$_LAMBDA,		TPA$_EXIT)
+	);
+!
+! Text.  The remainder of the operator response is treated
+! as a comment, and has no effect on the mount.  If there is
+! a comment, at least one blank must separate it from the
+! previous section of the operator response.
+!
+$STATE	(TEXT,
+	(TPA$_BLANK,		MORE_TEXT),
+	(TPA$_EOS,		TPA$_EXIT)
+	);
+
+$STATE	(MORE_TEXT,
+	(TPA$_ANY,		MORE_TEXT),
+	(TPA$_EOS,		TPA$_EXIT)
+	);
+END
+ELUDOM

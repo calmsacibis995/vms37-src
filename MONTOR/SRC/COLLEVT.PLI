@@ -1,0 +1,463 @@
+COLLECTION_EVENT: Procedure	Options(Ident('V03-003'));
+
+/*
+/****************************************************************************
+/*									    *
+/*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+/*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+/*  ALL RIGHTS RESERVED.						    *
+/* 									    *
+/*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+/*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+/*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+/*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+/*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+/*  TRANSFERRED.							    *
+/* 									    *
+/*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+/*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+/*  CORPORATION.							    *
+/* 									    *
+/*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+/*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+/* 									    *
+/*									    *
+/****************************************************************************
+/*/
+
+/*
+/*++
+/* FACILITY:  MONITOR Utility 
+/*
+/* ABSTRACT:  COLLECTION_EVENT AST Routine.
+/*		
+/*		 Queued from the EXECUTE_REQUEST routine each time a
+/*		   data collection is required.
+/*
+/*
+/* ENVIRONMENT:
+/*
+/*	VAX/VMS operating system. unprivileged user mode,
+/*		except for certain collection routines which
+/*		run in EXEC or KERNEL mode to access system
+/*		data bases.
+/*
+/* AUTHOR:  Thomas L. Cafarella, April, 1981
+/*
+
+/*
+/* MODIFIED BY:
+/*
+/*	V03-001	TLC0014		Thomas L. Cafarella	01-Apr-1982	13:00
+/*		Correct attached processor time reporting for MODES.
+/*
+/*	V03-003	TLC1011		Thomas L. Cafarella	29-Mar-1982	20:00
+/*		Move system service names for SSERROR msg to static storage.
+/*
+/*	V03-002	TLC1003		Thomas L. Cafarella	23-Mar-1982	13:00
+/*		Fix up module headers.
+/*
+/*	V03-001	TLC1002		Thomas L. Cafarella	20-Mar-1982	13:00
+/*		Move collection event flag to REQUEST.PLI for consolidation.
+/*
+/*		Compress bar graph range for MODES and TOPCPU.
+/*
+/*--
+/*/
+
+/*
+/*	!-----------------------------------------------------------------------------+
+/*	!									      !
+/*	! 				INCLUDE  FILES				      !
+/*	!									      !
+/*	!-----------------------------------------------------------------------------+
+/*/
+
+%INCLUDE	MONDEF;				/* Monitor utility structure definitions */
+
+/*
+/*	!-----------------------------------------------------------------------------+
+/*	!									      !
+/*	!		   SYSTEM SERVICE MACRO DEFINITIONS			      !
+/*	!									      !
+/*	!-----------------------------------------------------------------------------+
+/*/
+
+%INCLUDE	SYS$SETIMR;			/* $SETIMR system service */
+
+/*
+/*	!-----------------------------------------------------------------------------+
+/*	!									      !
+/*	!		     EXTERNAL STORAGE  DEFINITIONS			      !
+/*	!									      !
+/*	!-----------------------------------------------------------------------------+
+/*/
+
+Declare
+MNR$_CLASMISS	FIXED BINARY(31) GLOBALREF VALUE,	/* Error message */
+MNR$_SSERROR	FIXED BINARY(31) GLOBALREF VALUE,	/* Error message */
+MNR$_COLLERR	FIXED BINARY(31) GLOBALREF VALUE;	/* Error message */
+
+Declare
+YES		BIT(1)		 GLOBALREF VALUE,	/* For general use */
+NO		BIT(1)		 GLOBALREF VALUE,	/* For general use */
+COLL_EV_FLAG	FIXED BINARY(31) GLOBALREF VALUE,	/* Collection event flag */
+MAX_CLASS_NO	FIXED BINARY(31) GLOBALREF VALUE,	/* Maximum defined class number */
+SKIP_TO_CLASS	FIXED BINARY(7)  GLOBALREF VALUE;	/* Skip to class record indicator for READ_INPUT rtn */
+
+Declare
+COLLENDED	BIT(1) ALIGNED   GLOBALREF,		/* YES => collection has ended */
+COLLSTAT	FIXED BINARY(31) GLOBALREF,		/* COLLECTION_EVENT return status code */
+NORMAL		FIXED BINARY(31) GLOBALREF, 		/* MONITOR normal return status */
+MULT_TEMP	FIXED BINARY(31) GLOBALREF,		/* Temp hold area for MCA$L_INT_MULT */
+INTERVAL_DEL	BIT(64) ALIGNED	 GLOBALREF,		/* Delta time value for Interval */
+SETIMR_STR	FIXED BINARY(7)  GLOBALREF;		/* Count byte for $SETIMR cstring */
+
+Declare
+FLUSH_IND	BIT(1) ALIGNED	 GLOBALREF,		/* Flush indicator; YES=> perform FLUSH */
+FLUSH_COLLS	FIXED BINARY(15) GLOBALREF,		/* Number of collection events between FLUSH's */
+FLUSH_CTR	FIXED BINARY(15) GLOBALREF;		/* Down counter for FLUSH_COLLS */
+
+Declare
+CDBPTR			POINTER GLOBALREF,		/* Pointer to CDB (Class Descriptor Block) */
+C			POINTER DEFINED(CDBPTR),	/* Synonym for CDBPTR */
+MRBPTR			POINTER GLOBALREF,		/* Pointer to MRB (Monitor Request Block) */
+M			POINTER DEFINED(MRBPTR),	/* Synonym for MRBPTR */
+MCAPTR			POINTER GLOBALREF,		/* Pointer to MCA (Monitor Communication Area) */
+MC			POINTER DEFINED(MCAPTR),	/* Synonym for MCAPTR */
+SPTR			POINTER GLOBALREF,		/* Pointer to SYI (System Information Area) */
+CCDPTR			POINTER GLOBALREF;		/* Pointer to CCD (Current Class Descriptor) Array */
+
+Declare
+INPUT_FILE	FILE RECORD INPUT,				/* Monitor Input (Playback) File */
+INPUT_CPTR	POINTER GLOBALREF,				/* Ptr to input buffer count word */
+INPUT_DATA	CHAR(512) VARYING BASED(INPUT_CPTR);		/* Playback file input buffer */
+
+Declare
+01 CURR_CLASS_DESCR (MAX_CLASS_NO+1) BASED(CCDPTR),		/* Current Class Descriptor */
+								/* This array of structures includes a CCD (Current */
+								/* Class Descriptor) for each possible class     */
+    02 CURR_CDBPTR	POINTER,				/* CDBPTR for current class */
+    02 CURR_CLASS_NO	FIXED BINARY(7);			/* Class number for current class */
+
+/*
+/*	!-----------------------------------------------------------------------------+
+/*	!									      !
+/*	!		       GLOBAL STORAGE  DEFINITIONS			      !
+/*	!									      !
+/*	!-----------------------------------------------------------------------------+
+/*/
+
+/*
+/*	!-----------------------------------------------------------------------------+
+/*	!									      !
+/*	!		     	  COMPILE-TIME CONSTANTS			      !
+/*	!									      !
+/*	!-----------------------------------------------------------------------------+
+/*/
+
+%REPLACE NOT_SUCCESSFUL		BY '0'B;		/* Failing status bit */
+
+/*
+/*	!-----------------------------------------------------------------------------+
+/*	!									      !
+/*	!		     	       OWN STORAGE				      !
+/*	!									      !
+/*	!-----------------------------------------------------------------------------+
+/*/
+
+Declare
+CALL			FIXED BINARY(31),			/* Holds function value (return status) of called routines */ 
+STATUS			BIT(1)	BASED(ADDR(CALL)),		/* Low-order status bit for called routines */
+I			FIXED BINARY(15),			/* Index for DO loop */
+BUFF_PTR		POINTER,				/* Temporary pointer to input file buffer */
+CURR_TYPE		FIXED BINARY(7),			/* Class record type of record just read */
+PREV_TYPE		FIXED BINARY(7),			/* Class record type of record previously read */
+PREV_CONT		BIT(1) ALIGNED,				/* Value of MNR_CLS$V_CONT for record previously read */
+CLASS_MISSING		BIT(1) ALIGNED,				/* For Playback, ON => requested class not in file */
+CLASS_FOUND		BIT(1) ALIGNED;				/* For Playback, ON => requested class found in file */
+
+Declare
+MON_ERR		ENTRY (ANY VALUE, ANY, ANY) OPTIONS(VARIABLE),	/* MONITOR MACRO-32 routine to log synchronous errors */
+READ_INPUT	ENTRY (FIXED BINARY(7)),			/* MONITOR routine to read an input (playback) file record */
+COLLECTION_END	ENTRY,						/* MONITOR routine to indicate end of collection */
+CLASS_COLLECT	ENTRY	(FIXED BINARY(7))			/* MONITOR MACRO-32 routine to collect a buffer of data */
+			RETURNS(FIXED BINARY(31));
+
+/*
+/*++
+/*
+/* FUNCTIONAL DESCRIPTION:
+/*
+/*	COLLECTION_EVENT
+/*
+/*	COLLECTION_EVENT is an AST routine invoked via the $DCLAST
+/*	system service from the EXECUTE_REQUEST routine, or via
+/*	the $SETIMR system service from a previous invocation of
+/*	COLLECTION_EVENT. It performs performance data collection
+/*	from VMS data bases of the running system, or from an
+/*	input recording file. A single invocation of COLLECTION_EVENT
+/*	causes collection of data for all classes in the MONITOR
+/*	request. The data is collected by calling the CLASS_COLLECT
+/*	routine once for each class. CLASS_COLLECT stores the data in a
+/*	collection buffer (pointed to by the CDB) for each class.
+/*
+/*	On the first collection event, class-specific initialization
+/*	is performed by a call to the CLASS_INIT routine.
+/*
+/* INPUTS:
+/*
+/*	None
+/*
+/* IMPLICIT INPUTS:
+/*
+/*	All MONITOR variables accessible to this routine.
+/*
+/* OUTPUTS:
+/*
+/*	None
+/*
+/* IMPLICIT OUTPUTS:
+/*
+/*	MCA$L_COLLCNT is incremented by 1.
+/*
+/*	Data for all requested classes has been collected into
+/*	their respective CDB collection buffers.
+/*
+/*	All MONITOR variables accessible to this routine.
+/*
+/* ROUTINE VALUE:
+/*
+/*	COLLSTAT contains the status of this collection event upon
+/*	exit.
+/*
+/* SIDE EFFECTS:
+/*
+/*	If this is the final collection event, the COLLENDED bit is set.
+/*
+/*--
+/*/
+
+IF COLLENDED = YES  THEN RETURN;				/* If collection has already ended, return immediately */
+
+IF M->MRB$V_PLAYBACK						/* Playback Request */
+    THEN DO;
+	 IF MC->MCA$L_COLLCNT = 0				/* If first collection event, */
+	     THEN MULT_TEMP = 1;				/* ... set multiple to trigger on this collection */
+	 MC->MCA$V_MULTFND = NO;				/* Indicate multiple not yet found */
+	 MULT_TEMP = MULT_TEMP - 1;				/* Count down toward zero */
+	 IF MULT_TEMP = 0					/* If it's time to record and display, */
+	     THEN DO;
+		  MC->MCA$V_MULTFND = YES;			/* ... indicate so */
+		  MULT_TEMP = MC->MCA$L_INT_MULT;		/* ... and re-load multiple value for next collection */
+		  END;
+	 BUFF_PTR = MC->MCA$A_INPUT_PTR;			/* Get pointer to input file buffer for later use */
+	 PREV_TYPE = -1;					/* Dummy previous record type (class no) */
+	 PREV_CONT = NO;					/* Dummy previous "continue" bit setting */
+	 CLASS_MISSING = '0'B;					/* Class not missing */
+
+	 DO I = 1 TO M->MRB$W_CLASSCT WHILE (^ MC->MCA$V_EOF & ^ CLASS_MISSING);	/* Loop through all requested classes */
+	 CLASS_FOUND = '0'B;					/* Haven't found class yet */
+	 CDBPTR = CURR_CDBPTR(I);				/* Set up current CDB */
+	 IF MC->MCA$L_COLLCNT = 0				/* If first collection event */
+	     THEN CALL = CLASS_INIT();				/* ... then do init for this class */
+
+	 DO WHILE (^ MC->MCA$V_EOF & ^ CLASS_FOUND & ^ CLASS_MISSING);	/* Loop causes input file to skip past unwanted */
+									/* ... classes within the recorded interval */
+	 CURR_TYPE = BUFF_PTR->MNR_CLS$B_TYPE;			/* Get class (record) type of current record */
+	 IF (CURR_TYPE < PREV_TYPE)  |  (CURR_TYPE > CURR_CLASS_NO(I)) |
+	    (CURR_TYPE = PREV_TYPE & PREV_CONT = NO)		/* Check for missing class (should never occur) */
+	     THEN DO;
+		  CLASS_MISSING = YES;				/* Indicate "class missing" error */
+		  COLLSTAT = MNR$_CLASMISS;			/* Save failing status */
+		  CALL MON_ERR(MNR$_CLASMISS);			/* ... and log the error */
+		  END;
+	     ELSE DO;
+		  IF CURR_TYPE = CURR_CLASS_NO(I)		/* If inputted class = monitored class */
+		      THEN DO;
+			   CLASS_FOUND = YES;			/* Indicate found the record needed */
+			   CALL = CLASS_COLLECT(CURR_CLASS_NO(I)); /* Collect data for this class */
+			   IF STATUS = NOT_SUCCESSFUL				/* If collection failed, */
+			       THEN DO;
+				    COLLSTAT = MNR$_COLLERR;			/* Save failing status */
+				    CALL MON_ERR(MNR$_COLLERR,CALL);		/* Log the error */
+				    CALL COLLECTION_END();			/* ... and terminate collection */
+				    END;
+			   END;
+		  PREV_TYPE = CURR_TYPE;			/* Current now becomes previous */
+		  PREV_CONT = BUFF_PTR->MNR_CLS$V_CONT;		/* Save previous "continue" bit setting */
+		  CALL READ_INPUT(SKIP_TO_CLASS);		/* Read the next class record */
+		  END;
+	 END;
+
+	 IF MC->MCA$V_EOF  |  CLASS_MISSING			/* If anything but CLASS_FOUND, */
+	     THEN CALL COLLECTION_END();			/* ... then indicate collection ended */
+
+	 END;
+
+	 IF COLLENDED = NO					/* If end of collection not indicated, then scan */
+								/* ... the input file for the beginning of the next */
+								/* ... interval and leave the file positioned there. */
+	     THEN DO;
+		  CURR_TYPE = BUFF_PTR->MNR_CLS$B_TYPE;		/* Get class (record) type of current record */
+		  DO WHILE(^ MC->MCA$V_EOF & CURR_TYPE > PREV_TYPE); /* Loop while class type numbers increase */
+		  PREV_TYPE = CURR_TYPE;			/* Current now becomes previous */
+		  CALL READ_INPUT(SKIP_TO_CLASS);		/* Read the next class record */
+		  CURR_TYPE = BUFF_PTR->MNR_CLS$B_TYPE;		/* Get class (record) type of current record */
+		  END;
+		  IF MC->MCA$V_EOF				/* If end-of-file reached, */
+		      THEN CALL COLLECTION_END();		/* ... then indicate so */
+		  END;
+	 END;
+
+
+    ELSE DO;							/* Live Request */
+
+	   DO I = 1 TO M->MRB$W_CLASSCT WHILE (COLLENDED = NO);	/* Loop once for each requested class */
+	   CDBPTR = CURR_CDBPTR(I);				/* Set up current CDB */
+	   IF MC->MCA$L_COLLCNT = 0				/* If first collection event */
+	       THEN CALL = CLASS_INIT();			/* ... then do init for this class */
+	   CALL = CLASS_COLLECT(CURR_CLASS_NO(I));		/* Collect data for this class */
+	   IF STATUS = NOT_SUCCESSFUL				/* If collection failed, */
+	       THEN DO;
+		    COLLSTAT = MNR$_COLLERR;			/* Save failing status */
+		    CALL MON_ERR(MNR$_COLLERR,CALL);		/* Log the error */
+		    CALL COLLECTION_END();			/* ... and terminate collection */
+		    END;
+	   END;
+
+	   IF COLLENDED = NO					/* If not at end of collection, */
+	       THEN DO;
+		    IF M->MRB$V_RECORD				/* If recording, */
+			THEN DO;
+			     FLUSH_CTR = FLUSH_CTR - 1;		/* Decrement flush counter for this coll event */
+			     IF FLUSH_CTR = 0			/* If reached zero, then time to flush */
+				 THEN DO;
+				      FLUSH_IND = YES;		/* Indicate flush required */
+				      FLUSH_CTR = FLUSH_COLLS;	/* ... and start down counter at beginning again */
+				      END;
+			     END;
+
+		    CALL = SYS$SETIMR(COLL_EV_FLAG,INTERVAL_DEL,COLLECTION_EVENT,);
+								/* Re-enter COLLECTION_EVENT at specified interval */
+								/* COLL_EV_FLAG is not used; it is just a dummy */
+		    IF STATUS = NOT_SUCCESSFUL			/* If $SETIMR failed, */
+		        THEN DO;
+			     COLLSTAT = MNR$_SSERROR;		/* Save failing status */
+			     CALL MON_ERR(MNR$_SSERROR,CALL,SETIMR_STR); /* Log the error */
+			     CALL COLLECTION_END();		/* ... and terminate collection */
+			     END;
+		    END;
+	   END;
+
+MC->MCA$L_COLLCNT = MC->MCA$L_COLLCNT + 1;			/* Count this collection event */
+RETURN;								/* Return to caller */
+
+CLASS_INIT: Procedure Returns(fixed binary(31));		/* Class-specific initialization */
+
+/*
+/*++
+/*
+/* FUNCTIONAL DESCRIPTION:
+/*
+/*	CLASS_INIT
+/*
+/*	This routine is called by COLLECTION_EVENT on the first
+/*	collection event to perform class-specific initialization.
+/*	Currently, the MODES and PROCESSES classes require such
+/*	initialization.
+/*
+/* INPUTS:
+/*
+/*	None
+/*
+/* OUTPUTS:
+/*
+/*	None
+/*
+/* IMPLICIT OUTPUTS:
+/*
+/*	Initialization for the MODES and PROCESSES classes performed.
+/*
+/* ROUTINE VALUE:
+/*
+/*	SS$_NORMAL
+/*
+/* SIDE EFFECTS:
+/*
+/*	None
+/*
+/*--
+/*/
+
+/*
+/*	!-----------------------------------------------------------------------------+
+/*	!									      !
+/*	! 				 LOCAL STORAGE				      !
+/*	!									      !
+/*	!-----------------------------------------------------------------------------+
+/*/
+
+Declare
+PROCS_CLSNO	FIXED BINARY(31) GLOBALREF VALUE,		/* PROCESSES class number */
+MODES_CLSNO	FIXED BINARY(31) GLOBALREF VALUE,		/* MODES class number */
+REG_PROC	FIXED BINARY(31) GLOBALREF VALUE,		/* Regular PROCESSES display code */
+TOPC_PROC	FIXED BINARY(31) GLOBALREF VALUE,		/* TOPCPU PROCESSES display code */
+TOP_RANGE	FIXED BINARY(31) GLOBALREF VALUE;		/* Range value for TOPB, TOPD, TOPF bar graph */
+
+Declare
+IDBPTR		POINTER,					/* Pointer to Item Descriptor Block (IDB) */
+ITMSTR (1:C->CDB$L_COUNT) FIXED BINARY(7) BASED(C->CDB$A_ITMSTR); /* Vector of item numbers for this class */
+
+Declare
+1 PERFTABLE GLOBALREF,						/* Table of IDB's */
+  2 IDB_BLOCK (0:127) CHAR(IDB$K_ILENGTH);			/* Up to 128 IDB's */
+
+Declare
+1 PINTERRUPT_STR  BASED(IDBPTR->IDB$A_LNAME),			/* Counted string for "Interrupt Stack PRIMARY" */
+  2 L FIXED BINARY(7),						/* Count */
+  2 S CHAR(1);							/* First character of string */
+
+Declare
+PROCTITLE (0:127) GLOBALREF POINTER;				/* Table of pointers to PROCESSES screen titles */
+
+IF CURR_CLASS_NO(I) = MODES_CLSNO					/* If MODES class, */
+    THEN DO;
+	 MC->MCA$A_MPADDR = NULL();					/* Indicate no MP address */
+	 IDBPTR = ADDR(IDB_BLOCK(ITMSTR(1)));				/* Set up IDB ptr for later reference */
+									/* ... to PINTERRUPT_STR */
+	 IF SPTR->MNR_SYI$B_MPCPUS = 2					/* Check if monitored system a multiprocessor */
+	     THEN							/* Multiprocessor system */
+		  IF C->CDB$V_CPU					/* Check for type of display requested */
+		      THEN DO;						/* CPU-specific display */
+			   C->CDB$L_COUNT = C->CDB$L_COUNT *		/* Increase number of displayed items */
+					    SPTR->MNR_SYI$B_MPCPUS;
+			   C->CDB$W_BLKLEN = C->CDB$W_BLKLEN *		/* ... and size of coll buff data block */
+					    SPTR->MNR_SYI$B_MPCPUS;
+			   END;
+		      ELSE DO;						/* Combined display */
+			   C->CDB$V_CPU_EXP = YES;			/* Indicate that number of monitored items */
+									/* ... must be expanded during collection */
+			   PINTERRUPT_STR.L = PINTERRUPT_STR.L - 10;	/* Shorten "Interrupt Stack" display string */
+									/* ... to remove the word "PRIMARY" */
+			   END;
+	     ELSE							/* Uniprocessor system */
+		  PINTERRUPT_STR.L = PINTERRUPT_STR.L - 10;		/* Shorten "Interrupt Stack" display string */
+									/* ... to remove the word "PRIMARY" */
+	 END;
+
+    ELSE  IF CURR_CLASS_NO(I) = PROCS_CLSNO				/* If PROCESSES class, */
+	      THEN DO;
+		   C->CDB$A_TITLE = PROCTITLE(C->CDB$B_ST);		/* Set up ptr to title for requested display type */
+
+		   IF C->CDB$B_ST = TOPC_PROC				/* If TOPCPU display, */
+		       THEN C->CDB$L_RANGE = 100;			/* Set range to 100 */
+		       ELSE C->CDB$L_RANGE = TOP_RANGE;			/* Set range for other TOP displays */
+
+		   END;
+
+RETURN(NORMAL);
+
+END CLASS_INIT;
+
+END COLLECTION_EVENT;

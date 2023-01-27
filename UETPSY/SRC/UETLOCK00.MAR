@@ -1,0 +1,2493 @@
+	.TITLE	UETLOCK00 - Local Lock Manager UETP Test
+	.IDENT	'V03-000'
+	.ENABLE	SUPPRESSION
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY: VAX/VMS UETP
+;
+; ABSTRACT:
+;	This module serves as both the controlling (driver) and slave (driven)
+;	images of the UETP Lock Manager Test.  Depending on the invocation and
+;	parameters supplied, it chooses to be the driver, in which case it
+;	starts up copies of itself and directs their actions; or the driven
+;	process, in which case it is started by the driver and is told what
+;	action to perform next.
+;
+; ENVIRONMENT: 
+;	The DETACH and GROUP privileges and ENQLM=20 are needed to run this
+;	test.
+;
+;--
+;
+; AUTHOR:  Paul Jenq,	CREATION DATE:  8-Aug-1981
+;
+; MODIFIED BY:
+;
+;	V03-004	RNH0004		Richard N. Holstein,	21-Dec-1981
+;		Respond to the $DEQ spec change which added the FLAGS arg.
+;
+;	V03-003	RNH0003		Richard N. Holstein,	25-Nov-1981
+;		Merge UETLOCK00 and UETLOCK01 sources.  Make use of the ability
+;		to run more than one other process to check various things and
+;		be a bit more cautious in setting up our data structures as a
+;		result of that.  Implement deadlock detection checking for a
+;		single node.  Implement dump mode operation.
+;
+;	V03-002	RNH0002		Richard N. Holstein,	29-Sep-1981
+;		Fix the typos in RNH0001.  Create detached process with same
+;		base priority as parent process.
+;
+;	V03-001	RNH0001		Richard N. Holstein,	21-Sep-1981
+;		Miscellaneous debugging for Field Test 1.  Standardize error
+;		handling.
+;
+;**
+
+	.SBTTL	Declarations
+;
+; INCLUDE FILES:
+;
+;	SYS$LIBRARY:LIB.MLB	for general definitions
+;	SHRLIB$:UETP.MLB	for UETP definitions
+;
+
+;
+; MACROS:
+;
+	$ACCDEF			; Account msg definition
+	$CHFDEF			; Condition handler
+	$DEVDEF			; Device characteristics
+	$DIBDEF			; Device infomation block
+	$JPIDEF			; Job/proc information def
+	$LCKDEF			; LCK definition
+	$MSGDEF			; Message definition
+	$SHRDEF			; Shared message
+	$STSDEF			; Status definition
+	$UETPDEF		; UETP messages
+;
+; Macro to build test table entries.  NOTE WELL!  Some code depends on this
+; table having entries which are eight bytes long (i.e., a quadword).  This
+; length is available as the parameter COMMAND_SIZE.
+;
+.MACRO TST_TABLE PROC,TYP,LKMOD,RESR=<A>,PAR=< >,FLAG,TST_FLG=<^X0000>
+	.IIF LT ^A/PROC/-LOW_PROC,-
+		.ERROR 0		; Illegal proc name PROC in TST_TABLE
+	.IIF GT ^A/PROC/-HIGH_PROC,-
+		.ERROR 0		; Illegal proc name PROC in TST_TABLE
+	.ASCII	/PROC/			; Process name to perform the action
+	.BYTE	TYP			; Type of system svc: ENQ, ENQW or DEQ
+	.IIF LT TYP, .ERROR TYP		; Illegal TYP-argument in TST_TABLE
+	.IIF GT TYP-MAXCODE, .ERROR TYP ; Illegal TYP-argument in TST_TABLE
+	.IF B LKMOD
+		.BYTE	^XFF		; Type of lock - $ENQ LKMODE argument
+	.IFF
+		.BYTE	LCK$K_'LKMOD'MODE ; Type of lock - $ENQ LKMODE argument
+	.ENDC
+	.ASCII	/RESR/			; One character resource name
+	.ASCII	/PAR/			; One character parent lock
+	.IF B FLAG
+		.BYTE	0		; Lock characs - $ENQ FLAGS argument
+	.IFF
+		.BYTE	LCK$M_'FLAG	; Lock characs - $ENQ FLAGS argument
+	.ENDC
+	.WORD	TST_FLG			; Test action after calling system svc
+.ENDM	TST_TABLE
+
+;
+; This next macro is used to build the table of process names, to generate the
+; parameters we need to check that we only use legal process names and to build
+; various other data structures which rely on process names.  It calls the X
+; macro, which must be defined each time to the specific purpose to be
+; performed.  PROCESS NAMES MUST BE ONE ASCII CHARACTER!
+;
+.MACRO	PROC_NAMES
+	X	P			; Master (driver) process
+	X	Q			; First slave (driven) process
+	X	R			; Next slave (driven) process
+.ENDM	PROC_NAMES
+
+;
+; EQUATED SYMBOLS:
+;
+
+	RMS$_FACILITY = 1		; Standard RMS facility code
+	UETP = UETP$_FACILITY@STS$V_FAC_NO ; UETP facility code massaged
+	UETP$_ABENDD = UETP!SHR$_ABENDD	; Abort message codes
+	UETP$_BEGIND = UETP!SHR$_BEGIND ; Begin message
+	UETP$_ENDEDD = UETP!SHR$_ENDEDD ; End message
+	UETP$_TEXT   = UETP!SHR$_TEXT	; Text message
+
+; Code depends not only on individual values of the following, but also on
+; their ordering.
+	ENQ     = 0			; Do ENQ. Code depends on this value
+	ENQW    = 1			; Do ENQW. Code depends on this value
+	DEQ     = 2			; Do DEQ
+	ENDTEST = 3			; END OF TEST code
+	MAXCODE = 3			; Greatest legal TYP field in TST_TABLE
+
+; Generate high and low bounds for process names.  Count process names.  Note
+; that the first process name is assumed to be the master process and that we
+; don't include it in the count.
+.MACRO	X	PROCESS
+	.IIF NDF PROC_COUNT, PROC_COUNT = -1 ; Initialize count of processes
+	PROC_COUNT = PROC_COUNT+1	     ; First is master, don't count it
+	.IIF NDF LOW_PROC,   LOW_PROC   = ^A/PROCESS/ ; Low bound
+	.IIF NDF HIGH_PROC,  HIGH_PROC  = ^A/PROCESS/ ; Initial high bound
+	.IIF LT  HIGH_PROC-^A/PROCESS/, HIGH_PROC = ^A/PROCESS/ ; High bound
+.ENDM	X	; For process name bounds
+	PROC_NAMES			; Generate bounds and count processes
+
+;
+; Common event flags
+;
+	DONE_CEF   = 64			; CEF for action complete by driven proc
+	BAST_CEF   = 65			; CEF for blocking ast delivery...
+	BAST_CEF_V = <65-64>		; ...and correspoinding bit
+	CMP_VAL    = 66			; CEF for compare value...
+	CMP_VAL_V  = <66-64>		; ...and corresponding bit
+	UNLOCK_CEF = 67			; CEF for unlock
+	DLDET_CEF  = 68			; CEF for deadlock detected...
+	DLDET_CEF_V= DLDET_CEF-64	; ...and corresponding bit
+	DLRES_CEF  = 69			; CEF for deadlock resolved
+	DLMASK     = <1@<DLDET_CEF-64>>!- ; Mask for $WFLAND of deadlock flags
+		     <1@<DLRES_CEF-64>>
+
+;
+; Bits in TSTFLG.
+;
+	BLKAST_V = 0			; Blocking AST test
+	INCOMP_V = 1			; Lock mode incompatibility test
+	VALBLK_V = 2			; Value block test
+	SYNCST_V = 3			; SYNCSTS test
+	DEADLK_V = 4			; Deadlock test - don't know victim
+	NOCAST_V = 5			; No completion AST 
+	NOWAIT_V = 6			; Do not wait for DONE CEF
+	VICTIM_V = 7			; This is a deadlock victim for sure
+
+	BLKAST_M = 1@BLKAST_V		; And corresponding bit masks
+	INCOMP_M = 1@INCOMP_V
+	VALBLK_M = 1@VALBLK_V
+	SYNCST_M = 1@SYNCST_V
+	DEADLK_M = 1@DEADLK_V
+	NOCAST_M = 1@NOCAST_V
+	NOWAIT_M = 1@NOWAIT_V
+	VICTIM_M = 1@VICTIM_V
+;
+; Bits in LOCFLG.
+;
+	C_AST_V = 0			; Set if completion AST was delivered
+	DLPRC_V = 1			; Set if $FORCEX done on driven procs
+	C_AST_M = 1@C_AST_V
+	DLPRC_M = 1@DLPRC_V
+;
+; Bits in GLBFLG.
+;
+	DRIVEN_V = 0			; Set if we are a driven (slave) proc
+	DRIVEN_M = 1@DRIVEN_V
+	DUMP_V   = 1			; Set if we're running in dump mode
+	DUMP_M   = 1@DUMP_V
+;
+; Miscellaneous
+;
+	SYNC_EF     = 1			; Local EF for SYNCSTS test
+	SNDMSG_EFN  = 4			; EFN for QIO to send to driven procs
+	TEXT_BUFFER = 132		; Buffer length for FAO output
+	LKSB_SIZE   = 24		; Size of lock status block in bytes
+	COMMAND_SIZE= 8			; Size of a TEST_TABLE entry
+
+	.SBTTL	Read-Only Data
+	.PSECT	RODATA,NOEXE,NOWRT,PAGE
+;
+; See the PROC_NAMES macro definition for restrictions on the names of
+; processes.
+;	TST_TABLE process,sstype,lock-mode,resource,parent-id,ssflags,action-flags
+;
+
+TEST_TABLE:
+;
+; Test of new locks grant
+;
+	TST_TABLE <P>,ENQ,NL,<A>
+
+	TST_TABLE <P>,ENQ,CR,<B>
+
+	TST_TABLE <P>,ENQ,CW,<C>
+
+	TST_TABLE <P>,ENQ,PR,<D>
+
+	TST_TABLE <P>,ENQ,PW,<E>
+
+	TST_TABLE <P>,ENQ,EX,<F>
+;
+; Test of lock conversion
+;
+	TST_TABLE <P>,ENQW,CR,<A>,,CONVERT
+
+	TST_TABLE <P>,ENQW,PR,<B>,,CONVERT
+
+	TST_TABLE <P>,ENQW,PW,<C>,,CONVERT
+
+	TST_TABLE <P>,ENQW,NL,<D>,,CONVERT
+
+	TST_TABLE <P>,ENQW,EX,<E>,,CONVERT
+
+	TST_TABLE <P>,ENQW,CW,<F>,,CONVERT
+;
+; Test of Deque
+;
+	TST_TABLE <P>,DEQ,,<A>
+
+	TST_TABLE <P>,DEQ,,<B>
+
+	TST_TABLE <P>,DEQ,,<C>
+
+	TST_TABLE <P>,DEQ,,<D>
+
+	TST_TABLE <P>,DEQ,,<E>
+
+	TST_TABLE <P>,DEQ,,<F>
+;
+; Test of lock mode compatibility and blocking AST
+;
+	TST_TABLE <P>,ENQW,NL,<A>,,,BLKAST_M
+
+	TST_TABLE <Q>,ENQW,CR,<A>
+
+	TST_TABLE <Q>,ENQW,EX,<A>,,CONVERT
+
+	TST_TABLE <P>,ENQW,CR,<B>,,,BLKAST_M
+
+	TST_TABLE <Q>,ENQW,CW,<B>
+
+	TST_TABLE <Q>,ENQW,PR,<B>,,CONVERT
+
+	TST_TABLE <Q>,ENQW,EX,<B>,,CONVERT,INCOMP_M
+
+	TST_TABLE <P>,ENQW,CW,<C>,,,BLKAST_M
+
+	TST_TABLE <Q>,ENQW,PR,<C>,,,INCOMP_M
+
+	TST_TABLE <Q>,DEQ,,<C>
+
+	TST_TABLE <P>,ENQW,CW,<C>,,,BLKAST_M
+
+	TST_TABLE <Q>,ENQW,CR,<C>
+
+	TST_TABLE <Q>,ENQW,EX,<C>,,CONVERT,INCOMP_M
+
+	TST_TABLE <P>,ENQW,PR,<D>,,,BLKAST_M
+
+	TST_TABLE <Q>,ENQW,CW,<D>,,,INCOMP_M
+
+	TST_TABLE <Q>,DEQ,,<D>
+
+	TST_TABLE <P>,ENQW,PR,<D>,,,BLKAST_M
+
+	TST_TABLE <Q>,ENQW,EX,<D>,,,INCOMP_M
+
+	TST_TABLE <P>,ENQW,PW,<E>,,,BLKAST_M
+
+	TST_TABLE <Q>,ENQW,CR,<E>
+
+	TST_TABLE <Q>,ENQW,PW,<E>,,CONVERT,INCOMP_M
+
+	TST_TABLE <Q>,DEQ,,<E>
+
+	TST_TABLE <P>,ENQW,EX,<F>,,,BLKAST_M
+
+	TST_TABLE <Q>,ENQW,CR,<F>,,,INCOMP_M
+
+	TST_TABLE <Q>,DEQ,,<F>
+
+	TST_TABLE <P>,ENQW,EX,<F>,,,BLKAST_M
+
+	TST_TABLE <Q>,ENQW,EX,<F>,,,INCOMP_M
+;
+; Test of value block
+;
+	TST_TABLE <P>,ENQW,CR,<V>,,VALBLK
+
+	TST_TABLE <Q>,ENQW,CR,<V>,,VALBLK
+
+	TST_TABLE <P>,ENQW,PW,<V>,,<VALBLK!LCK$M_CONVERT>,VALBLK_M
+
+	TST_TABLE <P>,ENQW,CR,<V>,,<VALBLK!LCK$M_CONVERT>,
+
+	TST_TABLE <Q>,ENQW,PW,<V>,,<VALBLK!LCK$M_CONVERT>,VALBLK_M
+;
+; Test of tree structured lock and LCK$M_NOQUEUE flag
+;
+	TST_TABLE <P>,ENQW,CW,<U>
+
+	TST_TABLE <P>,ENQW,PW,<X>,<U>
+
+	TST_TABLE <P>,ENQW,EX,<Z>,<X>
+
+	TST_TABLE <Q>,ENQW,CR,<U>
+
+	TST_TABLE <Q>,ENQW,PR,<X>,<U>,NOQUEUE,NOCAST_M
+;
+; Test of LCK$M_SYNCSTS flag
+;
+	TST_TABLE <P>,ENQW,PW,<S>,,SYNCSTS,<SYNCST_M!BLKAST_M>
+
+	TST_TABLE <Q>,ENQ,EX,<S>,,SYNCSTS
+;
+; Test of Local deadlock detection
+;
+	TST_TABLE <P>,ENQW,EX,<L>
+
+	TST_TABLE <Q>,ENQW,EX,<M>
+
+	TST_TABLE <P>,ENQ,EX,<M>,,,DEADLK_M
+
+	TST_TABLE <Q>,ENQ,EX,<L>,,,DEADLK_M!NOWAIT_M
+
+	TST_TABLE <R>,ENQW,NL,<N>
+
+	TST_TABLE <R>,ENQW,EX,<N>
+
+	TST_TABLE <R>,ENQW,EX,<N>,,,VICTIM_M
+;
+; Tell all detached processes to terminate.  Generate a termination message for
+; all processes.  The driver process is smart enough to ignore the message
+; because it must wait for all other processes to finish.
+;
+.MACRO	X	PROCESS
+	TST_TABLE <PROCESS>,ENDTEST,,,,,NOWAIT_M
+.ENDM	X	; For termination list
+	PROC_NAMES			; Generate list for termination msgs
+
+TABLE_END:				; End of Test table
+	.LONG	0
+TO_BE_FILLED:				; For patch use
+	.BLKQ	2
+
+BEGUN_ADDR:				; Used by UETP$_SATSMS
+	.ASCIC	/begun/
+END_ADDR:
+	.ASCIC	/successful/
+FAIL_ADDR:
+	.ASCIC	/failed/
+
+MODE:					; Determines some runtime actions...
+	.ASCID	/MODE/			; ...based on log name translation
+
+THREE_MIN:				; A three minute timer so that...
+	.LONG	-10*1000*1000*180	; ...the test never hangs forever
+	.LONG	-1
+
+LK_CEF_DESC:				; Logical name for common EF
+	.ASCID	/LKTEST_CEF/
+
+LKTEST_DESC:				; Image name of driven process
+	.ASCID	/UETLOCK00.EXE/
+
+; Variable part of names of detached processes. This depends on one-char
+; names, as described in the PROC_NAMES macro definition.
+.MACRO	X	PROCESS
+	.ASCII	/PROCESS/
+.ENDM	X	; For table of ASCII process names
+ALL_PROCS:				; Names of all processes
+	PROC_NAMES			; This list includes the driver process
+PROCS = ALL_PROCS+1			; PROCS differs from ALL_PROCS in
+					; ...it excludes the driver process
+
+LOG_MSGVEC:				; $PUTMSG MSGVEC arg so we can print...
+	.WORD	3,1			; ...everything from...
+	.LONG	UETP$_TEXT		; ...the driven procs' .LOG file(s)...
+	.WORD	1,1			; ...to our SYS$OUTPUT
+	.ADDRESS LOG_MSGPTR
+
+CNTRLCMSG:				; Control C messsage
+	.ASCID	\Aborted via a user CTRL/C\
+
+SUBPROC_STRING:				; Mailbox code to tell driven proc...
+	.ASCID	/Proc: /		; ...which one it is
+					; THIS STRING MUST FIT INTO A...
+					; ...MAILBOX USED FOR PASSING...
+					; ...COMMANDS TO DRIVEN PROCESSES!
+
+ILL_PROC_NAME:				; Driven process name is not in our table
+	.ASCID	/Illegal name for cooperating detached process: !AD./
+
+ERR_IN_TABLE:
+	.ASCID	/Internal consistency error:  test specified non-existent process./
+
+SNDMBX_ERRMSG:
+	.ASCID	/Couldn't send mailbox to cooperating detached process./
+
+CAST_ERRMSG:
+	.ASCID	/Error, no completion AST delivered./
+
+BAST_ERRMSG:
+	.ASCID	/Error, no blocking AST delivered./
+
+LKVAL_ERRMSG:
+	.ASCID	/Lock value block returned !XL instead of !XL./
+
+NOSYNCH_ERRMSG:
+	.ASCID	/$ENQW returned !XL instead of SS$_SYNCH./
+
+CASTSYNCH_ERRMSG:
+	.ASCID	/$ENQW delivered a completion AST for a resource which/-
+		<13><10>/	should not be free when LCK$M_SYNCSTS was set./
+
+SYNCH_ERRMSG:
+	.ASCID	/$ENQW set a synchronization event flag, though it returned/-
+		<13><10>/	SS$_SYNCSTS and delivered no completion AST./
+
+NOSYQUEUE_ERRMSG:
+	.ASCID	\$ENQW did not queue a request for a resource which was in\-
+		\ use,!/	though LCK$M_SYNCSTS was set; status was !XL.\
+
+PAR_ERRMSG:
+	.ASCID	/$ENQ or $ENQW returned !XL instead of SS$_NOTQUEUED./
+
+VICTIM_ERRMSG:
+	.ASCID	\Wrong or no victim selected for deadlock resolution,\-
+		\!/	returned lock status of !XL.\
+
+DEQALL_ERRMSG:
+	.ASCID	\$DEQ of all locks returned !XL instead of SS$_NORMAL.\
+
+DEADLK_ERRMSG:
+	.ASCID	\Deadlock was not detected/resolved in !UL seconds.\
+
+NODLOCK_ERRMSG:
+	.ASCID	\Allocation of deadlocked resource succeeded despite\-
+		<13><10>\	deadlock not having been detected.\
+
+CASTPAR_ERRMSG:
+	.ASCID	/Completion AST parameter was !XL instead of !XL./
+
+NOTRMB_ERRMSG:
+	.ASCID	/Error reading termination mailbox from cooperating process./
+
+MSGTYP_ERRMSG:
+	.ASCID	/Message type in termination mailbox was !XL instead of !XL./
+
+TERMBX_ERRMSG:
+	.ASCID	\Termination mailbox received for an unknown process,\-
+		\!/	process id = !XL, final process status = !XL.\
+
+DETPRC_ERRMSG:
+	.ASCID	/Error in cooperating detached process, id = !XL, status = !XL./
+
+FILE:					; Fills in RMS_ERR_STRING
+	.ASCID	/file/
+RECORD:					; Fills in RMS_ERR_STRING
+	.ASCID	/record/
+RMS_ERR_STRING:				; Announces an RMS error
+	.ASCID	/RMS !AS error in file !AD/
+
+RMS_ERRMSG:
+	.ASCID	/RMS error with cooperating process log file, !AS./
+
+FORCEX_MSG:
+	.ASCID	/Process !AS was forced into exiting./
+
+DUMP_MSG:
+	.ASCID	\Process !AD trying !AC RESNAM=!AD,LKMODE=!AC,FLAGS=#^X!XB,-\-
+		\!/	PARID-lock=!AD.  Test flags are ^X!XW.  !%T\
+
+NONE:					; !AD string for $FAO
+	.ASCII	/none/
+NONE_LENGTH = .-NONE
+
+TEST_CODES:				; List of SS we perform
+	.ADDRESS ENQ_CODE		; Ordering and content are dependent...
+	.ADDRESS ENQW_CODE		; ...on the definitions in the...
+	.ADDRESS DEQ_CODE		; ...Equated Symbols section
+ENQ_CODE:
+	.ASCIC	/$ENQ/
+ENQW_CODE:
+	.ASCIC	/$ENQW/
+DEQ_CODE:
+	.ASCIC	/$DEQ/
+
+LOCK_MODES:				; List of $ENQ lock modes
+	.ADDRESS NLMODE_CODE		; Ordering and content are dependent...
+	.ADDRESS CRMODE_CODE		; ...on the definitions supplied...
+	.ADDRESS CWMODE_CODE		; ...by the $LCKDEF macro
+	.ADDRESS PRMODE_CODE
+	.ADDRESS PWMODE_CODE
+	.ADDRESS EXMODE_CODE
+	.ADDRESS NOMODE_CODE		; This one is a dummy for $DEQ
+NLMODE_CODE:
+	.ASCIC	/NL/
+CRMODE_CODE:
+	.ASCIC	/CR/
+CWMODE_CODE:
+	.ASCIC	/CW/
+PRMODE_CODE:
+	.ASCIC	/PR/
+PWMODE_CODE:
+	.ASCIC	/PW/
+EXMODE_CODE:
+	.ASCIC	/EX/
+NOMODE_CODE:
+	.ASCIC	/no/
+
+	.SBTTL	Read/Write Data
+	.PSECT	RWDATA,WRT,NOEXE,PAGE
+
+DRIVEN_DESC:				; Name of driven process. Driven procs...
+	.WORD	TEST_NAME_LEN+1,0	; ...always have qualifier char at end
+	.ADDRESS TEST_NAME_I
+TEST_NAME_D:				; Name of the test - .ASCID version
+	.WORD	TEST_NAME_LEN,0
+	.ADDRESS TEST_NAME_I
+; THESE NEXT ITEMS MUST REMAIN CONTIGUOUS!
+TEST_NAME_C:				; Name of the test - .ASCIC version
+	.BYTE	TEST_NAME_LEN
+TEST_NAME_I:				; Name of the test - .ASCII version
+	.ASCII	/UETLOCK00_/
+TEST_NAME_LEN = .-TEST_NAME_I		; Length in chars of our test name
+PROC_QUALIFIER:				; Driven process qualifier appended...
+	.BLKB	1			; ...to test name
+; End of contiguous items
+
+MBXCHANS:				; Mailbox channels to communicate with detach prc
+	.BLKW	PROC_COUNT
+
+PROCIDS:				; Detached processes id
+	.BLKL	PROC_COUNT
+	.LONG	0			; End of the proc id table
+
+LOG_FILE_DESC:				; Skeleton name for driven proc log files
+	.WORD	LOG_FILE_LEN,0
+	.ADDRESS LOG_FILE_QUAL
+; THE FOLLOWING ITEMS MUST REMAIN CONTIGUOUS!
+LOG_FILE_QUAL:				; Character to distinguish between procs
+	.BYTE	0
+	.ASCII	/LKTEST.LOG/
+LOG_FILE_LEN = .-LOG_FILE_QUAL
+; End of items which must remain contiguous.
+
+ENQLST:					; ENQ(W) QIO arguments list
+	$ENQ	RESNAM = RESR_DESC
+
+DEQLST:					; DEQ QIO argument list
+	$DEQ
+
+TST_COMMAND:				; Test command from the test table
+	.LONG	0,0
+
+TSTFLG:					; Tells actions after calling sys svc
+	.WORD	0
+
+RESR_DESC:				; Resource name descriptor
+	.LONG	RESR_LEN
+	.ADDRESS RESR
+RESR:					; Resource name
+	.ASCII	/?LOCK/
+RESR_LEN = .-RESR
+
+DLOCK_TIME:				; Delta time for $SETIMR to prevent...
+	.BLKL	1			; ...deadlock hangs
+	.LONG	-1
+
+GETUIC:					; Get UIC
+	.WORD	4			; Length of recieve buffer
+	.WORD	JPI$_UIC		; Request UIC
+	.LONG	LK_UIC			; Buffer address
+	.LONG	0			; No return length
+	.WORD	4			; Get our base priority
+	.WORD	JPI$_PRIB
+	.ADDRESS BASE_PRI
+	.LONG	0
+	.LONG	0			; End of list
+
+LK_UIC:					; Put UIC here
+	.LONG	0
+
+BASE_PRI:				; Parent process' base priority
+	.LONG	0
+
+DIBBUF_DESC:				; Device information buffer descriptor
+	.WORD	DIB$K_LENGTH,0
+	.ADDRESS DIBBUF
+DIBBUF:					; Device information block
+	.BLKB	DIB$K_LENGTH
+
+MBX_DESC:				; Mailbox logical name descriptor
+	.LONG	MBXNAM_LEN
+	.ADDRESS MBXNAM
+MBXNAM:					; Mailbox logical name
+	.ASCII	/?LKMBX/
+MBXNAM_LEN = .-MBXNAM
+
+MBX_IOSB:				; Mailbox QIO IO status block
+	.LONG	0,0
+
+EX_MBXCHAN:				; Termination mailbox channel
+	.WORD	0
+EXIT_MSG:				; Buffer for termination mailbox msg
+	.BLKB	ACC$K_TERMLEN
+EX_PROC_CNT:				; Exit process count
+	.LONG	PROC_COUNT
+
+TTCHAN:					; Terminal channel
+	.LONG	0
+TTNAME_ROPTR:				; Descriptor for recursive...
+	.WORD	63,0			; ...translation of TTNAME
+	.ADDRESS TTNAME
+TTNAME_RWPTR:				; Descriptor for recursive...
+	.WORD	TTNAME_LEN,0		; ...translation of TTNAME
+	.ADDRESS TTNAME
+TTNAME:
+	.ASCII	/SYS$INPUT/
+	TTNAME_LEN=.-TTNAME
+	.BLKB	63-TTNAME_LEN
+
+TYPE:					; System service type
+	.LONG	3
+
+GLBFLG:					; Holds flags which remain thru test
+	.BYTE	0
+
+LOCFLG:					; Local flag - flags for one TST_TABLE event
+	.BYTE	0
+
+EF_STATE:				; Event flag longword
+	.LONG	0
+
+SAVED_VAL:				; Saved value of first quad of value block
+	.LONG	0,0
+LKID_ADDR:				; Lock id address
+	.LONG	0
+LKSB_ADDR:				; Lock status block address
+	.LONG	0
+LKSBS:					; Buffer for LKSB's
+	.BLKQ	<3*26>
+
+EXIT_DESC:				; Exit handler descrip
+	.LONG	0
+	.ADDRESS EXIT_HANDLER
+	.LONG	1
+	.ADDRESS STATUS
+
+MSG_BLOCK:				; Message block for GETMSG
+	.BLKB	4
+
+AST_MODE:				; Remembers state of AST enabling
+	.LONG	0
+
+SS_FAIL_MODE:				; Remembers state of SS error exceptions
+	.LONG	0
+
+FAO_BUF:				; FAO output string descriptor
+	.WORD	TEXT_BUFFER,0
+	.ADDRESS BUFFER
+
+BUFFER_PTR:				; Text buffer descriptor
+	.WORD	TEXT_BUFFER,0
+	.ADDRESS BUFFER
+
+BUFFER:					; FAO output and other misc. buffer
+	.BLKB	TEXT_BUFFER
+
+ARG_COUNT:				; Argument count
+	.LONG	0
+STATUS:					; Final status code
+	.LONG	0
+
+LOG_MSGPTR:				; $FAO arg for $PUTMSG when copying...
+	.WORD	0,0			; ...the driven proc log file...
+	.ADDRESS RMS_BUFFER		; ...to our SYS$OUTPUT
+
+RMS_BUFFER:				; Log file record buffer
+	.BLKB	TEXT_BUFFER
+
+	.SBTTL	RMS-32 Data Structures
+
+	.ALIGN	LONG
+
+LOG_FAB:
+	$FAB -
+	FNA = LOG_FILE_QUAL,-
+	FNS = LOG_FILE_LEN,-
+	ORG = <SEQ>,-
+	MRS = TEXT_BUFFER
+
+LOG_RAB:
+	$RAB -
+	FAB = LOG_FAB,-
+	UBF = RMS_BUFFER,-
+	USZ = TEXT_BUFFER
+
+INPUT_FAB:				; Reads SYS$INPUT
+	$FAB -
+	FNM = <SYS$INPUT:>
+
+INPUT_RAB:				; Reads SYS$INPUT
+	$RAB -
+	FAB = INPUT_FAB,-
+	UBF = TST_COMMAND,-
+	USZ = COMMAND_SIZE
+
+	.SBTTL	TESTLOCK - Initialization
+	.PSECT	TESTLOCK,EXE,NOWRT,PAGE
+	.DEFAULT DISPLACEMENT,WORD
+
+;+
+;	This module serves as both the controlling (driver) and controlled
+;	(driven) process of the Lock Manager test.  Initialize and set up
+;	those things which are common to both processes - overhead, determining
+;	our function, timers and interprocess communication.
+;-
+.ENTRY	UETLOCK00,^M<>			; Entry mask
+
+	MOVAL	SSERROR,(FP)		; Declare exception handler
+	$SETSFM_S ENBFLG = #1		; Enable system service failure mode
+	$DCLEXH_S DESBLK = EXIT_DESC	; Declare exit handler
+;
+; Determine if we are the master (driver) process or one of the slave (driven)
+; processes.  If we are a driven process, determine which one.  Use that info
+; to form our process name and announce us to the world.
+;
+	$OPEN	FAB = INPUT_FAB,-	; See what sort of thing SYS$INPUT is
+		ERR = RMS_ERROR
+	BLBC	R0,10$			; If we've no SYS$INPUT, we are driver
+	BBC	#DEV$V_MBX,-		; If SYS$INPUT is not a mailbox...
+		INPUT_FAB+FAB$L_DEV,10$	; ...we are driver
+	$CONNECT RAB = INPUT_RAB,-	; Check further to see if we're driven
+		 ERR = RMS_ERROR
+	BLBC	R0,10$			; Any error says we're driver
+	$GET	RAB = INPUT_RAB,-
+		ERR = RMS_ERROR
+	BLBC	R0,10$			; Any error says we're driver
+	CMPC3	SUBPROC_STRING,-	; See if mailbox message...
+		SUBPROC_STRING+8,-	; ...is the one we expect...
+		TST_COMMAND		; ...to tell us which process we are
+	BNEQ	10$			; BR if no match - we're driver
+	MOVB	(R3),PROC_QUALIFIER	; We're driven proc - copy which one
+	INCW	TEST_NAME_D		; Attach it to our name...
+	INCB	TEST_NAME_C		; ...in all places we need it
+	BISB2	#DRIVEN_M,GLBFLG	; Remember that we're a driven process
+					; We do only what we're told to do
+	LOCC	(R3),#PROC_COUNT,PROCS	; Have we a legal process name?
+	BNEQ	20$			; BR if so - we're all set up
+	$FAO_S	CTRSTR = ILL_PROC_NAME,- ; Bad name - quit
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = #1,-
+		P2     = #PROC_QUALIFIER
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHL	#3
+	BRW	ERROR_EXIT
+10$:
+	DECW	TEST_NAME_D		; Fix up our name...
+	DECB	TEST_NAME_C		; ...wherever it is needed
+	;BICB2	#DRIVEN_M,GLBFLG	; Remember that we're a driver process
+					; We tell other processes what to do
+20$:
+	$SETPRN_S PRCNAM = TEST_NAME_D	; Set our process name
+
+	PUSHAL	BEGUN_ADDR
+	PUSHAL	TEST_NAME_C
+	PUSHL	#2			; Argument count
+	PUSHL	#UETP$_SATSMS!STS$K_SUCCESS ; Set the begin message code
+	CALLS	#4,G^LIB$SIGNAL		; Print the UETP begin time message
+;
+; Set timer to catch hangs waiting for another process or for any hangs we
+; may encounter ourself.
+;
+	$SETIMR_S DAYTIM = THREE_MIN,-	; Set 3 minute timer
+		ASTADR = TIME_OUT,-
+		REQIDT = #1
+;
+; Enable control C handler if run from terminal.
+;
+	BBS	#DEV$V_TRM,-		; Skip ^C stuff if we're not at a...
+		INPUT_FAB+FAB$L_DEV,30$	; ...terminal
+	BRW	50$
+30$:
+	$TRNLOG_S LOGNAM = TTNAME_RWPTR,- ; Recursively translate the name...
+		  RSLLEN = TTNAME_RWPTR,- ; ...of our controlling terminal
+		  RSLBUF = TTNAME_ROPTR
+	MOVAL	TTNAME,TTNAME_RWPTR+4	; Undo possible previous PPF fixup
+	CMPL	R0,#SS$_NOTRAN		; Have we reached the end yet?
+	BEQL	40$			; BR if we have
+	CMPW	#^X001B,TTNAME		; Is this a Process Permanent File?
+	BNEQ	30$			; Recursively translate if not
+	SUBW	#4,TTNAME_RWPTR		; Remove RMS overhead from PPF name
+	ADDL2	#4,TTNAME_RWPTR+4
+	BRB	30$
+40$:
+	$ASSIGN_S DEVNAM = TTNAME_RWPTR,- ; We need a channel for the ^C QIO
+		  CHAN   = TTCHAN
+	$QIOW_S	CHAN     = TTCHAN,-	; Enable CTRL/C AST's...
+		FUNC     = #IO$_SETMODE!IO$M_CTRLCAST,-
+		P1       = CCASTHAND
+	PUSHAL	TEST_NAME_D		; ...and tell the user...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_ABORTC!STS$K_SUCCESS ; ...how to abort gracefully...
+	CALLS	#3,G^LIB$SIGNAL		; ...
+;
+; Create and associate with a common event flag block.  This will be used to
+; signal that a particular operation of a driven process has been completed.
+;
+50$:
+	$ASCEFC_S EFN = #DONE_CEF,-	; Create and assoc common EF cluster
+		  NAME = LK_CEF_DESC
+;
+; The logical name MODE is available to knowledgeable users to invoke special
+; actions in this test.
+;
+	$TRNLOG_S LOGNAM = MODE,-	; If MODE translates...
+		  RSLLEN = BUFFER_PTR,-
+		  RSLBUF = FAO_BUF
+	CMPL	#^A/DUMP/,BUFFER	; ...to "DUMP"...
+	BNEQ	60$
+	BISW2	#DUMP_M,GLBFLG		; ...then we type a running log
+60$:
+;
+; All things common to the driver and driven processes have been done.  Split
+; up and get on to the main work of the test.
+;
+	BBC	#DRIVEN_V,GLBFLG,DRIVER	; BR if we are the driver process
+	BRW	DRIVEN			; We are a driven process
+
+	.SBTTL	TESTLOCK - Driver Process
+;+
+;	This is the controlling process of the lock manager UETP test.  It
+;	creates detached, "cooperating" process(es), then, based on the entries
+;	in TST_TABLE, either calls Lock Manager system services or sends mail
+;	to (one or more) cooperating process(es) to have the process(es) call
+;	a Lock Manager system service.  Results are checked.
+;-
+DRIVER:
+	$CREMBX_S CHAN = EX_MBXCHAN,-	; Create and associate termination mbx
+		  MAXMSG = #ACC$K_TERMLEN,-
+		  BUFQUO = #256
+	$GETCHN_S CHAN = EX_MBXCHAN,-	; Get channel infomation - we need...
+		  PRIBUF = DIBBUF_DESC	; ...the mailbox unit number
+	$GETJPI_S ITMLST = GETUIC	; Get our UIC and our base priority
+	BSBW	CREATE_PROCS		; Go subroutine to create detached procs
+;
+; Have an outstanding read to the termination mailbox, should any detached
+; process end
+;
+	$QIO_S	CHAN = EX_MBXCHAN,-	; Read termination mailbox
+		FUNC = #IO$_READVBLK,-
+		ASTADR = EX_MBX_AST,-
+		IOSB = MBX_IOSB,-
+		P1 = EXIT_MSG,-
+		P2 = #ACC$K_TERMLEN
+;
+; For each line in TEST_TABLE, either execute the command directly or send a
+; message to one of the driven processes.  Wait for the driven process to
+; complete the command, if necessary.
+;
+	MOVAL	TEST_TABLE,R9		; Address of beginning of test table
+GET_COMMAND:
+	MOVQ	(R9),TST_COMMAND	; Get an entry of the test table 
+	CMPB	TST_COMMAND,ALL_PROCS	; Is it for self?
+	BEQL	20$			; BR if yes
+
+	$CLREF_S EFN = #DONE_CEF	; Clear CEF which says command is done
+	BSBW	SEND_MSG		; Send command to the detached process
+	BBC	#DEADLK_V,TST_COMMAND+6,10$ ; BR if not deadlock special case
+	$WFLAND_S EFN  = #DONE_CEF,-	; Deadlock situation has been set up...
+		  MASK = #DLMASK	; ...we wait until it's resolved
+10$:
+	BBS	#NOWAIT_V,TST_COMMAND+6,30$ ; BR if no_wait_done_cef bit set
+	$WAITFR_S EFN = #DONE_CEF	; Wait until another process finish 
+					; executing the test command
+	BRB	30$			; We've finished this table entry
+20$:
+	CMPB	#ENDTEST,TST_COMMAND+1	; Is this endtest for driver process?
+	BEQL	30$			; BR if so - we'll really end when...
+					; ...the test table is finished
+	BSBW	EXECUTE			; Go execute the test command
+30$:
+	MOVAL	COMMAND_SIZE(R9),R9	; Get address of next test table entry
+	TSTL	(R9)			; Is it end of the table?
+	BEQL	WAIT_PRCS		; BR if yes
+	BRW	GET_COMMAND		; Next entry
+
+WAIT_PRCS:
+	$HIBER_S			; Hibernate until created procs exit
+	BRW	SUC_EXIT		; The test is over, let's go home
+
+	.SBTTL	TESTLOCK - Driven Process
+;+
+;	This is the controlled process of the Lock Manager UETP test.  It
+;	is created by te driver process, then waits for commands from the
+;	driver process to tell it how to call Lock Manager system services.
+;	In some cases, results are checked to see if they are what we expect.
+;	Note that SYS$INPUT is already defined as the way commands are passed
+;	by the driver program.
+;-
+DRIVEN:
+GET_NEXTMSG:
+	$GET	RAB = INPUT_RAB,-	; Read a command
+		ERR = RMS_ERROR
+	BSBW	EXECUTE			; Perform it
+
+	$SETEF_S EFN = #DONE_CEF	; Tell the driver process we're done
+	BRB	GET_NEXTMSG
+
+	.SBTTL	Clean Up and Exit
+;+
+;	Arrive here from either the driver or the driven process.  Process
+;	exit or failure is the same in either case.
+;-
+SUC_EXIT:				; Successfully exit
+	MOVL	#SS$_NORMAL!STS$M_INHIB_MSG,-
+		STATUS
+	$EXIT_S STATUS			; Exit with status
+
+; To use FAIL_OUT, push to the stack the address of an error message and
+; BRW FAIL_OUT.
+FAIL_OUT:				; Failure exit
+	PUSHL	#1			; Arg count
+	PUSHL	#UETP$_TEXT!STS$K_ERROR ; UETP error code
+	PUSHL	#3			; Argument count
+	BRW	ERROR_EXIT		; Error exit
+
+	.SBTTL	Create Detached Processes and Mailboxes
+;++
+; FUNCTIONAL DESCRIPTION:
+; 	Create detached processes and associated mailboxes routine.  Such
+;	processes are called driven processes because they only perform what
+;	this, the driver process, tells them to do.  Detached processes with
+;	the same UIC are created according to the process indicators (Q, R,
+;	etc.) stored at addresses beginning PROCS.  The created processes
+;	will run the same image as this, but will be able to distinguish itself
+;	from this process by the content of the mailbox which is its SYS$INPUT.
+;	There are mailboxes associated with each created process as
+;	communication channels.
+;
+; CALLING SEQUENCE:
+;	BSBW	CREATE_PROCS
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	Process name table, PROCS
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+; IMPLICIT OUTPUTS:
+;	Exit if error
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Creates detached, cooperating processes
+;--
+CREATE_PROCS:
+	MOVC3	SUBPROC_STRING,-	; Initialize mailbox message...
+		SUBPROC_STRING+8,-	; ...that will tell driven proc...
+		TST_COMMAND		; ...which one it is
+	MOVL	R3,R6			; Save this pointer into TST_COMMAND
+	MOVAL	PROCS,R2		; Addr of process name indicators
+	MOVAL	MBXCHANS,R3		; Addr of associated mailbox channel
+	MOVAL	PROCIDS,R4		; Addr of process ids
+	CLRL	R5			; Indexes into process qualifier table
+10$:
+	MOVB	(R2)[R5],PROC_QUALIFIER	; Set up process name
+	MOVB	(R2)[R5],MBXNAM		; Set up assoc mailbox logical name 
+	MOVB	(R2)[R5],LOG_FILE_QUAL	; Set up log file name
+	MOVB	(R2)[R5],(R6)		; Set up command to say "driven proc"
+
+	$CREMBX_S CHAN = (R3)[R5],-	; Create mailbox and assign channel
+		  MAXMSG = #COMMAND_SIZE,- ; Maximum message length in bytes
+		  BUFQUO = #512,-	; Buffer quota
+		  LOGNAM = MBX_DESC	; Logical name "Q"LKMBX,"R"LKMBX, etc.
+
+	$CREPRC_S PIDADR = (R4)[R5],-	; Create detached process 
+		  IMAGE = LKTEST_DESC,- ; Image
+		  OUTPUT = LOG_FILE_DESC,- ; SYS$OUTPUT
+		  INPUT  = MBX_DESC,-	; SYS$INPUT
+		  PRCNAM = DRIVEN_DESC,- ; Proc name
+		  UIC = LK_UIC,-	; Same UIC as this controller
+		  BASPRI = BASE_PRI,-	; Same base priority
+		  MBXUNT = DIBBUF+DIB$W_UNIT ; Termination mailbox unit number
+
+	MOVZWL	(R3)[R5],-(SP)		; Send the driven proc's first command
+	CALLS	#1,MBX_QIO		; Tell it that it's a driven process!
+
+	AOBLSS	#PROC_COUNT,R5,10$	; Next process if any more
+	RSB
+
+	.SBTTL	Determine Which Driven Process Gets Command
+;++
+; FUNCTIONAL DESCRIPTION:
+; 	Send message to cooperative processes routine
+;
+; CALLING SEQUENCE:
+;	BSBW	SEND_MSG
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	Message is in TST_COMMAND
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Mailbox message sent to the designated process
+;
+; COMPLETION CODES:
+;	In STATUS if error
+;
+; SIDE EFFECTS:
+;	NONE
+;--
+
+SEND_MSG:
+	CLRL	R5			; Index into driven processes
+10$:					; Which process?
+	CMPB	TST_COMMAND,PROCS[R5]	; Compare process indicator
+	BEQL	20$			; BR if equal
+	AOBLSS	#PROC_COUNT,R5,10$	; Try again if more process indicators
+	PUSHAL	ERR_IN_TABLE		; Error message
+	BRW	FAIL_OUT		; Failure out
+20$:
+	MOVZWL	MBXCHANS[R5],-(SP)
+	CALLS	#1,MBX_QIO		; Send the message
+	RSB
+
+	.SBTTL	Send Messages to Driven Processes
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine is called to send a message to any one of the driven
+;	processes.  It does a $QIO and checks to see that the message was sent
+;	correctly.
+;
+; CALLING SEQUENCE:
+;	CALLx	#1,MBX_QIO
+;
+; INPUT PARAMETERS:
+;	04(AP) has the channel by which we access the mailbox
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Message written to mailbox.
+;
+; COMPLETION CODES:
+;	Result of $QIO
+;
+; SIDE EFFECTS:
+;	Program terminates if an error occurs.
+;
+;--
+
+MBX_QIO:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	$QIOW_S EFN = #SNDMSG_EFN,-	; Send the message
+		CHAN = 04(AP),-
+		FUNC = #IO$_WRITEVBLK,-
+		IOSB = MBX_IOSB,-
+		P1 = TST_COMMAND,-
+		P2 = #COMMAND_SIZE
+	BLBC	MBX_IOSB,10$		; BR if IOSB is not right
+	RET				; Return
+10$:
+	MOVZWL	MBX_IOSB,STATUS		; Use IOSB status as exit status...
+	PUSHL	STATUS			; ...and a message of complaint
+	PUSHAL	SNDMBX_ERRMSG
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHL	#4
+	BRW	ERROR_EXIT
+
+	.SBTTL	Execute Test Commands in the Test Table
+;++
+; FUNCTIONAL DESCRIPTION:
+; 	Decode the test command and set up the service parameters accordingly,
+;	Execute the service (ENQ,ENQW,DEQ) requested
+;
+; CALLING SEQUENCE:
+;	BSBW	EXECUTE
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	Test command stored in TST_COMMAND quadword
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Address of LKSB in R3
+;
+; COMPLETION CODES:
+;	In STATUS if error
+;
+; SIDE EFFECTS:
+;	Exit if error, 
+;	BSBW CHECK_UP if ENQW to check correctness
+;	An AST may be generated for some locks
+;--
+
+EXECUTE:
+	CLRB	LOCFLG			; Clear all local flags
+	MOVAL	TST_COMMAND,R6		; Addr of the test command
+	TSTB	(R6)+			; Skip the process indicator
+	MOVZBL	(R6)+,TYPE		; Get type of service, ENQ, ENQW or DEQ
+	CMPL	#ENDTEST,TYPE		; Is it end of test for driven process?
+	BNEQ	10$			; BR if not
+	BRW	SUC_EXIT		; We're done if it is
+10$:
+	BBC	#DUMP_V,GLBFLG,20$	; BR if we don't dump every command
+	CALLS	#0,DUMP_COMMAND		; Type every command to SYS$OUTPUT
+20$:
+	MOVAL	ENQLST,R7		; Assume ENQ(W), Addr of ENQ arg list
+	CLRL	ENQ$_EFN(R7)		; Assume EFN = 0
+	MOVZBL	(R6)+,ENQ$_LKMODE(R7)	; Get lock mode
+	MOVZBL	(R6)+,R2		; Get resource indicator
+	MOVB	R2,RESR			; Set resource name
+	SUBL2	#^A/A/,R2		; Index of associated LKSB
+	MULL2	#LKSB_SIZE,R2		; Displacement of the LKSB from LKSBS
+	MOVAL	LKSBS(R2),R3		; Address of associated LKSB
+	MOVL	R3,LKSB_ADDR		; Store the addr of LKSB
+	MOVAL	4(R3),LKID_ADDR		; Address of the LOCK ID
+	CMPL	TYPE,#DEQ		; Is it DEQ?
+	BNEQ	30$			; BR if not
+	BRW	DEQS			; Yes, go dequeue
+30$:
+	MOVL	R3,ENQ$_LKSB(R7)	; Address of LKSB
+	MOVZBL	(R6)+,R4		; Parent lock indicator
+	CLRL	ENQ$_PARID(R7)		; Assume no parent lock
+	CMPB	R4,#^A/ /		; Is there parent lock?
+	BEQL	40$			; BR if no
+	SUBL2	#^A/A/,R4		; Index of LKSB for parent lock
+	MULL2	#24,R4			; Displacement of LKSB of parent lock
+	MOVAL	LKSBS(R4),R4		; Address of LKSB of parent lock
+	MOVL	4(R4),ENQ$_PARID(R7)	; Parent lock id
+40$:	
+	MOVZBL	(R6)+,ENQ$_FLAGS(R7)	; Get enq flag
+	BBC	#LCK$V_SYNCSTS,ENQ$_FLAGS(R7),50$ ; BR if not SYNCSTS flag test
+	MOVL	#SYNC_EF,ENQ$_EFN(R7)	; Set up EFN for SYNCSTS test
+	$CLREF_S EFN = #SYNC_EF		; We need to initialize the efn for it
+50$:
+	MOVAL	COMP_AST,ENQ$_ASTADR(R7) ; Addr of completion AST
+	MOVL	LKID_ADDR,ENQ$_ASTPRM(R7) ; Set AST param to be addr of LKID
+	MOVW	(R6)+,TSTFLG		; Get test flag
+	BBC	#NOCAST_V,TSTFLG,60$	; BR if no_completion_ast bit not set
+	CLRL	ENQ$_ASTADR(R7)		; No completion AST
+60$:
+	CLRL	ENQ$_BLKAST(R7)		; Assume blocking ast not requested
+	BBC	#BLKAST_V,TSTFLG,70$	; BR if block_ast bit not set
+	MOVAL	BLOCK_AST,ENQ$_BLKAST(R7) ; Set address of blocking AST routine
+70$:
+	BBC	#DEADLK_V,TSTFLG,80$	; BR if not deadlock special case
+	$CLREF_S EFN = #DLDET_CEF	; Deadlock must be detected and...
+	$CLREF_S EFN = #DLRES_CEF	; ...resolved. One flag per condition
+	MOVAL	DLOCK_AST,ENQ$_ASTADR(R7) ; Deadlock gets special AST
+	MULL3	#-10000000*<PROC_COUNT+5>,- ; To prevent hanging forever...
+		G^LCK$GL_WAITTIME,R1	    ; ...while waiting for...
+	MOVL	R1,DLOCK_TIME		    ; ...deadlock detection,...
+	$SETIMR_S DAYTIM = DLOCK_TIME,-	    ; ...we set a timer...
+		  ASTADR = DLOCK_TO_AST,-   ; ...which will get us out...
+		  REQIDT = LKID_ADDR	    ; ...if need be
+80$:
+	BLBS	TYPE,ENQWS		; Dispatch for correct system service
+					; (Correctness of TYPE guaranteed by...
+					; ...assembly time checks)
+ENQS:
+	$ENQ_G	ENQLST			; Enqueue
+	BSBW	CHK_SS			; Check R0 to see if we queued up OK
+	RSB				; Return
+ENQWS:
+	$ENQW_G ENQLST			; Enqueue and wait for EFN
+	BSBW	CHECK_UP		; Go check final status
+	RSB				; Return
+DEQS:
+	MOVL	4(R3),DEQLST+DEQ$_LKID  ; Lock id of the lock to be dequeued
+	$DEQ_G	DEQLST			; Dequeue
+	BSBW	CHK_SS			; Check R0 to see if we dequeued OK
+	RSB				; Return
+
+	.SBTTL	Type the Current Command
+;++
+; FUNCTIONAL DESCRIPTION:
+; 	Type the current command to be executed.
+;
+; CALLING SEQUENCE:
+;	CALLS	#0,DUMP_COMMAND
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	TST_COMMAND filled with next command to execute
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Message to SYS$OUTPUT
+;--
+
+DUMP_COMMAND:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	MOVZBL	TST_COMMAND+1,R1	; Get the type of SS call
+	MOVZBL	TST_COMMAND+2,R2	; Get the kind of lock we tried
+	CMPL	#DEQ,R1			; Were we doing a $DEQ?
+	BNEQ	10$			; BR if not
+	MOVL	#LCK$K_EXMODE+1,R2	; No mode for $DEQ, say that
+10$:
+	MOVL	#1,R3			; Assume that we've a parent lock
+	MOVAL	TST_COMMAND+4,R4
+	CMPB	#^A/ /,(R4)		; But have we?
+	BNEQ	20$			; BR if we have
+	MOVL	#NONE_LENGTH,R3		; We have none...
+	MOVAL	NONE,R4			; ...supply appropriate message
+20$:
+	$FAO_S	CTRSTR = DUMP_MSG,-	; Format the TEST_TABLE entry...
+		OUTLEN = BUFFER_PTR,-	; ...into something humanly readable
+		OUTBUF = FAO_BUF,-
+		P1     = #1,-
+		P2     = #TST_COMMAND+0,-
+		P3     = TEST_CODES[R1],-
+		P4     = #1,-
+		P5     = #TST_COMMAND+3,-
+		P6     = LOCK_MODES[R2],-
+		P7     = TST_COMMAND+5,-
+		P8     = R3,-
+		P9     = R4,-
+		P10    = TST_COMMAND+6,-
+		P11    = #0
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_INFO
+	CALLS	#3,G^LIB$SIGNAL
+	RET
+
+	.SBTTL	Check Correctness of the ENQW Test
+;++
+; FUNCTIONAL DESCRIPTION:
+; 	Check correctness of enqdeq service routine.
+;
+; CALLING SEQUENCE:
+;	BSBW	CHECK_UP
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	Status code in R0, LKSB
+;	Address of LKSB in R3
+;	Address of $ENQW argument list in R7
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message if error
+;
+; COMPLETION CODES:
+;	in STATUS if error
+;
+; SIDE EFFECTS:
+;	BSBW	CHK_XXXX for further check
+;--
+
+CHECK_UP:
+	BBC	#LCK$V_SYNCSTS,ENQ$_FLAGS(R7),10$ ; BR if not SYNCSTS test
+	BRW	CHK_SYNCSTS		; Check SYNCSTS flag test
+10$:
+	BBC	#LCK$V_NOQUEUE,ENQ$_FLAGS(R7),20$ ; BR if NOQUEUE not specfied
+	BRW	CHK_NOQUEUE		; Check NOQUEUE flag test
+20$:
+	BBC	#VICTIM_V,TSTFLG,30$	; BR if not dlock test w/ known victim
+	BRW	CHK_DEADLOCK		; Check for deadlock - return via subr
+30$:
+	BSBW	CHK_SS			; Check R0 = #SS$_NORMAL
+	BSBW	CHK_LKSB		; Check LKSB status code = #SS$_NORMAL
+
+	BBS	#NOCAST_V,TSTFLG,40$	; BR if no_completion_ast specified
+	BSBW	CHK_CAST		; Go check completion ast delivered
+40$:
+	BBC	#INCOMP_V,TSTFLG,50$	; Incompatible flag set?
+	BSBW	CHK_BLOCKAST		; Go check blocking ast delivered
+50$:
+	BBC	#LCK$V_VALBLK,ENQ$_FLAGS(R7),60$ ; BR if not value block test
+	BSBW	CHK_VALBLK		; Go check value block test
+60$:
+	RSB
+
+	.SBTTL	Check Completion AST
+;++
+; FUNCTIONAL DESCRIPTION:
+; 	Check completion ast delivered routine.
+;
+; CALLING SEQUENCE:
+;	BSBW	CHK_CAST
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Exit message if error
+;
+; COMPLETION CODES:
+;	in STATUS if error
+;
+; SIDE EFFECTS:
+;	Exit if error
+;--
+
+CHK_CAST:
+	BBSC	#C_AST_V,LOCFLG,10$	; BR if comp_ast bit set (AST deliv.)
+	PUSHAL	CAST_ERRMSG		; Error message
+	BRW	FAIL_OUT		; Failure exit
+10$:
+	RSB				; Return
+
+	.SBTTL	Check Blocking AST
+;++
+; FUNCTIONAL DESCRIPTION:
+; 	Check blocking ast delivered routine.  The delivery of blocking AST
+;	to another is indicated by setting a common EF BAST_CEF.
+;
+; CALLING SEQUENCE:
+;	BSBW	CHK_BLOCKAST
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message if error
+;
+; COMPLETION CODES:
+;	In STATUS if error
+;
+; SIDE EFFECTS:
+;	NONE
+;--
+
+CHK_BLOCKAST:
+	$WAITFR_S EFN = #BAST_CEF	; Wait for blocking ast delivered
+	$CLREF_S EFN = #BAST_CEF	; Reset the blocking ast CEF flag
+	RSB				; Return
+
+	.SBTTL	Check Lock Value Block
+;++
+; FUNCTIONAL DESCRIPTION:
+; 	Check value block test routine.
+;
+; CALLING SEQUENCE:
+;	BSBW	CHK_VALBLK
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	Address of $ENQ argument list in R7
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message if error
+;
+; COMPLETION CODES:
+;	In STATUS if error
+;
+; SIDE EFFECTS:
+;	NONE
+;--
+
+CHK_VALBLK:
+	MOVL	LKSB_ADDR,R8		; Addr of LKSB
+	BBS	#LCK$V_CONVERT,ENQ$_FLAGS(R7),10$ ; BR if not a new lock
+	MOVQ	8(R8),SAVED_VAL		; Save the low quadword of lock value bk
+	RSB				; Return
+10$:					; Not new lock
+	BBS	#VALBLK_V,TSTFLG,20$	; BR if VALBLK test flag set
+	RSB				; Return
+20$:
+	$READEF_S EFN = #CMP_VAL,-	; Read the CEF flag
+		  STATE = EF_STATE
+	BBS	#CMP_VAL_V,EF_STATE,30$ ; BR if CMP_VAL flag set
+	$SETEF_S EFN = #CMP_VAL		; Set the common EF CMP_VAL 
+	INCL	8(R8)			; Increment the user lock value block
+	RSB				; Return
+30$:
+	INCL 	SAVED_VAL		; Increment the saved value
+	CMPL	8(R8),SAVED_VAL		; Is the lock value OK?
+	BNEQ	40$			; Error if not equal
+	$CLREF_S EFN = #CMP_VAL		; Reset the CEF
+	RSB				; Return
+40$:
+	$FAO_S	CTRSTR = LKVAL_ERRMSG,-	; Value block error message
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = 08(R8),-
+		P2     = SAVED_VAL
+	PUSHAL	BUFFER_PTR
+	BRW	FAIL_OUT
+
+
+	.SBTTL	Check SYNCSTS Flag Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+; 	Check LCK$M_SYNCSTS flag test routine
+;
+; CALLING SEQUENCE:
+;	BSBW	CHK_SYNCSTS
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	R0 is the returned status from $ENQW
+;	LOCFLG synchronizes us with other test routines
+;	Test flag in TSTFLG
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message if error
+;
+; COMPLETION CODES:
+;	In STATUS if error
+;
+; SIDE EFFECTS:
+;	NONE
+;--
+CHK_SYNCSTS:
+	BBC	#SYNCST_V,TSTFLG,30$	; BR if SYNCH flag cleared
+	CMPW	R0,#SS$_SYNCH		; Compare R0 status code
+	BEQL	10$			; BR if equal
+	PUSHL	R0			; Save the status...
+	$FAO_S	CTRSTR = NOSYNCH_ERRMSG,- ; ...and give a useful error
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R0
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHL	#4
+	BRW	ERROR_EXIT
+10$:
+	BBC	#C_AST_V,LOCFLG,20$	; Should no comp ast delivered
+	PUSHAL	CASTSYNCH_ERRMSG	; Error message
+	BRW	FAIL_OUT		; Failure exit
+20$:
+	$READEF_S EFN = #SYNC_EF,-	; Read EF
+		STATE = EF_STATE
+	BBC	#SYNC_EF,EF_STATE,50$	; Error if SYNC EFN set
+	PUSHAL	SYNCH_ERRMSG		; Error message
+	BRW	FAIL_OUT		; Failure out
+30$:
+	CMPW	R0,#SS$_NORMAL		; Check R0
+	BEQL	40$			; BR if equal
+	PUSHL	R0			; Save the status...
+	$FAO_S	CTRSTR = NOSYQUEUE_ERRMSG,- ; ...and give a useful error
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R0
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHL	#4
+	BRW	ERROR_EXIT
+40$:
+	$SETEF_S EFN = #UNLOCK_CEF	; Set unlock event flag
+	$WAITFR_S EFN = #SYNC_EF	; Wait for SYNC_EF 
+	BSBW	CHK_CAST		; Comp ast should be delivered
+50$:
+	RSB				; Return
+
+	.SBTTL	Check NOQUEUE Flag Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+; 	Check LCK$M_NOQUEUE flag function test routine
+;
+; CALLING SEQUENCE:
+;	BSBW	CHK_NOQUEUE
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	Status code in R0
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message if error
+;
+; COMPLETION CODES:
+;	STATUS if error
+;
+; SIDE EFFECTS:
+;	NONE
+;--
+
+CHK_NOQUEUE:
+	CMPW	R0,#SS$_NOTQUEUED	; Is R0 status code OK?
+	BNEQ	10$			; BR if not
+	RSB				; Return
+10$:
+	MOVL	R0,STATUS		; Save returned status as exit status
+	$FAO_S	CTRSTR = PAR_ERRMSG,-	; Wrong status returned
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = STATUS
+	PUSHL	STATUS
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHL	#4
+	BRW	ERROR_EXIT
+
+	.SBTTL	Check Deadlock Test
+;++
+; FUNCTIONAL DESCRIPTION:
+; 	Check deadlock test routine.  This routine is executed only in those
+;	situations where a victim can be preselected and the results of
+;	requesting a lock predetermined.
+;
+; CALLING SEQUENCE:
+;	BSBW	CHK_DEADLOCK
+;
+; INPUT PARAMETERS:
+;	Status code in R0
+;
+; IMPLICIT INPUTS:
+;	R3 points to lock status block
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message if expected status not found
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Program exits if expected status not found
+;--
+
+CHK_DEADLOCK:
+	CMPW	(R3),#SS$_DEADLOCK	; Is the status code OK?
+	BNEQ	10$			; BR if not
+	RSB
+10$:
+	MOVZWL	(R3),STATUS		; Save returned status as exit status
+	$FAO_S	CTRSTR = VICTIM_ERRMSG,- ; Wrong status returned
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = STATUS
+	PUSHL	STATUS
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHL	#4
+	BRW	ERROR_EXIT
+
+	.SBTTL	Check Status Code Subroutine
+;++
+; FUNCTIONAL DESCRIPTION:
+; 	Subroutine to check normal status code in R0 (CHK_SS) 
+;	and LKSB (CHK_LKSB), exit if error is found.
+;
+; CALLING SEQUENCE:
+;	BSBW	CHK_SS
+;	BSBW	CHK_LKSB
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	Status code in R0 (CHK_SS), in LKSB (CHK_LKSB)
+;	Address of LKSB in R3 (CHK_LKSB)
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Exit if error
+;
+; COMPLETION CODES:
+;	In STATUS if error
+;
+; SIDE EFFECTS:
+;	Exit if error
+;--
+
+CHK_SS:
+	CMPW	R0,#SS$_NORMAL		; Success ?
+	BNEQ	10$			; BR if not
+	RSB				; Return
+10$:
+	MOVL	R0,STATUS		; Status code in STATUS
+	INSV	#STS$K_ERROR,-		; We'll force severity to be...
+		#STS$V_SEVERITY,-	; ...an error, always
+		#STS$S_SEVERITY,STATUS
+	PUSHL	STATUS
+	PUSHL	#1
+	BRW	ERROR_EXIT
+
+
+CHK_LKSB:
+	CMPW	(R3),#SS$_NORMAL	; Status code in LKSB correct?
+	BNEQ	10$			; BR if not
+	RSB
+10$:
+	MOVZWL	(R3),STATUS		; Error status code
+	INSV	#STS$K_ERROR,-		; We'll force severity to be...
+		#STS$V_SEVERITY,-	; ...an error, always
+		#STS$S_SEVERITY,STATUS
+	PUSHL	STATUS
+	PUSHL	#1
+	BRW	ERROR_EXIT
+
+	.SBTTL	Completion AST Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	ENQ(W) completion ast routine. This routine set a flag in LOCFLG
+;	to indicate the completion ast being delivered and check the ast 
+;	parameter.
+;
+; CALLING SEQUENCE:
+;	Called via AST when system service ENQ(W) complete
+;
+; INPUT PARAMETERS:
+;	AST parameter = LKID_ADDR
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message if error
+;
+; COMPLETION CODES:
+;	In STATUS if error
+;
+; SIDE EFFECTS:
+;	NONE
+;--
+
+COMP_AST:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	BISB2	#C_AST_M,LOCFLG		; Set completion ast deliv flag
+	CMPL	4(AP),LKID_ADDR		; AST parameter OK ?
+	BNEQ	10$			; Error if not equal
+	RET
+10$:
+	$FAO_S	CTRSTR = CASTPAR_ERRMSG,- ; AST parameter error message
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = 04(AP),-
+		P2     = LKID_ADDR
+	PUSHAL	BUFFER_PTR
+	BRW	FAIL_OUT		; Failure exit
+
+	.SBTTL	Blocking AST Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This blocking ast routine is called whenever the lock granted
+;	blocks another lock request. The routine set a common EF for another
+;	process to check the ast delivered. It then dequeue the lock such
+;	that another process can get the requested lock. In SYNCSTS flag test,
+;	The routine waits for a common EF before dequeue the lock.
+;
+; CALLING SEQUENCE:
+;	Called via blocking AST 
+;
+; INPUT PARAMETERS:
+;	LKID_ADDR as AST parameter
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message if error found
+;
+; COMPLETION CODES:
+;	In STATUS if error
+;
+; SIDE EFFECTS:
+;	NONE
+;--
+
+BLOCK_AST:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	$SETEF_S EFN = #BAST_CEF	; Set a CEF BAST_CEF
+	BBC	#SYNCST_M,TSTFLG,10$	; BR if SYNCST flag clear
+	$WAITFR_S EFN = #UNLOCK_CEF	; Wait for the unlock flag
+10$:
+	MOVL	LKID_ADDR,R8		; Address of LKID
+	$DEQ_S	LKID = (R8)		; Dequeue the lock
+	BSBW	CHK_SS			; Check R0
+	RET
+
+	.SBTTL	Deadlock Detection and Resolution Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine is specified as the completion AST routine when detecting
+;	and resolving a deadlock situation between processes each of which is
+;	equally likely to be the deadlock victim.
+;
+; CALLING SEQUENCE:
+;	Called via AST if deadlock is detected or resolved
+;
+; INPUT PARAMETERS:
+;	04(AP) is LKID_ADDR
+;
+; IMPLICIT INPUTS:
+;	Associated lock status block
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message if error found
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Program exits on some errors.  Common event flags signifying deadlock
+;	detection or resolution may be set.  The victim process dequeues its
+;	request for a deadlocked resource.  Timers to prevent permanent
+;	deadlock are cancelled.
+;--
+
+DLOCK_AST:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	SUBL3	#4,04(AP),R3		; Figure the LKSB address
+	CMPW	#SS$_DEADLOCK,(R3)	; Are we the victim process?
+	BNEQ	10$			; BR if not
+	$SETEF_S EFN = #DLDET_CEF	; Indicate that a victim has been found
+	$DEQ_S	FLAGS = #LCK$M_DEQALL	; Dequeue all my locks, allowing...
+					; ...other process(es) to succeed
+	CMPL	#SS$_NORMAL,R0		; Did we dequeue all locks?
+	BNEQ	30$			; BR if not
+	$CANTIM_S REQIDT = 04(AP)	; Dlock was found, we don't need timer
+	RET				; We're done with deadlock detection
+
+10$:
+	BSBW	CHK_LKSB		; See if we got our lock, broken dlock
+	$READEF_S EFN = #DLDET_CEF,-	  ; Did we get it because...
+		STATE = EF_STATE
+	BBS	#DLDET_CEF_V,EF_STATE,20$ ; ...some other process got deadlock?
+	PUSHAL	NODLOCK_ERRMSG
+	BRW	FAIL_OUT
+20$:
+	$SETEF_S EFN = #DLRES_CEF	; Indicate that deadlock has been resolved
+	$DEQ_S	FLAGS = #LCK$M_DEQALL	; Dequeue all my locks, allowing...
+					; ...other tests to run
+	CMPL	#SS$_NORMAL,R0		; Did we dequeue all locks?
+	BNEQ	30$			; BR if not
+	$CANTIM_S REQIDT = 04(AP)	; Dlock was resolved, we don't need timer
+	RET
+
+30$:
+	MOVL	R0,STATUS		; Save returned status as exit status
+	$FAO_S	CTRSTR = DEQALL_ERRMSG,- ; Wrong status returned
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = STATUS
+	PUSHL	STATUS
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHL	#4
+	BRW	ERROR_EXIT
+
+	.SBTTL	Deadlock Timeout AST Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine executes only if deadlock was not detected or resolved to
+;	this process's satisfaction in some reasonable time, a multiple of the
+;	SYSGEN parameter of the interval for deadlock detection.
+;
+; CALLING SEQUENCE:
+;	Called via $SETIMR AST
+;
+; INPUT PARAMETERS:
+;	04(AP) is LKID_ADDR
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Common event flags specifying deadlock detection and resolution are
+;	set.  The resource requested by this process is dequeued.
+;--
+
+DLOCK_TO_AST:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	MULL3	#PROC_COUNT+5,-		; Figure how long...
+		G^LCK$GL_WAITTIME,R1	; ...we waited for deadlock
+	$FAO_S	CTRSTR = DEADLK_ERRMSG,- ; Tell the world that deadlock...
+		OUTLEN = BUFFER_PTR,-	 ; ...detection seemed to fail
+		OUTBUF = FAO_BUF,-
+		P1     = R1
+	PUSHAL	BUFFER_PTR
+	BRW	FAIL_OUT		; We can't continue - fail with msg
+
+	.SBTTL	Termination Mailbox AST Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Receives the termination mailboxes from driven processes.
+;
+; CALLING SEQUENCE:
+;	Called via AST 
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	MBX_IOSB has the result of the read of a termination mailbox
+;	EXIT_MSG is the buffer into which the mail is written
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message if incorrect or inconsistent info in mailbox
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	May cause program termination
+;
+;--
+
+EX_MBX_AST:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	BLBC	MBX_IOSB,50$		; BR if IO was not successful
+	CMPW	EXIT_MSG+ACC$W_MSGTYP,#MSG$_DELPROC ; Is it a termination msg?
+	BNEQ	60$			; BR if not
+	MOVAL	PROCIDS,R2		; Addr of process ids
+10$:
+	CMPL	MBX_IOSB+4,(R2)		; Process id found?
+	BEQL	20$			; BR if yes
+	MOVAL	4(R2),R2		; Next process id
+	TSTL	(R2)			; End of process id table?
+	BNEQ	10$			; Try next if more
+	BRW	70$			; Process id not found
+20$:
+	CMPW	EXIT_MSG+ACC$L_FINALSTS,#SS$_NORMAL ; Deleted normally?
+	BEQL	30$
+	BRW	80$			; BR if not
+30$:
+	CLRL	(R2)			; Clear the proc id
+	DECL	EX_PROC_CNT		; Decrement exist proc count
+	BNEQ	40$			; BR if there are more to wait for
+	BRW	WAKE_UP			; Go wake up the controller process
+40$:
+	$QIO_S	CHAN = EX_MBXCHAN,-	; QIO read to mailbox for next process
+		FUNC = #IO$_READVBLK,-
+		ASTADR = EX_MBX_AST,-
+		IOSB = MBX_IOSB,-
+		P1 = EXIT_MSG,-
+		P2 = #ACC$K_TERMLEN
+	RET				; Return
+50$:
+	MOVZWL	MBX_IOSB,STATUS		; Use mailbox status as exit status
+	PUSHL	STATUS
+	PUSHAL	NOTRMB_ERRMSG
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHL	#4
+	BRW	ERROR_EXIT
+60$:
+	MOVZWL	EXIT_MSG+ACC$W_MSGTYP,R6 ; Complain about the kind of msg we got
+	$FAO_S	CTRSTR = MSGTYP_ERRMSG,-
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R6,-
+		P2     = #MSG$_DELPROC
+	PUSHAL	BUFFER_PTR		; Error in termination mailbox
+	BRW	FAIL_OUT		; Failure out
+70$:
+	$FAO_S	CTRSTR = TERMBX_ERRMSG,- ; We got a message for the wrong proc
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = MBX_IOSB+4,-
+		P2     = EXIT_MSG+ACC$L_FINALSTS
+	PUSHAL	BUFFER_PTR
+	BRW	FAIL_OUT
+80$:
+	BBS	#DLPRC_V,LOCFLG,90$	; BR if the process is deleted by LOCK00
+	$FAO_S	CTRSTR = DETPRC_ERRMSG,- ; Error in detached proccess
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = (R2),-
+		P2     = EXIT_MSG+ACC$L_FINALSTS
+	PUSHAL	BUFFER_PTR
+	BRW	FAIL_OUT		; Failure out
+90$:
+	RET
+WAKE_UP:
+	$WAKE_S				; Wake up the controller
+	RET				; Return
+
+	.SBTTL	Timer Expiration Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine will be called only if the timer which was set to prevent
+;	program hangs goes off.
+;
+; CALLING SEQUENCE:
+;	Called via AST at $SETIMR expiration.
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	#SS$_TIMEOUT
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+TIME_OUT:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	PUSHL	#SS$_TIMEOUT		; Push the signal name
+	PUSHL	#1			; Push the argument count total
+	BRW	ERROR_EXIT		; Bail out completely
+
+	.SBTTL	System Service Exception Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine is executed if a software or hardware exception occurs or
+;	if a LIB$SIGNAL system service is used to output a message.
+;	Information about this method of handling messages and errors can be
+;	found in the VMS COMMON RUN-TIME manual and in the VMS SYSTEM SERVICE
+;	manual.
+;
+; CALLING SEQUENCE:
+;	Entered via an exception from the system
+;
+; INPUT PARAMETERS:
+;	ERROR_COUNT   = previous cumulative error count
+;	                -----------------
+;	   AP ---->     !       2       !
+;			!---------------!
+;			! SIGNL ARY PNT !
+;			!---------------!
+;			! MECH  ARY PNT !
+;			!---------------! ---------
+;			!       4       !         ^
+;			!---------------!         !
+;			! ESTABLISH FP  !         !
+;			!---------------!         !
+;			!    DEPTH      ! Mechanism Array
+;			!---------------!         !
+;			!      R0       !         !
+;			!---------------!         !
+;			!      R1       !         v
+;			!---------------! ---------
+;			!       N       !         ^
+;			!---------------!         !
+;			! CONDITION NAME!         !
+;			!---------------!         !
+;			! N-3 ADDITIONAL!    Signal Array
+;			! LONG WORD ARGS!         !
+;			!---------------!         !
+;			!      PC       !         !
+;			!---------------!         !
+;			!      PSL      !         v
+;			!---------------! ---------
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	May branch to ERROR_EXIT
+;--
+
+SSERROR:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	$SETAST_S ENBFLG = #0		; Disable AST delivery
+	CLRL	AST_MODE		; Assume it was disabled
+	CMPL	R0,#SS$_WASSET		; Were AST's enabled?
+	BNEQ	10$			; BR if not enabled
+	MOVL	#1,AST_MODE		; Set it to be reenabled
+10$:	$SETSFM_S ENBFLG = #0		; Disable SS failure mode for PUTMSG
+	CLRL	SS_FAIL_MODE		; Assume it was disabled
+	CMPL	R0,#SS$_WASSET		; Was SS failure mode enabled?
+	BNEQ	20$			; BR if not enabled
+	MOVL	#1,SS_FAIL_MODE		; Set it to be reenabled
+20$:	MOVL	CHF$L_SIGARGLST(AP),R6	; Get the signal array pointer
+	CMPZV	#STS$V_FAC_NO,#STS$S_FAC_NO,- ; Is this a message from LIB$SIGNAL?
+		CHF$L_SIG_NAME(R6),#UETP$_FACILITY
+	BNEQ	30$			; BR if this is a system exception
+	SUBL2	#2,CHF$L_SIG_ARGS(R6)	; Drop the PC and PSL
+	$PUTMSG_S MSGVEC = CHF$L_SIG_ARGS(R6) ; Print the message
+	$SETSFM_S ENBFLG = SS_FAIL_MODE	; Set to previous state
+	$SETAST_S ENBFLG = AST_MODE	; Set to previous state
+	RET				; Return to the program
+30$:
+	CMPZV	#STS$V_FAC_NO,#STS$S_FAC_NO,- ; Is it an RMS failure?
+		CHF$L_SIG_ARG1(R6),#RMS$_FACILITY
+	BNEQ	40$			; BR if not
+	$SETSFM_S ENBFLG = SS_FAIL_MODE	; Set to previous state
+	$SETAST_S ENBFLG = AST_MODE	; Set to previous state
+	RET				; Yes, RMS_ERROR gets to handle them
+40$:
+	MOVL	CHF$L_SIG_NAME(R6),STATUS ; Save the status
+	CLRL	R8			; Assume for now it's not SS failure
+	CMPL	#SS$_SSFAIL,STATUS	; But is it a System Service failure?
+	BNEQ	60$			; BR if not - no special case message
+	$GETMSG_S MSGID = CHF$L_SIG_ARG1(R6),- ; Get SS failure code associated text
+		 MSGLEN = BUFFER_PTR,-
+		 BUFADR = FAO_BUF,-
+		 FLAGS  = #14,-
+		 OUTADR = MSG_BLOCK
+	TSTB	MSG_BLOCK+1		; Get FAO arg count for SS failure code
+	BEQL	50$			; Don't use $GETMSG if no $FAO args...
+	PUSHAL	BUFFER_PTR		; ...else build up...
+	PUSHL	#1			; ...a message describing...
+	PUSHL	#UETP$_TEXT		; ...why the System Service failed
+	INSV	CHF$L_SIG_ARG1(R6),-	; Give the message...
+		#STS$V_SEVERITY,-	; ...the correct severity code
+		#STS$S_SEVERITY,(SP)
+	MOVL	#3,R8			; Count the number of args we pushed
+	BRB	60$
+50$:
+	PUSHL	CHF$L_SIG_ARG1(R6)	; Save SS failure code
+	MOVL	#1,R8			; Count the number of args we pushed
+60$:
+	MULL3	#4,CHF$L_SIG_ARGS(R6),R7 ; Convert longwords to bytes
+	SUBL2	R7,SP			; Save the current signal array...
+	MOVC3	R7,CHF$L_SIG_NAME(R6),(SP) ; ...on the stack
+	ADDL3	R8,CHF$L_SIG_ARGS(R6),-(SP) ; Push the current arg count
+	BRW	ERROR_EXIT
+
+	.SBTTL	RMS Error Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles error returns from RMS calls.
+;
+; CALLING SEQUENCE:
+;	Called by RMS when a file processing error is found.
+;
+; INPUT PARAMETERS:
+;	The FAB or RAB associated with the RMS call.
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Program may exit, depending on severity of the error.
+;
+;--
+
+RMS_ERROR:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	MOVL	4(AP),R6		; See whether we're dealing with...
+	CMPB	#FAB$C_BID,FAB$B_BID(R6) ; ...a FAB or a RAB
+	BNEQ	10$			; BR if it's a RAB
+	MOVAL	FILE,R7			; FAB-specific code:  text string...
+	MOVL	R6,R8			; ...address of FAB...
+	PUSHL	FAB$L_STV(R6)		; ...STV field for error...
+	PUSHL	FAB$L_STS(R6)		; ...STS field for error...
+	MOVL	FAB$L_STS(R6),STATUS	; ...and save the error code
+	BRB	COMMON			; FAB and RAB share other code
+10$:
+	MOVAL	RECORD,R7		; RAB-specific code:  text string...
+	MOVL	RAB$L_FAB(R6),R8	; ...address of associated FAB...
+	PUSHL	RAB$L_STV(R6)		; ...STV field for error...
+	PUSHL	RAB$L_STS(R6)		; ...STS field for error...
+	MOVL	RAB$L_STS(R6),STATUS	; ...and save the error code
+COMMON:
+	MOVZBL	FAB$B_FNS(R8),R10	; Get the file name size
+	$FAO_S	CTRSTR = RMS_ERR_STRING,- ; Common code, prepare error message...
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R7,-
+		P2     = R10,-
+		P3     = FAB$L_FNA(R8)
+	PUSHAL	BUFFER_PTR		; ...and arguments for ERROR_EXIT...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT		; ...
+	EXTZV	#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,-
+		STATUS,R9 		; ...get the severity code...
+	BISB2	R9,(SP)			; ...and add it into the signal name
+	PUSHL	#5			; Current arg count
+	BRW	ERROR_EXIT
+
+	.SBTTL	CTRL/C Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles CTRL/C AST's
+;
+; CALLING SEQUENCE:
+;	Called via AST
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+CCASTHAND:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+					
+	BBS	#DRIVEN_V,GLBFLG,30$	; Skip this if we are a driven proc
+	MOVAL	PROCS,R2		; Addr of process indicator
+	MOVAL	PROCIDS,R3		; Addr of detached process id
+	CLRL	R5			; Index 
+10$:
+	TSTL	(R3)[R5]		; Is the process exited ?
+	BEQL	20$			; BR if yes
+	$FORCEX_S PIDADR = (R3)[R5],-	; Delete the process
+		CODE = #0		; Status is zero
+	BISB2	#DLPRC_M,LOCFLG		; Set the delete process flag
+20$:
+	AOBLSS	#PROC_COUNT,R5,10$	; Next if more
+
+30$:
+	PUSHAL	CNTRLCMSG		; Set message pointer
+	PUSHL	#1			; Set arg count
+	PUSHL	#UETP$_TEXT!STS$K_WARNING ; Set signal name
+	PUSHL	#0			; Indicate an abnormal termination
+	PUSHAL	TEST_NAME_D		; ...
+	PUSHL	#2			; ...
+	PUSHL	#UETP$_ABENDD!STS$K_WARNING ; ...
+	CALLS	#7,G^LIB$SIGNAL		; Output the message...
+	MOVL	#<STS$K_SUCCESS!SS$_CONTROLC-- ; ...and exit status
+		STS$K_SUCCESS+STS$K_WARNING>+-
+		STS$M_INHIB_MSG,STATUS
+	$EXIT_S	STATUS			; Terminate program cleanly
+
+	.SBTTL	Error Exit
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine prints an error message and exits.
+;
+; CALLING SEQUENCE:
+;	PUSHx error specific information on the stack
+;	PUSHL current argument count
+;	BRW   ERROR_EXIT
+;
+; INPUT PARAMETERS:
+;	Arguments to LIB$SIGNAL, as above
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	Message to SYS$OUTPUT (log file) and SYS$ERROR
+;
+; IMPLICIT OUTPUTS:
+;	Program exit
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+ERROR_EXIT:
+	BBS	#DRIVEN_V,GLBFLG,30$	; Skip this if we are a driven proc
+	MOVAL	PROCS,R2		; Addr of process indicator
+	MOVAL	PROCIDS,R3		; Addr of detached process id
+	CLRL	R5			; Index 
+10$:
+	TSTL	(R3)[R5]		; Is the process exited ?
+	BEQL	20$			; BR if yes
+	$FORCEX_S PIDADR = (R3)[R5],-	; Delete the process
+		CODE = #0		; Status is zero
+	BISB2	#DLPRC_M,LOCFLG		; Set the delete process flag
+20$:
+	AOBLSS	#PROC_COUNT,R5,10$	; Next if more
+
+30$:
+	TSTL	STATUS			; Was any exit status supplied?
+	BNEQ	40$			; BR if one was
+	MOVL	#UETP$_ABENDD!STS$K_ERROR,- ; Supply a generic one otherwise
+		STATUS
+40$:
+	ADDL3	(SP)+,#4,ARG_COUNT	; Get total # args, pop partial count
+	PUSHL	#0			; Push the time parameter
+	PUSHAL	TEST_NAME_D		; Push test name...
+	PUSHL	#2			; ...arg count...
+	PUSHL	#UETP$_ABENDD!STS$K_ERROR ; ...and signal name
+	CALLS	ARG_COUNT,G^LIB$SIGNAL	; Print the message
+	BISL	#STS$M_INHIB_MSG,STATUS ; Don't print messages twice
+	$EXIT_S STATUS			; Exit in error
+
+	.SBTTL	Exit Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Output the log file of detached processes to SYS$OUTPUT and exit.
+;
+; CALLING SEQUENCE:
+;	Invoked automatically by $EXIT system service.
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	STATUS contains the exit status
+;	Log files of cooperating detached processes
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Contents of cooperating processes written to SYS$OUTPUT
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Log files of cooperating detached processes are deleted
+;
+;--
+EXIT_HANDLER:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	$SETSFM_S ENBFLG = #0		; We can't trap System Service errors
+
+	BBS	#DRIVEN_V,GLBFLG,10$	; Ignore log files if we're driven proc
+	BSBW	TYPE_LOG_FILES		; Dump driven process log file(s)
+
+10$:
+	TSTL	STATUS			; The only way we get no status...
+	BNEQ	EXIT_MESSAGE		; ...is if we were $FORCEXed. BR if OK
+	$FAO_S	CTRSTR = FORCEX_MSG,-	; Type a message to tell of our...
+		OUTLEN = BUFFER_PTR,-	; ...$FORCEX plight
+		OUTBUF = FAO_BUF,-
+		P1     = #TEST_NAME_D
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#3,G^LIB$SIGNAL
+	MOVL	#UETP$_ABENDD!STS$K_ERROR!- ; Supply a default exit status
+		STS$M_INHIB_MSG,STATUS
+
+EXIT_MESSAGE:
+	PUSHAL	END_ADDR		; Assume we completed successfully
+	BLBS	STATUS,10$		; But did we?
+	MOVAL	FAIL_ADDR,(SP)		; Modify message if we failed
+10$:
+	PUSHAL	TEST_NAME_C
+	PUSHL	#2			; Argument count
+	PUSHL	#UETP$_SATSMS		; Set the end message code
+	INSV	STATUS,#STS$V_SEVERITY,- ; Give the test status
+		#STS$S_SEVERITY,(SP)
+	CALLS	#4,G^LIB$SIGNAL		; Print the ending message
+	RET
+
+;
+; This routine does "typical" UETP log file output, i.e., it reads a file,
+; searching for a keyword used as a beginning sentinel.  When the sentinel
+; is found, all lines of the file up to, but not including, a line containing
+; and ending sentinel are copied to SYS$OUTPUT.  An end of file counts as an
+; ending sentinel.  The copying algorithm is done for all the driven
+; processes started up by this driver.
+;
+TYPE_LOG_FILES:
+	CLRL	R5			; Initialize pointer to table of...
+					; ...qualifiers for driven proc names
+10$:
+	MOVB	PROCS[R5],LOG_FILE_QUAL	; Set up name for this log file
+	$OPEN	FAB = LOG_FAB		; Open the log file
+	BSBW	FAB_ERROR
+	BLBC	R0,50$			; Don't try to read if we have error
+	$CONNECT RAB = LOG_RAB		; Connect to log file
+	BSBW	RAB_ERROR
+	BLBC	R0,50$			; Don't try to read if we have error
+
+20$:
+	$GET	RAB = LOG_RAB		; Read a record looking for sentinel
+	BLBC	R0,30$			; BR if error
+	MOVZBW	BEGUN_ADDR,R4		; Form MATCHC length argument
+	MATCHC	R4,BEGUN_ADDR+1,-	; Did we find a beginning sentinel?
+		#TEXT_BUFFER,RMS_BUFFER
+	BNEQ	20$			; Loop for next record if not
+
+30$:
+	$GET	RAB = LOG_RAB		; Read a record to copy
+	BLBC	R0,40$			; BR if error
+	MOVZBW	END_ADDR,R4		; Form MATCHC length argument
+	MATCHC	R4,END_ADDR+1,-		; Did we find an ending sentinel?
+		#TEXT_BUFFER,RMS_BUFFER
+	BEQL	50$			; BR if we did
+	MOVW	LOG_RAB+RAB$W_RSZ,-	; Set the size of our message
+		LOG_MSGPTR
+	$PUTMSG_S MSGVEC = LOG_MSGVEC	; All driven proc msgs go to SYS$OUTPUT
+	BRB	30$			; Do the next record
+
+40$:
+	CMPL	R0,#RMS$_EOF		; End of file ?
+	BEQL	50$			; BR if it is
+	BSBB	RAB_ERROR		; Give an error otherwise...
+	BLBC	R0,60$			; ...and skip the rest of this one
+50$:
+	$CLOSE	FAB = LOG_FAB		; Close the log file
+					; We don't care about errors here
+	$ERASE	FAB = LOG_FAB		; Delete the log file
+					; An error here can be ignored, too
+60$:
+	ACBL	#PROC_COUNT-1,#1,R5,10$	; Loop through all driven processes
+	RSB				; Return to mainline code
+
+RAB_ERROR:
+	BLBC	R0,10$			; If there is no error...
+	RSB				; ...we take no action
+10$:
+	PUSHL	LOG_RAB+RAB$L_STV	; Get the specific error
+	PUSHL	LOG_RAB+RAB$L_STS
+	BRB	ALL_ERROR		; Rest of code is same for FAB & RAB
+
+
+
+FAB_ERROR:
+	BLBC	R0,10$			; If there is no error...
+	RSB				; ...we take no action
+10$:
+	PUSHL	LOG_FAB+FAB$L_STV	; Get the specific error
+	PUSHL	LOG_FAB+FAB$L_STS
+	;BRB	ALL_ERROR		; Rest of code is same for FAB & RAB
+
+
+
+ALL_ERROR:
+	PUSHL	R0			; Register must be preserved
+	$FAO_S	CTRSTR = RMS_ERRMSG,-	; RMS error message
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = #LOG_FILE_DESC
+	POPL	R0			; Register must be preserved
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1			; Arg count
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; Message code
+	CALLS	#5,G^LIB$SIGNAL		; Output - note that R0 is preserved
+	RSB				; Return with R0 intact
+
+	.END	UETLOCK00

@@ -1,0 +1,2181 @@
+	.TITLE UETTTYS00 VAX/VMS UETP DEVICE TEST FOR TERMINALS
+	.IDENT	'V03-000'
+	.ENABLE SUPPRESSION
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY:
+;	This module will be distributed with VAX/VMS under the [SYSTEST]
+;	account.
+;
+; ABSTRACT:
+;	This program tests terminal devices  etc.
+;
+; ENVIRONMENT:
+; 	This program will run in user access mode, with interrupts enabled
+;	at all times.  This program requires the following privileges and
+;	quotas:
+;
+;--
+;
+; AUTHOR: Larry D. Jones,	CREATION DATE: January, 1981
+;
+; MODIFIED BY:
+;
+;	V03-006 RNP0003		Robert N. Perron,	22-Jan-1982
+;		Added watchdog timer to prevent test from hanging if we
+;		get a hung device.
+;
+;	V03-005 RNP0002		Robert N. Perron,	31-Dec-1981
+;		Fixed problem with terminals that have network logical
+;		links.
+;
+;	V03-004 RNP0001		Robert N. Perron,	23-Dec-1981
+;		Added two second pause after each page of output to give 
+;		other device tests a chance to run.
+;
+;	V03-003	RNH0001		Richard N. Holstein,	09-Oct-1981
+;		Use secondary device characteristics to get around problems
+;		when a device is spooled.  Don't test spooled devices.
+;
+;	V03-002	LDJ0002		Larry D. Jones,		29-Sep-1981
+;		Added support for LA34, LA38, VT101, VT102 and VT131. Fixed
+;		problem with disabling all lines on one unsupported terminal.
+;		Fixed problem with VT100 one shot mode leaving terminal char.
+;		set wrong.
+;
+;	V03-001	LDJ0001		Larry D. Jones,		22-Sep-1981
+;		Fixed possible hang problem when running UETP from other than
+;		the console.
+;
+;**
+
+	.SBTTL	Declarations
+;
+; INCLUDE FILES:
+;
+;	SYS$LIBRARY:LIB.MLB	for general definitions
+;	SHRLIB$:UETP.MLB	for UETP definitions
+
+;
+; MACROS:
+;
+	$CHFDEF				; Condition handler frame definitions
+	$DCDEF				; Device characteristics definitions
+	$DEVDEF				; Device definitions
+	$DIBDEF				; Device Information Block
+	$TTDEF				; Terminal definitions
+	$SECDEF				; Section definitions
+	$SHRDEF				; Shared messages
+	$STSDEF				; Status return
+	$UETUNTDEF			; UETP unit block offset definitions
+	$UETPDEF			; UETP
+;
+;
+	.MACRO TERMINAL,TERM_NAME,CLASS,TYPE,PREAMBLE,TERM_DATA,HEAD_LEN
+		.=PC1...		; PC of terminal type table
+		.BYTE	CLASS,TYPE,HEAD_LEN ; TERM_NAME
+		.ADDRESS PC2...		; ASCIC name address
+		.ADDRESS PREAMBLE	; ASCIC preamble address
+		.ADDRESS TERM_DATA	; ASCID terminal specific data address
+		PC1...=PC1...+15	; bump to the next address
+		.=PC2...		; point to the next ASCIC msg
+					; make it's label and function ID
+TERM_NAME:
+		.ASCIC /TERM_NAME/
+		PC2...=.		; update the string PC
+	.ENDM TERMINAL
+;
+; EQUATED SYMBOLS:
+;
+;   Facility number definitions:
+	UETP_K = 116
+	RMS_K = 1
+
+;   SHR message definitions:
+	UETP = UETP_K@STS$V_FAC_NO	; Define the UETP facility code
+;
+	UETP$_ABENDD = UETP!SHR$_ABENDD	; Define the UETP message codes
+	UETP$_BEGIND = UETP!SHR$_BEGIND
+	UETP$_ENDEDD = UETP!SHR$_ENDEDD
+	UETP$_OPENIN = UETP!SHR$_OPENIN
+	UETP$_TEXT   = UETP!SHR$_TEXT
+
+;   Internal flag bits...:
+	TEST_OVERV   = 1		; Set when test is over
+	SAFE_TO_UPDV = 2		; Set when its safe to update UETINIDEV
+	SELF_TESTV   = 3		; Set when only user terminal is tested
+	BEGIN_MSGV   = 4		; Set when the begin message is output
+	SCROL_CLRV   = 5		; Set when a scroll area is defined
+	TIMOUT_ERRV  = 6		; Set if watch dog timer goes off
+
+;   ...and corresponding masks:
+	TEST_OVERM   = 1@TEST_OVERV
+	SAFE_TO_UPDM = 1@SAFE_TO_UPDV
+	SELF_TESTM   = 1@SELF_TESTV
+	BEGIN_MSGM   = 1@BEGIN_MSGV
+	SCROL_CLRM   = 1@SCROL_CLRV
+	TIMOUT_ERRM  = 1@TIMOUT_ERRV
+
+;   Miscellany:
+	LC_BITM       = ^X20		; Mask to convert lower case to upper
+	REC_SIZE      = 20		; UETINIDEV.DAT record size
+	TEXT_BUFFER   = 132		; Internal text buffer size
+	EFN2          = 4		; EFN used for three minute timer
+	MAX_DEV_DESIG = 9		; Longest possible controller name
+	MAX_UNIT_DESIG= 5		; Maximum unit number length
+	CR            = ^XD		; Carriage return
+	LF	      = ^XA		; Line feed
+	ESC	      = 27		; Escape
+	FF	      = 12		; Form feed
+	TERM_TYPE_CNT = 19		; Number of terminal types known now
+	MAX_NAME_SIZE = 7		; Maximum terminal name size
+	MAX_PROC_NAME = 15		; Maximum process name size
+	HDR_OUT_SIZE  = 256		; Maximum header output size
+	SPL_UNITV     = 7		; UETUNT$B_FLAG bit if unit is spooled
+	SPL_UNITM     = 1@SPL_UNITV
+
+;   The following definitions are set depending on the device under test.
+;   Their names should not change because they are used in size calculations
+;   in the executable code. TSD_SIZE should be made at least as large as the
+;   largest terminal specific data size for any terminal in the test.
+;
+
+	WRITE_SIZE    = 257		; Size of device write buffer
+	TSD_SIZE      = 1536		; Size of device header buffer(3 pages)
+;
+;   Device dependent definitions
+	UETUNT$B_LINE   = UETUNT$C_DEVDEP         ; Current line number
+	UETUNT$B_HD_LEN = UETUNT$B_LINE+1	  ; Header length in lines
+	UETUNT$B_LENGTH = UETUNT$B_HD_LEN+1       ; Page length
+	UETUNT$W_WIDTH  = UETUNT$B_LENGTH+1       ; Page width
+	UETUNT$L_CURHDR = UETUNT$W_WIDTH+4	  ; Current position in the TSD
+	UETUNT$K_CCTBL  = UETUNT$L_CURHDR+4       ; Carriage control size table address
+	UETUNT$K_WRITE  = UETUNT$K_CCTBL+8        ; Terminal write buffer
+	UETUNT$K_HEADER = UETUNT$K_WRITE+257	  ; Header buffer
+	UETUNT$V_2PL    = 2			  ; 2 page limit flag
+	UETUNT$M_2PL    = 1@UETUNT$V_2PL
+
+	DEVDEP_SIZE   = <UETUNT$K_WRITE--
+			UETUNT$C_INDSIZ> ; Size of device dependent part of UETUNT
+
+	PAGES = <<UETUNT$C_INDSIZ+-	; Add together all of the pieces...
+		  DEVDEP_SIZE+-		; ...which make up a UETP unit block...
+		  WRITE_SIZE+-		; ...to give to the $EXPREG service below
+		  TSD_SIZE+-
+		  511>/512>
+
+
+	.SBTTL	Read-Only Data
+	.PSECT	RODATA,NOEXE,NOWRT,PAGE
+
+ACNT_NAME:				; Process name on exit
+	.ASCID	/SYSTEST/
+
+TEST_NAME:				; This test name
+	.ASCID	/UETTTYS00/
+
+SUPDEV_GBLSEC:				; How we access UETSUPDEV.DAT
+	.ASCID	/UETSUPDEV/
+
+CONTROLLER:				; Logical name of controller
+	.ASCID	/CTRLNAME/
+
+MODE:					; Run mode logical name
+	.ASCID	/MODE/
+
+CS1:					; Device class and type control string
+	.ASCID	/!2XB !2XB /
+
+CS3:					; Device class-only control string
+	.ASCID	/!2XB **/
+
+TTNAME_ROPTR:				; Descriptor for recursive...
+	.WORD	63,0			; ...translation of TTNAME
+	.ADDRESS TTNAME
+
+CNTRLCMSG:
+	.ASCID	\Aborted via a user CTRL/C\
+
+NO_CTRLNAME:
+	.ASCID	/No controller specified./
+
+DEAD_CTRLNAME:
+	.ASCID	/Can't test controller !AS, marked as unusable in UETINIDEV.DAT./
+
+NOUNIT_SELECTED:
+	.ASCID	/No units selected for testing./
+
+ILLEGAL_REC:
+	.ASCID	/Illegal record format in file UETINIDEV.DAT!/
+
+PASS_MSG:
+	.ASCID	/End of pass !UL with !UL iterations at !%D./
+
+HEAD_CTRSTR:
+	.ASCID	\!ACVAX/VMS UETP terminal test UETTTYS00 for the !AC at !AS!/\
+
+TIME_OUT_MSG:
+	.ASCID	\Device off line or not testable.\
+
+TIMOUT_ERR_MSG:
+	.ASCID	/Time-out error on device !AS./
+
+PROMPT_MSG:
+	.ASCII	/Controller designation?: /
+	PMTSZ = .-PROMPT_MSG
+
+THREEMIN:				; 3 minute delta time
+	.LONG	-10*1000*1000*180,-1
+
+TWOMIN:					; 2 minute delta time
+	.LONG	-10*1000*1000*120,-1
+
+FIVESEC:				; 5 second delta time
+	.LONG	-10*1000*1000*5,-1
+
+TWOSEC:					; 2 seconds delta time
+	.LONG	-10*1000*1000*2,-1
+
+UNIT_DESC:				; Descriptor used to convert unit #
+	.LONG	5
+	.ADDRESS BUFFER+6
+
+CONT_DESC:				; Descriptor used to convert controller...
+	.WORD	REC_SIZE,0		; ...from lowercase to uppercase
+	.ADDRESS BUFFER
+
+FILE:					; Fills in RMS_ERR_STRING
+	.ASCID	/file/
+
+RECORD:					; Fills in RMS_ERR_STRING
+	.ASCID	/record/
+
+RMS_ERR_STRING:				; Announces an RMS error
+	.ASCID	/RMS !AS error in file !AD/
+
+HUNG_TERMINAL:
+	.ASCID	/UETTTYS00 test is hung!/
+
+NOSPOOLED:				; We found a spooled device
+	.ASCID	/Unable to test !AS because it is spooled./
+
+SIZE_TBL:				; table of output record sizes
+	.WORD	0			; line size added in later
+	.WORD	0
+	.WORD	2
+	.WORD	1
+	SIZE_TBL_LEN=.-SIZE_TBL
+
+DATA_BUF:				; 256 bytes of all printable characters
+	A=^A/!/
+	.REPT 94
+	.BYTE A
+	A=A+1
+	.ENDR
+	A=^A/!/
+	.REPT 94
+	.BYTE A
+	A=A+1
+	.ENDR
+	A=^A/!/
+	.NLIST
+	.REPT 68
+	.BYTE A
+	A=A+1
+	.ENDR
+	.LIST
+
+;
+; Carriage control longword format.
+;
+;	+----------+----------+----------+----------+
+;	!  postfix !  prefix  ! data Type! Fortran  !
+;	+----------+----------+----------+----------+
+;
+;
+CC_TBL:
+	.BYTE	0,1,1,0			; Prefix newline PosDfix null
+	.BYTE	0,1,1,1			; Prefix-Postfix newline
+	.BYTE	0,2,0,0			; Prefix-Postfix null
+	.BYTE	0,1,0,1			; Prefix null Postfix newline
+	.BYTE	0,2,^X8D,0		; Prefix 7 bit Postfix null
+	.BYTE	0,2,^XCD,0		; Prefix 8 bit Postfix null
+	.BYTE	0,1,^X8D,1		; Prefix 7 bit Postfix newline
+	.BYTE	0,1,^XCD,1		; Prefix 8 bit Postfix newline
+	.BYTE	0,1,0,^X8D		; Prefix null Postfix 7 bit
+	.BYTE	0,3,1,^X8D		; Prefix newline Postfix 7 bit
+	.BYTE	0,3,^X8D,^X8D		; Prefix 7 bit Postfix 7 bit
+	.BYTE	0,3,^XCD,^X8D		; Prefix 8 bit Postfix 7 bit
+	.BYTE	0,1,0,^XCD		; Prefix null Postfix 8 bit
+	.BYTE	0,3,1,^XCD		; Prefix newline Postfix 8 bit
+	.BYTE	0,3,^X8D,^XCD		; Prefix 7 bit Postfix 8 bit
+	.BYTE	0,2,^XCD,^XCD		; Prefix 8 bit Postfix 8 bit
+	.BYTE	0,1,0,0			; Prefix-Postfix null
+	CC_TBL_SIZE = <.-CC_TBL>/4
+;
+; The following table contains the device class and type of all devices supported
+; by this test.  Any new devices must be added to this table or the device will
+; be tested as a DT$_TTYUNKN. The only other information that has to be supplied
+; to this program to test a new device is any device specific data. (See below)
+; The table contains a byte for the device class, a byte for the device type, and
+; an address of a device descriptor for the device specific data or zero if none
+; exists.
+;
+
+TERM_NAMES:
+	.BLKB	TERM_TYPE_CNT*MAX_NAME_SIZE	; number of terminal macros * max bytes per name
+
+	PC1... = .
+	PC2... = TERM_NAMES
+TESDEV_TBL:
+	.BLKB	15*TERM_TYPE_CNT		; Allocate space for each macro
+	SAVE_PC... = .
+	TERMINAL VT100,DC$_TERM,DT$_VT100,VT100_PREAMBLE,VT100_DATA,0
+	TERMINAL VT101,DC$_TERM,DT$_VT101,VT100_PREAMBLE,VT100_DATA,0
+	TERMINAL VT102,DC$_TERM,DT$_VT102,VT100_PREAMBLE,VT100_DATA,0
+	TERMINAL VT125,DC$_TERM,DT$_VT125,VT100_PREAMBLE,VT100_DATA,0
+	TERMINAL VT131,DC$_TERM,DT$_VT131,VT100_PREAMBLE,VT100_DATA,0
+	TERMINAL VT132,DC$_TERM,DT$_VT132,VT100_PREAMBLE,VT100_DATA,0
+	TERMINAL VT52,DC$_TERM,DT$_VT52,VT52_PREAMBLE,VT52_DATA,4
+	TERMINAL LA120,DC$_TERM,DT$_LA120,FORM_FEED,LA120_DATA,2
+	TERMINAL LA34,DC$_TERM,DT$_LA34,FORM_FEED,LA36_DATA,2
+	TERMINAL LA36,DC$_TERM,DT$_LA36,FORM_FEED,LA36_DATA,2
+	TERMINAL LA38,DC$_TERM,DT$_LA38,FORM_FEED,LA36_DATA,2
+	TERMINAL VT55,DC$_TERM,DT$_VT55,VT52_PREAMBLE,VT52_DATA,2
+	TERMINAL VT5X,DC$_TERM,DT$_VT5X,VT52_PREAMBLE,VT52_DATA,2
+	TERMINAL VT05,DC$_TERM,DT$_VT05,VT05_PREAMBLE,VT05_DATA,2
+	.=PC1...
+UNKNOWN1:
+	TERMINAL UNKNOWN,DC$_TERM,DT$_TTYUNKN,FORM_FEED,UNKN_DATA,2
+	TERMINAL LA180,DC$_LP,DT$_LA180,FORM_FEED,LA180_DATA,2
+	TERMINAL LA11,DC$_LP,DT$_LA11,FORM_FEED,LA11_DATA,2
+	TERMINAL LP11,DC$_LP,DT$_LP11,FORM_FEED,LP11_DATA,2
+	TERMINAL LAX,DC$_LP,DT$_LAX,FORM_FEED,LAX_DATA,2
+	. = SAVE_PC...
+	TESDEV_TBL_END = .
+
+	.ALIGN	LONG
+;
+; The following is device specific data. To add data of this type do the following:
+;
+;	1.	Create an ASCIC string for the terminal data to be printed before
+;		the header (PREAMBLE).
+;
+;	2.	Create a string descriptor for the data.
+;
+;	3.	Enter the terminal data and update the TSD_SIZE constant if the
+;		new terminal specific data size is larger than the current value
+;		for TSD_SIZE.
+;
+;	4.	Enter the terminal information in the above table
+;
+; Terminal specific data for the VT100 terminal
+;
+
+VT100_DATA:
+	.LONG	VT100L
+	.ADDRESS VT100_OUT_DATA
+
+VT100_PREAMBLE:
+;
+; Set-up and header line
+;
+	.BYTE	VT100_PRE_LEN
+	.ASCII	<ESC>/7/	; Save attributes
+	.ASCII	<ESC>/</	; Enter ANSI mode
+	.ASCII	<ESC>/[2J/	; Clear the screen
+	.ASCII	<ESC>/[1;1H/	; Go home
+	VT100_PRE_LEN = .-VT100_PREAMBLE-1
+VT100_OUT_DATA:
+	.ASCII	<ESC>/[0;1q/	; LED 1
+	.ASCII	<ESC>/[0;1m/	; Set bold
+;
+; Set-up double height and double width line modes
+;
+	.REPT	3
+	.ASCII	<ESC>/#3/	; Double height top
+	.ASCII	<ESC>/E/	; Next line
+	.ASCII	<ESC>/#4/	; Double height bottom
+	.ASCII	<ESC>/E/	; Next line
+	.ENDR
+	.REPT	3
+	.ASCII	<ESC>/#6/	; Double width
+	.ASCII	<ESC>/E/	; Next line
+	.ENDR
+;
+; Write double height lines
+;
+	.ASCII	<ESC>/[2;1f/	; Goto line 2, col 1
+	.ASCII	'ABCDEFGHIJKLMNOPQRSTUVWXYZ-+/\[]01234567'<ESC>'E'
+	.ASCII	'ABCDEFGHIJKLMNOPQRSTUVWXYZ-+/\[]01234567'<ESC>'E'
+	.ASCII	<ESC>/[0;2q/	; LED 2
+	.ASCII	<ESC>/[0;4m/	; Set underscore
+	.ASCII	/abcdefghijklmnopqrstuvwxyz_|`~{}/<ESC>/E/
+	.ASCII	/abcdefghijklmnopqrstuvwxyz_|`~{}/<ESC>/E/
+	.ASCII	<ESC>/[0;1;2q/	; LED 1 and 2
+	.ASCII	<ESC>/[0;1;4m/	; Bold and underscore
+	.ASCII	<ESC>/(0/	; Special graphics and line drawing set
+	.ASCII	/abcdefghijklmnopqrstuvwxyz_|`~{}/<ESC>/E/
+	.ASCII	/abcdefghijklmnopqrstuvwxyz_|`~{}/<ESC>/E/
+;
+; Write double width lines
+;
+	.ASCII	<ESC>/[0;3q/	; LED 3
+	.ASCII	<ESC>/[0;5m/	; Blink
+	.ASCII	<ESC>/(B/	; USASCII
+	.ASCII	'ABCDEFGHIJKLMNOPQRSTUVWXYZ-+/\[]01234567'<ESC>'E'
+	.ASCII	<ESC>/[0;1;3q/	; LED 1 and 3
+	.ASCII	<ESC>/[0;1;5m/	; Bold and blink
+	.ASCII	/abcdefghijklmnopqrstuvwxyz_|`~{}/<ESC>/E/
+	.ASCII	<ESC>/[0;2;3q/	; LED 2 and 3
+	.ASCII	<ESC>/[0;4;5m/	; underscore and blink
+	.ASCII	<ESC>/(0/	; Special graphics and line drawing set
+	.ASCII	/abcdefghijklmnopqrstuvwxyz_|`~{}/<ESC>/E/
+;
+; Write normal mode graphics line
+;
+	.ASCII	<ESC>/[0;1;2;3q/ ; LED 1, 2, and 3
+	.ASCII	<ESC>/[0;1;4;5m/ ; Bold, underscore, and blink
+	.ASCII	/abcdefghij/
+	.ASCII	<ESC>/[0;4q/	; LED 4
+	.ASCII	<ESC>/[0;7m/	; Reverse video
+	.ASCII	/klmnopqrst/
+	.ASCII	<ESC>/[0;1;4q/	; LED 1 and 4
+	.ASCII	<ESC>/[0;1;7m/	; Bold and reverse video
+	.ASCII	/uvwxyz_|`~/
+	.ASCII	<ESC>/[0;2;4q/	; LED 2 and 4
+	.ASCII	<ESC>/[0;4;7m/	; Underscore and reverse
+	.ASCII	/{}abcdefgh/
+	.ASCII	<ESC>/[0;1;2;4q/ ; LED 1, 2, and 4
+	.ASCII	<ESC>/[0;1;4;7m/ ; Bold, underscore and reverse
+	.ASCII	/ijklmnopqr/
+	.ASCII	<ESC>/[0;3;4q/	; LED 3 and 4
+	.ASCII	<ESC>/[0;5;7m/	; Blink and reverse
+	.ASCII	/stuvwxyz_|/
+	.ASCII	<ESC>/[0;1;3;4q/ ; LED 1, 3, and 4
+	.ASCII	<ESC>/[0;1;5;7m/ ; Bold, blink, and reverse
+	.ASCII	/`~{}abcdef/
+	.ASCII	<ESC>/[0;2;3;4q/ ; LED 2, 3, and 4
+	.ASCII	<ESC>/[0;4;5;7m/ ; Underscore, blink, and reverse
+	.ASCII	/ghijklmnop/
+;
+; Test cursor control features
+;
+	.ASCII	<ESC>/[7;33H/<ESC>/[0;1;2q/<ESC>/[0;1;4m&*()=:;?/
+	.ASCII	<ESC>/[1A?/
+	.ASCII	<ESC>/[0;2q/<ESC>/[0;4m/<ESC>/[1A^/
+	.ASCII	<ESC>/[1A^/
+	.ASCII	<ESC>/[1D%/
+	.ASCII	<ESC>/[2D$/
+	.ASCII	<ESC>/[2D#/
+	.ASCII	<ESC>/[2D@/
+	.ASCII	<ESC>/[2D!/
+	.ASCII	<ESC>/[2D9/
+	.ASCII	<ESC>/[2D8/
+	.ASCII	<ESC>/[1D/<ESC>/[1B8/
+	.ASCII	<ESC>/[1D/<ESC>/[0;1;2q/<ESC>/[0;1;4m/<ESC>/[1B&*()=:;/
+	.ASCII	<ESC>/[1D/<ESC>/[0;2q/<ESC>/[0;4m/<ESC>/[1A%/
+	.ASCII	<ESC>/[2D$/
+	.ASCII	<ESC>/[2D#/
+	.ASCII	<ESC>/[2D@/
+	.ASCII	<ESC>/[2D!/
+	.ASCII	<ESC>/[2D9/
+	.ASCII	<ESC>/[6C/<ESC>/[5B/<ESC>/[0;2;3q/<ESC>/[0;4;5m?/
+	.ASCII	<ESC>/[1D;/
+	.ASCII	<ESC>/[2D:/
+	.ASCII	<ESC>/[2D=/
+	.ASCII	<ESC>/[2D)/
+	.ASCII	<ESC>/[2D(/
+	.ASCII	<ESC>/[2D*/
+	.ASCII	<ESC>/[2D&/
+	.ASCII	<ESC>/[1D/<ESC>/[1A/<ESC>/[0;1;3q/<ESC>/[0;1;5m89!@#$%^/
+	.ASCII	<ESC>/[0q/	; No LEDs
+	.ASCII	<ESC>/[12;24r/	; Set scroll to 12 thru 24
+	.ASCII	<ESC>/[12;1H/	; Go to scroll area
+	.ASCII	<ESC>/[0m/	; Reset attributes
+	.ASCII	<ESC>/(B/	; Reset to USASCII
+	.ASCII	<ESC>/B/	; Restore cursor and attributes
+	VT100L = .-VT100_OUT_DATA
+
+VT100_ORIG_SCROL:		; Return to full screen scroll
+	.ASCII	<ESC>/[0;24r/<ESC>/[23;1H/
+	VOSL = .-VT100_ORIG_SCROL
+
+;
+; Terminal specific data for the VT52 terminal
+;
+VT52_DATA:
+	.LONG	VT52L
+	.ADDRESS VT52_OUT_DATA
+VT52_PREAMBLE:
+	.BYTE	VT52_PRE_LEN
+	.ASCII	<ESC>/H/		; Home
+	.ASCII	<ESC>/J/		; Clear
+	VT52_PRE_LEN = .-VT52_PREAMBLE-1
+VT52_OUT_DATA:
+	.ASCII	<ESC>/F/		; Enter graphics mode
+	.ASCII	/abcdefghijktuvwxyz{|}~/
+	.ASCII	<ESC>/Y/<34><53>/~/<ESC>/D/<ESC>/D}/
+	.ASCII	<ESC>/D/<ESC>/D|/<ESC>/D/<ESC>/D{/<ESC>/D/<ESC>/Dz/
+	.ASCII	<ESC>/D/<ESC>/Dy/<ESC>/D/<ESC>/Dx/<ESC>/D/<ESC>/Dw/
+	.ASCII	<ESC>/D/<ESC>/Dv/<ESC>/D/<ESC>/Du/<ESC>/D/<ESC>/Dt/
+	.ASCII	<ESC>/D/<ESC>/Dk/<ESC>/D/<ESC>/Dj/<ESC>/D/<ESC>/Di/
+	.ASCII	<ESC>/D/<ESC>/Dh/<ESC>/D/<ESC>/Dg/<ESC>/D/<ESC>/Df/
+	.ASCII	<ESC>/D/<ESC>/De/<ESC>/D/<ESC>/Dd/<ESC>/D/<ESC>/Dc/
+	.ASCII	<ESC>/D/<ESC>/Db/<ESC>/D/<ESC>/Da/<ESC>/Y/<33><54>
+	.ASCII	/l/<ESC>/D/<ESC>/Bs/<ESC>/Am/<ESC>/D/<ESC>/Br/
+	.ASCII	<ESC>/An/<ESC>/B/<ESC>/Dq/<ESC>/Ao/<ESC>/B/<ESC>/Dp/
+	.ASCII	<ESC>/Ap/<ESC>/B/<ESC>/Do/<ESC>/Aq/<ESC>/B/<ESC>/Dn/
+	.ASCII	<ESC>/Ar/<ESC>/B/<ESC>/Dm/<ESC>/As/<ESC>/B/<ESC>/Dl/
+	.ASCII	<ESC>/Ar/<ESC>/B/<ESC>/Dm/<ESC>/Aq/<ESC>/B/<ESC>/Dn/
+	.ASCII	<ESC>/Ap/<ESC>/B/<ESC>/Do/<ESC>/Ao/<ESC>/B/<ESC>/Dp/
+	.ASCII	<ESC>/An/<ESC>/B/<ESC>/Dq/<ESC>/Am/<ESC>/B/<ESC>/Dr/
+	.ASCII	<ESC>/Al/<ESC>/B/<ESC>/Ds/<ESC>/Aabcdefghijktuvwxyz{|}~/
+	.ASCII	<ESC>/Y/<34><69>/abcdefghijktuvwxyz{|}~/<ESC>/Aabcdefghijktuvwxyz{|}~/
+	.ASCII	<ESC>/Y/<34><91>/abcdefghijktuvwxyz{|}~/
+	.ASCII	<ESC>/G/<CR><LF>	; Exit graphics mode
+	VT52L = .-VT52_OUT_DATA
+;
+; Terminal specific data for the VT05 terminal
+;
+VT05_PREAMBLE:
+	.BYTE	VT05_PRE_LEN
+	.BYTE	29,0,0,0,31
+	VT05_PRE_LEN = .-VT05_PREAMBLE-1
+
+VT05_DATA:
+	.LONG	0			; There is no VT05 terminal specific data
+	.ADDRESS VT05_DATA
+;
+; Terminal specific data for the LA120 terminal
+;
+LA120_DATA:
+	.LONG	0			; There is no LA120 terminal specific data
+	.ADDRESS LA120_DATA
+;
+; Terminal specific data for the LA36 terminal
+;
+LA36_DATA:
+	.LONG	0			; There is no LA36 terminal specific data
+	.ADDRESS LA36_DATA
+;
+; Terminal specific data for the LA180 terminal
+;
+LA180_DATA:
+	.LONG	0			; There is no LA180 terminal specific data
+	.ADDRESS LA180_DATA
+;
+; Terminal specific data for the LA11 terminal
+;
+LA11_DATA:
+	.LONG	0			; There is no LA11 terminal specific data
+	.ADDRESS LA11_DATA
+;
+; Terminal specific data for the an UNKNOWN terminal
+;
+UNKN_PREAMBLE:
+	.BYTE	0
+
+UNKN_DATA:
+	.LONG	0			; There is no UNKNOWN terminal
+	.ADDRESS LA120_DATA		; specific data
+;
+; Terminal specific data for the LP11 terminal
+;
+LP11_DATA:
+	.LONG	0			; There is no LP11 terminal specific data
+	.ADDRESS LP11_DATA
+;
+; Terminal specific data for the LAX terminal
+;
+LAX_DATA:
+	.LONG	0			; There is no LAX terminal specific data
+	.ADDRESS LAX_DATA
+FORM_FEED:
+	.BYTE	1			; Form feed ASCIC string
+	.BYTE	FF
+
+CRLF:					; Carriage return and Line feed
+	.BYTE	CR,LF
+LFCR:					; Line feed and Carriage return
+	.BYTE	LF,CR
+
+	.SBTTL	Read/Write Data
+	.PSECT	RWDATA,WRT,NOEXE,PAGE
+
+TTCHAN:					; Channel associated with ctrl. term.
+	.WORD	0
+
+TTNAME_RWPTR:				; Descriptor for recursive...
+	.WORD	TTNAME_LEN,0		; ...translation of TTNAME
+	.ADDRESS TTNAME
+TTNAME:
+	.ASCII	/SYS$INPUT/
+	TTNAME_LEN=.-TTNAME
+	.BLKB	63-TTNAME_LEN
+
+FLAG:					; Miscellaneous flag bits
+	.WORD	0			; (See Equated Symbols for definitions)
+
+FAO_BUF:				; FAO output string descriptor
+	.WORD	TEXT_BUFFER,0
+	.ADDRESS BUFFER
+
+BUFFER_PTR:				; Fake .ASCID buffer for misc. strings
+	.WORD	TEXT_BUFFER,0		; A word for length, a word for desc.
+	.ADDRESS BUFFER
+
+BUFFER:					; FAO output and other misc. buffer
+	.BLKB	TEXT_BUFFER
+
+DEVDSC:					; Device name descriptor
+	.WORD	MAX_DEV_DESIG,0
+	.ADDRESS DEV_NAME
+
+
+; NOTE THAT THE CODE DEPENDS ON THE FOLLOWING TWO ITEMS BEING TOGETHER.
+PROCESS_NAME:				; Process name
+	.ASCID	/UETTTYS00_/
+DEV_NAME:				; Device name buffer
+	.BLKB	MAX_DEV_DESIG+MAX_UNIT_DESIG
+	NAME_LEN = .-DEV_NAME
+
+; END OF ITEMS WHICH CODE DEPENDS ON BEING TOGETHER.
+
+
+DATA_DSC:				; Descriptor for STR$UPCASE
+	.LONG	WRITE_SIZE
+	.ADDRESS 0
+DIB:					; Device Information Block
+	.WORD	DIB$K_LENGTH,0
+	.ADDRESS DIBBUF
+DIBBUF:
+	.BLKB	DIB$K_LENGTH
+
+DIB_SEC:				; Device Information Block (secondary)
+	.WORD	DIB$K_LENGTH,0
+	.ADDRESS DIBBUF_SEC
+DIBBUF_SEC:
+	.BLKB	DIB$K_LENGTH
+
+ERROR_COUNT:				; Cumulative error count at runtime
+	.LONG	0
+
+STATUS:					; Status value on program exit
+	.LONG	0
+
+STAT:					; IO status block
+	.QUAD	0
+
+AST_MODE:				; Prior setting of AST delivery
+	.LONG	0
+
+SS_FAIL_MODE:				; Prior setting of SS failure mode
+	.LONG	0
+
+INADDRESS:				; $CRMPSC address storage
+	.LONG	0,0
+OUTADDRESS:
+	.LONG	0,0
+
+UNIT_NUMBER:				; Current dev unit number for GET_LINE
+	.WORD	0
+
+DEVNAM_LEN:				; Current device name length
+	.WORD	0
+
+RANDOM1:				; Random word #1
+	.LONG	^XAAAAAAAA
+
+RANDOM2:				; Random word #2
+	.LONG	^XA72EA72E
+
+ITERATION:				; # of times all tests were executed
+	.LONG	0
+
+MSG_BLOCK:				; Auxiliary $GETMSG info
+	.BLKB	4
+
+PASS:					; Pass count
+	.LONG	0
+
+EXIT_DESC:				; Exit handler descriptor
+	.LONG	0
+	.ADDRESS EXIT_HANDLER
+	.LONG	1
+	.ADDRESS STATUS
+
+ARG_COUNT:				; Argument counter used by ERROR_EXIT
+	.LONG	0
+
+RMSRUNDWN_BUF:			; Return buf for RMSRUNDWN close failures
+	.WORD	22,0
+	.ADDRESS RUNDWN_BUF
+
+RUNDWN_BUF:
+	.BLKB 22
+	
+;
+; Head of self-relative UETP unit block list.
+;
+	.ALIGN QUAD
+
+UNIT_LIST:				; Head of unit block circular list
+	.QUAD	0
+
+NEW_NODE:				; Newly aquired node address
+	.QUAD	0
+
+HEAD_BUF:				; Buffer descriptor for the header message
+	.LONG	132
+	.ADDRESS 0
+HEAD_LENGTH:				; Length of header record
+	.LONG	0
+SPARE:					; Spot used to store byte while rotating data
+	.BYTE	0
+CUR_UNTBLK:				; Memory storage for the current unit block adr
+	.LONG	0
+
+	.SBTTL	RMS-32 Data Structures
+	.ALIGN	LONG
+
+INFAB:					; Allocate FAB for SYS$INPUT
+	$FAB-
+	FNM=<SYS$INPUT:>
+INRAB:					; Allocate RAB for SYS$INPUT
+	$RAB-
+	FAB=INFAB,-
+	ROP=PMT,-
+	PBF=PROMPT_MSG,-
+	PSZ=PMTSZ,-
+	UBF=DEV_NAME,-
+	USZ=NAME_LEN
+
+INI_FAB:				; Allocate FAB for UETINIDEV
+	$FAB-
+	FAC = <GET,PUT,UPD>,-
+	RAT = CR,-
+	SHR = <GET,PUT,UPI>,-
+	FNM = <UETINIDEV.DAT>
+
+INI_RAB:				; Allocate RAB for UETINIDEV
+	$RAB-
+	FAB = INI_FAB,-
+	RBF = BUFFER,-
+	UBF = BUFFER,-
+	USZ = REC_SIZE
+
+DDB_RFA:				; RFA storage for INI_RAB
+	.BLKB	6
+
+	.ALIGN	LONG
+SUP_FAB:				; Allocate FAB for UETSUPDEV
+	$FAB-
+	FAC = GET,-
+	SHR = <UPI,GET>,-
+	RAT = CR,-
+	FOP = UFO,-
+	FNM = <UETSUPDEV.DAT>
+
+;
+; Dummy FAB and RAB to copy to the UETP unit blocks
+; The following FAB and RAB must be contiguous and in this order!
+;
+
+DUMMY_FAB:
+	$FAB	RAT = <PRN>,-
+		RFM = <VFC>,-
+		FAC = <BRO,PUT>
+
+DUMMY_RAB:
+	$RAB	RSZ = WRITE_SIZE,-
+		ROP = <ASY,BIO>,-
+		RHB = 0
+
+	.SBTTL	Main Program
+	.PSECT	TTYS,EXE,NOWRT,PAGE
+
+	.DEFAULT DISPLACEMENT,WORD
+
+;+
+;	Start up the terminal test.  This entails some overhead necessary to
+;	cope with both expected and unforseen conditions, figuring out just
+;	what devices are to be tested, making sure we can test the indicated
+;	devices and setting up writeable space for each device to be tested.
+;-
+
+.ENTRY UETTTYS00,^M<>			; Entry mask
+
+	MOVAL	SSERROR,(FP)		; Declare exception handler
+	$SETSFM_S ENBFLG = #1		; Enable system service failure mode
+	$DCLEXH_S DESBLK = EXIT_DESC	; Declare an exit handler
+	$TRNLOG_S LOGNAM = TTNAME_RWPTR,- ; Try SYS$INPUT to make sure it
+		  RSLBUF = BUFFER_PTR	; We have to put the result somewhere
+	CMPL	R0,#SS$_NOTRAN		; Is there something there?
+	BEQL	20$			; BR if no SYS$INPUT assigned
+	$OPEN	FAB = INFAB,-		; Open SYS$INPUT
+		ERR = RMS_ERROR
+	$CONNECT-			; Connect RAB to SYS$INPUT
+		RAB = INRAB,-
+		ERR = RMS_ERROR
+	BBC	#DEV$V_TRM,-		; BR if SYS$INPUT is NOT a terminal
+		INFAB+FAB$L_DEV,10$
+	$TRNLOG_S LOGNAM = CONTROLLER,-	; Get the name of controller if
+		  RSLLEN = DEVNAM_LEN,-	;   logical name exists
+		  RSLBUF = DEVDSC
+	CMPL	R0,#SS$_NORMAL		; Was a controller specified?
+	BNEQ	10$			; BR if not
+	BRW	PROC_CONT_NAME		; Yes, go process it 
+10$:
+	$GET	RAB = INRAB,-		; Read SYS$INPUT for controller name
+		ERR = RMS_ERROR
+	MOVW	INRAB+RAB$W_RSZ,-	; Save the name length
+		DEVNAM_LEN
+	BNEQ	PROC_CONT_NAME		; BR if we got something
+	BBS	#DEV$V_TRM,-		; BR if SYS$INPUT is a terminal
+		INFAB+FAB$L_DEV,30$
+20$:	MOVL	#SS$_BADPARAM,STATUS	; Save the exit status
+	PUSHAL	NO_CTRLNAME		; Prepare for message...
+	PUSHL	#1			; ...arg count
+	PUSHL	#UETP$_TEXT!STS$K_ERROR ; ...signal name
+	PUSHL	#3			; ...arg count
+	BRW	ERROR_EXIT		; ...go tell of bad setup
+30$:
+	BISB2	#SELF_TESTM,FLAG	; Set self test mode
+40$:	$TRNLOG_S LOGNAM = TTNAME_RWPTR,- ; Recursively translate the name
+		  RSLLEN = TTNAME_RWPTR,- ;   of our controlling terminal
+		  RSLBUF = TTNAME_ROPTR
+	MOVAL	TTNAME,TTNAME_RWPTR+4	; Undo possible previous PPF fixup
+	CMPL	R0,#SS$_NOTRAN		; Have we reached the end yet?
+	BEQL	50$			; BR if we have
+	CMPW	#ESC,TTNAME		; Is this a Process Permanent File?
+	BNEQ	40$			; Recursively translate if not
+	SUBW	#4,TTNAME_RWPTR		; Remove RMS overhead from PPF name
+	ADDL2	#4,TTNAME_RWPTR+4
+	BRB	40$
+50$:					; SYS$INPUT translation finished
+	MOVC3	TTNAME_RWPTR,TTNAME,DEV_NAME ; Use physical terminal name
+	MOVW	TTNAME_RWPTR,DEVNAM_LEN ; Save the device name length
+
+PROC_CONT_NAME:
+	MOVW	DEVNAM_LEN,DEVDSC	; Set the device name length
+	PUSHAL	DEVDSC			; Make sure...
+	PUSHAL	DEVDSC			; ...that the specified controller...
+	CALLS	#2,G^STR$UPCASE		; ...is all uppercase for later comaparison
+	ADDW2	DEVNAM_LEN,PROCESS_NAME	; Get true process name length
+	CMPW	PROCESS_NAME,#MAX_PROC_NAME ; Is the result too long for VMS?
+	BLEQ	10$			; BR if not
+	MOVW	#MAX_PROC_NAME,PROCESS_NAME ; Make it as long as you can
+10$:
+	CLRL	-(SP)			; Set the time stamp flag
+	PUSHAL	PROCESS_NAME		; Set the test name
+	PUSHL	#2			; Push the argument count
+	PUSHL	#UETP$_BEGIND!STS$K_SUCCESS ; Set the message code
+	CALLS	#4,G^LIB$SIGNAL		; Print the startup message
+	BISW2	#BEGIN_MSGM,FLAG	; Set flag so we don't output it again
+	$SETPRN_S PRCNAM = PROCESS_NAME	; Set the process name to UETDEVS00_x
+	BBS	#DEV$V_TRM,-		; BR if SYS$INPUT is a terminal
+		INFAB+FAB$L_DEV,20$
+	BRW	40$
+20$:	$TRNLOG_S LOGNAM = TTNAME_RWPTR,- ; Recursively translate the name
+		  RSLLEN = TTNAME_RWPTR,- ;   of our controlling terminal
+		  RSLBUF = TTNAME_ROPTR
+	MOVAL	TTNAME,TTNAME_RWPTR+4	; Undo possible previous PPF fixup
+	CMPL	R0,#SS$_NOTRAN		; Have we reached the end yet?
+	BEQL	30$			; BR if we have
+	CMPW	#ESC,TTNAME		; Is this a Process Permanent File?
+	BNEQ	20$			; Recursively translate if not
+	SUBW	#4,TTNAME_RWPTR		; Remove RMS overhead from PPF name
+	ADDL2	#4,TTNAME_RWPTR+4
+	BRB	20$
+30$:	; SYS$INPUT translation finished
+	$ASSIGN_S DEVNAM = TTNAME_RWPTR,- ; We always need to assign a channel
+		  CHAN   = TTCHAN	  ; Returned channel number
+	$QIOW_S-			; Enable CTRL/C AST's...we are interractive
+		CHAN     = TTCHAN,-
+		FUNC     = #IO$_SETMODE!IO$M_CTRLCAST,-
+		P1       = CCASTHAND	; Handler address
+	PUSHAL	TEST_NAME		; ...and tell the user...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_ABORTC!STS$K_SUCCESS ; ...how to abort gracefully...
+	CALLS	#3,G^LIB$SIGNAL		; ...
+40$:
+	BBC	#SELF_TESTV,FLAG,50$	; Skip this if not self test
+	MOVC3	TTNAME_RWPTR,@<TTNAME_RWPTR+4>,-
+		DEV_NAME 		; Save our device name
+	MOVW	TTNAME_RWPTR,DEVDSC	; Save its size
+	ADDW3	#8,DEVDSC,PROCESS_NAME	; Fix the process name length
+	$GETDEV_S DEVNAM = DEVDSC,-
+		  PRIBUF = DIB		; Get the device characteristics
+	BSBW	GET_NODE		; Get a unit block and init it
+;
+; Set the device dependent parameters
+;
+	PUSHAL	DIBBUF			; Push the device characteristics buffer
+	ADDL3	#UNIT_LIST,UNIT_LIST,-(SP) ; Push the unit block address
+	CALLS	#2,SET_DEVDEP		; Set the device characteristics
+	$SETPRN_S PRCNAM = PROCESS_NAME	; Set the process name to UETTTYS00_x
+	BRW	ALL_SET			; Skip useless checking
+50$:
+
+;
+; From UETINIDEV.DAT and UETSUPDEV.DAT, get information which gives controller
+; and unit configuration and lets us know if the setup to run this test was
+; done correctly.
+;
+	$OPEN	FAB = INI_FAB,-		; Open file "UETINIDEV.DAT"
+		ERR = RMS_ERROR
+	$CONNECT RAB = INI_RAB,-	; Connect the RAB and FAB
+		 ERR = RMS_ERROR
+	$MGBLSC_S  INADR = INADDRESS,-	; Connect to UETSUPDEV global section
+		  RETADR = OUTADDRESS,-
+		  GSDNAM = SUPDEV_GBLSEC,-
+		   FLAGS = #SEC$M_EXPREG
+	CMPL	R0,#SS$_NOSUCHSEC	; Was the section already there?
+	BNEQ	60$			; BR if it was...
+	$OPEN	FAB = SUP_FAB,-		; ...else open "UETSUPDEV.DAT"
+		ERR = RMS_ERROR
+	$CRMPSC_S CHAN = SUP_FAB+FAB$L_STV,- ; Create the global section
+		 INADR = INADDRESS,-
+		RETADR = OUTADDRESS,-
+		GSDNAM = SUPDEV_GBLSEC,-
+		 FLAGS = #SEC$M_EXPREG!SEC$M_GBL
+60$:
+	SUBL3	OUTADDRESS,OUTADDRESS+4,R6 ; Create global section length
+
+FIND_IT:
+	$GET	RAB = INI_RAB,-		; Get the first record
+		ERR = RMS_ERROR
+	PUSHAL	CONT_DESC		; Make sure...
+	PUSHAL	CONT_DESC		; ...that the controller name...
+	CALLS	#2,G^STR$UPCASE		; ...is all uppercase letters
+	CMPB	#^A/D/,BUFFER		; Is this a DDB?
+	BEQL	10$			; Go on if not
+	CMPB	#^A/E/,BUFFER		; Is this the end of the file?
+	BNEQ	FIND_IT			; Continue on if not
+	PUSHAL	DEVDSC			; Push device not supported message
+	PUSHAL	PROCESS_NAME		; Parameters on the stack
+	PUSHL	#2
+	PUSHL	#UETP$_DENOSU
+	INSV	#STS$K_ERROR,-
+		#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,(SP)	; Set the severity code...
+	MOVL	(SP),STATUS		; ...and save it as the exit status
+	PUSHL	#4
+	BRW	ERROR_EXIT		; Exit in error
+10$:
+	CMPC	DEVNAM_LEN,BUFFER+6,DEV_NAME ; Is this the right controller?
+	BNEQ	FIND_IT			; BR if not
+	MOVC3	#6,INI_RAB+RAB$W_RFA,DDB_RFA ; Save the Record File Address
+	CMPB	#^A/T/,BUFFER+4		; Can we test this controller?
+	BEQL	FOUND_IT		; BR if we can...
+	$FAO_S	CTRSTR = DEAD_CTRLNAME,- ; ...and yell at user if we can't
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = #DEVDSC
+	MOVL	#SS$_BADPARAM,STATUS	; Set return status
+	PUSHAL	BUFFER_PTR		; ...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; ...
+	PUSHL	#3			; ...
+	BRW	ERROR_EXIT		; We can't test what we can't test
+
+FOUND_IT:
+	$GET	RAB = INI_RAB,-		; Get a record
+		ERR = RMS_ERROR
+	PUSHAL	CONT_DESC		; Make sure...
+	PUSHAL	CONT_DESC		; ...that this line...
+	CALLS	#2,G^STR$UPCASE		; ...is all uppercase letters
+	CMPB	#^A/U/,BUFFER		; Is this a UCB?
+	BEQL	20$			; BR if it is
+	CMPB	#^A/D/,BUFFER		; Is this a DDB?
+	BEQL	10$			; BR if yes
+	CMPB	#^A/E/,BUFFER		; Is this the end?
+	BEQL	10$			; BR if yes
+	PUSHAL	ILLEGAL_REC		; Then this is an error in the record
+	PUSHL	#1			; Push the error message
+	PUSHL	#UETP$_TEXT!STS$K_ERROR ; Push the signal name
+	PUSHL	#3			; Push the temp arg count
+	BRW	ERROR_EXIT		; Finish for good
+10$:
+	BRW	ALL_SET			; Found DDB or END
+20$:
+	CMPB	#^A/T/,BUFFER+4		; Is the unit testable?
+	BNEQ	FOUND_IT		; BR if not
+	PUSHL	#1			; Flag to ignore blanks when converting
+	PUSHL	#2			; Set byte size of results
+	PUSHAL	UNIT_NUMBER		; Set address to receive word
+	PUSHAL	UNIT_DESC		; Push string address
+	CALLS	#4,G^OTS$CVT_TZ_L	; Convert ASCII unit # to hex
+	SKPC	#^A/ /,#MAX_UNIT_DESIG,-
+		BUFFER+6		; Find out where unit number really is
+	ADDW3	R0,DEVNAM_LEN,DEVDSC	; Calculate device'unit string length
+	MOVZWL	DEVNAM_LEN,R2		; Offset to unit number in DEVDSC
+	MOVC3	R0,(R1),DEV_NAME(R2)	; Append unit number to device
+	$GETDEV_S DEVNAM = DEVDSC,-	; Get the device characteristics
+		  PRIBUF = DIB,-
+		  SCDBUF = DIB_SEC
+	BBC	#DEV$V_SPL,-
+		DIB$L_DEVCHAR+DIBBUF_SEC,25$	; Check for the spool bit
+	MOVC3	#DIB$K_LENGTH,DIBBUF_SEC,- ; Use secondary buffer if spooled
+		DIBBUF
+25$:	INCL	DEVDSC			; Don't forget the : on the end
+	MOVB	#^A/:/,(R3)		; Stick in the colon
+	MOVZBL	DIBBUF+DIB$B_DEVCLASS,R7 ; Save the device class
+	MOVZBL	DIBBUF+DIB$B_DEVTYPE,R8	; Save the device type
+	$FAO_S	CTRSTR = CS1,-
+		OUTBUF = FAO_BUF,-
+		P1     = R7,-
+		P2     = R8		; Make it into a string
+	MATCHC	#6,BUFFER,R6,@OUTADDRESS ; Find the device class and type
+	BEQL	30$			; BR if it was found
+	$FAO_S	CTRSTR = CS3,-		; Try for full class support
+		OUTBUF = FAO_BUF,-
+		    P1 = R7
+	MATCHC	#6,BUFFER,R6,@OUTADDRESS ; Find the device class only
+	BNEQ	40$			; BR if not found
+30$:
+	MOVZBL	TEST_NAME,R5		; Get the test name length
+	CMPC3	R5,(R3),TEST_NAME+8	; Are we the right test?
+	BEQL	50$			; BR if yes
+40$:
+	PUSHAL	DEVDSC			; Push device not supported message
+	PUSHAL	PROCESS_NAME		; Parameters on the stack
+	PUSHL	#2			; Push the argument count
+	PUSHL	#UETP$_DENOSU
+	INSV	#STS$K_ERROR,-
+		#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,(SP)	; Set the severity code...
+	MOVL	(SP),STATUS		; ...and save it as the exit status
+	PUSHL	#4			; Push the partial arg count...
+	BRW	ERROR_EXIT		; ...and split this scene
+50$:
+	PUSHR	#^M<R6>			; Save across GET_NODE & SET_DEVDEP
+	BSBW	GET_NODE		; Get a unit block and init it
+;
+; Set the device dependent parameters
+;
+	PUSHAL	DIBBUF			; Push device information block adr
+	PUSHL	R6			; Push unit block address
+	CALLS	#2,SET_DEVDEP		; Set the device dependent stuff
+	POPR	#^M<R6>			; Saved across GET_NODE & SET_DEVDEP
+	BRW	FOUND_IT		; Do the next UCB
+
+;
+; Arrive here when we have the device configuration.  In normal or loop forever
+; mode, set a timer far enough in the future such that we can do a reasonable
+; set of tests before the timer expires, but if our device gets hung, the
+; program won't waste too much time before noticing.  Let one-shot mode be a
+; special case.
+;
+ALL_SET:
+	TSTL	UNIT_LIST		; Anything to test?
+	BNEQ	10$			; BR if yes
+	PUSHAL	NOUNIT_SELECTED		; Else set up the error message...
+	PUSHL	#1			; ...argument count...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; ...signal name...
+	PUSHL	#3			; ...and parameter count
+	MOVL	#SS$_BADPARAM,STATUS	; Set return status
+	BRW	ERROR_EXIT		; ...and give up, complaining
+10$:
+	BISW2	#SAFE_TO_UPDM,FLAG	; OK safe to update UETINIDEV.DAT now
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6 ; Set the unit block address
+20$:
+	$TRNLOG_S LOGNAM = MODE,-	; Get the run mode
+		  RSLLEN = BUFFER_PTR,-
+		  RSLBUF = FAO_BUF
+	BICB2	#LC_BITM,BUFFER		; Convert to upper case
+	CMPB	#^A/O/,BUFFER		; Is this a one shot?
+	BNEQ	TIME_IT			; BR if not
+	BISW2	#TEST_OVERM,FLAG	; End after one iteration
+	BRW	ONE_SHOT		; Skip the SETIMR
+TIME_IT:
+	$SETIMR_S DAYTIM = THREEMIN,-	; Set timer AST to 3 minutes
+		  ASTADR = TIME_OUT,-
+		  EFN    = #EFN2
+
+RESTART:
+;******************************************************************************
+;
+; Device test specific code goes here.
+;
+; At this point the device designation is in location DEV_NAME pointed to by
+; descriptor DEVDSC. The device is known to be supported and testable by this test.
+; To leave successfully BRW SUC_EXIT, to leave in error BRW ERROR_EXIT.
+;
+;******************************************************************************
+
+	TSTL	PASS			; Only create and connect on the first pass
+	BNEQ	10$			; else branch
+	BBC	#SPL_UNITV,-		; Is this unit spooled?
+		UETUNT$B_FLAGS(R6),3$
+	BRW	25$			; BR if so - try the next one
+3$:
+	$CREATE  FAB = UETUNT$K_FAB(R6) ; Create the channel
+	BLBS	R0,5$			; Did we succeed? Br if yes...
+	INCL	ERROR_COUNT		; Bump the error count
+	PUSHL	R0			; Push the error code...
+	PUSHL	R0			; ...and the error code...
+	MOVZBL	UETUNT$T_FILSPC(R6),-
+		DEVDSC			; ...get the name size...
+	MOVAL	UETUNT$T_FILSPC+1(R6),-
+		DEVDSC+4		; ...get the name address...
+	PUSHAL	DEVDSC			; ...and push the device designation...
+	PUSHAL	TEST_NAME		; ...and the test name...
+	PUSHL	#3			; ...and the arg count...
+	PUSHL	#UETP$_DEUNUS!STS$K_ERROR ; ...and the signal name...
+	PUSHL	ERROR_COUNT		; ...and the error count...
+	PUSHL	#1			; ...and the argument count...
+	PUSHL	#UETP$_ERBOX!STS$K_ERROR ; ...and the signal name...
+	CALLS	#9,G^LIB$SIGNAL		; ...and print the error
+	BICB2	#UETUNT$M_TESTABLE,-
+		UETUNT$B_FLAGS(R6)	; Clear the testable bit
+	BISB2	#UETUNT$M_DONE,-
+		UETUNT$B_FLAGS(R6)	; Set the done testing bit
+	BRW	25$			; Skip testing
+5$:
+	$CONNECT RAB = UETUNT$K_RAB(R6),-
+		 ERR = RMS_ERROR	; Connect the RAB
+10$:
+	BISB2	#UETUNT$M_TESTABLE,-
+		UETUNT$B_FLAGS(R6)	; Set the testable bit
+	MOVAL	SERVICE_IO2,R8		; Set the success service address
+	MOVAL	UETUNT$K_RAB(R6),R7	; Get the RAB address
+	MOVAL	UETUNT$K_HEADER+2(R6),-
+		RAB$L_RBF(R7)		; Set RAB write address
+	MOVW	UETUNT$K_HEADER(R6),-
+		RAB$W_RSZ(R7)		; Set RAB write size
+	CMPW	RAB$W_RSZ(R7),#HDR_OUT_SIZE ; Check the size
+	BLEQ	20$			; Br if small enough...
+	MOVW	#HDR_OUT_SIZE,RAB$W_RSZ(R7) ; ...else make it small enough
+	MOVAL	SERVICE_IO1,R8		; It will take more than one bite
+					; to output this header
+20$:
+	MOVB	UETUNT$B_HD_LEN(R6),-
+		UETUNT$B_LINE(R6)	; Save it's length in lines
+	$WRITE	RAB = (R7),-
+		ERR = RMS_ERROR,-
+		SUC = (R8)		; Write the header async
+25$:
+	ADDL2	(R6),R6			; Get the next unit block address
+	CMPL	R6,#UNIT_LIST		; Is this the end?
+	BEQL	30$			; Br if yes...
+	BRW	RESTART			; else do the next one...
+30$:
+	ADDL3	#UNIT_LIST,UNIT_LIST,R11 ; Set the unit block list header
+40$:
+	BITB	#UETUNT$M_TESTABLE,-
+		UETUNT$B_FLAGS(R11)	; Is this unit testable?
+	BNEQ	50$			; BR if yes
+	ADDL2	(R11),R11		; Next unit block
+	CMPL	R11,#UNIT_LIST		; Are we full circle in the list?
+	BNEQ	40$			; BR if not
+	PUSHAL	NOUNIT_SELECTED		; Else set up the error message...
+	PUSHL	#1			; ...argument count...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; ...signal name...
+	PUSHL	#3			; ...and parameter count
+	MOVL	#SS$_BADPARAM,STATUS	; Set return status
+	BRW	ERROR_EXIT		; ...and give up, complaining
+50$:
+	$HIBER_S			; Service I/O AST's
+	$CANTIM_S			; Forget the watchdog timer
+	BRW	SUC_EXIT		; Loop until the test is over
+
+ONE_SHOT:
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6 ; Get the list address
+ONE_SHOT_LOOP:
+	BBC	#SPL_UNITV,-		; Is this unit spooled?
+		UETUNT$B_FLAGS(R6),5$
+	BRW	NEXT_TTY		; BR if it is - try the next
+5$:
+	MOVL	R6,CUR_UNTBLK		; Save a copy of the adr in perm mem
+	$SETIMR_S DAYTIM = FIVESEC,-
+		  ASTADR = TIMED_OUT,-
+		  EFN    = #EFN2	; Set a 5 second watch dog timer
+	MOVZBL	UETUNT$T_FILSPC(R6),-
+		DEVDSC			; Get the name size
+	MOVAL	UETUNT$T_FILSPC+1(R6),-
+		DEVDSC+4		; Get the name address
+	$SETSFM_S ENBFLG = #0		; Don't bail out on this error
+	$ASSIGN_S DEVNAM = DEVDSC,-
+		  CHAN   = UETUNT$W_CHAN(R6) ; Assign the channel
+	MOVL	R0,STATUS		; Save the status
+	BLBS	STATUS,10$		; If OK then go on...
+	BRW	ONESHOT_ERROR		; ...else take care of failure.
+10$:
+	MOVZWL	UETUNT$K_HEADER(R6),R7	; Get the header size
+	MATCHC	#2,CRLF,R7,-
+		UETUNT$K_HEADER+2(R6)	; Find the CR/LF. There has to be one
+	MOVAL	UETUNT$K_HEADER+2(R6),-
+		R8			; Get the header start address
+	SUBL3	R8,R3,R8		; Get the byte count to the start of...
+	MOVL	R6,CUR_UNTBLK		; Save the unit block address
+	$QIOW_S	FUNC = #IO$_WRITEVBLK,-
+		CHAN = UETUNT$W_CHAN(R6),-
+		IOSB = UETUNT$K_RAB+RAB$L_STS(R6),-
+		P1   = UETUNT$K_HEADER+2(R6),-
+		P2   = R8		; Output the header
+	BLBS	R0,20$			; BR if no error...
+	MOVL	R0,STATUS		; Save the status
+	MOVL	R0,R9
+	BRW	ONESHOT_ERROR		; ...else take care of failure.
+20$:
+	$CANTIM_S			; Forget the watch dog timer
+	$SETSFM_S ENBFLG = #1		; Turn on SS failure mode
+	MOVZWL	UETUNT$K_RAB+RAB$L_STS(R6),R9 ; Get the IOSB value
+	BLBS	R9,30$ 			; If the IOSB has no error we are OK
+	MOVL	R9,STATUS		; Save the error code
+	BRW	ONESHOT_ERROR		; Report the failure
+	BRB	NEXT_TTY		; ...and look at the rest of the lines
+30$:
+	BISB2	#UETUNT$M_TESTABLE,-
+		UETUNT$B_FLAGS(R6)	; We have a good line here. Say so.
+NEXT_TTY:
+	ADDL2	(R6),R6			; Get the next unit block
+	CMPL	#UNIT_LIST,R6		; Are we all done?
+	BEQL	SUC_EXIT		; Br if yes
+	BRW	ONE_SHOT_LOOP		; Else test the next line
+ONESHOT_ERROR:
+	$CANTIM_S			; Forget the watchdog timer
+	INCL	ERROR_COUNT		; Bump the error count
+	PUSHL	STATUS			; Push the error code...
+	PUSHL	STATUS			; ...and the error code...
+	PUSHAL	DEVDSC			; ...and the device designation...
+	PUSHAL	TEST_NAME		; ...and the test name...
+	PUSHL	#3			; ...and the arg count...
+	PUSHL	#UETP$_DEUNUS!STS$K_ERROR ; ...and the signal name...
+	PUSHL	ERROR_COUNT		; ...and the error count...
+	PUSHL	#1			; ...and the argument count...
+	PUSHL	#UETP$_ERBOX!STS$K_ERROR ; ...and the signal name...
+	CALLS	#9,G^LIB$SIGNAL		; ...and print the error
+	CMPW	R9,#SS$_CANCEL		; Did a timeout occur?
+	BEQL	10$			; BR if it was
+	CMPW	R9,#SS$_ABORT		; Did a timeout occur?
+	BNEQ	20$			; BR if not
+10$:
+	PUSHAL	TIME_OUT_MSG		; Print the timeout error message
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#3,G^LIB$SIGNAL
+20$:
+	BRW	NEXT_TTY		; Go do the next unit
+TIMED_OUT:
+	.WORD	0			; Go here with watchdog timer timeout
+	MOVL	CUR_UNTBLK,R6		; Get the unit block address
+	$CANCEL_S CHAN = UETUNT$W_CHAN(R6) ; This is one IO that will never complete
+	RET
+
+SUC_EXIT:
+	$TRNLOG_S LOGNAM = MODE,-
+		  RSLLEN = BUFFER_PTR,-
+		  RSLBUF = FAO_BUF	; Get the run mode
+	BICB2	#LC_BITM,BUFFER		; Convert to upper case
+	CMPB	#^A/L/,BUFFER		; Is this a loop for ever?
+	BNEQ	10$			; BR if not
+	BICW2	#TEST_OVERM,FLAG	; Reset the termination flag
+	INCL	PASS			; Bump the pass count
+	$FAO_S	CTRSTR = PASS_MSG,-
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = PASS,-
+		P2     = ITERATION,-
+		P3     = #0		; Make the end of pass message
+	PUSHAL	BUFFER_PTR		; Push the string desc.
+	PUSHL	#1			; Push arg count
+	PUSHL	#UETP$_TEXT!STS$K_INFO	; Push the signal name
+	CALLS	#3,G^LIB$SIGNAL		; Print the end of pass message
+	CLRL	ITERATION		; Reset the iteration count
+	BRW	TIME_IT			; Do the next pass
+10$:
+	MOVL	#SS$_NORMAL!STS$M_INHIB_MSG,STATUS ; Set successful exit status
+	$EXIT_S STATUS			; Exit with the status
+
+	.SBTTL	GET_NODE Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+; This routine dynamically allocates enough memory for a unit block,
+; a device dependent parameter area and I/O buffers. The unit block is inserted
+; into the queue header UNIT_LIST.  It then initializes the unit block.
+; The unit block format is as follows:
+;
+;			+---------------+ -------
+;	UETUNT$L_FLINK	!		!	^
+;			+---------------+	!
+;	UETUNT$L_BLINK	!		!	!
+;			+-----------+---+	!
+;	UETUNT$B_TYPE		    !   !	!
+;			    +-------+---+	!
+;	UETUNT$W_SIZE	    !   !   !    contains DEVDEP_SIZE + UETUNT$C_INDSIZ
+;			+---+-------+		!
+;	UETUNT$B_FLAGS  !   !			!
+;			+---+   +-------+	!
+;	UETUNT$W_CHAN	        !   !   !	!
+;			+-------+-------+	!
+;	UETUNT$W_FUNC	!   !   !		!
+;			+-------+-------+	+----- UETUNT$C_SIZE
+;	UETUNT$L_ITER	!		!	!
+;			+---------------+	!
+;	UETUNT$T_FILSPC	!		!	!
+;			!/\/\/\/\/\/\/\/!	!
+;			     128 bytes		!
+;			!/\/\/\/\/\/\/\/!	!
+;			!		!	!
+;	UETUNT$K_FAB	!---------------!	!
+;			!		!	!
+;			!/\/\/\/\/\/\/\/!	!
+;			 FAB$C_BLN bytes	!
+;			!/\/\/\/\/\/\/\/!	!
+;			!		!	!
+;	UETUNT$K_RAB	+---------------+	!
+;			!		!	!
+;			!\/\/\/\/\/\/\/\!	!
+;			 RAB$C_BLN bytes	!
+;			!\/\/\/\/\/\/\/\!	!
+;			!		!	v
+;	UETUNT$K_DEVDEP	+-----------+---+ -------
+;	UETUNT$B_LINE		    !   !	^
+;				+---+---+	!
+;	UETUNT$B_HD_LEN		!   !		!
+;			    +---+---+		!
+;	UETUNT$B_LENGTH	    !   !		!
+;			+---+---+               +----- DEVDEP_SIZE
+;	UETUNT$W_WIDTH  !       !		!
+;			+-------+-------+	!
+;	UETUNT$L_CURHDR !               !       !
+;			+---------------+       !
+;	UETUNT$K_CCTBL	!		!	v
+;	UETUNT$K_WRITE	+---------------+ -------
+
+;	UETUNT$K_WRITE  +---------------+ -------
+;    	WRITE buffer 	!		!	^
+;			!\/\/\/\/\/\/\/\!	!
+;			    257 bytes		+----- WRITE_SIZE
+;			!/\/\/\/\/\/\/\/!	!
+;			!		!	v
+;	UETUNT$K_HEADER	+---------------+ -------
+;    	HEADER buffer 	!		!	^
+;			!\/\/\/\/\/\/\/\!	!
+;			    132 bytes		+----- HEADER_SIZE
+;			!/\/\/\/\/\/\/\/!	!
+;			!		!	v
+;			+---------------+ -------
+;
+; CALLING SEQUENCE:
+;	BSBW	GET_NODE
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	UNIT_LIST contains head of doubley linked circular list of unit blocks
+;
+; OUTPUT PARAMETERS:
+;	R6 = address of  new node
+;
+; IMPLICIT OUTPUTS:
+;	New inited unit block is inserted into UNIT_LIST
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+GET_NODE:
+
+	$EXPREG_S PAGCNT = #PAGES,-
+		  RETADR = NEW_NODE	; Get a new node of demand zero memory
+	INSQTI	@NEW_NODE,UNIT_LIST	; Put the new node in the unit list
+	MOVL	NEW_NODE,R6		; Save a copy of its address
+	MOVB	#1,UETUNT$B_TYPE(R6)	; Set the structure type
+	MOVW	#UETUNT$C_INDSIZ+DEVDEP_SIZE,-
+		UETUNT$W_SIZE(R6)	; Set the structure size
+	MOVB	DEVDSC,UETUNT$T_FILSPC(R6) ; Set the device name size
+	MOVC3	DEVDSC,@DEVDSC+4,-
+		UETUNT$T_FILSPC+1(R6)	; Save the device name
+	MOVC3	#FAB$C_BLN+RAB$C_BLN,-
+		DUMMY_FAB,UETUNT$C_FAB(R6) ; Save a FAB and a RAB away
+	MOVAL	UETUNT$K_FAB(R6),R7	; Save the FAB address
+	MOVAL	UETUNT$K_RAB(R6),R8	; Save the RAB address
+	MOVL	R7,RAB$L_FAB(R8)	; Set the FAB address in the RAB
+	MOVB	UETUNT$T_FILSPC(R6),-
+		FAB$B_FNS(R7)		; Set the FNS field in the FAB
+	MOVAL	UETUNT$T_FILSPC+1(R6),-
+		FAB$L_FNA(R7)		; Set the FNA field in the FAB
+	MOVAL	(R6),RAB$L_CTX(R8)	; Set the UETUNT address in the RAB
+	MOVAL	UETUNT$K_HEADER(R6),-
+		RAB$L_RBF(R8)		; Set the buffer address
+	RSB
+
+	.SBTTL	SET_DEVDEP Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine initializes the device dependent parameters in the unit
+;	block specified.
+;
+; CALLING SEQUENCE:
+;	PUSHAL	DIB			; Push the device information block adr
+;	PUSHAL	UNIT_BLOCK		; Push the unit block address
+;	CALLS	#2,SET_DEVDEP		; Set the device characteristics
+;
+; INPUT PARAMETERS:
+;	4(AP) address of the unit block
+;	8(AP) address of the device information block
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Device characteristics are inited in the unit block
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+SET_DEVDEP:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	MOVL	4(AP),R6		; Get the unit block address
+	MOVL	8(AP),R9		; Get the DIB address
+	MOVAL	TESDEV_TBL,R10		; Set the table address
+	CMPB	#DT$_LA120,DIB$B_DEVTYPE(R9) ; Should only 2 pages be printed?
+	BNEQ	10$			; Br if not...
+	BISB2	#UETUNT$M_2PL,UETUNT$B_FLAGS(R6) ; ...else set the flag
+10$:
+	CMPB	#DC$_LP,DIB$B_DEVCLASS(R9) ; Should only 2 pages be printed?
+	BNEQ	20$			; Br if not ...
+	BISB2	#UETUNT$M_2PL,UETUNT$B_FLAGS(R6) ; ...else set the flag
+20$:
+	CMPW	(R10),DIB$B_DEVCLASS(R9) ; Is this the right table entry?
+	BEQL	30$			; Br if yes
+	ACBW	#TESDEV_TBL_END,#15,R10,20$ ; Do it for the whole table
+	MOVAL	UNKNOWN1,R10		; Assume the lowest level of test
+30$:
+	MOVAL	UETUNT$K_HEADER+2(R6),-
+		HEAD_BUF+4		; Set the output address
+	MOVB	2(R10),UETUNT$B_HD_LEN(R6) ; Save the header length in lines
+	CMPL	7(R10),#VT100_PREAMBLE	; Is this a scroll region device?
+	BNEQ	35$			; BR if not
+	BISB2	#SCROL_CLRM,UETUNT$B_FLAGS(R6) ; else set the scrol clear flag
+35$:
+	$FAO_S  CTRSTR = HEAD_CTRSTR,-
+		OUTLEN = HEAD_LENGTH,-
+		OUTBUF = HEAD_BUF,-
+		P1     = 7(R10),-
+		P2     = 3(R10),-
+		P3     = #DEVDSC	; Form the header + preamble
+	MOVW	HEAD_LENGTH,-
+		UETUNT$K_HEADER(R6)	; Save the header/preamble length
+	MOVAL	UETUNT$K_HEADER+2(R6),R8 ; Get the header start address
+	MOVAL	HDR_OUT_SIZE(R8),-
+		UETUNT$L_CURHDR(R6)	; Set the current header address
+	MOVZWL	HEAD_LENGTH,R7		; Get the header length
+	ADDL2	R7,R8			; Make the start address for the TSD
+	MOVL	11(R10),R7		; Get the TSD desc address
+	MOVC3	(R7),@4(R7),(R8)	; Copy the TSD into the unit block
+	ADDW2	(R7),UETUNT$K_HEADER(R6) ; update the total header length
+40$:
+	MOVB	DIB$L_DEVDEPEND+3(R9),-
+		UETUNT$B_LENGTH(R6)	; Set the page length
+	MOVZWL	DIB$W_DEVBUFSIZ(R9),-
+		R7			; Get the line size
+	MOVW	R7,UETUNT$W_WIDTH(R6)	; Save the line size
+	ADDW2	#SIZE_TBL_LEN,R7	; Add in the CCTBL table length
+	MOVC3	R7,SIZE_TBL,UETUNT$K_CCTBL(R6) ; Init the CC tbl and write buffer
+	SUBL2	#SIZE_TBL_LEN,R7	; Take size table back out
+	ADDW2	R7,UETUNT$K_CCTBL(R6)	; Set the record lengths
+	ADDW2	R7,UETUNT$K_CCTBL+2(R6)
+	ADDW2	R7,UETUNT$K_CCTBL+4(R6)
+	ADDW2	R7,UETUNT$K_CCTBL+6(R6)
+	ADDL2	#UETUNT$K_WRITE,R7	; Calculate the byte offset into the block
+	ADDL2	R6,R7			; Calculate the address
+	MOVW	LFCR,(R7)		; Set up the termination characters
+	BITL	#TT$M_LOWER,DIB$L_DEVDEPEND(R9) ; Is this a lower case terminal?
+	BNEQ	50$			; Br if yes
+	MOVL	#WRITE_SIZE,DATA_DSC	; Init the string descriptor
+	MOVAL	UETUNT$K_WRITE(R6),-
+		DATA_DSC+4
+	PUSHAL	DATA_DSC		; Set up STR$UPCASE destination
+	PUSHAL	DATA_DSC		; Set up source
+	CALLS	#2,G^STR$UPCASE		; Convert data buffer to upper case
+50$:
+	INCL	UETUNT$L_ITER(R6)	; Set to page 1
+	BBC	#DEV$V_SPL,-
+		DIB$L_DEVCHAR(R9),60$	; Check for the spool bit
+	BISB2	#SPL_UNITM!UETUNT$M_DONE,- ; We can't test spooled devices
+		UETUNT$B_FLAGS(R6)
+	$FAO_S	CTRSTR = NOSPOOLED,-	; Let the user know about it
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = #DEVDSC
+	INCL	ERROR_COUNT
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_WARNING
+	PUSHL	ERROR_COUNT
+	PUSHL	#1
+	PUSHL	#UETP$_ERBOX!STS$K_WARNING
+	CALLS	#6,G^LIB$SIGNAL
+60$:
+	RET
+
+	.SBTTL SERVICE_IO
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine services all asynchronous I/O completions for all unit
+;	numbers under test.  After the proper number of iterations or elapsed
+;	time have been completed the unit number is disabled for testing.
+;	This routine does the data checking as well as the next I/O initiation.
+;
+; CALLING SEQUENCE:
+;	Entered via an AST from the RMS
+;
+; INPUT PARAMETERS:
+;	4(AP) = address of RAB of unit completing I/O
+;
+; OUTPUT PARAMETERS:
+;	None
+;--
+
+SERVICE_IO:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	MOVL	4(AP),R11			; Get the RAB address
+NEW_PAGE:
+	$DISCONNECT RAB = (R11),-
+		    ERR = RMS_ERROR		; Disconnect to set IO mode
+	BISL2	#RAB$M_BIO,RAB$L_ROP(R11)	; Set to block IO for the header
+	$CONNECT    RAB = (R11),-
+		    ERR = RMS_ERROR		; OK now hook it back up
+	BRB	SERVICE_IO1+2			; This is first time only for the
+;
+; This entry point is to service header AST's.
+;
+
+SERVICE_IO1:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	MOVL	4(AP),R11			; Get the RAB address
+	MOVL	RAB$L_CTX(R11),R10		; Save the unit block address
+	MOVAL	SERVICE_IO1,R8			; Set the AST service routine address
+	MOVL	UETUNT$L_CURHDR(R10),RAB$L_RBF(R11) ; Set the transfer address
+	MOVZWL	UETUNT$K_HEADER(R10),R7		; Get the header size
+	MOVAL	UETUNT$K_HEADER+2(R10),R9	; Get the header start address
+	ADDL2	R7,R9				; Calculate the end address
+	ACBW	R9,#256,UETUNT$L_CURHDR(R10),10$ ; Output header in chunks
+	SUBL2	RAB$L_RBF(R11),R9		; If not enough header left for 256...
+	MOVW	R9,RAB$W_RSZ(R11)		; ...then set size to whats left...
+	MOVAL	SERVICE_IO2,R8			; ...and setup AST adr for data
+10$:
+	$WRITE	RAB = (R11),-
+		SUC = (R8),-
+		ERR = RMS_ERROR			; Start the next header write
+	RET
+;
+; This entry point is to set up for non-header data transfers.
+;
+
+SERVICE_IO2:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	MOVL	4(AP),R11			; Get the RAB address
+	$DISCONNECT RAB = (R11),-
+		    ERR = RMS_ERROR		; Disconnect to set IO mode
+	BICL2	#RAB$M_BIO,RAB$L_ROP(R11)	; Set to record IO for the data
+	$CONNECT    RAB = (R11),-
+		    ERR = RMS_ERROR		; OK now hook it back up
+	BRB	SERVICE_IO3+2			; This is first time only for the
+
+;
+; This entry point is to service normal data transfers.
+;
+	
+SERVICE_IO3:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	MOVL	4(AP),R11			; Get the RAB address
+	MOVL	RAB$L_CTX(R11),R10		; Save the unit block address
+	CLRQ	R8				; Clear the area
+	SUBB3	UETUNT$B_HD_LEN(R10),-
+		UETUNT$B_LINE(R10),R8		; Leave the non-header line cnt
+						; in R8
+	EDIV	#CC_TBL_SIZE,R8,R8,R8		; Leave the CC_TBL index in R8
+	MOVL	CC_TBL+1[R8],R7			; Get the size table index
+	MOVZBL	R7,R7				; Clean off the garbage
+	MOVAL	UETUNT$K_WRITE(R10),RAB$L_RBF(R11) ; Set the new transfer adr
+	MOVW	UETUNT$K_CCTBL(R10)[R7],-
+		RAB$W_RSZ(R11)			; Set the transfer size
+	MOVAL	CC_TBL+2[R8],RAB$L_RHB(R11)	; Set the carriage control char's
+	MOVL	UETUNT$W_WIDTH(R10),R9		; Get the line length
+	DECL	R9				; Move it over one byte
+	MOVB	UETUNT$K_WRITE(R10)[R9],SPARE	; Rotate the data pattern...
+	MOVC3	R9,UETUNT$K_WRITE(R10),-
+		UETUNT$K_WRITE+1(R10)		; ...
+	MOVB	SPARE,UETUNT$K_WRITE(R10)	;
+	INCB	UETUNT$B_LINE(R10)		; One more line done
+	CMPB	UETUNT$B_LINE(R10),-
+		UETUNT$B_LENGTH(R10)		; Is the page full?
+	BEQL	10$				; BR if yes
+	BRW	80$				; Br if not
+10$:
+	MOVAL	UETUNT$K_HEADER+2(R10),-
+		UETUNT$L_CURHDR(R10)		; Reset header address
+	BBC	#SCROL_CLRV,UETUNT$B_FLAGS(R10),20$ ; BR if no scroll to clear
+	MOVAL	VT100_ORIG_SCROL,RAB$L_RBF(R11) ; Set the reset scroll address
+	MOVW	#VOSL,RAB$W_RSZ(R11)		; Set the reset scroll length
+	$PUT	RAB = (R11),-
+		ERR = RMS_ERROR			; Reset the scroll region
+	$WAIT	RAB = (R11)			; Wait for the I/O to finish
+	MOVAL	UETUNT$K_WRITE(R10),RAB$L_RBF(R11) ;  Reset the write address
+20$:
+	$SETIMR_S DAYTIM = TWOSEC,-		; Pause in testing to give other
+		  EFN    = #12			;  tests a chance to run
+	$WAITFR_S EFN = #12
+	BBC	#TEST_OVERV,FLAG,50$		; BR if we are done
+	BISB2	#UETUNT$M_DONE,UETUNT$B_FLAGS(R10) ; ...else set our done flag
+30$:
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6		; Get the list header
+40$:
+	BBC	#UETUNT$V_DONE,UETUNT$B_FLAGS(R6),90$ ; BR if any unit is not done
+	ADDL3	R6,(R6),R6			; Get the next unit block adr
+	CMPL	R6,#UNIT_LIST			; All done checking?
+	BNEQ	40$				; BR if yes
+	$WAKE_S					; Else its all over with
+	RET					; Tha-a-Tha-a-Thats all folks
+50$:
+	INCL	UETUNT$L_ITER(R10)		; Bump iteration counter
+	INCL	ITERATION			; and test wide iteration count
+	BBC	#UETUNT$V_2PL,UETUNT$B_FLAGS(R10),60$ ; Br if no 2 page limit
+	CMPL	#3,UETUNT$L_ITER(R10)		; See if 2 pages are out
+	BNEQ	60$				; Br if not yet
+	BISB2	#UETUNT$M_DONE,UETUNT$B_FLAGS(R10) ; Set the done flag
+	BRB	30$				; Stop testing
+60$:
+	MOVB	UETUNT$B_HD_LEN(R10),-
+		UETUNT$B_LINE(R10)		; Init line count
+	MOVW	UETUNT$K_HEADER(R10),-
+		RAB$W_RSZ(R11)			; Set RAB write size
+	CMPW	RAB$W_RSZ(R11),#HDR_OUT_SIZE 	; Check the size
+	BLEQ	70$				; Br if small enough...
+	MOVW	#HDR_OUT_SIZE,RAB$W_RSZ(R11)	; ...else make it small enough
+70$:
+	BRW	NEW_PAGE			; Start a fresh page
+80$:
+	$PUT	RAB = UETUNT$K_RAB(R10),-
+		ERR = RMS_ERROR,-
+		SUC = SERVICE_IO3		; Kick off the next I/O operation
+90$:
+	RET
+
+	.SBTTL	Timer Expiration Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine will be called when the three minute pass timer expires.
+;	The number of pages output by each unit is checked. If less then two
+;	pages were completed the device must be very slow or hung. To force
+;	completion of the slow units the line count is set to one less than
+;	the total page size. A two minute watchdog timer is then set - all
+;	units should finish unless they are hung. If the watchdog timer goes
+;	off an error message is output for all the units that did not finish.
+;
+; CALLING SEQUENCE:
+;	Called via AST at $SETIMR expiration.
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+TIME_OUT:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	BISW2	#TEST_OVERM,FLAG		; Set the test over flag
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6		; Get the list header
+10$:
+	BBC	#UETUNT$V_TESTABLE,-		; Br if unit is not testable
+		UETUNT$B_FLAGS(R6),20$
+	CMPL	#3,UETUNT$L_ITER(R6)		; 2 pages done? (starts with 1)
+	BLEQ	20$				; BR if more than 2 pages are out
+						; ... must be a fast terminal
+	SUBB3	#1,UETUNT$B_LENGTH(R6),-	; Set line count equal to page
+		UETUNT$B_LINE(R6)		; ...length minus one
+20$:
+	ADDL2	(R6),R6				; Get the next unit block adr
+	CMPL	R6,#UNIT_LIST			; All done checking?
+	BNEQ	10$				; BR if no
+	$SETIMR_S DAYTIM = TWOMIN,-		; Every unit should be done 
+		  ASTADR = WATCHDOG_TIMER	;  within 2 minutes
+	RET
+
+WATCHDOG_TIMER:	; We should never get here unless there is a hung device.
+
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6		; Get the list header
+10$:
+	BBC	#UETUNT$V_TESTABLE,-		; Br if unit is not testable
+		UETUNT$B_FLAGS(R6),20$
+	BBS	#UETUNT$V_DONE,UETUNT$B_FLAGS(R6),20$ ; BR if this unit is done
+	MOVZBW	UETUNT$T_FILSPC(R6),DEVDSC	; Setup device name length
+	MOVC3	DEVDSC,UETUNT$T_FILSPC+1(R6),-	; Get device name
+		DEV_NAME
+	$FAO_S	CTRSTR = TIMOUT_ERR_MSG,-		; Prepare error message
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = #DEVDSC
+	INCL	ERROR_COUNT			; Bump the error count
+	PUSHAL	BUFFER_PTR			; push error message
+	PUSHL	#1				; push arg count
+	PUSHL	#UETP$_TEXT!STS$K_ERROR		; push the signal name
+	PUSHL	ERROR_COUNT			; ...and the error count...
+	PUSHL	#1				; ...and the argument count...
+	PUSHL	#UETP$_ERBOX!STS$K_ERROR 	; ...and the signal name...
+	CALLS	#6,G^LIB$SIGNAL			; report the error
+	BISW2	#TIMOUT_ERRM,FLAG		; Set time out error flag
+20$:
+	ADDL2	(R6),R6				; Get the next unit block adr
+	CMPL	R6,#UNIT_LIST			; All done checking?
+	BNEQ	10$				; BR if no
+	$WAKE_S
+	RET
+
+
+	.SBTTL	System Service Exception Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine is executed if a software or hardware exception occurs or
+;	if a LIB$SIGNAL system service is used to output a message.
+;	Information about this method of handling messages and errors can be
+;	found in the VMS COMMON RUN-TIME manual and in the VMS SYSTEM SERVICE
+;	manual.
+;
+; CALLING SEQUENCE:
+;	Entered via an exception from the system
+;
+; INPUT PARAMETERS:
+;	ERROR_COUNT   = previous cumulative error count
+;	                -----------------
+;	   AP ---->     !       2       !
+;			!---------------!
+;			! SIGNL ARY PNT !
+;			!---------------!
+;			! MECH  ARY PNT !
+;			!---------------! ---------
+;			!       4       !         ^
+;			!---------------!         !
+;			! ESTABLISH FP  !         !
+;			!---------------!         !
+;			!    DEPTH      ! Mechanism Array
+;			!---------------!         !
+;			!      R0       !         !
+;			!---------------!         !
+;			!      R1       !         v
+;			!---------------! ---------
+;			!       N       !         ^
+;			!---------------!         !
+;			! CONDITION NAME!         !
+;			!---------------!         !
+;			! N-3 ADDITIONAL!    Signal Array
+;			! LONG WORD ARGS!         !
+;			!---------------!         !
+;			!      PC       !         !
+;			!---------------!         !
+;			!      PSL      !         v
+;			!---------------! ---------
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	May branch to ERROR_EXIT
+;--
+
+SSERROR:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	$SETAST_S ENBFLG = #0		; Disable AST delivery
+	CLRL	AST_MODE		; Assume it was disabled
+	CMPL	R0,#SS$_WASSET		; Were AST's enabled?
+	BNEQ	10$			; BR if not enabled
+	MOVL	#1,AST_MODE		; Set it to be reenabled
+10$:	$SETSFM_S ENBFLG = #0		; Disable SS failure mode for PUTMSG
+	CLRL	SS_FAIL_MODE		; Assume it was disabled
+	CMPL	R0,#SS$_WASSET		; Was SS failure mode enabled?
+	BNEQ	20$			; BR if not enabled
+	MOVL	#1,SS_FAIL_MODE		; Set it to be reenabled
+20$:	MOVL	CHF$L_SIGARGLST(AP),R6	; Get the signal array pointer
+	CMPZV	#STS$V_FAC_NO,#STS$S_FAC_NO,- ; Is this a message from LIB$SIGNAL?
+		CHF$L_SIG_NAME(R6),#UETP_K
+	BNEQ	30$			; BR if this is a system exception
+	SUBL2	#2,CHF$L_SIG_ARGS(R6)	; Drop the PC and PSL
+	$PUTMSG_S MSGVEC = CHF$L_SIG_ARGS(R6) ; Print the message
+	$SETSFM_S ENBFLG = SS_FAIL_MODE	; Set to previous state
+	$SETAST_S ENBFLG = AST_MODE	; Set to previous state
+	RET				; Return to the program
+30$:
+	CMPZV	#STS$V_FAC_NO,#STS$S_FAC_NO,- ; Is it an RMS failure?
+		CHF$L_SIG_ARG1(R6),#RMS_K
+	BNEQ	40$			; BR if not
+	$SETSFM_S ENBFLG = SS_FAIL_MODE	; Set to previous state
+	$SETAST_S ENBFLG = AST_MODE	; Set to previous state
+	RET				; Yes, RMS_ERROR gets to handle them
+40$:
+	MOVL	CHF$L_SIG_NAME(R6),STATUS ; Save the status
+	CLRL	R8			; Assume for now it's not SS failure
+	CMPL	#SS$_SSFAIL,STATUS	; But is it a System Service failure?
+	BNEQ	60$			; BR if not - no special case message
+	$GETMSG_S MSGID = CHF$L_SIG_ARG1(R6),- ; Get SS failure code associated text
+		 MSGLEN = BUFFER_PTR,-
+		 BUFADR = FAO_BUF,-
+		 FLAGS  = #14,-
+		 OUTADR = MSG_BLOCK
+	TSTB	MSG_BLOCK+1		; Get FAO arg count for SS failure code
+	BEQL	50$			; Don't use $GETMSG if no $FAO args...
+	PUSHAL	BUFFER_PTR		; ...else build up...
+	PUSHL	#1			; ...a message describing...
+	PUSHL	#UETP$_TEXT		; ...why the System Service failed
+	INSV	CHF$L_SIG_ARG1(R6),-	; Give the message...
+		#STS$V_SEVERITY,-	; ...the correct severity code
+		#STS$S_SEVERITY,(SP)
+	MOVL	#3,R8			; Count the number of args we pushed
+	BRB	60$
+50$:
+	PUSHL	CHF$L_SIG_ARG1(R6)	; Save SS failure code
+	MOVL	#1,R8			; Count the number of args we pushed
+60$:
+	MULL3	#4,CHF$L_SIG_ARGS(R6),R7 ; Convert longwords to bytes
+	SUBL2	R7,SP			; Save the current signal array...
+	MOVC3	R7,CHF$L_SIG_NAME(R6),(SP) ; ...on the stack
+	ADDL3	R8,CHF$L_SIG_ARGS(R6),-(SP) ; Push the current arg count
+	BRW	ERROR_EXIT
+
+	.SBTTL	RMS Error Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles error returns from RMS calls.
+;
+; CALLING SEQUENCE:
+;	Called by RMS when a file processing error is found.
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	The FAB or RAB associated with the RMS call.
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Program may exit, depending on severity of the error.
+;
+;--
+
+RMS_ERROR:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	MOVL	4(AP),R6		; See whether we're dealing with...
+	CMPB	#FAB$C_BID,FAB$B_BID(R6) ; ...a FAB or a RAB
+	BNEQ	10$			; BR if it's a RAB
+	MOVAL	FILE,R7			; FAB-specific code:  text string...
+	MOVL	R6,R8			; ...address of FAB...
+	PUSHL	FAB$L_STV(R6)		; ...STV field for error...
+	PUSHL	FAB$L_STS(R6)		; ...STS field for error...
+	MOVL	FAB$L_STS(R6),STATUS	; ...and save the error code
+	BRB	COMMON			; FAB and RAB share other code
+10$:
+	MOVAL	RECORD,R7		; RAB-specific code:  text string...
+	MOVL	RAB$L_FAB(R6),R8	; ...address of associated FAB...
+	PUSHL	RAB$L_STV(R6)		; ...STV field for error...
+	PUSHL	RAB$L_STS(R6)		; ...STS field for error...
+	MOVL	RAB$L_STS(R6),STATUS	; ...and save the error code
+COMMON:
+	MOVZBL	FAB$B_FNS(R8),R10	; Get the file name size
+	$FAO_S	CTRSTR = RMS_ERR_STRING,- ; Common code, prepare error message...
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R7,-
+		P2     = R10,-
+		P3     = FAB$L_FNA(R8)
+	PUSHAL	BUFFER_PTR		; ...and arguments for ERROR_EXIT...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT		; ...
+	EXTZV	#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,-
+		STATUS,R9 		; ...get the severity code...
+	BISB2	R9,(SP)			; ...and add it into the signal name
+	PUSHL	#5			; Current arg count
+	BRW	ERROR_EXIT
+
+	.SBTTL	CTRL/C Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles CTRL/C AST's
+;
+; CALLING SEQUENCE:
+;	Called via AST
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+CCASTHAND:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	PUSHAL	CNTRLCMSG		; Set message pointer
+	PUSHL	#1			; Set arg count
+	PUSHL	#UETP$_TEXT!STS$K_WARNING ; Set signal name
+	PUSHL	#0			; Indicate an abnormal termination
+	PUSHAL	PROCESS_NAME		; ...
+	PUSHL	#2			; ...
+	PUSHL	#UETP$_ABENDD!STS$K_WARNING ; ...
+	CALLS	#7,G^LIB$SIGNAL		; Output the message
+	MOVL	#<SS$_CONTROLC-STS$K_SUCCESS+STS$K_WARNING>,-
+		STATUS			; Set the exit status
+	BISW2	#TEST_OVERM,FLAG	; Set termination flag
+	RET
+
+	.SBTTL	Error Exit
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine prints an error message and exits.
+;
+; CALLING SEQUENCE:
+;	MOVx  error status value,STATUS
+;	PUSHx error specific information on the stack
+;	PUSHL current argument count
+;	BRW   ERROR_EXIT
+;
+; INPUT PARAMETERS:
+;	Arguments to LIB$SIGNAL, as above
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	Message to SYS$OUTPUT and SYS$ERROR
+;
+; IMPLICIT OUTPUTS:
+;	Program exit
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+ERROR_EXIT:
+
+	$SETAST_S ENBFLG = #0		; Disable AST's
+	BBS	#BEGIN_MSGV,FLAG,10$	; BR if "begin" msg has already been output
+	CLRL	-(SP)			; Set the time stamp flag
+	PUSHAL	PROCESS_NAME		; Set the test name
+	PUSHL	#2			; Push the argument count
+	PUSHL	#UETP$_BEGIND!STS$K_SUCCESS ; Set the message code
+	CALLS	#4,G^LIB$SIGNAL		; Print the startup message
+10$:	ADDL3	(SP)+,#7,ARG_COUNT	; Get total # args, pop partial count
+	INCL	ERROR_COUNT		; Keep running error count
+	PUSHL	#0			; Push the time parameter
+	PUSHAL	PROCESS_NAME		; Push test name...
+	PUSHL	#2			; ...arg count...
+	PUSHL	#UETP$_ABENDD!STS$K_ERROR ; ...and signal name
+	PUSHL	ERROR_COUNT		; Finish off arg list...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_ERBOX!STS$K_ERROR ; ...for error box message
+	CALLS	ARG_COUNT,G^LIB$SIGNAL	; Truly bitch
+	BISL	#STS$M_INHIB_MSG,STATUS	; Don't print messages twice!
+	$EXIT_S STATUS			; Exit in error
+
+	.SBTTL	Exit Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles cleanup at exit.  If the MODE logical name is
+;	equated to "ONE", the routine will update the test flag in the
+;	UETINIDEV.DAT file depending on the UETUNT$M_TESTABLE flag state in the
+;	UETUNT$B_FLAGS field of the unit block for each unit for the device
+;	under test.
+;
+; CALLING SEQUENCE:
+;	Invoked automatically by $EXIT System Service.
+;
+; INPUT PARAMETERS:
+;	STATUS  contains the exit status.
+;	FLAG    has synchronizing bits.
+;	DDB_RFA contains the RFA of the DDB record for this device in UETINIDEV.
+;
+; IMPLICIT INPUTS:
+;	UNIT_LIST points to the head of a doubly linked circular list of unit
+;		  blocks for the device under test.
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Various files are de-accessed, the process name is reset, and any
+;	necessary synchronization with UETPDEV01 is carried out.
+;	If the MODE logical name is equated to "ONE", the routine will update
+;	the test flag in the UETINIDEV.DAT file depending on the 
+;	UETUNT$M_TESTABLE flag state in the UETUNT$B_FLAGS field of the unit
+;	block for each unit for the device under test.
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+EXIT_HANDLER:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	$SETSFM_S ENBFLG = #0		; Turn off System Service failure mode
+	$SETAST_S ENBFLG = #0		; Disable AST's
+	$TRNLOG_S LOGNAM = MODE,-	; Get the run mode
+		  RSLLEN = BUFFER_PTR,-
+		  RSLBUF = FAO_BUF
+	BICB2	#LC_BITM,BUFFER		; Convert to upper case
+	CMPB	#^A/O/,BUFFER		; Is this a one shot?
+	BEQL	10$			; BR if yes...
+	BRW	END_UPDATE		; ...else don't update UETINIDEV.DAT
+10$:
+	BBS	#SAFE_TO_UPDV,FLAG,20$	; Only update if it's safe
+	BRW	END_UPDATE		; Else forget it
+20$:
+	MOVAL	INI_RAB,R10		; Set the RAB address
+	MOVB	#RAB$C_RFA,RAB$B_RAC(R10) ; Set RFA mode
+	MOVC3	#6,DDB_RFA,RAB$W_RFA(R10) ; Set RFA to DDB line
+	$GET	RAB = (R10)		; Go back to the DDB record
+	BLBC	R0,END_UPDATE		; If failure then forget it
+	MOVB	#RAB$C_SEQ,RAB$B_RAC(R10) ; Set back to sequential mode
+	ADDL3	#UNIT_LIST,UNIT_LIST,R11 ; Set the unit block list header
+	CLRL	R9			; Init an index
+UNIT_LOOP:
+	BITB	#UETUNT$M_TESTABLE,-
+		UETUNT$B_FLAGS(R11)	; Is this unit testable?
+	BEQL	10$			; BR if not
+	INCL	R9			; Another unit that's testable
+10$:
+	ADDL2	(R11),R11		; Next unit block
+	CMPL	R11,#UNIT_LIST		; Are we full circle in the list?
+	BNEQ	UNIT_LOOP		; BR if not
+	TSTL	R9			; Any testable units?
+	BNEQ	20$			; BR if yes...
+	MOVB	#^A/N/,BUFFER+4		; ...else disable the DDB record...
+	$UPDATE RAB = (R10)		; ...here
+	BLBC	R0,END_UPDATE		; If error then forget it
+20$:
+	ADDL2	(R11),R11		; Next unit block
+	CMPL	R11,#UNIT_LIST		; Are we full circle in the list?
+	BEQL	END_UPDATE		; BR if yes
+	$GET	RAB = (R10)		; Get a record
+	BLBC	R0,END_UPDATE		; If error then forget it
+	BICB2	#LC_BITM,BUFFER		; Convert to uppercase
+	CMPB	#^A/U/,BUFFER		; Is it a UCB record?
+	BNEQ	END_UPDATE		; BR if not
+	BITB	#UETUNT$M_TESTABLE,-
+		UETUNT$B_FLAGS(R11)	; Is this unit testable?
+	BNEQ	20$			; BR if yes...
+	MOVB	#^A/N/,BUFFER+4		; ...else disable the UCB record...
+	$UPDATE RAB = (R10)		; ...here
+	BLBC	R0,END_UPDATE		; If error then forget it
+	BRB	20$			; Look at the next record
+END_UPDATE:
+	PUSHL	#0			; Set the time flag
+	PUSHAL	PROCESS_NAME		; Push the test name
+	PUSHL	#2			; Push arg count
+	PUSHL	#UETP$_ENDEDD		; Push signal name
+	EXTZV	#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,-
+		STATUS,R0		; Get the proper exit severity
+	INSV	R0,#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,(SP)	; Set the end message severity
+	CALLS	#4,G^LIB$SIGNAL		; Output the message
+	$DISCONNECT  RAB = INI_RAB	; Disconnect the RAB from the FAB
+	$CLOSE	     FAB = INI_FAB	; Close the file
+	$SETPRN_S PRCNAM = ACNT_NAME	; Reset the process name
+	BBC	#TIMOUT_ERRV,FLAG,10$	; BR if no units hung
+	PUSHL	#0			; We have a hung unit - cancel all
+	PUSHAL	RMSRUNDWN_BUF		;  image and indirect I/O so we can
+	CALLS	#2,G^SYS$RMSRUNDWN	;  exit without hanging
+10$:
+	RET				; That's all folks!
+
+	.END	UETTTYS00

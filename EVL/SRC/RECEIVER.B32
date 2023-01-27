@@ -1,0 +1,1502 @@
+MODULE receiver (IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  DECnet V2.0 event logger
+!
+! ABSTRACT:
+!
+!	This module contains the routines which receive events from
+!	both the local node or other nodes and place the events into
+!	the appropriate sink (console, file or monitor process).
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. unprivileged user mode,
+!
+! AUTHOR:  Tim Halvorsen, June 1980
+!
+! Modified by:
+!
+!	V006	TMH0006		Tim Halvorsen	23-Aug-1981
+!		Use new ACP QIO interface
+!
+!	V005	TMH0005		Tim Halvorsen	10-Aug-1981
+!		Remove temporary definition of MSG$_EVTRCVCHG,
+!		since it is now defined by $MSGDEF.
+!
+!	V004	TMH0004		Tim Halvorsen	28-Jul-1981
+!		Reference EVCDEF.L32 rather than require file.
+!
+!	V003	TMH0003		Tim Halvorsen	25-Jun-1981
+!		Fix QIOW to use an specific event flag, to avoid
+!		conflict with asynchronous QIO's using the same flag.
+!
+!	V002	TMH0002		Tim Halvorsen	07-Apr-1981
+!		Exit process if we cannot declare ourselves as the
+!		EVL object.
+!
+!	V001	TMH0001		Tim Halvorsen	19-Nov-1980
+!		Send formatted events to OPCOM only if the monitor
+!		sink is on and no name is specified rather than the
+!		console sink.  Thus, OPCOM becomes the default monitor
+!		program.
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';		! VAX/VMS common definitions
+
+REQUIRE 'SYS$LIBRARY:UTILDEF';		! Common VMS definitions
+
+LIBRARY 'SHRLIB$:NET';			! Network control QIO definitions
+					! (NETACP database symbols)
+
+LIBRARY 'LIB$:EVCDEF';			! Event data definitions
+
+REQUIRE 'LIB$:EVLDEF';			! Event logger definitions
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    evl$receive:	NOVALUE,	! Receiver initialization
+    update_sinkdata:	NOVALUE,	! Update our version of sink data
+    delete_sink:	NOVALUE,	! Delete a sink
+    wait_for_interrupt:	NOVALUE,	! Wait for network interrupt
+    net_interrupt:	NOVALUE,	! Network interrupt AST routine
+    open_event_link:	NOVALUE,	! Open incoming event logical link
+    close_event_link:	NOVALUE,	! Close event logical link
+    shutdown:		NOVALUE,	! Shut down receiver gracefully
+    wait_for_event:	NOVALUE,	! Wait for an incoming event record
+    event_received:	NOVALUE,	! Accept incoming event record
+    evl$queue_event:	NOVALUE,	! Queue an event record to sinks
+    output_events:	NOVALUE,	! Output all events for a given sink
+    output_console:	NOVALUE,	! Output event to console sink
+    write_line:		NOVALUE,	! Write line to console sink device
+    output_file:	NOVALUE,	! Output event to file sink
+    open_file:		NOVALUE,	! Open file sink
+    close_file:		NOVALUE,	! Close file sink
+    output_monitor:	NOVALUE,	! Output event to process sink    
+    save_lines:		NOVALUE,	! Append output lines into buffer
+    open_monitor:	NOVALUE,	! Open monitor process sink
+    close_monitor:	NOVALUE;	! Close monitor process sink
+
+!
+! BUILTIN functions
+!
+
+BUILTIN
+    INSQUE,				! INSQUE instruction
+    REMQUE;				! REMQUE instruction
+
+!
+! Define macro for message reporting
+!
+
+MACRO
+    msg(ident) =
+	BEGIN
+	%IF NOT %DECLARED(%NAME('evl$_',ident))
+		%THEN EXTERNAL LITERAL %NAME('evl$_',ident); %FI
+	%NAME('evl$_',ident)
+	END%;
+
+!
+! Literals
+!
+
+LITERAL
+    object_number = 26,			! EVL object number
+    max_queued_events = 10,		! Maximum events on sink queue before
+					! incoming events are blocked and the
+					! sink queue is emptied
+    mbx_maxmsg = 64;			! Maximum size of mailbox message
+
+!
+! OWN storage
+!
+
+OWN
+    net_channel:	WORD,			! Logical link channel number
+    mbx_channel:	WORD,			! Mailbox channel number
+    mbx_message:	VECTOR [mbx_maxmsg,BYTE], ! Mailbox input buffer
+    iosb:		BBLOCK [8],		! I/O status block for MBX
+    sink_header:	VECTOR [2],		! Listhead for sink descriptors
+    iec_header:		VECTOR [2];		! Listhead for incoming links
+
+GLOBAL
+    evl$b_rcvdone:	BYTE INITIAL(true);	! True if receiver inactive
+
+!
+! External storage
+!
+
+EXTERNAL
+    evl$gl_logmask:	BBLOCK,		! Logging bit mask
+    evl$gt_localnode;			! Local node name string
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    format_event:	NOVALUE,	! Format an event record
+    evl$allocdbk,			! Allocate data storage block
+    evl$deallocdbk,			! Deallocate data storage block
+    evl$unjulian,			! Convert julian half-day time
+    evl$printlog,			! Print hex bytes to log
+    evl$netshow,			! Get information from NETACP
+    wkq$add_work_item,			! Add work to work queue
+    lib$asn_wth_mbx: ADDRESSING_MODE(GENERAL),	! Assign with assoc. mailbox
+    lib$put_output: ADDRESSING_MODE(GENERAL),	! Write to SYS$OUTPUT
+    lib$get_vm:	ADDRESSING_MODE(GENERAL),	! Allocate storage
+    lib$free_vm: ADDRESSING_MODE(GENERAL);	! Deallocate storage
+
+GLOBAL ROUTINE evl$receive: NOVALUE =
+
+!---
+!
+!	This routine is called to initialize the event
+!	receiver and setup work to do asynchronously
+!	via the work queue.  A request for sink data is
+!	issued to NETACP and nothing is done until the
+!	request is satisfied.  When sink data is obtained
+!	(or when there is any), then the sink list is
+!	updated and processing of events begins.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+LOCAL
+    nfb:	BBLOCK [5],		! Network function block for DECLOBJ
+    nfb_desc:	VECTOR [2],		! Descriptor of NFB
+    mbxmodes:	VECTOR [2],		! Enables mailbox message types
+    status;
+
+sink_header [0] = sink_header;		! Initialize sink listhead
+sink_header [1] = sink_header;
+
+iec_header [0] = iec_header;		! Initialize incoming channel listhead
+iec_header [1] = iec_header;
+
+status = LIB$ASN_WTH_MBX(%ASCID '_NET:', ! Assign channel to NETACP
+			0,0,		! mailbox MAXMSG,BUFQUO (ignored)
+			net_channel,	! Channel to NETACP
+			mbx_channel);	! Channel to mailbox
+
+IF NOT .status				! If error assigning channel,
+THEN
+    BEGIN
+    SIGNAL(msg(netasn), 0, .status);	! then signal the error
+    RETURN;
+    END;
+
+nfb [0,0,8,0] = NFB$C_DECLOBJ;		! Set function to "Declare object"
+nfb [1,0,32,0] = object_number;		! Object number for event logger
+
+nfb_desc [0] = 5;			! Setup descriptor of NFB
+nfb_desc [1] = nfb;
+
+status = $QIOW(FUNC = IO$_ACPCONTROL,	! Issue read on mailbox
+		CHAN = .net_channel,
+		EFN = evl$c_synch_efn,
+		IOSB = iosb,
+		P1 = nfb_desc);
+
+IF .status				! If successfully submitted,
+THEN
+    status = .iosb [0,0,16,0];		! then pick up final status
+
+IF .status EQL ss$_badparam		! If object already defined
+					! (EVL is already running somewhere)
+THEN
+    $EXIT(CODE = ss$_normal);		! then exit process quietly
+
+IF NOT .status
+THEN
+    SIGNAL(msg(netasn), 0, .status);	! then signal error
+
+mbxmodes [0] = 0;			! Enable all mailbox messages
+mbxmodes [1] = -1;
+
+status = $QIOW(FUNC = IO$_SETMODE,	! Issue read on mailbox
+		CHAN = .net_channel,
+		EFN = evl$c_synch_efn,
+		IOSB = iosb,
+		P1 = mbxmodes);
+
+IF .status				! If successfully submitted,
+THEN
+    status = .iosb [0,0,16,0];		! then pick up final status
+
+IF NOT .status
+THEN
+    SIGNAL(msg(netasn), 0, .status);	! then signal error
+
+update_sinkdata();			! Update sink information
+
+wait_for_interrupt();			! Wait for connect request
+
+END;
+
+ROUTINE update_sinkdata: NOVALUE =
+
+!---
+!
+!	This routine is called to request an updated description
+!	of the sink types from NETACP.
+!
+!	The format of the sink information in NETACP is:
+!
+!		0) Sink type (console, file or monitor process)
+!		4) State (on, off or hold)
+!		8) Sink name string (counted string)
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	sink_header = Address of sink listhead
+!	evl$b_rcvdone = True if list empty (receiver inactive), else false
+!
+!---
+
+BEGIN
+
+LOCAL
+    status,
+    buffer:	BBLOCK [256],		! Buffer for sink information
+    bufdesc:	VECTOR [2],		! Descriptor of above buffer
+    position:	VECTOR [nfb$c_p2strtlng,BYTE], ! Buffer for current position
+    sink:	REF BBLOCK;		! Address of current sink entry
+
+sink = .sink_header;			! Start at first sink block
+
+WHILE .sink NEQ sink_header		! Until end of linked list,
+DO
+    BEGIN
+    sink [sink$v_delete] = true;	! Mark for possible deletion
+    sink = .sink [sink$l_link];		! and link to next one
+    END;
+
+bufdesc [0] = 256;			! Setup descriptor
+bufdesc [1] = buffer;
+
+position <0,16> = 0;			! Start at first ESI record
+
+WHILE evl$netshow(
+	nfb$c_db_esi,			! Event sink information
+	nfb$c_wildcard,0,		! Search all records
+	nfb$c_collate,position,		! Get next record; update position
+	3,				! # fields for each item; fields are:
+	UPLIT(	nfb$c_esi_snk,		! Sink type (longword)
+		nfb$c_esi_sta,		! Sink state (longword)
+		nfb$c_esi_lna),		! Sink name (string)
+	bufdesc)			! Return buffer descriptor
+DO
+    BEGIN
+    IF .evl$gl_logmask [elg$v_dbupdat]	! If we are logging database updates,
+    THEN
+	BEGIN
+	SIGNAL(msg(logdbur), 1, 0);	! then signal update occurred
+	SIGNAL(msg(dbcrcv), 4,
+		CASE .buffer [0,0,32,0] FROM sink$c_console TO sink$c_monitor
+		OF
+		    SET
+		    [sink$c_console]:	UPLIT BYTE(%ASCIC 'console');
+		    [sink$c_file]:	UPLIT BYTE(%ASCIC 'file');
+		    [sink$c_monitor]:	UPLIT BYTE(%ASCIC 'monitor process');
+		    [OUTRANGE]:		UPLIT BYTE(%ASCIC 'unknown');
+		    TES,
+		.buffer [8,0,16,0], buffer [10,0,0,0],
+		CASE .buffer [4,0,32,0] FROM sink$c_on TO sink$c_hold
+		OF
+		    SET
+		    [sink$c_on]:	UPLIT BYTE(%ASCIC 'ON');
+		    [sink$c_off]:	UPLIT BYTE(%ASCIC 'OFF');
+		    [sink$c_hold]:	UPLIT BYTE(%ASCIC 'HOLD');
+		    [OUTRANGE]:		UPLIT BYTE(%ASCIC 'UNKNOWN');
+		    TES);
+	END;
+
+    sink = .sink_header;		! Start at first entry in list
+
+    IF
+	WHILE .sink NEQ sink_header	! Until end of list
+	DO
+	    BEGIN
+	    IF .sink [sink$b_type] EQL .buffer [0,0,32,0] ! If sink type matches
+	    THEN
+		BEGIN
+		LOCAL previous_state;
+		previous_state = .sink [sink$b_state];	! Save previous state
+		sink [sink$b_state] = .buffer [4,0,32,0]; ! Store new state
+		sink [sink$b_namelen] = .buffer [8,0,16,0]; ! Store new name
+		CH$MOVE(.sink [sink$b_namelen], buffer [10,0,0,0], sink [sink$t_name]);
+		sink [sink$v_error] = false;	! Try operations on sink again
+		IF .sink [sink$b_state] NEQ sink$c_off	! If sink being turned on,
+		    OR .previous_state EQL sink$c_off	! or if sink in the process
+						! of being deleted,
+		THEN
+		    sink [sink$v_delete] = false; ! Mark this sink be retained
+		EXITLOOP false;
+		END;
+	    sink = .sink [sink$l_link];		! Skip to next in chain
+	    END
+						! If not found in list,
+	AND .buffer [4,0,32,0] NEQ sink$c_off	! and not in 'off' state,
+    THEN
+	BEGIN					! Then add the sink
+	LOCAL
+	    length;
+	length = sink$c_length;			! Length of new sink entry
+	signal_if_error(LIB$GET_VM(length,sink));	! Allocate new entry
+	CH$FILL(0,sink$c_length,.sink);			! Zero the entry
+	sink [sink$b_type] = .buffer [0,0,32,0];	! Store sink type
+	sink [sink$b_state] = .buffer [4,0,32,0];	! Store new state
+	sink [sink$b_namelen] = .buffer [8,0,16,0];	! Store new name
+	CH$MOVE(.sink [sink$b_namelen], buffer [10,0,0,0], sink [sink$t_name]);
+	sink [sink$l_evtfl] = sink [sink$l_evtfl]; ! Init event queue listhead
+	sink [sink$l_evtbl] = sink [sink$l_evtfl];
+	INSQUE(.sink, .sink_header [1]);	! Insert into queue
+	evl$b_rcvdone = false;			! Mark receiver active
+	END;
+
+    IF .sink [sink$b_state] EQL sink$c_on	! If sink just turned on,
+    THEN
+	wkq$add_work_item(output_events,.sink); ! then flush any "held" events
+    END;
+
+!
+!	If any sinks were turned off, we flush any events queued
+!	for that sink and then delete the sink.  These two functions
+!	are queued on the work queue to ensure that any asynchronous
+!	activity on that sink completes before the delete is done.
+!
+
+sink = .sink_header;			! Start at first sink again
+
+WHILE .sink NEQ sink_header		! For each sink block
+DO
+    BEGIN
+    IF .sink [sink$v_delete]		! If sink was turned off or omitted,
+    THEN
+	BEGIN
+	sink [sink$b_state] = sink$c_off;	! Set state off if sink omitted
+	wkq$add_work_item(output_events,.sink); ! then flush the sink events
+	wkq$add_work_item(delete_sink,.sink);	! and delete the sink
+	END;
+    sink = .sink [sink$l_link];		! Skip to next in list
+    END;
+
+END;
+
+ROUTINE delete_sink (sink): NOVALUE =
+
+!---
+!
+!	Delete a given sink
+!
+! Inputs:
+!
+!	sink = Address of sink block
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    sink:	REF BBLOCK;		! Address of sink block
+
+LOCAL
+    length;
+
+IF .sink [sink$l_closertn] NEQ 0	! If there is a close routine,
+THEN
+    (.sink [sink$l_closertn])(.sink);	! Close the sink
+
+REMQUE(.sink,length);			! Remove from linked list
+
+length = sink$c_length;
+LIB$FREE_VM(length,sink);		! Deallocate sink block
+
+evl$b_rcvdone = (.sink_header [0] EQL sink_header) ! Flag if we are active
+	AND (.iec_header [0] EQL iec_header);
+
+END;
+
+ROUTINE wait_for_interrupt: NOVALUE =
+
+!---
+!
+!	Issue an asynchronous QIO on the associated mailbox
+!	for the network channel waiting for connect requests
+!	for the receiver.
+!
+! Inputs:
+!
+!	mbx_channel = Channel number for mailbox
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+LOCAL
+    status;
+
+status = $QIO(FUNC = IO$_READVBLK,	! Issue read on mailbox
+		CHAN = .mbx_channel,
+		EFN = evl$c_asynch_efn,
+		IOSB = iosb,
+		ASTADR = net_interrupt,
+		P1 = mbx_message,
+		P2 = mbx_maxmsg);
+
+IF NOT .status
+THEN
+    SIGNAL(msg(readevt), 0, .status);	! then signal error
+
+END;
+
+ROUTINE net_interrupt: NOVALUE =
+
+!---
+!
+!	This AST routine is called when the outstanding QIO
+!	on the associated mailbox completes.  If the interrupt
+!	indicates a connect is pending, then the acceptance
+!	routine is added to the work queue.
+!
+! Inputs:
+!
+!	mbx_message = Mailbox message
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+SELECTONEU .mbx_message [0]		! Select based on message type
+OF
+    SET
+
+[msg$_netshut]:				! Network shutting down
+
+    BEGIN
+    wkq$add_work_item(shutdown);	! Shut down receiver gracefully
+    RETURN;				! Do not re-issue mailbox read
+    END;
+
+[msg$_connect]:				! Incoming connect request
+
+    BEGIN
+    LOCAL
+	ptr,len,
+	iec:	REF BBLOCK;		! Incoming event channel block
+    len = iec$c_length;
+    LIB$GET_VM(len,iec);		! Allocate incoming channel block
+    CH$FILL(0,iec$c_length,.iec);	! Zero the block
+    iec [iec$w_size] = iec$c_length;	! Set length of block
+    ptr = 5 + .mbx_message [4];		! Get index of start of ascic data
+    iec [iec$b_ncblen] = .mbx_message [.ptr];	! Set length of NCB
+    CH$COPY(.mbx_message [.ptr], mbx_message [.ptr+1],
+		0, iec$c_maxncblen, iec [iec$t_ncb]);
+    INSQUE(.iec, .iec_header [1]);	! Insert into list
+    wkq$add_work_item(open_event_link,.iec);	! Queue the connect accept
+    evl$b_rcvdone = false;		! Mark receiver active
+    END;
+
+[msg$_evtrcvchg]:			! If event receiver database change
+
+    wkq$add_work_item(update_sinkdata);	! then update sink information
+
+TES;
+
+wait_for_interrupt();			! Issue another read on mailbox
+
+END;
+
+ROUTINE open_event_link (iec): NOVALUE =
+
+!---
+!
+!	Open the logical link for incoming event records.
+!
+! Inputs:
+!
+!	iec = Address of incoming event channel block
+!
+! Outputs:
+!
+!	routine = True if link established, false if not
+!---
+
+BEGIN
+
+MAP
+    iec:	REF BBLOCK;		! Address of event channel block
+
+LOCAL
+    status,
+    ptr,
+    ncb_desc:	VECTOR [2];		! Descriptor of NCB
+
+!
+!	Setup NCB for connect accept
+!
+
+ncb_desc [0] = .iec [iec$b_ncblen];	! Get length of requestor ncb
+ncb_desc [1] = iec [iec$t_ncb];		! and address of ncb
+
+!
+!	Get copy of NCB up to slash to enable its use in error reporting
+!
+
+ptr = CH$FIND_CH(.iec [iec$b_ncblen], iec [iec$t_ncb], '/');
+
+IF NOT CH$FAIL(.ptr)			! If ending slash found,
+THEN
+    iec [iec$b_ncblen] = .ptr - iec [iec$t_ncb]; ! then truncate rest of junk
+
+!
+!	Setup NCB for accept by zeroing optional data sent by requestor
+!
+
+(.ptr+3) <0,8> = 0;			! Zero optional data
+
+status = $ASSIGN(DEVNAM = %ASCID '_NET:', ! Get channel for incoming link
+		CHAN = iec [iec$w_chan]);
+
+IF NOT .status				! If error assigning channel,
+THEN
+    BEGIN
+    SIGNAL(msg(netasn), 0, .status);	! then signal the error
+    close_event_link(.iec);		! and deallocate the storage
+    RETURN;
+    END;
+
+status = $QIOW(FUNC = IO$_ACCESS,	! Accept the logical link
+		CHAN = .iec [iec$w_chan],
+		EFN = evl$c_synch_efn,
+		IOSB = iec [iec$w_iosb],! Address of I/O status block
+		P2 = ncb_desc);		! Address of network control block
+
+IF .status				! If successfully submitted,
+THEN
+    status = .iec [iec$w_iosb];		! then pick up QIO final status
+
+IF NOT .status				! If error starting up link
+THEN
+    BEGIN
+    SIGNAL(msg(netasn), 0, .status);	! then signal the error
+    close_event_link(.iec);		! and deallocate the storage
+    RETURN;
+    END;
+
+!
+!	Log the incoming connect accept
+!
+
+IF .evl$gl_logmask [elg$v_rcvccf]	! If logging receiver incoming links,
+THEN
+    BEGIN
+    ncb_desc [0] = .iec [iec$b_ncblen];	! Setup descriptor of NCB - optional
+    SIGNAL(msg(logopnr), 3, .ncb_desc [0], .ncb_desc [1], 0);
+    END;
+
+wait_for_event(.iec);			! Wait for an incoming event record
+
+END;
+
+ROUTINE close_event_link (iec): NOVALUE =
+
+!---
+!
+!	Close the logical link for incoming event records.
+!
+! Inputs:
+!
+!	iec = Address of incoming event channel block
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    iec:	REF BBLOCK;		! Address of incoming event channel
+
+LOCAL
+    length,
+    status;
+
+IF .iec [iec$w_chan] NEQ 0		! If channel was assigned,
+THEN
+    BEGIN
+    status = $DASSGN(CHAN = .iec [iec$w_chan]); ! Deassign network channel
+
+    IF NOT .status				! If error detected,
+    THEN
+	SIGNAL(msg(netdas), 0, .status);	! then signal error
+    END;
+
+REMQUE(.iec, status);			! Remove from linked list
+length = .iec [iec$w_size];		! Get size of block
+LIB$FREE_VM(length,iec);		! Deallocate storage
+
+evl$b_rcvdone = (.sink_header [0] EQL sink_header) ! Flag if we are active
+	AND (.iec_header [0] EQL iec_header);
+
+END;
+
+ROUTINE shutdown: NOVALUE =
+
+!---
+!
+!	This routine is called when the network is shutting down
+!	to gracefully close all sinks and incoming links so that
+!	EVL goes away quietly.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+LOCAL
+    ptr:	REF BBLOCK,		! Pointer to sink or iec block
+    next_ptr;
+
+ptr = .iec_header;			! Start at first link context block
+WHILE .ptr NEQ iec_header		! Until end of linked list,
+DO
+    BEGIN
+    next_ptr = .ptr [iec$l_link];
+    close_event_link(.ptr);		! Abort the incoming link
+    ptr = .next_ptr;			! and link to next in chain
+    END;
+
+ptr = .sink_header;			! Start at first sink block
+WHILE .ptr NEQ sink_header		! Until end of linked list,
+DO
+    BEGIN
+    ptr [sink$b_state] = sink$c_off;		! Force deletion of sink
+    wkq$add_work_item(output_events,.ptr);	! flush the sink events
+    wkq$add_work_item(delete_sink,.ptr);	! and delete the sink
+    ptr = .ptr [sink$l_link];		! Link to next one
+    END;
+
+END;
+
+ROUTINE wait_for_event (iec): NOVALUE =
+
+!---
+!
+!	This routine is called to obtain processed events from
+!	the receiver's incoming logical link.  Each incoming event
+!	is immediately queued to the disposal queue for the appropriate
+!	sink types.
+!
+! Inputs:
+!
+!	iec = Address of incoming event channel context block
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    iec:	REF BBLOCK;		! Address of incoming event channel
+
+LOCAL
+    status;
+
+status = $QIO(FUNC = IO$_READVBLK,	! Get event from incoming link
+		CHAN = .iec [iec$w_chan],
+		EFN = evl$c_asynch_efn,
+		IOSB = iec [iec$w_iosb],! Address of I/O status block	
+		ASTADR = event_received,! Address of completion routine
+		ASTPRM = .iec,		! Giving IEC as routine parameter
+		P1 = iec [iec$t_event],	! Address of event buffer
+		P2 = iec$c_maxevtlen);	! Length of event buffer
+
+IF NOT .status				! If unsuccessful
+THEN
+    SIGNAL(msg(readevt),0,.status);	! then signal error
+
+END;
+
+ROUTINE event_received (iec): NOVALUE =
+
+!---
+!
+!	This AST routine is called when a new event has come
+!	in over the logical link.  The event is queued to the
+!	appropriate sink type(s).
+!
+! Inputs:
+!
+!	iec = Address of incoming event channel context block
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    iec:	REF BBLOCK;		! Address of incoming event block
+
+IF NOT .iec [iec$w_iosb]		! If error from QIO,
+THEN
+    BEGIN
+    IF .iec [iec$w_iosb] NEQ ss$_linkabort ! If link was not aborted,
+    THEN
+	SIGNAL(msg(readevt), 0, .iec [iec$w_iosb]); ! then signal the error
+    close_event_link(.iec);		! close the link until re-established
+    RETURN;
+    END;
+
+wkq$add_work_item(evl$queue_event,	! Queue event to sink(s)
+    .iec [iec$w_iosb1], iec [iec$t_event]);
+
+wkq$add_work_item(wait_for_event, .iec);! Issue another QIO only after
+					! the entire queue is cleaned out
+
+END;
+
+GLOBAL ROUTINE evl$queue_event (length, event): NOVALUE =
+
+!---
+!
+!	This routine is called to queue a given event record
+!	to the appropriate sink type(s).
+!
+! Inputs:
+!
+!	length = Length of event record
+!	event = Address of event record:
+!
+!		0) Function code (always 1 = event record)
+!		1) Event flags (byte) which sink(s) get the event
+!		2) Event code (word)
+!		4) Time of event (6 bytes) in Julian half-day format
+!		10) Source node (2 + 1-7 bytes) address and name
+!		?) Event entity (1+n bytes) describing line or node ID
+!		?) Event data, depending on event code
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    event:	REF BBLOCK;		! Address of event record
+
+LOCAL
+    event_overflow:	BYTE,		! True if event queue overflowed
+    sink:	REF BBLOCK;		! Address of sink descriptor block
+
+IF .evl$gl_logmask [elg$v_rcvevt]	! If logging received messages,
+THEN
+    BEGIN
+    LOCAL msgdesc: VECTOR [2];
+    msgdesc [0] = .length;		! Setup descriptor of message
+    msgdesc [1] = .event;
+    EVL$PRINTLOG($BITPOSITION(elg$v_rcvevt),	! Log the received message
+	%ASCID 'Event received',0,msgdesc);
+    END;
+
+event_overflow = false;			! Preset no overflow
+sink = .sink_header [0];		! Start at first sink entry
+
+WHILE .sink NEQ sink_header		! Until end of sink list
+DO
+    BEGIN
+    IF .(event [evt$b_flags])<.sink [sink$b_type]-1,1> ! If this sink gets event,
+	AND .sink [sink$b_state] NEQ sink$c_off	! and delete not pending,
+    THEN
+	BEGIN				! then insert into sink's queue
+	LOCAL
+	    status,
+	    entry:	REF BBLOCK;	! Address of event data block
+
+	status = evl$allocdbk(evq$c_size+.length, .sink [sink$l_evtbl], entry);
+	sink [sink$w_events] = .sink [sink$w_events] + 1;
+	entry [evq$w_evtsize] = .length;
+	CH$MOVE(.length, .event, entry [evq$t_event]);
+	IF .status			! If first entry in queue,
+	THEN
+	    wkq$add_work_item(output_events, .sink); ! start emptying queue
+	IF .sink [sink$w_events] GEQU max_queued_events	! If too many events,
+	THEN
+	     event_overflow = true;	! then mark events are overflowing
+	END;
+    sink = .sink [sink$l_link];		! Skip to next sink type
+    END;
+
+END;
+
+ROUTINE output_events (sink): NOVALUE =
+
+!---
+!
+!	This routine is called when an event is queued for
+!	any sink.  All events for the given sink are written
+!	to the appropriate destination depending on the sink
+!	type.  Note that this routine may be called when
+!	there are no events queued if the sink is turned off
+!	and wants to be cleaned up here.
+!
+! Inputs:
+!
+!	sink = Address of sink descriptor block
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    sink:	REF BBLOCK;		! Address of sink block
+
+LOCAL
+    event_data:	REF BBLOCK,		! Address of next event data block
+    event:	REF BBLOCK;		! Address of actual event record
+
+IF .sink [sink$b_state] EQL sink$c_hold	! If holding sink output,
+THEN
+    RETURN;				! return without dequeueing anything
+
+WHILE NOT REMQUE(.sink [sink$l_evtfl], event_data) ! Dequeue the next event
+DO
+    BEGIN
+    sink [sink$w_events] = .sink [sink$w_events] - 1;	! Decrement events left
+    event = event_data [evq$t_event];	! Address the actual event record
+
+    IF .sink [sink$b_state] EQL sink$c_on	! If sink is ON,
+	AND NOT .sink [sink$v_error]		! and not in error state
+    THEN
+    CASE .sink [sink$b_type] FROM 0 TO sink$c_monitor	! Dispatch to routine
+    OF
+	SET
+	[sink$c_console]: output_console(		! Output to console
+			.sink, .event, .event_data [evq$w_evtsize]);
+	[sink$c_file]:    output_file(			! Output to file
+			.sink, .event, .event_data [evq$w_evtsize]);
+	[sink$c_monitor]: output_monitor(		! Output to process
+			.sink, .event, .event_data [evq$w_evtsize]);
+	[INRANGE]:	  SIGNAL(msg(badtype), 1, .sink [sink$b_type]);
+	TES;
+
+    evl$deallocdbk(.event_data);	! Deallocate data block
+    END;
+
+IF .sink [sink$b_type] EQL sink$c_console ! If console sink,
+    AND .sink [sink$l_closertn] NEQ 0	! and currently open,
+THEN
+    (.sink [sink$l_closertn])(.sink);	! then close the sink at the end
+					! of the "batch" to prevent the
+					! file/device from being tied up
+END;
+
+ROUTINE output_console (sink, event, event_length): NOVALUE =
+
+!---
+!
+!	Output an event record to the console sink.
+!
+! Inputs:
+!
+!	sink = Address of sink descriptor block
+!	event = Address of event record
+!	event_length = Length of event record
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    sink:	REF BBLOCK,		! Address of sink block
+    event:	REF BBLOCK;		! Address of event record
+
+LOCAL
+    status,
+    desc:	VECTOR [2];		! Descriptor
+
+IF .sink [sink$l_closertn] EQL 0	! If sink not yet initialized,
+THEN
+    BEGIN
+    IF .sink [sink$b_namelen] EQL 0	! If no sink name specified,
+    THEN
+	BEGIN
+	sink [sink$b_namelen] = 6;	! then default to _OPA0:
+	CH$MOVE(6, UPLIT BYTE('_OPA0:'), sink [sink$t_name]);
+	END;
+    open_file(.sink);			! then open the file/device
+    IF .sink [sink$l_closertn] EQL 0	! If unsuccessful,
+    THEN
+	RETURN;				! then forget about the output
+    END;
+
+format_event(.event, .event_length, write_line, .sink); ! Format the event
+
+desc [0] = 0;
+write_line(.sink, desc);		! write a null line afterwards
+
+END;
+
+ROUTINE write_line (sink, bufdesc): NOVALUE =
+
+!---
+!
+!	This routine is called at the end of every line
+!	in the formatted display.  The line is written
+!	to the device or file specified by the sink.
+!	If we are logging received events to the batch
+!	job log, write the formatted text to the log as well.
+!
+! Inputs:
+!
+!	sink = Address of sink control block
+!	bufdesc = Address of descriptor of current output buffer
+!
+! Outputs:
+!
+!	The line is written.
+!---
+
+BEGIN
+
+MAP
+    sink:	REF BBLOCK;		! Address of sink control block
+
+BIND
+    desc = .bufdesc:	VECTOR,		! Address line descriptor
+    timeout = UPLIT(-15*10*1000*1000,-1); ! I/O timeout = 15 seconds
+
+LOCAL
+    status,
+    fab:	REF BBLOCK,		! Address of FAB
+    rab:	REF BBLOCK;		! Address of RAB
+
+IF .evl$gl_logmask [elg$v_rcvevt]	! If logging received events,
+THEN
+    LIB$PUT_OUTPUT(desc);		! then write line to batch job log
+
+IF .sink [sink$l_closertn] EQL 0	! If file no longer open,
+THEN
+    RETURN;				! then skip it
+
+rab = .sink [sink$l_rab];		! Get address of RAB
+fab = .rab [rab$l_fab];			! Get address of FAB
+
+rab [rab$w_rsz] = .desc [0];		! Set up length/address of this line
+rab [rab$l_rbf] = .desc [1];
+
+status = $PUT(RAB = .rab);		! Output the record
+
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    LOCAL name: VECTOR [2];
+    name [0] = .sink [sink$b_namelen];
+    name [1] = sink [sink$t_name];
+    SIGNAL(msg(writefile), 1, name, .status, .rab [rab$l_stv]);
+    sink [sink$v_error] = true;		! Suspend all operations on sink
+					! until data base change
+    END;
+
+END;
+
+ROUTINE output_file (sink, event, event_length): NOVALUE =
+
+!---
+!
+!	Output an event record to a file.
+!
+! Inputs:
+!
+!	sink = Address of sink descriptor block
+!	event = Address of event record
+!	event_length = Length of event record
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    sink:	REF BBLOCK,		! Address of sink block
+    event:	REF BBLOCK;		! Address of event record
+
+LOCAL
+    status,
+    name:	VECTOR [2],		! Descriptor of file name
+    rab:	REF BBLOCK;		! Address of RAB
+
+name [0] = .sink [sink$b_namelen];	! Setup descriptor of file name
+name [1] = sink [sink$t_name];
+
+IF .sink [sink$l_closertn] EQL 0	! If sink is not yet initialized
+THEN
+    open_file(.sink);			! then open the file
+
+rab = .sink [sink$l_rab];		! Get address of RAB
+rab [rab$w_rsz] = .event_length;	! Set length of event record
+rab [rab$l_rbf] = .event;		! and address
+
+status = $PUT(RAB = .rab);		! Write event record to file
+
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    SIGNAL(msg(writefile), 1, name, .status, .rab [rab$l_stv]);
+    close_file(.sink);			! Close sink file
+    sink [sink$v_error] = true;		! Suspend all operations on sink
+					! until data base change
+    END;
+
+END;
+
+GLOBAL ROUTINE open_file (sink): NOVALUE =
+
+!---
+!
+!	Open a file sink.
+!
+! Inputs:
+!
+!	sink = Address of sink control block
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    sink:	REF BBLOCK;		! Address of sink block
+
+LOCAL
+    status,
+    length,				! Length of FAB and RAB storage
+    name:	VECTOR [2],		! Descriptor of sink name
+    rab:	REF BBLOCK,		! Address of RAB
+    fab:	REF BBLOCK;		! Address of FAB
+
+name [0] = .sink [sink$b_namelen];	! Setup descriptor of file name
+name [1] = sink [sink$t_name];
+
+length = rab$c_bln + fab$c_bln;
+signal_if_error(LIB$GET_VM(length,rab));	! Allocate RAB/FAB
+
+fab = .rab + rab$c_bln;			! Get address of FAB
+
+$FAB_INIT(FAB = .fab,			! Initialize FAB
+	FNS = .name [0],
+	FNA = .name [1],
+	DNM = '.LOG',
+	FAC = PUT,
+	RAT = CR,
+	FOP = (CIF,SQO),
+	SHR = (GET,UPI));
+$RAB_INIT(RAB = .rab,			! Initialize RAB
+	FAB = .fab,
+	ROP = (EOF,WBH));
+
+status = $CREATE(FAB = .fab);		! Create the event file
+
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    IF .fab [fab$l_stv] NEQ ss$_devalloc ! If not "device allocated" error,
+    THEN				! (which is ok, since user might want
+					! to use the output terminal)
+	SIGNAL(msg(openfile), 1, name, .status, .fab [fab$l_stv]);
+    LIB$FREE_VM(length,rab);		! Deallocate storage
+    RETURN;
+    END;
+
+status = $CONNECT(RAB = .rab);		! Connect to stream
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    SIGNAL(msg(openfile), 1, name, .status, .rab [rab$l_stv]);
+    LIB$FREE_VM(length,rab);		! Deallocate storage
+    RETURN;
+    END;
+
+sink [sink$l_rab] = .rab;		! Save address of RAB
+sink [sink$l_closertn] = close_file; 	! Set file opened
+
+END;
+
+ROUTINE close_file (sink): NOVALUE =
+
+!---
+!
+!	Close a file sink.
+!
+! Inputs:
+!
+!	sink = Address of sink block
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    sink:	REF BBLOCK;		! Address of sink block
+
+LOCAL
+    status,
+    rab:	REF BBLOCK;		! Address of RAB
+
+rab = .sink [sink$l_rab];		! Get address of RAB
+
+IF .rab NEQ 0				! If RAB and FAB were allocated
+THEN
+    BEGIN
+    LOCAL
+	length,
+	name:	VECTOR [2],		! Descriptor of file name
+	fab:	REF BBLOCK;		! Address of FAB
+
+    fab = .rab [rab$l_fab];		! Get address of FAB
+
+    name [0] = .sink [sink$b_namelen];	! Setup descriptor of file name
+    name [1] = sink [sink$t_name];
+
+    $DISCONNECT(RAB = .rab);		! Disconnect to cancel any I/O
+
+    status = $CLOSE(FAB = .fab);	! Close the file
+
+    IF NOT .status			! If error detected,
+    THEN
+	SIGNAL(msg(closefile), 1, name, .status, .fab [fab$l_stv]);
+
+    length = rab$c_bln + fab$c_bln;	! Length of RAB/FAB storage
+    LIB$FREE_VM(length,rab);		! Deallocate RAB and FAB
+    END;
+
+sink [sink$l_closertn] = 0;		! Set sink no longer open
+
+END;
+
+ROUTINE output_monitor (sink, event, event_length): NOVALUE =
+
+!---
+!
+!	Output an event record to a monitor process.
+!
+! Inputs:
+!
+!	sink = Address of sink descriptor block
+!	event = Address of event record
+!	event_length = Length of event record
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    sink:	REF BBLOCK,		! Address of sink block
+    event:	REF BBLOCK;		! Address of event record
+
+LOCAL
+    status;
+
+IF .sink [sink$b_namelen] EQL 0		! If no monitor name specified,
+THEN
+    BEGIN				! then use default "monitor", OPCOM
+    LOCAL
+	opcom_desc:	VECTOR [2],	! Descriptor of OPCOM buffer
+	opcom_buf:	BBLOCK [192+$BYTEOFFSET(opc$l_ms_text)];
+
+    sink [sink$b_maxbufsiz] = 192;	! Set maximum limit for output
+    sink [sink$b_buflen] = 0;		! Initialize buffer descriptor
+    sink [sink$l_buffer] = opcom_buf + $BYTEOFFSET(opc$l_ms_text);
+
+    format_event(.event, .event_length, ! Call formatting routines
+		save_lines, .sink);	! but append output lines together
+
+    sink [sink$b_buflen] = .sink [sink$b_buflen] - 2;	! Remove trailing CR/LF
+
+    opcom_buf [opc$b_ms_type] = opc$_rq_rqst;	! REQUEST to be sent to operator
+    opcom_buf [opc$b_ms_target] = opc$m_nm_ntwork; ! Sent to network operators
+    opcom_buf [opc$w_ms_status] = 0;		! No status
+    opcom_buf [opc$l_ms_rqstid] = 0;		! No request ID
+
+    opcom_desc [0] = .sink [sink$b_buflen] + $BYTEOFFSET(opc$l_ms_text);
+    opcom_desc [1] = opcom_buf;
+
+    status = $SNDOPR(MSGBUF = opcom_desc); ! Send message to OPCOM
+
+    IF NOT .status			! If error detected,
+    THEN
+	BEGIN
+	SIGNAL(msg(brdcst), 1, %ASCID 'OPCOM', .status); ! then signal the error
+	sink [sink$v_error] = true;	! Suspend all operations on sink
+					! until data base change
+	END;
+    RETURN;
+    END;
+
+IF .sink [sink$l_closertn] EQL 0	! If sink is not yet initialized
+THEN
+    open_monitor(.sink);		! then connect to process
+
+status = $QIOW(FUNC = IO$_WRITEVBLK,	! Send event to monitor process
+		CHAN = .sink [sink$w_channel],
+		EFN = evl$c_synch_efn,
+		IOSB = sink [sink$w_iosb],
+		P1 = .event,		! Address of event record
+		P2 = .event_length);	! Length of event record
+
+IF .status				! If successfully submitted,
+THEN
+    status = .sink [sink$w_iosb];	! then get final I/O status
+
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    IF .status NEQ ss$_abort		! If something other than link abort,
+    THEN
+	BEGIN
+	SIGNAL(msg(writemon), 0, .status);	! then report error
+	sink [sink$v_error] = true;	! Suspend all operations on sink
+					! until data base change
+	END;
+    close_monitor(.sink);		! Close the sink
+    END;
+
+END;
+
+ROUTINE save_lines (sink, desc, short_form): NOVALUE =
+
+!---
+!
+!	This is an action routine called by the event formatting
+!	routines for each line of output.  It appends each line
+!	into an buffer associated with the sink followed by a CR/LF.
+!
+! Inputs:
+!
+!	sink = Address of sink block
+!	desc = Address of descriptor of formatted line
+!	short_form = Length of line if short form is desired
+!			(-1 if no short form possible)
+!
+! Outputs:
+!
+!	The line is appended to the buffer
+!---
+
+BEGIN
+
+MAP
+    sink:	REF BBLOCK,		! Address of sink control block
+    desc:	REF VECTOR;		! Descriptor of output line
+
+LOCAL
+    linedesc:	VECTOR [2],		! Descriptor of the line
+    outdesc:	VECTOR [2];		! Output buffer descriptor
+
+outdesc [0] = .sink [sink$b_maxbufsiz] - .sink [sink$b_buflen];
+outdesc [1] = .sink [sink$l_buffer] + .sink [sink$b_buflen];
+
+linedesc [0] = .desc [0];		! Copy descriptor locally
+linedesc [1] = .desc [1];
+
+IF .short_form GTR 0			! If there is a short form,
+THEN
+    linedesc [0] = .short_form		! then use that because OPCOM
+ELSE					! is limited in output size
+IF .short_form EQL 0			! If short form means no output,
+THEN
+    RETURN;				! then don't append anything at all
+
+$FAO(%ASCID '!AS!/',			! Append the string to the buffer
+	outdesc,outdesc,		! Result buffer/length
+	linedesc);			! Parameter is descriptor of line
+
+sink [sink$b_buflen] = .sink [sink$b_buflen] + .outdesc [0]; ! Update length
+
+END;
+
+ROUTINE open_monitor (sink): NOVALUE =
+
+!---
+!
+!	Open the monitor process sink.
+!
+! Inputs:
+!
+!	sink = Address of sink control block
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    sink:	REF BBLOCK;		! Address of sink block
+
+LOCAL
+    status,
+    ncb_desc: VECTOR [2],		! Descriptor of NCB for process
+    ncb:	VECTOR [128,BYTE];	! NCB
+
+status = $ASSIGN(DEVNAM = %ASCID '_NET:',
+		CHAN = sink [sink$w_channel]);
+
+IF NOT .status			! If error detected,
+THEN
+    (SIGNAL(msg(netasn), 0, .status); RETURN);	! then report error
+
+CH$COPY(CH$RCHAR(evl$gt_localnode+2), evl$gt_localnode+3,
+	8, UPLIT('::"TASK='),
+	.sink [sink$b_namelen], sink [sink$t_name],
+	1, UPLIT('"'),
+	0, 128, ncb);
+
+ncb_desc [0] = CH$RCHAR(evl$gt_localnode+2)+8+.sink [sink$b_namelen]+1;
+ncb_desc [1] = ncb;
+
+status = $QIOW(FUNC = IO$_ACCESS,	! Connect to monitor process
+		CHAN = .sink [sink$w_channel],
+		EFN = evl$c_synch_efn,
+		IOSB = sink [sink$w_iosb],
+		P2 = ncb_desc);
+
+IF .status				! If successfully submitted,
+THEN
+    status = .sink [sink$w_iosb];	! then get final I/O status
+
+IF NOT .status				! If error detected,
+THEN
+    (SIGNAL(msg(openmon), 1, ncb_desc, .status); RETURN);
+
+sink [sink$l_closertn] = close_monitor; ! Set connection established
+
+IF .evl$gl_logmask [elg$v_monopn]	! If logging monitor connections,
+THEN
+    SIGNAL(msg(logopnm), 3, .ncb_desc [0], .ncb_desc [1], 0);
+
+END;
+
+ROUTINE close_monitor (sink): NOVALUE =
+
+!---
+!
+!	Close the monitor process sink.
+!
+! Inputs:
+!
+!	sink = Address of sink block
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    sink:	REF BBLOCK;		! Address of sink block
+
+LOCAL
+    status,
+    ncb_desc:	VECTOR [2];		! Descriptor of NCB
+
+ncb_desc [0] = .sink [sink$b_namelen];	! Setup descriptor of process name
+ncb_desc [1] = sink [sink$t_name];
+
+status = $DASSGN(CHAN = .sink [sink$w_channel]); ! Deassign channel
+
+IF NOT .status				! If error detected,
+THEN
+    SIGNAL(msg(closemon), 1, ncb_desc, .status);
+
+sink [sink$l_closertn] = 0;		! Mark sink closed
+
+END;
+
+END
+ELUDOM

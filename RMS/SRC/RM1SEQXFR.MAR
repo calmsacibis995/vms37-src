@@ -1,0 +1,1017 @@
+	$BEGIN	RM1SEQXFR,001,$RMS1,<TRANSFER BLOCK FOR SEQUENTIAL FILE ORG>
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; Facility: rms32
+;
+; Abstract:
+;		this module performs i/o transfers for the
+;		sequential file organization.
+;
+; Environment:
+;		star processor running starlet exec.
+;
+; Author: L F Laverdure,	 creation date: 3-FEB-1977
+;
+; Modified By:
+;
+;	V03-001	KPL0001		P Lieberwirth	22-Mar-1982
+;		Move a word of the BDB$L_IOSB as system error code
+;		on errors encountered in read-ahead/write-behind,
+;		not a longword, as before, which led to bad messages.
+;
+;	V02-039	CDS0003		C D Saether	20-Aug-1981
+;		Remove references to BDB$M_LKDINWS flag.
+;
+;	V02-038	CDS0002		C D Saether	7-May-1981
+;		Clear DRT before qio on write to block device
+;		like it used to before V02-037.
+;
+;	V02-037	CDS0001		C D Saether	6-Feb-1981
+;		Always set bdb$v_iop for duration of i/o on
+;		buffer reads and writes so multi-streaming
+;		cache interlocks work correctly
+;
+;	V02-036	KRM0001		K R Malik	19-NOV-1980
+;		Check for new status codes, SS$_LINKABORT and SS$_LINKDISCON
+;		and map to RMS$_EOF if found (leave in check for SS$_ABORT
+;		for the	time being).
+;
+;	V02-035	REFORMAT	P S Knibbe	24-Jul-1980
+;
+;	V034	CDS0078		C D Saether	26-MAR-1980	11:10
+;		zero bdb$w_numb on sys error, branch to errwrt on
+;		qio error for task to task
+;
+;	V033	CDS0077		C D Saether	21-MAR-1980	15:20
+;		set bdb$w_numb to smaller of iosb count field and
+;		buffer size on errors.
+;
+;	V032	JAK0041		J A Krycka	19-MAR-1980	15:30
+;		continuation of v031.
+;
+;	V031	JAK0041		J A Krycka	03-MAR-1980	11:00
+;		clean up of ntget and ntput.
+;
+;	V030	PSK0013		P S Knibbe	18-FEB-1980	17:50
+;		make sure bdb$w_numb is always valid after a sequential
+;		read.
+;
+; Revision history:
+;
+;	V029	PSK0011		P S Knibbe	23-JAN-1980
+;	when a magtape reads eof, the eof bit flag should be set and
+;	the nrp_vbn should be set equal to the ebk in order to force
+;	checkin the flag on subsequent operations.
+;
+;	V028	CDS0076		C D Saether	22-JAN-1980	15:20
+;	fix write behind bug causing wait for completion of i/o on
+;	on all buffers when unnecessary
+;
+;	V027	CDS0061		C D Saether	6-DEC-1979	19:50
+;	set now for mailboxes if 0 timeout spec'd.  use lesser of
+;	bdb$w_numb or bdb$w_size for reads from terminal.
+;
+;	V026	CDS0030		C D Saether	11-SEP-1979	16:30
+;	take out terminal checks in put_unit_rec for size of record
+;
+;	V025	CDS0026		C D Saether	18-AUG-1979	00:03
+;	write to unit record devices from user buffer
+;	don't write records larger than devbufsiz to terminals checks
+;	have moved here from rm$put_unit_rec
+;
+;	V024	CDS0011		C D Saether	26-JUN-1979	17:00
+;	take cntrl z checking for terminals out of rm$seqrd
+;
+;--
+
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+;
+; Macros:
+;
+
+	$IFBDEF
+	$IRBDEF
+	$BDBDEF
+	$IMPDEF
+	$PIODEF
+	$RABDEF
+	$DEVDEF
+	$IODEF
+	$QIODEF
+	$TTDEF
+	$SSDEF
+
+;
+; Equated Symbols:
+;
+
+	ROP=RAB$L_ROP*8			; bit offset to rop
+	CTRLZ	= 26
+
+;
+; Own Storage:
+;
+
+
+	.SBTTL	RM$SEQRAH - ROUTINE TO PERFORM READ AHEAD QIO
+
+;++
+; RM$SEQRAH - Read ahead QIO
+;
+; this routine performs read ahead for the sequential file organization.
+; currently used for files-11 disk and magtape only.
+;
+; Calling sequence:
+;
+;	bsbw	rm$seqrah
+;
+; Input Parameters:
+;
+;	r11	impure area addr
+;	r10	ifab addr
+;	r9	irab addr
+;	r8	rab addr
+;	r4	bdb address for read ahead
+;	r2	# of bytes to read
+;	r1	starting vbn
+;
+; Implicit Inputs:
+;
+;	ifb$w_chnl	i/o channel for qio
+;
+; outputs:
+;
+;	r0		status code
+;	r1,ap		destroyed
+;
+; Implicit Outputs:
+;
+;	bdb$w_numb		# of bytes transferred
+;	bdb$l_vbn		starting vbn for buffer
+;	bdb$v_val		cleared
+;	bdb$l_iosb,bdb$l_iosb+4	user as system iosb for qio
+;
+;
+; status codes:
+;
+;	standard qio system service codes
+;
+; Side Effects:
+;
+;	the ast for i/o completion will occur at rm$rahwbhast with r4
+;	as the ast parameter.
+;
+; note:
+;
+;	the read ahead/write behind code assumes that qios will occur in the
+;	same order as they are queued, otherwise the following sequence may fail:
+;	wbh vbn n, read vbn m, read vbn n; a stale copy of vbn n may be read.
+;	if this ordering assumption becomes invalid, additional code will have
+;	to be written.
+;
+;--
+
+
+RM$SEQRAH::
+	CLRB	BDB$B_FLGS(R4)		; clear all bdb flags
+	SSB	#BDB$V_IOP,-
+		BDB$B_FLGS(R4)		; set io in progress
+	MOVL	R1,BDB$L_VBN(R4)	; store vbn in bdb
+	MOVW	R2,BDB$W_NUMB(R4)	; store size of xfer in bdb
+	BSBW	SETP6_P3		; build qio parm block
+	BSBW	SETP2_EFN_RAH
+
+	ASSUME	QIO$_NARGS EQ 12
+
+	CALLS	#12,@#SYS$QIO		; do qio
+	BLBS	R0,10$			; branch if qio was ok
+	CSB	#BDB$V_IOP,-
+		BDB$B_FLGS(R4)		; note no io in progress
+10$:	RSB
+
+	.SBTTL	RM$QUIET_SEQMBF - ROUTINE TO FLUSH OUT ALL RAH/WBH
+
+;++
+; RM$QUIET_SEQMBF - Flush out all RAH/WBH
+;
+; this routine scans down the bdb chain and wait for all
+; pending io to complete. if a write behind error occurs it saves
+; the status and reports it after all io is quiet.
+;
+; Calling sequence:
+;
+;	bsbw	rm$quiet_seqmbf
+;
+; Input Parameters:
+;
+;	r11	impure area addr
+;	r10	ifab addr
+;	r9	irab addr
+;	r8	rab addr (or fab)
+;
+; Implicit Inputs:
+;
+;	ifb$w_chnl	i/o channel for qio
+;
+; outputs:
+;
+;	r0		status code
+;	r1 thru r3,ap are destroyed
+;
+; Implicit Outputs:
+;
+;	all bdb's in chain have been initialized
+;
+;
+; status codes:
+;
+;	wbe
+;
+; Side Effects:
+;
+;
+;--
+
+RM$QUIET_SEQMBF::
+	CLRL	IRB$L_CURBDB(R9)	; there is no longer a current bdb
+	PUSHR	#^M<R4,R5>		; save registers
+	PUSHL	#1			; anticipate success
+	ADDL3	#IFB$L_BDB_FLNK,IRB$L_IFAB_LNK(R9),R4; get bdb list head addr
+	MOVL	R4,R5			; save it
+	ASSUME	BDB$L_FLINK EQ 0
+10$:	MOVL	(R4),R4			; get next bdb
+	CMPL	R4,R5			; at end?
+	BEQL	30$			; branch if yes
+	BBC	#BDB$V_IOP,-
+		BDB$B_FLGS(R4),20$	; branch if no io in progress
+	BSBB	RM$STALLRAHWBH		; wait for io to complete
+	BLBS	R0,20$			; branch if no wbe errors
+	MOVL	R0,(SP)			; remember error
+20$:	CLRB	BDB$B_FLGS(R4)		; clear flags
+	CLRL	BDB$L_VBN(R4)		; and vbn
+	BRB	10$			; branch back for next bdb
+
+30$:	POPR	#^M<R0,R4,R5>		; restore status and r4,r5
+	RSB
+
+;++
+; rm$stallrahwbh - STALL Read Ahead and Write behind
+;
+; this routine waits for io done for a bdb for which a rah or wbh was done.
+;
+; Calling sequence:
+;
+;	bsbw	rm$stallrahwbh
+;
+; inputs:
+;
+;	same as rm$quiet_seqmbf
+;	r4 = bdb address to stall for
+;
+; outputs:
+;
+;	r0 = status	either suc or wbe
+;
+;	r1 thru r3,ap are destroyed only if really stalls
+;
+;  note:	the bdb flags bit 'ast_dcl' is used to interlock rah/wbh
+;	i/o done processing with the ast side of the system.  when the i/o
+;	is initialized ast_dcl is zeroed.  when the ast routine for i/o
+;	completion is executed, the bit is set, and if already set the waiting
+;	stream is restarted (subject to imp$v_inhast), else the ast is simply
+;	dismissed.  when testing for i/o done, this routine first sets
+;	bdb$l_wait to the address of the irab and then tests the bit, setting
+;	it.  if the bit was clear, the routine must stall for i/o done,
+;	otherwise the buffer may be used immediately.
+;
+;--
+
+RM$STALLRAHWBH::
+	MOVL	R9,BDB$L_WAIT(R4)	; set ast param in case of wait
+	BBSS	#BDB$V_AST_DCL,-
+		BDB$B_FLGS(R4),20$	; branch if i/o done
+					; indicates waiting otherwise
+	BSBW	RM$STALL		; stall for io complete
+20$:	RMSSUC				; assume success for wbh or rah
+
+	ASSUME	BDB$V_VAL EQ 0
+
+	BBCC	#BDB$V_VAL,-
+		BDB$B_FLGS(R4),25$	; branch if rah
+	CLRL	BDB$L_VBN(R4)		; cause blk not to be reused
+	BLBC	BDB$L_IOSB(R4),30$	; branch if errors
+25$:	RSB
+30$:	$PSECT_BR	L$RMS1
+	MOVZWL	BDB$L_IOSB(R4),-
+		RAB$L_STV(R8)		; return system error code to user
+	RMSERR	WBE			; and report write behind error
+	RSB
+	$PSECT_RESTORE
+
+
+;++
+;
+; routine to get the next bdb via the flnk of a bdb thru the list head
+;
+; Calling sequence:
+;
+;	bsbw	rm$seqflnkbdb
+;
+; inputs:
+;
+;	r9 = irab address
+;	r4 = bdb address
+;
+; outputs:
+;
+;	r4 = new bdb address via flnk
+;	r0 = list head address for bdb chain
+;
+;--
+
+RM$SEQFLNKBDB::
+	ADDL3	#IFB$L_BDB_FLNK,-
+		IRB$L_IFAB_LNK(R9),R0	; get bdb list head addr
+
+	ASSUME	BDB$L_FLINK EQ 0
+
+	MOVL	(R4),R4			; get next bdb
+	CMPL	R4,R0			; at list head
+	BNEQ	XIT			; branch if no
+	MOVL	(R4),R4			; yes go one more
+XIT:	RSB
+
+	.SBTTL	RM$SEQRD - ROUTINE TO PERFORM SEQUENTIAL READS
+
+;++
+; RM$SEQRD - Performat sequential reads
+;
+; this routine performs read virtual block for the sequential
+; file organization.  one of several flavors is performed
+; depending upon whether the device for the read is a
+; terminal and whether a read-ahead (ie multi-buffering)
+; was done or is in progress.
+;
+; Calling sequence:
+;
+;	bsbw	rm$seqrd
+;
+; Input Parameters:
+;
+;	r11	impure area addr
+;	r10	ifab addr
+;	r9	irab addr
+;	r8	rab addr
+;	r3	option to avoid read if bit 0 set
+;		(currently simply checks for i/o in progress)
+;	r2	# of bytes to read
+;	r1	starting vbn
+;
+; Implicit Inputs:
+;
+;	irb$l_curbdb	addr of old current bdb
+;	irb$l_nxtbdb	bdb addr for which last rah was done
+;	dev$v_trm	terminal device flag
+;			if set, the various rop terminal option
+;			bits are used along with irb$b_tmo,
+;			irb$_l_pbf and irb$b_psz if specified
+;	ifb$w_chnl	i/o channel for qio
+;
+; outputs:
+;
+;	irb$l_curbdb	new current bdb = r4 = flnk of old curbdb or
+;			if old curbdb = 0 then nxtbdb
+;	r4		addr of new current bdb
+;	r0		status code
+;	r1 thru r3,ap	destroyed
+;
+; Implicit Outputs:
+;
+;	bdb$w_numb		# of bytes transferred
+;	bdb$l_vbn		starting vbn for buffer
+;	bdb$v_val		set unless an error occurred
+;	irb$l_ios,irb$l_ios4	system specified i/o status block
+;				(useful for detecting unit record
+;				eof or reporting errors)
+;	rab$l_stv		set to terminator if device is terminal
+;				or system error code if sys error
+;
+;
+; status codes:
+;
+;	standard rms, in particular, suc, eof, tmo, wbe, and sys.
+;
+; Side Effects:
+;
+;	may have switched to running at ast level
+;	bdb$v_iop set for duration of i/o
+;
+;--
+
+
+RM$SEQRD::
+	$TSTPT	SEQRD
+	MOVL	IRB$L_CURBDB(R9),R4	; get current bdb
+	BNEQ	10$			; branch if there was one
+	MOVL	IRB$L_NXTBDB(R9),R4	; use next bdb for new current bdb
+	BRB	20$			; and continue
+10$:	BSBB	RM$SEQFLNKBDB		; get new current bdb
+20$:	MOVL	R4,IRB$L_CURBDB(R9)	; and update curbdb
+	BBCC	#BDB$V_IOP,BDB$B_FLGS(R4),40$; branch if not a rah bdb
+	PUSHR	#^M<R1,R2,R3>
+	BSBB	RM$STALLRAHWBH		; wait for io done
+	POPR	#^M<R1,R2,R3>
+	BLBC	R0,XIT			; branch if wbe error
+30$:	BLBS	R3,40$			; branch if write, claim bdb
+	CMPL	R1,BDB$L_VBN(R4)	; is this the desired vbn
+	BNEQ	35$			; branch if no
+	MOVQ	BDB$L_IOSB(R4),IRB$L_IOS(R9); put io status in irab
+	MOVZWL	BDB$L_IOSB(R4),R0	; get completion code
+	BRB	QIODONE			; and go join common code
+
+;
+;  bumped into a rah or wbh bdb that was not for the block that we wanted.
+;  quiet the read aheads and write behinds.
+;
+
+35$:	PUSHR	#^M<R1,R2,R3>
+	BSBW	RM$QUIET_SEQMBF		; quiet activity
+	POPR	#^M<R1,R2,R3>
+	BLBC	R0,XIT			; get out on error
+
+;
+;  claim unused bdb
+;
+
+40$:	MOVL	R1,BDB$L_VBN(R4)	; save vbn in bdb
+	MOVW	R2, BDB$W_NUMB(R4)	; and # bytes used
+	BEQL	SUCCESS			; get out if 0
+	BLBS	R3,SUCCESS		; all done if no read flagged
+	BBS	#DEV$V_TRM,-
+		IFB$L_PRIM_DEV(R10),-
+		TRMREAD			; branch if terminal
+
+RM$RDBUFWT::
+
+;
+; perform remote file access using network specific code. however,
+; perform task-to-task communication using standard rms code.
+;
+
+	BBS	#IFB$V_DAP,(R10),NTGET	; branch if remote access via dap
+
+;
+; issue read qio (not for terminal) and wait for completion
+;
+; start building argument list on stack
+;
+
+	BSBW	SETP6_P3		; build p6 thru p3 on stack
+	BSBW	SETP2_EFN		; build p2 thru efn on stack
+	BBC	#DEV$V_MBX,-
+		IFB$L_PRIM_DEV(R10),-
+		DOQIO			; branch if not mailbox
+	BBC	#RAB$V_TMO+ROP,-
+		(R8),-
+		DOQIO			; or if timeout not wanted
+	TSTB	RAB$B_TMO(R8)		; 0 timeout spec'd
+	BNEQ	DOQIO			; neq don't want now modifier
+	SSB	#IO$V_NOW,-
+		QIO$_FUNC-4(SP)		; set qio sub func to do now
+DOQIO:
+	ASSUME	QIO$_NARGS EQ 12
+
+	BISB2	#BDB$M_IOP,BDB$B_FLGS(R4) ; note i/o in progress
+	CALLS	#12,@#SYS$QIO		; do the qio
+	BLBC	R0,ERRSYS		; branch on error
+	BSBW	RM$STALL		; await completion
+	BICB2	#BDB$M_IOP,BDB$B_FLGS(R4) ; note i/o complete
+QIODONE:
+	MOVW	IRB$W_IOS2(R9),-
+		BDB$W_NUMB(R4)		; store real byte count
+	BLBC	R0,ERR_READ		; branch on i/o error
+SETVAL:	BISB2	#BDB$M_VAL,-
+		BDB$B_FLGS(R4)		; set buffer valid
+RET:
+	RSB
+
+;++
+;
+; perform network get/find function via the remote fal
+; note that network find does not return a record
+;
+;--
+
+NTGET:	$PSECT_BR	NF$NETWORK
+	BBC	#IRB$V_FIND,(R9),10$	; branch if get operation
+	BSBW	NT$FIND			; perform network find
+	BRB	20$			;
+10$:	BSBW	NT$GET			; perform network get
+20$:	BLBC	R0,30$			; branch on failure
+	BRW	SETVAL			; branch on success
+30$:	RSB				; exit with rms code in r0
+	$PSECT_RESTORE
+
+
+;
+;  error on qio - give default error of 'sys'
+;
+
+ERRSYS:	$PSECT_BR	L$RMS1GET
+	BICB2	#BDB$M_IOP,BDB$B_FLGS(R4) ; make sure clear on error
+	CLRW	BDB$W_NUMB(R4)		; zero on error so no data moved
+	RMSERR	SYS,R1			; set default error code
+	BRB	CHKEOF			; go see if error is eof
+	$PSECT_RESTORE
+
+;
+; error on read - check for eof
+;
+
+ERR_READ:
+	$PSECT_BR	L$RMS1GET
+
+	RMSERR	RER,R1			; set default error code
+	CMPW	IRB$W_IOS2(R9),-
+		BDB$W_SIZE(R4)		; check 'byte count' against
+	BLEQU	CHKEOF			; size of buffer. dataoverrun
+					; err from magtape has size of
+					; of block here instead of bytes
+					; actually transferred.
+	MOVW	BDB$W_SIZE(R4),-
+		 BDB$W_NUMB(R4)		; use buff size instead
+CHKEOF:	CMPW	R0,#SS$_ENDOFFILE	; is it eof?
+	BEQL	EOF			; branch if yes
+	BBS	#IFB$V_NSP,(R10),10$	; branch if task-to-task operation
+	CMPW	R0,#SS$_TIMEOUT		; perhaps it's time out?
+	BNEQ	ERRQIO			; branch if not
+	RMSERR	TMO			; yes - change error code
+	BRB	TSTSIZ
+10$:	CMPW	R0,#SS$_LINKABORT	; Did partner issue disconnect abort?
+	BEQL	EOF			; Branch if yes
+	CMPW	R0,#SS$_LINKDISCON	; Did partner issue sync disconnect?
+	BEQL	EOF			; Branch if yes
+	CMPW	R0,#SS$_ABORT		; Was logical link destroyed (old code)?
+	BEQL	EOF			; Branch if yes
+
+;
+; some unexpected qio error
+;
+
+ERRQIO:	BRW	RM$MAPERR		; see if error mappable to rms code
+EOF:	BBC	#DEV$V_SQD,-
+		IFB$L_PRIM_DEV(R10),10$	; if magtape
+	BBS	#DEV$V_FOR,-
+		IFB$L_PRIM_DEV(R10),10$	; and not foreign
+	SSB	#IRB$V_EOF,(R9)		; set eof flag
+	MOVL	IFB$L_EBK(R10),-
+		IRB$L_NRP_VBN(R9)	; set vbn = ebk to force
+					; op's to look at flag
+	MOVW	IFB$W_FFB(R10),-
+		IRB$W_NRP_OFF(R9)
+10$:	RMSERR	EOF			; change error code
+TSTSIZ:	TSTW	IRB$W_IOS2(R9)		; zero data length?
+	BNEQ	SETVAL1			; treat as valid if so
+	BRW	RET
+SETVAL1:
+	BRW	SETVAL
+	$PSECT_RESTORE
+
+;
+; successful return for no read required
+;
+
+SUCCESS:
+	RMSSUC
+	RSB
+
+;
+;
+; either no next bdb or iop was set
+; neither should ever happen (gulp!)
+;
+; note: on read ahead or write behind, iop can be set
+;	in which case must wait for the buffer to be freed.
+;
+
+ERRBUG:	RMSTBUG	FTL$_NONXTBDB
+
+
+;
+; issue read qio for terminal
+;
+; must build argument list to include timeout period
+; and prompt buffer address and size
+;
+
+TRMREAD:
+
+;
+; start building the qio parameter list
+;
+
+	CMPW	BDB$W_NUMB(R4),-
+		BDB$W_SIZE(R4)		; buffer big enough?
+	BLEQU	5$			; lequ it is
+	MOVW	BDB$W_SIZE(R4),-
+		BDB$W_NUMB(R4)		; else use buffer size
+5$:	MOVZBL	RAB$B_PSZ(R8),-(SP)	; p6 = prompt buffer size
+	PUSHAB	@RAB$L_PBF(R8)		; p5 = prompt buffer addr
+	BNEQ	10$			; branch if specified
+	CLRL	QIO$_P6-QIO$_P5(SP)	; insure 0 size
+	BRB	20$
+
+;
+; probe prompt buffer for caller readability
+;
+
+10$:
+	IFNORD	QIO$_P6-QIO$_P5(SP),-
+		@0(SP),-
+		ERRPBF,IRB$B_MODE(R9)	; branch if not readable
+20$:	CLRL	-(SP)			; p4 = terminator class
+					;  = default (tc$m_standard)
+	MOVZBL	RAB$B_TMO(R8),-(SP)	; p3 = timeout period
+	BSBB	SETP2_EFN		; finish build of arg list
+
+;
+;  check for read prompt and if found change the i/o function code
+;
+
+	BBC	#RAB$V_PMT+ROP,-
+		(R8),30$		; branch if not read prompt
+	MOVL	#IO$_READPROMPT,-
+		QIO$_FUNC-4(SP)		; substitute function code
+					; or in the terminal read options bits
+
+;
+; the following assumes check that the rms definitions for
+; the terminal read sub functions match those of
+; the starlet system
+;
+
+	ASSUME	<RAB$V_RNE-24> EQ <IO$V_NOECHO - 6>
+	ASSUME	<RAB$V_PTA-24> EQ <IO$V_PURGE - 6>
+	ASSUME	<RAB$V_TMO-24> EQ <IO$V_TIMED - 6>
+	ASSUME	<RAB$V_RNF-24> EQ <IO$V_NOFILTR - 6>
+	ASSUME	<RAB$V_CVT-24> EQ <IO$V_CVTLOW - 6>
+
+;
+
+30$:	EXTZV	#RAB$V_RNE+ROP,#6,(R8),R0; get the option bits
+	INSV	R0,#6,#6,QIO$_FUNC-4(SP); and set them into the i/o func
+	BRW	DOQIO			; common finish
+
+;
+; prompt buffer not readable
+;
+
+ERRPBF:	$PSECT_BR	L$RMS1
+	POPR	#^M<R0,R1>		; clean up stack
+	RMSERR	PBF
+	RSB
+	$PSECT_RESTORE
+
+
+;
+; routine to build qio args on stack
+; p3 = vbn, p4 = p5 = p6 = 0
+; input:	bdb$l_vbn(r4) = vbn
+; note:		r0,r1 destroyed
+;
+
+SETP6_P3:
+	MOVL	(SP)+,R0		; get return pc
+	CLRQ	-(SP)			; p6, p5 = 0
+	PUSHL	#0			; p4 = 0
+	PUSHL	BDB$L_VBN(R4)		; p3 = vbn
+	JMP	(R0)			; return
+
+;
+; routine to build qio args on stack for a read ahead or write behind qio
+; set p2 thru efn
+;
+
+SETP2_EFN_RAH:
+	MOVL	(SP)+,R0		; get return pc
+	MOVZWL	BDB$W_NUMB(R4),-(SP)	; p2 = xfer size
+	PUSHL	BDB$L_ADDR(R4)		; p1 = buffer addr from bdb
+
+	ASSUME	QIO$_ASTPRM EQ <QIO$_P1 - 4>
+
+	PUSHL	R4			; astprm = bdb addr
+
+	ASSUME	QIO$_ASTADR EQ <QIO$_ASTPRM - 4>
+
+	PUSHAL	W^RM$RAHWBHAST		; set ast service address
+
+	ASSUME	QIO$_IOSB EQ <QIO$_ASTADR - 4>
+
+	PUSHAL	BDB$L_IOSB(R4)		; use iosb in bdb
+	CSB	#BDB$V_AST_DCL,-
+		BDB$B_FLGS(R4)		; clear i/o done flag
+	BRB	SETFUNC			; go join common code
+
+;
+; routine to build qio args on stack
+; sets p2 thru efn
+;
+
+SETP2_EFN:
+	MOVL	(SP)+,R0		; get return pc
+	MOVZWL	BDB$W_NUMB(R4),-(SP)	; p2 = xfer size
+	PUSHL	BDB$L_ADDR(R4)		; p1 = buffer addr from bdb
+SETAST_EFN:				; entry point from rm$seqwtur
+
+	ASSUME	QIO$_ASTPRM EQ <QIO$_P1 - 4>
+
+	PUSHL	R9			; astprm = irab addr = r9
+
+	ASSUME	QIO$_ASTADR EQ <QIO$_ASTPRM - 4>
+
+	PUSHAL	W^RM$STALLAST		; ast addr
+
+	ASSUME	QIO$_IOSB EQ <QIO$_ASTADR - 4>
+
+	PUSHAL	IRB$L_IOS(R9)		; iosb addr
+
+	ASSUME	QIO$_FUNC EQ <QIO$_IOSB - 4>
+
+	BBS	#DEV$V_FOR,-
+		IFB$L_PRIM_DEV(R10),-
+		READ_LOG		; branch if foreign dev
+SETFUNC:
+	PUSHL	#IO$_READVBLK		; i/o function code
+
+	ASSUME	QIO$_CHAN EQ <QIO$_FUNC - 4>
+
+SETCHN:	MOVZWL	IFB$W_CHNL(R10),-(SP)	; i/o channel
+
+	ASSUME	QIO$_EFN EQ <QIO$_CHAN - 4>
+	ASSUME	IFB$B_EFN EQ IRB$B_EFN
+SETEFN:
+	ASSUME	IRB$C_BID&1 EQ 0
+	ASSUME	IFB$C_BID&1 EQ 1
+	ASSUME	IRB$B_BID EQ IFB$B_BID
+
+	BLBS	IRB$B_BID(R9),2$	; branch if ifab
+	BBS	#IRB$V_ASYNC,-
+		(R9),ASYNCEFN		; branch if async operation
+	BBS	#IRB$V_RAHWBH,-
+		(R9),ASYNCEFN		; branch if rah/wbh call
+2$:	MOVZBL	IRB$B_EFN(R9),-(SP)	; use allocated efn
+	BNEQ	10$			; branch if one allocated
+	MOVB	#IMP$C_SYNCEFN,(SP)	; use the sync efn
+	BBSS	#PIO$V_SYNC1,-
+		@#PIO$GW_STATUS,20$	; claim efn
+5$:	MOVB	(SP),IRB$B_EFN(R9)	; save efn
+10$:	JMP	(R0)			; return
+20$:	INCB	(SP)			; bump efn
+	BBCS	#PIO$V_SYNC2,-
+		@#PIO$GW_STATUS,5$	; claim use of 2nd efn
+	INCB	(SP)			; must use third efn
+	BRB	5$
+ASYNCEFN:
+	PUSHL	#IMP$C_ASYQIOEFN	; use (throw away) async efn
+	JMP	(R0)			; return
+
+;
+
+READ_LOG:
+	PUSHL	#IO$_READLBLK		; set read logical for foreign dev
+	BRB	SETCHN			; rejoin main line
+
+;
+; global entry point to set the io channel and efn for io
+;
+
+RM$SETCHN_EFN::
+	POPR	#^M<R0>			; get return pc
+	BRB	SETCHN			; go do it
+
+;
+;!!!!\ TEMPORARY UNTIL RM0FILFNC ABLE TO CALL RM$SETCHN_EFN\!!!!!
+;
+
+
+RM$SETEFN::
+	POPR	#^M<R0>			; get return pc
+	BRB	SETEFN
+	.SBTTL	RM$SEQWT - ROUTINE TO PERFORM SEQUENTIAL WRITES
+
+;++
+; RM$SEQWT
+;
+; this routine performs write virtual block for the sequential
+; file organization. one of several flavors is performed
+; depending upon whether the device is a unit record
+; device and whether write-behind multi-buffer is in progress.
+;
+; Calling sequence:
+;
+;	bsbw	rm$seqwtbd - write to a block device
+;	bsbw	rm$seqwtur - write to a unit record device
+;
+; Input Parameters:
+;
+;	r11	impure area addr
+;	r10	ifab addr
+;	r9	irab addr
+;	r8	rab addr
+;	r4	bdb addr of buffer to write
+;
+; Implicit Inputs:
+;
+;	rab$v_wbh	user wants write behind option
+;	irb$v_rahwbh	write behind processing flag
+;	bdb$l_addr	address of buffer
+;	bdb$l_vbn	vbn to write (block device)
+;	bdb$w_numb	# bytes to write
+;	bdb$b_pre_cctl	carriage control byte (unit record device)
+;	bdb$b_post_cctl
+;	ifb$l_chnl	i/o channel
+;
+; outputs:
+;
+;	r0	status code
+;	r1-r3	destroyed
+;
+; Implicit Outputs:
+;
+;	bdb$v_drt		cleared
+; if not write behind:
+;	irb$l_ios,irb$l_ios4	system specified i/o status block data
+;	rab$l_stv		system error code if sys error
+; if write behind:
+;	bdb$v_iop		set
+;
+; status codes:
+;
+;	standard rms, in particular, suc, eof, and sys.
+;
+; Side Effects:
+;
+;	if write behind, an ast will occur at rm$rahwbhast
+;	upon i/o completion
+;
+;	if not write behind, may have switched to running at ast level.
+;
+;	bdb$v_iop is set for duration of i/o
+;
+;--
+;
+; write to a unit record device - build arg list on stack
+; note: not doing write behind to unit record device
+;
+;--
+
+RM$SEQWTUR::
+	$TSTPT	SEQWTUR
+
+;
+; perform remote file access using network specific code. however,
+; perform task-to-task communication using standard rms code.
+;
+
+	BBS	#IFB$V_DAP,(R10),NTPUT	; branch if remote access via dap
+	CLRQ	-(SP)			; p6,p5 = 0
+	CLRQ	-(SP)			; p4,p3 = 0
+
+	ASSUME	BDB$B_PRE_CCTL+1 EQ BDB$B_POST_CCTL
+
+	MOVW	BDB$B_PRE_CCTL(R4),6(SP); p4 = carriage control
+	MOVAB	WTCOM0,R0		; ret addr after setast_efn
+	MOVZWL	BDB$W_NUMB(R4),-(SP)	; push transfer size
+	PUSHL	BDB$L_CURBUFADR(R4)	; address of buffer
+	BRW	SETAST_EFN		; and set up rest
+
+;
+; write to a block device - build arg list on stack
+;
+
+RM$SEQWTBD::
+	$TSTPT	SEQWTBD
+	BBC	#IRB$V_RAHWBH,-
+		(R9),RM$WTBUFWT		; branch if wbh not enabled
+	BBC	#RAB$V_WBH+ROP,-
+		(R8),RM$WTBUFWT		; or user does not buy in
+	BSBW	SETP6_P3		; setup qio call arg block on stack
+	BSBW	SETP2_EFN_RAH
+	MOVL	#1,AP			; set write behind flag
+	BRB	WTCOM1			; join common code
+
+RM$WTBUFWT::
+	BSBW	SETP6_P3		; p6=p5=p4=0, p3 = vbn
+
+;
+; build remaining argument list on stack
+;
+
+WTCOMM:	BSBW	SETP2_EFN		; build p2 thru efn on stack
+WTCOM0:	CLRL	AP			; clear write behind flag
+
+	ASSUME	IO$_WRITEVBLK EQ IO$_READVBLK-1
+	ASSUME	IO$_WRITELBLK EQ IO$_READLBLK-1
+
+WTCOM1:	DECL	QIO$_FUNC-4(SP)		; change to write
+	BBS	#DEV$V_TRM,-
+		IFB$L_PRIM_DEV(R10),30$	; branch if terminal
+	BBS	#DEV$V_MBX,-
+		IFB$L_PRIM_DEV(R10),40$	; branch if mailbox
+
+	ASSUME	QIO$_NARGS EQ 12
+
+10$:
+	BICB2	#BDB$M_DRT,BDB$B_FLGS(R4) ; note not dirty anymore
+	BISB2	#BDB$M_IOP,BDB$B_FLGS(R4) ; note i/o in progress
+	CALLS	#12,@#SYS$QIO		; do the qio
+	BLBC	R0,ERRQIO1
+	BLBS	AP,20$			; branch if write behind call
+	BSBW	RM$STALL		; await completion
+	BICB2	#BDB$M_IOP,BDB$B_FLGS(R4) ; note i/o completion
+	BLBC	R0,ERRWRT		; branch on error
+20$:	RSB
+30$:	BBC	#RAB$V_CCO+ROP,(R8),10$	; branch if cco not speced
+	BBCS	#IO$V_CANCTRLO,-
+		QIO$_FUNC-4(SP),10$	; cancel control o. this
+					; won't be set already.
+40$:	BBC	#RAB$V_TMO+ROP,(R8),10$	; don't want now checked
+	TSTB	RAB$B_TMO(R8)		; 0 timeout spec'd?
+	BNEQ	10$			; nope, do normal read
+	BBCS	#IO$V_NOW,-
+		QIO$_FUNC-4(SP),10$	; set now sub func and branch.
+					; won't be set already.
+
+;++
+;
+; perform network put/update function via the remote fal
+;
+;--
+
+NTPUT:	$PSECT_BR	NF$NETWORK
+	BBSC	#IRB$V_UPDATE,(R9),10$	; branch if update operation
+
+;
+;  and clear flag
+;
+
+	BSBW	NT$PUT			; perform network put
+	RSB				; exit with rms code in r0
+10$:	BSBW	NT$UPDATE		; perform network update
+	RSB				; exit with rms code in r0
+	$PSECT_RESTORE
+
+;
+; error on qio call
+;
+
+ERRQIO1:
+	BICB2	#BDB$M_IOP,BDB$B_FLGS(R4); make sure iop is not set
+	BBS	#IFB$V_NSP, (R10), ERRWRT; branch if task to task net
+
+;
+; operation so abort error
+; doesn't map to eof
+;
+
+	BRW	ERRSYS
+
+;
+; error writing - set default error code and go map if possible
+;
+
+ERRWRT:	$PSECT_BR	L$RMS1
+
+	RMSERR	WER,R1
+	BRW	RM$MAPERR
+	$PSECT_RESTORE
+	.END

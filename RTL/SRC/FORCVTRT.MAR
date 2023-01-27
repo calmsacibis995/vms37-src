@@ -1,0 +1,598 @@
+	.TITLE	FOR$CVTRT - Convert Real (D, G, H) to Text
+	.IDENT	/1-014/			; File: FORCVTRT.MAR  Edit: JAW1014
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY: FORTRAN Language Support Library
+;
+; ABSTRACT:
+;
+;	Routines to convert D, G and H floating values to text representations.
+;	This module supports FORTRAN D, E, F and G formatting.
+;
+; ENVIRONMENT: User Mode, AST Reentrant
+;
+;--
+; AUTHOR: Steven B. Lionel, CREATION DATE: 19-Jun-1979
+;
+
+	.SBTTL	Edit History
+;
+; 1-001 - Original.  SBL 19-Jun-1979
+; 1-002 - Remove STRING_LEN from stack frame.  SBL 11-Jul-1979
+; 1-003 - Fix bug in rounding.  SBL 6-Jul-1979
+; 1-004 - Keep sign on F underflow to zero.  SBL 16-July-1979
+; 1-005 - Fix bug in G format rounding with digits_in_int.  SBL 25-July-1979
+; 1-007 - Negate 1-004, that is not the desired behavior.  SBL 20-Aug-1979
+; 1-008 - Speed optimizations. Use CASE for argument pickup.  Use
+;	  fast way of computing temp string length.  SBL 27-Dec-1979
+; 1-009 - Use correct limit in CASE statements.  SBL 28-Dec-1979
+; 1-010 - Use signed branch on CASEB.  SBL 31-Dec-1979
+; 1-011 - Do correct thing for >128 arguments.  SBL 31-Dec-1979
+; 1-012 - Allow the digits-in-fract parameter to be optional, as in V1.
+;	  SBL 11-June-1980
+; 1-013 - Fix bug in 1-012 where FLAGS wasn't always cleared correctly.
+;	  SBL 27-June-1980
+; 1-014 - If V_ERR_OFLO is set, indicating Ew.dEe or Gw.dEe editing,
+;	  return error if exponent overflows (don't drop the letter E).
+;	  SPR 11-38351.  JAW 15-Jun-1981
+
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+;
+; EXTERNAL DECLARATIONS:
+;
+	.DSABL	GBL				; Prevent undeclared
+						; symbols from being
+						; automatically global.
+	.EXTRN	OTS$$CVT_D_T_R8			; Kernel convert routine
+	.EXTRN	OTS$$CVT_G_T_R8			; For G floating
+	.EXTRN	OTS$$CVT_H_T_R8			; For H floating
+	.EXTRN	FOR$_OUTCONERR			; Error code
+
+;
+; MACROS:
+;
+
+;
+; EQUATED SYMBOLS:
+;
+	REGMASK = ^M<R2, R3, R4, R5, R6, R7, R8>
+
+; Stack frame offsets from FP
+;; Common frame for kernel convert routines
+	PACKED = -8			; Temp for packed representation
+	FLAGS = PACKED - 4		; Flags for outer and inner routines
+	SIG_DIGITS = FLAGS - 4		; Significant digits
+	STRING_ADDR = SIG_DIGITS - 4	; Address of temp string
+	SIGN = STRING_ADDR - 4		; Sign
+	DEC_EXP = SIGN - 4		; Decimal exponent
+	OFFSET = DEC_EXP - 4		; Offset
+	RT_RND = OFFSET - 4		; Right round point
+	COMMON_FRAME = RT_RND		; Common frame size
+;; Not-in-common stack frame
+	EXP_LETTER = COMMON_FRAME - 4	; Exponent letter to use
+	S_SCALE = EXP_LETTER - 4	; Saved scale factor
+	S_DI = S_SCALE - 4		; Saved digits in integer
+	S_DE = S_DI - 4			; Saved digits in exponent
+	S_DF = S_DE - 4			; Saved digits in fraction
+	LEAD_DIGITS = S_DF - 4		; Number of leading digits
+	LEAD_ZERO = LEAD_DIGITS - 4	; Number of zeroes after decimal pt.
+	TRAIL_DIGITS = LEAD_ZERO - 4	; Number of trailing digits
+	FRAME = TRAIL_DIGITS		; Frame size
+
+	M_TRUNCATE = 1@24		; Flag to kernel routine
+	M_RT_ROUND = 1@25		;
+
+;
+; OWN STORAGE:
+;
+
+;
+; PSECT DECLARATIONS:
+;
+	.PSECT _FOR$CODE PIC, USR, CON, REL, LCL, SHR, -
+			EXE, RD, NOWRT, LONG
+
+
+	.SBTTL	FOR$CVT_x_Ty - Convert real to text
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	These routines perform conversion of floating values
+;	to text representations.  They are divided according to the
+;	FORTRAN format types and by data type.
+;
+;	The FORTRAN format types are D/E (exponential),
+;	F (fixed point) and G (fixed or exponential).
+;
+; CALLING SEQUENCE:
+;	status.wlc.v = FOR$CVT_x_Ty (value.rx.r, out_string.wt.ds
+;				     [,digits_in_fract.rlu.v
+;				     [, scale_factor.rl.v
+;				     [, digits_in_int.rlu.v
+;				     [, digits_in_exp.rlu.v
+;				     [, caller_flags.rlu.v]]]])
+;
+;	where:
+;	    x is the datatype, either D, G or H
+;	    y is the format, one of D, E, F and G
+;
+; INPUT PARAMETERS:
+;
+	value		= 4		; The address of the floating value to be converted.
+	digits_in_fract	= 12		; The number of digits in the fraction
+					; portion.  Optional, assumed 0.
+	scale_factor	= 16		; Optional, assumed 0.  If
+					; digits_in_int is not present, 
+					; scale_factor takes on the
+					; FORTRAN semantics, i.e. indicating
+					; the true scale factor on F format
+					; or the digits_in_int for D, E and G
+					; formats.  The scale factor effect
+					; is that the externally represented
+					; number equals the internally
+					; represented number multiplied
+					; by 10**scale_factor.
+	digits_in_int	= 20		; The number of digits in the
+					; integer part of an exponentially
+					; formatted value.  Optional,
+					; assumed 0.  Ignored for F
+					; format.
+	digits_in_exp	= 24		; The number of digits in the
+					; exponent field.  Optional,
+					; assumed 2.  If the exponent
+					; overflows this field by 1 digit,
+					; the exponent letter is removed.
+	caller_flags	= 28		; Optional, assumed 0.
+	    V_FORCEPLUS = 0		; Force + on positive values
+	    V_ERR_OFLO = 1		; Exponent field width overflow
+					; is an error.
+;
+; IMPLICIT INPUTS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+	out_string	= 8		; The address of the descriptor of the result
+					; string.  The string must be
+					; class S. (Scalar)
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL - Successful completion
+;	FOR$_OUTCONERR - Output conversion error.  The value did not
+;		fit in the given string.
+;
+; SIDE EFFECTS:
+;
+;	SS$_ROPRAND - If the value to be converted is a reserved
+;		      floating operand.  
+;
+;--
+
+FOR$CNV_OUT_E::
+	.ENTRY	FOR$CVT_D_TE, REGMASK
+	MOVAB	FRAME(FP), SP		; Set up stack frame
+	MOVB	#^A/E/, EXP_LETTER(FP)	; Use letter E
+	MOVAB	OTS$$CVT_D_T_R8, R8	; Convert routine address
+	BRB	COMMON_E
+
+	.ENTRY	FOR$CVT_G_TE, REGMASK
+	MOVAB	FRAME(FP), SP		; Set up stack frame
+	MOVB	#^A/E/, EXP_LETTER(FP)	; Use letter E
+	MOVAB	OTS$$CVT_G_T_R8, R8	; Convert routine address
+	BRB	COMMON_E
+
+	.ENTRY	FOR$CVT_H_TE, REGMASK
+	MOVAB	FRAME(FP), SP		; Set up stack frame
+	MOVB	#^A/E/, EXP_LETTER(FP)	; Use letter E
+	MOVAB	OTS$$CVT_H_T_R8, R8	; Convert routine address
+	BRB	COMMON_E
+
+FOR$CNV_OUT_D::
+	.ENTRY	FOR$CVT_D_TD, REGMASK
+	MOVAB	FRAME(FP), SP		; Set up stack frame
+	MOVB	#^A/D/, EXP_LETTER(FP)	; Use letter D
+	MOVAB	OTS$$CVT_D_T_R8, R8	; Convert routine address
+	BRB	COMMON_E
+
+	.ENTRY	FOR$CVT_G_TD, REGMASK
+	MOVAB	FRAME(FP), SP		; Set up stack frame
+	MOVB	#^A/D/, EXP_LETTER(FP)	; Use letter D
+	MOVAB	OTS$$CVT_G_T_R8, R8	; Convert routine address
+	BRB	COMMON_E
+
+	.ENTRY	FOR$CVT_H_TD, REGMASK
+	MOVAB	FRAME(FP), SP		; Set up stack frame
+	MOVB	#^A/D/, EXP_LETTER(FP)	; Use letter D
+	MOVAB	OTS$$CVT_H_T_R8, R8	; Convert routine address
+	BRB	COMMON_E
+
+COMMON_E:
+	BSBW	INITIALIZE		; Analyze argument list
+	MOVL	S_DF(FP), SIG_DIGITS(FP)	; Initial number of sig. digits
+	TSTL	S_DI(FP)		; Digits_in_int >=0?
+	BEQL	10$			; Equal to zero
+	BGTR	5$			; Greater than zero
+	ADDL2	S_DI(FP), SIG_DIGITS(FP)
+	BGTR	10$			; Must be positive
+	BRW	ERROR			; No significant digits!
+5$:	INCL	SIG_DIGITS(FP)		; Get 1 more significant digit
+10$:	ADDL3	#19, SIG_DIGITS(FP), R2	; Find temp_string length
+	SUBL2	R2, SP			; Create string on stack
+	MOVL	SP, STRING_ADDR(FP)	; Temp string address
+	MOVL	value(AP), R0		; Value address
+	MOVL	FP, R1			; Local frame address
+	JSB	(R8)			; Call kernel conversion routine
+	ADDL2	OFFSET(FP), STRING_ADDR(FP) ; Get first character pos.
+	ADDL2	S_SCALE(FP), DEC_EXP(FP) ; Adjust exponent for scale
+E_CONVERT:
+	SUBL2	S_DI(FP), DEC_EXP(FP)	; Adjust for digits in int
+	TSTL	SIGN(FP)		; Is value zero?
+	BNEQ	20$			; No
+	CLRL	DEC_EXP(FP)		; Yes, exponent is zero
+20$:	MOVL	S_DF(FP), TRAIL_DIGITS(FP)
+	MOVL	S_DI(FP), LEAD_DIGITS(FP) ; Number of leading digits
+	BGTR	25$			; Negative?
+	CLRL	LEAD_DIGITS(FP)		; Yes
+	MNEGL	S_DI(FP), LEAD_ZERO(FP)	; Number of zeroes after dec. pt.
+	ADDL2	S_DI(FP), TRAIL_DIGITS(FP)
+	BGTR	30$			; Must be positive
+	BRB	29$			; Otherwise error
+25$:	CLRL	LEAD_ZERO(FP)		; No leading zeroes
+	SUBL2	S_DI(FP), TRAIL_DIGITS(FP)
+	INCL	TRAIL_DIGITS(FP)
+	BGEQ	30$			; Can't be negative
+29$:	BRW	ERROR
+30$:	BSBW	DIGITS_OUT		; Output digits
+	MOVB	EXP_LETTER(FP), (R3)+	; Move exponent letter
+	MOVL	R3, R4			; Save address
+	CVTLP	DEC_EXP(FP), #5, PACKED(FP) ; Convert exponent
+	CVTPS	#5, PACKED(FP), S_DE(FP), (R4)
+	BVC	35$			; Overflow?
+	BBS	#V_ERR_OFLO, FLAGS(FP), 34$ ; Yes: if exponent field
+					;  width overflow is an error,
+					;  don't drop the E.
+	INCL	S_DE(FP)		; Try another digit
+	DECL	R3
+	CVTPS	#5, PACKED(FP), S_DE(FP), (R3)
+	BVC	35$			; No overflow
+34$:	BRW	ERROR			; Overflow
+35$:	ADDL2	S_DE(FP), R3		; Move string pointer
+	INCL	R3
+	BRW	FINISH			; Finish up string
+
+	.SBTTL	FOR$CVT_x_TF - Fixed point format
+
+FOR$CNV_OUT_F::
+	.ENTRY	FOR$CVT_D_TF, REGMASK
+	MOVAB	FRAME(FP), SP		; Set up stack frame
+	MOVAB	OTS$$CVT_D_T_R8, R8	; Convert routine address
+	BRB	COMMON_F
+
+	.ENTRY	FOR$CVT_G_TF, REGMASK
+	MOVAB	FRAME(FP), SP		; Set up stack frame
+	MOVAB	OTS$$CVT_G_T_R8, R8	; Convert routine address
+	BRB	COMMON_F
+
+	.ENTRY	FOR$CVT_H_TF, REGMASK
+	MOVAB	FRAME(FP), SP		; Set up stack frame
+	MOVAB	OTS$$CVT_H_T_R8, R8	; Convert routine address
+	BRB	COMMON_F
+
+COMMON_F:
+	BSBW	INITIALIZE_F		; Analyze argument list
+	CLRB	EXP_LETTER(FP)		; Indicates F format
+	MOVZWL	@out_string(AP), SIG_DIGITS(FP)	; Get field width
+	DECL	SIG_DIGITS(FP)		; Max number of sig. digits
+	ADDL3	#19, SIG_DIGITS(FP), R2	; Calculate temp string size
+	SUBL2	R2, SP			; Create string on stack
+	MOVL	SP, STRING_ADDR(FP)	; String address
+	BISL	#M_RT_ROUND, FLAGS(FP)	; Flag indicating right round
+	ADDL3	S_DF(FP), S_SCALE(FP), RT_RND(FP)  ; RounSCALEng position
+	MOVL	value(AP), R0		; Value address
+	MOVL	FP, R1			; Local frame pointer
+	JSB	(R8)			; Do the conversion
+	ADDL2	OFFSET(FP), STRING_ADDR(FP) ; Get first digit pos.
+	ADDL2	S_SCALE(FP), DEC_EXP(FP)  ; Adjust for scale factor
+F_CONVERT:
+	TSTL	SIGN(FP)		; Is value zero?
+	BNEQ	10$			; If zero
+	CLRL	DEC_EXP(FP)		; Then exponent is zero
+10$:	MOVL	DEC_EXP(FP), LEAD_DIGITS(FP)	; Number of leading digits
+	BGEQ	20$			; If greater than 0
+	CLRL	LEAD_DIGITS(FP)		; Else no leading digits
+20$:	MNEGL	DEC_EXP(FP), LEAD_ZERO(FP)	; Number of zeroes after dec pt.
+	BGEQ	30$			; If greater than 0
+	CLRL	LEAD_ZERO(FP)		; Else no leading zeroes
+30$:	SUBL3	LEAD_ZERO(FP), S_DF(FP), TRAIL_DIGITS(FP)
+	BGTR	35$			; If not positive
+	CLRL	TRAIL_DIGITS(FP)	; Then no trailing digits
+	MOVL	S_DF(FP), LEAD_ZERO(FP)
+	TSTL	LEAD_DIGITS(FP)		; Any significant digits?
+	BGTR	35$			; Yes
+	CLRL	SIGN(FP)		; No, value is +0
+35$:	BSBW	DIGITS_OUT		; Format the digits
+	BRW	FINISH			; Clean up and exit
+
+	.SBTTL	FOR$CVT_x_TG - Convert real to text - G format
+
+FOR$CNV_OUT_G::
+	.ENTRY	FOR$CVT_D_TG, REGMASK
+	MOVAB	FRAME(FP), SP		; Set up stack frame
+	MOVB	#^A/E/, EXP_LETTER(FP)	; Use letter E for E format
+	MOVAB	OTS$$CVT_D_T_R8, R8	; Convert routine address
+	BRB	COMMON_G
+
+	.ENTRY	FOR$CVT_G_TG, REGMASK
+	MOVAB	FRAME(FP), SP		; Set up stack frame
+	MOVB	#^A/E/, EXP_LETTER(FP)	; Use letter E for E format
+	MOVAB	OTS$$CVT_G_T_R8, R8	; Convert routine address
+	BRB	COMMON_G
+
+	.ENTRY	FOR$CVT_H_TG, REGMASK
+	MOVAB	FRAME(FP), SP		; Set up stack frame
+	MOVB	#^A/E/, EXP_LETTER(FP)	; Use letter E for E format
+	MOVAB	OTS$$CVT_H_T_R8, R8	; Convert routine address
+	BRB	COMMON_G
+
+COMMON_G:
+	BSBW	INITIALIZE		; Analyze argument list
+	MOVZWL	@out_string(AP), SIG_DIGITS(FP)	; Initial number
+	ADDL3	#2, S_DE(FP), R0	; Get number needed
+	SUBL2	R0, SIG_DIGITS(FP)	
+	ADDL3	#19, SIG_DIGITS(FP), R2	; Calculate temp string size
+	SUBL2	R2, SP			; Create string on stack
+	MOVL	SP, STRING_ADDR(FP)	; String address
+	BISL	#M_TRUNCATE, FLAGS(FP)	; Don't round
+	MOVL	value(AP), R0		; Value address
+	MOVL	FP, R1			; Local frame pointer
+	JSB	(R8)			; Do the conversion
+	ADDL2	OFFSET(FP), STRING_ADDR(FP) ; Get first digit pos.
+	MOVL	STRING_ADDR(FP), R4	; R4 points to it
+	TSTL	SIGN(FP)		; Zero?
+	BEQL	USE_E			; Use E format
+	ADDL2	S_SCALE(FP), DEC_EXP(FP) ; Adjust for true scale factor
+	BGEQ	TRY_F			; Value >= 0.1, try F conversion
+	CMPL	DEC_EXP(FP), #-1	; Is it less than 0.1?
+	BLSS	USE_E			; Yes, use E conversion
+	ADDL3	S_DI(FP), S_DF(FP), R1	; Will it round to 0.1?
+	CMPC5	#0, (SP), #^A/9/, R1, (R4)	; .099999...?
+	BNEQ	USE_E			; No, use E format
+	CMPB	(R3), #^A/5/		; will it round?
+	BLSS	USE_E			; No, use E format
+	MOVB	#^A/1/, -1(R4)		; Change to 0.100000
+	MOVC5	#0, (SP), #^A/0/, SIG_DIGITS(FP), (R4)
+	DECL	STRING_ADDR(FP)		; Value is now 0.10000!
+	INCL	DEC_EXP(FP)
+	BRW	F_CONVERT		; Go to F conversion section
+TRY_F:
+	CMPL	DEC_EXP(FP), S_DF(FP) 	; Too big for F?
+	BGTR	USE_E			; Yes, use E format
+	BLSS	USE_F			; No, use F
+	CMPC5	#0, (SP), #^A/9/, DEC_EXP(FP), (R4)	; 99999...?
+	BNEQ	USE_F			; No, use F format
+	CMPB	(R3), #^A/5/		; 99999....9995?
+	BLSS	USE_F			; Won't round, use it as is
+	MOVB	#^A/1/, -1(R4)		; Change to 100000....
+	MOVC5	#0, (SP), #^A/0/, SIG_DIGITS(FP), (R4)
+	DECL	STRING_ADDR(FP)		; Now changed
+	INCL	DEC_EXP(FP)
+	BRW	E_CONVERT		; Go to E conversion routine
+USE_E:
+	MOVL	S_DF(FP), R0		; Initial rounding position
+	TSTL	S_DI(FP)		; In which direction to move?
+	BEQL	20$			; =0, Nowhere
+	BLSS	10$			; < 0?
+	INCL	R0			; F+1 digits
+	BRB	20$			; continue
+10$:	ADDL2	S_DI(FP), R0		; F-|I| digits
+20$:	BSBB	G_ROUND			; round the value
+	BRW	E_CONVERT		; And finish with E conversion
+USE_F:
+	MOVL	S_DF(FP), R0		; how many digits to round after
+	BSBB	G_ROUND			; round the value
+	SUBL2	DEC_EXP(FP), S_DF(FP)	; Alter format to fit
+	BRW	F_CONVERT		; Finish with F conversion
+
+;+
+; G_ROUND rounds the value at the offset pointed to by R0.
+;-
+G_ROUND:
+	ADDL3 	R0, R4, R2
+	CMPB	(R2), #^A/5/	; Round?
+	BGEQ	10$		; Yes
+	RSB			; No, exit
+10$:	CMPB	-(R2), #^A/9/	; Is this a 9?
+	BLSS	20$		; No, finish
+	MOVB	#^A/0/, (R2)	; Make it a zero
+	BRB	10$		; Continue
+20$:	INCB	(R2)		; Round up
+	CMPL	R2, R4		; Have we moved past digit start?
+	BGEQ	30$		; No, exit
+	DECL	STRING_ADDR(FP)	; Yes, move address
+	INCL	DEC_EXP(FP)	; and exponent
+30$:	RSB			; Exit
+
+	.SBTTL	INITIALIZE - Analyze argument list
+;+
+; INITIALIZE looks at the argument list and fills in the appropriate
+; values in the local frame.
+;-
+
+INITIALIZE:
+	CMPB	(AP), #7		; 7 Arguments given?
+	BEQL	70$			; Skip defaults
+	CLRL	FLAGS(FP)		; No flags initially
+	MOVL	#2, S_DE(FP)		; Digits in exponent
+	CLRL	S_DI(FP)		; Digits in integer
+	CLRL	S_SCALE(FP)		; Scale factor
+	CLRL	S_DF(FP)		; Digits in fraction
+	CASEB	(AP), #2, #5		; Select on number of arguments
+1$:	.WORD	20$-1$			; 2 arguments
+	.WORD	30$-1$			; 3 arguments
+	.WORD	40$-1$			; 4 arguments
+	.WORD	50$-1$			; 5 arguments
+	.WORD	60$-1$			; 6 arguments
+	.WORD	70$-1$			; 7 arguments
+	; fall through			; assume >7 arguments
+70$:	MOVZBL	caller_flags(AP), FLAGS(FP)
+60$:	MOVL	digits_in_exp(AP), S_DE(FP)
+50$:	MOVL	digits_in_int(AP), S_DI(FP)
+	MOVL	scale_factor(AP), S_SCALE(FP)
+	MOVL	digits_in_fract(AP), S_DF(FP)	; Digits in fraction part
+	RSB
+40$:	MOVL	scale_factor(AP), S_DI(FP)	; Release 1 meaning
+30$:	MOVL	digits_in_fract(AP), S_DF(FP)	; Digits in fraction part
+20$:	RSB
+
+	.SBTTL	INITIALIZE_F - Analyze argument list for F format
+;+
+; INITIALIZE_F is performs the same function as INITIALIZE except that
+; the scale factor is truly the scale factor and that the digits_in_integer
+; and digits_in_exp values are ignored.
+;-
+
+INITIALIZE_F:
+	CLRL	FLAGS(FP)		; No flags initially
+	CLRL	S_SCALE(FP)		; Scale factor
+	MOVL	digits_in_fract(AP), S_DF(FP)	; Digits in fraction part
+	CASEB	(AP), #3, #4		; Select on number of arguments
+1$:	.WORD	30$-1$			; 3 arguments
+	.WORD	40$-1$			; 4 arguments
+	.WORD	50$-1$			; 5 arguments
+	.WORD	60$-1$			; 6 arguments
+	.WORD	70$-1$			; 7 arguments
+	; fall through			; assume >7 arguments
+70$:	MOVB	caller_flags(AP), FLAGS(FP)
+60$:
+50$:
+40$:	MOVL	scale_factor(AP), S_SCALE(FP)
+30$:	RSB
+
+	.SBTTL	DIGITS_OUT
+;+
+; Routine to format the digits in the output string.
+;
+; The string will be constructed as follows:
+;
+;	n1 blanks, where n1 is calculated
+;	LEAD_DIGITS digits
+;	a decimal point
+;	LEAD_ZERO zeroes
+;	TRAIL_DIGITS digits
+;
+;	The sign is inserted where appropriate.  If LEAD_DIGITS is
+;	zero, an optional leading zero is inserted if there is
+;	room.
+;-
+DIGITS_OUT:
+	MOVL	STRING_ADDR(FP), R6		; Address of first digit
+	MOVQ	@out_string(AP), R2		; Get string descriptor
+	MOVZWL	R2, R2
+	SUBL3	LEAD_DIGITS(FP), R2, R0		; Find leading blanks
+	SUBL2	LEAD_ZERO(FP), R0
+	SUBL2	TRAIL_DIGITS(FP), R0
+	TSTB	EXP_LETTER(FP)			; F format?
+	BEQL	10$				; Yes
+	SUBL2	S_DE(FP), R0
+	SUBL2	#2, R0				; Compensate for exponent
+10$:	TSTL	SIGN(FP)			; Negative?
+	BLSS	15$				; Yes
+	BBC	#V_FORCEPLUS, FLAGS(FP), 20$	; Force plus sign?
+15$:	DECL	R0				; Use another character
+20$:	DECL	R0				; For decimal point
+	BLSS	ERROR				; No room left
+	MOVL	R0, R7
+	BEQL	22$				; Skip if no blanks
+21$:	MOVB	#^A/ /, (R3)+			; Insert leading blanks
+	SOBGTR	R0, 21$				; Loop till done
+22$:	TSTL	SIGN(FP)			; Negative?
+	BLSS	25$				; Yes
+	BBC	#V_FORCEPLUS, FLAGS(FP), 30$	; Force + sign?
+	MOVB	#^A/+/, (R3)+			; Yes
+	BRB	30$
+25$:	MOVB	#^A/-/, (R3)+			; Minus sign
+30$:	TSTL	LEAD_DIGITS(FP)			; Check for leading zero
+	BGTR	40$				; Not necessary
+	TSTL	TRAIL_DIGITS(FP)		; Required?
+	BGTR	35$				; No
+	TSTL	R7				; Is there room?
+	BLEQ	ERROR				; No
+	BRB	37$				; Put it in
+35$:	TSTL	R7				; Is there room?
+	BLEQ	40$				; No, skip it
+37$:	CMPB	-(R3), #^A/ /			; Is last char a blank?
+	BEQL	38$				; Yes, dont move it
+	MOVB	(R3), -1(R3)			; Move sign
+38$:	MOVB	#^A/0/, (R3)+			; Insert zero
+	BRB	42$
+40$:	MOVC3	LEAD_DIGITS(FP), (R6), (R3)	; Move leading digits
+	MOVL	R1, R6
+42$:	MOVB	#^A/./, (R3)+			; Move decimal point
+	MOVL	LEAD_ZERO(FP), R0		; Insert leading zeroes
+	BLEQ	50$				; Skip if none
+45$:	MOVB	#^A/0/, (R3)+			; Move a zero
+	SOBGTR	R0, 45$				; Loop till done
+50$:	MOVL	TRAIL_DIGITS(FP), R0		; Move trailing digits
+	BLEQ	60$				; Skip if none
+	MOVC3	R0, (R6), (R3)			; Move trailing digits
+60$:	RSB					; Return
+
+ERROR:
+	MOVQ	@out_string(AP), R0
+	MOVC5	#0, (SP), #^A/*/, R0, (R1)
+	MOVL	#FOR$_OUTCONERR, R0
+	RET
+
+	.SBTTL	FINISH
+;+
+; FINISH blank fills the remainder of the string and returns to the caller.
+;-
+FINISH:
+	MOVQ	@out_string(AP), R0	; Get string descriptor
+	MOVZWL	R0, R0
+	ADDL2	R0, R1			; Find last character
+	SUBL2	R3, R1			; Subtract characters used
+	BEQL	EXIT			; If none left, exit
+10$:	MOVB	#^A/ /, (R3)+		; Move a blank
+	SOBGTR	R1, 10$			; Loop till done
+EXIT:	MOVL	#1, R0			; SS$_NORMAL
+	RET
+
+
+	.END

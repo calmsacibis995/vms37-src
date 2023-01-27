@@ -1,0 +1,1181 @@
+MODULE lbr_dump (				! Library examination routines
+			LANGUAGE (BLISS32),
+			IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  Library access procedures
+!
+! ABSTRACT:
+!
+!	The VAX/VMS librarian procedures implement a standard access method
+!	to libraries through a shared, common procedure set.
+!
+! ENVIRONMENT:
+!
+!	VAX native, user mode.
+!
+!--
+!
+!
+! AUTHOR: Tim Halvorsen, Benn Schreiber, Bob Grosso	16-Mar-1981
+!
+! MODIFIED BY:
+!
+!	V02-003		RPG0003		Bob Grosso	15-Dec-1981
+!		Enhance command interpretation and help.
+!		Add next function.
+!
+!	V02-002		RPG0002		Bob Grosso	30-Jul-1981
+!		Remove non-pic descriptors and add some error checking.
+!
+!--
+
+%SBTTL 'Declarations';
+
+LIBRARY 'SYS$LIBRARY:STARLET.L32';	! VAX/VMS common definitions
+
+REQUIRE 'PREFIX';		! Librarian general definitions
+
+REQUIRE 'LBRDEF';		! Librarian structure definitions
+
+FORWARD ROUTINE
+    lbr$dump_indexblocks,	! Dump the entire index in hex and ASCII
+    lbr$dump_index;		! Dump the index
+
+EXTERNAL ROUTINE
+    find_block : JSB_3,
+    find_index : JSB_2,				! Find index block in memory
+    lookup_cache : JSB_2,
+    scr$set_cursor : ADDRESSING_MODE (GENERAL),
+    scr$get_screen : ADDRESSING_MODE (GENERAL),
+    scr$erase_line : ADDRESSING_MODE (GENERAL),
+    scr$erase_page : ADDRESSING_MODE (GENERAL),
+    scr$put_buffer : ADDRESSING_MODE (GENERAL),
+    scr$put_screen : ADDRESSING_MODE (GENERAL),
+    scr$set_buffer : ADDRESSING_MODE (GENERAL),
+    ots$cvt_tz_l   : ADDRESSING_MODE (GENERAL),	! convert text to hex
+    lib$put_output : ADDRESSING_MODE (GENERAL);	! Write to SYS$OUTPUT
+
+EXTERNAL
+    lbr$gl_control: REF BBLOCK;	! Address of control block
+
+OWN
+    cur_vbn,
+    faostring1 : countedstring ('!/Index block !XL at address !XL'),
+    faostring2 : countedstring ('(parent = !XL, used = !XW)!/'),
+    faostring3 : countedstring ('!XW   !XL !XW   !AC'),
+    faostring4 : countedstring ('!XW   !XL !XW   !XL'),
+    faodmpblk  : countedstring ('!XL !XL !XL !XL !AF'),
+    faohash  : countedstring ('         !XL'),	! print the contents of a hash bucket
+    faohashentry : countedstring ('!XL !XL'),	! print the address of the hash bucket followed by it's contents
+    faoblock : countedstring ('!XL !XL !XL !XL !XL !XL !XL !XL  !AF'), ! dump a line of the block in hex and ASCII
+    faoentry : countedstring ('!XL ');		! print one of the four longwords of a cache entry
+
+BIND
+    help_desc_0 = $DESCRIPTOR ('From SYS$INPUT, enter a single letter command with an <ESC>.'),
+    help_desc_1 = $DESCRIPTOR ('?  Help'),
+    help_desc_2 = $DESCRIPTOR ('N  (North) move up the hash table'),
+    help_desc_3 = $DESCRIPTOR ('S  (South) move down a bucket'),
+    help_desc_4 = $DESCRIPTOR ('E  (East) move over to the next cache entry in current hash bucket'),
+    help_desc_5 = $DESCRIPTOR ('W  (West) move back in the linked list of cache entries'),
+    help_desc_6 = $DESCRIPTOR ('B  jump Back to the first cache entry in current bucket'),
+    help_desc_7 = $DESCRIPTOR ('O  return to Origin; first entry of first bucket '),
+    help_desc_8 = $DESCRIPTOR ('J  Jump down 10 buckets in hash table'),
+    help_desc_9 = $DESCRIPTOR ('D  Display block of current cache entry'),
+    help_desc_10 = $DESCRIPTOR ('H  Display library header block'),
+    help_desc_11 = $DESCRIPTOR ('L  query for a VBN to locate in cache'),
+    help_desc_12 = $DESCRIPTOR ('G  query for a VBN to get from library and cache'),
+    help_desc_13 = $DESCRIPTOR ('X  dump neXt vbn'),
+    help_desc_14 = $DESCRIPTOR ('R  Reprint the screen'),
+    help_desc_15 = $DESCRIPTOR ('Q  Quit and clear the screen');
+
+LITERAL
+    first_bucket = 0,				! offset to first bucket in hash
+    last_bucket = lbr$c_hashsize/4 - 1;		! last bucket in hash table
+
+MACRO
+    write_screen (line, col, string) =		! write to specified position on screen
+        scr$put_screen ( fao_buffer (string	! string must contain fao format line followed by fao arguements
+        %IF %LENGTH GTR 1 %THEN ,%REMAINING %FI),
+        line, col)%;
+
+%SBTTL 'LBR$DUMP_INDEX';
+
+GLOBAL ROUTINE lbr$dump_index (index) =
+
+!---
+!
+!	Dump the contents of the entire index structure
+!	to SYS$OUTPUT.
+!
+! Inputs:
+!
+!	index = Primary index number
+!
+! Outputs:
+!
+!	None
+!
+!---
+
+BEGIN
+MACRO
+    write (string) =
+	lib$put_output (fao_buffer (string
+	%IF %LENGTH GTR 1 %THEN ,%REMAINING %FI))%;
+
+EXTERNAL ROUTINE
+    lib$put_output : ADDRESSING_MODE (GENERAL);
+
+ROUTINE fao_buffer (ctrstr,args) =
+BEGIN
+OWN
+    desc :	BBLOCK [dsc$c_s_bln],	! Result descriptor
+    buf :	VECTOR [80, BYTE];	! Output buffer
+MAP
+    ctrstr :	REF VECTOR [,BYTE],
+    args :	VECTOR [4];
+
+LOCAL
+    faodesc : BBLOCK [dsc$c_s_bln];
+
+faodesc [dsc$w_length] = .ctrstr [0];
+faodesc [dsc$a_pointer] = ctrstr [1];
+desc [dsc$w_length] = 80;			! Set up result descriptor
+desc [dsc$a_pointer] = buf;
+$faol (ctrstr=faodesc, outlen=desc, outbuf=desc, prmlst=args);
+RETURN desc;
+END;
+
+%SBTTL 'dump_block2';
+
+ROUTINE dump_block2 (index, vbn) =
+BEGIN
+LOCAL
+    entry,
+    index_desc: REF BBLOCK,	! Index descriptor
+    index_block: REF BBLOCK;	! Index block address
+
+index_desc = .lbr$gl_control [lbr$l_hdrptr] + lhd$c_idxdesc
+		+ (.index-1)*idd$c_length;
+
+perform (find_index (.vbn, index_block));
+
+write(faostring1,.vbn,.index_block);
+write(faostring2,
+	.index_block [index$l_parent],
+	.index_block [index$w_used]);
+
+entry = .index_block+index$c_entries;
+WHILE (.entry LSS .index_block+index$c_entries+.index_block[index$w_used]-1) DO
+    BEGIN
+    MAP entry: REF BBLOCK;
+    IF .index_desc [idd$v_ascii]	! If ASCII keys,
+    THEN
+	write(faostring3,
+		.entry - .index_block,
+		.entry [idx$l_vbn], .entry [idx$w_offset],
+		entry [idx$b_keylen])
+    ELSE
+	write(faostring4,
+		.entry - .index_block,
+		.entry [idx$l_vbn], .entry [idx$w_offset],
+		.entry [idx$l_keyid]);
+    entry = .entry + idx$c_rfaplsbyt + .entry [idx$b_keylen];
+    END;
+
+entry = .index_block+index$c_entries;
+WHILE (.entry LSS .index_block+index$c_entries+.index_block[index$w_used]-1) DO
+    BEGIN
+    MAP entry: REF BBLOCK;
+    IF .entry [idx$w_offset] EQL rfa$c_index	! If subindex,
+    THEN
+	dump_block2(.index, .entry [idx$l_vbn]);
+    entry = .entry + idx$c_rfaplsbyt + .entry [idx$b_keylen];
+    END;
+
+RETURN true;
+END;
+
+%SBTTL 'dump_block';
+
+ROUTINE dump_block (index, vbn) =
+BEGIN
+LOCAL
+    index_desc: REF BBLOCK,	! Index descriptor
+    index_block: REF BBLOCK;	! Index block address
+
+index_desc = .lbr$gl_control [lbr$l_hdrptr] + lhd$c_idxdesc
+		+ (.index-1)*idd$c_length;
+
+perform (find_index (.vbn, index_block));
+
+write(faostring1,.vbn,.index_block);
+write(faostring2,
+	.index_block [index$l_parent],
+	.index_block [index$w_used]);
+
+INCRU entry FROM .index_block+index$c_entries
+	TO .index_block+index$c_entries+.index_block [index$w_used]-1
+	BY idx$c_length + .index_desc [idd$w_keylen]
+DO
+    BEGIN
+    MAP entry: REF BBLOCK;
+    IF .index_desc [idd$v_ascii]	! If ASCII keys,
+    THEN
+	write(faostring3,
+		.entry - .index_block,
+		.entry [idx$l_vbn], .entry [idx$w_offset],
+		entry [idx$b_keylen])
+    ELSE
+	write(faostring4,
+		.entry - .index_block,
+		.entry [idx$l_vbn], .entry [idx$w_offset],
+		.entry [idx$l_keyid]);
+    END;
+
+INCRU entry FROM .index_block+index$c_entries
+	TO .index_block+index$c_entries+.index_block [index$w_used]-1
+	BY idx$c_length + .index_desc [idd$w_keylen]
+DO
+    BEGIN
+    MAP entry: REF BBLOCK;
+    IF .entry [idx$w_offset] EQL rfa$c_index	! If subindex,
+    THEN
+	dump_block(.index, .entry [idx$l_vbn]);
+    END;
+
+RETURN true;
+END;
+
+%SBTTL 'main body of LBR$DUMP_INDEX';
+
+!
+!	Main body of lbr$dump_index procedure
+!
+LOCAL
+    index_desc: REF BBLOCK;		! Index descriptor
+
+index_desc = .lbr$gl_control [lbr$l_hdrptr] + lhd$c_idxdesc
+		+ (.index-1)*idd$c_length;
+IF .index_desc [idd$l_vbn] EQL 0	! If empty index,
+THEN
+    RETURN true;			! return immediately
+
+IF .index_desc [idd$v_varlenidx]
+THEN
+    perform(dump_block2 (.index, .index_desc [idd$l_vbn]))
+ELSE
+    perform(dump_block (.index, .index_desc [idd$l_vbn]));
+
+RETURN true;
+
+END;	! lbr$dump_index ()
+
+%SBTTL 'LBR$DUMP_INDEXBLOCKS';
+
+GLOBAL ROUTINE lbr$dump_indexblocks (index) =
+
+!---
+!
+!	Dump the entire index structure in both hex and ASCII
+!	to SYS$OUTPUT.
+!
+! Inputs:
+!
+!	index = Primary index number
+!
+! Outputs:
+!
+!	None
+!
+!---
+
+BEGIN
+MACRO
+    write (string) =
+	lib$put_output (fao_buffer (string
+	%IF %LENGTH GTR 1 %THEN ,%REMAINING %FI))%;
+
+EXTERNAL ROUTINE
+    lib$put_output : ADDRESSING_MODE (GENERAL);
+
+ROUTINE fao_buffer (ctrstr,args) =
+BEGIN
+OWN
+    desc :	BBLOCK [dsc$c_s_bln],	! Result descriptor
+    buf :	VECTOR [80, BYTE];	! Output buffer
+MAP
+    ctrstr :	REF VECTOR [,BYTE],
+    args :	VECTOR [4];
+
+LOCAL
+    faodesc : BBLOCK [dsc$c_s_bln];
+
+faodesc [dsc$w_length] = .ctrstr [0];
+faodesc [dsc$a_pointer] = ctrstr [1];
+desc [dsc$w_length] = 80;			! Set up result descriptor
+desc [dsc$a_pointer] = buf;
+$faol (ctrstr=faodesc, outlen=desc, outbuf=desc, prmlst=args);
+RETURN desc;
+END;
+
+%SBTTL 'dump_wholeblk2';
+
+ROUTINE dump_wholeblk2 (index, vbn) =
+BEGIN
+LOCAL
+    entry,
+    index_desc: REF BBLOCK,	! Index descriptor
+    index_block: REF BBLOCK;	! Index block address
+
+index_desc = .lbr$gl_control [lbr$l_hdrptr] + lhd$c_idxdesc
+		+ (.index-1)*idd$c_length;
+
+perform (find_index (.vbn, index_block));
+
+write(faostring1,.vbn,.index_block);
+INCRU i FROM 0 TO 511 BY 16 DO
+    write(faodmpblk,
+	.index_block [.i+12,0,32,0], .index_block [.i+8,0,32,0],
+	.index_block [.i+4,0,32,0], .index_block [.i,0,32,0],
+	16, index_block [.i,0,0,0] );
+
+entry = .index_block+index$c_entries;
+WHILE (.entry LSS .index_block+index$c_entries+.index_block[index$w_used]-1) DO
+    BEGIN
+    MAP entry: REF BBLOCK;
+    IF .index_desc [idd$v_ascii]	! If ASCII keys,
+    THEN
+	write(faostring3,
+		.entry - .index_block,
+		.entry [idx$l_vbn], .entry [idx$w_offset],
+		entry [idx$b_keylen])
+    ELSE
+	write(faostring4,
+		.entry - .index_block,
+		.entry [idx$l_vbn], .entry [idx$w_offset],
+		.entry [idx$l_keyid]);
+    entry = .entry + idx$c_rfaplsbyt + .entry [idx$b_keylen];
+    END;
+
+entry = .index_block+index$c_entries;
+WHILE (.entry LSS .index_block+index$c_entries+.index_block[index$w_used]-1) DO
+    BEGIN
+    MAP entry: REF BBLOCK;
+    IF .entry [idx$w_offset] EQL rfa$c_index	! If subindex,
+    THEN
+	dump_wholeblk2(.index, .entry [idx$l_vbn]);
+    entry = .entry + idx$c_rfaplsbyt + .entry [idx$b_keylen];
+    END;
+
+RETURN true;
+END;
+
+%SBTTL 'dump_wholeblk';
+
+ROUTINE dump_wholeblk (index, vbn) =
+BEGIN
+LOCAL
+    index_desc: REF BBLOCK,	! Index descriptor
+    index_block: REF BBLOCK;	! Index block address
+
+index_desc = .lbr$gl_control [lbr$l_hdrptr] + lhd$c_idxdesc
+		+ (.index-1)*idd$c_length;
+
+perform (find_index (.vbn, index_block));
+
+write(faostring1,.vbn,.index_block);
+INCRU i FROM 0 TO 511 BY 16 DO
+    write(faodmpblk,
+	.index_block [.i+12,0,32,0], .index_block [.i+8,0,32,0],
+	.index_block [.i+4,0,32,0], .index_block [.i,0,32,0],
+	16, index_block [.i,0,0,0] );
+
+INCRU entry FROM .index_block+index$c_entries
+	TO .index_block+index$c_entries+.index_block [index$w_used]-1
+	BY idx$c_length + .index_desc [idd$w_keylen]
+DO
+    BEGIN
+    MAP entry: REF BBLOCK;
+    IF .index_desc [idd$v_ascii]	! If ASCII keys,
+    THEN
+	write(faostring3,
+		.entry - .index_block,
+		.entry [idx$l_vbn], .entry [idx$w_offset],
+		entry [idx$b_keylen])
+    ELSE
+	write(faostring4,
+		.entry - .index_block,
+		.entry [idx$l_vbn], .entry [idx$w_offset],
+		.entry [idx$l_keyid]);
+    END;
+
+INCRU entry FROM .index_block+index$c_entries
+	TO .index_block+index$c_entries+.index_block [index$w_used]-1
+	BY idx$c_length + .index_desc [idd$w_keylen]
+DO
+    BEGIN
+    MAP entry: REF BBLOCK;
+    IF .entry [idx$w_offset] EQL rfa$c_index	! If subindex,
+    THEN
+	dump_wholeblk(.index, .entry [idx$l_vbn]);
+    END;
+
+RETURN true;
+END;
+
+%SBTTL 'Main body of LBR$DUMP_INDEXBLOCKS';
+
+!
+!	Main body of lbr$dump_indexblocks procedure
+!
+LOCAL
+    index_desc: REF BBLOCK;		! Index descriptor
+
+index_desc = .lbr$gl_control [lbr$l_hdrptr] + lhd$c_idxdesc
+		+ (.index-1)*idd$c_length;
+IF .index_desc [idd$l_vbn] EQL 0	! If empty index,
+THEN
+    RETURN true;			! return immediately
+IF .index_desc [idd$v_varlenidx]
+THEN
+    perform( dump_wholeblk2 (.index, .index_desc [idd$l_vbn]))
+ELSE
+    perform( dump_wholeblk (.index, .index_desc [idd$l_vbn]));
+
+RETURN true;
+
+END;	! lbr$dump_indexblocks ()
+
+%SBTTL 'LBR$DUMP_CACHE';
+
+GLOBAL ROUTINE lbr$dump_cache  =
+
+!---
+!
+!	Interactively dump the cache to SYS$OUTPUT.
+!
+! Inputs:
+!
+!	From SYS$INPUT, enter any of the single letter commands with an <ESC>.
+!	    N	move (North) up the hash table 
+!	    S	move (South) down to next bucket in hash table
+!	    E   move (East) over to the next cache entry in current hash bucket
+!	    W   move (West) back in the linked list of cache entries.
+!	    B	jump Back to the first cache entry in current bucket
+!	    J	Jump down 10 buckets in hash table
+!	    D	Display the VBN for the current cache entry
+!	    O   return to Origin; first entry of first bucket
+!	    L   query for a VBN to locate in cache
+!	    G   query for a VBN to get from library and cache
+!	    R   Reprint the screen 
+!	    Q   Quit and clear the screen
+!
+! Outputs:
+!
+!	Displays requested contents of library cache on VT100
+!
+!---
+
+BEGIN
+
+FORWARD ROUTINE
+    display_entries,	! Print the cache entry list for current and next bucket
+    display_entry_1,	! Print the cache entry list for the current bucket
+    display_entry_2,	! Print the cache entry list for the next bucket
+    display_block;	! Locate memory address of current block and display it.
+
+LITERAL
+    first_entry = 0,	! first entry in linked list of cache entries
+    blk_col = 20,	! column to print block dump in
+    blk_lin = 9,	! line to start block dump on
+    level_1 = 1,	! Cache entry list for current bucket
+    input_lin = 24,	! Place cursor for command input
+    input_col = 0,	! Place cursor for command input
+    depth_offset = 1,	! How many lines down to display cache entry list
+    wid_offset = 20,	! How many columns over to display cache entry list
+    bcktoffset = 2,	! How many lines down to display window of hash buckets
+    entry_depth = 5,	! Number of lines to display a level 1 cache entry
+    entry_wid = 9,	! Number of characters taken by display of one cache entry 
+    entries_wide = 12,	! Max number of enties in cache entry linked list to fit on screen.
+    half_hash_window = 5; ! Half size of window surrounding current bucket
+
+ROUTINE fao_buffer (ctrstr,args) =
+BEGIN
+OWN
+    desc :	BBLOCK [dsc$c_s_bln],	! Result descriptor
+    buf :	VECTOR [132, BYTE];	! Output buffer
+MAP
+    ctrstr :	REF VECTOR [,BYTE],
+    args :	VECTOR [4];
+
+LOCAL
+    faodesc : BBLOCK [dsc$c_s_bln];
+
+faodesc [dsc$w_length] = .ctrstr [0];
+faodesc [dsc$a_pointer] = ctrstr [1];
+desc [dsc$w_length] = 132;			! Set up result descriptor
+desc [dsc$a_pointer] = buf;
+$faol (ctrstr=faodesc, outlen=desc, outbuf=desc, prmlst=args);
+RETURN desc;
+END;
+
+
+%SBTTL 'display_bucket';
+
+ROUTINE display_bucket ( bucket, entry) =
+!+++
+!
+!	For the current bucket, display the linked list of cache entries
+!	starting at the offset ENTRY, and display the linked list for the
+!	the bucket following the current bucket.  Dump the block for the 
+!	the current cache entry.
+!
+!---
+BEGIN
+perform ( display_entry_1 ( .bucket, .entry) );
+perform ( display_entry_2 ( .bucket+1, first_entry) );
+perform ( display_block (.bucket, .entry) );
+RETURN true;
+END;	! routine display_bucket
+
+
+%SBTTL 'erase_block';
+
+ROUTINE erase_block (lin,col,nlines) =
+!+++
+!
+!	Erase a block on the screen.
+!	Called by 
+!		dump_block 
+!		display_block
+!
+!---
+BEGIN
+INCR i FROM .lin TO (.lin + .nlines - 1) BY 1 DO
+scr$erase_line (.i,.col);
+RETURN true;
+END;
+
+%SBTTL 'display_entries';
+
+ROUTINE display_entries ( bucket, entry, level) = 
+!+++
+!
+!	Display the cache entry linked list for the given bucket
+!	On the screen at the given level.
+!	Called by:
+!		display_entry_1
+!
+!---
+BEGIN
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK,
+    cache = .context [ctx$l_cache] : VECTOR;
+
+LOCAL
+    line,
+    cache_entry : REF BBLOCK,
+    entry_num,
+    entries_out;
+
+cache_entry = .cache[.bucket];
+line = entry_depth * (.level-1) + depth_offset;
+entries_out = 0;
+entry_num = 0;
+
+IF NOT ( (.bucket LSS first_bucket) OR (.bucket GTR last_bucket) ) THEN
+    WHILE (.cache_entry NEQ 0) AND (.entries_out LSS entries_wide) DO
+        BEGIN
+        IF ( .entry_num GEQ .entry ) THEN
+            BEGIN
+            write_screen( .line, wid_offset + .entries_out*entry_wid, 
+                faoentry, .cache_entry[ cache$l_link ] );
+            write_screen( .line+1, wid_offset + .entries_out*entry_wid, 
+                faoentry, .cache_entry[ cache$l_vbn ] );
+            write_screen( .line+2, wid_offset + .entries_out*entry_wid, 
+                faoentry, .cache_entry[ cache$l_address ] );
+            write_screen( .line+3, wid_offset + .entries_out*entry_wid, 
+                faoentry, .cache_entry[ cache$w_flags ] );
+            entries_out = .entries_out + 1;
+            END;
+        cache_entry = .cache_entry[ cache$l_link];
+        entry_num = .entry_num + 1;
+        END;	! WHILE still entries in bucket, and not off edge of screen
+
+IF (.entries_out LSS entries_wide ) THEN
+    BEGIN
+    perform ( scr$erase_line(.line , wid_offset + .entries_out * entry_wid) );
+    perform ( scr$erase_line(.line+1 , wid_offset + .entries_out * entry_wid));
+    perform ( scr$erase_line(.line+2 , wid_offset + .entries_out * entry_wid));
+    perform ( scr$erase_line(.line+3 , wid_offset + .entries_out * entry_wid));
+    END;
+RETURN true;
+END;	! Routine display_entries
+
+
+%SBTTL 'display_entry_1';
+
+ROUTINE display_entry_1 ( bucket, entry) =
+!+++
+!
+!	Display the linked list of cache entries at BUCKET,
+!	which is the current bucket, and display at level 1,
+!	beginning witht the ENTRYth entry in the list.
+BEGIN
+LOCAL status;
+status = display_entries (.bucket, .entry, level_1);
+RETURN .status;
+END;
+
+
+%SBTTL 'display_entry_2';
+
+ROUTINE display_entry_2 ( bucket, entry) = 
+!+++
+!
+!	Display the linked list of cache entries at bucket,
+!	where bucket is the next bucket after the current 
+!	bucket.  Count in ENTRY entries before displaying.
+!	Display at level 2, and only display the VBN and flags
+!	field from the cache entry due to line limit on screen.
+!
+!---
+BEGIN
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK,
+    cache = .context [ctx$l_cache] : VECTOR;
+
+LOCAL
+    status,
+    line,
+    entry_num,
+    cache_entry : REF BBLOCK,
+    entries_out;
+
+cache_entry = .cache[.bucket];
+line = entry_depth + depth_offset;
+entries_out = 0;
+entry_num = 0;
+
+IF NOT ( (.bucket LSS first_bucket) OR (.bucket GTR last_bucket) ) THEN
+    WHILE (.cache_entry NEQ 0) AND (.entries_out LSS entries_wide) DO
+        BEGIN
+        IF ( .entry_num GEQ .entry ) THEN
+            BEGIN
+            write_screen( .line, wid_offset + .entries_out*entry_wid, 
+                faoentry, .cache_entry[ cache$l_vbn ] );
+            write_screen( .line+1, wid_offset + .entries_out*entry_wid, 
+                faoentry, .cache_entry[ cache$w_flags ] );
+            entries_out = .entries_out + 1;
+            END;
+        cache_entry = .cache_entry[ cache$l_link];
+        entry_num = .entry_num + 1;
+        END;	! WHILE still entries in bucket, and not off edge of screen
+
+IF (.entries_out LSS entries_wide ) THEN
+    BEGIN
+    perform (scr$erase_line(.line , wid_offset + .entries_out * entry_wid));
+    perform (scr$erase_line(.line+1 , wid_offset + .entries_out * entry_wid));
+    END;
+RETURN true;
+END;	! Routine display_entry_2
+
+
+%SBTTL 'dump_block';
+
+ROUTINE dump_block ( blk ) =
+!+++
+!
+!	Dump the block at address BLK, in hex and ASCII.
+!
+!___
+BEGIN
+MAP
+    blk : REF BBLOCK;
+LOCAL
+    status,
+    line;
+
+IF .blk EQL 0 THEN 
+    BEGIN
+    status = erase_block ( blk_lin,blk_col,16);
+    RETURN .status;
+    END;
+line = blk_lin;
+INCR i FROM 0 TO 512-32 BY 32 DO
+    BEGIN
+    write_screen ( .line, blk_col, faoblock,
+     .blk [.i+28,0,32,0], .blk [.i+24,0,32,0], .blk [.i+20,0,32,0],
+     .blk [.i+16,0,32,0], .blk [.i+12,0,32,0], .blk [.i+8,0,32,0],
+     .blk [.i+4,0,32,0], .blk [.i,0,32,0],
+     32, blk [.i,0,0,0] );
+    line = .line + 1;
+    END;
+RETURN true;
+END; 	! routine dump_block
+
+
+%SBTTL 'display_block';
+
+ROUTINE display_block ( bucket, entry) =
+!+++
+!
+!	Locate the ENTRYth cache entry in BUCKET,  obtain the address
+!	of the cached block and call dump_block to print the hex and 
+!	ASCII dump of the block.
+!
+!---
+BEGIN
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK,
+    cache = .context [ctx$l_cache] : VECTOR;
+
+LOCAL
+    status,
+    entry_num,
+    vbn,
+    cache_entry : REF BBLOCK;
+
+IF (.bucket LSS first_bucket) OR (.bucket GTR last_bucket) THEN
+    RETURN erase_block(blk_lin,blk_col,16);
+cache_entry = .cache[.bucket];
+IF .cache_entry EQL 0 THEN
+    RETURN erase_block(blk_lin,blk_col,16);
+entry_num = 0;
+WHILE (.cache_entry NEQ 0) AND (.entry_num LSS .entry) DO
+    BEGIN
+    cache_entry = .cache_entry[cache$l_link];
+    entry_num = .entry_num + 1;
+    END;
+IF ( (.entry_num EQL .entry) AND (.cache_entry[cache$l_address] NEQ 0) )
+THEN
+    BEGIN
+    cur_vbn = .cache_entry [cache$l_vbn];
+    status = dump_block ( .cache_entry[cache$l_address]);
+    END
+ELSE
+    status = erase_block (blk_lin,blk_col,16);
+RETURN .status;
+END;	! routine display_block
+
+
+%SBTTL 'find_vbn';
+
+ROUTINE find_vbn ( read, bucket, entry, vbn) =
+!+++
+!
+!	Search the cache for a cache_entry for the requested VBN.
+!	If found, reset the current bucket and entry to point to it.
+!	If function is read then read it in and cache it.
+!
+!	bucket: address of global longword containing current bucket
+!	entry : address of global current offset in cache entry list
+!	vbn   : virtual block to search cache for
+!
+!---
+BEGIN
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK,
+    cache = .context [ctx$l_cache] : VECTOR;
+LOCAL
+    bckt,
+    blkadr,
+    cache_addr,
+    cache_entry :	REF BBLOCK,
+    ntry,
+    status;
+
+IF .read
+THEN perform ( find_block ( .vbn, blkadr, cache_addr ) )
+ELSE perform ( lookup_cache (.vbn, cache_addr) );
+
+bckt = (.vbn - 1) MOD (lbr$c_hashsize/4);
+cache_entry = .cache[.bckt];
+ntry = 0;
+UNTIL ( (.cache_entry EQL 0) OR (.cache_entry[cache$l_vbn] EQL .vbn)) DO
+    BEGIN
+    cache_entry = .cache_entry[cache$l_link];
+    ntry = .ntry + 1;
+    END;
+IF (.cache_entry EQL 0) OR (.cache_entry NEQ .cache_addr)
+THEN 0=0		! access violate to trap logic error
+ELSE
+    BEGIN
+    .bucket = .bckt;
+    .entry = .ntry;
+    END;
+RETURN true;
+END;	! ROUTINE find_vbn
+
+
+%SBTTL 'locate_vbn';
+
+ROUTINE locate_vbn ( read, bucket, entry ) =
+!+++
+!
+!	Request from SYS$INPUT a VBN to find.  Locate the VBN in the cache,
+!	and if found, reset the current bucket and entry.  If READ is true,
+!	then read the block into the cache if not already there.
+!
+!	bucket: address of global longword containing current bucket
+!	entry : address of global current offset in cache entry list
+!
+!---
+BEGIN
+
+OWN
+    desc :	BBLOCK [dsc$c_s_bln],	! Result descriptor
+    buf :	VECTOR [32, BYTE];	! Output buffer
+LOCAL
+    status,
+    vbn;
+
+desc [dsc$w_length] = 32;			! Set up result descriptor
+desc [dsc$a_pointer] = buf;
+perform ( scr$set_cursor(input_lin, input_col) );
+perform( scr$get_screen( desc,0,desc[dsc$w_length] ) );
+perform( ots$cvt_tz_l ( desc, vbn ) );		! convert text string to hex
+status = find_vbn ( .read, .bucket, .entry, .vbn);
+RETURN .status;
+END;	! routine locate_vbn
+
+
+%SBTTL 'display_hash';
+
+ROUTINE display_hash ( bucket ) =
+!+++
+!
+!	Display window of the hash surrounding the current bucket
+!
+!---
+BEGIN
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK,
+    cache = .context [ctx$l_cache] : VECTOR;
+
+LOCAL
+    status,
+    bckt,
+    begwin,
+    endwin;
+
+IF ( .bucket LEQ half_hash_window ) THEN
+    BEGIN
+    begwin = 0;
+    endwin = 2 * half_hash_window;
+    END
+ELSE
+    BEGIN
+    begwin = .bucket - half_hash_window;
+    endwin = .bucket + half_hash_window;
+    END;
+IF .endwin GTR last_bucket THEN endwin = last_bucket;
+bckt = 0;
+WHILE ( .bckt LEQ .endwin ) DO
+    BEGIN
+    IF ( .bckt EQL .bucket) THEN
+        write_screen ( .bckt - .begwin + bcktoffset, 0, faohashentry,
+          cache + 4* .bckt, .cache[.bckt])
+    ELSE
+        IF .bckt GEQ .begwin THEN
+            write_screen ( .bckt - .begwin + bcktoffset, 0, faohash, .cache[.bckt]);
+    bckt = .bckt + 1;
+    END;	! WHILE 
+RETURN true;
+END;	! routine display_hash ( bucket )
+
+
+%SBTTL 'display_header';
+
+ROUTINE display_header =
+!+++
+!
+!	Dump VBN 1, the library header.
+!
+!---
+BEGIN
+LOCAL status;
+status = dump_block( .lbr$gl_control[lbr$l_hdrptr] );
+RETURN .status
+END;
+
+
+%SBTTL 'up';
+
+ROUTINE up (bucket, entry) =
+!+++
+!
+!	Decrement the current bucket by one and re-display the cache
+!	entry lists for the current bucket and the bucket after the
+!	current bucket.  Update the display of the hash window around
+!	the current bucket.
+!
+!	bucket: address of global longword containing current bucket
+!	entry : address of global current offset in cache entry list
+!
+!---
+BEGIN
+IF ..bucket NEQ first_bucket THEN 
+    .bucket = ..bucket - 1;
+display_hash (..bucket);
+display_entry_1 (..bucket, ..entry);
+display_entry_2 (..bucket + 1, first_entry);
+dump_block(0);
+RETURN true;
+END;
+
+ROUTINE down (bucket, entry) =
+!+++
+!
+!	Increment the current bucket by one and re-display the cache
+!	entry lists for the current bucket and the bucket after the
+!	current bucket.  Update the display of the hash window around
+!	the current bucket.
+!
+!	bucket: address of global longword containing current bucket
+!	entry : address of global current offset in cache entry list
+!
+!---
+BEGIN
+IF ..bucket LSS last_bucket THEN
+    .bucket = ..bucket + 1
+ELSE
+    .bucket = last_bucket;
+display_hash (..bucket);
+display_entry_1 (..bucket, ..entry);
+display_entry_2 (..bucket + 1, first_entry);
+dump_block(0);
+RETURN true;
+END;
+
+ROUTINE right (bucket, entry) =
+!+++
+!
+!	Increment the current entry by one and re-display the cache
+!	entry list for the current bucket.
+!
+!	bucket: address of global longword containing current bucket
+!	entry : address of global current offset in cache entry list
+!
+!---
+BEGIN
+.entry = ..entry + 1;
+display_entry_1 (..bucket, ..entry);
+dump_block(0);
+RETURN true;
+END;
+
+ROUTINE left (bucket, entry) =
+!+++
+!
+!	Decrement the current entry by one and re-display the cache
+!	entry list for the current bucket.
+!
+!	bucket: address of global longword containing current bucket
+!	entry : address of global current offset in cache entry list
+!
+!---
+BEGIN
+IF ..entry NEQ 0 THEN
+    .entry = ..entry - 1;
+display_entry_1 (..bucket, ..entry);
+dump_block(0);
+RETURN true;
+END;
+
+
+%SBTTL 'display_help';
+
+ROUTINE display_help = 
+BEGIN
+!+++
+!
+!	Help by printing the valid commands
+!
+!---
+LOCAL
+    hlplin,
+    hlpcol;
+
+hlplin = 5;
+hlpcol = 5;
+
+scr$erase_page (1,1);		! Start out with a shiny blank screen
+scr$put_screen ( help_desc_0, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_1, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_2, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_3, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_4, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_5, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_6, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_7, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_8, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_9, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_10, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_11, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_12, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_13, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_14, (hlplin = .hlplin + 1), .hlpcol);
+scr$put_screen ( help_desc_15, (hlplin = .hlplin + 1), .hlpcol);
+RETURN true;
+END;	! Routine display_help
+
+
+%SBTTL 'main body of LBR$DUMP_CACHE';
+
+!+++
+!	Begin body of GLOBAL ROUTINE lbr$dump_cache ( )
+!---
+
+OWN
+    scr80_strng : countedstring ('[?3l'),
+    scr132_strng : countedstring ('[?3h[23;24r');
+
+LOCAL
+    continue,
+    scr80_desc : BBLOCK [dsc$c_s_bln],
+    scr132_desc : BBLOCK [dsc$c_s_bln],
+    desc :	BBLOCK [dsc$c_s_bln],
+    buf  :	VECTOR [20,BYTE],
+    bucket,
+    entry;
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK,
+    cache = .context [ctx$l_cache] : VECTOR,
+    command = buf[0] : BYTE;
+
+SWITCHES NOOPTIMIZE;	! keep compiler from stashing away buf[0] before the
+			! the call to scr$get_screen(desc) 
+
+IF cache EQL 0 THEN RETURN true;	! there is no cache
+
+CH$FILL (0,dsc$c_s_bln,scr80_desc);
+scr80_desc [dsc$w_length] = .scr80_strng [0];
+scr80_desc [dsc$a_pointer] = scr80_strng [1];
+CH$FILL (0,dsc$c_s_bln,scr132_desc);
+scr132_desc [dsc$w_length] = .scr132_strng [0];
+scr132_desc [dsc$a_pointer] = scr132_strng [1];
+
+perform (lib$put_output (scr132_desc) );
+bucket = 0;	! Set global current bucket to first bucket in Hash table
+entry = 0;	! Set global entry offset in linked list of cache entries
+		!  first entry in the list.
+scr$erase_page (1,1);		! Start out with a shiny blank screen
+display_hash (.bucket);	! Display the window around the current hashtable bucket
+display_bucket (.bucket,.entry); ! Display the linked list of cache entries for
+				 !  for the current bucket and one after current.
+cur_vbn = 1;			! set for first block
+desc [dsc$w_length] = 20;	! Initialize input command buffer.
+desc [dsc$a_pointer] = buf;	! Initialize input command buffer.
+
+continue = true;	! Continue obtaining and executing command requests
+WHILE .continue DO	! Until a Quit or invalid command is entered.
+    BEGIN
+    perform ( scr$set_cursor(input_lin, input_col) );
+    perform ( scr$get_screen(desc) );	! Read screen to obtain command
+    IF (.command GEQ %X'41') AND (.command LEQ %X'5A')
+    THEN command = .command + %X'20';
+    SELECTONE .command OF		! Take appropriate action
+        SET
+	[%X'3F'] :  display_help();		! ? Help with the commands
+        [%X'6E'] :  up (bucket, entry);		! 'N'orth
+        [%X'73'] :  down (bucket, entry);	! 'S'outh
+        [%X'65'] :  right (bucket, entry);	! 'E'ast
+        [%X'77'] :  left (bucket, entry);	! 'W'est
+        [%X'64'] :  display_block(.bucket,.entry);! 'D'isplay block
+	[%X'68'] :  display_header();		! display 'H'eader
+	[%X'6C'] :  BEGIN			! 'L'ocate a vbn in the cache
+		    IF locate_vbn ( false, bucket, entry)
+		    THEN
+			BEGIN
+			display_hash (.bucket);
+			display_bucket (.bucket,.entry);
+			END;
+		    END;
+	[%X'67'] :  BEGIN			! 'G'et a vbn and cache it
+		    IF locate_vbn ( true, bucket, entry)
+		    THEN
+			BEGIN
+			display_hash (.bucket);
+			display_bucket (.bucket,.entry);
+			END;
+		    END;
+        [%X'6F'] :  BEGIN			! 'O'rigin
+                    bucket = 0;
+		    entry = 0;
+		    scr$erase_page (1,1);
+		    display_hash (.bucket);
+		    display_bucket (.bucket,.entry);
+		    END;
+	[%X'62'] :  BEGIN			! 'B'ack
+		    entry = 0;
+		    scr$erase_page (1,1);
+		    display_hash (.bucket);
+		    display_bucket (.bucket,.entry);
+		    END;
+	[%X'72'] :  BEGIN			! 'R'efresh the screen 
+		    scr$erase_page (1,1);
+		    display_hash (.bucket);
+		    display_bucket (.bucket,.entry);
+		    END;
+	[%X'6A'] :  BEGIN			! 'J'ump down
+		    bucket = .bucket + 10;
+		    display_hash (.bucket);
+		    display_bucket (.bucket,.entry);
+		    END;
+        [%X'78'] :  BEGIN			! ne'X't
+		    IF find_vbn (true, bucket, entry, .cur_vbn + 1)
+		    THEN
+			BEGIN
+			display_hash (.bucket);
+			display_bucket (.bucket,.entry);
+			END;
+		    END;
+        [%X'71'] :  continue = false;		! 'Q'uit
+
+        [OTHERWISE] :
+		    BEGIN			! Print the help and quit
+		    display_help();
+		    continue = false;
+		    END;
+        TES;
+    END;
+
+perform (lib$put_output (scr80_desc) );
+RETURN true;
+END;	! lbr$dump_cache
+
+END
+ELUDOM

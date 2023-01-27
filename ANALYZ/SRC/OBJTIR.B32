@@ -1,0 +1,588 @@
+%title 'OBJTIR - Analyze TIR/DBG/TBT Object Records'
+	module objtir	(
+			ident='V03-000') = begin
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! Facility:	VAX/VMS Analyze Facility, Analyze TIR/DBG/TBT Object Records
+!
+! Abstract:	This module is responsible for analyzing the TIR and
+!		associated object records:
+!			DBG	Debugger Information Records
+!			TBT	Traceback Information Records
+!			TIR	Text Information/Relocation Records
+!
+!
+! Environment:
+!
+! Author: Paul C. Anagnostopoulos, Creation Date: 16 January 1980
+!
+! Modified By:
+!
+! , : Version
+! 01 -
+!--
+
+%sbttl 'Module Declarations'
+!
+! Libraries and Requires:
+!
+
+library 'starlet';
+require 'objexereq';
+
+!
+! Table of Contents:
+!
+
+forward routine
+	anl$object_tir: novalue,
+	anl$object_tir_clean: novalue;
+
+!
+! Macro Definitions:
+!
+! The following macro is used to initialize one entry in the TIR command table.
+
+macro cmd_def(command,operand,stack) =
+	%if %identical(command,reserved) %then
+		rep (stack-operand+1)*8 of byte (0)
+	%else
+		uplit byte(%ascic %string(command)),
+		byte (%exactstring(3,%x'00',%string(operand))),
+		byte (stack)
+	%fi
+%;
+
+!
+! External References:
+!
+
+external routine
+	anl$check_symbol,
+	anl$format_error,
+	anl$format_hex,
+	anl$format_line,
+	anl$object_argument_dsc,
+	anl$object_env_ref,
+	anl$object_psect_ref,
+	anl$object_record_line,
+	anl$report_line;
+
+!
+! Own Variables:
+!
+! The following variable keeps track of the stack depth as we analyze TIR
+! commands.  It is cleared after each object module.
+
+own
+	stack_depth: long initial (0);
+
+! The following bit vector is needed to keep track of which literals are
+! defined with the OPR_DFLIT command.
+
+own
+	literal_def_bits: bitvector[256] initial(rep 256/8 of byte (0));
+
+%sbttl 'ANL$OBJECT_TIR - Analyze TIR & Associated Object Records'
+!++
+! Functional Description:
+!	This routine is responsible for analyzing the TIR, DBG, and TBT
+!	object records.
+!
+! Formal Parameters:
+!	record_number	The number of this object record.
+!	the_record	Address of descriptor of the object record.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$object_tir(record_number,the_record): novalue = begin
+
+bind
+	record_dsc = .the_record: descriptor;
+
+! The following table defines all of the commands valid in these records
+! (except the store immediate command).  Each entry includes the symbolic
+! name of the command, the operand type (see below), and the number of
+! longwords pushed on or popped from the stack.
+
+field cmd_table_fields = set
+	command_name	= [0,0,32,0],
+	operand_type	= [4,0,24,0],
+	stack_affect	= [7,0, 8,1]
+tes;
+
+own
+	cmd_table: blockvector[128,8,byte] field(cmd_table_fields)
+		initial (
+
+!			COMMAND NAME	OPERAND TYPE	STACK AFFECT
+!			------------	------------	------------
+
+		cmd_def(STA_GBL,	SYM,		+1),
+		cmd_def(STA_SB,		B,		+1),
+		cmd_def(STA_SW,		W,		+1),
+		cmd_def(STA_LW,		L,		+1),
+		cmd_def(STA_PB,		BPB,		+1),
+		cmd_def(STA_PW,		BPW,		+1),
+		cmd_def(STA_PL,		BPL,		+1),
+		cmd_def(STA_UB,		UB,		+1),
+		cmd_def(STA_UW,		UW,		+1),
+		cmd_def(STA_BFI,	NO,		+1),
+		cmd_def(STA_WFI,	NO,		+1),
+		cmd_def(STA_LFI,	NO,		+1),
+		cmd_def(STA_EPM,	SYM,		+1),
+		cmd_def(STA_CKARG,	ARG,		+1),
+		cmd_def(STA_WPB,	WPB,		+1),
+		cmd_def(STA_WPW,	WPW,		+1),
+		cmd_def(STA_WPL,	WPL,		+1),
+		cmd_def(STA_LSY,	ENS,		+1),
+		cmd_def(STA_LIT,	LTX,		+1),
+		cmd_def(reserved, 19,19),
+
+		cmd_def(STO_SB,		NO,		-1),
+		cmd_def(STO_SW,		NO,		-1),
+		cmd_def(STO_LW,		NO,		-1),
+		cmd_def(STO_BD,		NO,		-1),
+		cmd_def(STO_WD,		NO,		-1),
+		cmd_def(STO_LD,		NO,		-1),
+		cmd_def(STO_LI,		NO,		-1),
+		cmd_def(STO_PIDR,	NO,		-1),
+		cmd_def(STO_PICR,	NO,		-1),
+		cmd_def(STO_RSB,	NO,		-2),
+		cmd_def(STO_RSW,	NO,		-2),
+		cmd_def(STO_RL,		NO,		-2),
+		cmd_def(STO_VPS,	VLD,		-1),
+		cmd_def(STO_USB,	NO,		-1),
+		cmd_def(STO_USW,	NO,		-1),
+		cmd_def(STO_RUB,	NO,		-2),
+		cmd_def(STO_RUW,	NO,		-2),
+		cmd_def(STO_B,		NO,		-1),
+		cmd_def(STO_W,		NO,		-1),
+		cmd_def(STO_RB,		NO,		-2),
+		cmd_def(STO_RW,		NO,		-2),
+		cmd_def(STO_RIVB,	TXT,		-1),
+		cmd_def(STO_PIRR,	NO,		-2),
+		cmd_def(reserved, 43,49),
+
+		cmd_def(OPR_NOP,	NO,		 0),
+		cmd_def(OPR_ADD,	NO,		-1),
+		cmd_def(OPR_SUB,	NO,		-1),
+		cmd_def(OPR_MUL,	NO,		-1),
+		cmd_def(OPR_DIV,	NO,		-1),
+		cmd_def(OPR_AND,	NO,		-1),
+		cmd_def(OPR_IOR,	NO,		-1),
+		cmd_def(OPR_EOR,	NO,		-1),
+		cmd_def(OPR_NEG,	NO,		 0),
+		cmd_def(OPR_COM,	NO,		 0),
+		cmd_def(OPR_INSV,	VLD,		-1),
+		cmd_def(OPR_ASH,	NO,		-1),
+		cmd_def(OPR_USH,	NO,		-1),
+		cmd_def(OPR_ROT,	NO,		-1),
+		cmd_def(OPR_SEL,	NO,		-2),
+		cmd_def(OPR_REDEF,	SYM,		 0),
+		cmd_def(OPR_DFLIT,	LTX,		-1),
+		cmd_def(reserved, 67,79),
+
+		cmd_def(CTL_SETRB,	NO,		-1),
+		cmd_def(CTL_AUGRB,	L,		 0),
+		cmd_def(CTL_DFLOC,	NO,		-1),
+		cmd_def(CTL_STLOC,	NO,		-1),
+		cmd_def(CTL_STKDL,	NO,		 0),
+		cmd_def(reserved, 85,127)
+
+		);
+
+! The following list defines the operand type codes used in the table above.
+! Each one specifies a different combination of operands that can follow
+! a command operation code.
+!
+!	ARG	symbol, byte argument index, argument descriptor
+!	B	signed byte
+!	BP	byte psect number
+!	BPB	byte psect number, signed byte
+!	BPL	byte psect number, signed longword
+!	BPW	byte psect number, signed word
+!	ENS	word environment number, symbol
+!	L	signed longword
+!	LTX	byte literal index
+!	SYM	symbol
+!	TXT	ASCIC text string
+!	UB	unsigned byte
+!	UW	unsigned word
+!	VLD	byte position, byte size
+!	W	signed word
+!	WP	word psect number
+!	WPB	word psect number, signed byte
+!	WPL	word psect number, signed longword
+!	WPW	word psect number, signed word
+
+local
+	scanp: ref block[,byte],
+	record_type: byte,
+	command_number: long,
+	fit_ok: byte,
+	command: signed byte,
+	work_dsc: descriptor,
+	literal_index: byte;
+
+
+! We begin by printing a major line for the record.
+
+scanp = .record_dsc[ptr];
+record_type = .scanp[obj$b_rectyp];
+anl$object_record_line((selectoneu .record_type of set
+			[obj$c_tir]:	anl$_objtirrec;
+			[obj$c_dbg]:	anl$_objdbgrec;
+			[obj$c_tbt]:	anl$_objtbtrec;
+			tes),
+			.record_number,record_dsc);
+increment (scanp);
+
+! Now we go into a loop processing the commands in the record.
+! COMMAND_NUMBER will count them as we go.
+! SCANP will advance along the various commands and fields of the record.
+! FIT_OK will remain true unless a field spills off the end of the record.
+
+command_number = 0;
+fit_ok = true;
+while (.scanp lssa (.record_dsc[ptr]+.record_dsc[len])) and .fit_ok do (
+
+	! Count the command and prepare to print it nicely.
+
+	increment (command_number);
+	anl$report_line(0);
+
+	! We split up depending upon whether it is a store immediate
+	! command or some other one.
+
+	command = .scanp[0,0,8,1];
+	increment (scanp);
+	if .command lss 0 then (
+
+		! It's a store immediate.  Print a line for the command,
+		! and then dump the text.
+
+		anl$format_line(1,1,anl$_objtirstoim,.command_number,-.command);
+		build_descriptor(work_dsc,-.command,.scanp);
+		anl$format_hex(2,work_dsc);
+		scanp = .scanp + -.command;
+
+	) else (
+
+		! It's some other command.  If it's invalid, just tell the
+		! user.  We also have to ignore the rest of the
+		! record since God only knows what it looks like.
+
+		if .cmd_table[.command,command_name] eqlu 0 then (
+			anl$format_error(anl$_objtirres,.command);
+			build_descriptor(work_dsc,.record_dsc[len]-(.scanp-.record_dsc[ptr]),.record_dsc[ptr]);
+			anl$format_hex(2,work_dsc);
+			return;
+		) else (
+
+			! It's a good command.  Adjust the stack and then
+			! print a line for it.  We use a different line if
+			! it changes the stack depth.
+
+			stack_depth = .stack_depth + .cmd_table[.command,stack_affect];
+			anl$format_line(2,1,
+				(if .cmd_table[.command,stack_affect] eqlu 0 then anl$_objtircmd
+									     else anl$_objtircmdstk),
+				.command_number,.cmd_table[.command,command_name],
+				.command,.stack_depth);
+		);
+
+		! Now we select on the operand type for this command.  This 
+		! will tell us how to print the operands, and also let us 
+		! adjust the scan pointer to the next command.  NOTE that we
+		! use selectu so that operand types can make use of more
+		! than one case.
+
+		selectu .cmd_table[.command,operand_type] of set
+
+
+		['BP',
+		 'BPB',
+		 'BPW',
+		 'BPL']:	! The command takes a byte psect number,
+				! perhaps followed by something else.  Make
+				! sure to record the psect reference.
+
+				(ensure_field_fit(0,0,8,0,record_dsc);
+				if .fit_ok then (
+					anl$format_line(0,2,anl$_objpsect,.scanp[0,0,8,0]);
+					anl$object_psect_ref(.scanp[0,0,8,0]);
+					increment (scanp);
+				););
+
+
+		['WP',
+		 'WPB',
+		 'WPW',
+		 'WPL']:	! The command takes a word psect number,
+				! perhaps followed by something else.
+
+				(ensure_field_fit(0,0,16,0,record_dsc);
+				if .fit_ok then (
+					anl$format_line(0,2,anl$_objpsect,.scanp[0,0,16,0]);
+					anl$object_psect_ref(.scanp[0,0,16,0]);
+					scanp = .scanp + 2;
+				););
+
+
+		['ENS']:	! The command takes a word environment number,
+				! perhaps followed by something else.
+
+				(ensure_field_fit(0,0,16,0,record_dsc);
+				if .fit_ok then (
+					anl$format_line(0,2,anl$_objenv,.scanp[0,0,16,0]);
+					anl$object_env_ref(.scanp[0,0,16,0]);
+					scanp = .scanp + 2;
+				););
+
+		['B',
+		 'BPB',
+		 'WPB']:	! The command takes a signed byte operand,
+				! perhaps preceeded by something else.
+
+				(ensure_field_fit(0,0,8,1,record_dsc);
+				if .fit_ok then (
+					anl$format_line(0,2,anl$_objvalue,.scanp[0,0,8,1]);
+					increment (scanp);
+				););
+
+
+		['UB']:		! The command takes an unsigned byte operand.
+
+				(ensure_field_fit(0,0,8,0,record_dsc);
+				if .fit_ok then (
+					anl$format_line(0,2,anl$_objuvalue,.scanp[0,0,8,0]);
+					increment (scanp);
+				););
+
+
+		['LTX']:	! The command takes a byte literal index.  We
+				! need to save it for later checking.
+
+				(ensure_field_fit(0,0,8,0,record_dsc);
+				if .fit_ok then (
+					anl$format_line(0,2,anl$_objlitindex,.scanp[0,0,8,0]);
+					literal_index = .scanp[0,0,8,0];
+					increment (scanp);
+				););
+
+
+		['W',
+		 'BPW',
+		 'WPW']:	! The command takes a signed word operand,
+				! perhaps preceeded by something else.
+
+				(ensure_field_fit(0,0,16,1,record_dsc);
+				if .fit_ok then (
+					anl$format_line(0,2,anl$_objvalue,.scanp[0,0,16,1]);
+					scanp = .scanp + 2;
+				););
+
+
+		['UW']:		! The command takes an unsigned word operand.
+
+
+				(ensure_field_fit(0,0,16,0,record_dsc);
+				if .fit_ok then (
+					anl$format_line(0,2,anl$_objuvalue,.scanp[0,0,16,0]);
+					scanp = .scanp + 2;
+				););
+
+
+		['L',
+		 'BPL',
+		 'WPL']:	! The command takes a signed longword operand,
+				! perhaps preceeded by somthing else.
+
+
+				(ensure_field_fit(0,0,32,1,record_dsc);
+				if .fit_ok then (
+					anl$format_line(0,2,anl$_objvalue,.scanp[0,0,32,1]);
+					scanp = .scanp + 4;
+				););
+
+
+		['SYM',
+		 'ARG',
+		 'ENS']:	! The command takes a symbol name, perhaps
+				! preceeded or followed by something else.
+
+				(ensure_ascic_fit(0,0,8,0,record_dsc,work_dsc);
+				if .fit_ok then (
+					anl$format_line(0,2,anl$_objsymbol,.work_dsc[len],.work_dsc[ptr]);
+					anl$check_symbol(work_dsc);
+					scanp = .scanp + 1 + .work_dsc[len];
+				););
+
+
+		['ARG']:	! The command takes an argument descriptor.
+				! This consists of a symbol, which was analyzed
+				! above, an argument index, and an actual
+				! argument descriptor.
+
+				(ensure_field_fit(0,0,8,0,record_dsc);
+				if .fit_ok then (
+					anl$format_line(0,2,anl$_objtirargindex,.scanp[0,0,8,0]);
+					increment (scanp);
+					fit_ok = anl$object_argument_dsc(3,scanp,record_dsc);
+				););
+
+
+		['TXT']:	! The command takes a counted string with text.
+
+				(ensure_ascic_fit(0,0,8,0,record_dsc,work_dsc);
+				if .fit_ok then (
+					anl$format_hex(2,work_dsc);
+					scanp = .scanp + 1 + .work_dsc[len];
+				););
+
+
+		['VLD']:	! The command takes a vield definition, 
+				! consisting of a position and a size.
+
+				(ensure_field_fit(0,0,16,0,record_dsc);
+				if .fit_ok then (
+					anl$format_line(0,2,anl$_objtirvield,.scanp[0,0,8,0],.scanp[1,0,8,0]);
+					if .scanp[0,0,8,0]+.scanp[1,0,8,0] gtru
+					   minu(31,(.scanp[0,0,8,0]+8)/8*8) then
+						anl$format_error(anl$_objbadvield);
+					scanp = .scanp + 2;
+				););
+
+		tes;
+
+		! Check the stack to ensure that we haven't popped too much.
+
+		if .stack_depth lss 0 then
+			anl$format_error(anl$_objbadpop);
+
+		! Now we have to perform some checks that are specific to
+		! various commands.  Just select on the command and make
+		! the check.
+
+		selectoneu .command of set
+		[tir$c_sta_lit]:
+
+			! We have a stack literal value command.  Make sure
+			! the literal has been defined.
+
+			if not .literal_def_bits[.literal_index] then
+				anl$format_error(anl$_objundeflit);
+
+		[tir$c_opr_dflit]:
+
+			! We have a define literal command.  Set the defined
+			! bit for the literal.
+
+			literal_def_bits[.literal_index] = true;
+
+		[tir$c_ctl_dfloc,
+		 tir$c_ctl_stloc,
+		 tir$c_ctl_stkdl]:
+
+			! We have a command that is not valid in TIR records,
+			! only in DBG and TBT records.
+
+			if .record_type eqlu obj$c_tir then
+				anl$format_error(anl$_objnontircmd);
+		tes;
+
+	! Analysis of command is complete.
+
+	);
+
+! Go on to next command.
+
+);
+
+return;
+
+end;
+
+%sbttl 'ANL$OBJECT_TIR_CLEAN - Check TIR Errors and Clean Up'
+!++
+! Functional Description:
+!	This routine is called at the end of each module to check for any
+!	global TIR errors (e.g., stack not empty).  It also cleans up for
+!	the next module.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$object_tir_clean: novalue = begin
+
+
+! If the stack isn't clean, issue an error message.
+
+if .stack_depth gtr 0 then
+	anl$format_error(anl$_objbadpush,.stack_depth);
+
+! Now just clean it out anyway.
+
+stack_depth = 0;
+
+! Clear all the literal definition bits.
+
+ch$fill(%x'00', %allocation(literal_def_bits),literal_def_bits);
+
+return;
+
+end;
+
+end eludom

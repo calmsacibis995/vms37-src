@@ -1,0 +1,423 @@
+MODULE STR$$ALLOC (			!
+		IDENT = '1-012'		! File: STRALLOC.B32	Edit: RKR1012
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:  String handling : allocation.
+!
+! ABSTRACT:
+!
+!	String allocation is mostly done in-line in the STR$ routines
+!	by macros.  This module contains the data structure for short
+!	strings, the initialization routine for that data structure,
+!	and an allocation routine which is called by the macros when
+!	one of the short string queues runs dry.
+!
+! ENVIRONMENT:  VAX-11 User Mode
+!
+! AUTHOR: John Sauter, CREATION DATE: 12-MAR-1979
+!
+! MODIFIED BY:
+!
+! 1-001	- Original.  JBS 13-MAR-1979
+! 1-002	- Store in STR$W_ALLOC_LEN the maximum number of data bytes
+!	   which the user can place in this string.  This will always be
+!	   a multiple of 8.  JBS 14-MAR-1979
+! 1-003	- Compensate for the new structure of STR$$Q_SHORT_Q.  JBS 16-MAR-1979
+! 1-004	- Rearrange how storage is gotten for an empty short queue to try
+!	   to improve performance.  JBS 27-MAR-1979
+! 1-005	- Get 128 pages at a time and hand them out to strings as needed.
+!	   This is another attempt to improve performance.  JBS 27-MAR-1979
+! 1-006	- Rearrange how the 128-page chunk is handed out so that we
+!	   we need not give a whole page to each string size.  JBS 03-APR-1979
+! 1-007	- Use the new STR messages for signaling.  JBS 16-MAY-1979
+! 1-008	- Make some minor edits based on the code review.  JBS 12-JUN-1979
+! 1-009	- Use the new symbol names in STRMACROS.REQ.  JBS 21-JUN-1979
+! 1-010	- Change the calling sequence to STR$$ALLOC_SHORT so that the caller
+!	   loops doing REMQUEs.  This shortens the code in the calling
+!	   sequence.  JBS 21-JUN-1979
+! 1-011 - String speedup, no signalling from this module.  RW  9-Jan-1980
+! 1-012 - In STR$$ALLOC_SHORT, if we get error return from LIB$GET_VM
+!	  return immmediately with status of STR$_INSVIRMEM.
+!	  RKR 2-MAR-1982. (FT1/FT2 QAR #156).
+!--
+
+!<BLF/PAGE>
+
+!
+! SWITCHES:
+!
+
+SWITCHES ADDRESSING_MODE (EXTERNAL = GENERAL, NONEXTERNAL = WORD_RELATIVE);
+
+!
+! LINKAGES:
+!
+!	NONE
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    STR$$INIT : NOVALUE,			! Initialize the short queues
+    STR$$ALOC_SHORT;				! Add space to a short queue
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'RTLIN:RTLPSECT';			! Macros for defining psects
+
+REQUIRE 'RTLIN:STRMACROS';			! String macros
+
+LIBRARY 'RTLSTARLE';				! System symbols
+
+!
+! MACROS:
+!
+!	NONE
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+!+
+! Define the number of bytes to get when a short string runs out.
+! This space is divided up into short strings.
+!-
+    STR$K_ALLOC_LRG = 512*128,
+!+
+! Define the number of bytes to take out of that space for each length
+! of string.  This must be larger than the largest possible short
+! string.
+!-
+    STR$K_ALLOC_SML = 512;
+
+!
+! PSECTS:
+!
+
+DECLARE_PSECTS (STR);				! Declare psects for STR$ facility
+
+!
+! GLOBAL STORAGE:
+!
+
+GLOBAL
+!+
+! The following cell is zero until the other data has been initialized.
+!-
+    STR$$V_INIT : INITIAL (0),
+!+
+! The following are the queues.  They get initialized to empty before
+! being used for the first time.
+!-
+    STR$$Q_SHORT_Q : STR$$SHORT_STR [STR$K_NUM_SH_QS];
+
+!
+! OWN STORAGE
+!
+
+OWN
+!+
+! The following queue controls the passing out of the 128 pages gotten
+! when we need more storage.  We get space 128 pages at a time to avoid
+! fragmentation with LIB$GET_VM's storage.
+! This queue usually holds 0 or 1 blocks.  The block is up to 128 pages
+! in length.  If an AST goes off while we are allocating, a second large
+! block will be allocated.  When a block is exhausted the queue is examined
+! for another before calling LIB$GET_VM.
+!-
+    PAGE_QUEUE : VECTOR [2];
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+    LIB$GET_VM;					! Get virtual storage
+
+!+
+! The following error codes are used by this module:
+!-
+
+EXTERNAL LITERAL
+    STR$_NORMAL : UNSIGNED (6),				! Successful completion
+    STR$_INSVIRMEM;				! Insufficient virtual memory
+
+
+GLOBAL ROUTINE STR$$INIT 			! Initialize the queues
+    : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Initialize the short string queues.  This routine is called
+!	by the allocation macros before touching them, provided that
+!	STR$$V_INIT is clear.  To be AST re-entrant, this routine
+!	does the initialization, with ASTs off, only if STR$$V_INIT
+!	is still clear.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	STR$$V_INIT.mv	If 1, do nothing.  An AST has initialized
+!			the queues.
+!
+! IMPLICIT OUTPUTS:
+!
+!	STR$$V_INIT.mv		Set to 1.
+!	STR$$Q_SHORT_Q.wq	Set to "empty" for REMQUE/INSQUE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Disables and re-enables ASTs if they are enabled at entry.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	AST_STATUS;
+
+!+
+! Disable ASTs so we can test STR$$V_INIT.  We must not permit an AST
+! after we start to initialize the queues, since such an AST could
+! try to allocate a string.
+!-
+    AST_STATUS = $SETAST (ENBFLG = 0);
+
+    IF ( NOT .STR$$V_INIT)
+    THEN
+	BEGIN
+!+
+! We must do the initialization.  Mark all short string queues as empty.
+!-
+
+	INCR INDEX FROM 1 TO STR$K_NUM_SH_QS DO
+	    BEGIN
+
+	    LOCAL
+		Q_ADDR;
+
+	    Q_ADDR = STR$$Q_SHORT_Q [.INDEX*STR$K_ALL_QUA, 0];
+	    .Q_ADDR = .Q_ADDR;
+	    .Q_ADDR + %UPVAL = .Q_ADDR;
+	    END;
+
+!+
+! Mark that we have obtained no space from LIB$GET_VM.
+!-
+	PAGE_QUEUE [0] = PAGE_QUEUE [1] = PAGE_QUEUE [0];
+!+
+! Mark the initialization as complete.
+!-
+	BLOCK [STR$$V_INIT, 0, 0, 1, 0] = 1;
+	END;
+
+!+
+! If ASTs were enabled when we entered, re-enable them.
+!-
+
+    IF (.AST_STATUS EQL SS$_WASSET) THEN $SETAST (ENBFLG = 1);
+
+    RETURN;
+    END;					! end of STR$$INIT
+
+
+GLOBAL ROUTINE STR$$ALOC_SHORT (		! Allocate a short string
+	LENGTH					! Length of the string to be allocated
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Allocate a short string.  This is called only if the short
+!	queue for the string is empty.  Space is obtained in large
+!	chunks for the allocation pool, if necessary, and one string
+!	from this pool is used to satisfy the request.  Unlike other
+!	versions of the string package, no unallocated strings of this
+!	same length are created.
+!	The calling sequence invloves doing a REMQUE,
+!	observing that it fails, and then calling this routine.
+!	After this routine returns, loop back to the REMQUE, waiting
+!	for it to succeed.
+!
+! FORMAL PARAMETERS:
+!
+!	LENGTH.rl.v	The number of bytes wanted in the string.
+!			The attempt to allocate a string with this
+!			many data bytes from the short queues failed.
+!
+! IMPLICIT INPUTS:
+!
+!	STR$$Q_SHORT_Q.mq	One of these queues is empty or we
+!				wouldn't have been called.
+!	PAGE_QUEUE.mq		Get a page from here if necessary.
+!
+! IMPLICIT OUTPUTS:
+!
+!	STR$$Q_SHORT_Q.mq	The residue of the old big chunk may be
+!				put on its queue for later use.
+!	PAGE_QUEUE.mq		Put 128 pages on here if it is empty.
+!
+! COMPLETION CODES:
+!
+!	STR$_NORMAL
+!	STR$_INSVIRMEM		If not enough memory to allocate to queues
+!
+! SIDE EFFECTS:
+!
+!	May allocate virtual storage.
+!	If it must but cannot, return STR$_INSVIRMEM
+!
+!--
+
+    BEGIN
+
+    BUILTIN
+	INSQUE,
+	REMQUE;
+
+    LOCAL
+	RETURN_STATUS,
+	ALLOC_LENGTH,
+	ALLOC_OFFSET,
+	ALLOC_DONE,
+	ALLOC_BLOCK : REF VECTOR,
+	LARGE_LEFT,
+	INSQUE_ADDR,
+	STRING_BLOCK : REF BLOCK [, BYTE] FIELD (STR$SHORT_FIELD);
+
+!+
+! Define the offsets into ALLOC_BLOCK.  This vector remembers how much of the
+! current large block can still be used for allocation.
+!-
+
+    LITERAL
+	A_ALLOC_FWD = 0,			! Forward pointer
+	A_ALLOC_BAK = 1,			! Backward pointer
+	L_ALLOC_AMT = 2,			! Number of free bytes
+	K_ALLOC_LEN = 3;			! Length of this header
+
+!+
+! Compute the number of bytes we must allocate in this string.  The
+! number of bytes wanted is rounded up to the next eight, and the
+! header length is added.
+!-
+    ALLOC_LENGTH = ((.LENGTH + (STR$K_ALL_QUA - 1)) AND ( NOT (STR$K_ALL_QUA - 1)))	!
+    + STR$K_HED_LEN + STR$K_RESIDUE;
+!+
+! If there is already a page on the page queue, use it to satisfy this request.
+!-
+
+    IF (REMQUE (.PAGE_QUEUE [0], ALLOC_BLOCK))
+    THEN
+	BEGIN
+!+
+! We need more space on the page queue.  Get a lot of pages to avoid
+! checkerboarding LIB$GET_VM's space, since we will never return our pages.
+!-
+
+	LOCAL
+	    CHUNK_BASE;
+
+	RETURN_STATUS = LIB$GET_VM (%REF (STR$K_ALLOC_LRG), CHUNK_BASE);
+	IF ( NOT .RETURN_STATUS) THEN RETURN STR$_INSVIRMEM;
+
+	ALLOC_BLOCK = .CHUNK_BASE;
+	LARGE_LEFT = STR$K_ALLOC_LRG;
+	END
+    ELSE
+	BEGIN
+	LARGE_LEFT = .ALLOC_BLOCK [L_ALLOC_AMT];
+	RETURN_STATUS = STR$_NORMAL;
+	END;
+
+!+
+! Point to the short queue that these strings are to go on.
+!-
+    INSQUE_ADDR = STR$$Q_SHORT_Q [.LENGTH, 0];
+!+
+! Divide part of this space into strings of the requested length and
+! put them in the appropriate short string queue.
+!-
+    ALLOC_OFFSET = 0;
+    ALLOC_DONE = 0;
+
+    WHILE (((.ALLOC_OFFSET + .ALLOC_LENGTH) LSS STR$K_ALLOC_SML)
+	AND (.LARGE_LEFT GEQ .ALLOC_LENGTH)) DO
+	BEGIN
+	STRING_BLOCK =
+	    .ALLOC_BLOCK + .ALLOC_OFFSET + STR$K_HED_LEN + STR$K_RESIDUE;
+	STRING_BLOCK [STR$W_ALLOC_LEN] =
+	    .ALLOC_LENGTH - STR$K_HED_LEN - STR$K_RESIDUE;
+	INSQUE (.STRING_BLOCK, ..INSQUE_ADDR);
+	ALLOC_DONE = 1;
+	ALLOC_OFFSET = .ALLOC_OFFSET + .ALLOC_LENGTH;
+	LARGE_LEFT = .LARGE_LEFT - .ALLOC_LENGTH;
+	END;
+
+!+
+! The space remaining, if any, is returned to the page queue for the next
+! string bucket that comes up empty.  Note that, if there was so little space
+! that we were unable to allocate even a single string, the space is discarded.
+! This can happen only at the end of the "large" blocks.  In this case we
+! will be called again, since the REMQUE will fail again, and we will
+! allocate more space on the page queue.
+!-
+
+    IF ((.LARGE_LEFT GEQ (K_ALLOC_LEN*%UPVAL)) AND .ALLOC_DONE)
+    THEN
+	BEGIN
+!+
+! There is enough space left in the large block to put it on the queue.
+!-
+
+	LOCAL
+	    INSQUE_ADDR;
+
+	ALLOC_BLOCK = .ALLOC_BLOCK + .ALLOC_OFFSET;
+	ALLOC_BLOCK [L_ALLOC_AMT] = .LARGE_LEFT;
+	INSQUE_ADDR = PAGE_QUEUE [0];
+	INSQUE (ALLOC_BLOCK [A_ALLOC_FWD], ..INSQUE_ADDR);
+	END;
+
+    RETURN .RETURN_STATUS;
+    END;					! of routine STR$ALOC_SHORT
+
+END						! end of module STR$$ALLOC
+
+ELUDOM

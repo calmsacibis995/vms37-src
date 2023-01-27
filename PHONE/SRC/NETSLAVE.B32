@@ -1,0 +1,604 @@
+%title 'NETSLAVE - Network Slave Program'
+	module netslave (
+			ident='V03-001') = begin
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! Facility:	VAX/VMS Telephone Facility, Network Slave Program
+!
+! Abstract:	This module is the network slave program.  When someone
+!		on a remote node wants to talk to someone on our node,
+!		this module acts as the network slave intermediary.
+!
+!
+! Environment:	The life and times of a network slave is restricted to
+!		two controlled cases:
+!
+!		1.  The master creates the slave for information-gathering
+!		    purposes (e.g., remote directory).  The slave exists only
+!		    to gather information, and dies when the gathering is done.
+!
+!		2.  The master creates the slave so it can talk to a user
+!		    on the slave's node.  The slave provides ONE-WAY 
+!		    communication from the master to the user.  The
+!		    user talks back to the master via a symmetrical slave.
+!
+!		NOTE that some errors are handled in the slave by simply 
+!		dying and letting the master worry about it.
+!			
+!
+! Author: Paul C. Anagnostopoulos, Creation Date: 11 December 1980
+!
+! Modified By:
+!
+!	V03-001	PCA0044		Paul Anagnostopoulos	26-Mar-1982
+!		Minor changes to convert from process name to user name.
+!--
+
+%sbttl 'Module Declarations'
+!
+! Libraries and Requires:
+!
+
+library 'sys$library:starlet.l32';
+require 'phonereq';
+
+!
+! Table of Contents:
+!
+
+forward routine
+	phn$init_slave: novalue,
+	phn$slave_drive: novalue,
+	phn$slave_directory2: novalue,
+	phn$slave_verify: novalue,
+	phn$slave_ring_out: novalue,
+	phn$slave_pass_smb: novalue,
+	phn$write_slave_status: novalue,
+	phn$read_slave;
+
+!
+! External References:
+!
+
+external routine
+	phn$directory_line,
+	phn$estab_link,
+	phn$local_jangle,
+	phn$make_pub,
+	phn$send_smb;
+
+!
+! Own Variables:
+!
+! The following word contains the DECnet logical link channel number.
+
+own
+	decnet_channel: word;
+
+! The following table sets up a correspondence between various PHONE
+! status codes and the universal code transmitted as part of our network
+! protocol.  We can't transmit VMS-format status codes because they may
+! change.
+
+own
+	status_code_table: vector[10,long] initial(	! universal code
+				phn$_linkerror,		! 	0
+				phn$_ok,		!	1
+				phn$_badspec,		!	2
+				phn$_cantreach,		!	3
+				phn$_needuser,		!	4
+				phn$_nopriv,		!	5
+				phn$_noproc,		!	6
+				phn$_targterm,		!	7
+				phn$_loggedoff,		!	8
+				phn$_unplugged		!	9
+				);
+
+%sbttl 'PHN$INIT_SLAVE - Initialize Network Slave'
+!++
+! Functional Description:
+!	This routine is called by the PHONE mainline to see if indeed
+!	we are a network slave.  If not, we just return.  If so, then we
+!	establish a logical link and invoke the network slave mainline.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$init_slave: novalue = begin
+
+local
+	status: long;
+
+
+! We will determine if we are a network slave by trying to assign to SYS$NET.
+! If it fails, we aren't, and we just return.  If it succeeds, we are, and
+! we have completed the logical link.
+
+status = $assign(devnam=describe('SYS$NET'),
+		 chan=decnet_channel);
+if not .status then
+	return;
+
+! Now we can simply wait for steering messages from the remote node.
+
+phn$slave_drive();
+
+end;
+
+%sbttl 'PHN$SLAVE_DRIVE - Handle Steering Messages'
+!++
+! Functional Description:
+!	This routine is the "mainline" for the network slave program.
+!	It waits for steering messages to be sent across the logical
+!	link and then acts accordingly.  Most messages can be sent
+!	on to the target task, but a few are handled herein.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$slave_drive: novalue = begin
+
+local
+	status: long,
+	decnet_iosb: block[8,byte];
+
+
+! Just sit in a loop processing steering messages.
+
+loop (
+	local
+		local_described_buffer(smb_buf,phn$k_mbxsize);
+
+	! Wait for a steering message from the remote person.  If we get
+	! a transmission error, just die.
+
+	status = $qiow(efn=phn$k_decnetefn,
+		       chan=.decnet_channel,
+		       func=io$_readvblk,
+		       iosb=decnet_iosb,
+		       p1=.smb_buf[ptr],
+		       p2=.smb_buf[len]);
+	check (.status);
+	check (.decnet_iosb[0,0,16,0]);
+	smb_buf[len] = .decnet_iosb[2,0,16,0];
+
+	! Now we can extract the steering message type code and decide what to
+	! do with the SMB.  Some routines are passed the steering message
+	! descriptor, which they can clobber.
+
+	selectoneu ch$rchar(.smb_buf[ptr]) of set
+
+	[smb__directory2]:
+			phn$slave_directory2();
+
+	[smb__slave_verify]:
+			phn$slave_verify(smb_buf);
+
+	[smb__rang_in]:
+			phn$slave_ring_out(smb_buf);
+
+	[smb__slave_done]:
+			$exit(code=ss$_normal);
+
+	[otherwise]:	phn$slave_pass_smb(smb_buf);
+	tes;
+
+);
+
+end;
+
+%sbttl 'PHN$SLAVE_DIRECTORY2 - Handle Remote Directory'
+!++
+! Functional Description:
+!	This steering message routine is called when the slave has been
+!	created to gather directory information for the master.  Each
+!	time the steering message is received, this routine transmits
+!	a directory line for the next process on its node.  The slave
+!	exists only for the duration of ONE remote directory request.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$slave_directory2: novalue = begin
+
+own
+	wild_pid: long initial(-1);
+
+local
+	status: long;
+local
+	local_described_buffer(display_line,79);
+
+
+! Get the directory line for the next process on our node.
+
+status = phn$directory_line(wild_pid,display_line);
+
+! If we ran out of processes, then send a null line back to the master.
+! Otherwise send the directory line.
+
+if .status nequ phn$_ok then
+	display_line[len] = 0;
+$qiow(efn=phn$k_decnetefn,
+      chan=.decnet_channel,
+      func=io$_writevblk,
+      p1=.display_line[ptr],
+      p2=.display_line[len]);
+
+return;
+
+end;
+
+%sbttl 'PHN$SLAVE_VERIFY - Verify Existence of Process'
+!++
+! Functional Description:
+!	This steering message routine is called when the master sends us
+!	a slave_verify steering message.  It does this as its first action
+!	when it wants to set up a conversation with a remote user.
+!	We are required to verify the existence of the user and set up
+!	a link to it.
+!
+! Formal Parameters:
+!	verify_smb	The SMB as it was sent to us.  This includes:
+!			1.	The steering message type code.
+!
+!			2.	The home node/user name of the master,
+!				followed by an eofrom character.
+!
+!			3.	The home node/user name of the target.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$slave_verify(verify_smb): novalue = begin
+
+bind
+	smb_dsc = .verify_smb: descriptor;
+
+local
+	status: long,
+	work_dsc: descriptor,
+	op: ref pub,
+	tp: ref pub;
+
+
+! Many routines assume that the first PUB on the chain is "our PUB", 
+! representing this user's phone.  In a network slave that doesn't really
+! make sense, but we will create a PUB to represent the master who
+! created us.  This PUB will be a reflection of "our PUB" in the master.
+
+work_dsc[ptr] = .smb_dsc[ptr] + 1;
+work_dsc[len] = ch$find_ch(.smb_dsc[len],.smb_dsc[ptr],eofrom) - .smb_dsc[ptr] - 1;
+status = phn$make_pub(work_dsc,op);
+check (.status);
+op[pub_v_temporary] = false;
+
+! Now we can set up a PUB representing the target user on this remote
+! node that the master wants to talk to.
+
+work_dsc[ptr] = ch$find_ch(.smb_dsc[len],.smb_dsc[ptr],eofrom) + 1;
+work_dsc[len] = .smb_dsc[len] - .work_dsc[ptr] + .smb_dsc[ptr];
+status = phn$estab_link(work_dsc,tp);
+tp[pub_v_temporary] = false;
+
+! Finally, we send that status back to the master so it knows how things went.
+
+phn$write_slave_status(.status);
+return;
+
+end;
+
+%sbttl 'PHN$SLAVE_RING_OUT - Ring a Remote Phone'
+!++
+! Functional Description:
+!	This steering message routine is executed when the master sends
+!	a rang_in message to the slave.  The slave is supposed to ring
+!	the remote person's phone, and return a status to the master.
+!
+! Formal Parameters:
+!	ring_smb	The address of a descriptor of the SMB as sent
+!			by the master.  We are only interested in the
+!			first time flag.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$slave_ring_out(ring_smb): novalue = begin
+
+bind
+	smb_dsc = .ring_smb: descriptor;
+
+
+local
+	status: long,
+	first_ring_flag: byte;
+
+
+! Begin by extracting the first time flag from the steering message.
+
+first_ring_flag = ch$rchar(ch$find_ch(.smb_dsc[len],.smb_dsc[ptr],eofrom)+1);
+
+! Now we can actually ring the person's phone.  Call a routine to do this,
+! and send the resulting status back to the master.
+
+status = phn$local_jangle(..phn$gq_pubhead[0],.first_ring_flag);
+phn$write_slave_status(.status);
+
+return;
+
+end;
+
+%sbttl 'PHN$SLAVE_PASS_SMB - Pass SMB on to Process'
+!++
+! Functional Description:
+!	This steering message routine handles all those steering messages
+!	that do not require any special action on the part of the slave.
+!	We simply need to pass the SMB on to the target user.
+!
+! Formal Parameters:
+!	pass_smb	Address of descriptor of SMB.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$slave_pass_smb(pass_smb): novalue = begin
+
+bind
+	smb_dsc = .pass_smb: descriptor;
+
+local
+	status: long,
+	char_ptr: long,
+	tp: ref pub,
+	mbx_iosb: block[8,byte];
+
+
+! We can just send the SMB to the target user via its receive mailbox.
+! We'll do it ourselves, rather than calling PHN$SEND_SMB, so we don't
+! have to split apart the SMB just to have it reassembled.
+
+tp = ..phn$gq_pubhead[0];
+status = $qiow(chan=.tp[pub_w_channel],
+	       func=io$_writevblk + io$m_now,
+	       iosb=mbx_iosb,
+	       p1=.smb_dsc[ptr],
+	       p2=.smb_dsc[len]);
+check (.status);
+check (.mbx_iosb[0,0,16,0]);
+
+return;
+
+end;
+
+%sbttl 'PHN$WRITE_SLAVE_STATUS - Send Status Back to Master'
+!++
+! Functional Description:
+!	This little routine can be called to network slave routines to send
+!	a status back to the master.
+!
+! Formal Parameters:
+!	phone_status	VMS-format status to send to the master.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$write_slave_status(phone_status): novalue = begin
+
+local
+	universal_status: byte,
+	status: long;
+
+
+! Because we don't want to use VMS-format status codes in our protocol, we
+! must translate the status to a universal protocol status.  This is done
+! by looking it up in the status table and using the index as the universal
+! status.  If we don't find it, just use code 0 (anl$_linkerror).
+
+universal_status = 0;
+incru i from 0 to %allocation(status_code_table)/4-1 do
+	if .phone_status eqlu .status_code_table[.i] then (
+		universal_status = .i;
+exitloop;
+	);
+
+! Write the universal status over the logical link.  Die if we can't do that,
+! and let the master worry about completion of the I/O.
+
+status = $qiow(efn=phn$k_decnetefn,
+	       chan=.decnet_channel,
+	       func=io$_writevblk,
+	       p1=universal_status,
+	       p2=1);
+check (.status);
+
+return;
+
+end;
+
+%sbttl 'PHN$READ_SLAVE - Read Data from Logical Link'
+!++
+! Functional Description:
+!	This routine is not actually part of the network slave program, but
+!	it belongs in this module.  It is called by the master to read
+!	data sent over the logical link by the slave.
+!
+! Formal Parameters:
+!	channel		The channel number of the logical link.
+!	buffer		Address of descriptor of buffer.  We set the length.
+!	status_flag	A boolean, true if we are reading a status code.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	phn$_remoteerror	Error occured while reading data.
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$read_slave(channel,buffer,status_flag) = begin
+
+bind
+	buffer_dsc = .buffer: descriptor;
+
+local
+	status: long,
+	decnet_iosb: block[8,byte];
+
+
+! Read the data from the slave.
+
+status = $qiow(efn=phn$k_decnetefn,
+	       chan=.channel,
+	       func=io$_readvblk,
+	       iosb=decnet_iosb,
+	       p1=.buffer_dsc[ptr],
+	       p2=.buffer_dsc[len]);
+
+! Make sure the read went OK.  If not, return a failure status.
+
+if not .status or not .decnet_iosb[0,0,16,0] then
+	return phn$_remoteerror;
+
+! We have to do different things depending upon whether this is a status
+! we read or just data.
+
+if .status_flag then (
+
+	! We just read a universal status, defined as part of the PHONE
+	! protocol.  We want to translate it back to a VMS-format status
+	! using the status code table.
+
+	bind
+		universal_status = .buffer_dsc[ptr]: byte;
+
+	buffer_dsc[len] = 4;
+	.buffer_dsc[ptr] = .status_code_table[.universal_status];
+
+) else
+
+	! It's just some data we read.
+
+	buffer_dsc[len] = .decnet_iosb[2,0,16,0];
+
+return phn$_ok;
+
+end;
+
+end eludom

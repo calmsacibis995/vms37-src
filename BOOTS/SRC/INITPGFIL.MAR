@@ -1,0 +1,638 @@
+	.TITLE	INITPGFIL - Initialize a Page File Control Block
+	.IDENT	'V03-005'
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility:	SYSGEN Utility
+;
+; Abstract:	This module isolates the procedure to initialize the
+;		secondary page file control blocks. The procedure was
+;		previously located in module RMSCONIO.
+;
+; Environment:	The code in this procedure executes in kernel mode.
+;
+; Author:	R.I. Hustvedt, Creation Date: 7-Sep-1977
+;
+; Modified by:
+;
+;	V03-005	LJK0160		Lawrence J. Kenah	11-Apr-1982
+;		Use correct upper limit in BOO$INITPGFIL.
+;
+;	V03-004	LJK0154		Lawrence J. Kenah	1-Apr-1982
+;		The cell SGN$GW_SWPFILCT is no longer in the parameter
+;		area. Address accordingly.
+;
+;	V03-003	LJK0151		Lawrence J. Kenah	24-Mar-1982
+;		Reset SP after return from INIT_BITMAP.
+;
+;	V03-002	LJK0149		Lawrence J. Kenah	22-Mar-1982
+;		The use of index 0 for SHELL lives again. Start vector
+;		scan at index 1. Make minor logic changes to reflect this
+;		change. Clear STARTBYTE field in PFL.
+;
+;	V03-001	LJK0143		Lawrence J. Kenah	11-Mar-1982
+;		Add two optional input parameters to allow only a portion
+;		of a paging or swap file to be made available when the
+;		file is installed.
+;
+;	V02-010	LJK0131		Lawrence J. Kenah	12-Feb-1982
+;		Initialize new field in PFL. Change name of reference
+;		to alternate entry in EXE$DEANONPAGED. Initialize 
+;		PFL$B_FLAGS field with MOVB for consistent state.
+;
+;	V02-009	LJK0107		Lawrence J. Kenah	31-Dec-1981
+;		Report page file and/or swap file resource available
+;		when an additional paging or swap file is installed.
+;
+;	V02-008	LJK0104		Lawrence J. Kenah	17-Dec-1981
+;		Insure that mapping pointers for page and swap files 
+;		are entirely resident.
+;
+;	V02-007	LJK0102		Lawrence J. Kenah	16-Dec-1981
+;		Do not allow zero-length files to be installed.
+;		Check for xxxFILCNT zero when installing xxx file.
+;		Truncate file size to multiple of eight blocks.
+;		Insure that page files with bit map sizes larger than
+;		65k bytes are correctly initialized.
+;
+;       V02-006 LJK0080         Lawrence J. Kenah       10-Nov-1981
+;               The lowest swap file index is now index 0. 
+;		Change names of cells containing upper and lower limits on
+;		page file index to MMG$GW_MINPFIDX and MMG$GL_MAXPFIDX.
+;
+;	V02-005	LJK0065		Lawrence J. Kenah	11-Sep-1981
+;		Parameter cells must be addressed in a very special way
+;		from the SYSGEN utility. Added status code to successful 
+;		return path.
+;
+;	V02-004	HRJ0028		Herb Jacobs		23-Aug-1981
+;		Zero unused cells in page file control block.
+;
+;	V02-003	LJK0043		Lawrence J. Kenah	6-Aug-1981
+;		Complete rewrite to take into account the fact that page
+;		files and swap files are nearly identical. This procedure
+;		is now called by SYSINIT to initialize PAGEFILE.SYS and
+;		also SWAPFILE.SYS (if that file also exists).
+;
+;	V02-002	HRJ0023		Herb Jacobs		30-Jun-1981
+;		Guarantee bitmap to start with a 0 byte for new page file
+;		allocation routine.
+;
+;	V02-001 LJK0010		Lawrence J. Kenah	14-Jan-1981
+;		Moved page file control block initialization to a separate
+;		module for possible use by checkpoint facility.
+;
+;--
+
+	.SUBTITLE	DECLARATIONS
+
+;
+; INCLUDE FILES:
+;
+
+	$DYNDEF				; Dynamic structure identification codes
+	$IPLDEF				; Symbolic IPL codes
+	$PFLDEF				; Page file control block
+	$PTRDEF				; Pointer control block 
+	$PTEDEF				; Page table entry layout
+	$RSNDEF				; Resource codes
+	$SYSGMSGDEF			; SYSGEN message definitions
+	$WCBDEF				; Window control block 
+
+;
+; EQUATED SYMBOLS:
+;
+
+;	Offsets from AP
+
+	FILESIZE = 4			; Size of page or swap file
+	WCBADDR = 8			; Address of WCB that maps file
+	MAXVBN = 12			; Largest VBN in file that can be used
+	PAGEFIDX = 16			; Address in which to return new
+					;  page file index
+	MINVBN = 20			; Number of blocks not in bitmap
+	STARTVBN = 24			; Number of blocks marked as "in use"
+
+;	Offsets from FP
+
+	PAGE_OR_SWAP = -4		; 0 => swap file and 1 => page file
+	PFLVEC_HILIM = -8		; Upper limit for PFL vector search
+	PFLVEC_LOLIM = -12		; Lower limit for PFL vector search
+	PFL_L_STARTVBN = -16		; Saved value of STARTVBN(AP)
+	PFL_L_MINVBN = -20		; Saved value of MINVBN(AP)
+
+;	Mask for WCB access field	
+
+	WCB_MASK = WCB$M_COMPLETE ! WCB$M_CATHEDRAL
+
+	.PAGE
+	.SBTTL	INSTALL PAGE OR SWAP FILE
+
+;++
+; Functional Description:
+;
+;	BOO$INITPAGFIL
+;	BOO$INITSWPFIL
+;
+;	BOO$INITxxxFIL initializes a page file control block for a page file
+;	or swap file that has just been opened. A bitmap is allocated from
+;	nonpaged pool and set up to indicate that the entire file is
+;	available for use (bitmap is filled with ones). (If the STARTVBN
+;	parameter is specified and nonzero, the first STARTVBN blocks are
+;	initially marked as in use.) The address of the WCB is stored in the
+;	page file control block. If the caller requests it, the index of
+;	this file (used to locate the PFL in the page file control block
+;	vector) can be returned to the caller. 
+;
+; Input Parameters:
+;
+;	FILESIZE(AP)	Size (in blocks) of the file
+;	WCBADDR(AP)	Address of WCB that maps the file
+;	MAXVBN(AP)	Parameter that controls largest VBN that may be used
+;
+;	If the MAXVBN is zero or is larger than ^X003FFFFF, then the
+;	MAXVBN field in the page file control block is set to
+;	^X003FFFFF. Otherwise, PFL$L_MAXVBN is set to the smallest
+;	power of 2 larger than the MAXVBN input parameter. 
+;	(See routine FIND_MAXVBN for details.)
+;
+; Optional Input Parameters:
+;
+;	Both of these parameters nust be present or both assume the
+;	default values of zero.
+;
+;	MINVBN(AP)	Number of blocks at the start of the file that
+;			are not represented in the bitmap.
+;			(Defaults to zero if not present)
+;	STARTVBN(AP)	Number of bits at the start of the bitmap that
+;			are cleared, indicating that the first STARTVBN
+;			blocks are not available for use. 
+;			(Defaults to zero if not present)
+;
+;	Note that the total number of blocks initially available is
+;
+;		AVAILABLE = FILESIZE - MINBVN - STARTVBN
+;
+; Implicit Input:
+;
+;	MMG$GL_PAGSWPVC	Contains the address of vector that locates each
+;			swap file table entry and page file control block
+;
+;	SGN$GW_PAGFILCT	Maximum number of paging files allowed in this
+;			configuration
+;
+;	SGN$GW_SWPFILCT	Maximum number of swapping files allowed in this
+;			configuration
+;
+;	IPL is assumed to be zero on entry to these procedures.
+;
+; Output Parameters:
+;
+;	PAGEFIDX(AP)	Address in which to return new page file index
+;
+; Implicit Output:
+;
+;	A page file control block and its associated bitmap are allocated
+;	from nonpaged pool. Various fields in the PFL are filled in
+;	according to the input parameters. All bits in the bitmap are set,
+;	indicating an empty file (unless STARTVBN is specified and nonzero,
+;	in which case, the first STARTVBN bits are cleared, indicating that
+;	the associated blocks are initially in use.) The address of the map
+;	is stored in the page file control block. Finally, the page file
+;	control block address is stored in the first empty entry in the page
+;	file control block vector. 
+;
+;	MMG$GL_MAXPFIDX	This cell contains the index of the most recently
+;			installed paging file. If entry is at BOO$INITPAGFIL,
+;			then this cell is updated.
+;
+; Completion Status:
+;
+;	R0 low bit set indicates success.
+;
+;	R0 low bit clear indicates error.
+;
+;		SS$_INSFMEM	Insufficient nonpaged pool for bitmap
+;
+;		SYSG$_SWAPAGINS	There is no more room in the page file 
+;				control block vector. The number of page or 
+;				swap files specified by the appropriate
+;				SYSGEN parameter have already been installed.
+;
+;		SYSG$_EMPTYFILE	Page or swap files of zero length cannot be
+;				installed.
+;
+;		SS$_PARTMAPPED	File does not have all of its mapping pointers
+;				permanently resident and there is not enough
+;				nonpaged pool to allocate an extended window
+;				control block.
+;--
+
+	.PSECT PAGED_CODE	RD,NOWRT,EXE,LONG
+
+	.ENABLE		LOCAL_BLOCK
+
+BOO$INITPAGFIL::
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9>	; Entry mask
+	PUSHL	#1			; Store code that distinguishes entry  
+	MOVZWL	G^<SGN$GW_PAGFILCT-EXE$A_SYSPARAM+MMG$A_SYSPARAM>,-(SP)
+					; Zero extend page file count
+	BEQL	10$			; Count of zero prevents installation
+	MOVZWL	G^SGN$GW_SWPFILCT,R1	; Zero extend swap file count
+	ADDL2	R1,(SP)			; Store sum as upper limit PFL index
+	DECL	(SP)			; Account for zero origin
+	PUSHL	R1			; Swap file count is lower limit
+	BRB	20$			; Join common code
+
+10$:	MOVL	#SYSG$_SWAPAGINS,R0	; Indicate error status
+	RET				;  and return
+
+BOO$INITSWPFIL::
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9>	; Entry mask
+	PUSHL	#0			; Store entry point code 
+	MOVZWL	G^SGN$GW_SWPFILCT,R1	; Zero extend swap file count
+	SUBL3	#1,R1,-(SP)		; Modified swap file count is upper limit
+	BEQL	10$			; (Count of one prevents installation)
+	PUSHL	#1			;  and 1 is the lower limit
+
+;  Calculate value for PFL$L_MAXVBN
+
+20$:	SUBL2	#8,SP			; Allocate space for MINVBN and STARTVBN
+	BSBW	CHECK_ARG_LIST		; Get MINVBN and STARTVBN parameters
+	MOVL	MAXVBN(AP),R6		; Get MAXVBN parameter
+	BEQL	30$			; If not present, use default
+	CMPL	R6,#PTE$M_PGFLVB	; Also use default if input parameter
+	BGEQU	30$			;  is larger than default value
+	BSBW	FIND_MAXVBN		; Otherwise, perform a detailed calculation
+	BRB	40$			;  ... and continue in line
+
+30$:	MOVL	#PTE$M_PGFLVB,R6
+
+;  Calculate modified file size
+
+40$:	SUBL3	PFL_L_MINVBN(FP),FILESIZE(AP),-(SP)	; Get actual size
+	BLEQU	70$			; Error if absurd parameters
+	BICL3	#^B0111,(SP)+,R7	; Retrieve modified file size 
+	BEQL	70$			; Error if file has no space in it
+	CMPL	R7,R6			; Make sure that file size is smaller
+	BLSSU	50$			;  than MAXVBN.
+	BICL3	#^B0111,R6,R7		; If not, minimize file size.
+
+; All mapping pointers must be permanently resident in order that memory 
+; management I/O requests can always complete without ACP intervention.
+
+50$:	MOVL	WCBADDR(AP),R9		; Get WCB address from argument list
+	BICB3	#^C<WCB_MASK>,WCB$B_ACCESS(R9),R0	
+					; Check COMPLETE and CATHEDRAL 
+	CMPB	#WCB_MASK,R0		;  bits. Error if both bits are not set
+	BNEQ	80$			; Set error status and return
+
+;  Determine bitmap size in bytes
+
+	DIVL3	#8,R7,R8		; Convert bit count to byte count
+	ADDL3	#<PFL$K_LENGTH+1>,R8,R1	; Determine size of pool allocation
+					;  (+1 is for stopper byte in bitmap)
+	JSB	G^EXE$ALONONPAGED	; Allocate a block of pool
+	BLBC	R0,90$			; Quit if allocation failed
+
+;  Now load the various fields in the page file control block
+;
+; 	R1 = Size of allocation request
+;	R2 = Address of page file control block
+;	R6 = Modified MAXVBN parameter
+;	R7 = Modified FILESIZE parameter
+;	R8 = Bitmap size in bytes
+;	R9 = Address of window control block that completely maps file
+
+	MOVAL	PFL$L_BITMAPLOC(R2),PFL$L_BITMAP(R2) ; Store address of bitmap
+	CLRL	PFL$L_STARTBYTE(R2)	; Let allocator initialize this field
+	SUBL3	R8,R1,PFL$W_SIZE(R2)	; Store PFL size (excluding bitmap size)
+	MOVZBW	#DYN$C_PFL,PFL$B_TYPE(R2) ; Store type code and clear PFC field
+	MOVL	R9,PFL$L_WINDOW(R2)	; Store WCB address into PFL
+	MOVL	(SP)+,PFL$L_VBN(R2)	; Store the offset VBN field
+	MOVL	R8,PFL$L_BITMAPSIZ(R2)	; Store bitmap size
+	SUBL3	PFL_L_STARTVBN(FP),R7,PFL$L_FREPAGCNT(R2) ; Free page count 
+					;  is modified file size - STARTVBN
+	BGTRU	60$			; Keep going if there are free pages
+	PUSHL	#SYSG$_EMPTYFILE	; Treat error as "file too small"
+	BRW	140$			; Error if absurd parameters
+
+60$:	MOVL	R6,PFL$L_MAXVBN(R2)	; Store MAXVBN parameter
+	CLRW	PFL$W_ERRORCNT(R2)	; Clear count of potentially bad blocks
+	MOVB	G^MPW$GW_MPWPFC,PFL$B_ALLOCSIZ(R2) ; Initialize MPW cluster factor
+	BSBW	INIT_BITMAP		; Mark all blocks in file as free
+	ADDL2	#4,SP			; Clear STARTVBN value from stack
+	MOVB	#PFL$M_INITED,PFL$B_FLAGS(R2)	; Indicate that file is ready
+
+;  Now locate empty PFL vector slot and store PFL address
+
+	MOVQ	(SP)+,R4		; Load index limits into R4 and R5
+	BRW	LOCKED_CODE_BEGIN
+
+;  Error returns 
+
+70$:	MOVL	#SYSG$_EMPTYFILE,R0	; Zero length files cannot be installed
+	RET				; Return error status
+
+80$:	MOVZWL	#SS$_PARTMAPPED,R0	; Set error status code
+90$:	RET				;  and return
+
+	.PSECT NONPAGED_CODE	RD,NOWRT,EXE,LONG
+
+LOCKED_CODE_BEGIN:
+	SETIPL	LOCK_IPL		; Do at IPL 7 to prevent simultaneous updates
+	BSBW	FIND_PFL_SLOT		; Locate empty PFL slot and store 
+	BLBC	R0,130$
+	TSTL	(SP)+			; Entry at BOO$INITPAGFIL?
+	BEQL	110$			; Branch if not
+	MOVL	R3,G^MMG$GL_MAXPFIDX	; Otherwise, update PFL index upper limit
+	MOVL	#RSN$_PGFILE,R0		; Report PAGEFILE resource available only
+	JSB	G^SCH$RAVAIL		;  when installing paging file
+110$:	MOVL	#RSN$_SWPFILE,R0	; Report SWAPFILE resource available when
+	JSB	G^SCH$RAVAIL		;  any paging or swap file is installed
+	SETIPL	#0			; Reenable scheduling
+	MOVL	PAGEFIDX(AP),R1		; Does the caller want the PFL index?
+	BEQL	120$			; Branch if not
+	MOVL	R3,(R1)			; Otherwise store the PFL index
+120$:	MOVZWL	#SS$_NORMAL,R0		; Signal success
+	RET				;  and return
+
+; No free slot is available in the page file control block vector. The
+; PFL and its associated bitmap must be deallocated.
+;
+;	(SP)	Error status code
+
+130$:	PUSHL	#SYSG$_SWAPAGINS	; Signal a failure
+140$:	MOVL	R2,R0			; Get address of PFL
+	MOVZWL	PFL$W_SIZE(R2),R1	; Get size of PFL less bitmap size
+	ADDL2	PFL$L_BITMAPSIZ(R2),R1	; Add bitmap size
+	JSB	G^EXE$DEANONPGDSIZ	; Deallocate the block
+	SETIPL	#0			; Reenable scheduling
+	MOVL	(SP)+,R0		; Restore error status
+	RET				; Return error status to caller
+
+	.DISABLE		LOCAL_BLOCK
+
+	.PAGE
+	.SUBTITLE	FIND_PFL_SLOT	Find free slot in PFL vector
+
+;+
+; This routine locates the first free slot (one pointing to MMG$GL_NULLPFL)
+; in either the swap file or page file area of the PFL vector and loads
+; the PFL address passed as an input parameter into that slot.
+;
+; Input parameters:
+;
+;	R2 = Address of page file control block to be stored in vector
+;	R4 = Index at which search begins
+;	R5 = Index at which search must end
+;
+;		(Note that R4 and R5 are inclusive limits)
+;		(Note also that R4 LSSU R5)
+;
+; Implicit input:
+;
+;	MMG$GL_PAGSWPVC	Pointer to page file control block vector
+;
+; Output parameter:
+;
+;	R3 = Index into PFL vector into which PFL address is stored.
+;
+; Implicit output:
+;
+;	The PFL address passed into this routine in R2 is loaded into
+;	the empty vector slot located by this routine.
+;
+; Side effects:
+;
+;	R1 is destroyed
+;
+; Return status:
+;
+;	R0 = SS$_NORMAL => successful return
+;
+;	R0 = SS$_NOSLOT => no empty slots are available
+;-
+
+FIND_PFL_SLOT:
+	MOVAL	G^MMG$GL_NULLPFL,R0	; This address indicates an empty slot
+	MOVL	G^MMG$GL_PAGSWPVC,R1	; Get PFL vector address
+	MOVL	R4,R3			; Get initial index value	
+10$:	CMPL	(R1)[R3],R0		; Is this slot free?
+	BEQL	30$			; Equal implies free
+	AOBLEQ	R5,R3,10$		; If we drop through this loop, then ...
+
+20$:	MOVZWL	#SS$_NOSLOT,R0		; There is no slot available
+	RSB				;  and return error code
+
+30$:	MOVL	R2,(R1)[R3]		; Store PFL address in empty slot
+	MOVZWL	#SS$_NORMAL,R0		; Indicate success
+	RSB				;  and return to caller
+
+;  This method of locking pages down while elevating IPL is used because
+;  this module is used by both SYSINIT and SYSGEN. SYSGEN locks pages
+;  into its working set, making this technique unnecessary (but harmless).
+;  SYSINIT does not lock pages into its working set.
+
+LOCK_IPL:
+	.WORD	IPL$_SYNCH		; Value of synchronization IPL
+
+LOCKED_CODE_END:
+
+	ASSUME	<LOCKED_CODE_END - LOCKED_CODE_BEGIN> LE 512
+
+	.PAGE
+	.SUBTITLE	CHECK_ARG_LIST
+;+
+; Check the argument list for the presence of optional parameters. If the
+; parameters are present, store their values in local storage. If the 
+; parameters are not specified, store their default values of zero.
+;
+; Input parameter:
+;
+;	(AP) = Number of arguments passed to procedure
+;
+; Optional input parameters:
+;
+;	MINVBN(AP)	Number of blocks at the start of the file that
+;			are not represented in the bitmap.
+;			(Defaults to zero if not present)
+;	STARTVBN(AP)	Number of bits at the start of the bitmap that
+;			are cleared, indicating that the first STARTVBN
+;			blocks are not available for use. 
+;			(Defaults to zero if not present)
+;
+; Output parameters:
+;
+;	PFL_L_MINVBN(FP)	Set to value of MINVBN(AP) or zero if
+;			that parameter is not present.
+;	PFL_L_STARTVBN(FP)	Set to value of STARTVBN(AP) or zero if
+;			that parameter is not present.
+;-
+
+CHECK_ARG_LIST:
+	CMPB	(AP),#6			; Check for six or more parameters
+	BLSSU	10$			; Branch if fewer than six
+	MOVQ	MINVBN(AP),PFL_L_MINVBN(FP)	; Store optional parameters
+	RSB
+
+; The following assumptions demand that the two optional parameters be
+; adjacent in the argument list and in local storage so that they can
+; be stored (or zeroed) with a single MOVQ (or CLRQ) instruction.
+
+	ASSUME	STARTVBN EQ <MINVBN + 4>		; Offsets from AP
+	ASSUME	PFL_L_STARTVBN EQ <PFL_L_MINVBN + 4>	; Offsets from FP
+
+10$:	CLRQ	PFL_L_MINVBN(FP)	; Parameters default to zero
+	RSB
+
+	.PAGE
+	.SUBTITLE	FIND_MAXVBN	Calculate modified MAXVBN parameter
+
+;+
+; This routine calculates the smallest power of two that is larger than
+; a given integer and returns a value which is that value minus one.
+;
+; Input parameter:
+;
+;	R6 = Integer between 0 and ^X3FFFFF
+;
+; Output parameter:
+;
+;	R6 = Integer of the form 2**N - 1 where 
+;
+;		N-1 LSSU log(x) LEQU N
+;
+;	     log(x) is log base 2 of the input parameter
+;-
+
+	.PSECT PAGED_CODE	RD,NOWRT,EXE,LONG
+
+FIND_MAXVBN:
+	MOVL	R6,R2
+	MOVL	#1,R0
+	MOVL	#1,R1
+10$:	CMPL	R0,R2
+	BGEQU	20$
+	ASHL	#1,R1,R1
+	BISL2	R1,R0
+	BRB	10$
+
+20$:	MOVL	R0,R6
+	RSB
+
+	.PAGE
+	.SUBTITLE	INIT_BITMAP
+;+
+; Initialize the page file bitmap. The first STARTVBN bits are
+; cleared, indicating that the associated blocks are initially
+; allocated. The remaining bits are set, indicating that the remainder
+; of the file is available. 
+; 
+; Input parameters:
+;
+;	R2 = Address of page file control block
+;
+;	PFL$L_BITMAPSIZ(R2)	Size in bytes of bitmap
+;	PFL$L_BITMAP(R2)	Address of start of bitmap
+;	PFL_L_STARTVBN(FP)	Number of blocks to mark as in use
+;
+; Side effects:
+;
+;	All of R0 through R9, with the exception of R2, are destroyed.
+;-
+
+; Page file allocation code assumes that the first byte in its
+; bitmap never contains all ones. By placing the flags byte
+; immediately before the beginning of the bitmap and reserving a flag
+; bit for all time, this function is accomplished. 
+
+	ASSUME	PFL$L_BITMAPLOC EQ <PFL$B_FLAGS + 1>
+
+; The following table contains the eight possibilities that can exist
+; for the boundary byte between the portion of the bitmap that indicates
+; blocks in use and the portion that indicates free blocks.
+
+BOUNDARY_BYTE:
+	.BYTE	^B11111111
+	.BYTE	^B11111110
+	.BYTE	^B11111100
+	.BYTE	^B11111000
+	.BYTE	^B11110000
+	.BYTE	^B11100000
+	.BYTE	^B11000000
+	.BYTE	^B10000000
+
+INIT_BITMAP:
+	MOVL	PFL$L_BITMAP(R2),R3	; Start of bitmap to R3
+	PUSHL	#0			; Initialize top of stack to zero
+	MOVL	PFL_L_STARTVBN(FP),R8	; Get STARTVBN parameter into register
+	BEQL	10$			; Branch if entire file available
+	CLRL	R9			; Clear upper half of R8:R9 quadword
+	EDIV	#8,R8,(SP),R8		; Quotient to top of stack
+					; Remainder to R8
+	CLRL	R9			; Set fill character to 00 (null)
+	BSBB	20$			; Clear out first half of bitmap
+10$:	MOVB	BOUNDARY_BYTE[R8],(R3)+	; Set/clear boundary byte
+	ADDL3	#1,(SP)+,R0		; R0 contains number of bytes completed
+	SUBL3	R0,PFL$L_BITMAPSIZ(R2),-(SP) ; Bytes remaining to top of stack
+	MCOML	#0,R9			; Set fill character to FF (all ones)
+	BSBB	20$			; Set rest of bitmap to all ones
+	CLRB	(R3)			; Set stopper byte at end of bitmap
+	ADDL2	#4,SP			; Reset stack pointer
+	RSB				;  and return
+
+;-
+; Set or clear a number of bits in a bitmap
+;
+; Input parameters:
+;
+;	R3	Bitmap address (updated by this routine)
+;	R9	Fill character (either 00 or FF)
+;	0(SP)	Return PC
+;	4(SP)	Number of bytes to set or clear
+;
+; Side effects:
+;
+;	R2 preserved
+;	R3 updated to point one byte beyond bitmap
+;	The rest of R0 through R7 are destroyed
+;-
+
+20$:	PUSHL	R2			; Only register worth saving
+	MOVZWL	8(SP),R6		; Low order word of bitmap size to R6
+	MOVZWL	10(SP),R7 		; High order word of bitmap size to R7
+	BEQL	40$			; Skip loop if one MOVC5 will suffice
+
+30$:	MOVC5	#0,(R3),R9,#^XFFFF,(R3) ; Initialize (64k - 1) bytes of bitmap
+	MOVB	R9,(R3)+		; Get the last byte, too
+	SOBGTR	R7,30$			; Go back for next 64k block
+
+40$:	MOVC5	#0,(R3),R9,R6,(R3)	; Initialize what's left
+	POPL	R2			; Restore PFL address to R2
+	RSB
+
+	.END

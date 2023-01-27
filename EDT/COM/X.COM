@@ -1,0 +1,1 @@
+$ MESSAGE/OBJ:[-.OBJ]EDTMSGS du1:[-.src]EDTMSGS

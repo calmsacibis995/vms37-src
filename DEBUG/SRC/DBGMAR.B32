@@ -1,0 +1,836 @@
+MODULE DBGMAR ( IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	DEBUG (DBG)
+!
+! ABSTRACT:
+!	This module contains the lexical scanner and reduction routines
+!	for MACRO/DEBUG.
+!
+! ENVIRONMENT:	VAX/VMS, user mode, interrupts disabled.
+!
+! Version:	1.13
+!
+! History:
+!	Author:
+!		Carol Peters, 25 July 1977
+!
+!	Modified by:
+!		John Francis,  3 April 1981
+!		Richard Title 18 Sep   1981
+!
+!+
+! 1.01	21-SEP-78	MCC	Added dbg$mar_reductn from DBGPAR
+! 1.02	26-SEP-78	DAR	Removed require file SYSLIT and added MACRO.REQ
+! 1.03	29-SEP-78	DAR	Deleted previous edit history, fixed lexical
+!				startup code and alphabetized the reduction labels.
+! 1.04	18-OCT-78	MCC	Changed semantic stack from VECTOR to BLOCKVECTOR
+!				to accomodate BLISS fields.
+! 1.05	25-OCT-78	DAR	Changed DBG$MAR_REDUCTN to make explicit calls
+!				to DBG$ADD_ARG instead of using the "LINK_XX" macros.
+! 1.06	30-MAR-79	MCC	Changed dbg$mar_reductn to support LOG files
+! 1.07	13-JUL-79	MCC	Changed DBG$MAR_REDUCTN to include actions
+!				for indirect command files.
+! 1.09	29-NOV-79	BAO	Added support for TYPE[/OVERRIDE].
+! 1.10	30-JAN-80	MCC	Added support for HELP
+! 1.11	 6-FEB-80	MCC 	Fixed ev/switch...was not working
+! 1.12	 2-APR-81	JF	Make ^D0000 reset radix to default
+! 1.13	 3-APR-81	JF	Check for null digit string following ^D, etc.
+! 3.01	18-SEP-81	RT	Added support for source line display
+! 3.02	04-Nov-81	RT	Added support for search command
+! 3.03	21-Nov-81	RT	Changed processing of SET MODULE and CANCEL MODULE
+!				to allow for module names that begin with a number.
+!--
+
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+	dbg$mar_get_lex,	! extracts a MACRO lexeme from the input buffer
+	dbg$mar_reductn;	! MACRO action routines
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'src$:dbgprolog.req';
+REQUIRE 'SRC$:DBGGEN.REQ';
+REQUIRE 'src$:COMTER.REQ';			
+REQUIRE 'SRC$:SCALIT.REQ';
+REQUIRE 'SRC$:BSTRUC.REQ';
+REQUIRE 'SRC$:SYSSER.REQ';
+REQUIRE	'src$:MACRO.REQ';		! MACRO/DEBUG Parse tables.
+! REQUIRE 'src$:redmac.req' is required in MACRO section
+
+
+!
+! MACROS:
+!
+REQUIRE 'src$:redmac.req';
+
+!
+! EQUATED SYMBOLS:
+!
+
+
+!
+! OWN STORAGE:
+!
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+	dbg$get_filesp,				! Extract filespec from input string
+	dbg$freerelease,			! Release dynamically allocated storage
+	dbg$radx_convrt,			! converts ASCII strings to binary numbers
+	dbg$cis_getfsp,				! get filespec for ind com files
+	dbg$verify_out,				! decides whether to VERIFY input
+    	dbg$parse_search,			! Parses the SEARCH command
+	dbg$show_type,				! prints current type.
+	dbg$get_help,				! Invoke librarian for HELP
+    	dbg$sta_getsourcemod,			! looks up module rst pointer
+    	dbg$get_dir_list,			! Parses a directory list
+	dbg$cis_openicf;			! Open ind com file
+
+EXTERNAL
+	dbg$char_table : VECTOR [, BYTE],	! Character type table
+	dbg$token_table : VECTOR [, BYTE],	! Table of token types.
+    	dbg$gl_search_verb,			! Pointer to command execution
+    						!     network for SEARCH
+	dbg$gb_def_mod : VECTOR [, BYTE],	! mode structure
+    	dbg$gb_set_module_flag: BYTE,		! TRUE during SET MODULE or 
+    						!     CANCEL MODULE command.
+	dbg$gl_get_lex,				! holds name of get lexeme routine
+	dbg$gl_gbltyp,				! the type override field.
+	dbg$gw_gbllngth : WORD,			! The length field for use with 
+						! type ASCII.
+	dbg$gl_log_buf,				! Addr of buffer containing LOG filespec
+    	dbg$gl_module,				! Holds module rst pointer 
+    						! during the SET SOURCE command
+    	dbg$gl_set_source,
+    	dbg$gl_set_source2,
+    	dbg$gl_dirlist,				! Holds directory list during
+    						! the SET SOURCE command
+	dbg$gl_stk : semantic_stack,		! semantic stack for tokens, etc.
+    	dbg$src_left_margin,			! left margin for source display
+    	dbg$src_right_margin;			! right margin for source display
+
+
+GLOBAL ROUTINE dbg$mar_get_lex (input_stg_desc, lexeme_stg_desc) =
+
+!++
+! Functional description:
+!	Using the character pointer for the input line, extracts a lexeme
+!	from the input line. A lexeme is defined as an operator, an
+!	alphanumeric string, a numeric string, or an
+!	illegal string. Blanks and comments are absorbed.
+!	The lexeme is returned in the lexeme buffer in the
+!	same form as in the input string, except for numeric
+!	strings, in which case the string is converted to a
+!	binary number and that is returned in the lexeme buffer.
+!	A token equivalent of the lexeme is the value of the
+!	routine.
+!
+! Formal parameters:
+!	input_stg_desc	- string descriptor to the input buffer.
+!	lexeme_stg_desc	- varying string descriptor to the lexeme buffer
+!
+! Implicit inputs:
+!	DBG$CHAR_TABLE	- a 128 byte VECTOR that maps each ascii character
+!			  onto a dense list of equivalents.
+!	DBG$TOKEN_TABLE	- a 21 byte VECTOR that maps each operator onto
+!			  its token equivalent.
+!
+! Outputs:
+!	input_stg_desc	- the field dsc$a_pointer is updated to point to
+!			  the next byte to be read in the input stream.
+!			  This byte is the delimiter of the lexeme found.
+!			  The field dsc$w_length contains the length of
+!			  the yet unread input line.
+!	lexeme_stg_desc	- the field dsc$w_length holds the actual length
+!			  in bytes of the lexeme found. The lexeme buffer
+!			  addressed by the field dsc$a_pointer holds the
+!			  lexeme string or value.
+!
+! Implicit outputs:
+!	The ASCII representation of the lexeme is written into the
+!	string addressed by the dsc$a_pointer field of lexeme_stg_desc.
+!
+! Routine value:
+!	The type of lexeme found, alpha_str_token, digit_str_token,
+!	eol_token, or "operator"_token.
+!
+! Side effects:
+!	Signal if an input character is invalid,
+!	or if a radix-operator not followed by digits,
+!	or the input string length is negative.
+!--
+
+    BEGIN
+
+	LITERAL
+		single_prec	= 1,
+		double_prec	= 3,
+		table_offset	= 9,
+		operator_max	= 30;
+
+	LITERAL
+		max_state_index	= 4,			! index ranges from 0 to 4
+		invalid_state	= 0,			! invalid character seen
+		alpha_state	= 1,			! alphabetic string expected
+		numeric_state	= 2,			! numeric string expected
+		eocommand_state	= 3,			! logical end of line or error seen
+		radix_state	= 4,			! radix setting expected
+		unspec_state	= 5;			! unspecified state, probably special character operator
+
+	BIND
+		lex_type_tbl	= UPLIT (
+
+		mask (illegal),
+		mask (alpha, alpha_low, alpha_and_hex, alphalo_and_hex),
+		mask (numeric),
+		mask (ind_comment, end_of_line),
+		mask (up_arrow)
+
+		) : VECTOR;
+
+	BIND
+		lex_state_tbl	= UPLIT BYTE (
+
+		invalid_state,
+		alpha_state,
+		numeric_state,
+		eocommand_state,
+		radix_state
+
+		) : VECTOR [, BYTE];
+
+
+	MAP
+		input_stg_desc	: REF BLOCK [, BYTE],	! input string descriptor
+		lexeme_stg_desc	: REF BLOCK [, BYTE];	! lexeme string descriptor
+
+	LOCAL
+		input_ptr,				! character pointer for input
+		lexeme_ptr,				! character pointer for lexeme
+		previous_radix,				! current local radix
+		state_index,				! index into lex_state_tbl
+		state,					! current state of lexical processor
+		char,					! holds a single character
+		count;					! counts characters used
+
+	IF .input_stg_desc [dsc$w_length] LSS 0		! Parse error if no input line left.
+	THEN SIGNAL (dbg$_parseerr);
+
+	!+
+	! Make the string pointers into formal BLISS character pointers.
+	!-
+	input_ptr = ch$ptr (.input_stg_desc [dsc$a_pointer]);
+	lexeme_ptr = ch$ptr (.lexeme_stg_desc [dsc$a_pointer]);
+
+	previous_radix = .dbg$gb_mod_ptr [mode_radix];	! Save current radix in case of local override.
+
+	count = -1;
+	DO						! Loop to skip leading blanks.
+	    BEGIN
+	    char = ch$rchar_a (input_ptr);
+	    count = .count + 1;
+	    END
+	UNTIL .dbg$char_table[.char] NEQ blanks;
+
+	input_ptr = ch$plus (.input_ptr, -1);		! Adjust ptr to first significant character.
+	input_stg_desc [dsc$w_length] = .input_stg_desc [dsc$w_length] - .count;
+
+
+    	!+
+    	! First check whether we are processing a SET SOURCE command.
+    	! If so, just read a character and return alpha_str_token.
+    	! The routine dbg$get_dir_list in DBGPAR will handle the rest.
+    	!-
+    	IF .dbg$gl_set_source
+    	THEN
+    	    BEGIN
+    	    ! check for exhausted input
+    	    IF .input_stg_desc[dsc$w_length] EQL 0
+    	    THEN
+    		SIGNAL(dbg$_MISDIRLIS);
+
+    	    ch$wchar_a (.char, lexeme_ptr);
+    	    lexeme_stg_desc [dsc$w_length] = 1;
+    	    input_stg_desc [dsc$a_pointer] = ch$plus(.input_ptr,1);
+    	    input_stg_desc [dsc$w_length] = .input_stg_desc[dsc$w_length] - 1;
+
+    	    ! Check for SET SOURCE/MODULE=XXX 
+    	    IF .char EQL '/'
+    	    THEN
+    		BEGIN
+    		dbg$gl_set_source = FALSE;
+    		dbg$gl_set_source2 = TRUE;
+    		RETURN slash_token
+    		END
+    	    ELSE
+    	        RETURN alpha_str_token;
+    	    END;
+
+	!+
+	! Convert the mapping of the first significant character
+	! into a lexical state. This state drives the later CASE
+	! processing.
+	!-
+	state_index = 0;
+	REPEAT
+		BEGIN
+		IF .lex_type_tbl [.state_index] ^ .dbg$char_table [.char] LSS 0
+		THEN
+			BEGIN
+			state = .lex_state_tbl [.state_index];
+			EXITLOOP
+			END
+		ELSE
+			BEGIN
+			state_index = .state_index + 1;
+			IF .state_index GTR max_state_index
+			THEN
+				BEGIN
+				state = unspec_state;
+				EXITLOOP
+				END;
+			END;
+		END;
+
+    	! If we are processing a SET MODULE or CANCEL MODULE command, and
+    	! if we are looking at a numeric, then change state to alpha_state
+    	! to allow for module names that begin with numbers.
+    	!
+    	IF .dbg$gb_set_module_flag
+    	THEN
+    	    IF .char GEQ %C'0' AND .char LEQ %C'9'
+    	    THEN
+    		state = alpha_state;
+    	
+
+	REPEAT CASE .state FROM 0 to max_state_index + 1 OF	! analyze current state
+
+		SET
+
+		[invalid_state]:			! if illegal, just signal
+			SIGNAL (dbg$_invchar);
+
+		[alpha_state]:				! alphanumeric string
+			BEGIN
+
+			!+
+			! Now read the input buffer until a non-alpha
+			! and non-numeric
+			! character is encountered. Store each
+			! character found in the buffer for the lexeme
+			! unless the length of that buffer is expended.
+			!-
+
+			count = 0;
+
+			DO
+				BEGIN
+				IF (.char GEQU %C'a')
+				THEN char = .char - upper_case_dif;
+				count = .count + 1;
+				IF .count LEQ sym_max_length
+				THEN ch$wchar_a (.char, lexeme_ptr);
+				char = ch$a_rchar (input_ptr);
+				END
+			WHILE	(oneof (.dbg$char_table [.char], alpha, alpha_low, numeric,
+						alpha_and_hex, alphalo_and_hex, period));
+
+			!+
+			! Return the alpha lexeme.
+			!-
+			IF .count GTR sym_max_length
+			THEN
+				BEGIN
+				SIGNAL (dbg$_stgtrunc);
+				lexeme_stg_desc [dsc$w_length] = sym_max_length;
+				END
+			ELSE lexeme_stg_desc [dsc$w_length] = .count;
+			input_stg_desc [dsc$a_pointer] = .input_ptr;
+			input_stg_desc [dsc$w_length] = .input_stg_desc [dsc$w_length] - .count;
+
+
+			RETURN alpha_str_token
+			END;
+
+		[numeric_state]:			! numeric string
+			BEGIN
+
+			!+
+			! Now read the input buffer until a non-numeric
+			! character is encountered. Ignore all leading
+			! zeroes unless a decimal point was present.
+			! Store each character found in the buffer for
+			! the lexeme unless the length of that buffer
+			! is expended.
+			!-
+			count = 0;
+
+				WHILE (.char EQL %C'0')
+				DO
+					BEGIN
+					count = .count + 1;
+					char = ch$a_rchar (input_ptr);
+					END;
+
+			!+
+			! If the entire number was zero, put a single
+			! zero in the lexeme buffer and return.
+			!-
+			input_stg_desc [dsc$w_length] = .input_stg_desc [dsc$w_length] - .count;
+			IF .dbg$char_table [.char] NEQ numeric
+				AND NOT (oneof (.dbg$char_table [.char], alpha_and_hex, alphalo_and_hex))
+			THEN
+				BEGIN
+				!+
+				! Check for no digits seen (can only happen if
+				! put into numeric_state by a radix-selection
+				! operator (^D,^B, etc.), with no following
+				! digits).
+				! Example: ^D-123 typed instead of -^D123.
+				!-
+				if .count EQL 0
+				THEN SIGNAL(dbg$_nooprnd);
+				ch$wchar (0, .lexeme_ptr);
+				lexeme_stg_desc [dsc$w_length] = 1;
+				input_stg_desc [dsc$a_pointer] = .input_ptr;
+				dbg$gb_mod_ptr [mode_radix] = .previous_radix;
+				RETURN digit_str_token
+				END;
+
+			!+
+			! This is the normal store and pick up next
+			! numeric character.
+			!-
+
+			count = 0;
+				DO
+					BEGIN
+					IF .dbg$char_table[.char] EQL alphalo_and_hex
+					THEN char = .char - upper_case_dif;
+					count = .count + 1;
+					IF .count GTR num_max_length
+					THEN
+						BEGIN
+
+						ch$move (num_max_length - 1,
+							ch$plus (ch$ptr (.lexeme_stg_desc [dsc$a_pointer]), 1),
+							ch$ptr (.lexeme_stg_desc [dsc$a_pointer]));
+						ch$wchar (.char, .lexeme_ptr-1);
+						END
+					ELSE ch$wchar_a (.char, lexeme_ptr);
+					char = ch$a_rchar (input_ptr);
+
+
+					END
+				WHILE (oneof (.dbg$char_table [.char], numeric,
+						alpha_and_hex, alphalo_and_hex));
+
+
+			!+
+			! Convert the number, restore the old radix,
+			! and return the numeric lexeme.
+			!-
+
+
+
+				BEGIN
+				lexeme_stg_desc[dsc$w_length] = .count;
+				.lexeme_stg_desc[dsc$a_pointer] = dbg$radx_convrt (.lexeme_stg_desc);
+				dbg$gb_mod_ptr [mode_radix] = .previous_radix;
+				lexeme_stg_desc [dsc$w_length] = 4;
+
+
+				END;
+
+			input_stg_desc [dsc$a_pointer] = .input_ptr;
+			input_stg_desc [dsc$w_length] = .input_stg_desc [dsc$w_length] - .count;
+			RETURN digit_str_token
+			END;
+
+		[eocommand_state]:			! logical end of line
+			BEGIN
+
+			!+
+			! The length of the input line should be set to
+			! zero here. Reduce it one so that it is less than
+			! zero. This will cause an error if this same
+			! input line ever comes back to the lex routine.
+			!-
+			lexeme_stg_desc [dsc$w_length] = 0;
+			input_stg_desc [dsc$a_pointer] = ch$plus (.input_ptr, 1);
+			input_stg_desc [dsc$w_length] = .input_stg_desc [dsc$w_length] - 1;
+			RETURN eol_token
+			END;
+
+		[radix_state]:				! up arrow
+			BEGIN
+
+			!+
+			! An up arrow can occur as a standalone character,
+			! meaning previous location, or as an escape
+			! character that preceeds a radix specifier.  In the
+			! latter case, the up arrow is followed by one of:
+			! 'B', 'D', 'O', or 'X'.
+			!-
+			LOCAL
+				radix_flag;
+
+			char = ch$rchar (ch$plus (.input_ptr, 1));
+			IF (.char GEQU %C'a')		! lower case character
+			THEN char = .char - upper_case_dif;
+			SELECTONE .char OF
+			    SET
+			    [%C'B']:	BEGIN
+					dbg$gb_mod_ptr[mode_radix] = binary_radix;
+					radix_flag = TRUE;
+					END;
+			    [%C'D']:	BEGIN
+					dbg$gb_mod_ptr[mode_radix] = decimal_radix;
+					radix_flag = TRUE;
+					END;
+			    [%C'O']:	BEGIN
+					dbg$gb_mod_ptr[mode_radix] = octal_radix;
+					radix_flag = TRUE;
+					END;
+			    [%C'X']:	BEGIN
+					dbg$gb_mod_ptr[mode_radix] = hex_radix;
+					radix_flag = TRUE;
+					END;
+			    [otherwise]: radix_flag = FALSE;
+			    TES;
+			IF .radix_flag
+			THEN
+				BEGIN
+				input_ptr = ch$plus (.input_ptr, 2);
+				char = ch$rchar (.input_ptr);
+				input_stg_desc[dsc$w_length] = .input_stg_desc[dsc$w_length] - 2;
+				state = numeric_state;
+				END
+			ELSE
+				BEGIN
+				char = asc_up_arrow;
+				state = unspec_state;
+				END;
+			END;
+
+		[unspec_state]:				! special character like operator or illegal
+			BEGIN
+
+			!+
+			! Most likely, this is a single character
+			! operator. Write its ASCII value into the
+			! lexeme buffer, and return its equivalent
+			! token.
+			!-
+			LOCAL
+				index;
+
+			index = .dbg$char_table[.char];
+			IF ((.index GEQ table_offset) AND (.index LEQ operator_max))
+			THEN
+				BEGIN
+				ch$wchar (.char, .lexeme_ptr);
+				lexeme_stg_desc[dsc$w_length] = 1;
+				input_stg_desc[dsc$a_pointer] = ch$plus (.input_ptr, 1);
+				input_stg_desc[dsc$w_length] = .input_stg_desc[dsc$w_length] - 1;
+				RETURN .dbg$token_table[.index - table_offset]
+				END;
+
+			!+
+			! This doesn't seem to be anything about which
+			! we know. SIGNAL invalid character.
+			!-
+			SIGNAL (dbg$_invchar);
+			END;			! loop back to CASE statement.
+
+		TES;
+
+	RETURN 1;
+	END;					! end of dbg$mar_get_lex
+
+GLOBAL ROUTINE dbg$mar_reductn (action_key, stack, lex_stg_desc, lahead_stg_desc, parse_stg_desc) =
+!++
+! Functional description:
+!	Does the action associated with a reduction. The action is chosen
+!	based on the action_key, which is the name of an action routine
+!	as specified in the semantics table.
+!
+! Formal parameters:
+!	action_key	- name of the action routine
+!	stack	- top of stack in the context of the reduction
+!	lex_stg_desc	- string descriptor for lexemes
+!	lahead_stg_desc	- string descriptor for look ahead
+!	parse_stg_desc	- string descriptor to hold original command line
+!
+! Implicit inputs:
+!	the name of the parse stack : dbg$gl_stk
+!
+! Routine value:
+!	TRUE or FALSE
+!
+! Side effects:
+!	The top of stack is often changed. Arguments are put into
+!	linked lists, context values are altered.
+!--
+
+    BEGIN
+    MAP
+	lex_stg_desc	: REF BLOCK [ ,BYTE],
+	lahead_stg_desc	: REF BLOCK [ ,BYTE],
+	parse_stg_desc	: REF BLOCK [ ,BYTE];
+
+    EXTERNAL
+    	dbg$gl_modrstptr2; 	! Holds module rst pointer during the TYPE command.
+    				! Is used to implement "sticky" module specifications,
+    				! e.g., in TYPE MOD1\1,2,3
+    				! the MOD1 applies to all three modules
+
+    CASE .action_key FROM 1 TO marnone OF
+
+	SET
+
+	[marcomlin]:	BEGIN
+			dbg$verify_out (.parse_stg_desc);
+			IF NOT dbg$perform_cmd (.stack) 
+			THEN 
+				RETURN false;
+			END;
+
+	[maraddexa]:	dbg$add_arg (dbg$gl_stk[.stack+2, stk$v_base], 0);
+	[maraddexp]:	dbg$gl_stk [.stack, stk$v_val1] = .dbg$gl_stk [.stack, stk$v_val1]
+				+.dbg$gl_stk [.stack+2, stk$v_val1];
+    	[maraddone]:	dbg$add_arg(dbg$gl_stk[.stack,stk$v_base],-1);
+	[maraddran]:	dbg$add_arg (dbg$gl_stk[.stack+2, stk$v_base],
+					dbg$gl_stk[.stack+4, stk$v_base]);
+    	[maraddsrc]:	dbg$add_arg(dbg$gl_stk[.stack+2,stk$v_base],-1);
+	[maraftcnt]:	dbg$get_step_count (.stack+1, .lex_stg_desc);
+	[marascclr]:	IF .dbg$gl_gbltyp EQL dsc$k_dtype_t
+			THEN dbg$gl_gbltyp = -1;
+	[marasclen]:	dbg$save_ascii_leng(.lex_stg_desc);
+	[marbreacb]:	dbg$gl_list[2] = dbg$get_bpt_act (.parse_stg_desc);
+	[marcalsub]:	dbg$add_arg (dbg$gl_stk[.stack+1, stk$v_base], 0);
+	[marcanarg]:	dbg$cancel_parm (.stack);
+    	[marcanmod]:	dbg$gl_context [dbg$k_module] = TRUE;
+	[marcanovr]:	dbg$gl_gbltyp = -1;
+	[marcanswi]:	dbg$can_switch (.stack);
+	[mardefarg]:	dbg$add_arg (dbg$gl_stk[.stack, stk$v_base],
+					dbg$gl_stk[.stack+2, stk$v_base]);
+	[mardeflst]:	dbg$add_arg (dbg$gl_stk[.stack+2, stk$v_base],
+					dbg$gl_stk[.stack+4, stk$v_base]);
+    	[mardefmod]:	BEGIN
+    			IF .dbg$gl_modrstptr2 EQL 0 
+    			THEN
+    			    dbg$gl_stk[.stack,stk$v_nt_ptr] =
+    				dbg$sta_getsourcemod(0)
+    			ELSE
+    			    dbg$gl_stk[.stack,stk$v_nt_ptr] =
+    				.dbg$gl_modrstptr2;
+    			IF .dbg$gl_stk[.stack,stk$v_nt_ptr] EQL 0
+    			THEN
+    			    SIGNAL(dbg$_noscope,
+    				.dbg$gl_stk[.stack,stk$v_val1]);
+    			END;
+	[mardefnam]:	dbg$save_name (.stack, .lex_stg_desc);
+	[mardfltyp]:	dbg$set_default_typ();
+	[mardgptho]:	dbg$bld_num_pth(.lahead_stg_desc);
+	[mardigpat]:	dbg$bld_num_pth(.lex_stg_desc);
+	[mardigstr]:	dbg$trans_name(.stack, .lahead_stg_desc);
+
+	[mardivexp]:	dbg$division (.stack);
+	[marexaone]:	dbg$add_arg (dbg$gl_stk[.stack, stk$v_base], 0);
+    	[marexasrc]:	dbg$gl_stk[.stack,stk$v_val1] = exsource_token;
+	[marexpran]:	dbg$add_arg (dbg$gl_stk[.stack, stk$v_base],
+					dbg$gl_stk[.stack+2, stk$v_base]);
+	[marextbit]:	dbg$extract_bits (.stack);
+    	[margetdir]:	BEGIN
+    			dbg$get_dir_list(.lex_stg_desc,.parse_stg_desc,.stack);
+    			dbg$gl_set_source = FALSE;
+    			END;
+	[marindcom]:	dbg$cis_openicf();
+	[marindexp]:	dbg$mac_indirection (.stack);
+	[marinsclr]:	IF .dbg$gl_gbltyp EQL dsc$k_dtype_zi
+			THEN dbg$gl_gbltyp = -1;
+    	[marintstr]:	dbg$trans_name(.stack,.lex_stg_desc);
+	[margethlp]:	dbg$get_help (.parse_stg_desc);
+	[margeticf]:	dbg$cis_getfsp(.lex_stg_desc, .parse_stg_desc);
+	[margetfsp]:	BEGIN
+			MAP dbg$gl_log_buf : REF VECTOR [,BYTE];
+			dbg$gl_log_buf = dbg$get_filesp(.lex_stg_desc, .parse_stg_desc);
+			END;
+	[marloctyp]:	dbg$set_local_type();
+    	[marmodule]:	! We have just processed a SET_MODULE -> SET MODULE
+    			! or a CANCEL_MODULE -> CANCEL MODULE reduction.
+    			dbg$gb_set_module_flag = TRUE;
+    	[marmarone]:	BEGIN
+   			! Right margin goes in val2,
+    			! left margin in val1.
+    			! Since only one margin was specified, it was the
+    			! right margin so put it in val2
+    			dbg$gl_stk[.stack,stk$v_val2] = 
+    			    .dbg$gl_stk[.stack,stk$v_val1];
+    			! The left margin is 1.
+    			!
+    			dbg$gl_stk[.stack,stk$v_val1] = 1;
+    			END;
+    	[marmartwo]:	BEGIN
+    			! Right margin is in position stack+2.
+    			! Put it on top of the stack in field val2.
+    			dbg$gl_stk[.stack,stk$v_val2] = 
+    			    .dbg$gl_stk[.stack+2,stk$v_val1];
+    			END;
+    	[marmarlef]:	BEGIN
+    			! SET MARGIN L:
+    			dbg$gl_stk[.stack,stk$v_val2] = -1;
+    			END;
+    	[marmarrig]: 	BEGIN
+    			! SET MARGIN :R
+    			dbg$gl_stk[.stack,stk$v_val1] = -1;
+    			dbg$gl_stk[.stack,stk$v_val2] =
+    			    .dbg$gl_stk[.stack+1,stk$v_val1];
+    			END;
+    	[marmaxfil]:	dbg$gl_context[dbg$k_maxfiles] = TRUE;
+    	[marmodcan]:	BEGIN
+    			dbg$gl_context[dbg$k_source] = TRUE;
+    			dbg$gl_module = .dbg$gl_stk[.stack+5, stk$v_val1];
+    			END;
+    	[marmodsou]:	BEGIN
+    			dbg$gl_context[dbg$k_source] = TRUE;
+    			dbg$gl_dirlist = .dbg$gl_stk[.stack+5,stk$v_val1];
+    			dbg$gl_module = .dbg$gl_stk[.stack+4,stk$v_val1];
+    			END;
+	[marmulexp]:	dbg$gl_stk [.stack, stk$v_val1] = .dbg$gl_stk [.stack, stk$v_val1]
+				 * .dbg$gl_stk [.stack+2, stk$v_val1];
+	[marnegexp]:	dbg$negation (.stack);
+	[marovrins]:	dbg$gl_gbltyp = dsc$k_dtype_zi;
+	[marovrasc]:	BEGIN
+			    dbg$gl_gbltyp = dsc$k_dtype_t;
+			    dbg$gw_gbllngth = 4;
+			END;
+	[marovropl]:	dbg$set_overs (override_mode, .dbg$gl_stk [.stack+2, stk$v_val1]);
+	[marovropt]:	dbg$set_overs (override_mode, .dbg$gl_stk [.stack, stk$v_val1]);
+	[marovropr]:	dbg$set_overs (override_mode, .dbg$gl_stk [.stack+1, stk$v_val1]);
+	[marovrstl]:	dbg$set_overr_step (.stack+2);
+	[marovrstp]:	dbg$set_overr_step (.stack+1);
+	[marovrtyp]:	dbg$set_over_typ();
+	[marposexp]:	dbg$pop_stack (.stack);
+	[marquotec]:	BEGIN
+			dbg$gl_stk[.stack, stk$v_val1] = dbg$extract_str (.parse_stg_desc);
+			dbg$gl_stk [.stack, stk$v_val2] = .dbg$gl_stk [.stack, stk$v_val1];
+			DBG$GL_STK [.STACK, STK$V_TYPE] = DSC$K_DTYPE_T;
+			END;
+	[marrempar]:	dbg$pop_stack (.stack);
+	[marsavmod]:	BEGIN
+    			dbg$add_module (.stack, .lex_stg_desc);
+    			IF .dbg$gl_set_source2
+    			THEN
+    			    dbg$gl_set_source = TRUE;
+    			END;
+	[marsavone]:	dbg$sav_pth_nam();
+	[marsavpat]:	dbg$build_path (.lex_stg_desc, FALSE);
+	[marsavtyp]:	dbg$save_type(.stack);
+    	[marsetsea]: 	dbg$gl_context[dbg$k_search] = TRUE;
+     	[marsearch]: 	BEGIN
+    			! Call a routine which will parse the remainder of
+    			! the input line. It will construct a command 
+    			! execution network and leave a pointer to the
+    			! result on the stack.
+    			!
+    			dbg$gl_search_verb =
+    			    dbg$parse_search (.parse_stg_desc);
+    			END;
+    	[marshosea]:	dbg$gl_context[dbg$k_search] = TRUE;
+	[marsetbre]:	dbg$break_setup (.stack, .dbg$gl_stk [.stack+2, stk$v_val1], 1);
+	[marsetbra]:	dbg$break_setup (.stack, .dbg$gl_stk [.stack+3, stk$v_val1],
+					.list_elem_exp1(.dbg$gl_head_lst));
+    	[marsetmar]:	dbg$gl_context[dbg$k_margins] = TRUE;
+    	[marsetsou]:	BEGIN
+    			dbg$gl_context[dbg$k_source] = TRUE;
+    			dbg$gl_dirlist = .dbg$gl_stk[.stack+1,stk$v_val1];
+    			dbg$gl_module = 0;
+    			END;
+	[marsettrc]:	dbg$gl_context[dbg$k_trce_call] = TRUE;
+	[marsettrb]:	dbg$gl_context[dbg$k_trce_brch] = TRUE;
+	[marsetdec]:	dbg$set_dec_overs() ;
+	[marsetlan]:	dbg$save_lang_name (.stack+2, .lex_stg_desc);
+	[marsetlog]:	dbg$gl_context[dbg$k_log] = TRUE;
+	[marsetmdl]:	dbg$gl_context[dbg$k_module] = TRUE;
+	[marsetmod]:	dbg$gl_context[dbg$k_mode] = TRUE;
+	[marsetout]:	dbg$gl_context[dbg$k_output] = TRUE;
+	[marsetsco]:	dbg$gl_context[dbg$k_scope] = TRUE;
+	[marsetstp]:	dbg$gl_context[dbg$k_step] = TRUE;
+	[marshfexp]:	dbg$gl_stk [.stack, stk$v_val1] = .dbg$gl_stk [.stack, stk$v_val1]
+				 ^ .dbg$gl_stk [.stack+2, stk$v_val1];
+	[marshoarg]:	dbg$show_param (.stack);
+	[marshocal]:	dbg$gl_context[dbg$k_traceback] = TRUE;
+	[marshcall]:	BEGIN
+			dbg$get_step_count (.stack+1, .lex_stg_desc);
+			dbg$gl_context[dbg$k_traceback] = TRUE;
+			END;
+	[marshotyp]:	dbg$show_type(default);
+	[marshovtp]:	dbg$show_type(override);
+    	[marsoucon]:	dbg$gl_set_source = TRUE;
+    	[marsrcmod]:	BEGIN
+    			dbg$gl_modrstptr2 = dbg$gl_stk[.stack,stk$v_nt_ptr] =
+    			    .dbg$gl_stk[.stack,stk$v_val1];
+    			dbg$gl_stk[.stack,stk$v_val1] =
+    			    .dbg$gl_stk[.stack+2,stk$v_val1];
+    			dbg$gl_stk[.stack,stk$v_val2] =
+    			    .dbg$gl_stk[.stack+2,stk$v_val2];
+    			END;
+    	[marsrcone]:	BEGIN
+    			dbg$gl_stk[.stack,stk$v_val2] =
+    			    .dbg$gl_stk[.stack,stk$v_val1];
+    			END;
+    	[marsrcran]:	dbg$gl_stk[.stack,stk$v_val2] =
+    			    .dbg$gl_stk[.stack+2,stk$v_val1];
+	[marstcoun]:	dbg$get_step_count (.stack+1, .lex_stg_desc);
+	[marstpcnt]:	dbg$get_step_count (.stack+2, .lex_stg_desc);
+	[marstaloc]:	dbg$add_arg (dbg$gl_stk[.stack+1, stk$v_base], 0);
+	[marsubexp]:	dbg$gl_stk [.stack, stk$v_val1] = .dbg$gl_stk [.stack, stk$v_val1]
+				 - .dbg$gl_stk [.stack+2, stk$v_val1];
+	[marsvolpt]:	dbg$build_path(.lahead_stg_desc, FALSE);
+	[martrnnam]:	dbg$reduce_pathname (.stack, .lahead_stg_desc);
+	[maruqunam]:	dbg$translate_name (.stack, .lex_stg_desc);
+	[marnone]:	0;
+
+	[INRANGE, OUTRANGE]:	RETURN FALSE;
+
+	TES;
+
+RETURN TRUE
+END;
+
+END							! End of module
+ELUDOM

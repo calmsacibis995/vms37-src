@@ -1,0 +1,851 @@
+MODULE ACPCNTRL (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-007'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This module implements the ACP control I/O function.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  23-May-1979  17:07
+!
+! MODIFIED BY:
+!
+!	V03-007	ACG0285		Andrew C. Goldstein,	12-Apr-1982  17:24
+!		Fix cathedral window logic for empty headers,
+!		do not unlock volume if there is no storage map
+!
+!	V03-006	LMP0019		L. Mark Pilant,		 1-Apr-1982  14:20
+!		Correct a boundary condition that would cause windows to
+!		be corrupted.
+!
+!	V03-001	LMP0016		L. Mark Pilant,		25-Mar-1982  13:35
+!		Remove diddling of the COMPLETE bit in the window segments.
+!		Also, fix a buf that caused the system to crash if a remap
+!		was forced on a file whose corresponding window did not start
+!		with VBN 1.
+!
+!	V02-004	LMP0012		L. Mark Pilant,		15-Mar-1982  16:00
+!		Add a routine to set WCB$M_COMPLETE in all the window
+!		segments if the remap succeeds.
+!
+!	V02-003	LMP0003		L. Mark Pilant,		25-Nov-1981  11:40
+!		Add routine to remap a file into multiple windows.
+!
+!	V02-002	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:24
+!		Previous revision history moved to F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+!
+! Range of control function codes recognized by this module.
+!
+
+LITERAL
+	MIN_CNTRLFUNC	= MINU (FIB$C_LOCK_VOL,
+				FIB$C_UNLK_VOL,
+				FIB$C_ENA_QUOTA,
+				FIB$C_ADD_QUOTA,
+				FIB$C_EXA_QUOTA,
+				FIB$C_MOD_QUOTA,
+				FIB$C_REM_QUOTA,
+				FIB$C_DSA_QUOTA,
+				FIB$C_REMAP
+				),
+
+	MAX_CNTRLFUNC	= MAXU (FIB$C_LOCK_VOL,
+				FIB$C_UNLK_VOL,
+				FIB$C_ENA_QUOTA,
+				FIB$C_ADD_QUOTA,
+				FIB$C_EXA_QUOTA,
+				FIB$C_MOD_QUOTA,
+				FIB$C_REM_QUOTA,
+				FIB$C_DSA_QUOTA,
+				FIB$C_REMAP
+				);
+
+FORWARD ROUTINE
+	ACPCONTROL,			! ACPCONTROL function routine
+	DISMOUNT,			! do volume dismount processing
+	LOCK_VOLUME,			! lock or unlock volume
+	MARK_CATHEDRAL	: NOVALUE,	! flag window as being cathedral
+	ADD_WINDOW	: NOVALUE,	! add a window to the queue
+	REMOVE_WINDOW	: NOVALUE,	! remove and deallocate a window segment
+	LAST_SEGMENT	: NOVALUE;	! set the window as the last segment
+
+GLOBAL ROUTINE ACPCONTROL =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine implements the ACP control I/O function. It sets up
+!	context and dispatches on the control function.
+!
+! CALLING SEQUENCE:
+!	ACPCONTROL ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CLEANUP_FLAGS: cleanup action and status flags
+!	IO_PACKET: address of I/O request packet
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	assorted status values
+!
+! SIDE EFFECTS:
+!	control function executed
+!
+!--
+
+BEGIN
+
+LOCAL
+	FIB		: REF BBLOCK,	! address of user FIB
+	ABD		: REF BBLOCK,	! address of buffer descriptor
+	STATUS;				! return status from called routine
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action and status flags
+	IO_PACKET	: REF BBLOCK;	! address of caller's I/O packet
+
+EXTERNAL ROUTINE
+	GET_FIB,			! get user FIB
+	REMAP_FILE	: NOVALUE,	! remap the file into segmented windows
+	QUOTA_FILE_OP,			! quota file maint operation
+	CONN_QFILE;			! connect quota file
+
+
+! Set up control block pointers. If there is no complex buffer packet, then
+! this is an I/O kill call, which is a NOP.
+!
+
+IF NOT .IO_PACKET[IRP$V_COMPLX] THEN RETURN 1;
+
+ABD = .BBLOCK [.IO_PACKET[IRP$L_SVAPTE], AIB$L_DESCRIPT];
+FIB = GET_FIB (.ABD);
+
+IF .BBLOCK [IO_PACKET[IRP$W_FUNC], IO$V_DMOUNT]
+THEN RETURN DISMOUNT ();
+
+IF .FIB[FIB$W_CNTRLFUNC] EQL 0
+THEN RETURN 1;				! 0 is a NOP
+
+! Dispatch on the control function.
+!
+
+CASE .FIB[FIB$W_CNTRLFUNC] FROM MIN_CNTRLFUNC TO MAX_CNTRLFUNC OF
+    SET
+
+    [FIB$C_REMAP]:	REMAP_FILE ();
+
+    [FIB$C_LOCK_VOL,
+     FIB$C_UNLK_VOL]:	BEGIN
+			IF NOT .CLEANUP_FLAGS[CLF_SYSPRV]
+			THEN ERR_EXIT (SS$_NOPRIV);
+			KERNEL_CALL (LOCK_VOLUME, .FIB[FIB$W_CNTRLFUNC]);
+			END;
+
+    [FIB$C_ENA_QUOTA]:	CONN_QFILE (.ABD, .FIB);
+
+    [FIB$C_ADD_QUOTA,
+     FIB$C_EXA_QUOTA,
+     FIB$C_MOD_QUOTA,
+     FIB$C_REM_QUOTA,
+     FIB$C_DSA_QUOTA]:	QUOTA_FILE_OP (.ABD, .FIB);
+
+    [INRANGE,
+     OUTRANGE]:		ERR_EXIT (SS$_ILLIOFUNC);
+
+    TES;
+
+RETURN 1;
+
+END;					! end of routine ACPCONTROL
+
+ROUTINE DISMOUNT =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine handles the DISMOUNT subfunction of the ACPCONTROL
+!	function. It reads the volume's storage control block, clears the
+!	status bits, and rewrites the block to indicate that the volume
+!	has been properly dismounted. (Once a volume is marked for dismount,
+!	all deferred write cacheing, etc., is turned off.)
+!
+!
+! CALLING SEQUENCE:
+!	DISMOUNT ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!	CURRENT_UCB: UCB of volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1 if success
+!
+! SIDE EFFECTS:
+!	storage control block rewritten
+!
+!--
+
+BEGIN
+
+LOCAL
+	SCB		: REF BBLOCK;	! buffer containing storage control block
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume
+	CURRENT_UCB	: REF BBLOCK;	! UCB of volume
+
+EXTERNAL ROUTINE
+	READ_BLOCK,			! read a disk block
+	WRITE_BLOCK,			! write a disk block
+	CHECKSUM;			! compute block checksum
+
+
+! Clear the SCB flags if the volume is not write locked or allocation locked.
+!
+
+IF NOT (.CURRENT_VCB[VCB$V_NOALLOC]
+	OR .BBLOCK [CURRENT_UCB[UCB$L_DEVCHAR], DEV$V_SWL])
+THEN
+    BEGIN
+    SCB = READ_BLOCK (.CURRENT_VCB[VCB$L_SBMAPLBN] - 1, 1, BITMAP_TYPE);
+    SCB[SCB$L_STATUS] = 0;
+    CHECKSUM (.SCB);
+    WRITE_BLOCK (.SCB);
+    END;
+
+1
+END;					! end of routine DISMOUNT
+
+GLOBAL ROUTINE REMAP_FILE : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called when it becomes necessary to guarantee that
+!	the entire file is mapped.  This is done by creating, if necessary,
+!	multiple WCB's and linking them together.
+!
+! CALLING SEQUENCE:
+!	REMAP_FILE ()
+!
+! INPUT PARAMETERS:
+!	none
+!
+! IMPLICIT INPUTS:
+!	PRIMARY_FCB: address of the current primary FCB
+!	CURRENT_WINDOW: address of the current primary window segment
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	none
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	As many WCB's as are needed are allocated and linked to provide
+!	mapping for the extire file.  Any errors are noted for the user.
+!
+!--
+
+BEGIN
+
+LINKAGE
+	L_MAP_POINTER	= JSB:
+			  GLOBAL (HEADER_COUNT = 6, HEADER_LBN = 7, HEADER_POINTER = 8);
+
+GLOBAL REGISTER
+	HEADER_COUNT	= 6,		! retrieval pointer count
+	HEADER_LBN	= 7,		! retrieval pointer start LBN
+	HEADER_POINTER	= 8 : REF BBLOCK;	! pointer into map area
+
+LABEL
+	HEADER_CHECK,			! loop to check window/header correspondence
+	WINDOW_TRUNCATE;		! loop to match up last FCB with a window
+LOCAL
+	WINDOW_SEGMENT	: REF BBLOCK,	! address of the next window segment
+	OLD_WINDOW	: REF BBLOCK,	! the original window
+	NEW_WINDOW	: REF BBLOCK,	! the new window list
+	FCB		: REF BBLOCK,	! address of the current FCB
+	LAST_FCB	: REF BBLOCK,	! address of the last FCB
+	HEADER		: REF BBLOCK,	! address of the header owned by an FCB
+	HEADER_VBN,			! current VBN in the header
+	NEXT_SEGMENT	: REF BBLOCK,	! address of the segment after the next
+	WINDOW_POINTER	: REF BBLOCK,	! address of the window map area
+	WINDOW_VBN,			! current VBN in the window
+	WINDOW_ENDVBN;			! ending VBN of the window
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action and status flags
+	PRIMARY_FCB	: REF BBLOCK,	! primary FCB for the file
+	CURRENT_WINDOW	: REF BBLOCK;	! primary window for the file
+
+EXTERNAL ROUTINE
+	DEALLOCATE,			! deallocate a block of memory
+	READ_HEADER,			! read a file header specified by FCB
+	TURN_WINDOW,			! map the file header specified
+	MARK_COMPLETE	: NOVALUE,	! mark all windows as complete
+	MARK_INCOMPLETE;		! mark all window segments as incomplete
+
+EXTERNAL ROUTINE
+	GET_MAP_POINTER	: L_MAP_POINTER;	! get next pointer from header
+
+! Make sure that a file is there.
+!
+
+IF .CURRENT_WINDOW EQL 0 THEN ERR_EXIT (SS$_FILNOTACC);
+
+! Make sure it is actually necessary to do the remap operation.
+!
+
+IF .CURRENT_WINDOW[WCB$V_COMPLETE]
+AND .CURRENT_WINDOW[WCB$V_CATHEDRAL]
+THEN RETURN;
+
+! If there is a file accessed, try to build any necessary window segments.
+! There are three cases which can arise in trying to remap the entire file.
+! 1) The window completely maps the file but it was not required to; in this
+! case it is simply necessary to set WCB$V_CATHEDRAL. 2) The window was
+! previously complete, but is no longer due to an extension of the file; in
+! this case is is necessary to add the new window pointers to the last window
+! segment (which may be the primary window). 3) The file was never completely
+! mapped. In this case there are no special special conditions to consider.
+! All that is necessary is to traverse the linked FCB's to build the window
+! segments.
+!
+
+! First case; WCB$V_COMPLETE is set. Simply set WCB$V_CATHEDRAL and return.
+!
+
+IF .CURRENT_WINDOW[WCB$V_COMPLETE] AND NOT .CURRENT_WINDOW[WCB$V_CATHEDRAL]
+THEN
+    BEGIN
+    KERNEL_CALL (MARK_CATHEDRAL, .CURRENT_WINDOW);
+    RETURN;
+    END;
+
+! Second case; the file was previously mapped complete. Locate the FCB which
+! corresponds to the last window segment and start adding from there.
+!
+
+IF .CURRENT_WINDOW[WCB$V_CATHEDRAL]
+THEN
+    BEGIN
+    WINDOW_SEGMENT = .CURRENT_WINDOW;
+    FCB = .PRIMARY_FCB;
+
+    UNTIL .WINDOW_SEGMENT[WCB$L_LINK] EQL 0
+    DO WINDOW_SEGMENT = .WINDOW_SEGMENT[WCB$L_LINK];
+    NEW_WINDOW = .WINDOW_SEGMENT;		! remember current end point
+
+    WINDOW_ENDVBN = .WINDOW_SEGMENT[WCB$L_STVBN];
+    WINDOW_POINTER = .WINDOW_SEGMENT + WCB$C_MAP;
+    DECR J FROM .WINDOW_SEGMENT[WCB$W_NMAP] TO 1 DO
+	BEGIN
+	WINDOW_ENDVBN = .WINDOW_ENDVBN + .WINDOW_POINTER[WCB$W_COUNT];
+	WINDOW_POINTER = .WINDOW_POINTER + 6;
+	END;
+
+    HEADER_CHECK: BEGIN
+    LAST_FCB = .FCB;				! in case only 1 FCB
+    DO
+	BEGIN
+	IF .FCB[FCB$L_STVBN] GTR .WINDOW_ENDVBN THEN EXITLOOP 0;
+	LAST_FCB = .FCB;
+	FCB = .FCB[FCB$L_EXFCB];
+	END
+    UNTIL .FCB EQL 0;
+    FCB = .LAST_FCB;
+    HEADER = READ_HEADER (0, .FCB);
+    HEADER_VBN = .FCB[FCB$L_STVBN];
+    HEADER_POINTER = .HEADER + .HEADER[FH2$B_MPOFFSET]*2;
+    IF .WINDOW_ENDVBN EQL .HEADER_VBN THEN LEAVE HEADER_CHECK;
+    UNTIL .HEADER_POINTER GEQA .HEADER + (.HEADER[FH2$B_MPOFFSET] + .HEADER[FH2$B_MAP_INUSE]) * 2
+    DO
+	BEGIN
+	GET_MAP_POINTER ();
+	IF .WINDOW_ENDVBN GEQ .HEADER_VBN
+	AND .WINDOW_ENDVBN LSS .HEADER_VBN + .HEADER_COUNT
+	THEN LEAVE HEADER_CHECK;
+	HEADER_VBN = .HEADER_VBN + .HEADER_COUNT;
+	END;
+    FCB = .FCB[FCB$L_EXFCB];
+
+! The last VBN mapped does not have a corresponding FCB.  In this case it
+! is necessary to locate the window segment that corresponds to the last
+! FCB.
+!
+
+    WINDOW_SEGMENT = .CURRENT_WINDOW;
+    WINDOW_TRUNCATE: BEGIN
+    DO
+	BEGIN
+	WINDOW_VBN = .WINDOW_SEGMENT[WCB$L_STVBN];
+	IF .WINDOW_VBN EQL .HEADER_VBN THEN LEAVE WINDOW_TRUNCATE;
+	WINDOW_POINTER = .WINDOW_SEGMENT + WCB$C_MAP;
+	DECR J FROM .WINDOW_SEGMENT[WCB$W_NMAP] TO 1 DO
+	    BEGIN
+	    WINDOW_VBN = .WINDOW_VBN + .WINDOW_POINTER[WCB$W_COUNT];
+	    WINDOW_POINTER = .WINDOW_POINTER + 6;
+	    IF .WINDOW_VBN EQL .HEADER_VBN THEN LEAVE WINDOW_TRUNCATE;
+	    END;
+	WINDOW_SEGMENT = .WINDOW_SEGMENT[WCB$L_LINK];
+	END
+    UNTIL .WINDOW_SEGMENT EQL 0;
+
+    BUG_CHECK (WCBFCBMNG, FATAL 'WCB/FCB correspondence broken');
+
+    END;				! end of block WINDOW_TRUNCATE
+
+! The window which corresponds to the last FCB has been found.  Truncate the
+! current window and remove any succeeding window segments.
+!
+
+    FCB = .LAST_FCB;
+    NEXT_SEGMENT = .WINDOW_SEGMENT[WCB$L_LINK];
+    KERNEL_CALL (LAST_SEGMENT, .WINDOW_SEGMENT);	! current segment is now the end
+    UNTIL .NEXT_SEGMENT EQL 0
+    DO
+	BEGIN
+	LOCAL	JUNK_SEGMENT	: REF BBLOCK;	! address of block to deallocate
+	JUNK_SEGMENT = .NEXT_SEGMENT;
+	NEXT_SEGMENT = .NEXT_SEGMENT[WCB$L_LINK];
+	KERNEL_CALL (REMOVE_WINDOW, .JUNK_SEGMENT);
+	END;
+
+    END;				! end of block HEADER_CHECK
+
+! Map any additional file headers or rebuild the last window if cleaning up
+! from an extend operation.
+!
+
+    WHILE 1 DO
+	BEGIN
+	KERNEL_CALL (TURN_WINDOW, .WINDOW_SEGMENT, .HEADER, 1, .FCB[FCB$L_STVBN]);
+	IF .CLEANUP_FLAGS[CLF_INCOMPLETE]
+	THEN
+	    BEGIN
+	    KERNEL_CALL (MARK_INCOMPLETE, .CURRENT_WINDOW);
+	    ERR_EXIT (SS$_EXBYTLM);
+	    END;
+	IF .FCB[FCB$L_EXFCB] EQL 0 THEN EXITLOOP 0;
+	UNTIL .WINDOW_SEGMENT[WCB$L_LINK] EQL 0
+	DO WINDOW_SEGMENT = .WINDOW_SEGMENT[WCB$L_LINK];
+	FCB = .FCB[FCB$L_EXFCB];
+	HEADER = READ_HEADER (0, .FCB);
+	END;
+
+    WINDOW_SEGMENT = .NEW_WINDOW[WCB$L_LINK];
+    UNTIL .WINDOW_SEGMENT EQL 0
+    DO
+	BEGIN
+	KERNEL_CALL (ADD_WINDOW, .WINDOW_SEGMENT, .PRIMARY_FCB[FCB$L_WLBL]);
+	WINDOW_SEGMENT = .WINDOW_SEGMENT[WCB$L_LINK];
+	END;
+
+    KERNEL_CALL (MARK_COMPLETE, .CURRENT_WINDOW);
+    RETURN;
+    END;
+
+! Third case; the file was never completely mapped. For this case no special
+! precautions need to be taken. Simply loop through all the FCB's associated
+! with the file, and create as many window segments as necessary.
+!
+
+FCB = .PRIMARY_FCB;
+WINDOW_SEGMENT = .CURRENT_WINDOW;
+KERNEL_CALL (MARK_CATHEDRAL, .WINDOW_SEGMENT);	!build cathedral windows
+
+! Now build the new windows using the original primary window as the base
+! for the new window segments.  This is necessary to aviod having to mung
+! the primary window address which may reside in several places.  It also
+! means that if an error occurs, the new window created will be valid, but
+! it will not be the same as it started out.
+!
+
+UNTIL .FCB EQL 0
+DO
+    BEGIN
+    HEADER = READ_HEADER (0, .FCB);
+    UNTIL .WINDOW_SEGMENT[WCB$L_LINK] EQL 0
+    DO WINDOW_SEGMENT = .WINDOW_SEGMENT[WCB$L_LINK];
+    KERNEL_CALL (TURN_WINDOW, .WINDOW_SEGMENT, .HEADER, 1, .FCB[FCB$L_STVBN]);
+    IF .CLEANUP_FLAGS[CLF_INCOMPLETE]
+    THEN
+	BEGIN
+	KERNEL_CALL (MARK_INCOMPLETE, .CURRENT_WINDOW);
+	ERR_EXIT (SS$_EXBYTLM);
+	END;
+    FCB = .FCB[FCB$L_EXFCB];
+    END;
+
+WINDOW_SEGMENT = .CURRENT_WINDOW[WCB$L_LINK];
+UNTIL .WINDOW_SEGMENT EQL 0
+DO
+    BEGIN
+    KERNEL_CALL (ADD_WINDOW, .WINDOW_SEGMENT, .PRIMARY_FCB[FCB$L_WLBL]);
+    WINDOW_SEGMENT = .WINDOW_SEGMENT[WCB$L_LINK];
+    END;
+
+KERNEL_CALL (MARK_COMPLETE, .CURRENT_WINDOW);
+RETURN;
+
+END;					! end of routine REMAP_FILE
+
+GLOBAL ROUTINE LOCK_VOLUME (FUNC) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine either locks or unlocks the current volume (or volume
+!	set), as indicated by the function argument. This routine must be
+!	called in kernel mode.
+!
+! CALLING SEQUENCE:
+!	LOCK_VOLUME (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: ACPCONTROL subfunction code
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1
+!
+! SIDE EFFECTS:
+!	lock bit in VCB either set or cleared
+!
+!--
+
+BEGIN
+
+LOCAL
+	VCB		: REF BBLOCK,	! VCB pointer
+	RVT		: REF BBLOCK,	! RVT of volume set
+	UCB		: REF BBLOCK;	! UCB of volume
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK;	! VCB of volume
+
+
+! If this is a volume set, iterate through the RVT.
+! Either lock or unlock the volume, depending on the function code.
+!
+
+VCB = .CURRENT_VCB;
+IF .VCB[VCB$W_RVN] NEQ 0
+THEN
+    BEGIN
+    RVT = .VCB[VCB$L_RVT];
+    INCR J FROM 1 TO .RVT[RVT$B_NVOLS]
+    DO
+	BEGIN
+	UCB = .VECTOR [RVT[RVT$L_UCBLST], .J-1];
+	IF .UCB NEQ 0
+	THEN
+	    BEGIN
+	    VCB = .UCB[UCB$L_VCB];
+	    IF .FUNC EQL FIB$C_LOCK_VOL
+	    THEN VCB[VCB$V_NOALLOC] = 1
+	    ELSE
+		BEGIN
+		IF .VCB[VCB$L_SBMAPLBN] NEQ 0
+		THEN VCB[VCB$V_NOALLOC] = 0;
+		END;
+	    END;
+	END;
+    END
+
+ELSE
+    BEGIN
+    IF .FUNC EQL FIB$C_LOCK_VOL
+    THEN VCB[VCB$V_NOALLOC] = 1
+    ELSE
+	BEGIN
+	IF .VCB[VCB$L_SBMAPLBN] NEQ 0
+	THEN VCB[VCB$V_NOALLOC] = 0;
+	END;
+    END;
+
+RETURN 1;
+
+END;					! end of routine LOCK_VOLUME
+
+! The remaining routines must be locked into the working set as they run
+! at an elevated IPL.
+
+LOCK_CODE;
+
+ROUTINE MARK_CATHEDRAL (WINDOW) : NOVALUE =
+
+!++
+!
+! ROUTINE DESCRITION:
+!
+!	This routine is used to mark the specified window as a Cathedral
+!	window.  It must be execured in kernel mode.
+!
+! CALLING SEQUENCE:
+!	MARK_CATHEDRAL (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of the window to mark
+!
+! IMPLICIT INPUTS:
+!	none
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	none
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	none
+!
+!--
+
+BEGIN
+
+MAP
+	WINDOW		: REF BBLOCK;		! address of the window to mark
+
+SET_IPL (IPL$_SYNCH);
+
+IF NOT .WINDOW[WCB$V_COMPLETE]
+THEN
+    BEGIN
+    WINDOW[WCB$L_STVBN] = 1;
+    WINDOW[WCB$W_NMAP] = 0;
+    END;
+
+WINDOW[WCB$V_CATHEDRAL] = 1;			! mark the window
+
+SET_IPL (0);
+
+RETURN;
+
+END;						! end of routine MARK_CATHEDRAL
+
+ROUTINE ADD_WINDOW (WINDOW, QUEUE_HEAD) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine adds the window specified into the queue specified. This
+!	routine must be called in kernel mode.
+!
+! CALLING SEQUENCE:
+!	ADD_WINDOW (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of the window segement to add
+!	ARG2: address of the queue head
+!
+! IMPLICIT INPUTS:
+!	none
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	none
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	none
+!
+!--
+
+BEGIN
+
+MAP
+	WINDOW		: REF BBLOCK,		! address of the window segment
+	QUEUE_HEAD	: REF BBLOCK;		! address of the queue head
+
+SET_IPL (IPL$_SYNCH);
+INSQUE (.WINDOW, .QUEUE_HEAD);
+SET_IPL (0);
+
+RETURN;
+
+END;						! end of routinr ADD_WINDOW
+
+ROUTINE REMOVE_WINDOW (WINDOW) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine removes the specifed window from the queue.  It then
+!	proceeds to deallocate the window.  This routine muse be called in
+!	kernel mode.
+!
+! CALLING SEQUENCE:
+!	REMOVE_WINDOW (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of the window to remove
+!
+! IMPLICIT INPUTS:
+!	none
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	none
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	none
+!
+!--
+
+BEGIN
+
+MAP
+	WINDOW		: REF BBLOCK;		! address of the window
+
+LOCAL
+	DUMMY;					! temp storage for queue entry address
+
+EXTERNAL ROUTINE
+	DEALLOCATE;				! deallocate system dynamic memory
+
+REMQUE (.WINDOW, DUMMY);
+DEALLOCATE (.WINDOW);
+
+RETURN;
+
+END;						! end of routine REMOVE_WINDOW
+
+ROUTINE LAST_SEGMENT (WINDOW) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine zaps the link pointer of the specified window segment
+!	therefore making it the last segment in the Cathedral window.
+!
+! CALLING SEQUENCE:
+!	LAST_SEGMENT (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of the window segment
+!
+! IMPLICIT INPUTS:
+!	none
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	none
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	none
+!
+!--
+
+BEGIN
+
+MAP
+	WINDOW		: REF BBLOCK;		! address of the window segment
+
+SET_IPL (IPL$_SYNCH);
+WINDOW[WCB$L_LINK] = 0;
+SET_IPL (0);
+
+RETURN;
+
+END;						! end of routine LAST_SEGMENT
+
+END
+ELUDOM

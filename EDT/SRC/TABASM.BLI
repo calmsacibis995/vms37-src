@@ -1,0 +1,926 @@
+MODULE	TABASM(IDENT='V03-000',MAIN=ASM,
+        ADDRESSING_MODE(EXTERNAL=LONG_RELATIVE,
+                        NONEXTERNAL=LONG_RELATIVE) =
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+BEGIN
+
+LIBRARY 'SYS$LIBRARY:STARLET';
+
+EXTERNAL ROUTINE
+    IO_OT,
+    IO_OI,
+    IO_OO,
+    IO_GET,
+    IO_CLO,
+    IO_WT,
+    IO_PUT;
+
+LITERAL						! Op-code values
+    OP_ABORT	= 0,
+    OP_ACTION	= 1,
+    OP_CALL	= 2,
+    OP_GOTO	= 3,
+    OP_OPTION	= 4,
+    OP_REQUIRE	= 5,
+    OP_RETURN	= 6,
+    OP_SELECT	= 7,
+    OP_TOKEN	= 8,
+    OP_END	= 9;
+
+LITERAL						! Symbol type definitions
+    TYP_UNDEF	= 0,				! Symbol is undefined
+    TYP_LABEL	= 1,				! Symbol is a label
+    TYP_ACTION	= 2,				! Symbol is an action routine
+    TYP_TOKEN   = 3,				! Symbol is a token identifier
+    TYP_OPERAND = 4;				! Symbol is an operand for action
+
+LITERAL
+    TAB		= 9,				! The tab character
+    FORM_FEED   = 12;				! And the form-feed
+
+LITERAL
+    NUM_OP_CODES= 9,				! Number of parser op-codes
+    NUM_FIELDS	= 6;				! Number of fields in sym tab
+
+STRUCTURE
+    BLOCKVECTOR[I,O,P,S,E;N,M] =
+        [N*M*4]
+        (IF I LSSU N THEN (BLOCKVECTOR + (I*M+O)*4) ELSE (%X'12344321'))<P,S,E>;
+STRUCTURE
+    BYTEVECTOR[I;N] =
+        [N]
+        (IF I LSSU N THEN (BYTEVECTOR+I) ELSE (%X'22224444'))<0,8,0>;
+    
+
+OWN
+    OP_CODES 	: VECTOR [70,BYTE]		! The allowable op-codes
+		    INITIAL (BYTE(
+			'ABORT  ',
+			'ACTION ',
+			'CALL   ',
+			'GOTO   ',
+			'OPTION ',
+			'REQUIRE',
+			'RETURN ',
+			'SELECT ',
+			'TOKEN  ',
+			'END	')),
+
+    OP_CODE_LEN : VECTOR [10]			! Length of the op-codes
+		    INITIAL(5,6,4,4,6,7,6,6,5,3),
+    INPUT_IFI,					! IFI for the input file
+    INPUT_RAB 	: $RAB_DECL,			! Rab for the input file
+    OUTPUT_RAB	: $RAB_DECL,			! Rab for the output file
+    INPUT_LENGTH,				! Length of current input line
+    INPUT_LINE 	: VECTOR [80,BYTE],		! The source input line
+    CURSOR,					! Index of next char in input
+    START_ID,					! Index of first char of an id
+    ID_LENGTH,					! Length of an identifier
+    ID_NUMBER,					! Index of current id
+    OP,						! The current operator
+    TAB_ADDR 	: INITIAL(0),			! Table address
+    TOK_TAB_SIZE,				! Size of the token table
+    LAB_INDEX_SIZE,				! Size of the label index
+    TOK_INDEX_SIZE,				! Size of the
+    ERR_COUNT   : INITIAL(0),			! Number of errors detected
+    OUT_BUF	: VECTOR[80,BYTE],		! Output buffer
+    OUT_POINT	: INITIAL(0),			! Index into output buffer
+    SYM_TAB 	: BLOCKVECTOR[500,NUM_FIELDS],	! The symbol table
+    NUM_SYM 	: INITIAL(0),			! Number of different symbols
+    NAMES 	: BYTEVECTOR[3000],		! Table to hold the names
+    STILL_TOKENS: INITIAL(1),			! Are we still doing tokens?
+    NEXT_CHAR 	: INITIAL(0);			! Index of next char in NAMES
+
+!
+! Symbol table field definitions
+!
+
+MACRO NAME_INDEX = 0,0,%BPVAL,0 %;		! Index into name table
+MACRO SYM_TYPE	 = 1,0,%BPVAL,0 %;		! Symbol type
+MACRO SYM_VALUE	 = 2,0,%BPVAL,0 %;		! Symbol value
+MACRO NAME_LEN	 = 3,0,%BPVAL,0 %;		! Length of symbol name
+MACRO REF_COUNT  = 4,0,%BPVAL,0 %;		! Count of ref's to symbol
+MACRO SYM_ADDR   = 5,0,%BPVAL,0 %;		! Address for labels
+
+LITERAL						! Error message numbers
+    ERR_BAD_ID	=  1,				! Bad identifier syntax
+    ERR_BAD_OP	=  2,				! Unknown op-code
+    ERR_GARBAGE =  3,				! Garbage at end of line
+    ERR_SYM_TYP =  4,				! Symbol type conflict
+    ERR_DOUBLE	=  5,				! Double definition of label
+    ERR_OPERAND =  6;				! Operand syntax error
+
+ROUTINE PUT_CHAR(C) : NOVALUE =
+BEGIN
+    OUT_BUF[.OUT_POINT] = .C;
+    OUT_POINT = .OUT_POINT + 1
+END;
+
+ROUTINE PUT_CHARS(C,N) : NOVALUE =
+BEGIN
+    MAP C : REF VECTOR[80,BYTE];
+
+    INCR I FROM 0 TO .N-1 DO
+	PUT_CHAR(.C[.I])
+END;
+    
+ROUTINE PUT_NUMBER(N) : NOVALUE =
+BEGIN
+    LOCAL
+	POWER,
+	TEMP;
+
+    TEMP = .N;
+    POWER = 10000;
+    WHILE .TEMP / .POWER EQL 0 AND
+	.POWER GTR 1 DO
+    	POWER = .POWER / 10;
+    DO
+	BEGIN
+	    PUT_CHAR(.TEMP / .POWER MOD 10 + '0');
+	    POWER = .POWER / 10;
+	END
+    UNTIL .POWER EQL 0
+END;
+
+ROUTINE PUT_NAME(ID) : NOVALUE =
+BEGIN
+    PUT_CHARS(NAMES[.SYM_TAB[.ID,NAME_INDEX]],
+    .SYM_TAB[.ID,NAME_LEN]);
+END;
+
+ROUTINE PUT_LINE : NOVALUE =
+BEGIN
+    IO_PUT(OUTPUT_RAB,OUT_BUF,.OUT_POINT);
+    OUT_POINT = 0
+END;
+
+ROUTINE GET_RECORD =
+BEGIN
+    LOCAL
+	SOURCE : REF VECTOR[80,BYTE];
+
+    IF IO_GET(INPUT_RAB,SOURCE,INPUT_LENGTH)
+    THEN
+	BEGIN
+            INCR I FROM 1 TO .INPUT_LENGTH DO INPUT_LINE[.I] = .SOURCE[.I-1];
+	    CURSOR = 1;
+	    INPUT_LINE[.INPUT_LENGTH+1] = '!';
+	    RETURN 1;
+	END
+    ELSE
+	RETURN 0;
+END;
+
+
+ROUTINE PUT_RECORD : NOVALUE =
+BEGIN
+    INPUT_LINE[0] = '!';
+    IO_PUT(OUTPUT_RAB,INPUT_LINE,.INPUT_LENGTH+1);
+END;
+
+ROUTINE LETTER =
+IF (.INPUT_LINE[.CURSOR] LSSU 'A' OR
+    .INPUT_LINE[.CURSOR] GTRU 'Z') AND
+    .INPUT_LINE[.CURSOR] NEQU '_' THEN
+    RETURN 0
+ELSE
+    RETURN 1;
+
+ROUTINE DIGIT =
+IF .INPUT_LINE[.CURSOR] LSSU '0' OR
+    .INPUT_LINE[.CURSOR] GTRU '9' THEN
+    RETURN 0
+ELSE
+    RETURN 1;
+
+ROUTINE GET_NUMBER(NUM) : NOVALUE = 
+BEGIN
+    LOCAL TEMP;
+    TEMP = 0;
+    WHILE DIGIT() DO
+	BEGIN
+	    TEMP = .TEMP * 10 + .INPUT_LINE[.CURSOR] - '0';
+	    CURSOR = .CURSOR + 1;
+	END;
+    .NUM = .TEMP
+END;
+
+ROUTINE ERROR(ERRMSG) : NOVALUE = 
+BEGIN
+    PUT_CHARS(UPLIT('ERROR '),6);
+    PUT_NUMBER(.ERRMSG);
+    PUT_LINE();
+    ERR_COUNT = .ERR_COUNT + 1;
+END;
+
+ROUTINE GET_ID : NOVALUE =
+IF NOT LETTER() THEN
+    ERROR(ERR_BAD_ID)
+ELSE
+    BEGIN
+	ID_LENGTH = 0;
+	START_ID = .CURSOR;
+	DO
+	    BEGIN
+		ID_LENGTH = .ID_LENGTH + 1;
+		CURSOR = .CURSOR + 1;
+	    END
+	UNTIL NOT ( LETTER() OR DIGIT() )
+    END;
+
+ROUTINE FIND_NAME : NOVALUE =
+BEGIN
+    INCR I FROM 0 TO .NUM_SYM - 1 DO
+	IF .ID_LENGTH EQL .SYM_TAB[.I,NAME_LEN]
+	THEN
+	    IF CH$EQL(.ID_LENGTH,
+		NAMES[.SYM_TAB[.I,NAME_INDEX]],
+		.ID_LENGTH,
+		INPUT_LINE[.START_ID])
+	    THEN
+		BEGIN
+		    ID_NUMBER = .I;
+		    SYM_TAB[.I,REF_COUNT] = .SYM_TAB[.I,REF_COUNT] + 1;
+		    RETURN
+		END;
+    ID_NUMBER = .NUM_SYM;
+    SYM_TAB[.NUM_SYM,NAME_INDEX] = .NEXT_CHAR;
+    SYM_TAB[.NUM_SYM,NAME_LEN] = .ID_LENGTH;
+    SYM_TAB[.NUM_SYM,SYM_VALUE] = 0;
+    SYM_TAB[.NUM_SYM,SYM_TYPE] = TYP_UNDEF;
+    SYM_TAB[.NUM_SYM,REF_COUNT] = 1;
+    INCR I FROM 0 TO .ID_LENGTH DO
+    BEGIN
+	NAMES[.NEXT_CHAR] = .INPUT_LINE[.START_ID+.I];
+	NEXT_CHAR = .NEXT_CHAR + 1
+    END;
+    NUM_SYM = .NUM_SYM + 1;
+END;
+
+ROUTINE CHECK_TYPE(TYPE) : NOVALUE =
+BEGIN
+    IF .SYM_TAB[.ID_NUMBER,SYM_TYPE] EQL TYP_UNDEF
+    THEN
+	SYM_TAB[.ID_NUMBER,SYM_TYPE] = .TYPE
+    ELSE
+	IF .SYM_TAB[.ID_NUMBER,SYM_TYPE] NEQ .TYPE
+	THEN
+	    ERROR(ERR_SYM_TYP)
+END;
+
+ROUTINE GET_LABEL_1 : NOVALUE =
+IF LETTER()
+THEN
+    BEGIN
+	GET_ID();
+	FIND_NAME();
+	IF .SYM_TAB[.ID_NUMBER,SYM_VALUE] NEQ 0 
+	THEN
+	    ERROR(ERR_DOUBLE)
+	ELSE
+	    SYM_TAB[.ID_NUMBER,SYM_VALUE] = 1;
+        CHECK_TYPE(TYP_LABEL)
+    END;
+
+ROUTINE SKIP_BLANKS : NOVALUE =
+WHILE .INPUT_LINE[.CURSOR] EQL ' ' OR
+    .INPUT_LINE[.CURSOR] EQL TAB OR
+    .INPUT_LINE[.CURSOR] EQL FORM_FEED
+DO CURSOR = .CURSOR + 1;
+
+ROUTINE GET_OP_CODE : NOVALUE =
+BEGIN
+    OP = -1;
+    SKIP_BLANKS();
+    IF .INPUT_LINE[.CURSOR] EQL '!' THEN RETURN;
+    IF LETTER()
+    THEN
+	BEGIN
+	    GET_ID();
+	    INCR I FROM 0 TO NUM_OP_CODES DO
+		IF CH$EQL( .ID_LENGTH,
+			INPUT_LINE[.START_ID],
+			7,OP_CODES[.I*7],' ')
+		THEN
+		    BEGIN
+			OP = .I;
+			RETURN;
+		    END;
+	END;
+    ERROR(ERR_BAD_OP)
+END;
+
+ROUTINE GET_OPERANDS : NOVALUE =
+BEGIN
+    LOCAL
+	MAX,
+	MIN,
+	OP_COUNT;
+
+    SKIP_BLANKS();
+    CASE .OP FROM 0 TO NUM_OP_CODES-1 OF
+    SET
+	[OP_ACTION]:
+	    BEGIN
+		GET_ID();
+		FIND_NAME();
+		CHECK_TYPE(TYP_ACTION);
+		SKIP_BLANKS();
+		IF .INPUT_LINE[.CURSOR] EQL '(' THEN
+		    BEGIN
+		    CURSOR = .CURSOR + 1;
+		    SKIP_BLANKS();
+		    GET_ID();
+		    FIND_NAME();
+		    CHECK_TYPE(TYP_OPERAND);
+		    SKIP_BLANKS();
+		    IF .INPUT_LINE[.CURSOR] NEQ ')' THEN
+			ERROR(ERR_OPERAND)
+		    ELSE
+			CURSOR = .CURSOR + 1;
+		    END;
+	    END;
+
+	[OP_CALL,OP_GOTO]:
+	    BEGIN
+		GET_ID();
+		FIND_NAME();
+		CHECK_TYPE(TYP_LABEL);
+	    END;
+
+	[OP_REQUIRE]:
+	    BEGIN
+		GET_ID();
+		FIND_NAME();
+		CHECK_TYPE(TYP_TOKEN);
+	    END;
+
+	[OP_OPTION]:
+	    BEGIN
+		GET_ID();
+		FIND_NAME();
+		CHECK_TYPE(TYP_TOKEN);
+		SKIP_BLANKS();
+		IF .INPUT_LINE[.CURSOR] EQL ','
+	    	THEN
+		    BEGIN
+			CURSOR = .CURSOR + 1;
+			SKIP_BLANKS();
+			GET_ID();
+			FIND_NAME();
+			CHECK_TYPE(TYP_LABEL);
+		    END
+		ELSE
+		    ERROR(ERR_OPERAND)
+	    END;
+
+	[OP_SELECT]:
+	    BEGIN
+		GET_NUMBER(OP_COUNT);
+		SKIP_BLANKS();
+		IF .INPUT_LINE[.CURSOR] NEQ ',' THEN
+		    ERROR(ERR_OPERAND)
+		ELSE
+		    CURSOR = .CURSOR+1;
+		SKIP_BLANKS();
+		GET_ID();
+		FIND_NAME();
+		CHECK_TYPE(TYP_ACTION);
+		SKIP_BLANKS();
+		IF .INPUT_LINE[.CURSOR] NEQ '!' THEN ERROR(ERR_GARBAGE);
+		INCR I FROM 1 TO .OP_COUNT DO
+		BEGIN
+		    GET_RECORD();
+		    PUT_RECORD();
+		    SKIP_BLANKS();
+		    GET_ID();
+		    FIND_NAME();
+		    CHECK_TYPE(TYP_TOKEN);
+		    SKIP_BLANKS();
+		    GET_ID();
+		    FIND_NAME();
+		    CHECK_TYPE(TYP_LABEL);
+		    SKIP_BLANKS();
+		    IF .INPUT_LINE[.CURSOR] NEQ '!' THEN ERROR(ERR_GARBAGE)
+		END;
+	    END;
+
+	[OP_ABORT,OP_RETURN]: ;
+	
+	[OP_TOKEN]:
+	    BEGIN
+		GET_ID();
+		FIND_NAME();
+		CHECK_TYPE(TYP_TOKEN);
+		SKIP_BLANKS();
+		IF .INPUT_LINE[.CURSOR] EQL ',' THEN
+		    CURSOR = .CURSOR + 1
+		ELSE
+		    ERROR(ERR_OPERAND);
+		SKIP_BLANKS();
+		GET_NUMBER(MIN);
+		SKIP_BLANKS();
+		IF .INPUT_LINE[.CURSOR] EQL ',' THEN
+		    CURSOR = .CURSOR+1
+		ELSE
+		    ERROR(ERR_OPERAND);
+		SKIP_BLANKS();
+		GET_NUMBER(MAX);
+		SKIP_BLANKS();
+		IF .INPUT_LINE[.CURSOR] EQL ',' THEN
+		    CURSOR = .CURSOR+1
+		ELSE
+		    ERROR(ERR_OPERAND);
+		WHILE .INPUT_LINE[.CURSOR] NEQ '!' DO CURSOR = .CURSOR+1
+	    END;
+    TES;
+    SKIP_BLANKS();
+    IF .INPUT_LINE[.CURSOR] NEQ '!' THEN ERROR(ERR_GARBAGE);
+END;
+
+ROUTINE FIRST_PASS : NOVALUE =
+BEGIN
+    WHILE GET_RECORD()
+    DO
+	BEGIN
+	    PUT_RECORD();
+	    GET_LABEL_1();
+	    GET_OP_CODE();
+	    IF .OP NEQ -1 THEN GET_OPERANDS(.OP);
+	END;
+END;
+
+ROUTINE SYM_LSS(I,J) =
+IF .SYM_TAB[.I,SYM_TYPE] LSS .SYM_TAB[.J,SYM_TYPE]
+THEN
+    RETURN 1
+ELSE
+    IF .SYM_TAB[.I,SYM_TYPE] EQL .SYM_TAB[.J,SYM_TYPE]
+    THEN
+	RETURN .SYM_TAB[.I,REF_COUNT] GTR .SYM_TAB[.J,REF_COUNT]
+    ELSE
+	RETURN 0;
+
+ROUTINE SWITCH(I,J) : NOVALUE =
+BEGIN
+    LOCAL 
+	TEMP : VECTOR[5];
+
+    LITERAL
+	SIZE = NUM_FIELDS * %BPVAL / 8;
+
+    CH$MOVE(SIZE,SYM_TAB[.I,NAME_INDEX],TEMP);
+    CH$MOVE(SIZE,SYM_TAB[.J,NAME_INDEX],SYM_TAB[.I,NAME_INDEX]);
+    CH$MOVE(SIZE,TEMP,SYM_TAB[.J,NAME_INDEX]);
+END;
+
+ROUTINE SORT_SYMS(LOW,HIGH) : NOVALUE = 
+BEGIN
+    LOCAL
+	MY_LOW,
+	MY_HIGH;
+    MY_LOW = .LOW;
+    MY_HIGH = .HIGH;
+    DO
+	BEGIN
+	    WHILE SYM_LSS(.MY_LOW,.MY_HIGH) DO MY_LOW = .MY_LOW+1;
+	    SWITCH(.MY_LOW,.MY_HIGH);
+	    IF .MY_LOW EQL .MY_HIGH THEN EXITLOOP;
+	    MY_HIGH = .MY_HIGH - 1;
+	    WHILE SYM_LSS(.MY_LOW,.MY_HIGH) DO MY_HIGH = .MY_HIGH-1;
+	    SWITCH(.MY_LOW,.MY_HIGH);
+            IF .MY_LOW EQL .MY_HIGH THEN EXITLOOP;
+	    MY_LOW = .MY_LOW + 1;
+	END
+    UNTIL 0;
+    IF .MY_LOW - .LOW GTR 1 THEN SORT_SYMS(.LOW,.MY_LOW-1);
+    IF .HIGH - .MY_HIGH GTR 1 THEN SORT_SYMS(.MY_HIGH+1,.HIGH);
+END;
+
+ROUTINE PUT_DEFS(I,TYP) : NOVALUE =
+BEGIN
+    LOCAL
+	DEF_VAL;
+
+    DEF_VAL = 1;
+    PUT_LINE();
+    WHILE .SYM_TAB[..I,SYM_TYPE] EQL .TYP DO
+	BEGIN
+	    PUT_CHARS(UPLIT('    '),4);
+	    PUT_CHARS(NAMES[.SYM_TAB[..I,NAME_INDEX]],
+		.SYM_TAB[..I,NAME_LEN]);
+	    PUT_CHAR(TAB);
+	    PUT_CHARS(UPLIT('=   '),4);
+	    PUT_NUMBER(.DEF_VAL);
+	    SYM_TAB[..I,SYM_VALUE] = .DEF_VAL;
+	    .I = ..I + 1;
+	    IF .SYM_TAB[..I,SYM_TYPE] EQL .TYP THEN
+		PUT_CHAR(',')
+	    ELSE
+		BEGIN
+		IF .TYP EQL TYP_ACTION THEN
+		    BEGIN
+		    PUT_CHAR(','); PUT_LINE();
+		    PUT_CHARS(UPLIT(BYTE('    NUM_SEM	=   ')),16);
+		    PUT_NUMBER(.DEF_VAL);
+		    END;
+		PUT_CHAR(';');
+		END;
+	    PUT_CHARS(UPLIT(BYTE(TAB,'! ')),3);
+	    PUT_NUMBER(.SYM_TAB[..I-1,REF_COUNT]);
+	    PUT_LINE();
+	    DEF_VAL = .DEF_VAL + 1;
+	END;
+END;
+
+ROUTINE OUTPUT_DEFS : NOVALUE =
+BEGIN
+    LOCAL
+	I;
+
+    PUT_LINE();
+    I = 0;
+    WHILE .SYM_TAB[.I,SYM_TYPE] EQL TYP_UNDEF DO
+	BEGIN
+	    PUT_CHARS(UPLIT('! No type for symbol: '),22);
+	    PUT_CHARS(NAMES[.SYM_TAB[.I,NAME_INDEX]],
+		.SYM_TAB[.I,NAME_LEN]);
+	    PUT_LINE();
+	    I = .I + 1;
+	END;
+    PUT_LINE();
+
+    IF .SYM_TAB[.I,SYM_TYPE] EQL TYP_LABEL THEN
+	BEGIN
+	    PUT_CHARS(UPLIT('LITERAL ! Parse table label defs'),32);
+	    PUT_DEFS(I,TYP_LABEL);
+	END;
+    PUT_LINE();
+
+    IF .SYM_TAB[.I,SYM_TYPE] EQL TYP_ACTION THEN
+	BEGIN
+	    PUT_CHARS(UPLIT('LITERAL ! Parse table action routine defs'),41);
+	    PUT_DEFS(I,TYP_ACTION);
+	END;
+    PUT_LINE();
+    IF .SYM_TAB[.I,SYM_TYPE] EQL TYP_TOKEN THEN
+	BEGIN
+	    PUT_CHARS(UPLIT('LITERAL ! Parse table token number defs'),41);
+	    PUT_DEFS(I,TYP_TOKEN);
+	END;
+    PUT_LINE();
+
+END;
+
+ROUTINE GET_LABEL_2 : NOVALUE =
+IF LETTER()
+THEN
+    BEGIN
+	GET_ID();
+	FIND_NAME();
+	SYM_TAB[.ID_NUMBER,SYM_ADDR] = .TAB_ADDR;
+	PUT_CHAR('!');
+	PUT_NAME(.ID_NUMBER);
+	PUT_LINE();
+    END;
+
+ROUTINE PUT_OPERAND : NOVALUE =
+BEGIN
+    LOCAL
+	VALUE;
+    VALUE = .SYM_TAB[.ID_NUMBER,SYM_VALUE];
+    IF .VALUE LSS 32 THEN
+	PUT_CHAR('+')
+    ELSE
+	BEGIN
+	    TAB_ADDR = .TAB_ADDR + 1;
+	    PUT_CHAR(',');
+	END;
+    PUT_CHAR(TAB);
+    PUT_NAME(.ID_NUMBER);
+END;
+
+ROUTINE PUT_OPERATION : NOVALUE =
+BEGIN
+    GET_ID();
+    FIND_NAME();
+    PUT_CHARS(UPLIT('OP_'),3);
+    PUT_CHARS(OP_CODES[.OP*7],.OP_CODE_LEN[.OP]);
+    TAB_ADDR = .TAB_ADDR + 1;
+    PUT_OPERAND(.ID_NUMBER);
+END;
+
+ROUTINE NON_TOKEN : NOVALUE =
+IF .OP NEQ OP_TOKEN AND
+   .STILL_TOKENS THEN
+    BEGIN
+	PUT_CHARS(UPLIT(BYTE('0)) : VECTOR[')),13);
+	PUT_NUMBER(.TAB_ADDR);
+	PUT_CHARS(UPLIT(BYTE(',BYTE];')),7);
+	PUT_LINE();
+	PUT_LINE();
+	PUT_CHARS(UPLIT(BYTE('BIND PARSE_TABLE = UPLIT(BYTE(')),30);
+	TOK_TAB_SIZE = .TAB_ADDR;
+	TAB_ADDR = 0;
+	STILL_TOKENS = 0;
+    END;
+
+ROUTINE GEN_TABLE : NOVALUE =
+BEGIN
+    LOCAL 
+	MAX,
+	MIN,
+	OP_COUNT;
+
+    SKIP_BLANKS();
+    PUT_CHAR(TAB);
+    CASE .OP FROM 0 TO NUM_OP_CODES-1 OF
+    SET
+	[OP_ACTION,OP_CALL,OP_REQUIRE,OP_GOTO]:
+	    BEGIN
+		NON_TOKEN();
+		PUT_OPERATION();
+		IF .INPUT_LINE[.CURSOR] EQL '(' THEN
+		    BEGIN
+		    CURSOR = .CURSOR+1;
+		    SKIP_BLANKS();
+		    GET_ID();
+		    FIND_NAME();
+		    PUT_CHAR(',');
+		    PUT_NAME(.ID_NUMBER);
+		    TAB_ADDR = .TAB_ADDR+1;
+		    SKIP_BLANKS();
+		    CURSOR = .CURSOR+1;
+		    END;
+	    END;
+
+	[OP_OPTION]:
+	    BEGIN
+		NON_TOKEN();
+		PUT_OPERATION();
+		SKIP_BLANKS();
+		CURSOR = .CURSOR + 1;
+	        PUT_CHAR(',');
+		PUT_CHAR(TAB);
+		SKIP_BLANKS();
+		GET_ID();
+		FIND_NAME();
+		PUT_NAME(.ID_NUMBER);
+		TAB_ADDR = .TAB_ADDR + 1;
+	    END;
+
+	[OP_SELECT]:
+	    BEGIN
+		NON_TOKEN();
+		GET_NUMBER(OP_COUNT);
+		PUT_CHARS(UPLIT('OP_'),3);
+		PUT_CHARS(OP_CODES[.OP*7],.OP_CODE_LEN[.OP]);
+	 IF .OP_COUNT LSS 32 THEN
+	    PUT_CHAR('+')
+	 ELSE
+	     BEGIN
+	     TAB_ADDR = .TAB_ADDR + 1;
+	     PUT_CHAR(',');
+	     END;
+	 PUT_NUMBER(.OP_COUNT);
+		PUT_CHAR(',');
+		TAB_ADDR = .TAB_ADDR + .OP_COUNT*2 + 2;
+		SKIP_BLANKS();
+		CURSOR = .CURSOR+1;
+		GET_ID();
+		FIND_NAME();
+		PUT_NAME(.ID_NUMBER);
+		PUT_CHAR(',');
+		PUT_LINE;
+		INCR I FROM 1 TO .OP_COUNT DO
+		BEGIN
+		    GET_RECORD();
+		    SKIP_BLANKS();
+		    GET_ID();
+		    FIND_NAME();
+		    PUT_CHAR(TAB);
+		    PUT_CHAR(TAB);
+		    PUT_NAME(.ID_NUMBER);
+		    PUT_CHAR(',');
+		    PUT_CHAR(TAB);
+		    SKIP_BLANKS();
+		    GET_ID();
+		    FIND_NAME();
+		    PUT_NAME(.ID_NUMBER);
+		    SKIP_BLANKS();
+		    PUT_CHAR(',');
+		    PUT_LINE();
+		END;
+	        RETURN;
+	    END;
+
+	[OP_ABORT,OP_RETURN]:
+	    BEGIN
+		NON_TOKEN();
+		PUT_CHARS(UPLIT('OP_'),3);
+		PUT_CHARS(OP_CODES[.OP*7],.OP_CODE_LEN[.OP]);
+		TAB_ADDR = .TAB_ADDR + 1;
+	    END;
+
+	[OP_TOKEN]:
+	    BEGIN
+		GET_ID();
+		FIND_NAME();
+		SYM_TAB[.ID_NUMBER,SYM_ADDR] = .TAB_ADDR;
+		SKIP_BLANKS();
+		CURSOR = .CURSOR + 1;
+		SKIP_BLANKS();
+		GET_NUMBER(MIN);
+		SKIP_BLANKS();
+		CURSOR = .CURSOR+1;
+		SKIP_BLANKS();
+		GET_NUMBER(MAX);
+		SKIP_BLANKS();
+		CURSOR = .CURSOR+1;
+                IF .INPUT_LINE[.CURSOR] EQL '%' THEN
+                    BEGIN
+                    CURSOR = .CURSOR + 1;
+                    MIN = .MIN + 8;
+                    END;
+		PUT_NUMBER(.MAX*16+.MIN);
+		PUT_CHAR(',');
+		PUT_CHAR('''');
+		INCR I FROM 1 TO .MAX DO
+		    BEGIN
+			PUT_CHAR(.INPUT_LINE[.CURSOR]);
+			IF .INPUT_LINE[.CURSOR] EQL '''' THEN
+			    PUT_CHAR('''');
+			CURSOR = .CURSOR + 1;
+		    END;
+		PUT_CHAR('''');
+		TAB_ADDR = .TAB_ADDR + .MAX + 1;
+	    END
+    TES;
+    PUT_CHAR(',');
+    PUT_LINE();
+END;
+
+ROUTINE PUT_LAB_TAB : NOVALUE =
+BEGIN
+    LOCAL 
+	I,NUM_LABS;
+    I = 0;
+    NUM_LABS = 0;
+    PUT_LINE();
+    PUT_CHARS(UPLIT('BIND LAB_TAB = UPLIT(WORD('),26);
+    PUT_LINE();
+    PUT_CHAR(TAB);
+    WHILE .I LSS .NUM_SYM  AND
+	.SYM_TAB[.I,SYM_TYPE] NEQ TYP_LABEL
+    DO I = .I + 1;
+    WHILE .I LSS .NUM_SYM AND
+	.SYM_TAB[.I,SYM_TYPE] EQL TYP_LABEL DO
+        BEGIN
+	    NUM_LABS = .NUM_LABS + 1;
+	    PUT_NUMBER(.SYM_TAB[.I,SYM_ADDR]);
+	    I = .I + 1;
+	    IF .SYM_TAB[.I,SYM_TYPE] EQL TYP_LABEL THEN
+  	      PUT_CHAR(',');
+	    IF .OUT_POINT GTR 50 THEN
+		BEGIN
+		    PUT_LINE();
+		    PUT_CHAR(TAB)
+		END;
+	END;		
+    PUT_CHARS(UPLIT(')) : VECTOR['),12);
+    PUT_NUMBER(.NUM_LABS);
+    PUT_CHARS(UPLIT(',WORD];'),7);
+    PUT_LINE();
+    LAB_INDEX_SIZE = .NUM_LABS * 2;
+END;
+
+ROUTINE PUT_TOK_TAB : NOVALUE =
+BEGIN
+    LOCAL 
+	I,NUM_TOKS;
+    I = 0;
+    NUM_TOKS = 0;
+    PUT_LINE();
+    PUT_CHARS(UPLIT('BIND TOK_INDX = UPLIT(WORD('),27);
+    PUT_LINE();
+    PUT_CHAR(TAB);
+    WHILE .I LSS .NUM_SYM  AND
+	.SYM_TAB[.I,SYM_TYPE] NEQ TYP_TOKEN
+    DO I = .I + 1;
+    WHILE .I LSS .NUM_SYM AND
+	.SYM_TAB[.I,SYM_TYPE] EQL TYP_TOKEN DO
+        BEGIN
+	    NUM_TOKS = .NUM_TOKS + 1;
+	    PUT_NUMBER(.SYM_TAB[.I,SYM_ADDR]);
+	    I = .I + 1;
+	    IF .SYM_TAB[.I,SYM_TYPE] EQL TYP_TOKEN THEN
+  	      PUT_CHAR(',');
+	    IF .OUT_POINT GTR 50 THEN
+		BEGIN
+		    PUT_LINE();
+		    PUT_CHAR(TAB)
+		END;
+	END;		
+    PUT_CHARS(UPLIT(BYTE(')) : VECTOR[')),12);
+    PUT_NUMBER(.NUM_TOKS);
+    PUT_CHARS(UPLIT(BYTE(',WORD];')),7);
+    PUT_LINE();
+    TOK_INDEX_SIZE = .NUM_TOKS * 2;
+END;
+
+ROUTINE SECOND_PASS =
+BEGIN
+    PUT_CHARS(UPLIT('BIND	TOKEN_TABLE = UPLIT(BYTE('),30);
+    PUT_LINE();
+    WHILE GET_RECORD() DO
+	BEGIN
+	    GET_LABEL_2();
+	    GET_OP_CODE();
+	    IF .OP NEQ -1 THEN 
+		GEN_TABLE()
+	    ELSE
+		PUT_LINE();
+	END;
+   PUT_CHARS(UPLIT(BYTE(TAB,'0)) : VECTOR[')),14);
+   PUT_NUMBER(.TAB_ADDR);
+   PUT_CHARS(UPLIT(BYTE(',BYTE];')),7);
+   PUT_LINE();
+   PUT_CHARS(UPLIT('Token table: '),13);
+   PUT_NUMBER(.TOK_TAB_SIZE);
+   PUT_CHARS(UPLIT(' bytes'),6);
+   IO_WT(OUT_BUF,.OUT_POINT);
+   OUT_POINT = 0;
+   PUT_CHARS(UPLIT('Parse table: '),13);
+   PUT_NUMBER(.TAB_ADDR);
+   PUT_CHARS(UPLIT(' bytes'),6);
+   IO_WT(OUT_BUF,.OUT_POINT);
+   OUT_POINT = 0;
+   PUT_LAB_TAB();
+   PUT_CHARS(UPLIT('Label index: '),13);
+   PUT_NUMBER(.LAB_INDEX_SIZE);
+   PUT_CHARS(UPLIT(' bytes'),6);
+   IO_WT(OUT_BUF,.OUT_POINT);
+   OUT_POINT = 0;
+   PUT_TOK_TAB();
+   PUT_CHARS(UPLIT('Token index: '),13);
+   PUT_NUMBER(.TOK_INDEX_SIZE);
+   PUT_CHARS(UPLIT(' bytes'),6);
+   IO_WT(OUT_BUF,.OUT_POINT);
+   OUT_POINT = 0;
+   PUT_CHARS(UPLIT('Grand total: '),13);
+   PUT_NUMBER(.TAB_ADDR+.TOK_TAB_SIZE+.TOK_INDEX_SIZE+.LAB_INDEX_SIZE);
+   PUT_CHARS(UPLIT(' bytes'),6);
+   IO_WT(OUT_BUF,.OUT_POINT);
+   OUT_POINT = 0;
+END;
+
+ROUTINE ASM =
+BEGIN
+    IO_OT();
+    INPUT_IFI = IO_OI(INPUT_RAB,UPLIT(BYTE('PARSTAB.TBL')),11);
+    IO_OO(OUTPUT_RAB,UPLIT('PARSTA.REQ'),10);
+    FIRST_PASS();
+    IF .ERR_COUNT EQL 0 THEN
+	BEGIN
+ 	SORT_SYMS(0,.NUM_SYM-1);
+	OUTPUT_DEFS();
+	IO_CLO(.INPUT_IFI,INPUT_RAB);
+	IO_OI(INPUT_RAB,UPLIT('PARSTAB.TBL'),11);
+	SECOND_PASS();
+	IO_WT(UPLIT(BYTE('Tables successfully constructed')),31);
+	END
+    ELSE
+	BEGIN
+	OUT_POINT = 0;
+	PUT_NUMBER(.ERR_COUNT);
+	PUT_CHARS(UPLIT(BYTE('errors detected')),15);
+	IO_WT(OUT_BUF,.OUT_POINT);
+	END;
+    RETURN 1
+END;
+END
+ELUDOM

@@ -1,0 +1,2759 @@
+	.TITLE	PUDRIVER
+	.IDENT	'V03-009'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; FACILITY:
+;
+;	VAX/VMS EXECUTIVE, I/O DRIVERS
+;
+; ABSTRACT:  This module contains the UDA port driver.
+;
+; AUTHORS:  Richard I. Hustvedt,  July 1981
+;	    Robert Rappaport
+;	
+; MODIFIED BY:
+;
+;	V03-009	RLRV3A8		Robert L. Rappaport	22-Apr-1982
+;		Fixed two bugs in HARDWARE_INIT.  First is that by
+;		the time this routine is called CRB$L_AUXSTRUC is
+;		pointing at the PDT and not the UCB.  Second bug was
+;		failure to read and record SA register in the UCB on
+;		an initialization failure. Also put a WFIKPCH into
+;		the time between when IP is written and when we read
+;		SA to insure that adequate time has past.
+;
+;	V03-008	RLRV3A7		Robert L. Rappaport	16-Apr-1982
+;		Fixed bug in POWERFAIL recovery.
+;
+;	V03-007	RLRV3A6		Robert L. Rappaport	13-Apr-1982
+;		Set PDT$B_PDT_TYPE to PDT$C_PU.
+;
+;	V03-006	RLRV3A5		Robert L. Rappaport	9-Apr-1982
+;		1. Remove changes introduced in RLRV3A1 to get around
+;		UDA50 microcode bug and instead refuse to bring an out
+;		of rev UDA50 online.
+;		2. Add conditionalized assembly code to bring old UDA50
+;		online so as to bypass above restriction.
+;
+;	V03-005	RLRV3A4		Robert L. Rappaport	30-Mar-1982
+;		Set UCB$B_DEVCLASS and UCB$B_DEVTYPE.
+;
+;	V03-004	RLRV3A3		Robert L. Rappaport	24-Mar-1982
+;		Added support for:
+;			1. MRESET and MSTART.
+;			2. Logging Device attentions after Hardware inits
+;				and errors.
+;		Also fixed up Powerfail logic and integrated it with
+;		Restart.
+;
+;	V03-003	RLRV3A2		Robert L. Rappaport	23-Mar-1982
+;		Add support for multiple concurrent connections.
+;
+;	V03-002	RLRV3A1		Robert L. Rappaport	16-Mar-1982
+;		Change loading of ring slots to be two step process
+;		whereby address is first loaded and then the ownership
+;		and flag bits are loaded and put as many instructions
+;		as possible between these two steps in order to get around
+;		UBA microcode problem. Note all changes with this edit
+;		trail can be removed after the microcode is fixed.
+;
+;	V03-001	RLRV3A0		Robert L. Rappaport	12-Mar-1982
+;		Corrected error in trace and also added code to pass
+;		the length of the Sequenced Message in R1 on dispatching
+;		sequenced messages.
+;
+;	V02-004	RLR0004		Robert L. Rappaport	1-Mar-1982
+;		Added logic to ALLOC_POOL to wait on CRB wait list
+;		if allocation failures are encountered.
+;
+;	V02-003	RLR0003		Robert L. Rappaport	26-Feb-1982
+;		Added conditionally assembled trace table allocation and
+;		utilization.
+;
+;	V02-002	RLR0002		Robert L. Rappaport	24-Feb-1982
+;		Changed spelling of PDT$L_DGHDRSZ to PDT$L_DGOVRHD and
+;		also enveloped the message and datagram dispatching
+;		instructions in PU$INT in PUSHL R4 and POPL R4 so as
+;		to assure that proper context is preserved.
+;
+;	V02-001	RLR0001		Robert L. Rappaport	12-Feb-1982
+;		Make reference to SCS$GB_UDABURST use G^.
+;
+;
+;--
+
+	.SBTTL	DEFINITIONS
+;
+; System definitions (LIB.MLB):
+;
+
+	$ADPDEF				;Adapter Control Block offsets
+	$CDRPDEF			;Class Driver Request Packet offsets
+	$CDTDEF				;Connection Descriptor offsets
+	$CRBDEF				;Channel Request Block offsets
+	$DCDEF				;Device type codes
+	$DDBDEF				;Device Data Block offsets
+	$DPTDEF				;Driver Prologue Table offsets
+	$EMBDEF				; Error log definitions
+	$EMBLTDEF			; Log message type codes
+	$IDBDEF				;IDB offsets
+	$PBDEF				;Path Block offsets
+	$PDTDEF				;Port Descriptor Table offsets
+	$RDDEF				;Response Descriptor offsets
+	$SBDEF				;System Block offsets
+	$SCSCMGDEF			;SCS Connection Management format
+	$SDIRDEF			;SCS Directory Entry offsets
+	$UBMDDEF			;Unibus Mapping Descriptor format
+	$UCBDEF				;Unit Control Block offsets
+	$VECDEF				;CRB transfer vector blk offsets
+
+	.PAGE
+	.SBTTL	+	UDA Command Packet Layout
+
+;+
+;	Each UDA command packet has the following structure where the
+;		individual fields are described below the diagram.
+;
+;	31				0
+;	 _______________________________
+;	!				!
+;	!	UDAB$L_FLINK		! Forward link longword
+;	!_______________________________!
+;	!				!
+;	!	UDAB$L_BLINK		! Backward link longword
+;	!_______________________________!
+;	!\\\\\\\! Buffer!  Ring	! Ring	!
+;	!\\\\\\\! Number! Number! Index	!
+;	!_______!_______!_______!_______!
+;	!				!
+;	!	UDAB$L_DESCRIP		! UNIBUS virtual address of this buffer
+;	!_______________________________!
+;	! CONID	!Msg!Cre!   Message	!
+;	!	!typ!dit!    length	! Controller message envelope
+;	!_______!___!___!_______________!
+;	!				! UDAB$T_TEXT
+;	!				!
+;	!  Contents of an MSCP Packet	!
+;	!				!
+;	!				!
+;	!				!
+;	!				!
+;	!_______________________________!
+;
+;
+; $UDABDEF -- Define UDA packet buffer structure.  Structure includes
+;	port driver header, controller header and text body.  The port
+;	driver header contains:
+;
+;		1. A FLINK and a BLINK for queueing the buffer on the
+;			free queue and also on the SEND Q.
+;
+;		2. $B_RINGINX which contains the index into a ring on
+;			which this buffer has been placed (valid only
+;			if the buffer is NOT on the free queue).
+;
+;		3. $B_RINGNO which contains the number (0 => command ring
+;			and 1 => response ring) of the ring on which the
+;			buffer is currently residing.
+;
+;		4. $B_BUFFNO which contains the number of this buffer.
+;			This value serves as an index into the
+;			PDT$L_BDTABLE, whose elements point to these
+;			buffers.
+;
+;		5. $L_DESCRIP which contains the UNIBUS virtual address
+;			of the text portion of this buffer in the low order
+;			30 bytes of this longword, and which also has the
+;			two high order bits (ownership and full bits) set.
+;			This is the precise value that must be placed in
+;			a ring longword so as to present the buffer to the
+;			controller.
+;
+;		6. The controller header which contains a word of length
+;			(of the following text portion only), a byte
+;			containing two four bit fields encoding the credit
+;			field and the message type field, and a byte of
+;			Connection ID.
+;
+;		7. The message text portion.
+;-
+
+
+	$DEFINI	UDAB
+
+$DEF	UDAB$L_FLINK		.BLKL	1	; Queue FLINK.
+
+$DEF	UDAB$L_BLINK		.BLKL	1	; Queue BLINK.
+
+$DEF	UDAB$B_RINGINX		.BLKB	1	; Index into ring.
+
+$DEF	UDAB$B_RINGNO		.BLKB	1	; Ring number.
+
+$DEF	UDAB$B_BUFFNO		.BLKB	1	; Index of this buffer.
+				.BLKB	1	; Reserved.
+
+$DEF	UDAB$L_DESCRIP		.BLKL	1	; UNIBUS virtual address of buff.
+
+$DEF	UDAB$L_CTRLHDR				; Alternate name for following
+						;  longword of fields.
+$DEF	UDAB$W_MSG_LEN		.BLKW	1	; Length of text portion.
+
+$DEF	UDAB$B_CREDTYPE		.BLKB	1	; Encoded CREDIT and MESSAGE TYPE.
+
+	$VIELD	UDAB,0,<-
+			<CREDITS,4>,-		; Credit bit field.
+			<MSGTYPE,4>,-		; Message type bit field.
+			>
+
+$DEF	UDAB$B_CONID		.BLKB	1	; Connection ID.
+
+$DEF	UDAB$T_TEXT		.BLKB	60	; Space for minimal maximum.
+
+UDAB$C_LENGTH = .
+
+	$DEFEND	UDAB
+	.PAGE
+
+; Define Device I/O Page Registers
+
+	$DEFINI UDA
+$DEF	UDAIP	.BLKW	1	; Initialization and Polling Register
+$DEF	UDASA	.BLKW	1	; Status, Address, & VAX Purge ACK Register
+	$DEFEND UDA
+
+
+; ++
+; Local symbol definitions
+;--
+
+LOOP_LIMIT	= ^X<FAB>	; Step 1 maximum wait time for response
+INTR_VEC	= ^O<270>	; Primary Interupt vector
+
+UDA$K_SEQMSGTYP = 0			; Sequential Message Type
+UDA$K_DGTYPE = 1			; Datagram type
+UDA$K_RINGEXP = 4			; Log base 2 of desired ring size
+UDA$K_RINGSIZE = 1@UDA$K_RINGEXP	; Number of Ring & Packet entries
+
+; Command and Message Ring Control Flags
+
+UDA_V_FLAG = 30				; Buffer control bit number
+UDA_M_FLAG = 1 @ UDA_V_FLAG		; Buffer control flag mask
+UDA_V_OWN  = 31				; Own flag bit number
+UDA_M_OWN  = 1 @ UDA_V_OWN		; Own flag mask
+
+STEP1_LIMIT=10				; Number of seconds for STEP 1 timeout
+STEP2_LIMIT=10				; Number of seconds for STEP 2 timeout
+STEP3_LIMIT=10				; Number of seconds for STEP 3 timeout
+
+NUMUBAVEC=128				; Number of slots in UBA vector
+
+NO_CONSEC_INITS=5			; Number of consecutive times to retry
+					;  hardware init without waiting for awhile.
+INIT_DELTA=10				; Number of seconds to wait when we wait
+					;  for a while.
+
+ALLOC_DELTA=1				; Number of seconds to wait before
+					;  retrying allocation request.
+PU_FORK_IPL=8				; Fork IPL.
+
+REGSAVE=2+2+4+4+16			; Size of data saved in PU_REGDUMP.
+					;  Includes space for ATTNCODE(2),
+					;   NUMBINITS(2), MAPREG(4),
+					;   UDASA(4-MOVZWL), HOST-PORT(16).
+INIT_ATTNCODE=1				; Attention code for INIT record.
+FAIL_ATTNCODE=2				; Attention code for failing INIT record.
+UDASA_ATTNCODE=3			; Attention code for record after error.
+PURGE_ATTNCODE=4			; Attention code for Purge error record.
+UCODE_ATTNCODE=5			; Attention code for uCODE out of rev.
+
+UDA50_CNTRLTYP=0			; UDA50 controller type code.
+	.PAGE
+	.SBTTL	+	Define PU Port specific PDT extension
+
+;+
+; PUPDT -- Define PU port specific extension to the PDT
+;	(Must appear after the definition of UDA$K_RINGEXP and 
+;	 UDA$K_RINGSIZE)
+;-
+
+	$DEFINI	PUPDT
+
+.=.+PDT$C_LENGTH			; Position to end of port-
+					;  independent portion of PDT
+$DEF	PDT$L_PU_CDTARY			; Array of pointers to CDT's.
+$DEF	PDT$L_PU_VC0	.BLKL	1	;  Connection block address for
+					;  virtual circuit 0 Disk MSCP
+
+$DEF	PDT$L_PU_VC1	.BLKL	1	; Connection block address for 
+					;  virtual circuit 1 Tape MSCP
+
+$DEF	PDT$L_PU_VC2	.BLKL	1	; Connection block address for 
+					;  virtual circuit 2 DUP
+
+$DEF	PDT$L_PU_VC255	.BLKL	1	; Connection block address for 
+					;  virtual circuit 255 (-1)
+					;  Maintenance protocol
+
+$DEF	PDT$W_PU_CRDARY			; Array of initial credits.
+$DEF	PDT$W_PU_CRED0	.BLKW	1	; Credits to assign on next
+					;  CONNECT to VC0.
+$DEF	PDT$W_PU_CRED1	.BLKW	1	; Credits to assign on next
+					;  CONNECT to VC1.
+$DEF	PDT$W_PU_CRED2	.BLKW	1	; Credits to assign on next
+					;  CONNECT to VC2.
+$DEF	PDT$W_PU_CRD255	.BLKW	1	; Credits to assign on next
+					;  CONNECT to VC255.
+$DEF	PDT$L_PU_UCB	.BLKL	1	; Address of our UCB.
+
+$DEF	PDT$L_PU_CSR	.BLKL	1	; Pointer to controller CSR.
+
+$DEF	PDT$L_PU_FQPTR	.BLKL	1	; Pointer to Free Q. Used to
+					;  test for emptiness of Free Q.
+$DEF	PDT$L_PU_FQFL	.BLKL	1	; Free Q forward pointer.
+$DEF	PDT$L_PU_FQBL	.BLKL	1	; Free Q backward pointer.
+
+$DEF	PDT$L_PU_SNDQFL	.BLKL	1	; Send Q forward  pointer.
+$DEF	PDT$L_PU_SNDQBL	.BLKL	1	; Send Q backward pointer.
+
+$DEF	PDT$L_PU_BUFQFL	.BLKL	1	; Buffer wait Q forward pointer.
+$DEF	PDT$L_PU_BUFQBL	.BLKL	1	; Buffer wait Q backward pointer.
+
+$DEF	PDT$B_CRINGINX	.BLKB	1	; Index of next available slot
+					;  in command ring.
+$DEF	PDT$B_CPOLLINX	.BLKB	1	; Index of next slot to be polled
+					;  by host, to see if released.
+$DEF	PDT$B_CRINGCNT	.BLKB	1	; Count of number of command
+					;  ring slots in use. Also
+					;  absolute difference between
+					;  previous two fields.
+
+$DEF	PDT$B_RRINGINX	.BLKB	1	; Index of next available slot
+					;  in response ring.
+$DEF	PDT$B_RPOLLINX	.BLKB	1	; Index of next slot to poll by
+					;  host, to see if filled in.
+$DEF	PDT$B_RRINGCNT	.BLKB	1	; Count of not yet filled in
+					;  buffers on response ring.
+					;  Absolute difference between
+					;  previous two fields.
+
+$DEF	PDT$B_NOCURCON	.BLKB	1	; # of current connections.
+$DEF	PDT$B_CONBITMAP	.BLKB	1	; Current Connection bit map. Corresponding
+					;  bit set for each open connection.
+
+$DEF	PDT$B_DATAPATH	.BLKB	1	; Permanently allocated datapath. For
+					;  VAX11-750 only. Else zero.
+			.BLKB	3	; Reserved
+
+$DEF	PDT$B_CRCONTENT	.BLKB	UDA$K_RINGSIZE	; Array of bytes (one per each
+						;  command ring slot) which
+						;  maintain index of buffer
+						;  currently filling this slot.
+
+$DEF	PDT$B_RRCONTENT	.BLKB	UDA$K_RINGSIZE	; Array of bytes (one per each
+						;  response ring slot) which
+						;  maintain index of buffer
+						;  currently filling this slot.
+
+$DEF	PDT$L_BDTABLE	.BLKL	2*UDA$K_RINGSIZE; Array of longwords (one per
+						;  buffer) which point to the
+						;  respective buffers.
+
+$DEF	PDT$L_COMAREA				; UDA communication area base
+			.BLKW	1		; Reserved word
+			.BLKB	1		; Reserved byte
+$DEF	PDT$B_PURGEDP	.BLKB	1		; Purge data path number
+
+$DEF	PDT$W_CMDINT	.BLKW	1		; Command ring transition flag
+
+$DEF	PDT$W_RSPINT	.BLKW	1		; Response ring transition flag
+
+$DEF	PDT$L_RINGBASE
+$DEF	PDT$L_RSPRING	.BLKL	UDA$K_RINGSIZE	; Response ring
+
+$DEF	PDT$L_CMDRING	.BLKL	UDA$K_RINGSIZE	; Command ring
+
+$DEF	PDT$L_PU_BUFARY				; Buffer array.
+
+	.REPT	2*UDA$K_RINGSIZE		; Allocate packets for response
+						; and command rings
+
+			.BLKB	UDAB$C_LENGTH	; Length of a buffer.
+
+	.ENDR
+PDT$C_RINGLEN = .-PDT$L_COMAREA			; Length of area to map
+
+	.IF	DF	PU_TRACE
+$DEF	PDT$L_TRTABLE	.BLKL	1	; Pointer to base of usable (beyond
+					;  header) portion of trace table
+$DEF	PDT$L_TRTBLPTR	.BLKL	1	; Pointer to next area in trace table
+					;  to use.
+$DEF	PDT$L_TRTBLEND	.BLKL	1	; Pointer beyond end of trace table.
+
+	.ENDC
+
+PDT$C_PULENGTH = .				; Total size of a 
+						;  PDT for the UDA port
+	$DEFEND PUPDT
+	.PAGE
+	.SBTTL	+	Define PU specific UCB extension
+
+;+
+; $PUUCBDEF -- Defined UDA extension to UCB.
+;	(Must appear after the definition of UDA$K_RINGEXP and 
+;	 UDA$K_RINGSIZE)
+;-
+
+	$DEFINI	UCB
+
+.=UCB$L_DPC+4					; Position to end of 
+						;  standard UCB for
+						;  error logging devices
+
+$DEF	UCB$L_PU_ALLOC	.BLKL	1	; Space to save size of alloc. request.
+
+$DEF	UCB$B_UDAFLAGS	.BLKB	1	; Internal control flags
+	$VIELD	UDA,0,<-		; Internal flag definitions
+		<ONLINE,,V>,-	; UDA is On Line
+	 >
+
+$DEF	UCB$B_INITCNT	.BLKB	1	; Count of # of times left to retry
+					;  hardware init consecutively.
+$DEF	UCB$W_NUMBINITS	.BLKW	1	; Number of times UDA50 has been Inited.
+
+$DEF	UCB$W_ATTNCODE	.BLKW	1	; Attention code for PU_REGDUMP.
+
+$DEF	UCB$W_UDASA	.BLKW	1	; Contents of SA saved at last interrupt
+
+$DEF	UCB$W_PORTSTEP1	.BLKW	1	; Contents of SA at start of STEP1.
+	_VIELD	PS1,0,<-		; Fields in STEP1
+		<,8>,-			;  Reserved
+		<DI,,M>,-		;  If set port implements enhanced diagnostics
+		<QB,,M>,-		;  If set port supports 22-bit bus addr
+		<NV,,M>,-		;  If set no host settable vector addr
+		<S1,,M>,-		;  Must be set in step 1
+		<S2,,M>,-		;  Must be clear in step 1
+		<S3,,M>,-		;  Must be clear in step 1
+		<S4,,M>,-		;  Must be clear in step 1
+		<ER,,M>,-		;  If set then we had an error
+	>
+
+$DEF	UCB$W_HOSTSTEP1	.BLKW	1	; What host writes to SA in STEP1.
+	_VIELD	HS1,0,<-		; Fields in Host STEP1
+		<INTVEC,7,M>,-		;  Interrupt vector address/4
+		<IE,,M>,-		;  Interrupt enable during STEPS 1-3
+		<RRNGLEN,3,M>,-		;  Response ring length (exponent)
+		<CRNGLEN,3,M>,-		;  Command ring length (exponent)
+		<WR,,M>,-		;  If set port enters diagnostic wrap mode
+		<BIT15,,M>,-		;  High bit always set
+	>
+
+$DEF	UCB$W_PORTSTEP2	.BLKW	1	; What port responds at start of STEP2.
+	_VIELD	PS2,0,<-		; Fields in Port STEP2
+		<RRNGLEN,3,M>,-		;  Echoed response ring length (exponent)
+		<CRNGLEN,3,M>,-		;  Echoed command ring length (exponent)
+		<WR,,M>,-		;  Echoed diagnostic wrap bit
+		<,1>,-			;  Echoed BIT15 always set
+		<PORTTYPE,3,M>,-	;  Type of this port
+		<S1,,M>,-		;  Must be clear in STEP2
+		<S2,,M>,-		;  Must be set in STEP2
+		<S3,,M>,-		;  Must be clear in STEP2
+		<S4,,M>,-		;  Must be clear in STEP2
+		<ER,,M>,-		;  If set then error in STEP1
+	>
+
+$DEF	UCB$W_HOSTSTEP2	.BLKW	1	; What host writes to SA during STEP2.
+	_VIELD	HS2,0,<-		; Fields in Host STEP2
+		<PI,,M>,-		;  Host requests adapter purge interrupts
+		<RINGBASEL,15,M>,-	;  Lo order of address of communication
+	>				;   area (in UNIBUS virtual space)
+
+$DEF	UCB$W_PORTSTEP3	.BLKW	1	; What port responds at start of STEP3.
+	_VIELD	PS3,0,<-		; Fields in Port STEP3
+		<INTVEC,7,M>,-		;  Echoed interrupt address/4
+		<IE,,M>,-		;  Echoed interrupt enable
+		<,3>,-			;  Reserved
+		<S1,,M>,-		;  Must be clear in STEP3
+		<S2,,M>,-		;  Must be clear in STEP3
+		<S3,,M>,-		;  Must be set in STEP3
+		<S4,,M>,-		;  Must be clear in STEP3
+		<ER,,M>,-		;  If set we had error in STEP2
+	>
+
+$DEF	UCB$W_HOSTSTEP3	.BLKW	1	; What host writes to SA during STEP3.
+	_VIELD	HS3,0,<-		; Fields in Host STEP3
+		<RINGBASEH,15,M>,-	;  Hi order of address of comm. area
+		<PP,,M>,-		;  If set host requests execution of
+	>				;   purge and poll tests
+
+$DEF	UCB$W_PORTSTEP4	.BLKW	1	; What port responds at start of STEP4.
+	_VIELD	PS4,0,<-		; Fields in Port STEP4
+		<UCODEVER,4,M>,-	;  Microcode version number
+		<CNTRLTYP,4,M>,-	;  Controller type
+		<,3>,-			;  Reserved
+		<S1,,M>,-		;  Must be clear in STEP4
+		<S2,,M>,-		;  Must be clear in STEP4
+		<S3,,M>,-		;  Must be clear in STEP4
+		<S4,,M>,-		;  Must be set in STEP4
+		<ER,,M>,-		;  If set we had an error in STEP3
+	>
+
+$DEF	UCB$W_HOSTSTEP4	.BLKW	1	; What host writes to SA during STEP4.
+	_VIELD	HS4,0,<-		; Fields in Host STEP4
+		<GO,,M>,-		;  If set controller begins immediately
+		<LF,,M>,-		;  If set host wants Last Fail response
+		<BURST,6,M>,-		;  Maximum lonwords(-1) / NPR transfer
+		<,8>,-			;  Reserved
+	>
+
+
+	$VIELD	UCB,0,<-			; Define bits for UCB$W_DEVSTS
+	<,1>,-					;  Unused
+	<PU_FRKBSY,,M>,-			;  Fork block interlock bit
+	<PU_HRDINI,,M>,-			;  Hardware init in progress
+	<PU_PWINIT,,M>,-			;  POWER init in progress
+	>					;
+
+UCB$C_PUSIZE = .
+
+	$DEFEND	UCB
+	.PAGE
+	.SBTTL	DRIVER STRUCTURES
+	.SBTTL	+	Driver Prologue Table
+
+	DPTAB	END=PU$END,-		;End of driver label
+		ADAPTER=UBA,-		;Adapter type
+		FLAGS=DPT$M_SCS,-	;Driver requires SCS to be loaded
+		UCBSIZE=UCB$C_PUSIZE,-	;UCB size
+		NAME=PUDRIVER		;Driver name
+
+	DPT_STORE INIT
+
+	DPT_STORE	UCB,UCB$B_FIPL,B,8	;Fork IPL
+
+	DPT_STORE	UCB,UCB$L_DEVCHAR,L,<-	;Device characteristics:
+			DEV$M_SHR!-		; Sharable
+			DEV$M_AVL!-		; Available
+			DEV$M_ELG!-		; Error logging device
+			DEV$M_IDV!-		; Input device
+			DEV$M_ODV>		; Output device
+
+	DPT_STORE	UCB,UCB$B_DIPL,B,21	;Device interrupt IPL
+
+	DPT_STORE REINIT
+
+	DPT_STORE	DDB,DDB$L_DDT,D,PU$DDT	;DDT address
+	DPT_STORE	CRB,CRB$L_INTD+4,-	;Interrupt routine addr
+			D,PU$INT		;
+	DPT_STORE	CRB,CRB$L_INTD+VEC$L_INITIAL,-
+			D,PU$CTLINIT		;Controller init addr
+	DPT_STORE	CRB,CRB$L_INTD+VEC$L_UNITINIT,-
+			D,PU$UNITINIT		;Unit init addr
+	DPT_STORE	END			;
+	.PAGE
+	.SBTTL	+	Driver Dispatch Table
+
+
+	DDTAB	DEVNAM=PU,-			;
+		START=PU$STARTIO,-		;QIO's are illegal temporarily
+		FUNCTB=PU$FUNCTABLE,-		;Function decision table
+		UNITINIT=PU$UNITINIT,-		;Unit init routine addr
+		ERLGBF=REGSAVE+4+EMB$L_DV_REGSAV,-
+		REGDMP=PU_REGDUMP
+
+;***
+;***Temporary start i/o routine:
+;***
+
+PU$STARTIO:
+
+	MOVZWL	#SS$_ILLIOFUNC,R0		; We do not support QIO's
+	CLRL	R1
+	REQCOM
+	.PAGE
+	.SBTTL	+	"Register" Dump routine
+
+;+ PU_REGDUMP
+;
+; Inputs:
+;	R0 => Buffer to fill
+;	R5 => UCB
+;
+; Outputs:
+;	R1 modified
+;
+
+PU_REGDUMP:
+
+	MOVL	#REGSAVE,(R0)+		; Save number of bytes following.
+	MOVW	UCB$W_ATTNCODE(R5),(R0)+; Save Attention code (record type).
+	MOVW	UCB$W_NUMBINITS(R5),(R0)+; Number times port init'ed.
+	MOVL	UCB$L_CRB(R5),R1	; R1 => CRB.
+
+	ASSUME	VEC$B_NUMREG	EQ	VEC$W_MAPREG+2
+	ASSUME	VEC$B_DATAPATH	EQ	VEC$B_NUMREG+1
+	MOVL	CRB$L_INTD+VEC$W_MAPREG(R1),(R0)+	; Save dedicated map registers.
+
+	MOVZWL	UCB$W_UDASA(R5),(R0)+	; Save contents of SA register.
+
+	ASSUME	UCB$W_HOSTSTEP1	EQ	UCB$W_PORTSTEP1+2
+	ASSUME	UCB$W_PORTSTEP2	EQ	UCB$W_HOSTSTEP1+2
+	ASSUME	UCB$W_HOSTSTEP2	EQ	UCB$W_PORTSTEP2+2
+	MOVQ	UCB$W_PORTSTEP1(R5),(R0)+	; Save Host-Port dialogue.
+
+	ASSUME	UCB$W_HOSTSTEP3	EQ	UCB$W_PORTSTEP3+2
+	ASSUME	UCB$W_PORTSTEP4	EQ	UCB$W_HOSTSTEP3+2
+	ASSUME	UCB$W_HOSTSTEP4	EQ	UCB$W_PORTSTEP4+2
+	MOVQ	UCB$W_PORTSTEP3(R5),(R0)+	; Save Host-Port dialogue.
+
+	RSB				; Return to caller.
+	.PAGE
+	.SBTTL	+	Function Decision Table
+
+PU$FUNCTABLE:
+
+	FUNCTAB	,-				;Valid functions:
+		<>				;None at present
+
+	FUNCTAB	,-				;Buffered functions:
+		<>			
+	.PAGE
+	.SBTTL	+	NULL MESSAGE AND DATAGRAM INPUT ROUTINES
+	.SBTTL	+	NULL CDT
+
+;+
+; NULL CDT and NULL message input and datagram input routines.
+;
+; Inputs:		(for routines)
+;
+;	R1				-Length of message
+;	R2				-Addr of message
+;	R4				-Addr of PDT
+;-
+
+	.enabl	lsb
+
+NULL_MSG_INPUT:				; Sequential messages for null connections
+					;  are to be ignored.
+	PUSHL	R3			; Save R3.
+	BRB	10$			; Branch around to deallocate buffer.
+
+NULL_DG_INPUT:				; Datagrams for null connections are to
+					;  be logged.
+	PUSHL	R3			; Save R3.
+	MOVL	PDT$L_PU_UCB(R4),R3	; R3 => UCB. (input to ERL$LOGMESSAGE)
+	MOVL	#EMB$C_UM,R0		; Log message type.
+	JSB	G^ERL$LOGMESSAGE	; Call to log message.
+10$:
+	SUBL	#UDAB$T_TEXT,R2		; R2 => buffer header.
+	BSBW	Q_DEALLOC_BUF		; Call internal entry to deallocate buffer.
+	POPL	R3			; Restore R3.
+NULL_ROUTINE:				; Label of an RSB instruction.
+NULL_ERR_ROUT:
+	RSB				; Return to our caller.
+
+	.ALIGN	LONG,0
+NULL_CDT:
+	ASSUME	CDT$L_MSGINPUT	EQ	0
+	.LONG	0			; Addr of null message input routine.
+	ASSUME	CDT$L_DGINPUT	EQ	4
+	.LONG	0			; Addr of null datagram input routine.
+	.LONG	0
+	ASSUME	CDT$L_ERRADDR	EQ	12
+	.LONG	0			; Addr of error routine.
+	.dsabl	lsb
+	.PAGE
+	.SBTTL	Request and Release DATAPATH transfer vectors
+
+;+
+
+	.ALIGN	LONG,0
+
+REQDATAPATH_TV:				; Transfer vector to routine to request
+					;  a UNIBUS datapath.
+	.LONG	IOC$REQDATAPUDA		; Routine to call (for VAX-11/780).
+					;  For other processors, this pointer
+					;  will be overlaid with the address of
+					;  REQDATAP_750730, below.
+
+RELDATAPATH_TV:				; Transfer vector to routine to release
+					;  a UNIBUS datapath.
+	.LONG	IOC$RELDATAPUDA		; Routine to call when running on
+					;  VAX-11/780.  For other processors,
+					;  this address is overlaid with the
+					;  address of RELDATAP_750730.
+
+;
+; REQDATAP_750730 simply assigns the permanently allocated datapath, whose
+;	number is stored in PDT$B_DATAPATH, to the current transfer.
+;
+; RELDATAP_750730 is simply a return to caller since we always wish to retain
+;	the permanently allocated datapath.
+;
+; Inputs:
+;	R4				-Addr of PDT
+;	R5				-Addr of CDRP
+;
+; Outputs:(for REQDATAP_750730)
+;	CDRP$L_UBARSRCE+UBMD$B_DATAPATH set from PDT$B_DATAPATH.
+;
+
+REQDATAP_750730:
+
+	MOVB	PDT$B_DATAPATH(R4),-			; Assign permanent data-
+		CDRP$L_UBARSRCE+UBMD$B_DATAPATH(R5)	;  path to transfer.
+
+RELDATAP_750730:
+
+	RSB						; Return to caller.
+	.PAGE
+	.SBTTL	INITIALIZATION
+;+
+; The following table gives word offsets for fork process SCS calls.
+; Offsets are relative to the address of the controller initialization
+; routine, PU$CTLINIT.
+;-
+
+;
+; Macro to generate the table and ASSUME statements about PDT format:
+;
+
+	.MACRO	SCS_OFFSET_TAB	ENTRY_LIST
+
+	 $$$ENTRYNUM=0				; No entries in table yet
+	 .IRP	ENTRY ENTRY_LIST		; For each entry in the list...
+	 .WORD	<FPC$'ENTRY'-PU$CTLINIT>	;  insert offset from ctl init,
+	 .IF	NE $$$ENTRYNUM			;  and for entries after the 1st
+	 ASSUME	$$$PREV+4 EQ PDT$L_'ENTRY'	;  specify assumed PDT adjacency
+	 .ENDC					;
+	 $$$PREV=PDT$L_'ENTRY'			; Set previous entry as this entry
+	 $$$ENTRYNUM=$$$ENTRYNUM+1		; Step entry count
+	 .ENDR					;
+
+	 ASSUME	$$$PREV+4 EQ PDT$C_SCSEND	; Final PDT assumption
+	 .WORD	0				; Offset table terminator
+	
+	.ENDM	SCS_OFFSET_TAB			;
+
+;
+; Table itself:
+;
+
+PU$SCSOFFSET::
+
+	SCS_OFFSET_TAB	<-			; Invoke macro to define offsets
+		ACCEPT,-		
+		ALLOCDG,-
+		ALLOCMSG,-
+		CONNECT,-
+		DEALLOCDG,-
+		DEALLOMSG,-
+		DEALRGMSG,-
+		DCONNECT,-
+		MAP,-
+		MAPBYPASS,-
+		MAPIRP,-
+		MAPIRPBYP,-
+		QUEUEDG,-
+		QUEUEMDGS,-
+		RCHMSGBUF,-
+		RCLMSGBUF,-
+		REJECT,-
+		REQDATA,-
+		SENDDATA,-
+		SENDDG,-
+		SENDMSG,-
+		SNDCNTMSG,-
+		UNMAP,-
+		READCOUNT,-
+		RLSCOUNT,-
+		MRESET,-
+		MSTART,-
+		MAINTFCN,-
+		>
+
+	.SBTTL	+	UNIT_INIT
+
+;+
+; TBS
+;
+; Inputs:
+;	
+;	R3			-Address of PA configuration reg
+;	R4			-Same as R3
+;	R5			-Addr of UCB
+;
+; Outputs:
+;
+;	R0-R3			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+PU$UNITINIT::
+
+;	MOVB	#DT$_UDA50,UCB$B_DEVTYPE  ; Set the device type to UDA50
+	TSTW	UCB$W_UNIT(R5)		; Is this unit 0?
+	BEQL	INIT_CTLR		; If YES, go to init controller first.
+
+	BISW	#UCB$M_ONLINE,-		; Else merely set unit on line
+		UCB$W_STS(R5)		;  and
+	RSB				; Return
+	.DSABL	LSB
+	.PAGE
+	.SBTTL	+	CONTROLLER INIT
+
+;+
+; The controller initialization entry as seen by the system, PU$CTLINIT,
+; is a noop since initialization can't begin without the unit 0 UCB.
+; Actual controller init is called from unit 0 unit initialization with
+; the same inputs as unit init.
+;
+;
+; Inputs:
+;
+;	R3			-Addr of PU CSR
+;	R4			-Same as R3
+;	R5			-Addr of UCB for unit 0
+;
+; Outputs:
+;
+;	R0-R3			-Destroyed
+;	Other registers 	-Preserved
+;-
+
+PU$CTLINIT::				; Controller init called by system
+
+	RSB				; Return
+	.PAGE
+;
+; Controller initialization called from unit 0 init.
+;
+; Inputs:
+;	R5				-UCB address
+;
+
+	.enabl	lsb
+
+INIT_CTLR::
+
+	TSTL	UCB$L_PDT(R5)		; See if first time thru here.
+	BNEQ	POWER_INIT		; NEQ implies this is POWER FAILURE.
+
+	BISW	#UCB$M_PU_FRKBSY,-	; Indicate the UCB fork block is in
+		UCB$W_DEVSTS(R5)	;  use. Setting this bit defers processing
+					;  powerfailure recovery until after
+					;  initialization completes.
+	IOFORK				; Lower IPL.
+
+	REQPCHAN			; Permanently allocate channel.
+
+	MOVB	#DC$_BUS,-		; Initialize constant UCB fields.
+		UCB$B_DEVCLASS(R5)
+
+; Initialize CRB wakeup mechanism.
+
+	MOVL	UCB$L_CRB(R5),R3	; R3 => CRB.
+	MOVL	R5,CRB$L_AUXSTRUC(R3)	; CRB => UCB as auxillary structure.
+	MNEGL	#1,CRB$L_DUETIME(R3)	; Set infinite time.
+	MOVAB	NULL_ROUTINE,-
+		CRB$L_TOUTROUT(R3)	; Inocuous routine for now.
+	JSB	G^IOC$THREADCRB		; Put CRB on wakeup list.
+
+	BSBW	BUILD_PDT		; Allocate and fill in PDT.
+
+	BSBW	INIT_UDA_BUFFERS		; Map area in PDT containing buffers.
+	BSBW	INIT_INIT_STEPS		; Initialize values in UCB to use
+					;  in UDA hardware initialization.
+	BSBW	BUILD_PB_SB		; Create and fill in System block and
+					;  Path block
+10$:
+	MOVB	#NO_CONSEC_INITS,-	; Initialize UCB field that counts
+		UCB$B_INITCNT(R5)	;  hardware init retries.
+
+	BSBW	HARDWARE_INIT		; Init UDA hardware.
+	BLBC	R0,15$			; LBC implies couldn't Init hardware.
+	BISW	#UCB$M_ONLINE,-		; After hardware init, we are online.
+		UCB$W_STS(R5)
+	BSBW	POLL_RSPRING		; This call has the effect of clearing
+					;  the UCB$M_PU_FRKBSY bit in
+					;  UCB$W_DEVSTS and also of finding any
+					;  responses that may have backed up
+					;  due to the bit's having been set.
+15$:
+	RSB
+
+POWER_INIT:
+
+	BBCS	#UCB$V_PU_FRKBSY,-	; Appropriate UCB fork block if free,
+		UCB$W_DEVSTS(R5),20$	;  else continue and RSB.
+	RSB				; If fork block busy, relie on
+					;  Interrupt Service Routine to GOTO
+					;  POST_POWER_FORK.
+20$:
+	IOFORK				; Lower IPL so as to continue with
+					;  signaling SYSAPS that the VC fell.
+	BRB	30$			; Branch around Fork block appropriation.
+POST_POWER_FORK:
+
+	BBCS	#UCB$V_PU_FRKBSY,-	; Appropriate the UCB fork block if NOT
+		UCB$W_DEVSTS(R5),30$	;  busy and branch around.
+	BUG_CHECK	UDAPORT,FATAL	; Crash if UCB fork block busy.
+30$:
+	BICW	#UCB$M_ONLINE!-		; If here we are not online,
+		 UCB$M_POWER,-		;  and the power failure is being handled
+		UCB$W_STS(R5)
+
+
+; Here we call the CONNECTION error routine for each connection.
+
+	MOVL	#3,R3			; R3 = highest possible connection index.
+40$:
+	MOVL	UCB$L_PDT(R5),R4		; R4 => PDT.
+	PUSHL	R3				; Save connection index.
+	PUSHL	R5				; Save R5 => UCB.
+	MOVL	PDT$L_PU_CDTARY(R4)[R3],R3	; R3 => CDT.
+	JSB	@CDT$L_ERRADDR(R3)		; Call connection error routine.
+						; NOTE: that for closed connections,
+						;  the error routine is the NULL
+						;  one that is just an RSB.
+	POPL	R5				; Restore R5 => UCB.
+	POPL	R3				; Restore R3 = connection index.
+	SOBGEQ	R3,40$				; Loop thru all possible indices.
+	BRB	10$				; Branch back to re-init port.
+	.dsabl	lsb
+	.PAGE
+	.SBTTL	+	Build PDT
+
+;+
+; BUILD_PDT - allocate and fill in non variable data in the UDA port PDT.
+;
+; Inputs:
+;	R5				-Addr of UCB
+;
+
+;
+; PDT adjacency assumptions:
+;
+
+ASSUME	PDT$W_SIZE	EQ 8
+ASSUME 	PDT$W_SIZE+2	EQ PDT$B_TYPE
+ASSUME	PDT$B_TYPE+1	EQ PDT$B_SUBTYP
+ASSUME	PDT$B_SUBTYP+1	EQ PDT$C_SCSBASE
+
+BUILD_PDT:
+
+	MOVZWL	#PDT$C_PULENGTH,R1	; Enough for a PDT
+	BSBW	ALLOC_POOL		; Allocate pool
+	BLBS	R0,10$			; Branch if success
+	RSB				; Else return error
+
+10$:	MOVL	R2,R0			; Save address
+	MOVL	R2,UCB$L_PDT(R5)	; Save PDT addr
+	MOVL	R5,PDT$L_PU_UCB(R2)	; PDT => UCB.
+	MOVL	UCB$L_CRB(R5),R3	; Get CRB addr
+	MOVL	R2,CRB$L_AUXSTRUC(R3)	;  and save PDT addr in CRB
+	CLRQ	(R2)+			; Init PDT, unused longwds,
+	ASSUME	PDT$B_PDT_TYPE	EQ	7
+	MOVB	#PDT$C_PU,-1(R2)	; Indicate type of PDT created.
+	MOVW	R1,(R2)+		;  PDT size,
+	MOVW	#<DYN$C_SCS_PDT@8 + DYN$C_SCS>,(R2)+  ;  structure subtype and type
+	MOVL	CRB$L_INTD+VEC$L_INITIAL(R3),R3  ; Get addr of controller
+						 ;  init routine
+	MOVAW	PU$SCSOFFSET,R1		; Get addr of table of offsets
+					;  to SCS entries in PUDRIVER
+
+20$:	CVTWL	(R1)+,R0		; Get offset to next SCS routine
+	BEQL	30$			; Branch if no more
+	ADDL3	R0,R3,(R2)+		; Add offset from controller init
+					;  to addr of controller init
+					;  and store in PDT
+	BRB	20$			; Get next offset
+
+30$:
+	MOVL	UCB$L_PDT(R5),R1		; R1 => PDT.
+	MOVL	UCB$L_CRB(R5),R0		; R0 => CRB.
+	ASSUME	IDB$L_CSR	EQ	0
+	MOVL	@CRB$L_INTD+VEC$L_IDB(R0),-	; Save CSR addr in PDT.
+		PDT$L_PU_CSR(R1)
+
+; Init NULL CDT with addresses of message and datagram input routines.
+
+	MOVAB	NULL_MSG_INPUT,-		; Address of message input
+		NULL_CDT+CDT$L_MSGINPUT		;  routine.
+	MOVAB	NULL_DG_INPUT,-			; Address of datagram input
+		NULL_CDT+CDT$L_DGINPUT		;  routine.
+	MOVAB	NULL_ERR_ROUT,-			; Address of error routine.
+		NULL_CDT+CDT$L_ERRADDR
+
+; Init CDT pointers to all point to NULL CDT.
+
+	MOVAB	NULL_CDT,R0			; R0 => NULL CDT.
+	MOVL	R0,PDT$L_PU_VC0(R1)		; VC0 CDT pointer => NULL CDT.
+	MOVL	R0,PDT$L_PU_VC1(R1)		; VC1 CDT pointer => NULL CDT.
+	MOVL	R0,PDT$L_PU_VC2(R1)		; VC2 CDT pointer => NULL CDT.
+	MOVL	R0,PDT$L_PU_VC255(R1)		; VC255 CDT pointer => NULL CDT.
+
+	.IF	DF	PU_TRACE
+	MOVL	#500*96+16,R1		; Allocate trace table for 500 entries.
+	BSBW	ALLOC_POOL		; Call to allocate.
+	BLBS	R0,40$			; LBS implies success.
+	RSB
+40$:
+	MOVL	UCB$L_PDT(R5),R0	; R0 => PDT.
+	MOVL	R0,PDT_PTR		; Save pointer to PDT in code for sanity
+					;  check.
+	CLRQ	(R2)+			; Initialize trace table header for SDA.
+	MOVW	R1,(R2)+		; Save size.
+	MOVW	#DYN$C_SCS,(R2)+	; Type.
+	CLRL	(R2)+			; Round header upto 16 byte boundary.
+	MOVL	R2,PDT$L_TRTABLE(R0)	; Save pointer to base of trace table.
+	MOVL	R2,PDT$L_TRTBLPTR(R0)	; Pointer to next area to use.
+	ADDL3	#500*96,R2,-		; Pointer to beyond end of trace
+		PDT$L_TRTBLEND(R0)	;  table.
+	.ENDC
+
+	MOVL	S^#SS$_NORMAL,R0		; Return success.
+	RSB
+	.PAGE
+	.IF	DF	PU_TRACE
+	.SBTTL	+	TRACE_COMMAND and TRACE_RESPONSE
+
+; Routines to record command and response buffer contents in the trace table.
+;	Trace table entries are 96 bytes long so that they line up nicely in
+;	a dump.
+;
+
+	.ALIGN	LONG,0
+PDT_PTR:	.LONG	0		; We store the address of the PDT here
+					;  so as to be able to do a compare
+					;  for sanity.
+
+TRACE_COMMAND:				; INPUTS: R2 => Command buffer,
+					;	  R4 => PDT.
+
+	MOVQ	R0,-(SP)		; Save R0 and R1.
+	MOVL	R2,R0			; R0 => buffer to trace.
+	BRB	TRACE_COMMON		; Branch around to common code.
+
+TRACE_RESPONSE:				; INPUTS: R3 => Response buffer,
+					;	  R4 => PDT.
+
+	MOVQ	R0,-(SP)		; Save R0 and R1.
+	MOVL	R3,R0			; R0 => buffer to trace.
+
+TRACE_COMMON:
+
+	CMPL	R4,PDT_PTR		; Sanity check.
+	BEQL	10$
+	BUG_CHECK	UDAPORT,FATAL
+10$:
+	DSBINT				; Prevent interrupts during allocation
+					;  of trace table entry.
+	MOVL	PDT$L_TRTBLPTR(R4),R1	; R1 => area in trace table to use.
+	CMPL	PDT$L_TRTBLEND(R4),R1	; See if we should circle back to start
+					;  of trace table.
+	BGTR	20$			; GTR implies NO.
+	MOVL	PDT$L_TRTABLE(R4),R1	; R1 => base of trace table.
+20$:
+	ADDL3	#96,R1,PDT$L_TRTBLPTR(R4); Point to next entry.
+	ENBINT				; Undo DSBINT.
+	MOVQ	(R0)+,(R1)+		; Twelve long words are 96 bytes.
+	MOVQ	(R0)+,(R1)+
+	MOVQ	(R0)+,(R1)+
+	MOVQ	(R0)+,(R1)+
+	MOVQ	(R0)+,(R1)+
+	MOVQ	(R0)+,(R1)+
+	MOVQ	(R0)+,(R1)+
+	MOVQ	(R0)+,(R1)+
+	MOVQ	(R0)+,(R1)+
+	MOVQ	(R0)+,(R1)+
+	MOVQ	(SP),(R1)+		; Trace saved R0, R1.
+	MOVL	8(SP),(R1)+		; Also trace caller's return point.
+	MOVL	PDT$L_PU_UCB(R4),R0	; R0 => UCB.
+	SUBL	UCB$L_DDT(R0),-4(R1)	; Make traced return point relative.
+	MNEGL	#1,(R1)+		; Flag marks end of trace entry.
+	MOVQ	(SP)+,R0		; Restore R0 and R1.
+	RSB
+
+	.ENDC
+	.PAGE
+	.SBTTL	+	INIT_UDA_BUFFERS
+
+;+
+; INIT_UDA_BUFFERS - accomplishes the following:
+;
+;	1. It fills in UCB$W_BCNT, UCB$W_BOFF and UCB$L_SVAPTE and clears
+;		CRB$L_INTD+VEC$W_MAPREG so that the standard UNIBUS
+;		map register allocation routine will allocate enough
+;		of these map registers to map the area located at
+;		PDT$L_COMAREA which is PDT$C_RINGLEN long.
+;		It then calls IOC$ALOUBMAPRM to permanently allocate
+;		the map registers.  The value left in UCB$L_SVAPTE, along
+;		with the values left in CRB$L_INTD+VEC$W_MAPREG by
+;		IOC$ALOUBMAPRM, allow the later loading of the allocated
+;		map registers. (Note the map registers are loaded at
+;		intialization time and after every reset of the port.)
+;
+;	2. It calculates the UNIBUS virtual address of the text portion
+;		of each of the 2*UDA$K_RINGSIZE buffers and stores this
+;		virtual address in the low order 18 bits of the buffer
+;		header, at offset UDAB$L_DESCRIP.  The UDA_M_OWN and
+;		UDA_M_FLAG bits are also set on in UDAB$L_DESCRIP so
+;		that this value can now be moved directly into a ring
+;		slot (be it command or response ring) to effect the transfer
+;		of this buffer to the port.
+;
+; Inputs:
+;	R5				-Addr of UCB
+;
+; Outputs:
+;	R0-R4				-Destroyed
+;	R5				-Preserved
+;-
+
+	.enabl	lsb
+
+INIT_UDA_BUFFERS:
+
+; Initialize fields in UCB so as to allow standard IOSUBNPAG routines
+;	to allocate MAP registers.
+
+	MOVW	#PDT$C_RINGLEN,-	; Length of area to map.
+		UCB$W_BCNT(R5)
+	MOVL	UCB$L_PDT(R5),R4	; R4 => PDT.
+	MOVAB	PDT$L_COMAREA(R4),R2	; R2 => area to map.
+	BICW3	#^XFE00,R2,-
+		UCB$W_BOFF(R5)		; Get offset of area to map.
+	EXTZV	S^#VA$V_VPN,-
+		S^#VA$S_VPN,R2,R2	; R2 = virtual page # of area.
+	MOVL	G^MMG$GL_SPTBASE,R0	; R0 => system page table.
+	MOVAL	(R0)[R2],UCB$L_SVAPTE(R5)
+					;
+
+	MOVL	UCB$L_CRB(R5),R3	; R3 => CRB.
+	CLRL	CRB$L_INTD+VEC$W_MAPREG(R3)
+					; Initialize to direct datapath (0).
+	CPUDISP	<DATAPATH_780,-		; Label of VAX-11/780 specific code.
+		 DATAPATH_750,-		; Label of VAX-11/750 specific code.
+		 DATAPATH_730>		; Label of VAX-11/730 specific code.
+
+DATAPATH_750:
+	JSB	G^IOC$REQDATAP		; Permanently allocate a datapath when
+					;  running on VAX-11/750 processor.
+
+DATAPATH_730:
+	MOVAB	REQDATAP_750730,-	; Overlay transfer vector when running
+		REQDATAPATH_TV		;  on a VAX-11/750 or a VAX-11/730.
+	MOVAB	RELDATAP_750730,-	; Overlay transfer vector when running
+		RELDATAPATH_TV		;  on a VAX-11/750 or a VAX-11/730.
+
+DATAPATH_780:
+	MOVB	CRB$L_INTD+VEC$B_DATAPATH(R3),-	; Remember datapath permanently
+		PDT$B_DATAPATH(R4)		;  allocated in PDT.
+	CLRB	CRB$L_INTD+VEC$B_DATAPATH(R3)	; Clear CRB field.
+
+	JSB	G^IOC$ALOUBMAPRM	; Permanently allocate map registers.
+
+; Here calculate the UNIBUS virtual address of each buffer.
+
+	MOVZWL	UCB$W_BOFF(R5),R0	; Byte offset of mapped area.
+	MOVL	UCB$L_CRB(R5),R1	; R1 => CRB
+
+	INSV	CRB$L_INTD+VEC$W_MAPREG(R1),#9,#9,R0	; R0 contains UNIBUS
+							;  VA of base of area.
+
+	PUSHL	R0			; Save on stack.
+
+	CLRL	R0			; Initialize loop counter.
+
+	MOVAB	PDT$L_PU_BUFARY+UDAB$T_TEXT(R4),R1	; R1 => text portion
+							;  of first buffer.
+10$:
+;	ASSUME	UDAB$B_BUFFNO+1 	is 	Reserved byte.
+	MOVZBW	R0,UDAB$B_BUFFNO-UDAB$T_TEXT(R1); Store index of this
+						;  buffer in its header.
+	MOVAB	-UDAB$T_TEXT(R1),-		; Point Buffer table array
+		PDT$L_BDTABLE(R4)[R0]		;  element to this buffer.
+	MOVAB	PDT$L_COMAREA(R4),R2		; R2 => base of mapped area.
+	SUBL3	R2,R1,R2			; R2 = offset of this buffer
+						;  from base of mapped area.
+	ADDL3	(SP),R2,-			; Calculate UNIBUS VA of this
+		UDAB$L_DESCRIP-UDAB$T_TEXT(R1)	;  buffer.
+
+	BISL	#UDA_M_OWN!-			; Set port ownership and mark
+		 UDA_M_FLAG,-			;  so port should interrupt on
+		UDAB$L_DESCRIP-UDAB$T_TEXT(R1)	;  ring transitions.
+
+	ADDL	#UDAB$C_LENGTH,R1	; R1 => text portion of next buffer.
+	AOBLSS	#2*UDA$K_RINGSIZE,R0,10$; Loop thru all buffers.
+
+	TSTL	(SP)+			; Clear stack.
+	RSB
+	.dsabl	lsb
+	.PAGE
+	.SBTTL	+	INIT_INIT_STEPS
+
+;+
+; INIT_INIT_STEPS - initialize the host responses for UDA hardware
+;			initialization.
+;
+; Inputs:
+;	R5				-Addr of UCB
+;
+; Outputs:
+;	UCB$W_HOSTSTEPx fields all initialized
+;
+;	Registers R0-R2 destroyed
+;-
+
+	.enabl	lsb
+
+INIT_INIT_STEPS:
+
+; First calculate the vector for this UDA.  This is done by scanning the
+;	UNIBUS adapter interrupt vector looking for a slot that points
+;	into this CRB$L_INTD.
+
+	MOVL	UCB$L_CRB(R5),R0		; R0 => CRB.
+	PUSHAL	CRB$L_INTD(R0)			; Save interrupt dispatcher
+						;  address on stack.
+	MOVL	CRB$L_INTD+VEC$L_IDB(R0),R0	; R0 => IDB.
+	MOVL	IDB$L_ADP(R0),R0		; R0 => ADP.
+	MOVL	ADP$L_VECTOR(R0),R0		; R0 => UBA interrupt vectors.
+
+	CLRL	R1			; Initialize counter.
+10$:
+	MOVL	(R0)+,R2		; R2 = contents of a vector.
+	BICL	#3,R2			; Clear low order 2 bits to remove
+					;  processor (780 vs 750) differences.
+	CMPL	R2,(SP)			; Is this our vector?
+	BEQL	20$			; EQL means yes.
+	AOBLSS	#NUMUBAVEC,R1,10$	; Else loop back to try again.
+	TSTL	(SP)+			; It had better be there
+	CLRL	R0			;  or else we return with an error
+	RSB				;  indication.
+20$:
+	TSTL	(SP)+			; Remove unneeded stack value.
+
+	BISW3	R1,-				; Or in vector address/4
+		#HS1_M_IE!-			;   (i.e. vector #) with
+		<UDA$K_RINGEXP@HS1_V_RRNGLEN>!-	;  Interrupt Enable bit, and
+		<UDA$K_RINGEXP@HS1_V_CRNGLEN>!-	;  the response and command ring
+		 HS1_M_BIT15,-			;  lengths and the high bit on,
+		UCB$W_HOSTSTEP1(R5)		;  and save it in the UCB.
+
+; Here we calculate the UNIBUS virtual address of the ring base so as to be
+;	able to communicate it to the controller.
+
+	MOVZWL	UCB$W_BOFF(R5),R0	; R0 contains byte offset of ringbase.
+	MOVL	UCB$L_CRB(R5),R1	; R1 => CRB.
+
+	INSV	CRB$L_INTD+VEC$W_MAPREG(R1),#9,#9,R0	; R0 contains the UBA
+							;  virtual address of
+							;  the communications
+							;  area.
+	ADDL	#PDT$L_RINGBASE-PDT$L_COMAREA,R0; Add in offset to ringbase.
+
+	CPUDISP	<PURGE_780,-
+		 PURGE_750,-
+		 PURGE_730>
+
+PURGE_780:
+	BISW	#HS2_M_PI,R0		; Ask for purge interrupts when
+					;  running on a VAX-11/780.
+PURGE_750:
+PURGE_730:
+
+	MOVW	R0,UCB$W_HOSTSTEP2(R5)	; Save communication area address and
+					;  purge interrupt request bit in UCB.
+
+	ASSUME	UCB$W_HOSTSTEP3	EQ	UCB$W_PORTSTEP3+2
+	MOVL	R0,UCB$W_PORTSTEP3(R5)	; Trash UCB$W_PORTSTEP3 as we store the
+					;  high word of R0 in UCB$W_HOSTSTEP3.
+
+; Here we pickup the SYSGEN parameter UDABURSTRATE.
+
+	MOVZBL	G^SCS$GB_UDABURST,R0	; R0 contains the burst rate setting.
+	ASHL	#HS4_V_BURST,R0,R0	; Shift burst rate into position.
+	BISW3	#HS4_M_GO!-		; Set GO bit and last fail packet bits,
+		 HS4_M_LF,-		;  or in burst rate,
+		R0,-			;  and save as HOST response to STEP 4.
+		UCB$W_HOSTSTEP4(R5)
+
+	MOVL	S^#SS$_NORMAL,R0	; Indicate success and
+	RSB				;  return to caller.
+	.dsabl	lsb
+	.PAGE
+	.SBTTL	+	Hardware Initialization
+
+;+
+; HARDWARE_INIT - internal subroutine
+;
+; Inputs:
+;	R5				-Addr of UCB
+;
+; Outputs:
+;
+;-
+
+	.enabl	lsb
+HARDWARE_INIT:
+
+	POPL	UCB$L_DPC(R5)		; Remember return
+	DECB	UCB$B_INITCNT(R5)	; Count # of consecutive times thru here.
+	BNEQ	8$			; NEQ means that we have not exhausted
+					;  consecutive retries.
+	MOVL	UCB$L_CRB(R5),R3	; R3 => CRB.
+	MOVAB	B^4$,CRB$L_TOUTROUT(R3)	; Establish wakeup routine.
+	ADDL3	#INIT_DELTA,-		; Establish a small delay.
+		G^EXE$GL_ABSTIM,-
+		CRB$L_DUETIME(R3)
+	RSB				; Evaporate for awhile.
+4$:
+	SETIPL	#PU_FORK_IPL		; Lower IPL after wakeup.
+	MOVL	CRB$L_AUXSTRUC(R3),R4	; R4 => PDT.
+	MOVL	PDT$L_PU_UCB(R4),R5	; R5 => UCB.
+	MOVAB	NULL_ROUTINE,-		; Restablish null wakeup routine.
+		CRB$L_TOUTROUT(R3)
+	MOVB	#NO_CONSEC_INITS,-	; Reinit count that went to zero.
+		UCB$B_INITCNT(R5)
+8$:
+	BISW	#UCB$M_PU_HRDINI,-	; Set bit signalling
+		UCB$W_DEVSTS(R5)	;  that we initing the port.
+	MOVL	UCB$L_PDT(R5),R4	; R4 => PDT.
+	MOVL	PDT$L_PU_CSR(R4),R3	; R3 => UDA CSR.
+	CLRB	PDT$B_PURGEDP(R4)	; Prevent spurious purges.
+10$:
+
+	CLRW	UDAIP(R3)		; Start hard init.
+
+; At least 100 micro seconds must pass between here
+
+	LOADUBA				; Load UNIBUS map registers with values
+					;  that map communication area and buffers.
+	DSBINT
+	WFIKPCH	15$,#2			; Cause timeout to waste time.
+15$:
+	SETIPL	UCB$B_FIPL(R5)		; Lower IPL after timeout.
+	BSBW	INIT_PU_PDT		; Initialize variable PDT data.
+	CLRW	UCB$W_PORTSTEP1(R5)	; Clear port responses so that
+	CLRW	UCB$W_PORTSTEP3(R5)	;  the error log record we create
+	CLRW	UCB$W_PORTSTEP3(R5)	;  will contain only the responses
+	CLRW	UCB$W_PORTSTEP4(R5)	;  received in this INIT attempt.
+	INCW	UCB$W_NUMBINITS(R5)	; Increment # of times we have attempted
+					;  to init port.
+; and here
+
+	MOVW	UDASA(R3),-		; Read SA register.
+		UCB$W_PORTSTEP1(R5)
+	BBC	#PS1_V_ER,-		; Test for error condition
+		UCB$W_PORTSTEP1(R5),30$	;  and branch around if clear.
+20$:
+	BRW	HARD_RETRY		; For now only.
+30$:
+	BBC	#PS1_V_S1,-		; Make sure we are in STEP1
+		UCB$W_PORTSTEP1(R5),20$	;  or else go back.
+
+; In Step 1.
+
+	DSBINT				; Prepare to respond to STEP1.
+	BBCC	#UCB$V_POWER,-		; Power failure negates what we have
+		UCB$W_STS(R5),35$	;  done until now.
+	BRW	HARDPOWER		; If power failure branch around.
+35$:
+	MOVW	UCB$W_HOSTSTEP1(R5),-	; Else move value to SA register.
+		UDASA(R3)
+	WFIKPCH	STEP1_TIMEOUT,#STEP1_LIMIT	; Wait for interrupt.
+
+	MOVW	UCB$W_UDASA(R5),-		; Save Port STEP2 start value
+		UCB$W_PORTSTEP2(R5)
+	IOFORK				; Lower IPL and continue.
+
+; In Step 2.
+
+	BBS	#PS2_V_ER,UCB$W_PORTSTEP2(R5),37$	; For now!!!!
+
+	BBS	#PS2_V_S2,-		; Make sure we are in STEP2.
+		UCB$W_PORTSTEP2(R5),40$
+37$:
+	BRW	HARD_RETRY		; Else branch to retry.
+40$:
+	CMPB	UCB$W_PORTSTEP2(R5),-	; Test whether controller echoed
+		UCB$W_HOSTSTEP1+1(R5)	;  fields correctly.
+	BEQL	50$			; EQL implies yes.
+	BRW	HARD_RETRY		; Else branch to retry.
+50$:
+	DSBINT				; Prepare to respond to STEP2.
+	BBCC	#UCB$V_POWER,-		; Power failure negates what we have
+		UCB$W_STS(R5),55$	;  done until now.
+	BRW	HARDPOWER		; If power failure branch around.
+55$:
+	MOVW	UCB$W_HOSTSTEP2(R5),-	; Else move value to SA register.
+		UDASA(R3)
+	WFIKPCH	STEP2_TIMEOUT,#STEP2_LIMIT	; Wait for interrupt.
+
+	MOVW	UCB$W_UDASA(R5),-		; Save Port STEP3 start value
+		UCB$W_PORTSTEP3(R5)
+	IOFORK				; Lower IPL and continue.
+
+; In Step 3.
+
+	BBS	#PS3_V_ER,UCB$W_PORTSTEP3(R5),57$	; For now!!!!
+
+	BBS	#PS3_V_S3,-		; Make sure we are in STEP3.
+		UCB$W_PORTSTEP3(R5),60$
+57$:
+	BRW	HARD_RETRY		; Else branch to retry.
+60$:
+	CMPB	UCB$W_PORTSTEP3(R5),-	; Test whether controller echoed
+		UCB$W_HOSTSTEP1(R5)	;  fields correctly.
+	BEQL	70$			; EQL implies yes.
+	BRW	HARD_RETRY		; Else branch to retry.
+70$:
+	DSBINT				; Prepare to respond to STEP3.
+	BBSC	#UCB$V_POWER,-		; Power failure negates what we have
+		UCB$W_STS(R5),HARDPOWER	;  done until now.
+	MOVW	UCB$W_HOSTSTEP3(R5),-	; Else move value to SA register.
+		UDASA(R3)
+	WFIKPCH	STEP3_TIMEOUT,#STEP3_LIMIT	; Wait for interrupt.
+
+	MOVW	UCB$W_UDASA(R5),-		; Save Port STEP4 start value
+		UCB$W_PORTSTEP4(R5)
+	IOFORK				; Lower IPL and continue.
+
+; In Step 4.
+
+	BBS	#PS4_V_ER,UCB$W_PORTSTEP4(R5),77$	; For now!!!!
+
+	BBS	#PS4_V_S4,-		; Make sure we are in STEP4.
+		UCB$W_PORTSTEP4(R5),80$
+77$:
+	BRB	HARD_RETRY		; Else branch around to retry.
+80$:
+	CMPZV	#PS4_V_CNTRLTYP,-	; Here we assure that the controller
+		#PS4_S_CNTRLTYP,-	;  microcode is upto rev level. First
+		UCB$W_PORTSTEP4(R5),-	;  see if we have a UDA50.
+		#UDA50_CNTRLTYP
+	BNEQ	90$			; If NOT, branch around.
+	MOVB	#DT$_UDA50,-		; Fill in UCB devtype field with value
+		UCB$B_DEVTYPE(R5)	;  for UDA50.
+	CMPZV	#PS4_V_UCODEVER,-	; If a UDA50, see if microcode
+		#PS4_S_UCODEVER,-	;  upto rev by comparing against out of
+		UCB$W_PORTSTEP4(R5),-	;  date microcode version #.
+		#1			; Out of date version number.
+	BEQL	UDA_OUTOFREV		; EQL implies inoperative Ucode.
+90$:
+	BSBW	STOCK_RSPRING		; Stock response ring after controller
+					;  clears it.
+
+	DSBINT				; Prepare to respond to STEP4.
+	BBSC	#UCB$V_POWER,-		; Power failure negates what we have
+		UCB$W_STS(R5),HARDPOWER	;  done until now.
+	MOVW	UCB$W_HOSTSTEP4(R5),-	; Else move value to SA register.
+		UDASA(R3)
+	ENBINT				; Lower IPL and
+	BICW	#UCB$M_PU_HRDINI,-	; Reset bit signalling
+		UCB$W_DEVSTS(R5)	;  that we initing the port.
+	MOVW	#INIT_ATTNCODE,-	; Indicate what kind of error log record
+		UCB$W_ATTNCODE(R5)	;  we are about to create.
+	JSB	G^ERL$DEVICEATTN	; Call to create error log record of INIT.
+
+	MOVL	S^#SS$_NORMAL,R0	; Return normal status.
+200$:
+	JMP	@UCB$L_DPC(R5)		;  return to caller.
+
+HARDPOWER:				; We got a powerfailure while initing
+					;  the UDA.  Simply start hardware init
+					;  over.
+	ENBINT				; Undo DSBINT.
+HARD_RETRY:
+	MOVL	UCB$L_PDT(R5),R4	; R4 => PDT.
+	MOVL	PDT$L_PU_CSR(R4),R0	; R0 => UDA CSR.
+	MOVW	UDASA(R0),UCB$W_UDASA(R5); Save error status in UCB for logging.
+	MOVW	#FAIL_ATTNCODE,-	; Indicate what kind of error log record
+		UCB$W_ATTNCODE(R5)	;  we are about to create.
+	JSB	G^ERL$DEVICEATTN	; Call to create error log record of INIT.
+	PUSHL	UCB$L_DPC(R5)		; Restore caller's return to stack.
+	BRW	HARDWARE_INIT		; And branch back to restart hardware
+					;  init of UDA.
+
+STEP1_TIMEOUT:
+STEP2_TIMEOUT:
+STEP3_TIMEOUT:
+	SETIPL	UCB$B_FIPL(R5)		; Lower IPL after timeout.
+	BRB	HARD_RETRY		; Go to try again.
+
+UDA_OUTOFREV:
+	.IF	DF	UDA50_BYPASS
+	BRB	90$			; Bypass rejection.
+	.ENDC
+
+	MOVW	#UCODE_ATTNCODE,-	; Indicate what kind of error log record
+		UCB$W_ATTNCODE(R5)	;  we are about to create.
+	JSB	G^ERL$DEVICEATTN	; Call to create error log record of INIT.
+	PUSHR	#^M<R3,R4,R5>		; Save registers.
+	MOVZBL	#MSG$_UDA50MVER,R4	; Message number to R4.
+	MOVAB	G^SYS$GL_OPRMBX,R3	; R3 => operator's mailbox.
+	JSB	G^EXE$SNDEVMSG		; Call to send operator message.
+	POPR	#^M<R3,R4,R5>		; Restore registers.
+	CLRL	R0			; Indicate unable to init hardware.
+	BRB	200$			; Branch back to return.
+
+	.dsabl	lsb
+	.PAGE
+	.SBTTL	+	INIT_PU_PDT	Fill in variable
+	.SBTTL	+			PDT data
+
+;+
+; INIT_PU_PDT - internal subroutine to initialize (or re-initialize)
+; variable PDT data.  This routine assumes that BUILD_PDT has been called
+; prior to the activation of this routine.
+;
+; INIT_PU_PDT is called from HARDWARE_INIT, and initializes the Q headers
+; in the PDT and also initializes the Ring structures by filling the response
+; ring with available buffers and then placing all the rest of the buffers on
+; the free Q.
+;
+; Inputs:
+;
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	Other registers		-Preserved
+;
+;	Response ring filled
+;	Free Q filled
+;	PDT$L_PU_SNDQFL initialized
+;	PDT$L_PU_BUFQFL initialized
+;-
+
+INIT_PU_PDT:
+
+	ASSUME	PDT$W_CMDINT	EQ	PDT$L_COMAREA+4
+	ASSUME	PDT$W_RSPINT	EQ	PDT$W_CMDINT+2
+	CLRQ	PDT$L_COMAREA(R4)
+
+	ASSUME	PDT$B_CPOLLINX	EQ	PDT$B_CRINGINX+1
+	ASSUME	PDT$B_CRINGCNT	EQ	PDT$B_CPOLLINX+1
+	ASSUME	PDT$B_RRINGINX	EQ	PDT$B_CRINGCNT+1
+	ASSUME	PDT$B_RPOLLINX	EQ	PDT$B_RRINGINX+1
+	ASSUME	PDT$B_RRINGCNT	EQ	PDT$B_RPOLLINX+1
+	ASSUME	PDT$B_NOCURCON	EQ	PDT$B_RRINGCNT+1
+	ASSUME	PDT$B_CONBITMAP	EQ	PDT$B_NOCURCON+1
+	CLRQ	PDT$B_CRINGINX(R4)
+
+	MOVL	#UDAB$T_TEXT,-		; Save UDA port SCS datagram header
+		PDT$L_DGOVRHD(R4)	;  size in PDT.
+	MOVL	#UDAB$T_TEXT,-		; Save UDA port SCS message header
+		PDT$L_MSGHDRSZ(R4)	;  size in PDT.
+
+; Initialize PDT Q headers.
+
+	MOVAB	PDT$L_PU_FQFL(R4),-	; Free Q header.
+		PDT$L_PU_FQFL(R4)
+	MOVAB	PDT$L_PU_FQFL(R4),-	; Free Q header.
+		PDT$L_PU_FQBL(R4)
+	MOVAB	PDT$L_PU_FQFL(R4),-	; Point Free Q pointer to Free Q. This
+		PDT$L_PU_FQPTR(R4)	;  pointer is used to test for
+					;  emptiness of Free Q.
+
+	MOVAB	PDT$L_PU_SNDQFL(R4),-	; Send Q header.
+		PDT$L_PU_SNDQFL(R4)
+	MOVAB	PDT$L_PU_SNDQFL(R4),-	; Send Q header.
+		PDT$L_PU_SNDQBL(R4)
+
+	MOVAB	PDT$L_PU_BUFQFL(R4),-	; Buffer wait Q header.
+		PDT$L_PU_BUFQFL(R4)
+	MOVAB	PDT$L_PU_BUFQFL(R4),-	; Buffer wait Q header.
+		PDT$L_PU_BUFQBL(R4)
+
+; Initialize initial credits for all possible connections.
+
+	MOVW	#1,PDT$W_PU_CRED0(R4)	; Initial credit of 1.
+	MOVW	#1,PDT$W_PU_CRED1(R4)	; Initial credit of 1.
+	MOVW	#1,PDT$W_PU_CRED2(R4)	; Initial credit of 1.
+	MOVW	#1,PDT$W_PU_CRD255(R4)	; Initial credit of 1.
+
+; Following loop is for arrays that are RINGSIZE long.
+
+	MOVL	#UDA$K_RINGSIZE-1,R0	; Initialize loop counter.
+10$:
+	MNEGB	#1,PDT$B_CRCONTENT(R4)[R0]	; Nothing in command slot.
+	MNEGB	#1,PDT$B_RRCONTENT(R4)[R0]	; Nothing in response slot.
+	CLRL	PDT$L_CMDRING(R4)[R0]		; Clear command ring slot.
+	CLRL	PDT$L_RSPRING(R4)[R0]		; Clear response ring slot.
+	SOBGEQ	R0,10$				; Loop thru all array elements.
+	RSB				; Return to caller. Rest of PDT init
+					;  called explicitly at label below.
+
+STOCK_RSPRING:
+
+; Loop thru all buffers (there are 2*RINGSIZE of them) and put them on the
+;	response ring or the free Q.
+
+	CLRL	R0			; Initialize loop variable.
+10$:
+	MOVL	PDT$L_BDTABLE(R4)[R0],R2; R2 => buffer[R0]
+	PUSHL	R0			; Remember loop variable before call.
+	BSBW	Q_DEALLOC_BUF		; Put buffer on response ring or free
+					;  Q, whichever is appropriate.
+	POPL	R0			; Restore loop variable.
+	AOBLSS	#2*UDA$K_RINGSIZE,R0,10$; Loop thru all buffers.
+
+	RSB				; And return to caller.
+	.PAGE
+	.SBTTL	+	BUILD_PB_SB Build System Block and Path Block
+
+;+
+; BUILD_PB_SB - Build and fill in the System Block and the Path Block.
+;
+; This portion of the UDA port driver is responsible for adding
+; the UDA to the system-wide configuration database.  It is invoked
+; as a one time initialization routine.
+;
+; The system wide configuration database consists of:
+;
+;
+;	SCS$GQ_CONFIG
+;	     |
+;	     v
+;	System Block ----> Path Block ----> Path Block ---->...
+;	     |
+;	     v
+;	System Block ----> Path Block ---->...
+;	     |
+;	     v
+;	    ...
+;
+; Only systems and paths with open port-port VC's are kept on the
+; above list.
+;
+; For each UDA (AZTEC or TU81) we build a Path Block and a System Block,
+; initialize them and link them into the systemwide configuration database.
+;
+; Inputs:
+;
+;	R4				-Addr of PDT
+;	R5 				-Addr of UCB
+;
+;-
+
+BUILD_PB_SB:
+
+	MOVL	#PB$K_LENGTH,R1		; Get size of a pathblock
+	BSBW	ALLOC_POOL		; Allocate one from pool
+	BLBS	R0,10$			; Branch around if successful allocation.
+	BRW	PB_ALLOC_FAIL		; Branch if no pool
+10$:
+	MOVL	R2,R3			; Set PB addr in standard register
+	MOVL	R2,R0			; Also set PB addr in a register to be
+					;  auto-incremented.
+	ASSUME	PB$L_FLINK	EQ	0
+	MOVL	R2,(R0)+		; This will be the only Path Block on
+					;  this list.
+	ASSUME	PB$L_BLINK	EQ	PB$L_FLINK+4
+	MOVL	R2,(R0)+		; Both FLINK and BLINK point here.
+
+	ASSUME	PB$W_SIZE	EQ	PB$L_BLINK+4
+	MOVW	R1,(R0)+		; Set structure size
+
+	ASSUME	PB$B_TYPE	EQ	PB$W_SIZE+2
+	ASSUME	PB$B_SUBTYP	EQ	PB$B_TYPE+1
+	MOVW	#DYN$C_SCS+<DYN$C_SCS_PB@8>,(R0)+  ; Set struct type, subtype
+
+	ASSUME	PB$B_RSTATION	EQ	PB$B_SUBTYP+1
+	CLRQ	(R0)+			; UDA is always station #0.
+
+	ASSUME	PB$W_STATE	EQ	PB$B_RSTATION+6
+	MOVW	#PB$C_OPEN,-2(R0)	; Always in OPEN state.
+
+	ASSUME	PB$L_RPORT_TYP	EQ	PB$W_STATE+2
+	EXTZV	#PS2_V_PORTTYPE,-	; Extract Port Type returned by hardware
+		#PS2_S_PORTTYPE,-	;  initialization of controller.
+		UCB$W_PORTSTEP2(R5),(R0)+
+
+	ASSUME	PB$L_RPORT_REV	EQ	PB$L_RPORT_TYP+4
+	EXTZV	#PS4_V_UCODEVER,-	; Extract ucode version returned by
+		#PS4_S_UCODEVER+-	;  hardware init of controller.
+		 PS4_S_CNTRLTYP,-
+		UCB$W_PORTSTEP4(R5),(R0)+
+
+	ASSUME	PB$L_RPORT_FCN	EQ	PB$L_RPORT_REV+4
+	CLRL	(R0)+			;***Temporary
+
+	ASSUME	PB$B_RST_PORT	EQ	PB$L_RPORT_FCN+4
+	ASSUME	PB$B_RSTATE	EQ	PB$B_RST_PORT+1
+	ASSUME	PB$W_RETRY	EQ	PB$B_RSTATE+1
+	CLRL	(R0)+			; Clear irrelevant fields.
+
+	ASSUME	PB$T_LPORT_NAME	EQ	PB$W_RETRY+2
+	MOVL	#^A/PUA0/,(R0)+		;***Temporary
+
+	ASSUME	PB$L_PDT	EQ	PB$T_LPORT_NAME+4
+	MOVL	R4,(R0)+		; Save PDT pointer in Path Block.
+
+	ASSUME	PB$L_CDTLST	EQ	PB$L_PDT+4
+	CLRL	(R0)+			; Clear CDTLST.
+
+	ASSUME	PB$L_WAITQFL	EQ	PB$L_CDTLST+4
+	ASSUME	PB$L_WAITQBL	EQ	PB$L_WAITQFL+4
+	MOVL	R0,(R0)+		; Initialize empty Q header.
+	MOVL	-4(R0),(R0)+
+
+	ASSUME	PB$L_SCSMSG	EQ	PB$L_WAITQBL+4
+	ASSUME	PB$W_STS	EQ	PB$L_SCSMSG+4
+;	ASSUME	PB$W_STS+2	is	Reserved Word
+	CLRQ	(R0)			; Clear irrelevant fields.
+
+
+; Now build System Block.
+
+	MOVL	#SB$K_LENGTH,R1		; Get size of SB
+	BSBW	ALLOC_POOL		; Allocate from nonpaged pool
+	BLBC	R0,SB_ALLOC_FAIL	; Branch if no pool
+
+	MOVW	R1,SB$W_SIZE(R2)	; Set struct size
+	MOVW	#DYN$C_SCS+<DYN$C_SCS_SB@8>,-  ; Set structure type
+		SB$B_TYPE(R2)		       ;  and subtype
+	MOVL	R3,SB$L_PBFL(R2)	; Set path block list to point to
+	MOVL	R3,SB$L_PBBL(R2)	;  this and only this Path Block.
+	MOVL	R3,SB$L_PBCONNX(R2)	; Also let this path be Next path.
+
+; Here we concoct the SYSTEMID of this controller.  It is made up of the
+;	following pieces:
+;
+;	 4	       3 3
+;	.7_____________2.1_____________________________0.
+;	! !		!				!
+;	!1!  TR number	!	UDA CSR address		!
+;	!_!_____________!_______________________________!
+
+	MOVL	UCB$L_CRB(R5),R0		; R0 => CRB.
+	MOVL	CRB$L_INTD+VEC$L_IDB(R0),R0	; R0 => IDB.
+	MOVL	IDB$L_CSR(R0),-			; Move CSR to low longword of
+		SB$B_SYSTEMID(R2)		;  SYSTEMID.
+	MOVL	IDB$L_ADP(R0),R0		; R0 => ADP.
+	MOVW	ADP$W_TR(R0),-			; Move nexus number to high
+		SB$B_SYSTEMID+4(R2)		;  word of SYSTEMID.
+	BISW	#^X80,SB$B_SYSTEMID+5(R2)	; Set high bit on in SYSTEMID.
+
+; Here link System Block onto system list.
+
+	MOVAL	G^SCS$GQ_CONFIG,R0	; R0 => Systemwide list head of system
+					;  blocks.
+	INSQUE	(R2),@4(R0)		; Queue to tail of list.
+	MOVL	S^#SS$_NORMAL,R0	; Indicate success and
+	RSB				;  return to caller.
+
+PB_ALLOC_FAIL:
+SB_ALLOC_FAIL:
+	CLRL	R0			; Indicate failure and
+	RSB				;  return to caller.
+	.PAGE
+	.SBTTL	+	ALLOC_POOL
+
+;+
+; This subroutine allocates and zeroes nonpaged pool.
+;	It is assumed here that the call here is always made from a called
+;	internal subroutine, implying that two return points must be popped
+;	off the stack if the thread is suspended.
+;
+; Inputs:
+;
+;	R1			-# bytes of pool to allocate
+;	R5			-Addr of UCB
+;	
+; Outputs:
+;
+;	R0			-0/1 for fail/success
+;	R1			-# bytes actually allocated
+;	R2			-Addr of buffer allocated
+;-
+
+ALLOC_POOL:				; Allocate and zero pool
+
+	POPL	UCB$L_DPC(R5)		; Remember return
+	PUSHL	R3			; Save R3.
+	JSB	G^EXE$ALONONPAGED	; Allocate from nonpaged pool
+	BLBC	R0,10$			; Skip clearing structure if failure
+	PUSHR	#^M<R0,R1,R2,R4,R5>	; Save MOVC registers
+	MOVC5	#0,(SP),#0,R1,(R2)	; Zero initialize structure
+	POPR	#^M<R0,R1,R2,R4,R5>	; Restore MOVC registers
+	POPL	R3			; Restore R3.
+	JMP	@UCB$L_DPC(R5)		; Return to caller.
+10$:					; Here we suffered an allocation failure.
+					;  Prepare to wait awhile before trying
+					;  again.
+	MOVL	R1,UCB$L_PU_ALLOC(R5)	; Save size of block to allocate.
+	POPL	UCB$L_FR3(R5)		; Pop given R3 into save area.
+	MOVL	R4,UCB$L_FR4(R5)	; Save R4.
+	POPL	UCB$L_FPC(R5)		; Save caller's caller's return.
+
+	MOVL	UCB$L_CRB(R5),R3	; R3 => CRB.
+	MOVAB	B^20$,CRB$L_TOUTROUT(R3); Establish wakeup routine.
+	ADDL3	#ALLOC_DELTA,-		; Establish a small delay.
+		G^EXE$GL_ABSTIM,-
+		CRB$L_DUETIME(R3)
+	RSB				; Evaporate for awhile.
+20$:
+	SETIPL	#PU_FORK_IPL		; Lower IPL after wakeup.
+	MOVL	CRB$L_AUXSTRUC(R3),R5	; R5 => UCB or PDT.
+	CMPB	#DYN$C_UCB,-		; Determine which, UCB or PDT.
+		UCB$B_TYPE(R5)
+	BEQL	30$			; EQL implies UCB.
+	MOVL	PDT$L_PU_UCB(R5),R5	; If PDT, go one level deeper so that
+30$:					;  here R5 => UCB.
+	MOVAB	NULL_ROUTINE,-		; Restablish null wakeup routine.
+		CRB$L_TOUTROUT(R3)
+	MOVL	UCB$L_PU_ALLOC(R5),R1	; Restore R1 = size of block to alloc.
+	MOVQ	UCB$L_FR3(R5),R3	; Restore R3 and R4.
+	PUSHL	UCB$L_FPC(R5)		; Re-establish caller's caller's return point.
+	PUSHL	UCB$L_DPC(R5)		; Re-establish caller's return point.
+	BRB	ALLOC_POOL		; Go try again.
+
+	.SBTTL	UNIMPLEMENTED FORK PROCESS CALLS
+FPC$ACCEPT::
+FPC$ALLOCDG::
+FPC$DEALLOCDG::
+FPC$MAP::
+FPC$MAPBYPASS::
+FPC$MAPIRPBYP::
+FPC$QUEUEMDGS::
+FPC$REJECT::
+FPC$REQDATA::
+FPC$SENDDATA::
+FPC$SENDDG::
+FPC$SENDMSG::
+
+FPC$READCOUNT::
+FPC$RLSCOUNT::
+FPC$MAINTFCN::
+	BUG_CHECK	UDAPORT,FATAL
+
+	.SBTTL	MRESET and MSTART
+
+;+
+; FPC$MRESET - causes connection ERROR ROUTINE to be called for all open
+;	connections and then does a HARDWARE INIT of the port.
+; FPC$MSTART is a NOP.
+;
+; Inputs:
+;	R4 => PDT
+;
+; Outputs:
+;	All registers preserved, however caller is returned to before the
+;		thread started by FPC$MRESET finishes.
+;-
+
+FPC$MRESET::
+
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save caller's registers.
+	MOVL	PDT$L_PU_UCB(R4),R5	; R5 => UCB for port.
+	BSBW	POST_POWER_FORK		; Start thread to call error routines
+					;  and to do hardware init.
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore caller's registers.
+FPC$MSTART::
+	RSB				; Return to caller.
+	.PAGE
+	.SBTTL	CONNECTION MANAGEMENT CALLS
+	.SBTTL	+	FPC$CONNECT,	COMPLETE PROCESSING A CONNECT
+
+;+
+; This routine is JMP'ed to from SCS$CONNECT with a CDT allocated
+; (and in the closed state) and initialized with the SYSAP's
+; connect parameters or 0's for fields not yet used.  FPC$CONNECT
+; does port-specific processing.
+;
+; The UDA port driver only supports one connection at a time.  The first
+; thing that FPC$CONNECT checks for is that there are no current connections
+; on this port. Then if there are none we check that the target of the
+; connection is one of the ones supported.  If so, then the initial credits
+; allotted to this connection are granted, the connection ID is saved, the
+; CDT address is stored and the CDT state is set to open.
+;
+; Inputs:
+;
+;	R3			-Addr of CDT
+;	R4			-Addr of PDT
+;
+;	CDT initialized as follows:
+;
+;	CDT$L_LCONID		-Local conid
+;	      MSGINPUT		-Addr to call in SYSAP for rec'd msgs
+;	      DGINPUT		-Addr to call in SYSAP for rec'd dgs
+;	      ERRADDR		-Addr to call in SYSAP for connection errors
+;	      RSTATION		-Remote station addr
+;	      PDT		-Addr of PDT
+;	      MINSEND		-Minimum send credit req'd by SYSAP
+;	      INITLREC		-Initial credit extended by SYSAP
+;	      DGREC		-Initial # of dg's queued 
+;	      STATE		-CLOSED
+;	      PB		-Addr of selected PB to remote system
+;	      WAITQFL/BL	-Set to show no entries
+;	      RPROCNAM		-Addr of dest process name
+;	      LPROCNAM		-Addr of local process name
+;	      CONDAT		-Addr of connect data
+;
+;	other CDT fields	-0
+;
+;
+;	(SP)			-Return PC in SYSAP
+;
+; Outputs:
+;
+;	R0			-Status:  SS$_NORMAL, SS$_FAILRSP,
+;					  SS$_REJECT, SS$_INSFMEM
+;	R1			-Reject reason or fail response reason
+;				 if R0 = REJECT or FAILRSP
+;	R2			-Addr of ACCEPT_REQ if R0 = success
+;	other registers		-Preserved
+;
+;	CDT$L_RCONID - UDA virtual circuit number
+;-
+
+	.ENABL	LSB
+VC0NAM:	.ASCII	/MSCP$DISK/		; Name for UDA VC 0
+VC0NAMLEN = .-VC0NAM			;  name length
+VC1NAM:	.ASCII	/MSCP$TAPE/		; Name for UDA VC 1
+VC1NAMLEN = .-VC1NAM			;  name length
+VC2NAM:	.ASCII	/DUP/			; Name for UDA VC 2
+VC2NAMLEN = .-VC2NAM			;  name length
+
+FPC$CONNECT::
+
+	MOVL	PDT$L_PU_UCB(R4),R0	; R0 => UCB.
+	BBC	#UCB$V_ONLINE,-		; Reject connect if offline.
+		UCB$W_STS(R0),CONREJ
+
+	$CHK_CDTSTATE -			; Verify that CDT state 
+		CLOSED,-		;  is closed;  if not,
+		ERROR=STATE_ERR		;  caller made error
+;
+; If the desired process name is MSCP$DISK, MSCP$TAPE or DUP, then the
+; connection can be completed.
+;
+	PUSHL	R3			; Remember R3=>CDT.
+	CMPC5	#VC0NAMLEN,VC0NAM,#^A/ /,-
+		#16,@CDT$L_RPROCNAM(R3) ; Is the connection to MSCP$DISK?
+	BEQL	CONVC0			; If yes make connection to VC0
+
+	MOVL	(SP),R3			; Refresh R3 => CDT.
+	CMPC5	#VC1NAMLEN,VC1NAM,#^A/ /,-
+		#16,@CDT$L_RPROCNAM(R3) ; Is the connection to MSCP$TAPE?
+	BEQL	CONVC1			; If yes make connection to VC1
+
+	MOVL	(SP),R3			; Refresh R3 => CDT.
+	CMPC5	#VC2NAMLEN,VC2NAM,#^A/ /,-
+		#16,@CDT$L_RPROCNAM(R3) ; Is the connection to DUP?
+	BEQL	CONVC2			; If yes make connection to VC2
+	POPL	R3			; Remove R3 from stack.
+CONREJ:
+	JSB	G^SCS$DEALL_CDT		; Free R3 => CDT.
+	MOVZWL	#SS$_REJECT,R0		; Otherwise reject connection
+	RSB				;
+;
+; Make a connection to MSCP$DISK which is virtual circuit 0 for a
+; UDA.
+;
+CONVC2:
+	MOVAB	PDT$L_PU_VC2(R4),R0	; Setup for common code.
+	MOVAB	PDT$W_PU_CRED2(R4),R1	; Initial credits to assign.
+	MOVL	#2,R2			; Remote connection ID.
+	BRB	CON_COMMON		; Branch around.
+
+CONVC1:
+	MOVAB	PDT$L_PU_VC1(R4),R0	; Setup for common code.
+	MOVAB	PDT$W_PU_CRED1(R4),R1	; Initial credits to assign.
+	MOVL	#1,R2			; Remote connection ID.
+	BRB	CON_COMMON		; Branch around.
+
+CONVC0:
+	MOVAB	PDT$L_PU_VC0(R4),R0	; Setup for common code.
+	MOVAB	PDT$W_PU_CRED0(R4),R1	; Initial credits to assign.
+	CLRL	R2			; Remote connection ID is zero.
+CON_COMMON:
+	POPL	R3			; Refresh R3 => CDT.
+	BBSS	R2,PDT$B_CONBITMAP(R4),-; Mark corresponding bit in bit map
+		CONREJ			;  as OPEN.  If already set, reject.
+	MOVL	R3,(R0)			; Save address of CDT for VCx
+	MOVL	R2,CDT$L_RCONID(R3)	; Set virtual circuit number into CDT
+	INCB	PDT$B_NOCURCON(R4)	; Increment # of current connections.
+
+	MOVW	(R1),CDT$W_SEND(R3)	; Put in initial send credits.
+
+	MOVW	#CDT$C_OPEN,-		; Move CDT state to
+		CDT$W_STATE(R3)		;  open
+	MOVZWL	S^#SS$_NORMAL,R0	; Set normal completion
+	RSB				; and return
+
+	.DSABL	LSB
+
+
+	.SBTTL	+	FPC$DCONNECT, PROCESS A DISCONNECT CALL
+
+;+
+; FPC$DCONNECT is called by the SYSAP.  It may be called only from the
+; open state.  The CDT is moved to the closed state.
+;
+; Inputs:
+;
+;	R0			-Disconnect reason
+;	R3			-Addr of CDT being disconnected
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-Status:  SS$_NORMAL, SS$_ILLCDTST
+;	R1,R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+
+FPC$DCONNECT::
+
+	MOVW	R0,CDT$W_REASON(R3)	; Save disconnect reason
+	$CHK_CDTSTATE	-		; Assure that CONNECTION is open.
+		OPEN,-
+		ERROR=STATE_ERR
+
+	MOVW	#CDT$C_CLOSED,-		; Move state to closed
+		CDT$W_STATE(R3)		;
+	DECB	PDT$B_NOCURCON(R4)	; Decrement # of current connections.
+
+	EXTZV	#0,#2,CDT$L_RCONID(R3),R0	; Get index of CDT pointer for
+	MOVAB	NULL_CDT,PDT$L_PU_CDTARY(R4)[R0];  this connection. Reset ptr.
+	JSB	G^SCS$DEALL_CDT		; Deallocate R3 => CDT.
+	MOVZWL	S^#SS$_NORMAL,R0	; Normal return status.
+	RSB				;
+	.PAGE
+	.SBTTL	SEQUENCED MESSAGE CALLS
+	.SBTTL	+	FPC$ALLOCMSG,	ALLOCATE A MESSAGE BUFFER
+
+;+
+; FPC$ALLOCMSG is optimized for the case where all resources that are
+; allocated are available.  FPC$ALLOCMSG  first checks the state of the
+; CONNECTION to assure that it is OPEN.  Then it allocates a send credit
+; and a buffer.  Finally it points R2 at the application (MSCP) portion
+; of the buffer, stores R2 in CDRP$L_MSG_BUF and returns a success code.
+;
+; Exceptions to this flow are handled out of line.
+;
+; First, if the CONNECTION state is NOT open, we return the SS$_ILLCDTST
+; status.
+;
+; If no send credits are available, the thread is suspended on the
+; CDT$L_CRWAITQBL.
+;
+; Finally, if no buffers are available, we first try to scare some up by
+; calling internal subroutine POLL_CMDRING, which polls the command ring
+; to free up slots and buffers.  If upon return from this call, a buffer
+; is available, we simply rejoin the mainline code.  If however, buffers
+; are still NOT available, we return the previously allocated send credit
+; and suspend the thread on PDT$L_BUFQBL.
+;
+; Upon resumption of threads from either of these wait Q's, we simply
+; branch back to the start of the routine and try all over again.
+;
+; Inputs:
+;
+;	R4			-Addr of PDT
+;	R5			-Addr of CDRP
+;	CDRP$L_CDT		-Addr of CDT
+;
+; Outputs:
+;
+;	R0			-Status:  SS$_NORMAL, SS$_ILLCDTST
+;	R1			-Destroyed
+;	R2			-Addr of message buffer, if status=success
+;	Other registers		-Preserved
+;
+;	CDRP$L_MSG_BUF		-Addr of message buffer, if status=success
+;-
+
+
+FPC$ALLOCMSG::
+
+	MOVL	CDRP$L_CDT(R5),R2	; Get CDT addr
+	$CHK_CDTSTATE	-		; Verify connection state
+		OPEN,-			;  is open.
+		ERROR=STATE_ERR,-	; Else report error to caller
+		CDT=R2			;
+
+	DECW	CDT$W_SEND(R2)		; Allocate the send credit.
+	BLSS	20$			; LSS means no credits available.
+	REMQUE	@PDT$L_PU_FQFL(R4),R0	; R0 => free buffer.
+	BVS	30$			; VS implies NO buffers.
+10$:
+	MOVAB	UDAB$T_TEXT(R0),R2	; R2 => MSCP portion of buffer.
+	MOVL	R2,CDRP$L_MSG_BUF(R5)	; Return to caller in CDRP as well.
+	MOVZWL	S^#SS$_NORMAL,R0	; Success return.
+	RSB				; And return.
+
+20$:
+	MOVL	CDT$L_CRWAITQBL(R2),R1	; R1 => where to INSQUE to await credits.
+	BRB	40$			; Branch around to common suspend code.
+30$:
+	BSBW	POLL_CMDRING		; Reclaim released buffers from
+					;  command ring.
+	REMQUE	@PDT$L_PU_FQFL(R4),R0	; Again try for R0 => free buffer.
+	BVC	10$			; VC implies buffers. Branch to mainline.
+	MOVL	CDRP$L_CDT(R5),R2	; Refresh R2=>CDT after call to POLL_CMDRING.
+	MOVL	PDT$L_PU_BUFQBL(R4),R1	; R1 => where to INSQUE to await buffers.
+40$:
+	INCW	CDT$W_SEND(R2)		; Return improper allocate.
+	POPL	CDRP$L_SAVD_RTN(R5)	; Save high level return.
+	$SUSP_SCS	(R1)		; Suspend on R1 => wait Q element.
+	PUSHL	CDRP$L_SAVD_RTN(R5)	; Restore high level return.
+	BRB	FPC$ALLOCMSG		; And go back to check on credits.
+	.PAGE
+	.SBTTL	+	FPC$DEALLOMSG,	DEALLOCATE A MESSAGE BUFFER
+
+;+
+; FPC$DEALLOMSG resets the message address specified by the caller to
+; the top of the message buffer and clears CDRP$L_MSG_BUF.  It then
+; decides whether to insert the free buffer onto the RESPONSE RING
+; or onto the free Q of buffers, with the RESPONSE RING having priority,
+; and being selected whenever it is not entirely full.  If the RESPONSE
+; RING is full then the buffer is INSQUEd onto PDT$L_PU_FQBL.
+;
+; If this INSQUE represents the first buffer on the free Q, then we
+; attempt to resume any threads waiting for buffers (PDT$L_PU_BUFQFL).
+; While the free Q remains non-empty and there exist threads waiting
+; for buffers, we continue to resume the threads until either we run
+; out of buffers or we run out of threads to resume.
+;
+; Internal entrypoint Q_DEALLOC_BUF is called from POLL_CMDRING after
+; R2 has been pointed at the buffer header.  Also internal entrypoint
+; INSERT_IN_RRING is called from INIT_PU_PDT at CONNECT time in order to
+; prime the RESPONSE RING.
+; Inputs:
+;
+;	R4			-Addr of PDT
+;	R5			-Addr of CDRP
+;	CDRP$L_MSG_BUF		-Addr of message buffer
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	Other registers		-Preserved
+;	CDRP$L_MSG_BUF		-Cleared
+;-
+
+FPC$DEALRGMSG::
+	SUBL	#UDAB$T_TEXT,R2		; R2 => buffer header.
+	BRB	Q_DEALLOC_BUF		;  and branch around to common code.
+FPC$DEALLOMSG::
+
+	SUBL3	#UDAB$T_TEXT,-
+		CDRP$L_MSG_BUF(R5),R2	; R2 => buffer header.
+	CLRL	CDRP$L_MSG_BUF(R5)	; Prevent spurious deallocates.
+
+FPC$QUEUEDG::
+Q_DEALLOC_BUF:				; Called here from POLL_CMDRING,
+					;  with R2 => free buffer.
+	CMPB	#UDA$K_RINGSIZE,-	; See if response ring is full up.
+		PDT$B_RRINGCNT(R4)
+	BLEQ	INSERT_IN_FREEQ		; LEQ implies full. Goto put on free Q.
+
+INSERT_IN_RRING:			; Here R2 => buffer to insert.
+
+	EXTZV	#0,#UDA$K_RINGEXP,-	; R0 = index of slot to use in response
+		PDT$B_RRINGINX(R4),R0	;  ring.
+
+	MOVB	UDAB$B_BUFFNO(R2),-	; Label new contents of this slot.
+		PDT$B_RRCONTENT(R4)[R0]
+
+	MOVB	R0,UDAB$B_RINGINX(R2)	; Remember where this buffer is for
+	MOVB	#1,UDAB$B_RINGNO(R2)	;  debugging.
+
+	ASSUME	UDAB$B_CREDTYPE	EQ	UDAB$W_MSG_LEN+2
+	ASSUME	UDAB$B_CONID	EQ	UDAB$B_CREDTYPE+1
+	MOVL	#UDAB$C_LENGTH-UDAB$T_TEXT,-	; Initialize response buffer
+		UDAB$W_MSG_LEN(R2)		;  length and zero credits,
+						;  type and conid.
+
+	MOVL	UDAB$L_DESCRIP(R2),-	; Fill in command ring slot.
+		PDT$L_RSPRING(R4)[R0]
+	INCB	PDT$B_RRINGINX(R4)	; Next time use next slot in ring.
+	INCB	PDT$B_RRINGCNT(R4)	; Increment # slots in use.
+
+INSERT_RTN:
+	RSB				; And return to caller or caller's caller.
+
+INSERT_IN_FREEQ:
+
+	INSQUE	UDAB$L_FLINK(R2),-	; Insert free buffer onto free Q.
+		@PDT$L_PU_FQBL(R4)
+	BNEQ	INSERT_RTN		; NEQ implies not first buffer on Q.
+10$:
+	$RESUME_FP	-		; Resume first thread awaiting buffers.
+		@PDT$L_PU_BUFQFL(R4),-
+		QEMPTY=INSERT_RTN	; Label to branch to if Q empty.
+
+	CMPL	PDT$L_PU_FQPTR(R4),-	; Test for emptiness of free Q.
+		PDT$L_PU_FQFL(R4)	;  If list points to itself, then empty.
+	BNEQ	10$			; NEQ means NOT empty, so try to resume
+	RSB				; Return to caller if empty.
+	.PAGE
+	.SBTTL	+	FPC$RCHMSGBUF,	RECYCLE MESSAGE BUFFER
+	.SBTTL	+			AT HIGH PRIORITY
+	.SBTTL	+	FPC$RCLMSGBUF,	RECYCLE MESSAGE BUFFER
+	.SBTTL	+			AT LOW PRIORITY
+
+;+
+; FPC$RCxMSGBUF checks if there is at least one send credit.  If
+; not, the SYSAP is suspended until there is.  FPC$RCxMSGBUF then
+; decrements the send credit.  The wait, if required, places the 
+; SYSAP CDRP at the end of the wait queue for low priority and at
+; the head of the queue for high priority.  The address of the
+; buffer being recycled is returned in R2.
+;
+; Inputs:
+;
+;	R4			-Addr of PDT
+;	R5			-Addr of CDRP
+;	CDRP$L_MSG_BUF		-Addr of message buffer
+;	CDRP$L_CDT		-Addr of CDT
+;
+; Outputs:
+;
+;	R0			-Status:  SS$_NORMAL, SS$_ILLCDTST
+;	R1			-Destroyed
+;	R2			-Addr of message buffer
+;	Other registers		-Preserved
+;-
+
+
+FPC$RCHMSGBUF::
+
+	MOVL	CDRP$L_CDT(R5),R1	; R1 => CDT.
+	$CHK_CDTSTATE	-		; Assure that connection open.
+		OPEN,-
+		ERROR=STATE_ERR,-
+		CDT=R1
+	DECW	CDT$W_SEND(R1)		; Test decrement a credit.
+	BLSS	10$			; LSS implies there were none to give.
+	MOVL	CDRP$L_MSG_BUF(R5),R2	; Return R2 => msg buffer.
+	MOVZWL	S^#SS$_NORMAL,R0	; Return status for caller
+	RSB				; And return.
+10$:					; Here only if allocation failure.
+	INCW	CDT$W_SEND(R1)		; Restore from above test decrement.
+	POPL	CDRP$L_SAVD_RTN(R5)	; Save first level return address.
+	$SUSP_SCS	-		; Suspend this thread at HEAD of 
+		CDT$L_CRWAITQFL(R1)	;  allocation wait list.
+	PUSHL	CDRP$L_SAVD_RTN(R5)	; Restore first level return to stack.
+	BRB	FPC$RCHMSGBUF		; Go back and try to allocate.
+
+FPC$RCLMSGBUF::
+
+	MOVL	CDRP$L_CDT(R5),R1	; R1 => CDT.
+	$CHK_CDTSTATE	-		; Assure that connection open.
+		OPEN,-
+		ERROR=STATE_ERR,-
+		CDT=R1
+	DECW	CDT$W_SEND(R1)		; Test decrement a credit.
+	BLSS	10$			; LSS implies there were none to give.
+	MOVL	CDRP$L_MSG_BUF(R5),R2	; Return R2 => msg buffer.
+	MOVZWL	S^#SS$_NORMAL,R0	; Return status for caller
+	RSB				; And return.
+10$:					; Here only if allocation failure.
+	INCW	CDT$W_SEND(R1)		; Restore from above test decrement.
+	POPL	CDRP$L_SAVD_RTN(R5)	; Save first level return address.
+	$SUSP_SCS	-		; Suspend this thread at TAIL of 
+		@CDT$L_CRWAITQBL(R1)	;  allocation wait list.
+	PUSHL	CDRP$L_SAVD_RTN(R5)	; Restore first level return to stack.
+	BRB	FPC$RCLMSGBUF		; Go back and try to allocate.
+	.PAGE
+	.SBTTL	+	FPC$SNDCNTMSG,	SEND COUNTED SEQUENCED MESSAGE
+; Inputs:
+;
+;	R1			-# bytes of application data
+;	R4			-Addr of PDT
+;	R5			-Addr of CDRP
+;	CDRP$L_CDT(R5)		-Addr of CDT
+;	CDRP$L_MSG_BUF(R5)	-Addr of message (user portion)
+;	CDRP$L_RSPID(R5)	-RSPID (to set RETFLG)
+;
+; Outputs:
+;
+;	R0			-Status:  SS$_NORMAL, SS$_ILLCDTST
+;	R1,R2			-Destroyed
+;	Other registers		-Preserved
+;-
+
+FPC$SNDCNTMSG::
+
+	MOVL	CDRP$L_CDT(R5),R0	; R0 => CDT
+	$CHK_CDTSTATE	-		; Verify connection is
+		OPEN,-			;  open
+		ERROR=STATE_ERR,-	; Else report error to SYSAP
+		CDT=R0
+
+	SUBL3	#UDAB$T_TEXT,-		; Point to buffer header.
+		CDRP$L_MSG_BUF(R5),R2	; R2 => buffer header.
+	CLRL	CDRP$L_MSG_BUF(R5)	; Prevent spurious deallocates.
+
+	ASSUME	UDAB$B_CREDTYPE		EQ	UDAB$W_MSG_LEN+2
+	ASSUME	UDAB$B_CONID		EQ	UDAB$B_CREDTYPE+1
+	MOVL	R1,UDAB$W_MSG_LEN(R2)	; Put message length in header.
+	MOVB	CDT$L_RCONID(R0),-	; Put remote connection ID in message
+		UDAB$B_CONID(R2)	;  header.
+
+	MOVQ	R3,CDRP$L_FR3(R5)
+	POPL	CDRP$L_FPC(R5)		; Save context in CDRP.
+
+	CMPB	#UDA$K_RINGSIZE,-	; See if any slots available in command
+		PDT$B_CRINGCNT(R4)	;  ring.
+	BLEQ	CRING_FULL		; LEQ implies ring full.
+
+INSERT_IN_CRING:			; Called from POLL_CMDRING with
+					;  R2 => buffer.
+
+	EXTZV	#0,#UDA$K_RINGEXP,-	; R0 = index of slot to use in command
+		PDT$B_CRINGINX(R4),R0	;  ring.
+
+
+	.IF	DF	UDA50_BYPASS
+	MOVL	UDAB$L_DESCRIP(R2),R1	; Copy descriptor to R1.
+	BICL	#UDA_M_OWN!-		; Clear port ownership and mark
+		 UDA_M_FLAG,R1		;  so port should NOT interrupt yet.
+	MOVL	R1,PDT$L_CMDRING(R4)[R0]; Copy into slot without hi order bits.
+	.ENDC
+
+	MOVB	UDAB$B_BUFFNO(R2),-	; Label new contents of this slot.
+		PDT$B_CRCONTENT(R4)[R0]
+
+	ASSUME	UDAB$B_RINGNO	EQ	UDAB$B_RINGINX+1
+	MOVZBW	R0,UDAB$B_RINGINX(R2)	; Remember where this buffer is for
+					;  debugging.
+
+	.IF	DF	PU_TRACE
+	BSBW	TRACE_COMMAND		; Copy command buffer to trace table.
+	.ENDC
+
+	MOVL	UDAB$L_DESCRIP(R2),-	; Fill in command ring slot.
+		PDT$L_CMDRING(R4)[R0]
+	MOVL	PDT$L_PU_CSR(R4),R1	; R1 => UDA CSR.
+	MOVW	UDAIP(R1),R0		; Jiggle controller register to force
+					;  polling of command ring.
+	INCB	PDT$B_CRINGINX(R4)	; Next time use next slot in ring.
+	INCB	PDT$B_CRINGCNT(R4)	; Increment # slots in use.
+
+	RSB				; And return to caller or caller's caller.
+
+CRING_FULL:
+
+; The following instructions (commented out) were useful in debugging only.
+;	BEQL	10$			; EQL means ring full not overflowed.
+;	BUG_CHECK	UDAPORT,FATAL	; Here we have overflowed command ring.
+;10$:
+	INSQUE	UDAB$L_FLINK(R2),-	; Insert onto tail of backed up buffers.
+		@PDT$L_PU_SNDQBL(R4)
+	BSBW	POLL_CMDRING		; Free up any possible slots in
+					;  command ring and dequeue from SND Q.
+	RSB				; Return to caller's caller.
+	.PAGE
+	.SBTTL	+	FPC$MAPIRP,	Map a buffer
+
+;+
+; FPC$MAPIRP - map a user buffer given IRP (CDRP) values.
+;
+; Inputs:
+;	R4 => PDT
+;	R5 => CDRP
+;	CDRP$L_LBUFH_AD => area to fill in with UNIBUS virtual address of
+;				user buffer.
+;
+; Outputs:
+;	CDRP$L_UBARSRCE	filled in with a) datapath assigned, b) # UBA map
+;					registers assigned, c) 1st map register
+;
+;	@CDRP$L_LBUFH_AD filled in with UNIBUS virtual address of user buffer
+;
+;	R0-R2	destroyed
+;	Other registers preserved.
+;-
+
+FPC$MAPIRP::
+
+	POPL	CDRP$L_SAVD_RTN(R5)	; Save return for two level process.
+	CLRL	CDRP$L_UBARSRCE(R5)	; Initialize.
+	JSB	@REQDATAPATH_TV		; Allocate datapath, if any available.
+	JSB	G^IOC$REQMAPUDA		; Allocate map registers.
+	JSB	G^IOC$LUBAUDAMAP	; Load map registers for this transfer.
+
+; Here we fill in the local buffer handle.  A description of the UBA mapping
+;	resources assigned to this transfer are currently in CDRP$L_UBARSRCE.
+;	We calculate the UNIBUS virtual address of the transfer and put this
+;	value into the @CDRP$L_LBUFH_AD.
+
+	MOVZWL	CDRP$W_BOFF(R5),R0	; Calculate UNIBUS virtual address of
+					;  user buffer. First get byte offset.
+	BICB	#1,R0			; Clear low bit in case of odd address.
+
+	INSV	CDRP$L_UBARSRCE+UBMD$W_MAPREG(R5),-
+		#9,#9,R0		; High order of UNIBUS virtual
+					;  address is map register #.
+
+	INSV	CDRP$L_UBARSRCE+UBMD$B_DATAPATH(R5),-
+		#24,#8,R0		; Place datapath number in high byte.
+
+	MOVL	CDRP$L_LBUFH_AD(R5),R1	; R1 => destination for buffer handle.
+
+	MOVL	R0,(R1)+		; Write "UBA" buffer
+	CLRQ	(R1)			;  handle and zero out rest.
+	JMP	@CDRP$L_SAVD_RTN(R5)	; Return to top level caller.
+	.PAGE
+	.SBTTL	+	FPC$UNMAP,	Release mapping resources
+
+;+
+; FPC$UNMAP
+;
+; Inputs:
+;	R5 => CDRP
+;	CDRP$L_UBARSRCE	contains accounting of allocated resources.
+;	CDRP$L_LBUFH_AD => local buffer handle.
+;
+; Outputs:
+;	Resources returned
+;	CDRP$L_LBUFH_AD cleared
+;	R0-R2 destroyed
+;	Other registers preserved
+;-
+
+FPC$UNMAP::
+
+	JSB	G^IOC$RELMAPUDA		; Return allocated map registers.
+	JSB	@RELDATAPATH_TV		; And also the datapath.
+	CLRL	CDRP$L_LBUFH_AD(R5)	; Prevent spurious deallocates.
+	RSB				; Return to caller.
+	.PAGE
+	.SBTTL	INTERNAL SUBROUTINES
+	.SBTTL	+	POLL_CMDRING
+
+;+
+; POLL_CMDRING is called to poll the command ring and reclaim any slots (and
+; the buffers pointed to by them) that have been released back to the host by
+; the port.  POLL_CMDRING makes use of some PDT fields:
+;
+;	PDT$B_CRINGCNT - which maintains the count of how many as yet
+;			unreclaimed slots the host has sent to the port.
+;
+;	PDT$B_CPOLLINX - whose low order UDA$K_RINGEXP bits contain the index
+;			of the command ring slot which we should poll next.
+;
+;	PDT$B_CRCONTENT - an array of UDA$K_RINGSIZE bytes, each of which
+;			maintains the index of the buffer currently pointed
+;			at by the corresponding ring slot.
+;
+;	PDT$L_BDTABLE - an array of UDA$K_RINGSIZE longwords, each of which
+;			point to the buffer corresponding to the index of the
+;			longword.
+;
+; POLL_CMDRING polls ring slots to see if the port has released them until
+; either of the following two conditions obtain: PDT$B_CRINGCNT goes to zero,
+; indicating that all command ring slots sent to the port have been reclaimed;
+; or upon polling a slot we come upon one that has NOT been released as yet.
+; Since slots are released in sequence, this means that we should cease
+; polling.
+;
+; POLL_CMDRING always polls the slot selected by PDT$B_CPOLLINX.  The low order
+; bits of this field are extracted and used as an index into the two arrays
+; mentioned above.
+;
+; A slot is polled by testing its high order bit. A zero bit indicates that
+; the slot has been released to the host.  Upon finding a released slot,
+; POLL_CMDRING reclaims it and the buffer pointed to it by:
+;
+;	1. The index of the buffer is obtained from the element of the
+;		PDT$B_CRCONTENT array corresponding to the current ring slot.
+;
+;	2. A pointer to the buffer is obtained from the PDT$L_BDTABLE array.
+;
+;	3. PDT$B_CPOLLINX is incremented so that the next poll will use the
+;		next slot in the command ring.
+;
+;	4. PDT$B_CRINGCNT is decremented to show one less unreclaimed slot.
+;
+;	5. If any buffers are queued waiting for available ring slots on
+;		PDT$L_PU_SNDQFL, the first one is removed from the Q and
+;		inserted into the command ring by calling internal subroutine
+;		INSERT_IN_CRING.
+;
+;	6. The now free buffer is put onto the response ring or the free Q,
+;		whichever is appropriate, by calling internal subroutine,
+;		Q_DEALLOC_BUF.
+;
+;	7. Finally we branch back to the beginning of POLL_CMDRING to poll
+;		again.
+;
+; Inputs:
+;
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-destroyed
+;	Other registers		-preserved
+;-
+
+POLL_CMDRING:
+
+	TSTB	PDT$B_CRINGCNT(R4)	; See if any slots in use on command
+	BEQL	20$			;  ring. EQL implies NO.
+
+	EXTZV	#0,#UDA$K_RINGEXP,-	; Extract ring index of slot of
+		PDT$B_CPOLLINX(R4),R2	;  where to begin polling.
+
+	TSTL	PDT$L_CMDRING(R4)[R2]	; Has controller released this slot?
+	BLSS	20$			; LSS implies NO.
+
+	MOVZBL	PDT$B_CRCONTENT(R4)[R2],R2	; R2 = index of buffer pointed
+						;  at by this slot.
+	MOVL	PDT$L_BDTABLE(R4)[R2],R2	; R2 => buffer header.
+
+	PUSHL	R2				; Remember R2 => free buffer.
+
+	INCB	PDT$B_CPOLLINX(R4)	; Bump polling index.
+	DECB	PDT$B_CRINGCNT(R4)	; One less used command ring slot.
+
+	REMQUE	@PDT$L_PU_SNDQFL(R4),R2	; R2 => buffer (if any) to be inserted
+	BVS	10$			;  in command ring. VS implies NONE.
+	BSBW	INSERT_IN_CRING		; Call to insert R2 => buffer in ring.
+10$:
+	POPL	R2			; Restore R2 => free buffer.
+	BSBW	Q_DEALLOC_BUF		; Call to put free buffer onto response
+					;  ring or onto free Q, whichever is
+					;  appropriate.
+	BRB	POLL_CMDRING		; Branch back to reclaim more buffers.
+20$:
+	RSB				; Return to caller.
+	.PAGE
+	.SBTTL	-	STATE_ERR,	RETURN CDT STATE ERROR
+	.SBTTL	-			TO SYSAP
+
+;+
+; Set error status code and return to caller.
+;-
+
+STATE_ERR:
+
+	MOVZWL	#SS$_ILLCDTST,R0		; Status = illegal CDT state
+	RSB				; Return to SYSAP
+
+
+	.PAGE
+	.SBTTL	INTERRUPT SERVICING
+	.SBTTL	+	PU$INT - Interrupt service routine
+;
+; Inputs:
+;	00(SP) - Pointer to IDB
+; 	04(SP)	- SAVED R0
+; 	08(SP)	- SAVED R1
+; 	12(SP)	- SAVED R2
+; 	16(SP)	- SAVED R3
+; 	20(SP)	- SAVED R4
+; 	24(SP)	- SAVED R5
+; 	28(SP)	- PC AT THE TIME OF THE INTERRUPT
+; 	32(SP)	- PSL AT THE TIME OF THE INTERRUPT
+;
+
+PU$INT::					;
+	MOVL	@(SP)+,R3		; Get address of IDB
+	MOVL	IDB$L_OWNER(R3),R5	; Get address of UCB
+	MOVL	UCB$L_PDT(R5),R4	; Get address of PDT
+	MOVL	IDB$L_CSR(R3),R3	; R3 => UDA CSR.
+	MOVW	UDASA(R3),-
+		UCB$W_UDASA(R5)		; Save error status in UCB.
+
+	MOVB	PDT$B_PURGEDP(R4),R0		; Fetch Purge data path number
+	BEQL	10$				; Br if none
+	CLRB	PDT$B_PURGEDP(R4)		; Clear it
+	MOVL	UCB$L_CRB(R5),R1		; R1 => CRB to setup for purge
+	MOVB	R0,CRB$L_INTD+VEC$B_DATAPATH(R1); Set path number for purge
+	JSB	G^IOC$PURGDATAP			; Purge specified data path
+	MOVL	PDT$L_PU_CSR(R4),R3		; Refresh R3=>CSR after purge
+	CLRW	UDASA(R3)			; Acknowledge purge interrupt
+	MOVL	UCB$L_CRB(R5),R1		; Refresh R1 => CRB.
+	CLRB	CRB$L_INTD+VEC$B_DATAPATH(R1)	; Clear datapath # from CRB.
+10$:
+	BBCC	#UCB$V_INT,-		; See if we are awaiting interrupt. If
+		UCB$W_STS(R5),20$	;  so then we are in hardware init. If
+					;  not, branch around.
+	MOVQ	UCB$L_FR3(R5),R3	; Restore initialization thread
+	JSB	@UCB$L_FPC(R5)		;  context.
+	BRB	30$			; And branch around to dismiss interrupt.
+20$:
+
+	BBSS	#UCB$V_PU_FRKBSY,-	; Appropriate UCB fork block, or else
+		UCB$W_DEVSTS(R5),30$	;  branch to dismiss interrupt
+	BSBB	POLL_RSPRING		; If we were successful in appropriating
+					;  the fork block, BSBB to poll the
+					;  response ring.
+30$:
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore registers.
+	REI				; And dismiss interrupt.
+	.PAGE
+	.SBTTL	+	POLL_RSPRING
+
+;+
+; POLL_RSPRING is called from the interrupt service routine at device IPL and
+; with the UCB fork allocated to this thread (i.e. UCB$M_PU_FRKBSY bit on in
+; UCB$W_DEVSTS).  POLL_RSPRING first IOFORK's on the UCB so that the interrupt
+; can be dismissed and then after resuming execution at fork IPL, it frees up
+; the UCB fork block (i.e. clears UCB$M_PU_FRKBSY) and tests whether a power
+; failure has occurred recently.  If so, then we merely branch out of the flow
+; here to begin a thread at POST_POWER_FORK, that causes all CONNECTION's to
+; resynchronize.
+;
+; If we remain here (normal case) we traverse the response ring looking for
+; buffers that have been released to the host (us), and upon finding one
+; we determine whether it is a SEQUENCED MESSAGE or a DATAGRAM and we call
+; the appropriate entrypoint in the SYSAP for the CONNECTION over which the
+; message was received.
+;
+; Inputs:
+;
+;	R4				-Addr of PDT
+;	R5				-Addr of UCB
+;
+;	UCB fork block allocated to this thread
+;
+; Outputs:
+;
+;	Response ring polled and SYSAPs called
+;-
+
+POLL_RSPRING:
+
+	IOFORK				; Lower IPL.
+	BICW	#UCB$M_PU_FRKBSY,-
+		UCB$W_DEVSTS(R5)	; Allow fork block to be re-used.
+	TSTW	UCB$W_UDASA(R5)		; See if we got a fatal error.
+	BLSS	5$			; LSS means fatal error.
+	BBC	#UCB$V_POWER,-		; See if POWERFAIL occurred while
+		UCB$W_STS(R5),10$	;  UCB fork block was busy. Branch if not.
+	BRB	8$			; Branch around if YES powerfail.
+5$:
+	MOVW	#UDASA_ATTNCODE,-	; Indicate what kind of error log record
+		UCB$W_ATTNCODE(R5)	;  we are about to create.
+	JSB	G^ERL$DEVICEATTN	; Call to create error log record of INIT.
+8$:
+	BRW	POST_POWER_FORK		; If POWERFAIL, get out of here.
+10$:
+	BBCC	#0,PDT$W_CMDINT(R4),20$	; Branch if command ring NOT UNfull.
+	BSBW	POLL_CMDRING		; Reclaim free space in command ring.
+20$:
+	CLRW	PDT$W_RSPINT(R4)	; Always clear response interrupt
+					;  indication since we always poll
+					;  response ring on interrupt.
+30$:
+	TSTB	PDT$B_RRINGCNT(R4)	; See if response ring has anything to
+	BNEQ	50$			;  poll.  NEQ implies YES.
+40$:
+	RSB				; If no more, kill this thread.
+50$:
+	EXTZV	#0,#UDA$K_RINGEXP,-	; Extract index mod sing size leaving
+		PDT$B_RPOLLINX(R4),R0	;  R0 = index of slot to poll.
+	TSTL	PDT$L_RSPRING(R4)[R0]	; See if slot released to host.
+	BLSS	40$			; LSS => slot still owned by controller.
+
+	INCB	PDT$B_RPOLLINX(R4)	  ; Bump response poll index.
+	DECB	PDT$B_RRINGCNT(R4)	  ; Decr # slots passed to controller.
+	MOVZBL	PDT$B_RRCONTENT(R4)[R0],R0; R0 = index of buffer with response.
+	MOVL	PDT$L_BDTABLE(R4)[R0],R3  ; R3 => buffer with response.
+
+	.IF	DF	PU_TRACE
+	BSBW	TRACE_RESPONSE		; Copy response buffer to trace table.
+	.ENDC
+
+	REMQUE	@PDT$L_PU_FQFL(R4),R2	; R2 => free buffer.
+	BVC	55$			; VC implies R2 => buffer.
+	BSBW	POLL_CMDRING		; If no buffers, reclaim some.
+	CMPB	#UDA$K_RINGSIZE,-	; For debugging, assure that we indeed
+		PDT$B_RRINGCNT(R4)	;  have a full response ring.
+	BEQL	57$			; EQL implies full response ring.
+	BUG_CHECK	UDAPORT,FATAL	; Else bug check for now.
+55$:
+	BSBW	INSERT_IN_RRING		; Else insert free buffer in response
+					;  ring.
+
+57$:	MOVL	R3,R0			; R0 => buffer with response.
+
+;	MOVZBL	UDAB$B_CONID(R0),R3	 ; R3 = connection ID of message.
+; Here we assume that VC0 is DISK MSCP, VC1 is TAPE MSCP, VC2 is DUP and
+;	VC255 (low order bits both on) so that VC255 maps to VC3
+	EXTZV	#0,#2,-			; Low order 2 bits select connection.
+		UDAB$B_CONID(R0),R3	;  R3 = connection ID of message.
+	MOVL	PDT$L_PU_CDTARY(R4)[R3],R3; R3 => CDT.
+
+	EXTZV	#UDAB$V_CREDITS,-	; Extract credits returned by message.
+		#UDAB$S_CREDITS,-
+		UDAB$B_CREDTYPE(R0),R1
+	MOVW	CDT$W_SEND(R3),R2	; Remember # credits before add.
+	ADDW	R1,CDT$W_SEND(R3)	; Add in new credits.
+	TSTW	R2			; Test credits before add.
+	BGTR	80$			; GTR implies that we had not run out
+					;  before this.
+	PUSHL	R0			; Save R0 => UDAB.
+60$:
+	TSTW	CDT$W_SEND(R3)		; See if we are positive here.
+	BLEQ	70$			; LEQ means no more credits left.
+	$RESUME_FP	-		; Resume anyone waiting for credits
+		@CDT$L_CRWAITQFL(R3),-
+		QEMPTY=70$		; Where to go if no waiters.
+	BRB	60$			; Go back and try to resume more.
+70$:
+	POPL	R0			; Restore R0 => UDAB
+80$:
+	MOVAB	UDAB$T_TEXT(R0),R2	; R2 => application area of message.
+	MOVZWL	UDAB$W_MSG_LEN(R0),R1	; Pickup length of datagram or message.
+	PUSHL	R4			; Save R4 => PDT before dispatching.
+	EXTZV	#UDAB$V_MSGTYPE,-	; Extract type of message.
+		#UDAB$S_MSGTYPE,-
+		UDAB$B_CREDTYPE(R0),R5
+	ASSUME	UDA$K_SEQMSGTYP	EQ	0
+	BNEQ	90$			; NEQ means NOT sequenced message.
+	JSB	@CDT$L_MSGINPUT(R3)	; Call sequenced message handler
+					;  passing R2 => message text.
+85$:
+	POPL	R4			; Restore R4 => PDT after dispatching.
+	BRW	30$			; Go back to test for more responses.
+90$:
+	CMPL	#UDA$K_DGTYPE,R5	; See if Datagram message.
+	BNEQ	100$			; NEQ means test for something else.
+	JSB	@CDT$L_DGINPUT(R3)	; Call datagram handler passing
+					;  R2 => datagram, with R1 = length.
+	BRB	85$			; Go back to test for more responses.
+100$:
+	BUG_CHECK	UDAPORT,FATAL
+	
+PU$END:
+	.END

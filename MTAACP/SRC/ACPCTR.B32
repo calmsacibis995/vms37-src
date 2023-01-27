@@ -1,0 +1,779 @@
+
+MODULE ACPCTR (LANGUAGE (BLISS32) ,
+		IDENT = 'V03-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  MTAACP
+!
+! ABSTRACT:
+!	This module handles acp control functions.
+!
+! ENVIRONMENT:
+!
+!	Starlet operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+
+!
+!
+! AUTHOR:  D. H. Gillespie,	 CREATION DATE:  09-JUL-1977
+!
+! MODIFIED BY:
+!
+!	V02-011 DMW00077	David Michael Walp	 8-Feb-1982
+!		Stored account and user name during mount time
+!
+!	V02-010 DMW00034	David Michael Walp	15-Sep-1981
+!		Fixed Cancel I/O vs Dismount race condition
+!
+!	V02-009 DMW00024	David Michael Walp	20-Jul-1981
+!		Change to RET_FREE_PAGE to not contract region P0 every time
+!		space is returned.
+!
+!       V02-008 DMW00009	David Michael Walp	14-Mar-1981
+!		Changed calculation of CCB address
+!
+!       V02-007 DMW00001	David Michael Walp	11-Nov-1980
+!		New BLISS compiler, FUNCTION declaration changed from
+!		BBLOCK to BLOCK. Old compiler used to give a longword
+!		with a declaration of "BBLOCK [1]".
+!
+!	V02-006	REFORMAT	Maria del C. Nasr	30-Jun-1980
+!
+!	V02-005 MCN0017		Maria del C. Nasr	18-Jun-1980
+!		Add a call to START_VIO after completing the next volume
+!		write.  This is part of the fix for multivolume processing,
+!		in which a new volume should be requested when the EOT is
+!		sensed in writing the header labels, and not wait for the
+!		data to be written.
+!
+!	V02-004	SPR27361	Maria del C. Nasr	10-Jun-1980
+!		Add a call to START_VIO after completing the next volume
+!		read.  This is part of the general fix which delays IO
+!		posting until all IO is successfully completed.
+!
+!	A0103	MCN0007		Maria del C. Nasr	13-Nov-1979   19:35
+!		Set single directory structured device bit (DEV$M_SDI)
+!
+!
+!**
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+
+REQUIRE 'SRC$:MTADEF.B32';
+
+FORWARD ROUTINE
+    MTA_ACPCNTRL	: NOPRES NOVALUE, ! control function dispatch
+    MTA_MOUNT	: NOPRES NOVALUE,	  ! mount function
+    CANCEL_IO	: COMMON_CALL NOVALUE,	  ! cancel i/o control
+    DO_CANCEL	: COMMON_CALL NOVALUE,	  ! do actual cancelation of io
+    MOUNT	: COMMON_CALL NOVALUE,	  ! mount control function, kernel mode
+    STALL	: COMMON_CALL NOVALUE,	  ! stall cancel
+    TERMINATE_VOL: COMMON_CALL NOVALUE;   ! terminate mount volume request
+
+EXTERNAL ROUTINE
+    CANCEL_OP_REPLY	: COMMON_CALL,		   ! cancel reply from operator
+    IO_DONE,					   ! complete io
+    NEXT_VOL_READ	: L$NEXT_VOL_READ NOVALUE, ! get next vol for read
+    NEXT_VOL_WRITE	: L$NEXT_VOL_WRIT NOVALUE, ! get next vol for write
+    READ_BLOCK	: COMMON_CALL,			   ! read a tape block
+    RET_FREE_PAGE	: COMMON_CALL,	   ! return virtual page to free list
+    RETURN_ALL_ERR	: COMMON_CALL,	   ! return blocked virtual io in error
+    SEND_ERRLOG,
+    SPACE_TM	: COMMON_CALL,			   ! space tape mark
+    START_VIO	: COMMON_CALL,			   ! start up virtual io
+    SYS$QIOW	: ADDRESSING_MODE (ABSOLUTE),
+    ZERO_CHANNEL	: COMMON_CALL;		   ! zero channel
+
+EXTERNAL
+    SCH$GL_PCBVEC	: REF VECTOR ADDRESSING_MODE (ABSOLUTE),
+    CURRENT_UCB	: REF BBLOCK,
+    CURRENT_WCB	: REF BBLOCK,	! address of current window control block
+    HDR1	: REF BBLOCK,	! hdr1(eof1) label
+    IO_CHANNEL,
+    IO_PACKET	: REF BBLOCK,	! address of current io packet
+    USER_STATUS;		! address of user status
+
+
+GLOBAL ROUTINE MTA_ACPCNTRL : NOPRES NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine handles the acp control function.
+!
+! CALLING SEQUENCE:
+!	MTA_ACPCNTRL()
+!
+! INPUT PARAMETERS:
+!	None
+!
+! IMPLICIT INPUTS:
+!	CURRENT_UCB - address of current unit control block
+!	CURRENT_VCB - address of current volume control block
+!	IO_PACKET - address of current io request packet
+!	QUEUE_HEAD  - address of acp queue
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	LOCAL_FIB - copy of user's fib
+!
+! ROUTINE VALUE:
+!	None
+!
+! SIDE EFFECTS:
+!	None
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    EXTERNAL ROUTINE
+	GET_FIB	: COMMON_CALL,		! get user's file information block
+	POSITION_TO_END	: COMMON_CALL,		! position volume set to end
+	SPACE_IN_FILE	: COMMON_CALL,		! space within file
+	REWIND_FILE	: COMMON_CALL,		! rewind file
+	REWIND_VOL_SET	: COMMON_CALL;		! rewind volume set
+
+    EXTERNAL
+
+	! address of current unit control block
+	!
+	CURRENT_UCB	: REF BBLOCK,
+	IO_PACKET	: REF BBLOCK,		! address of current io request
+						!   packet
+	QUEUE_HEAD	: REF BBLOCK;		! address of acp queue head
+
+    LOCAL
+	FIB	        : REF BBLOCK,		! address of copy of user's 
+						!   file info block
+	FUNCTION	: BLOCK [1],		! io function code and
+						!   modifiers
+	PACKET	: REF BBLOCK;			! address of io request packet
+
+    PACKET = .IO_PACKET;			! get address  of io packet
+    FUNCTION = .PACKET[IRP$W_FUNC];	! get function code and modifiers
+
+    IF .FUNCTION[IO$V_DMOUNT]
+	OR
+	.FUNCTION[IO$V_MOUNT]
+    THEN
+	RETURN;
+
+    IF NOT .PACKET[IRP$V_VIRTUAL]
+    THEN
+	BEGIN
+	KERNEL_CALL(CANCEL_IO);
+
+	IF (.CURRENT_VCB[VCB$V_WAIMOUVOL]
+	    AND
+	    NOT CANCEL_OP_REPLY())
+	    OR
+	    .CURRENT_VCB[VCB$V_WAIUSRLBL]
+	THEN
+	    BEGIN
+	    ERROR(SS$_CANCEL);
+	    KERNEL_CALL(DO_CANCEL);
+	    END;
+
+	! Stall cancel until rewind or mount vol complete so cancels are not
+	! continuously issued.
+	!
+
+	IF .CURRENT_VCB[VCB$V_WAIREWIND]
+	    OR
+	    .CURRENT_VCB[VCB$V_WAIMOUVOL]
+	THEN
+	    KERNEL_CALL(STALL);
+
+	RETURN;
+
+	END;
+
+    FIB = GET_FIB(.BBLOCK[.PACKET[IRP$L_SVAPTE], AIB$L_DESCRIPT]);
+
+    IF .CURRENT_VCB[VCB$V_WAIUSRLBL]
+    THEN
+	ERR_EXIT(SS$_WAITUSRLBL);
+
+    IF .CURRENT_VCB[VCB$V_MUSTCLOSE]
+    THEN
+	ERR_EXIT(SS$_MUSTCLOSEFL);
+
+    CASE .FIB[FIB$W_CNTRLFUNC] FROM FIB$C_REWINDVOL TO FIB$C_REWINDFIL OF
+	SET
+
+	[FIB$C_REWINDFIL] :
+	    REWIND_FILE();
+
+	[FIB$C_POSEND] :
+	    POSITION_TO_END();
+
+	[FIB$C_NEXTVOL] :
+	    BEGIN
+
+	    ! file must be accessed
+	    !
+
+	    IF .CURRENT_WCB EQL 0
+	    THEN
+		ERR_EXIT(SS$_FILNOTACC);
+
+	    ! if not in data area, not appropriate time to be doing a next
+	    ! volume
+	    !
+
+	    IF .CURRENT_VCB[VCB$B_TM] NEQ 1
+	    THEN
+		ERR_EXIT(SS$_ILLSEQOP);
+
+	    IF .CURRENT_WCB[WCB$V_READ]
+	    THEN
+		BEGIN				! read case
+		SPACE_TM(1);			! space to trailer record
+
+		IF NOT READ_BLOCK(.HDR1, 80)
+		THEN
+		    ERR_EXIT(SS$_TAPEPOSLOST);
+
+		IF .HDR1[EO1$L_EO1LID] EQL 'EOF1'
+		THEN
+		    ERR_EXIT(SS$_ENDOFFILE);
+
+		NEXT_VOL_READ();
+		END
+	    ELSE
+		NEXT_VOL_WRITE();		! write case
+	    KERNEL_CALL(START_VIO);		! requeue blocked io
+	    END;
+
+	[FIB$C_SPACE] :
+	    SPACE_IN_FILE();
+
+	[FIB$C_REWINDVOL] :
+	    REWIND_VOL_SET();
+
+	[OUTRANGE] :
+	    ERR_EXIT(SS$_ILLCNTRFUNC);
+
+	[INRANGE] :
+	    ERR_EXIT(SS$_ILLCNTRFUNC);
+	TES;
+
+    END;
+
+
+ROUTINE MOUNT : COMMON_CALL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine gets a virtual page for the mounted volume to use
+!
+! CALLING SEQUENCE:
+!	Mount(), must be called in kernel mode
+!
+! INPUT PARAMETERS:
+!	None
+!
+! IMPLICIT INPUTS:
+!	CURRENT_UCB - address of currnet unit control block
+!	CURRENT_VCB - address of current volume control block
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	Virtual page for volume to use
+!
+! ROUTINE VALUE:
+!	None
+!
+! SIDE EFFECTS:
+!	None
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    EXTERNAL ROUTINE
+	GET_FREE_PAGE	: COMMON_CALL;		! get free virtual page
+
+    EXTERNAL
+
+	! address of current unit control block
+	!
+	CURRENT_UCB	: REF BBLOCK;
+
+    LOCAL
+	JIB	: REF BBLOCK,
+	PCB	: REF BBLOCK,
+	VPAGE	: REF BBLOCK;	! address of virtual page for volume set
+
+    ! get virtual page for use by the volume set
+    !
+    GET_FREE_PAGE(1, VPAGE);
+    VPAGE[VVP$B_TYPE] = VVP_TYPE;
+    INSQUE(.VPAGE, CURRENT_VCB[VCB$L_VPFL]);
+    VPAGE[VVP$L_STALLIOFL] = VPAGE[VVP$L_STALLIOFL];
+    VPAGE[VVP$L_STALLIOBL] = VPAGE[VVP$L_STALLIOFL];
+
+    CURRENT_UCB[UCB$L_DEVCHAR] = .CURRENT_UCB[UCB$L_DEVCHAR]
+				  OR
+				  (DEV$M_MNT OR DEV$M_DIR OR DEV$M_SDI);
+
+    ! save the Account and User names
+    !
+    PCB = .SCH$GL_PCBVEC [ .(IO_PACKET[IRP$L_PID])<0, 16> ];
+    JIB = .PCB [ PCB$L_JIB ];
+    CH$MOVE ( VVP$S_USERNAME, JIB [JIB$T_USERNAME], VPAGE [VVP$T_USERNAME] );
+    CH$MOVE ( VVP$S_ACCOUNT,  JIB [JIB$T_ACCOUNT],  VPAGE [VVP$T_ACCOUNT] );
+    END;					! end of page
+
+ROUTINE CANCEL_IO : COMMON_CALL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine sets the cancel io indicator if a file is accessed.
+!
+! CALLING SEQUENCE:
+!	CANCEL_IO()
+!
+! INPUT PARAMETERS:
+!	None
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB - address of current volume control block
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	None
+!
+! ROUTINE VALUE:
+!	None
+!
+! SIDE EFFECTS:
+!	None
+!
+! USER ERRORS:
+!	None
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    IF .CURRENT_VCB[VCB$L_WCB] NEQ 0
+	OR
+	.CURRENT_VCB[VCB$V_WAIREWIND]
+	OR
+	.CURRENT_VCB[VCB$V_WAIMOUVOL]
+    THEN
+
+	! remember that cancel was issued
+	!
+	CURRENT_VCB[VCB$V_CANCELIO] = 1;
+
+    END;
+
+
+GLOBAL ROUTINE DO_CANCEL : COMMON_CALL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine cancels all blocked io and acp functions.
+!
+! CALLING SEQUENCE:
+!	DO_CANCEL(), called in kernel mode
+!
+! INPUT PARAMETERS:
+!	None
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB - address of current volume control block
+!	USER_STATUS - contains error code which blocked io should be returned with
+!
+! OUTPUT PARAMETERS:
+!	USER_STATUS - reset to normal status
+!
+! IMPLICIT OUTPUTS:
+!	None
+!
+! ROUTINE VALUE:
+!	None
+!
+! SIDE EFFECTS:
+!	None
+!
+! USER ERRORS:
+!	None
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    EXTERNAL ROUTINE
+	CHECK_DISMOUNT	: COMMON_CALL;		! get free virtual page
+
+    LOCAL
+	ABD	: REF BBLOCKVECTOR [, ABD$C_LENGTH],
+
+	! address containing information about blocked request
+	!
+	BLOCK_PAGE,
+	FUNCTION	: BLOCK [1],
+	PACKET	: REF BBLOCK,		! address of io blocked request
+	WINDOW;				! address of window for this request
+
+    ! If the process does not have a virtual page containing the information
+    ! describing the blocked request then have  fatal error
+    !
+
+    IF .CURRENT_VCB[VCB$L_VPFL] EQLA .CURRENT_VCB[VCB$L_VPBL]
+    THEN
+	BUG_CHECK(NOBVPVCB);
+
+    REMQUE(.CURRENT_VCB[VCB$L_VPBL], BLOCK_PAGE);
+    PACKET = .(.BLOCK_PAGE + VVP$K_LENGTH + IO_PACKET - USER_STATUS);
+    RET_FREE_PAGE(.BLOCK_PAGE,FALSE);	! return page(s) to virtual memory
+    RETURN_ALL_ERR();		! return all blocked physical io in error
+
+    IF .CURRENT_VCB[VCB$V_WAIMOUVOL]
+	OR
+	.CURRENT_VCB[VCB$V_WAIREWIND]
+    THEN
+	TERMINATE_VOL(.CURRENT_VCB[VCB$L_WCB]);
+
+    ! If fib descriptor present, zero count so the fib is not returned.
+    ! complete i/o.
+    !
+
+    IF .PACKET NEQ 0
+    THEN
+	BEGIN
+
+	!
+	!
+
+	IF .PACKET[IRP$V_COMPLX]
+	THEN
+	    BEGIN
+	    FUNCTION = .PACKET[IRP$W_FUNC];
+	    ABD = .BBLOCK[.PACKET[IRP$L_SVAPTE], AIB$L_DESCRIPT];
+
+	    IF .FUNCTION[IO$V_ACCESS]
+	    THEN
+		ZERO_CHANNEL(.PACKET)
+	    ELSE
+		BEGIN
+		FUNCTION = .PACKET[IRP$V_FCODE];
+
+		IF .FUNCTION NEQ IO$_DEACCESS
+		THEN
+		    ABD[ABD$C_WINDOW, ABD$W_COUNT] = 0;
+
+		END;
+
+	    ABD[ABD$C_FIB, ABD$W_COUNT] = 0;
+	    END;
+
+	IO_DONE(.PACKET);
+	END;
+
+    ! return stalled i/o with cancel
+    !
+
+    WHILE 1
+    DO
+	BEGIN
+
+	LOCAL
+	    SAVE_STATUS;
+
+	IF REMQUE(.BBLOCK[.CURRENT_VCB[VCB$L_VPFL], VVP$L_STALLIOFL], PACKET)
+	THEN
+	    EXITLOOP;
+
+	IF .PACKET[IRP$V_COMPLX]
+	THEN
+	    BEGIN
+	    FUNCTION = .PACKET[IRP$W_FUNC];
+	    ABD = .BBLOCK[.PACKET[IRP$L_SVAPTE], AIB$L_DESCRIPT];
+
+	    IF .FUNCTION[IO$V_ACCESS]
+	    THEN
+		ZERO_CHANNEL(.PACKET)
+	    ELSE
+		ABD[ABD$C_WINDOW, ABD$W_COUNT] = 0;
+
+	    ABD[ABD$C_FIB, ABD$W_COUNT] = 0;
+	    END;
+
+	! If this is a cancel request, return is with normal status
+	!
+	SAVE_STATUS = .USER_STATUS;
+	FUNCTION = .PACKET[IRP$V_FCODE];
+
+	IF .FUNCTION EQL IO$_ACPCONTROL
+	    AND
+	    NOT .PACKET[IRP$V_VIRTUAL]
+	THEN
+	    USER_STATUS = 1;
+
+	IO_DONE(.PACKET);
+	USER_STATUS = .SAVE_STATUS;
+	END;
+
+    ! If no file is accessed, turn off cancel I/O bit now.
+    !
+
+    IF .CURRENT_VCB[VCB$L_WCB] EQL 0
+    THEN 
+	BEGIN
+	CURRENT_VCB [ VCB$V_CANCELIO ] = 0;
+
+        ! If while the cancel I/O was pending a dismount could have been issued
+	! and refused waiting for cancel I/O to complete.  Check for dismount.
+	!
+	CHECK_DISMOUNT ( .BBLOCK [ .CURRENT_VCB[VCB$L_RVT], RVT$L_UCBLST ] );
+	END;
+
+    CURRENT_VCB[VCB$V_WAIREWIND] = 0;		! no longer waiting
+    CURRENT_VCB[VCB$V_WAIUSRLBL] = 0;
+    CURRENT_VCB[VCB$V_WAIMOUVOL] = 0;
+    ERROR(SS$_NORMAL);		! cancel function should complete normally
+    END;
+
+
+GLOBAL ROUTINE TERMINATE_VOL (WINDOW) : COMMON_CALL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine terminates a mount request.  If a file is open
+!	then the user must close the file.  The write indicator is cleared so
+!	that eof trailers are not written on deaccess.  The volume is marked
+!	not mounted and the volume position is marked ambiguous.
+!
+! CALLING SEQUENCE:
+!	TERMINATE_MOUNT(WINDOW), called in kernel mode
+!
+! INPUT PARAMETERS:
+!	ARG1 - address of window for request
+!
+! IMPLICIT INPUTS:
+!	None
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	None
+!
+! ROUTINE VALUE:
+!	None
+!
+! SIDE EFFECTS:
+!	None
+!
+! USER ERRORS:
+!	None
+!
+!--
+
+    BEGIN
+
+    EXTERNAL ROUTINE
+	GET_CCB;
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    MAP
+	WINDOW	: REF BBLOCK;		! address of window control block
+
+    LOCAL
+	MVL_ENTRY	: REF BBLOCK;			! address of MVL entry
+
+    IF .WINDOW NEQ 0
+    THEN 					! a file is open
+	BEGIN
+	CURRENT_VCB[VCB$V_NOWRITE] = 1;
+	CURRENT_VCB[VCB$V_MUSTCLOSE] = 1;	! the file must be closed
+	END;
+
+    IF .CURRENT_VCB[VCB$V_WAIMOUVOL]
+    THEN
+	BEGIN
+
+	LOCAL
+	    CCB	: REF BBLOCK,
+	    UCB	: REF VECTOR;
+
+	MVL_ENTRY = .CURRENT_VCB[VCB$L_MVL] + MVL$K_FIXLEN +
+	    ((.CURRENT_VCB[VCB$B_CUR_RVN] - 1)*MVL$K_LENGTH);
+	MVL_ENTRY[MVL$V_MOUNTED] = 0;		! volume is not mounted
+	UCB = BBLOCK[.CURRENT_VCB[VCB$L_RVT], RVT$L_UCBLST];
+	UCB = .UCB[.CURRENT_VCB[VCB$W_RVN]];
+	CCB = GET_CCB ( .IO_CHANNEL );
+	CCB[CCB$L_UCB] = .UCB;
+	SYS$QIOW(0, .IO_CHANNEL,
+	    IO$_REWINDOFF
+	    OR
+	    IO$M_NOWAIT, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+	SEND_ERRLOG(0, .UCB);
+	CURRENT_VCB[VCB$B_CUR_RVN] = 0;		! no volume is current
+
+	! no file is current, ie: start at beginning
+	!
+	CURRENT_VCB[VCB$L_CUR_FID] = 0;
+	END;
+
+    END;				! end of routine TERMINATE_MOUNT
+
+
+GLOBAL ROUTINE MTA_MOUNT : NOPRES NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine checks the validity of the mount request and
+!	sets up a virtual page for this volume set.
+!
+!
+! CALLING SEQUENCE:
+!	MTA_MOUNT()
+!
+! INPUT PARAMETERS:
+!	None
+!
+! IMPLICIT INPUTS:
+!	CURRENT_UCB	- address of current unit control block
+!	QUEUE_HEAD	- address of queue head for ACP
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	one page of virtual memory is devoted to this volume set
+!
+! ROUTINE VALUE:
+!	None
+!
+! SIDE EFFECTS:
+!	None
+!
+!--
+
+    BEGIN
+
+    EXTERNAL
+	CURRENT_UCB	: REF BBLOCK,
+	QUEUE_HEAD	: REF BBLOCK;
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    IF NOT .BBLOCK[CURRENT_UCB[UCB$L_DEVCHAR], DEV$V_SQD]
+	OR
+	.QUEUE_HEAD[AQB$B_ACPTYPE] NEQ AQB$K_MTA
+    THEN
+	ERR_EXIT(SS$_WRONGACP);
+
+    KERNEL_CALL(MOUNT);
+    END;					! end of routine MTA_MOUNT
+
+
+ROUTINE STALL : COMMON_CALL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine puts the cancel request packet on the stalled queue.
+!
+! CALLING SEQUENCE:
+!	STALL(), called in KERNEL mode
+!
+! INPUT PARAMETERS:
+!	None
+!
+! IMPLICIT INPUTS:
+!	None
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	cancel request queued to stall I/O queue
+!
+! ROUTINE VALUE:
+!	None
+!
+! SIDE EFFECTS:
+!	None
+!
+!--
+
+    BEGIN
+
+    EXTERNAL
+	IO_PACKET	: REF BBLOCK;		! address of current I/O packet
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    LOCAL
+	VPAGE	: REF BBLOCK;
+
+    VPAGE = .CURRENT_VCB[VCB$L_VPFL];
+    INSQUE(.IO_PACKET, .VPAGE[VVP$L_STALLIOBL]);
+    IO_PACKET = 0;
+    END;
+END
+
+ELUDOM

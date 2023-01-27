@@ -1,0 +1,1786 @@
+MODULE DBGNCNTRL (IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY: DEBUG
+!
+! ABSTRACT:
+!
+!	This module contains the top level routines for the version 3 debugger.
+!	Routine dbg$ncontrol is called by the old debugger mechanism (instead of
+!	dbg$pars_a_line) after an input line has been collected from the user's
+!	terminal, or a record has been read from an indirect command file or DO
+!	action buffer. Other routines in this module break an input line into single
+!	commands, verify these commands if appropriate, and allocate and deallocate
+!	'listed' dynamic storage. End of command clean-up routines are also included.
+!
+!	Routine dbg$ncontrol invokes the top level parsing and command execution
+!	networks as needed. At this time (4/15/80), commands are parsed and executed
+!	one at a time. At a later date, it is forseen that all commands on a single
+!	input line will be parsed before any are executed. Detection of errors presently
+!	cause the command in question to not be executed. Later on, the detection
+!	of an error in any of the commands on a single input line will cause all
+!	of the commands parsed up to the time of the error to be aborted.
+!
+!
+! ENVIRONMENT:	VAX/VMS
+!
+! AUTHOR:	David Plummer, CREATION DATE:	4/15/80
+!
+! VERSION : V2.2-001
+!
+! MODIFIED BY:
+!
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	DBG$NCONTROL 		: NOVALUE,	! Controls parsing and command 
+						! execution
+	DBG$NGET_CMD,				! Chops input string into com-
+						! mand strings
+	DBG$NKILL_CMD,				! Kills a command and frees up
+						! dynamic storage
+	DBG$NEND_OF_INPUT,			! End of parse line clean-up
+	DBG$NSAVE_FILESP,			! saves a filespec in a dynamic buffer
+	DBG$NVERIFY_OUT 	: NOVALUE,	! VERIFIES indirect command file commands
+	DBG$NCHANGE_TO_NEW 	: NOVALUE,	! Aids transition to new debugger
+	DBG$NCHANGE_TO_OLD 	: NOVALUE,	! Aids transition to old debugger
+	DBG$NSAVE_BREAK_BUFFER;			! Save a break action buffer
+
+!
+! REQUIRE FILES:
+!
+
+REQUIRE 'SRC$:DBGPROLOG.REQ';
+REQUIRE 'SRC$:DBGGEN.REQ';
+REQUIRE 'SRC$:SYSSER.REQ';
+
+!
+! EQUATED SYMBOLS:
+!
+
+!
+! MACROS
+!
+MACRO
+	INITIAL_PTR = 8, 0, 32, 0 %;		! Pointer to start of dynamic buffer
+	
+!
+! OWN STORAGE:
+!
+OWN
+	MESSAGE_POINTER,			! Holds address of message argument vector
+	CMD_STG_DESC	: BLOCK [12,BYTE],	! Command input string descriptor. Note
+						! the extra longword to contain the original
+						! dsc$a_pointer.
+	CMD_VERB_PTR,				! Start of executable parse tree
+	SAVE_INPUT_DESC	: REF DBG$STG_DESC, 	! Pointer to parse string descriptor
+						! used in gathering filespecs.
+	START_VERIFY_POINTER;			! Pointer to the start of the input to be verified
+
+!
+! EXTERNAL REFERENCES:
+!			
+
+EXTERNAL ROUTINE
+	DBG$NINITIALIZE 	: NOVALUE,	! Sets language specific context
+	DBG$NMATCH,				! Matches counted string to input
+	DBG$NOUT_INFO,				! Outputs an informational message
+	DBG$NSYNTAX_ERROR,			! Formats a syntax error
+	DBG$END_OF_LINE 	: NOVALUE,	! Version 2 end of line clean-up
+	DBG$END_OF_CMD		: NOVALUE,	! Version 2 end of command clean-up
+	DBG$NOUT_ARG_VECT 	: NOVALUE,	! Outputs a message vector
+	DBG$NMAKE_ARG_VECT,			! Constructs an argument vector
+	DBG$NNEXT_WORD,				! Isolates next word of input
+	DBG$NCIS_REMOVE,			! Removes a link from the cis
+	DBG$NFREEZ,				! Allocates non_listed storage
+	DBG$NLIST_FREEZ,			! Allocates listed dynamic storage
+	DBG$REL_TEMPMEM:	NOVALUE,	! Releases all temporary memory
+	DBG$RST_TEMP_RELEASE:	NOVALUE,	! Releases temporary RST entries
+	DBG$NPARSE_CMD,				! New debugger parser
+	DBG$NEXECUTE_CMD;			! New debugger command executor
+
+EXTERNAL
+	DBG$GL_GBLTYP,				! Override type
+	DBG$GW_GBLLNGTH 	: WORD,		! Override length
+	DBG$GL_DFLTTYP,				! Default type
+	DBG$GW_DFLTLENG 	: WORD,		! Default length
+	DBG$GL_CISHEAD 		: REF CIS_LINK,	! Head of cis
+	DBG$GB_DEF_OUT 		: VECTOR [,BYTE]; ! output control vecter in old debugger
+
+GLOBAL ROUTINE DBG$NCONTROL ( PARSE_STG_DESC ) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine dbg$ncontrol oversees command parsing and execution. Only commands
+!	that are parsed without detection of errors are executed. Routines are invoked
+!	for end of command and input processing.
+!
+! FORMAL PARAMETERS:
+!
+!	parse_stg_desc -		a VAX standrd descriptor of the input string
+!
+! IMPLICIT INPUTS:
+!
+!	cmd_verb_ptr -			pointer to the verb node (head node) of the
+!					executable command tree
+!
+!	message_pointer -		pointer to message argument vector
+!
+! IMPLICIT OUTPUTS:
+!
+!	Any outputs associated with command processing may be forced by this routine.
+!
+! ROUTINE VALUE:
+!
+!	NOVALUE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Valid DEBUG commands will be executed. Invalid DEBUG commands will cause
+!	generation of one or more error messages.
+!
+!--
+
+    BEGIN
+
+    MAP
+	PARSE_STG_DESC : REF BLOCK [,BYTE];
+
+    LOCAL
+	STATUS;			! Retains return code
+
+
+    ! Try to get another command from the present input buffer. Check for comments.
+    !
+    status = dbg$nget_cmd (.parse_stg_desc, cmd_stg_desc, message_pointer);
+
+    CASE .status FROM sts$k_warning TO sts$k_severe
+        OF
+	SET
+
+	[sts$k_warning] :		! No more input from present buffer
+	    BEGIN
+	    IF NOT dbg$nend_of_input (message_pointer)
+	    THEN
+		dbg$nout_arg_vect (.message_pointer);
+	    END;
+
+	[sts$k_success] :	! Parse and execute command
+	    BEGIN
+
+	    dbg$ninitialize ();
+
+	    IF dbg$nparse_cmd (cmd_stg_desc, cmd_verb_ptr, message_pointer)
+	    THEN
+		BEGIN
+		dbg$nverify_out (.parse_stg_desc [dsc$a_pointer]);
+			
+		IF NOT dbg$nexecute_cmd (cmd_verb_ptr, message_pointer)
+		THEN
+		    BEGIN
+		    dbg$nout_arg_vect (.message_pointer);
+		    IF NOT dbg$nkill_cmd (message_pointer)
+		    THEN
+			dbg$nout_arg_vect (.message_pointer);
+		    END;
+		END
+	    ELSE
+		BEGIN	! Kill command - bad parse
+		dbg$nout_arg_vect (.message_pointer);
+		IF NOT dbg$nkill_cmd (message_pointer)
+		THEN
+		    dbg$nout_arg_vect (.message_pointer);
+		END;
+	    END;
+
+	[sts$k_error] :	! Not parsable. Just verify the comment.
+	    BEGIN
+	    dbg$nverify_out (.parse_stg_desc [dsc$a_pointer]);
+	    IF NOT dbg$nend_of_input (message_pointer)
+	    THEN
+		dbg$nout_arg_vect (.message_pointer);
+	    END;
+
+	[sts$k_severe] :	! Error in input
+	    BEGIN
+	    dbg$nout_arg_vect (.message_pointer);
+	    IF NOT dbg$nkill_cmd (message_pointer)
+	    THEN
+		 dbg$nout_arg_vect (.message_pointer);
+	    END;
+
+	[INRANGE,OUTRANGE] :
+	    BEGIN
+	    0;
+	    END;
+
+	TES;
+
+
+    ! Perform end of command clean-up.  This involves resetting data structures
+    ! shared between the old debugger and the new.  It also involves releasing
+    ! all temporary memory allocated during the processing of the command and
+    ! releasing all unreferenced RST entries on the Temporary RST Entry List.
+    !
+    DBG$END_OF_CMD();
+    DBG$REL_TEMPMEM();
+    DBG$RST_TEMP_RELEASE();
+    RETURN;
+
+    END;
+
+ROUTINE DBG$NGET_CMD ( INPUT_DESC, CMD_DESC, MESSAGE_VECT) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine seperates the input line into one or more DEBUG commands. <cr>
+!	<ff>, and the null character (00) imply end of input line. Semi-colon (;)
+!	implies end of command.
+!
+! FORMAL PARAMETERS:
+!
+!	input_desc -		a VAX standard descriptor of the entire input line
+!
+!	cmd_desc -		upon exit from this routine, a VAX standard descriptor
+!				of a single potential DEBUG command
+!
+!	message_vect		- the address of a longword to contain the address 
+!				  of a message argument vector
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	sts$k_warning (0)	- the input line was found to be exhausted
+!
+!	sts$k_success (1)	- the comd_desc was updated to refer to a potential
+!				  DEBUG command
+!
+!	sts$k_error (2)		- the input descriptor was found to contain nothing
+!				  but a comment (! in first position)
+!
+!	sts$k_severe (4)	- error in input line
+!
+! SIDE EFFECTS:
+!
+!	All lower case alphabetic characters are converted to upper case, except
+!	for strings enclosed withing single or double quote marks. A check
+!	is made for unprintable characters in the input line (error message generated
+!	and failure return).
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	CHAR_STRING 	: REF VECTOR [,BYTE],	! Vector of 1 byte characters
+	QUOTE_FLAG,				! Signifies quoted string
+	QUOTE_CHAR,				! Contains quote char
+	CHAR_COUNT;				! Keeps count of characters
+
+    MAP
+	INPUT_DESC 	: REF dbg$stg_desc,
+	CMD_DESC 	: REF BLOCK [,BYTE];	! We don't REF to dbg$stg_desc
+						! because of the extra longword for
+						! the initial dsc$a_pointer
+
+
+    char_string = .input_desc [dsc$a_pointer];
+    char_count = 0;
+
+
+    ! Initialize the command descriptor
+    !
+    cmd_desc [dsc$b_dtype] = dsc$k_dtype_t;
+    cmd_desc [dsc$b_class] = dsc$k_class_s;
+    cmd_desc [dsc$w_length] = 0;
+    cmd_desc [dsc$a_pointer] = 0;
+    cmd_desc [initial_ptr] = 0;
+
+
+    ! Find a significant character
+    !
+    WHILE .input_desc [dsc$w_length] GTR 0
+    DO
+    	BEGIN
+	    IF .char_string [.char_count] NEQ dbg$k_car_return
+				AND
+	       .char_string [.char_count] NEQ dbg$k_line_feed
+				AND
+	       .char_string [.char_count] NEQ dbg$k_null
+				AND
+	       .char_string [.char_count] NEQ dbg$k_semicolon
+				AND
+	       .char_string [.char_count] NEQ dbg$k_blank
+
+	    THEN
+		EXITLOOP
+	    ELSE
+		BEGIN
+	 	    char_count = .char_count + 1;
+		    input_desc [dsc$w_length] = .input_desc [dsc$w_length] - 1;
+		END;
+	END;
+
+    IF .input_desc [dsc$w_length] EQL 0
+    THEN
+	RETURN sts$k_warning;
+
+
+    ! Set up the start verify pointer
+    !
+    start_verify_pointer = .input_desc [dsc$a_pointer];
+
+
+    ! Update pointer to rest of string
+    !
+    input_desc [dsc$a_pointer] = char_string [.char_count];
+
+
+    ! Check for a comment line
+    !
+    IF .char_string [.char_count] EQL dbg$k_ex_point
+    THEN
+	BEGIN
+	    input_desc [dsc$a_pointer] = .input_desc [dsc$a_pointer] +
+					 .input_desc [dsc$w_length];
+	    input_desc [dsc$w_length] = 0;
+	    RETURN sts$k_error;
+	END;
+
+
+    ! Now count the characters in the command
+    !
+    char_string = .input_desc [dsc$a_pointer];
+    char_count = 0;
+
+    quote_flag = false;
+    WHILE .input_desc [dsc$w_length] GTR 0
+    DO
+	BEGIN
+	    IF .char_string [.char_count] EQL dbg$k_car_return
+				OR
+	       .char_string [.char_count] EQL dbg$k_line_feed
+				OR
+	       .char_string [.char_count] EQL dbg$k_null
+				OR
+	       (NOT .quote_flag AND (.char_string [.char_count] EQL ';'
+					         OR
+				     .char_string [.char_count] EQL '!'))
+
+	    THEN
+		EXITLOOP
+	    ELSE
+		BEGIN
+		    IF .char_string [.char_count] EQL dbg$k_quote
+					OR
+		       .char_string [.char_count] EQL dbg$k_dblquote
+		    THEN
+			BEGIN
+			IF NOT .quote_flag
+			THEN
+			    BEGIN
+			    quote_char = .char_string [.char_count];
+			    quote_flag = true;
+			    END
+			ELSE
+			    BEGIN
+			    IF .char_string [.char_count] EQL .quote_char
+			    THEN
+				quote_flag = false;
+			    END;
+			END;
+
+		    char_count = .char_count + 1;
+		    input_desc [dsc$w_length] = .input_desc [dsc$w_length] - 1;
+		END;
+	END; 
+
+
+    ! Now try to get storage for the command string
+    !
+    IF NOT dbg$nlist_freez ((.char_count / %UPVAL) + 1,
+			     cmd_desc [dsc$a_pointer], .message_vect)
+    THEN
+ 	RETURN sts$k_severe;
+
+
+    ! Fill the command buffer
+    !
+    ch$move ( .char_count, .input_desc [dsc$a_pointer], .cmd_desc [dsc$a_pointer]);
+
+
+    ! Update the input descriptor pointer. Check for a comment to skip.
+    !
+    IF .char_string [.char_count] EQL dbg$k_ex_point
+    THEN
+	BEGIN
+	    input_desc [dsc$a_pointer] = char_string [.char_count] + .input_desc [dsc$w_length];
+	    input_desc [dsc$w_length] = 0;
+	END
+    ELSE
+	input_desc [dsc$a_pointer] = char_string [.char_count];
+    
+
+    ! Update the command descriptor
+    !
+    cmd_desc [initial_ptr] = .cmd_desc [dsc$a_pointer];
+    cmd_desc [dsc$w_length] = .char_count;
+    char_string = .cmd_desc [dsc$a_pointer];
+
+
+    ! Now check for bad chars and translate to upper case
+    !
+    char_count = 0;
+    quote_flag = false;
+    WHILE .char_count LSS .cmd_desc [dsc$w_length]
+    DO
+	BEGIN
+	    IF .char_string [.char_count] EQL dbg$k_tab
+	    THEN
+		char_string [.char_count] = dbg$k_blank;  ! Convert tab to space
+
+	    IF .char_string [.char_count] LSS dbg$k_blank
+	    THEN
+		BEGIN
+		    .message_vect = dbg$nmake_arg_vect (dbg$_invchar);
+		    RETURN sts$k_severe;
+		END
+	    ELSE
+		BEGIN
+		    IF .char_string [.char_count] EQL dbg$k_quote
+					OR
+		       .char_string [.char_count] EQL dbg$k_dblquote
+		    THEN
+			BEGIN
+			IF NOT .quote_flag
+			THEN
+			    BEGIN
+			    quote_char = .char_string [.char_count];
+			    quote_flag = true;
+			    END
+			ELSE
+			    BEGIN
+			    IF .char_string [.char_count] EQL .quote_char
+			    THEN
+				quote_flag = false;
+			    END;
+			END;
+
+		IF .char_string [.char_count] GEQ 'a'
+				AND
+		   .char_string [.char_count] LEQ 'z'
+				AND
+		   NOT .quote_flag
+		THEN
+		    char_string [.char_count] = .char_string [.char_count] 
+						- dbg$k_lcbias;
+		END;
+	   
+	    char_count = .char_count + 1;
+
+	END;
+
+
+    ! Termanate the command with a <cr>
+    !
+    char_string [.char_count] = dbg$k_car_return;
+    cmd_desc [dsc$w_length] = .cmd_desc [dsc$w_length] + 1;
+
+
+    ! Delete all leading end of command signifiers from the input string
+    !
+    char_string = .input_desc [dsc$a_pointer];
+
+    WHILE .input_desc [dsc$w_length] GTR 0
+    DO
+	BEGIN
+
+	    IF .char_string [0] NEQ dbg$k_car_return
+			    AND
+	       .char_string [0] NEQ dbg$k_line_feed
+			    AND
+	       .char_string [0] NEQ dbg$k_null
+			    AND
+	       .char_string [0] NEQ dbg$k_semicolon
+	    THEN
+	    	EXITLOOP;
+
+	    input_desc [dsc$w_length] = .input_desc [dsc$w_length] - 1;
+	    input_desc [dsc$a_pointer] = char_string [1];
+	    char_string = .input_desc [dsc$a_pointer];
+
+	END;
+
+
+    ! Save a pointer to the new input descriptor so that dbg$nsave_filespec
+    ! can use it.
+    !
+    save_input_desc = .input_desc;
+
+    RETURN sts$k_success;
+
+    END;			!End of dbg$nget_cmd
+
+
+GLOBAL ROUTINE DBG$NKILL_CMD (MESSAGE_VECT) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Invocation ot this routine takes place when an invalid debug command is
+!	encountered during parsing.
+!
+! FORMAL PARAMETERS:
+!
+!	message_vect	- the address of a longword to contain the address of a
+!			  message argument vector
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	On error return, a message argument vector is constructed
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	sts$k_success (1) - success
+!
+!	sts$k_severe  (4) - failure. message returned.
+!
+! SIDE EFFECTS:
+!
+!	The present input buffer is discarded
+!
+!--
+
+    BEGIN
+
+    ! Simply blow away the rest of the input line
+    !
+    IF NOT dbg$nend_of_input (.message_vect)
+    THEN
+	RETURN sts$k_severe;
+
+    RETURN sts$k_success;
+
+    END;			! End of dbg$n_kill_cmd
+
+
+GLOBAL ROUTINE DBG$NEND_OF_INPUT (MESSAGE_VECT) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is invoked when the present input line is exhausted.
+!
+! FORMAL PARAMETERS:
+!
+!	message_vect	- the address of a longword to contain the address of a
+!			  message argument vector
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	On error return, a message argument vector is returned.
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	sts$k_success (1)	- success. input removed
+!
+!	sts$k_severe  (4)	- failure. message argument vector returned.
+!
+! SIDE EFFECTS:
+!
+!	A link is removed from the head of the command input stream.
+!
+!--
+
+    BEGIN
+
+    ! Remove a node from the cis
+    !
+    IF NOT dbg$ncis_remove (.message_vect)
+    THEN
+	RETURN sts$k_severe;
+
+    RETURN sts$k_success;
+
+    END;			! End of dbg$nend_of_input
+
+GLOBAL ROUTINE DBG$NSAVE_FILESP (INPUT_DESC, FILE, MESSAGE_VECT) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine gathers a file spec from the command line. Since filespecs
+!	may be in the form a.b;12, the version number will not be contained in the
+!	command descriptor string as dbg$nget_command regards a ';' as end of command.
+!	Consequently, look-ahead must be performed on the entire input line string
+!	to locate the version number of a file spec. Quoted filespec strings are
+!	also allowed as this construction is necessary to specify filespecs that
+!	contain disk specifiers or sub-directories.
+!
+!	A filespec is returned in the form of a counted string, the storage for which
+!	is allocated from non-listed storage.
+!
+! FORMAL PARAMETERS:
+!
+!	input_desc -		the present command VAX standard string descriptor
+!
+!	file	-		the address of a longword to contain the filespec
+!
+!	message_vect -		the address of a longword to contain the address
+!				of a message argument vector
+!
+! IMPLICIT INPUTS:
+!
+!	save_input_desc -	VAX standard string descriptor of the rest of the
+!				complete input line.
+!
+! IMPLICIT OUTPUTS:
+!
+!	A counted string representing the filspec on success, or a message argument
+!	vector on failure.
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	sts$k_success (1) -	filespec collected.
+!
+!	sts$k_severe  (4) -	the filespec was not collected. message vector returned.
+!
+! SIDE EFFECTS:
+!
+!	Both the command descriptor and the line input descriptor may be updated.
+!	The command descriptor (input_desc) is always updated to reflect exhaused
+!	input. That is, the filespec is taken to be everything left in the command
+!	string. The input line descriptor (save_input_desc) will be updated to
+!	point past an explicit version number string.
+!
+!--
+    BEGIN
+
+    FORWARD ROUTINE
+	NEXT_CHAR,				! Returns the next character from input
+	FILENAME,				! Extracts a file spec name
+	FILETYPE,				! Extracts a file spec type
+	VERSION_NUMBER,				! Extracts a file spec version number
+	QUOTED_FILESPEC;			! Extracts a quoted filespec
+
+    LOCAL
+	NEXT_PTR,				! Pointer to position in filespec
+	FILESPEC 	: REF VECTOR [,BYTE],	! Contains the file spec
+	NAME 		: REF VECTOR [,BYTE],	! Contains the file name
+	TYPE 		: REF VECTOR [,BYTE],	! Contains the file type
+	VERSION 	: REF VECTOR [,BYTE],	! Contains the file version number
+	QUOTED_STRING;				! Pointer to a quoted file spec
+
+    OWN
+	ERROR_VECTOR,				! Pointer to message argument vector
+	CHAR 		: BYTE,			! Character of input buffer. This
+						! variable is 'own'ed to make it a 
+						! 'local global'.
+	ERROR_STG_DESC	: dbg$stg_desc,		! For error reporting
+	CMD_DESC 	: REF dbg$stg_desc;	! Descriptor for command input
+
+    BIND
+	ONE_QUOTE = UPLIT BYTE (dbg$k_quote),	! For error reporting
+	TWO_QUOTE = UPLIT BYTE (dbg$k_dblquote); ! For error reporting
+
+    !
+    !
+    !
+    !
+    !
+
+    ROUTINE NEXT_CHAR =
+
+    !++
+    !	This routine returns the next character of input. This character
+    !	may come from the command descriptor or the input line descriptor strings.
+    !--
+
+   	BEGIN
+
+	! Take the character from the command input descriptor or the line
+	! input descriptor.
+  	!
+	IF .cmd_desc [dsc$w_length] GTR 0
+	THEN
+	    BEGIN
+
+		! Take the char from the command input buffer
+		!
+		cmd_desc [dsc$w_length] = .cmd_desc [dsc$w_length] - 1;
+		char = .(.cmd_desc [dsc$a_pointer]) <0, 8, 0>;
+		cmd_desc [dsc$a_pointer] = .cmd_desc [dsc$a_pointer] + 1;
+
+
+		! Map a <cr> into a semicolon
+		!
+		IF .char EQL dbg$k_car_return
+		THEN
+		    char = dbg$k_semicolon;
+	    END
+
+	ELSE
+            BEGIN
+
+		! Take the character from the line input buffer.
+		! Check for exhausted input.
+		!
+		IF .save_input_desc [dsc$w_length] LEQ 0
+		THEN
+		    RETURN sts$k_error;
+
+
+		! We map a <cr> from the cmd buffer to a semicolon. Make sure
+		! that we do not return the semicolon twice.
+		!
+		IF .char EQL dbg$k_semicolon
+			AND
+		   .(.save_input_desc [dsc$a_pointer]) <0, 8, 0> EQL dbg$k_semicolon
+		THEN
+		    BEGIN
+			char = 0;
+			save_input_desc [dsc$w_length] = .save_input_desc [dsc$w_length] - 1;
+			save_input_desc [dsc$a_pointer] = .save_input_desc [dsc$a_pointer] + 1;
+			RETURN next_char ();
+		    END;
+
+		save_input_desc [dsc$w_length] = .save_input_desc [dsc$w_length] - 1;
+		char = .(.save_input_desc [dsc$a_pointer]) <0, 8, 0>;
+		save_input_desc [dsc$a_pointer] = .save_input_desc [dsc$a_pointer] + 1;
+	    END;
+
+	RETURN sts$k_success;
+
+	END;		! End of next_chars
+
+    !
+    !
+    !
+    !
+    !
+
+    ROUTINE FILENAME =
+
+    !++
+    !	This routine collects the filespec file name string. That is, all characters
+    !	up to a '.' or end of line.
+    !--
+
+    	BEGIN
+
+    	LOCAL
+	    NAME_BUF : REF VECTOR [,BYTE],	! Contains the filename string
+	    I;					! Counter
+
+ 	! The filename cannot be longer than the command input buffer. Get storage
+ 	! to hold the name string.
+	!
+	IF NOT dbg$nlist_freez (( .cmd_desc [dsc$w_length] / %UPVAL ) + 1,
+				    name_buf, .error_vector)
+	THEN
+	    RETURN sts$k_severe;
+
+
+	! Take characters up to a dot or semicolon.
+	!
+	name_buf [0] = 0;
+	i = 1;
+
+	WHILE .char NEQ dbg$k_dot
+		  AND
+	      .char NEQ dbg$k_semicolon
+	DO
+	    BEGIN
+	   	name_buf [0] = .i;
+	       	name_buf [.i] = .char;
+	        i = .i + 1;
+		next_char ();
+            END;
+
+	RETURN name_buf [0]
+
+	END;		! End of filename
+
+    !
+    !
+    !
+    !
+    !
+
+    ROUTINE FILETYPE =
+
+    !++
+    !	This routine collects the filespec file type string. The file type
+    !	consists of all characters between '.' and ';'.
+    !--
+
+	BEGIN
+
+	LOCAL
+	    TYPE_BUF : REF VECTOR [,BYTE],	! Buffer for file type
+	    I;					! Counter
+
+	! The file name cannot be longer than the command buffer. Get storage.
+	!
+	IF NOT dbg$nlist_freez (( .cmd_desc [dsc$w_length] / %UPVAL) + 1,
+				  type_buf, .error_vector)
+	THEN
+	    RETURN sts$k_severe;
+
+
+	! Take chars up to a semicolon. 
+	!
+	type_buf [0] = 0;
+	i = 1;
+
+	WHILE .char NEQ dbg$k_semicolon
+	DO
+	    BEGIN
+		type_buf [0] = .i;
+		type_buf [.i] = .char;
+		i = .i + 1;
+		next_char ();
+	    END;
+
+	RETURN type_buf [0];
+
+	END;		! End of filetype
+
+    !
+    !
+    !
+    !
+    !
+
+    ROUTINE VERSION_NUMBER =
+
+    !++
+    !	This routine collects a filespec version number string. That is, all numeric
+    !	characters following a ';' are taken to be the version number characters.
+    !--
+
+	BEGIN
+
+	LOCAL
+	    VERSION_BUF : REF VECTOR [,BYTE],	! Holds the version string
+	    I,					! Counter
+	    FLAG;				! Indicates end of input
+
+	! The version number can be no longer than the save input buffer ( the rest
+	! of the parse line buffer). Allocate storage to hold the string.
+	!
+	IF NOT dbg$nlist_freez (( .save_input_desc [dsc$w_length] / %UPVAL) + 1,
+				  version_buf, .error_vector)
+	THEN
+	    RETURN sts$k_severe;
+
+
+	! The first character will always be a semicolon. Store this character.
+	!
+	version_buf [1] = .char;
+	version_buf [0] = 1;
+
+
+	! Aquire the version number chars. Take characters as long as they are alphanumeric
+	!
+ 	i = 2;
+	flag = false;
+	next_char ();
+
+	WHILE .char GEQ '0'
+		  AND
+	      .char LEQ '9'
+	DO
+	    BEGIN
+		version_buf [0] = .i;
+		version_buf [.i] = .char;
+		i = .i + 1;
+
+
+		! Check for exhausted input
+		!
+		IF NOT next_char ()
+		THEN
+		    BEGIN
+			flag = true;
+			EXITLOOP;
+		    END;
+
+	    END;
+
+
+	! Return the last character to the input buffer, if it is not a semicolon
+	!
+	IF NOT .flag
+		AND
+	       .char NEQ dbg$k_semicolon
+	THEN
+	    BEGIN
+		save_input_desc [dsc$w_length] = .save_input_desc [dsc$w_length] + 1;
+		save_input_desc [dsc$a_pointer] = .save_input_desc [dsc$a_pointer] - 1;
+		(.save_input_desc [dsc$a_pointer]) <0, 8, 0> = .char;
+	    END;
+
+	RETURN version_buf [0];
+
+	END;		! End of version_number
+
+    !
+    !
+    !
+    !
+    !
+
+    ROUTINE QUOTED_FILESPEC =
+
+    !++
+    !	This routine collects a quoted filespec string. That is, all characters
+    !	coming between ' and ' or " and " are taken to be filespec string characters.
+    !	If a termnal ' or " is not encountered, an error message is produced.
+    !--
+
+	BEGIN
+
+	LOCAL
+	    I,					    ! Counter
+	    QUOTE_CHAR 	      : BYTE,		    ! Holds ' or " for error message
+	    TEMP_FILESPEC_BUF : REF VECTOR [,BYTE], ! TEMP buffer for filespec
+	    FILESPEC_BUF      : REF VECTOR [,BYTE]; ! Buffer for spec string			
+
+	! The first non-blank character must be a quote or we report failure.
+	!
+	IF .char NEQ dbg$k_quote
+		 AND
+	   .char NEQ dbg$k_dblquote
+	THEN
+	    RETURN sts$k_error;
+	
+	quote_char = .char;
+
+	
+	! We must allocate non-listed storage to contain the quoted filespec
+	! since we don't want it to disappear at the end of command clean-up.
+ 	! First we must allocate listed storage to hold the filespec while we
+	! get the characters since the maximum possible length of the buffer
+	! is the length of the command buffer + the length of the input buffer.
+	! Allocating a non-listed buffer of this size would be a waste.
+	!
+	IF NOT dbg$nlist_freez (((.cmd_desc [dsc$w_length] +
+	     		          .save_input_desc [dsc$w_length]) / %UPVAL) + 1,
+				  temp_filespec_buf, .error_vector)
+	THEN
+	    RETURN sts$k_severe;
+
+	temp_filespec_buf [0] = 0;
+	next_char ();
+
+
+	! Get characters until encountering a second quote. If no second quote
+	! is found, produce an error message.
+	!
+	i = 1;
+
+	WHILE .char NEQ dbg$k_quote
+		    AND
+	      .char NEQ dbg$k_dblquote
+	DO
+	    BEGIN
+		temp_filespec_buf [0] = .i;
+		temp_filespec_buf [.i] = .char;
+		i = .i + 1;
+
+		IF NOT next_char ()
+		THEN
+		    BEGIN	! No terminating quote mark - error
+			
+			! Don't print the last char which may be a spurious <cr> or semicolon
+			!
+			temp_filespec_buf [0] =
+						( IF .temp_filespec_buf [0] GTR 0
+						  THEN
+							.temp_filespec_buf [0] - 1
+						  ELSE
+							0);
+
+			error_stg_desc [dsc$a_pointer] = temp_filespec_buf [1];
+			error_stg_desc [dsc$w_length] = .temp_filespec_buf [0];
+
+			.error_vector = dbg$nmake_arg_vect (dbg$_noend, 3, error_stg_desc,
+							    1, (IF .quote_char EQL dbg$k_quote
+							       THEN one_quote
+							       ELSE two_quote));
+
+			RETURN sts$k_severe;
+							    
+		    END;
+	    END;
+
+
+	! Now allocate the semi-permanant dynamic buffer and copy the chars
+	! from the temporary buffer.
+	!
+	IF NOT dbg$nfreez ((.temp_filespec_buf [0] / %UPVAL) + 1, filespec_buf,
+			    .error_vector)
+
+	THEN
+	    RETURN sts$k_severe;
+
+	filespec_buf [0] = .temp_filespec_buf [0];
+	ch$move (.filespec_buf [0], temp_filespec_buf [1], filespec_buf [1]);
+
+	RETURN filespec_buf [0];
+
+	END;		! End of quoted_filespec
+
+
+    
+    ! Start of executable code for dbg$nsave_filesp
+    !
+    cmd_desc = .input_desc;
+    error_vector = .message_vect;
+
+
+    ! Obtain the first non-blank character
+    !
+    next_char ();
+    WHILE .char EQL dbg$k_blank
+    DO
+	next_char ();
+
+
+    ! Check for a quoted file spec
+    !
+    IF ( quoted_string = quoted_filespec () ) NEQ sts$k_error	! sts$k_error means
+								! no quotes
+    THEN
+
+	! Check for an error
+	!
+	IF .quoted_string EQL sts$k_severe
+	THEN
+	    RETURN sts$k_severe
+	ELSE
+	    BEGIN
+		.file = .quoted_string;
+		RETURN sts$k_success;
+	    END;
+
+
+    ! File spec wasn't quoted. Get the file name.
+    !
+    IF ( name = filename () ) EQL sts$k_severe
+    THEN
+	RETURN sts$k_severe;
+
+
+    ! Get the file type
+    !
+    IF ( type = filetype () ) EQL sts$k_severe
+    THEN
+	RETURN sts$k_severe;
+
+
+    ! Get the version number
+    !
+    IF ( version = version_number () ) EQL sts$k_severe
+    THEN
+	RETURN sts$k_severe;
+
+
+    ! Now put the filespec together
+    !
+    IF NOT dbg$nfreez (((.name [0] + .type[0] + .version[0]) / %UPVAL) + 1, 
+			filespec, .message_vect)
+    THEN
+	RETURN sts$k_severe;
+
+    next_ptr = ch$move (.name [0], name [1], filespec[1]);
+    next_ptr = ch$move (.type [0], type [1], .next_ptr);
+    ch$move (.version [0], version [1], .next_ptr);
+    filespec [0] = .name [0] + .type [0] + .version [0];
+
+    .file = filespec [0];
+
+    RETURN sts$k_success;
+
+    END;		! End of dbg$nsave_filesp
+
+
+GLOBAL ROUTINE DBG$NVERIFY_OUT (END_VERIFY_POINTER) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	The function of this routine is to verify commands read from an indirect
+!	command file. That is, the command or comment in question is displayed
+!	at the user's terminal.
+!
+! FORMAL PARAMETERS:
+!
+!	end_verify_pointer -		pointer to the last character of the input
+!					to be verified
+!
+! IMPLICIT INPUTS:
+!
+!	start_verify_pointer -		pointer to the first character of the input string
+!					to be verified
+!
+!	dbg$gb_def_out [out_verify] -	if this byte of dbg$gb_out_verify is set
+!					to a non-zero value (1), then a SET OUTPUT VERIFY
+!					command is in effect and the VERIFY should
+!					take place
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NOVALUE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	The character string lying between the start and end pointers (usually a
+!	single command or comment) is displayed at the user's terminal, if appropriate.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	PREV_LINK 	: REF cis_link,
+	OK_TO_VERIFY;
+
+    ! Get address of previous link in cis
+    !
+    prev_link = .dbg$gl_cishead [next_link];
+
+
+    ! Check the type of the cis node
+    !
+    CASE .dbg$gl_cishead [dsc$b_dtype] FROM cis_dbg$input TO cis_acbuf 
+	OF
+	SET
+
+	[cis_dbg$input] :
+	    BEGIN
+		ok_to_verify = false;
+	    END;
+
+	[cis_rab] :
+	    BEGIN
+		IF .prev_link [dsc$b_dtype] NEQ cis_inpbuf
+		THEN
+		    ok_to_verify = true
+		ELSE
+		    BEGIN
+			LOCAL
+			    pre_prev : REF cis_link;
+
+			pre_prev = .prev_link [next_link];
+			IF .pre_prev [dsc$b_dtype] NEQ cis_dbg$input
+			THEN
+			    ok_to_verify = true
+			ELSE
+			    ok_to_verify = false;
+		    END;
+	    END;
+
+	[cis_inpbuf] :
+	    BEGIN
+		IF .prev_link [dsc$b_dtype] EQL cis_dbg$input
+		THEN
+		    ok_to_verify = false
+		ELSE
+		    ok_to_verify = true;
+	    END;
+
+	[cis_acbuf] :
+	    BEGIN
+		ok_to_verify = true;
+	    END;
+
+	TES;
+
+
+    ! Delete leading semicolons
+    !
+    WHILE .(.start_verify_pointer) <0, 8, 0> EQL dbg$k_semicolon
+    DO
+	start_verify_pointer = .start_verify_pointer + 1;
+
+
+    ! Now check whether the command should be verified
+    !
+    IF .dbg$gb_def_out [out_verify]
+		AND
+       .ok_to_verify
+    THEN
+	$fao_tt_out (' !AD', .end_verify_pointer - .start_verify_pointer, .start_verify_pointer);
+
+    RETURN
+
+    END;		! End of dbg$nverify_out
+
+
+GLOBAL ROUTINE DBG$NCHANGE_TO_NEW : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Performs actions associated with switching from old debugger to new 
+!	debugger. These include initializing data structures, etc.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	dbg$gw_gbllngth - override length
+!
+!	dbg$gl_gbltyp   - override type
+!
+!	dbg$gw_dfltleng - default length
+!
+!	dbg$gl_dflttyp  - default type
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	The state of the world is changed to the way the new debugger expects it.
+!
+!--
+    BEGIN
+
+    ! The old debugger doesn't care about default and override lengths unless
+    ! the d/o type is asci. However, the new debugger does.
+    !
+    dbg$gw_dfltleng =
+	( CASE .dbg$gl_dflttyp FROM dsc$k_dtype_bu TO dsc$k_dtype_l
+	    OF
+	    SET
+
+	    [dsc$k_dtype_bu, dsc$k_dtype_b] : 1; 	! One byte
+
+	    [dsc$k_dtype_wu, dsc$k_dtype_w] : 2;	! Two bytes
+
+	    [dsc$k_dtype_lu, dsc$k_dtype_l] : 4;	! Four bytes
+
+	    [INRANGE, OUTRANGE] : .dbg$gw_dfltleng;	! No change
+	    
+	    TES);
+
+    IF .dbg$gl_gbltyp NEQ -1
+    THEN
+	dbg$gw_gbllngth =
+		( CASE .dbg$gl_gbltyp FROM dsc$k_dtype_bu TO dsc$k_dtype_l
+		    OF
+		    SET
+
+		    [dsc$k_dtype_bu, dsc$k_dtype_b] : 1;
+
+		    [dsc$k_dtype_wu, dsc$k_dtype_w] : 2;
+	
+		    [dsc$k_dtype_lu, dsc$k_dtype_l] : 4;
+
+		    [INRANGE, OUTRANGE] : .dbg$gw_gbllngth;
+
+		    TES);
+
+    RETURN;
+
+    END;	! End of dbg$nchange_to_new
+
+
+GLOBAL ROUTINE DBG$NCHANGE_TO_OLD : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Performs actions associated with switching from new debugger to old. 
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	save_input_desc	- descriptor of present input command line
+!
+!	dbg$gw_gbllngth - override length
+!
+!	dbg$gl_gbltyp   - override type
+!
+!	dbg$gw_dfltleng - default length
+!
+!	dbg$gl_dflttyp  - default type
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	The present input command line is modified to allow the old debugger parser
+!	to function properly. The state of the word is changed to what the old
+!	debugger expects.
+!
+!--
+    BEGIN
+
+    ! Give the version 2 debugger a clean start by causing end of line
+    ! clean-up, if input is exhausted. End of command clean-up
+    ! will be done in the control loop.
+    !
+    IF .save_input_desc [dsc$w_length] EQL 0
+    THEN
+        dbg$end_of_line ();
+
+
+    ! Set up the default length and override length properly for the old debugger
+    !
+    dbg$gw_dfltleng = (IF .dbg$gl_dflttyp EQL dsc$k_dtype_t THEN .dbg$gw_dfltleng ELSE 0);
+
+    dbg$gw_gbllngth = (IF .dbg$gl_gbltyp EQL dsc$k_dtype_t THEN .dbg$gw_gbllngth ELSE 0);
+	
+    RETURN;
+
+    END;	! End of dbg$nchange_to_old
+
+
+GLOBAL ROUTINE DBG$NSAVE_BREAK_BUFFER (INPUT_DESC, BUFFER, MESSAGE_VECT) =
+!++
+! Functional Description:
+!
+!	This routine is essentially like dbg$extract_str()
+! except that the bounding characters are "(" and ")" instead
+! of "'", and nesting of parentheses is allowed.  This routine
+! is called when the opening parenthesis of a list of breakpoint
+! actions is encountered.  The breakpoint actions are collected
+! but not lexically or semantically scanned.  Storage is reserved 
+! for the new string, and a pointer to this storage is returned.
+!
+!	A further complication for this routine but not for
+! exact_string, is that we can't just go blindly charging on
+! looking for matching parenthesis.  i.e. we can't get 
+! fooled by:
+!
+!	DBG>set b X do (d/as .=')'; etc)
+!
+! We resolve this problem by NOT paying any attention to characters
+! inside quoted strings within the DO action string.
+!
+! Parameters:
+!
+!	input_desc		- A longword containing the address of an ascii
+!				  string descriptor describing the present input command
+!
+!	buffer			- The address of a longword to contain the address
+!				  of the stored action buffer
+!
+!	message_vect		- The address of a longword to contain the address
+!				  of a message argument vector for errors
+!
+! Routine Value
+!
+!	sts$k_success (1) 	- Success. Buffer collected.
+!
+!	sts$k_severe  (4)	- Failure. Buffer not collected.
+!
+! Side Effects:
+!
+!	Storage may be allocated to contain the string.
+!--
+    BEGIN
+    MAP
+	INPUT_DESC 	: REF dbg$stg_desc;
+
+    LOCAL
+	ERROR_LENGTH,				! Used for error messages
+	ERROR_PTR,				! Used for error messages
+	NEW_POINTER,				! Temporary pointer
+	USE_COUNT,				! Number of characters used from input
+	PARSE_STG_DESC 	: REF dbg$stg_desc,  	! Parse input string descriptor
+	POINTER		: REF VECTOR [, BYTE],	! holds address of dynamic storage for
+						! action string when collected
+	PAREN_COUNT,				! count of paren levels
+	CHAR,					! holds a single character
+	COUNT,					! character count
+	INPUT_PTR,				! current pointer to input string
+	IN_STRING,				! 0 => we are not currently within
+						! an embedded quoted string.  Otherwise
+						! we are, and .in_string is the
+						! string delimiter (' or ").
+	TEMP_PTR 	: BLOCK[8,byte];	! string descriptor for embedded quote strings
+
+    ! The present input descriptor describes the input command lineup to the first
+    ! semicolon in the entire input line. Since we may have semicolons embedded
+    ! in a break action sequence, we must construct a buffer which contains the
+    ! present command line plus the rest of the input line. The remaining input
+    ! line is described by save_input_desc. Later, we must update the save_input_string
+    ! to reflect any input that we have used.
+    !
+    ! Obtain storage for the descriptor.
+    !
+    IF NOT dbg$nlist_freez (2, parse_stg_desc, .message_vect)
+    THEN
+	RETURN sts$k_severe;
+
+
+    ! Allocate a new buffer to hold all the input
+    !
+    IF NOT dbg$nlist_freez (((.input_desc [dsc$w_length] + .save_input_desc [dsc$w_length] )
+			    / %UPVAL) + 1,
+			    parse_stg_desc [dsc$a_pointer], .message_vect)
+    THEN
+	RETURN sts$k_severe;
+
+    new_pointer = ch$move (.input_desc [dsc$w_length], .input_desc [dsc$a_pointer],
+		           .parse_stg_desc [dsc$a_pointer]);
+
+
+    ! There is a <CR> at the end of the input descriptor. Change this to a semicolon.
+    !
+    ch$wchar (';', .new_pointer - 1);
+
+
+    ! Now copy the rest of the input line
+    !
+    ch$move (.save_input_desc [dsc$w_length], .save_input_desc [dsc$a_pointer],
+	     .new_pointer);
+
+
+    ! Set the count
+    !
+    parse_stg_desc [dsc$w_length] = .input_desc [dsc$w_length] + .save_input_desc [dsc$w_length];		
+
+
+    ! Set the variables used for error reporting
+    !
+    error_length = .parse_stg_desc [dsc$w_length] - 1;
+    error_ptr = .parse_stg_desc [dsc$a_pointer];
+
+
+    ! Do the real work
+    !
+    input_ptr = ch$ptr (.parse_stg_desc [dsc$a_pointer]);
+    count = 0;
+    in_string = 0;
+    temp_ptr[DSC$A_POINTER] = 0;
+    paren_count = 1;
+
+    WHILE true
+    DO
+	BEGIN
+
+	! Pick up the next character and see if we
+	! have run off the end of the string.
+	!
+	char = ch$rchar (.input_ptr);
+	IF .char EQL 0
+	THEN
+	    BEGIN
+	    LOCAL
+		DELIMITER;
+
+ 	    ! The string we complain about not begin delimited
+	    ! is either the supposed break action string, or
+	    ! a non-terminated embedded quoted string.
+	    !
+	    IF( .temp_ptr[ DSC$A_POINTER ] NEQ 0 )
+	    THEN
+		BEGIN
+
+		! We didn't find the ending ')' for the break
+		! action string because an embedded ascii 
+		! string was not properly terminated.
+		!
+		parse_stg_desc[DSC$A_POINTER] = .temp_ptr[DSC$A_POINTER];
+		parse_stg_desc[DSC$W_LENGTH] = .temp_ptr[DSC$W_LENGTH];
+		delimiter = .in_string;
+		END
+	    ELSE
+		BEGIN
+
+		! The action string itself was not terminated.
+		!
+		parse_stg_desc [dsc$w_length] = .error_length;
+		parse_stg_desc [dsc$a_pointer] = .error_ptr;
+
+		delimiter = %C')';
+		END;
+
+
+	    ! Truncate the string to 10 characters
+	    ! unless it is already smaller than that.
+	    !				
+	    IF( .parse_stg_desc[ DSC$W_LENGTH ] GTR 10 )
+	    THEN
+		parse_stg_desc[ DSC$W_LENGTH ] = 10;
+
+	    .message_vect = dbg$nmake_arg_vect (dbg$_noend, 3, .parse_stg_desc,
+					        1, delimiter);
+	    RETURN sts$k_severe;
+	    END;
+
+
+	! If we are not already in an embedded quoted string,
+	! then this may be the beginning of one.  If we are,
+	! then this may be the end of it.
+	!
+	IF( .char EQL %C'''' OR .char EQL %C'"' )
+	THEN
+	    BEGIN
+
+	    ! in_string tells not only whether or not we
+	    ! are in a quoted string, but what that
+	    ! string is delimited by.
+	    !
+	    IF( .in_string EQL 0 )
+	    THEN
+		BEGIN
+
+		! Now we are within a string.  Save the
+		! delimiter so we can find the end of it.
+		!
+		in_string = .char;
+
+
+		! Also save a string descriptor for this string
+		! as we may need it for later error processing.
+		! This string descriptor includes the supposed
+		! delimiting character.
+		!
+		temp_ptr[DSC$A_POINTER] = .input_ptr;
+		temp_ptr[DSC$W_LENGTH] = .error_length - .count;
+		END
+	    ELSE
+
+		! See if this quote ends the string we
+		! were already in.
+		!
+		IF( .in_string EQL .char )
+		THEN
+		    BEGIN
+
+		    ! End the string we were in.
+		    !
+		    in_string = 0;
+		    temp_ptr[DSC$A_POINTER] = 0;
+		    END;
+	    END
+	ELSE
+
+	    ! If we are already in an embedded string, and there
+	    ! is no chance that it is ending, then we don't care
+	    ! what the current character is.  Otherwise we
+	    ! have to look for parenthesis.
+	    !
+	    IF( .in_string EQL 0 )
+	    THEN
+
+	    	! We are not in an embedded string.
+	    	! Now we sort out the parenthesis matching.
+		!	
+	        IF( .char EQL %C')' )
+		THEN
+		    BEGIN
+	
+		
+		    ! Found a closing parenthesis. See
+		    ! whether this one matches the opening
+		    ! breakpoint action parenthesis, and
+		    ! if it does, then exit from this loop,
+		    ! and thus from the macro.
+		    !
+		    paren_count = .paren_count - 1;
+		    IF .paren_count LEQ 0
+		    THEN
+			BEGIN
+			EXITLOOP
+			END;
+		    END
+		ELSE
+		    IF( .char EQL %C'(' )
+		    THEN
+			paren_count = .paren_count + 1;
+
+
+	! Increment the character counter, update the pointer
+	! so that we are looking at the next character,
+	! and loop back to do so.
+	!
+	count = .count + 1;
+	input_ptr = ch$plus (.input_ptr, 1);
+	parse_stg_desc [dsc$w_length] = .parse_stg_desc [dsc$w_length] - 1;
+	END;		! End of loop
+
+
+    ! The breakpoint action string has been isolated.
+    ! We want the string address to be the address of a buffer in
+    ! dynamic memory.  If such a buffer cannot be allocated,
+    ! a SIGNAL is generated and an UNWIND is done.  The number
+    ! of bytes we need to allocate is the action string size +1
+    ! because we need 1 more byte to hold the count.
+    !
+    count = .count +1;
+    IF NOT dbg$nfreez ((.count + 1) / %UPVAL + 1, pointer, .message_vect)
+    THEN
+	RETURN sts$k_severe;
+
+
+    ! Copy the action string from the input
+    ! buffer, and then overwrite the character before
+    ! the string begins so that is becomes a counted string
+    ! action buffer.  We also ensure that there is a 0
+    ! character at the end of the buffer to ensure proper
+    ! termination of parsing it when the break happens.
+    !
+    ch$move (.count, .parse_stg_desc[DSC$A_POINTER]-1, pointer [0]);
+    pointer [0] = .count;
+    pointer[.count] = 0;
+
+
+    ! Now update the parse string descriptor to address
+    ! the character after the closing parenthesis.
+    !
+    parse_stg_desc [dsc$a_pointer] = ch$plus (.input_ptr, 1);
+    parse_stg_desc [dsc$w_length] = .parse_stg_desc [dsc$w_length] - 1;
+
+    
+    ! Now comes the time to figure out what we have and have not eaten so
+    ! that the save_input_desc may be updated properly. We must also update
+    ! the original input descriptor.
+    ! Check to see if there is still more stuff from input_desc.
+    !
+    IF .parse_stg_desc [dsc$a_pointer] LSSA .new_pointer
+    THEN
+	BEGIN
+
+	! The input_desc buffer has not been used completely.
+	!
+        input_desc [dsc$a_pointer] = .input_desc [dsc$a_pointer] +
+				     .input_desc [dsc$w_length] - 
+				     (.new_pointer - .parse_stg_desc [dsc$a_pointer]);
+				     
+	input_desc [dsc$w_length] = .new_pointer - .parse_stg_desc [dsc$a_pointer];
+	END
+    ELSE
+	BEGIN
+   
+	! The input_desc buffer has been exhausted and we are into the save_input_desc
+	! buffer. Update it and show exhaustion of the input_desc buffer.
+        !
+	input_desc [dsc$a_pointer] = 0;
+	input_desc [dsc$w_length] = 0;
+
+	save_input_desc [dsc$a_pointer] = .save_input_desc [dsc$a_pointer] +
+					  .parse_stg_desc [dsc$a_pointer] -
+					  .new_pointer;
+	save_input_desc [dsc$w_length] = .save_input_desc [dsc$w_length] -
+					 (.parse_stg_desc [dsc$a_pointer] -
+					  .new_pointer);
+	END;
+
+
+    ! Return a pointer to the saved-away action buffer.
+    !
+    .buffer = .pointer;
+
+    RETURN sts$k_success;
+
+    END;		! End of dbg$nsave_break_buffer
+
+END				!End of module
+ELUDOM

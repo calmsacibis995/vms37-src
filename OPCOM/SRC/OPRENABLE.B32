@@ -1,0 +1,444 @@
+MODULE	OPRENABLE	(
+			 LANGUAGE (BLISS32),
+			 IDENT = 'V03-000'
+			) =
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!
+!	OPCOM
+!
+! ABSTRACT:
+!
+!	This module contains the specialized logic to service
+!	a particular type of request sent by a user to OPCOM.
+!
+! Environment:
+!
+!	VAX/VMS operating system.
+!
+! Author:
+!
+!	Steven T. Jeffreys
+!
+! Creation date:
+!
+!	March 10, 1981
+!
+! Revision history:
+!
+! V02-002	STJ0166		Steven T. Jeffreys,	08-Feb-1982
+!		Removed reference to library LIB$GET_VM.
+!
+!--
+
+BEGIN						! Start of OPRENABLE
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:OPCOMDEF.REQ';
+
+FORWARD ROUTINE
+	OPRENABLE_HANDLER	: NOVALUE;
+
+BUILTIN
+
+	INSQUE,					! Insert entry onto a queue
+	REMQUE;					! Remove entry from a queue
+
+GLOBAL ROUTINE OPRENABLE_HANDLER (BUFFER_DESC) : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine is the handler for all OPRENABLE messages received by OPCOM.
+!
+!
+! Input:
+!
+!	BUFFER_DESC : The address of a quadword buffer descriptor that
+!		      describes the buffer containig the message.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	Some accounting data will be updated 
+!	to reflect the receipt of the message.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	None.
+!--
+
+BEGIN						! Start of OPRENABLE_HANDLER
+
+MAP
+	BUFFER_DESC	: REF BBLOCK;
+
+EXTERNAL LITERAL
+	OLD_FORMAT_MSG,				! Global status flag bit
+	RQCB_K_TYPE,				! RQCB structure type
+	MIN_SCOPE,				! Minimum value for scope
+	MAX_SCOPE;				! Maximum value for scope
+
+EXTERNAL ROUTINE
+	ALLOCATE_DS,				! Allocate a data structure
+	CHECK_OPER_COVERAGE : NOVALUE,		! Check operator coverage on requests
+	CHECK_REQUEST,				! Common sanity checks
+	CREATE_OCD	: NOVALUE,		! Create a new OCD
+	DEALLOCATE_MCB	: NOVALUE,		! Dispose of an MCB
+	DEALLOCATE_RQCB	: NOVALUE,		! Dispose of an RQCB
+	EXE$SETOPR	: ADDRESSING_MODE (GENERAL),
+	FIND_OCD,				! Find a given OCD
+	FIND_OPERATOR,				! Find a given operator
+	FORMAT_MESSAGE,				! Format a message and build an MCB
+	INTERPRET_MASK,				! Interpret the attention mask
+	LOG_MESSAGE,				! Write a message to a logfile
+	NOTIFY_LISTED_OPERATORS,		! Send message to list of operators
+	NOTIFY_OPERATOR,			! Send message to a given operator
+	UPD_OPER_CONTEXT,			! Update a given operator RQCB
+	VALID_OPERATOR;				! See if operator device is valid
+
+EXTERNAL
+	GLOBAL_STATUS	: BITVECTOR;		! Global status flags
+
+LOCAL
+	STATUS_DESC	: BBLOCK [DSC$K_S_BLN],	! Descriptor for status message
+	STATUS_BUF	: BBLOCK [OPC$K_MAXREAD], ! Buffer for status message
+	MESSAGE_VECTOR	: VECTOR [5,LONG],	! Message vector
+	MSG		: REF BBLOCK,		! Pointer to user request text
+	ARG_LIST	: VECTOR [3],		! Arguement list
+	BIT_VALUE	: LONG,			! 1 if ENABLE, 0 if DISABLE
+	FULL_DISABLE	: LONG,			! Boolean
+	FULL_ENABLE	: LONG,			! Boolean
+	FOUND		: LONG,			! Boolean
+	LOST_COVERAGE	: LONG,			! Boolean
+	OCD		: REF BBLOCK,		! OCD structure
+	RQCB		: REF BBLOCK,		! ReQuest Context Block
+	OPER_RQCB	: REF BBLOCK,		! Known operator RQCB
+	STATUS		: LONG;
+
+FULL_ENABLE = FALSE;
+FULL_DISABLE = FALSE;
+!
+! If the request does not contain enough data,
+! then it cannot be processed.  Ignore it.
+!
+IF .BUFFER_DESC [DSC$W_LENGTH] LSS (OPC$K_OPRENABLE_MIN_SIZE + OPC$K_COMHDRSIZ)
+THEN
+    RETURN;
+!
+! Call a special routine that does some sanity
+! checking and startup code for all request handlers.
+!
+IF NOT (STATUS = CHECK_REQUEST (.BUFFER_DESC, RQCB))
+THEN
+    RETURN;
+!
+! Check the specified device and see if it is a
+! valid operator device.  This routine will also
+! format the operator device name and create a
+! device name descriptor within the RQCB.
+!
+IF NOT VALID_OPERATOR (.BUFFER_DESC, .RQCB)
+THEN
+    BEGIN
+    DEALLOCATE_RQCB (.RQCB);
+    RETURN;
+    END;
+! 
+!
+! See if the operator is already known to OPCOM.
+! This entails scanning down the appropriate operator
+! list and comparing the device names for equality.
+!
+FOUND = FIND_OPERATOR (.RQCB, OPER_RQCB);
+!
+! If the operator is known to OPCOM, then the requestor's UIC
+! must agree with the UIC of the known operator.  If it does not,
+! then dismiss the request without notifying the requestor, as
+! this would only allow a user to cause an operator to be plauged
+! with error messages for a request he did not send.
+!
+IF .FOUND
+THEN
+    BEGIN
+    OCD = .RQCB [RQCB_L_OCD];				! Get the OCD address
+    IF ((.OCD [OCD_B_SCOPE] EQL OPC$K_GROUP) AND	! If GROUP OCD, the group fields
+	(.OCD [$BYTEOFFSET (OCD_L_UIC),16,16,0] NEQ	! of the UIC must be the same for both
+	 .RQCB [$BYTEOFFSET (RQCB_L_UIC),16,16,0]))	! the known operator and the requestor.
+    OR ((.OCD [OCD_B_SCOPE] EQL OPC$K_USER) AND		! If USER OCD, the UICs must be equal.
+	(.OCD [OCD_L_UIC] NEQ .RQCB [RQCB_L_UIC]))
+    THEN
+	BEGIN						! Dismiss the request
+	DEALLOCATE_RQCB (.RQCB);
+	RETURN;
+	END;
+    END;
+MESSAGE_VECTOR [0] = 0;					! Assume no error
+MESSAGE_VECTOR [1] = 0;
+!
+! Make sure that something is being enabled or disabled.
+! If not, this is an illegal request.  Also, do not allow
+! the user to touch the PERMOPER bit if the operator device
+! is a remote terminal.
+!
+IF  (.RQCB [RQCB_L_ATTNMASK1] EQL 0)
+AND (.RQCB [RQCB_L_ATTNMASK2] EQL 0)
+AND (NOT .BBLOCK [RQCB [RQCB_L_RQ_OPTIONS], OPC$V_PERMOPER])
+OR  ((.BBLOCK [RQCB [RQCB_W_OPRSTS], OPRSTS_V_REMTRM]) AND
+    (.BBLOCK [RQCB [RQCB_L_RQ_OPTIONS], OPC$V_PERMOPER]))
+THEN
+    MESSAGE_VECTOR [0] = OPC$_ILLRQST;			! Set request status
+!
+! See if the user has the correct privilege(s)
+! for the request to be granted.
+!
+IF ((.RQCB [RQCB_B_SCOPE] EQL OPC$K_SYSTEM) AND			! SYSTEM scope requires OPER privilege
+    (NOT .BBLOCK [RQCB [RQCB_L_PRIVMASK1], PRV$V_OPER]))
+OR ((.RQCB [RQCB_B_SCOPE] EQL OPC$K_GROUP) AND			! GROUP scope requires GROUP privilege
+    ((NOT .BBLOCK [RQCB [RQCB_L_PRIVMASK1], PRV$V_GROUP]) OR
+     (NOT .BBLOCK [RQCB [RQCB_L_PRIVMASK1], PRV$V_OPER])))
+OR ((.RQCB [RQCB_L_SENDERUIC] NEQ .RQCB [RQCB_L_UIC]) AND	! Issuing a request on another's behalf
+    (NOT .BBLOCK [RQCB [RQCB_L_PRIVMASK1], PRV$V_OPER]))	! requires OPER privilege.
+THEN
+    MESSAGE_VECTOR [0] = OPC$_ILLRQST;				! Set request status
+!
+! If an error was detected, notify the 
+! would-be operator and abort the request.
+!
+IF .MESSAGE_VECTOR [0] NEQ 0
+THEN
+    BEGIN
+    FORMAT_MESSAGE (.RQCB, MESSAGE_VECTOR);
+    NOTIFY_OPERATOR (.RQCB);
+    DEALLOCATE_RQCB (.RQCB);
+    RETURN;
+    END;
+!
+! Finish the request.
+!
+IF NOT .BBLOCK [RQCB [RQCB_L_RQ_OPTIONS], OPC$V_DISABLE]
+THEN
+    BEGIN
+    !
+    ! This is an enable request.
+    !
+    BIT_VALUE = 1;				! Set bit value
+    MESSAGE_VECTOR [0] = OPC$_TERMENAB;		! Set message code
+    IF NOT .FOUND
+    THEN
+	BEGIN
+	!
+	! The operator is not known to OPCOM.  An operator RQCB
+	! must be created and inserted onto the appropriate OCD
+	! operator list so the generalized ENABLE logic will work.
+	!
+	FULL_ENABLE = TRUE;
+	ALLOCATE_DS (RQCB_K_TYPE, OPER_RQCB);		! Clone a new RQCB
+	CH$MOVE (RQCB_K_SIZE, .RQCB, .OPER_RQCB);	! Copy old RQCB
+	OPER_RQCB [HDR_L_SEQNUM] = .OPER_RQCB [HDR_L_SEQNUM] + 1;
+	OPER_RQCB [RQCB_L_OPTIONS] = 0;			! Zero option mask
+	OPER_RQCB [RQCB_L_RQ_OPTIONS] = 0;		! Zero option mask
+	OPER_RQCB [RQCB_L_ATTNMASK1] = 0;		! Zero mask for enable
+	OPER_RQCB [RQCB_L_ATTNMASK2] = 0;		! Zero mask for enable
+	!
+	! Insert the operator RQCB into the operator list in the appropriate
+	! OCD.  If no OCD is found, then a new one must be created.
+	!
+	IF NOT FIND_OCD (.RQCB [RQCB_B_SCOPE], .RQCB [RQCB_L_UIC], OCD)
+	THEN
+	    CREATE_OCD (.RQCB [RQCB_B_SCOPE], .RQCB [RQCB_L_UIC], OCD);
+	INSQUE (.OPER_RQCB, OCD [OCD_L_OPERFLINK]);	! Insert cloned RQCB onto operator list
+	OPER_RQCB [RQCB_L_OCD] = .OCD;			! Set pointer to OCD
+	OCD [OCD_W_OPERCOUNT] = .OCD [OCD_W_OPERCOUNT]+1;! Increment operator count
+	ARG_LIST [0] = 1;				! Set arguement count
+	ARG_LIST [1] = OPER_RQCB [RQCB_L_OPER_LEN];	! Set operator device name
+	ARG_LIST [2] = ON;				! Bit value
+	$CMKRNL (ROUTIN=EXE$SETOPR, ARGLST=ARG_LIST);	! Set the OPR bit in the device UCB.
+	END;
+    END
+ELSE
+    IF NOT .FOUND
+    THEN
+	BEGIN
+	!
+	! The user is trying to disable a nonexistent operator.
+	!
+	MESSAGE_VECTOR [0] = OPC$_ILLRQST;
+	MESSAGE_VECTOR [1] = 0;
+	FORMAT_MESSAGE (.RQCB, MESSAGE_VECTOR);
+	NOTIFY_OPERATOR (.RQCB);
+	DEALLOCATE_RQCB (.RQCB);
+	RETURN;
+	END
+    ELSE	
+	BEGIN
+	!
+	! This is a legitimate DISABLE request.
+	!
+	BIT_VALUE = 0;				! Set for disable request
+	MESSAGE_VECTOR [0] = OPC$_TERMDSBL;
+	END;
+!
+! Update the OCD count vector for each bit present in the bit mask.
+! The count will be decremented for a DISABLE, incremented for an ENABLE.
+! Also update the OCD operator intrest mask, and the corresponding intrest
+! mask in the operator RQCB.  Note if there was a potential lose of operator
+! coverage on any outstanding requests.
+!
+LOST_COVERAGE = UPD_OPER_CONTEXT (.BBLOCK [RQCB [RQCB_L_RQ_OPTIONS], OPC$V_DISABLE],
+				  .RQCB [RQCB_L_ATTNMASK1],
+				  .RQCB [RQCB_L_ATTNMASK2],
+				  .OPER_RQCB
+				 );
+!
+! Set the PERMOPER bit as desired.
+!
+IF .BBLOCK [RQCB [RQCB_L_RQ_OPTIONS], OPC$V_PERMOPER]
+THEN
+    BBLOCK [OPER_RQCB [RQCB_L_RQ_OPTIONS], OPC$V_PERMOPER] = .BIT_VALUE;
+!
+! If the OPER_RQCB attention mask went to 0, then
+! disable the operator terminal.
+!
+IF (.OPER_RQCB [RQCB_L_ATTNMASK1] EQL 0) AND (.OPER_RQCB [RQCB_L_ATTNMASK2] EQL 0)
+THEN
+    BEGIN
+    FULL_DISABLE = TRUE;
+    BBLOCK [OPER_RQCB [RQCB_L_OPTIONS], OPC$V_NOBRD] = .BBLOCK [RQCB [RQCB_L_OPTIONS], OPC$V_NOBRD];
+    BBLOCK [OPER_RQCB [RQCB_L_OPTIONS], OPC$V_NOLOG] = .BBLOCK [RQCB [RQCB_L_OPTIONS], OPC$V_NOLOG];
+    RQCB [RQCB_L_OCD] = 0;			! Clear link to OCD
+    DEALLOCATE_RQCB (.RQCB);			! Get rid of the old RQCB
+    REMQUE (.OPER_RQCB, RQCB);			! Remove operator RQCB from list
+    RQCB = .OPER_RQCB;				! Copy the RQCB address
+    OCD = .RQCB [RQCB_L_OCD];			! Get OCD address
+    OCD [OCD_W_OPERCOUNT] = .OCD [OCD_W_OPERCOUNT] - 1;
+    ARG_LIST [0] = 1;				! Set arguement count
+    ARG_LIST [1] = OPER_RQCB [RQCB_L_OPER_LEN];	! Set operator device name
+    ARG_LIST [2] = OFF;				! Bit value
+    $CMKRNL (ROUTIN=EXE$SETOPR, ARGLST=ARG_LIST);	! Clear the OPR bit in the device UCB.
+    END;
+!
+OCD = .OPER_RQCB [RQCB_L_OCD];
+RQCB [RQCB_L_OCD] = .OCD;
+IF .FULL_ENABLE OR .FULL_DISABLE
+THEN
+    BEGIN
+    !
+    ! Send the ENABLE/DISABLE message to all CENTRAL operators
+    ! connected to this OCD.  Notify the requestor even if not a CENTRAL
+    ! operator.  If this is a full disable, explicitly notify this operator of
+    ! the DISABLE.  This is necessary because the operator is no longer
+    ! on the OCD's operator list, and would not be notified otherwise.
+    ! Note that the message is sent only if this is the initial ENABLE
+    ! or a full DISABLE for this operator.  Note that the request RQCB
+    ! must be used instead of the operator RQCB to avoid a race condition
+    ! when a user does an enable/disable and then implicitly disables the
+    ! operator.  This would cause the OPER_RQCB to evaporate in the middle
+    ! of the NOTIFY_LISTED_OPERATORS operation.
+    !
+    RQCB [RQCB_L_ATTNMASK1] = OPC$M_NM_CENTRL;
+    RQCB [RQCB_L_ATTNMASK2] = 0;
+    BBLOCK [RQCB [RQCB_L_STATUS], HDR_V_BRD] = TRUE;
+    MESSAGE_VECTOR [1] = 0;
+    MESSAGE_VECTOR [2] = RQCB [RQCB_L_OPER_LEN];
+    FORMAT_MESSAGE (.RQCB, MESSAGE_VECTOR);
+    LOG_MESSAGE (.RQCB);
+    NOTIFY_LISTED_OPERATORS (.RQCB);
+    IF .FULL_DISABLE
+    THEN
+	NOTIFY_OPERATOR (.RQCB);
+    END;
+!
+! Since the operator status has changed, send an operator
+! status message to the operator.  This does not have to
+! be done in the case of a full DISABLE.  
+!
+! If the operator was implicitly disabled during a NOTIFY_LISTED_OPERATORS
+! operation, then do not send the message, as it would cause the user to
+! think that the enable operation had completed.  This does not close the
+! timing window, but only makes it's occurrance less annoying.  A simple
+! test for the implicit disable is to check the sequence number on the
+! operator RQCB. If it is zero, it means that operator has been disabled,
+! and the RQCB deallocated.
+!
+IF (NOT .FULL_DISABLE) AND (.OPER_RQCB [RQCB_L_SEQNUM] NEQ 0)
+THEN
+    BEGIN
+    !
+    ! Create a buffer descriptor for the status message,
+    ! format the message, and log it.
+    !
+    STATUS_DESC [0,0,32,0] = OPC$K_MAXREAD;		! Set buffer size
+    STATUS_DESC [DSC$A_POINTER] = STATUS_BUF;		! Set buffer address
+    MESSAGE_VECTOR [0] = OPC$_OPERSTS;			! Set message number
+    MESSAGE_VECTOR [1] = 0;				! Set # of message args
+    MESSAGE_VECTOR [2] = RQCB [RQCB_L_OPER_LEN];	! Operator desc. addr
+    MESSAGE_VECTOR [3] = STATUS_DESC;			! Status line desc. addr
+    IF INTERPRET_MASK (OPER_RQCB [RQCB_L_ATTNMASK1], STATUS_DESC, STATUS_DESC)
+    THEN
+	BEGIN
+	FORMAT_MESSAGE (.RQCB, MESSAGE_VECTOR);
+	LOG_MESSAGE (.RQCB);				! Log the status message
+	NOTIFY_OPERATOR (.RQCB);			! Send the message to the operator
+	END;
+    END;
+!
+! Deallocate the RQCB.  If this was a full enable, clear
+! the pointer to the operator device name, as both the
+! RQCB and the OPER_RQCB point to the same device name.
+! Deallocating the RQCB in this case would cause the OPER_RQCB
+! device name to evaporate.
+!
+IF .FULL_ENABLE
+THEN
+    RQCB [RQCB_L_OPER_PTR] = 0;
+DEALLOCATE_RQCB (.RQCB);
+!
+! If there was a potential loss of operator coverage,
+! check the remaining requests queued to this OCD.
+! The routine will cancel any requests that no longer
+! have operator coverage.
+!
+IF .LOST_COVERAGE
+THEN
+    CHECK_OPER_COVERAGE (.OCD);
+
+END;						! End of OPRENABLE_HANDLER
+
+END						! End of OPRENABLE
+ELUDOM

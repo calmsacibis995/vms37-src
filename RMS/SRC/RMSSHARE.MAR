@@ -1,0 +1,442 @@
+	$BEGIN	RMSSHARE,017,RMSSHARE,<ROUTINE TO INIT/MODIFY RMS SFD>,<GBL>
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; FACILITY:
+;	RMS-32 File Sharing
+;
+; ABSTRACT:
+;	This program allocates/modifies the RMS SHARED FILE DATA BASE.
+;	If sharing is currently enabled (this program has already been
+;	run), a message to that effect is output, along with the current
+;	SHARED FILE DATA (SFD) counts.  A prompt is then made which
+;	allows the user to modify the maximum number of pages which may
+;	be allocated for RMS SHARED FILES.  If sharing is not currently
+;	enabled, a message to that effect is output, along with a prompt
+;	for the maximum number of pages to allow for RMS SHARED FILE
+;	DATA.
+;	When this program is run initially, it will allocate one page of
+;	the SYSTEM PAGED POOL for the SFD DATA COUNTS.
+;
+;	This program does a CHANGE MODE TO KERNEL call; however, because it
+;	is being run in EXEC MODE, the user does not specifically require
+;	CHANGE MODE TO KERNEL (CMKRNL) privilege.  This is because any program
+;	which runs in EXEC RING has this privilege implicitly.
+;
+; ENVIRONMENT:
+;	VAX/VMS Operating System
+;
+; WRITTEN BY:
+;		R A Newell		19-Sep-1978
+;
+; MODIFIED BY:
+;
+;	V02-017	REFORMAT	Frederick E. Deen, Jr.	    25-Jul-1980
+;		This code was reformatted to adhere to RMS standards
+;
+; REVISION HISTORY:
+;
+;	D M Bousquet		21-Dec-1978
+;	Changed prompting sequence, so that all I/O is done in
+;	USER MODE. (For some reason, indirect command files will not
+;	prompt correctly in EXEC. MODE)
+;
+;	R A Schaefer		14-Sep-1979
+;	Re-structure code and correct several bugs:
+;	    *  Complete failure if no SFD page is obtained.
+;	    *  EOF on input exited with error status
+;
+;
+;	R A Schaefer		31-Oct-1979
+;	Change algorithm to allocate all requested pages to start with and
+;	include them on the FREE-LIST.  This prevents dynamic space exhaustion
+;	(SPE errors) from afflicting unsuspecting COBOL programs.
+;	Maximum allocation is 1/2 of the system paged dynamic memory.
+;
+;--
+;
+
+
+;
+; MACROS
+;
+
+	$SFDDEF
+	$CMKRNLDEF
+	$PTEDEF
+	$VADEF
+	$PRTDEF
+	$IRPDEF
+	$SSDEF
+	$SHRDEF
+	$RMSDEF
+
+;
+; LOCAL DATA
+;
+
+;
+; COMMAND INPUT
+;
+
+CMDIFAB:
+	$FAB	FAC=GET,FNM=SYS$INPUT:,MRS=132,RAT=CR
+CMDIRAB:
+	$RAB	UBF=CMDBUF,USZ=CMDBSZ,FAB=CMDIFAB,ROP=PMT
+
+;
+; COMMAND OUTPUT
+;
+
+CMDOFAB:
+	$FAB	FAC=PUT,FNM=SYS$OUTPUT:,MRS=132,RAT=CR,RFM=VAR
+CMDORAB:
+	$RAB	UBF=CMDBUF,USZ=CMDBSZ,FAB=CMDOFAB
+
+;
+; DATA BUFFERS
+;
+
+CMDBUF:	.BLKB	256
+CMDBSZ=	.-CMDBUF
+
+;
+; PAGED DYNAMIC MEMORY LIMIT
+;
+
+MEMSIZ:	.BLKL	1
+
+;
+; Saved EXIT STATUS value
+;
+
+EXIT_STAT:
+	.BLKL	1
+
+
+;
+; FAO descriptions
+;
+
+FAOBUF:	.LONG	CMDBSZ,CMDBUF
+FAOLEN:	.BLKW	1
+
+;
+; Messages and prompts
+;
+
+SZMSG:	.ASCII	'%RMSSHARE-E-Invalid size parameter, set to maximum value: !UL'
+SZMSGSZ=	.-SZMSG
+SZMSGDSC:
+	.LONG	SZMSGSZ,SZMSG
+
+NOSHARE:
+	.ASCII	'RMS file sharing is not currently enabled...'
+	.ASCII	'!/  Maximum allocation allowed: !UL'
+	.ASCII	'!/  Enter max pages: '
+NOSHARESZ=	.-NOSHARE
+NOSHAREDSC:
+	.LONG	NOSHARESZ,NOSHARE
+
+INFO:	.ASCII	'RMS file sharing is currently enabled...'
+	.ASCII	'!/  Maximum allocation allowed: !UL'
+	.ASCII	'!/  Number of pages allocated: !UL'
+	.ASCII	'!/  Max pages used: !UL'
+	.ASCII	'!/  Current number of pages in use: !UL'
+	.ASCII	'!/  Enter max pages: '
+INFOSZ=	.-INFO
+INFODSC:
+	.LONG	INFOSZ,INFO
+
+;
+; Page alignment mask
+;
+
+	MASK	= ^X1FF
+
+
+;++
+;
+; START - This is the main code driver.
+;         This routine performs the prompt for input sequence and calls
+;         SHOWSHR to print out the initial sharing state and
+;         STRTSHR to enable or modify the sharing counts.
+;
+;         Because we are modifying counts
+;         in the SFD, we must run in EXEC MODE, as the protection on the pages
+;         is EXEC READ/WRITE.  Therefore, CHANGE MODE TO EXEC (CMEXEC)
+;         privilege is required to run this program.
+;
+;--
+
+START::	.WORD	0				; entry mask
+	MOVL	#1,EXIT_STAT			; assume success
+	$OPEN	FAB=CMDIFAB			; OPEN input
+	BLBC	R0,20$				; quit on error
+	$CONNECT	RAB=CMDIRAB		; CONNECT to it
+	BLBC	R0,20$				; quit on error
+	$OPEN	FAB=CMDOFAB			; OPEN output
+	BLBC	R0,20$				; quit on error
+	$CONNECT	RAB=CMDORAB		; CONNECT to it
+	BLBC	R0,20$				; quit on error
+10$:	$CMEXEC_S	SHOWSHR			; setup to show initial state
+	BLBC	R0,20$				; quit on error
+	$GET	RAB=CMDIRAB			; get new value
+	BLBS	R0,30$				; success?
+	CMPL	R0,#RMS$_EOF			; EOF?
+	BEQL	40$				; EOF is successful completion
+20$:	BRB	EXIT				; quit on weird error
+
+30$:	TSTW	CMDIRAB+RAB$W_RSZ		; test length of input
+	BEQL	40$				; quit on null line
+	MOVAL	CMDBUF,R1			; address of data
+	CMPL	#^A/EXIT/,(R1)			; exit condition?
+	BEQL	40$
+	CMPL	#^A/exit/,(R1)			; LC exit condition?
+	BEQL	40$
+
+	$CMEXEC_S	STRTSHR			; enable sharing
+	BLBS	R0,10$				; keep trying till user quits
+
+40$:	MOVL	EXIT_STAT,R0			; saved exit status
+EXIT:	RET
+
+
+;++
+;   EXEC MODE routines to do all the work:
+;	SHOWSHR - Routine to print out the current file sharing counts
+;	STRTSHR - Routine to enable sharing and/or modify the page limit
+;
+;--
+
+SHOWSHR:
+	.WORD	0				; entry mask
+
+;
+;	Maximum allowed storage is 1/2 the system's paged dynamic memory.
+;	Compute this limit by converting the system paged dynamic memory limit
+;	(in bytes) to pages and then 1/2 of those.
+;
+
+	ASHL	#-10,@#SGN$GL_PAGEDYN,MEMSIZ	; compute max # pages allowed
+	MOVL	@#RMS$GL_SFDBASE,R0		; get SFD address
+	BNEQ	10$				; branch if enabled
+	PUSHL	MEMSIZ				; max allowed value
+	PUSHAQ	FAOBUF				; set up FAO call
+	PUSHAW	FAOLEN
+	PUSHAQ	NOSHAREDSC			; control string desc
+	CALLS	#4,@#SYS$FAO
+	BRB	11$				; join common flow
+
+10$:	PUSHL	SFD$L_PAGECOUNT(R0)		; put page limit
+	PUSHL	SFD$L_PAGEMAX(R0)		; put maximum used
+	PUSHL	SFD$L_PAGELIMIT(R0)		; put # pages in use
+	PUSHL	MEMSIZ				; max allowed value
+	PUSHAQ	FAOBUF				; buffer addr
+	PUSHAW	FAOLEN				; actual length word
+	PUSHAQ	INFODSC				; control string descr
+	CALLS	#6,@#SYS$FAO			; call FAO
+11$:	MOVAL	CMDBUF,CMDIRAB+RAB$L_PBF	; set up for msg output
+	MOVB	FAOLEN,CMDIRAB+RAB$B_PSZ	; set message size
+	RET					; return with FAO status
+
+
+STRTSHR:
+	.WORD	^M<R2,R3,R4,R5>			; entry mask
+	MOVAL	CMDBUF,R2			; get address of input value
+	MOVZWL	CMDIRAB+RAB$W_RSZ,R1		; set size
+	BSBW	ASCBIN				; call ASCII to binary conversion
+	BLBC	R0,BADSZ			; error
+	TSTL	R3				; check size input
+	BLEQ	BADSZ				; error
+	CMPL	R3,MEMSIZ			; within allowed limits?
+	BGTR	BADSZ				; nope
+
+SETSZ:	MOVL	@#RMS$GL_SFDBASE,R4		; was SFD init?
+	BNEQ	20$				; branch if so
+
+
+;
+;	Allocate the initial page
+;
+
+	PUSHL	#1				; get one page of paged pool
+	PUSHL	#1				; number of parameters
+	BSBW	RM$GETS0PAGE			; get the requested page
+	BLBC	R0,NOROOM			; quit if no space
+	MOVL	@#RMS$GL_SFDBASE,R4		; get local ptr
+	INCL	SFD$L_PAGECOUNT(R4)		; incr # pages in use for SFD
+	INCL	SFD$L_PAGEMAX(R4)		; incr max # pages used for SFD
+	INCL	SFD$L_PAGELIMIT(R4)		; incr # pages allocated for SFD
+	MOVAL	SFD$L_RQ_FLNK(R4),-		; initialize resource queue
+		SFD$L_RQ_FLNK(R4)
+	MOVAL	SFD$L_RQ_FLNK(R4),-
+		SFD$L_RQ_BLNK(R4)
+	MOVAL	SFD$L_FREEPGLH(R4),-		; set up FREE PG LH
+		SFD$L_FREEPGLH(R4)
+	MOVAL	SFD$L_FREEPGLH(R4),-
+		SFD$L_FREEPGLH+4(R4)
+
+;
+;	Now add the additional requested pages to the FREE-PAGE-LIST
+;
+
+20$:	SUBL2	SFD$L_PAGELIMIT(R4),R3		; cannot reduce the page count
+	BGTR	ADD_LOOP			; add the pages
+	BEQL	RTN				; no change
+	MOVL	#SHR$_VALERR,EXIT_STAT		; set warning error and ignore value
+	BRB	RTN
+
+ADD_LOOP:
+	PUSHL	#1				; get space 1 page at a time
+	PUSHL	#1				; one arg
+	BSBW	RM$GETS0PAGE			; get the S0 SPACE
+	BLBC	R0,NOROOM			; no room!
+	INCL	SFD$L_PAGELIMIT(R4)		; add storage to count
+	INSQUE	(R1),@SFD$L_FREEPGLH+4(R4)	; add the page to the free list tail
+	SOBGTR	R3,ADD_LOOP			; loop as long as needed
+RTN:	MOVL	#1,R0
+	RET
+
+NOROOM:	MOVZWL	#SS$_INSFMEM,R0			; insuff memory error
+RET:	RET
+
+BADSZ:	MOVL	#SHR$_VALERR,EXIT_STAT		; set warning status
+	MOVL	MEMSIZ,R3			; set max as replacement value
+	PUSHL	R3				; set up for message
+	PUSHAQ	FAOBUF				; text buffer
+	PUSHAW	FAOLEN				; text length
+	PUSHAQ	SZMSGDSC			; control text desc
+	CALLS	#4,@#SYS$FAO			; create message
+	MOVAL	CMDBUF,CMDORAB+RAB$L_RBF	; output appropriate error msg
+	MOVW	FAOLEN,CMDORAB+RAB$W_RSZ	; set up size of msg
+	$PUT	RAB=CMDORAB			; output msg
+	BLBC	R0,RET				; on error, return I/O error status
+	BRW	SETSZ				; otherwise, proceed with init
+
+
+;++
+;
+;	Subroutine to convert ASCII string to BINARY
+;
+;	INPUTS:	R1, R2 = length and address of input string
+;
+;	OUTPUTS:	R0 - status code
+;			R3 - binary value
+;			R1, R2 - destroyed
+;
+;--
+
+ASCBIN:	CLRL	R3				; clear register
+	BRB	20$				; adjust char count
+10$:	MULL2	#10,R3				;
+	BVS	30$				; branch on overflow, error
+	CMPB	(R2),#^X20			; is it a space?
+	BEQL	25$				; branch if yes
+	SUBB3	#^A/0/,(R2)+,R0			;
+	BLSS	30$				;
+	CMPB	R0,#^A/9/-^A/0/			;
+	BGTRU	30$				;
+	ADDB2	R0,R3				;
+20$:	DECL	R1				;
+	BGEQ	10$				; branch if more characters
+	MOVL	#1,R0				; indicate success
+	RSB					; return
+25$:	INCB	R2				; bypass space
+	BRB	20$				;
+30$:	CLRL	R0				; indicate failure
+	RSB					; return
+
+
+;++
+;	This routine is the one which is actually called to get S0 SPACE
+;	from the system.  It does a CHANGE MODE TO KERNEL (CMKRNL) and
+;	executes the subroutine RM$GETS0.
+;
+;	RETURN VALUES:
+;	    R0 - success/failure indicator
+;	    R1 - address of allocated storage if successful
+;--
+
+RM$GETS0PAGE:
+	MOVL	(SP)+,R2			; save return PC
+	ASSUME	CMKRNL$_NARGS EQ 2
+	ASSUME	CMKRNL$_ARGLST EQ 8
+	$CMKRNL_S	RM$GETS0,(SP)		; go get S0 SPACE
+	ADDL2	#8,SP				; readjust the STACK
+	JMP	(R2)				; return
+
+;
+;	This subroutine gets S0 POOL SPACE from the SYSTEM for use as the
+;	SFD for the FILE SHARING FACILITY of RMS32.
+;
+
+RM$GETS0:
+	.WORD	^M<R2,R3,R4,R5>			; entry mask
+	MOVL	4(AP),R1			; get # of pages requested
+	ASHL	#9,R1,R5			; convert size to bytes
+	MOVAB	MASK(R5),R1			; get extra space to assure
+						;  required amount is
+						;  page-aligned
+	JSB	@#EXE$ALOPAGED			; allocate the space
+	BLBC	R0,20$				; branch if memory not available
+	ADDL3	R1,R2,R4			; save original ending addr
+	MOVAB	MASK(R2),R1			; round up starting addr
+	BICW	#MASK,R1			; page align starting addr
+	PUSHL	R1				; save starting addr
+	SUBL3	R2,R1,IRP$W_SIZE(R2)		; set up for deallocation
+	BEQL	5$				; branch if nothing to deallocate
+	MOVL	R2,R0				; set up for deallocation
+	JSB	@#EXE$DEAPAGED			; deallocate portion not page-align
+5$:	ADDL3	(SP),R5,R1			; get ending addr
+
+;
+;	No check is made to avoid return of space to the PAGED POOL after the
+;	allocated buffer as there will always be at least one 16-byte
+;	block left to return.
+;
+
+	SUBL3	R1,R4,IRP$W_SIZE(R1)		; set up for deallocation
+	MOVL	R1,R0				; set up for deallocation
+	JSB	@#EXE$DEAPAGED			; deallocate portion not page-align
+	MOVL	@#MMG$GL_SPTBASE,R3		; get system page table addr
+	EXTZV	#VA$V_VPN,#VA$S_VPN,(SP),R0	; extract virtual page number
+	MOVL	4(AP),R4			; get # of pages
+15$:	MOVAL	(R3)+[R0],R1			; get addr of page table entry
+	INSV	#PRT$C_EW,-			; change prot to exec write
+		#PTE$V_PROT,#PTE$S_PROT,(R1)
+	SOBGTR	R4,15$				; loop through all PTE'S
+	INVALID					; invalidate xlation buffer
+	MOVC5	#0,(SP),#0,R5,@0(SP)		; clear space
+	MOVL	(SP)+,R1			; return address
+	MOVL	#1,R0				; indicate success
+	TSTL	@#RMS$GL_SFDBASE		; has SFD been init'd?
+	BNEQ	20$				; yes, then just return
+	MOVAL	8(R1),@#RMS$GL_SFDBASE		; otherwise, setup initial ptr
+20$:	RET					; return
+
+
+	.END	START

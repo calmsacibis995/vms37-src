@@ -1,0 +1,510 @@
+
+MODULE RM3DELSDR (LANGUAGE (BLISS32) ,
+		IDENT = 'V03-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:	RMS32 INDEX SEQUENTIAL FILE ORGANIZATION
+!
+! ABSTRACT:
+!                Search for and delete SIDR entry
+!
+!
+! ENVIRONMENT:
+!
+!		VAX/VMS OPERATING SYSTEM
+!
+!--
+
+!
+! AUTHOR:        Christian Saether	     CREATION DATE:        	28-AUG-78  16:10
+!
+! MODIFIED BY:
+!
+!	V02-010 CDS0001		C Saether		30-Aug-1981
+!		Don't release with keep lock before doing nrp update.
+!
+!	V02-009	MCN0006		Maria del C. Nasr	16-Mar-1981
+!		Increase size of record identifier to a word in the NRP.
+!
+!	V02-008 REFORMAT	Ken Henderson		29-Jul-1980
+!		the code was reformatted
+!
+! REVISION HISTORY:
+!
+!   D. H. Gillespie, 	6-OCT-78  13:22
+!   X0002 - add update to NRP list
+!
+!   Wendy Koenig, 	12-OCT-78  10:42
+!   X0003 -  reflect two routines to update nrp
+!
+!   Wendy Koenig, 	24-OCT-78  14:01
+!   X0004 - make changes caused by sharing conventions
+!
+!   Christian Saether, 	12-DEC-78  20:49
+!   X0005 - do not remove last SIDR record but only mark deleted
+!
+!   Christian Saether, 	8-FEB-79  9:54
+!   X0006 - fix bug in error path
+!
+!   Christian Saether,  06-DEC-79  10:00
+!   0007 - don't force write through when writing modified bucket
+!
+!*****
+
+LIBRARY 'RMSLIB:RMS';
+
+REQUIRE 'RMSSRC:RMSIDXDEF';
+
+!
+! define default psects for code
+!
+
+PSECT
+    CODE = $$RMSDELETE3(PSECT_ATTR),
+    PLIT = $RMSDELETE3(PSECT_ATTR);
+
+MACRO
+    L_DEL_SIDR =
+		RL$DEL_SIDR = JSB() : 
+		GLOBAL (R_IFAB,R_REC_ADDR,R_IDX_DFN,R_IRAB,R_BKT_ADDR) %;
+
+! Linkages
+
+LINKAGE
+    L_GETNEXT_REC,
+    L_REC_OVHD,
+    L_CSEARCH_TREE,
+    L_DEL_SIDR,
+    L_MOVE,
+    L_RLSBKT,
+    L_DELETE_SIDR,
+    L_ZERO_NRP,
+    L_SQUISH_SIDR,
+    L_PREUPD_NRP,
+    L_UPD_NRP;
+
+!
+!
+! Forward Routines
+!
+!
+! External Routines
+
+EXTERNAL ROUTINE
+    RM$GETNEXT_REC	: RL$GETNEXT_REC,
+    RM$REC_OVHD		: RL$REC_OVHD,
+    RM$MOVE		: RL$MOVE,
+    RM$RLSBKT		: RL$RLSBKT,
+    RM$CSEARCH_TREE	: RL$CSEARCH_TREE,
+    RM$ZERO_NRP		: RL$ZERO_NRP NOVALUE,
+    RM$PREUPD_NRP	: RL$PREUPD_NRP NOVALUE,
+    RM$UPD_NRP		: RL$UPD_NRP;
+
+!
+
+
+GLOBAL ROUTINE RM$SQUISH_SIDR (BEG_SIDR) : RL$SQUISH_SIDR =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	given an entry in the sidr that needs deleting, squish it out
+!	and do all the necessary updates
+!	if this is the last entry in the sidr, squish out the whole sidr
+!	unless dupes are allowed and it is also the last sidr in the bucket,
+!	in which case, if called from del_sidr (ap<17,1> = 0) then the array
+!	element is only marked deleted, but the sidr is left to hold a key value
+!	for the bucket.  if called from recvr_spc, the entire sidr will always
+!	be removed unless we are positioned to add an array element to the
+!	sidr on this insert, in which case only the array element itself is
+!	removed.
+!	nrp positioning is still performed as if
+! 	the entire sidr was removed
+!
+! CALLING SEQUENCE:
+!	bsbw rm$squish_sidr (beg_sidr)
+!
+! INPUT PARAMETERS:
+!	beg_sidr -- pointer to the beginning of the sidr array
+!
+! IMPLICIT INPUTS:
+!	IFAB -- for rm$preupd_nrp
+!	irab -- for rm$getnext_rec, [curbdb],
+!		 upd_nrp -- if an update is necessary
+!	idx_dfn -- [keysz]
+!		-- [dupkeys] dupes are allowed if set
+!	rec_addr -- address of array entry that needs deleting
+!	bkt_addr -- address of bucket
+!	AP<0,16> - "dup pos", number of entries passed before this one
+!	AP<17,1> - if set, being called from recvr_spc
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	upd_nrp -- if set, indicates further update to nrp list necessary
+!	rec_addr -- pointing to next record, whether this one was actually
+!	deleted or not
+!
+! ROUTINE VALUE:
+!	number of bytes squished
+!
+! SIDE EFFECTS:
+!	squishes out an entry or an array
+!	pre-updates the nrp list, updates the freespace
+!
+!--
+
+    BEGIN
+
+    BUILTIN
+	AP;
+
+    EXTERNAL REGISTER
+	R_BKT_ADDR_STR,
+	R_REC_ADDR_STR,
+	R_IRAB_STR,
+	R_IFAB_STR,
+	R_IDX_DFN_STR;
+
+    MAP
+	BEG_SIDR	: REF BBLOCK;
+
+    LOCAL
+	EOB		: REF BBLOCK,
+	SIZE,
+	SIZ_FLD_PTR	: REF BBLOCK,
+	DEL_FROM,
+	LENGTH;
+
+    EOB = .BKT_ADDR[BKT$W_FREESPACE] + .BKT_ADDR;
+    SIZE = .REC_ADDR[IRC$V_PTRSZ] + 2 + 2;
+    SIZ_FLD_PTR = .BEG_SIDR + IRC$C_DATOVHDSZ;
+
+    IF NOT .BEG_SIDR[IRC$V_NOPTRSZ]
+    THEN
+	SIZ_FLD_PTR = .SIZ_FLD_PTR + .BEG_SIDR[IRC$V_PTRSZ] + IRC$C_DATPTRBAS;
+
+    ! assume we wish to delete from current REC_ADDR
+    !
+    DEL_FROM = .REC_ADDR;
+    SIZ_FLD_PTR[0, 0, 16, 0] = .SIZ_FLD_PTR[0, 0, 16, 0] - .SIZE;
+
+    IF .SIZ_FLD_PTR[0, 0, 16, 0] EQL .IDX_DFN[IDX$B_KEYSZ]
+    THEN
+
+	! we are going to remove the last array element from a SIDR array
+	!
+	!
+	BEGIN
+
+	! flag indicating that entire SIDR record being deleted
+	!
+	AP<16, 1> = 1;
+
+	IF .IDX_DFN[IDX$V_DUPKEYS]
+	THEN
+
+	    IF .AP<17, 1>			! called from recvr_spc
+	    THEN
+		BEGIN
+
+		IF NOT .IRAB[IRB$V_DUPS_SEEN]
+		    OR
+		    .BEG_SIDR NEQ .IRAB[IRB$L_LST_REC]
+		THEN
+
+		    ! we are not positioned on this record with the intent of
+		    ! adding an array element to an existing sidr record so
+		    ! feel free to get rid of the entire thing
+		    !
+		    BEGIN
+		    SIZE = .SIZE + .REC_ADDR - .BEG_SIDR;
+		    DEL_FROM = .BEG_SIDR;
+		    END
+
+		END
+	    ELSE
+
+		! we are being called from del_sidr so only mark the array
+		! entry deleted if this is the last sidr in the bucket
+		!
+
+		IF .BEG_SIDR EQL .BKT_ADDR + BKT$C_OVERHDSZ
+		    AND
+		    .REC_ADDR + .SIZE EQL .EOB
+		THEN
+		    BEGIN
+		    REC_ADDR[IRC$V_DELETED] = 1;
+		    SIZ_FLD_PTR[0, 0, 16, 0] = .SIZ_FLD_PTR[0, 0, 16, 0] +
+		    .SIZE;
+		    SIZE = 0;
+		    END
+		ELSE
+		    BEGIN
+		    SIZE = .SIZE + .REC_ADDR - .BEG_SIDR;
+		    DEL_FROM = .BEG_SIDR;
+		    END
+	ELSE
+
+	    ! duplicate keys are not allowed, so to be compatible with rms-11,
+	    ! delete the entire record always
+	    !
+	    BEGIN
+	    SIZE = .SIZE + .REC_ADDR - .BEG_SIDR;
+	    DEL_FROM = .BEG_SIDR;
+	    END;
+
+	! set up rec_addr for preupd_nrp because as far as it is concerned we
+	! have deleted the entire record
+	!
+	REC_ADDR = .BEG_SIDR;	! for NRP update point to beginning of record
+	END;
+
+    ! if clear_nrp decided that we have to update the nrp list, do so now
+    !
+    !
+    RM$PREUPD_NRP(.REC_ADDR, .BBLOCK[.IRAB[IRB$L_CURBDB], BDB$L_VBN],
+	.BEG_SIDR[IRC$B_ID]);
+    BKT_ADDR[BKT$W_FREESPACE] = .BKT_ADDR[BKT$W_FREESPACE] - .SIZE;
+    REC_ADDR = .DEL_FROM;
+
+    IF .SIZE NEQ 0
+	AND
+	(LENGTH = .EOB - (.REC_ADDR + .SIZE)) NEQ 0
+    THEN
+	RM$MOVE(.LENGTH, .REC_ADDR + .SIZE, .REC_ADDR);
+
+    RETURN .SIZE;
+
+    END;
+
+
+GLOBAL ROUTINE RM$DEL_SIDR : RL$DEL_SIDR =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+! Scan SIDR record pointed to and delete array entry that matches
+! the RP VBN and ID
+!
+!
+! CALLING SEQUENCE:
+!	RM$DEL_SIDR ()
+!
+! INPUT PARAMETERS:
+!
+! IMPLICIT INPUTS:
+!	BKT_ADDR - pointer to beginning of bucket
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	0	- array element not found in this SIDR record
+!	1	- array element found which matched current record pointer
+!
+! SIDE EFFECTS:
+!	upd_nrp - if set, indicates update to NRP list necessary(only when success)
+!
+!--
+
+    BEGIN
+
+    BUILTIN
+	AP;
+
+    EXTERNAL REGISTER
+	R_IDX_DFN_STR,
+	R_IRAB_STR,
+	R_BKT_ADDR_STR,
+	R_REC_ADDR_STR,
+	R_IFAB_STR;
+
+    LOCAL
+	SAV_RA	: REF BBLOCK,
+	VBN,
+	ID	: WORD,
+	EOD;
+
+    SAV_RA = .REC_ADDR;
+    VBN = .BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$L_RP_VBN];
+    ID = .BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$W_RP_ID];
+    RM$GETNEXT_REC();
+    EOD = .REC_ADDR;				! point to end of sidr
+    REC_ADDR = .SAV_RA;		! restore rec_addr to beginning of sidr
+    BEGIN
+
+    GLOBAL REGISTER
+	R_REC_SIZE;
+
+    REC_SIZE = -1;
+    REC_ADDR = .REC_ADDR + RM$REC_OVHD() + .IDX_DFN[IDX$B_KEYSZ];
+    END;			! rec_addr now points to first pointer entry
+    AP = 0;			! count of arrary elements passed in search
+
+    ! used as input to preupd_nrp ("dup_pos")
+    !
+
+    WHILE .REC_ADDR LSSA .EOD
+    DO
+	BEGIN
+
+	LOCAL
+	    SIZE;
+
+	SIZE = .REC_ADDR[IRC$V_PTRSZ] + 2;
+
+	IF .REC_ADDR[IRC$B_ID] NEQ .ID
+	    OR
+	    .REC_ADDR[IRC$V_DELETED]
+	    OR
+	    .(.REC_ADDR + 2)<0, .SIZE*8> NEQ .VBN
+	THEN
+	    REC_ADDR = .REC_ADDR + .SIZE + 2
+	ELSE
+
+	    ! found the entry -- squish it out and update the nrp list
+	    !
+	    BEGIN
+            RM$ZERO_NRP();
+
+	    ! note that AP<17,1> = 0 here to allow squish_sidr discretion in
+	    ! whether or not it will really remove the record ( it won't if
+	    ! it's the last in the bucket)
+	    !
+	    RM$SQUISH_SIDR(.SAV_RA);
+	    RETURN RMSSUC()
+            END;
+
+	AP = .AP + 1;				! bump count of array elements
+	END;
+
+    RETURN 0;
+
+    END;
+
+
+GLOBAL ROUTINE RM$DELETE_SIDR : RL$DELETE_SIDR =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+! Search alternate index for record using keybuffer 2 and delete
+! SIDR array entry that matches RP info in NRP list
+!
+! CALLING SEQUENCE:
+!	RM$DELETE_SIDR()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	status of rm$rlsbkt call that release modified bucket, or
+!	error status from rm$csearch_tree
+!
+! SIDE EFFECTS:
+!	sidr entry and possibly sidr record deleted or sidr entry
+!	marked deleted if last entry in bucket, nrp list updated,
+!	modified bucket released
+!
+!--
+
+    BEGIN
+
+    BUILTIN
+	AP;
+
+    EXTERNAL REGISTER
+	R_IDX_DFN_STR,
+	R_BDB_STR,
+	COMMON_RAB_STR;
+
+    GLOBAL REGISTER
+	R_REC_ADDR;
+
+    BDB = 0;
+    IRAB[IRB$B_SRCHFLAGS] = IRB$M_POSDELETE;
+    IRAB[IRB$B_STOPLEVEL] = 0;
+    IRAB[IRB$B_KEYSZ] = .IDX_DFN[IDX$B_KEYSZ];
+
+    ! This loop searches the secondary index for key match and then continues
+    ! search for an array element which matches the current VBN and ID.  It
+    ! may be necessary to search horizontally thru continuation SIDR's.
+    !
+    !
+    BEGIN
+
+    GLOBAL REGISTER
+	R_BKT_ADDR_STR;
+
+    DO
+	BEGIN
+
+	RETURN_ON_ERROR (RM$CSEARCH_TREE());
+
+	BDB = .IRAB[IRB$L_CURBDB];
+	BKT_ADDR = .BDB[BDB$L_ADDR];
+	END
+    UNTIL RM$DEL_SIDR()
+    END;
+
+    IRAB[IRB$L_CURBDB] = 0;
+
+    ! mark bucket dirty.  if nrp update required release with keep lock and
+    ! update nrp list, then release bucket.  if nrp update not required, just
+    ! release bucket
+    !
+    BDB[BDB$V_DRT] = 1;
+
+    IF .IRAB[IRB$V_UPD_NRP]
+    THEN
+	RM$UPD_NRP(.BDB[BDB$L_VBN]);
+
+    RETURN RM$RLSBKT(0);
+
+    END;
+
+END
+
+ELUDOM

@@ -1,0 +1,345 @@
+MODULE BUFFERS (%TITLE	'Buffer Manager'
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	Backup/Restore
+!
+! ABSTRACT:
+!
+!	This module contains the routines that manage the I/O buffer
+!	pool.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS User Mode
+!
+!--
+!
+! AUTHOR:  Andrew C. Goldstein, CREATION DATE:  9-Sep-1980  22:20
+!
+! MODIFIED BY:
+!
+!	V02-003	MLJ0054		Martin L. Jack,	22-Nov-1981  21:43
+!		Integrate GET_VM and FREE_VM jacket routines.
+!
+!	V02-002	MLJ0036		Martin L. Jack,	28-Aug-1981  17:27
+!		Initialize RWSV_HOLD_LIST.
+!
+!	V02-001	MLJ0010		Martin L. Jack,	25-Mar-1981  15:17
+!		Reorganize global storage.  Clean up signals.
+!
+!**
+
+
+LIBRARY 'SYS$LIBRARY:STARLET';
+REQUIRE 'SRC$:COMMON';
+REQUIRE 'LIB$:BACKDEF.B32';
+
+
+EXTERNAL LITERAL
+	BACKUP$_ALLOCMEM;
+
+
+G$DEFINE();			! Define global common area
+
+GLOBAL ROUTINE INIT_BUFFERS (COUNT, SIZE) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine initializes the I/O buffer pool.
+!
+! CALLING SEQUENCE:
+!	INIT_BUFFERS (COUNT, SIZE)
+!
+! INPUT PARAMETERS:
+!	COUNT: number of buffers to allocate
+!	SIZE: size in bytes of each buffer
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+BUILTIN
+	INSQUE;
+
+LOCAL
+	STATUS,				! general status return
+	X		: REF BBLOCK;	! storage being allocated
+
+EXTERNAL ROUTINE
+	GET_ZERO_VM;
+
+! Initialize the queue headers.
+!
+
+FREE_LIST[0] = FREE_LIST[0];
+FREE_LIST[1] = FREE_LIST[0];
+INPUT_WAIT[0] = INPUT_WAIT[0];
+INPUT_WAIT[1] = INPUT_WAIT[0];
+REREAD_WAIT[0] = REREAD_WAIT[0];
+REREAD_WAIT[1] = REREAD_WAIT[0];
+OUTPUT_WAIT[0] = OUTPUT_WAIT[0];
+OUTPUT_WAIT[1] = OUTPUT_WAIT[0];
+RWSV_HOLD_LIST[0] = RWSV_HOLD_LIST[0];
+RWSV_HOLD_LIST[1] = RWSV_HOLD_LIST[0];
+
+! Allocate a BCB and buffer of the requested size, and link them into
+! the free list. Repeat for the specified number.
+!
+
+COM_BUFF_COUNT = .COUNT;
+DECR J FROM .COUNT TO 1
+DO
+    BEGIN
+    X = GET_ZERO_VM (BCB_LENGTH);
+    X[BCB_STATE] = BCB_S_IDLE;
+    X[BCB_SIZE] = .SIZE;
+    INSQUE (.X, .FREE_LIST[1]);
+    END;
+
+
+X = .FREE_LIST[0];
+DECR J FROM .COUNT TO 1
+DO
+    BEGIN
+    LOCAL
+	RETADR:		VECTOR[2];
+
+    STATUS = $EXPREG(PAGCNT=(.SIZE+511)/512, RETADR=RETADR);
+    IF NOT .STATUS THEN SIGNAL (BACKUP$_ALLOCMEM, 0, .STATUS);
+    X[BCB_BUFFER] = .RETADR[0];
+    X = .X[BCB_FLINK];
+    END;
+
+END;					! End of routine INIT_BUFFERS
+
+GLOBAL ROUTINE WAIT (BCB) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine waits for I/O completion on the specified
+!	buffer control block.
+!
+! CALLING SEQUENCE:
+!	WAIT (BCB)
+!
+! INPUT PARAMETERS:
+!	BCB: address of buffer control block to wait on
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+MAP
+	BCB		: REF BBLOCK;	! BCB arg
+
+BIND
+	VALID_STATE	= UPLIT BYTE (1^BCB_S_READ
+				     +1^BCB_S_REREAD
+				     +1^BCB_S_WRITE)
+			: BITVECTOR;
+
+! Check the buffer state - it must have I/O pending.
+!
+
+IF .BCB[BCB_STATE] GEQU 8
+OR NOT .VALID_STATE[.BCB[BCB_STATE]]
+THEN BUG_CHECK (WAITIDLEBCB, 'Attempted wait on idle buffer');
+
+! Clear the event flag, check the I/O status, and then wait if I/O
+! is still pending.
+!
+
+WHILE TRUE
+DO
+    BEGIN
+    $CLREF (EFN = .BCB[BCB_STATE]);
+    IF .BCB[BCB_IO_STATUS] NEQ 0 THEN EXITLOOP;
+    $WAITFR (EFN = .BCB[BCB_STATE]);
+    END;
+BCB[BCB_STATE] = BCB_S_DATA;
+
+! If a completion action routine is specified, call it.
+!
+
+IF NOT .BCB[BCB_IO_STATUS]
+AND .BCB[BCB_FAIL_ACT] NEQ 0
+THEN (.BCB[BCB_FAIL_ACT]) (.BCB);
+
+IF .BCB[BCB_IO_STATUS]
+AND .BCB[BCB_SUCC_ACT] NEQ 0
+THEN (.BCB[BCB_SUCC_ACT]) (.BCB);
+
+END;					! End of routine WAIT
+
+GLOBAL ROUTINE GET_BUFFER =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine allocates a buffer from the buffer pool.
+!
+! CALLING SEQUENCE:
+!	GET_BUFFER ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+BUILTIN
+	REMQUE;
+
+LOCAL
+	BCB		: REF BBLOCK;	! buffer control block found
+
+! Grab the first buffer from the free list. If it is empty, wait for
+! completion of a write and take it.
+!
+
+IF REMQUE (.FREE_LIST[0], BCB)
+THEN
+    BEGIN
+    IF REMQUE (.OUTPUT_WAIT[0], BCB)
+    THEN BUG_CHECK (BUFFERSLOST, 'All freeable buffers are lost');
+    WAIT (.BCB);
+    END;
+
+BCB[BCB_RECORD] = .BCB[BCB_BUFFER] + BBH$K_LENGTH;
+BCB[BCB_STATE] = BCB_S_DATA;
+.BCB
+END;					! End of routine GET_BUFFER
+
+GLOBAL ROUTINE FREE_BUFFER (BCB) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns a buffer to the free list.
+!
+! CALLING SEQUENCE:
+!	FREE_BUFFER (BCB)
+!
+! INPUT PARAMETERS:
+!	BCB: address of buffer control block to be freed
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+BUILTIN
+	INSQUE;
+
+MAP
+	BCB		: REF BBLOCK;	! BCB arg
+
+! Check the buffer state for validity and hang it onto the free list.
+!
+
+IF .BCB[BCB_STATE] NEQ BCB_S_DATA
+THEN BUG_CHECK (FREEBADBUFF, 'Attempted to free busy (or free) buffer');
+
+BCB[BCB_STATE] = BCB_S_IDLE;
+INSQUE (.BCB, .FREE_LIST[1]);
+
+
+END;					! End of routine FREE_BUFFER
+
+END
+ELUDOM

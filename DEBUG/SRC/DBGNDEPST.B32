@@ -1,0 +1,1594 @@
+MODULE DBGNDEPST (IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!
+!	DEBUG
+!
+! ABSTRACT:
+!
+!	This module contains the ATN parse network, and the command execution
+!	networks necessary to support the DEPOSIT command. A command execution
+!	tree is constructed during command parsing and is used as input to the
+!	command execution network.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS
+!
+! AUTHOR:
+!
+!	David Plummer
+!
+! CREATION DATE:
+!
+!	9-Jul_80
+!
+! VERSION:
+!
+!	V02.2-001
+!
+! MODIFIED BY:
+!	Richard Title	31-Jul-81
+!
+! REVISION HISTORY:
+! 3.0	31-JUL-81	 RT	Added type qualifiers /FLOAT, /D_FLOAT, etc.
+!				for the deposit command.
+!
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	DBG$NPARSE_DEPOSIT,		! Parse network for DEPOSIT
+	LAHEAD,				! Performs lookahead on input string
+	DBG$NEXECUTE_DEPOSIT,		! Execution netword for DEPOSIT
+	SAVE_QUOTED_STRING,		! Accepts a quoted string
+	CREATE_PAGE_LIST,		! Creates a linked page list from address
+					! and length
+	SET_PAGE_PROT;			! Sets protection for a page list
+
+!
+! REQUIRE FILES:
+!
+REQUIRE 'SRC$:DBGPROLOG.REQ';
+
+REQUIRE 'SRC$:DBGGEN.REQ';
+
+!
+! EQUATED SYMBOLS
+!
+
+LITERAL					! Legal verb composites
+    DEPOSIT 			= 1,
+    DEPOSIT_INSTRUCTION 	= 2,
+    DEPOSIT_REGISTER		= 3;
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+	DBG$NOUT_INFO,				! Outputs and informational message
+	DBG$NSAVE_LAST_VAL 	: NOVALUE,	! Saves '\'
+	DBG$NSAVE_LAST_LOC 	: NOVALUE,	! Saves '.'
+	DBG$NGET_POTENTIAL_TYPE : NOVALUE,	! Returns potential type and length for '.'
+	DBG$INS_ENCODE,				! Encodes an instruction
+	DBG$NSAVE_DECIMAL_INTEGER,		! Converts user input to integer longword
+	DBG$NLIST_FREEZ,			! Allocates command temporary dynamic storage
+	DBG$NMATCH,				! Matches input against counted strings
+	DBG$NSYNTAX_ERROR,			! Formats a syntax error
+	DBG$NNEXT_WORD,				! Obtains next word of input
+	DBG$NGET_ADDRESS,			! Obtains object address from addr exp desc
+	DBG$NGET_RADIX,				! Obtains language or user set radix
+	DBG$NGET_TYPE,				! Obtains type of primary descriptor
+	DBG$NGET_DEFAULT_TYPE,			! Obtains user set default type
+	DBG$NGET_OVERRIDE_TYPE,			! Obtains user set override type
+	DBG$NPARSE_ADDRESS,			! Interface to Address Expression Interpreter
+	DBG$NPARSE_EXPRESSION,			! Interface to Expression Interpreter
+	DBG$NGET_PAGES,				! Obtains an rvalue page list
+	DBG$NMAKE_VAL_DESC,			! Constructs a value descriptor form primary
+	DBG$NTYPE_CONV,				! Type converter
+	DBG$STA_SETREGISTERS : NOVALUE, 	! Resets registers context
+	DBG$NMAKE_ARG_VECT,			! Constructs a message argument vector
+	DBG$PERFORM_DEPOSIT;			! Old debugger routine for deposit
+			
+EXTERNAL
+	DBG$GL_RUNFRAME : REF BLOCK [,BYTE], ! Pointer to current runframe
+	DBG$DEPOSIT_SOURCE : BLOCK [,BYTE],  ! Globals used by language-
+	DBG$DEPOSIT_TARGET : BLOCK [,BYTE];  ! independent 'old debugger'
+					     ! deposit routines.
+OWN
+	quoted_string_flag : INITIAL (FALSE);
+
+GLOBAL ROUTINE DBG$NPARSE_DEPOSIT (INPUT_DESC, VERB_NODE, MESSAGE_VECT) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine comprises the ATN parse network for the DEPOSIT verb.
+!	During parsing, calls are made to other routines to parse expressions
+!	and address expressions for inclusion as operands in the command
+!	execution tree. The competed tree is used as input to the command
+!	execution network which performs the associated semantic actions.
+!
+!	DEPOSITs are affected by command override types, user set override types,
+!	and user set default types. The strategy of this routine is to construct
+!	a command execution tree that reflects this situation. Thus, whenver the
+!	target of the DEPOSIT is described by anything other than a primary
+!	descriptor, adverb nodes are created to describe the type for the
+!	target. Primary descriptor entity types are overriden only by command
+!	and user set override types, - not the default type.
+!
+!	When an instruction DEPOSIT is indicated, a kernal DEBUG routine is
+!	called to obtain the source of the target. This MUST be a quoted string.
+!	The source for all other DEPOSITs is obtained through the Expression
+!	Interpreter.
+!
+! FORMAL PARAMETERS:
+!
+!	INPUT_DESC	- A longword containing the address of a standard ascii
+!			  string descriptor representing the user's input
+!
+!	VERB_NODE	- A longword containing the address of the verb (head)
+!			  node of the command execution tree
+!
+!	MESSAGE_VECT	- The address of a longword to contain the address of a
+!			  message argument vector upon detection of errors
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	On success, the entire command execution tree is constructed.
+!
+!	On failure, a message argument vector is constructed and returned.
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS (1)	- Success. Input parsed and execution tree constructed.
+!
+!	STS$K_SEVERE  (4)	- Failure. Error detected. Message argument vector
+!				  constructed and returned.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    MAP
+	VERB_NODE 		: REF dbg$verb_node;
+
+    BIND			
+
+	! Strings used at this level of parsing
+	!
+	DBG$CS_INSTRUCTION	= UPLIT BYTE (11, 'INSTRUCTION'),
+	DBG$CS_OCTAL		= UPLIT BYTE (5, 'OCTAL'),
+	DBG$CS_DECIMAL		= UPLIT BYTE (7, 'DECIMAL'),
+	DBG$CS_HEXADECIMAL	= UPLIT BYTE (11, 'HEXADECIMAL'),
+	DBG$CS_ASCII		= UPLIT BYTE (5, 'ASCII'),
+	DBG$CS_BYTE		= UPLIT BYTE (4, 'BYTE'),
+	DBG$CS_WORD		= UPLIT BYTE (4, 'WORD'),
+	DBG$CS_LONGWORD		= UPLIT BYTE (8, 'LONGWORD'),
+	DBG$CS_QUADWORD		= UPLIT BYTE (8, 'QUADWORD'),
+	DBG$CS_OCTAWORD		= UPLIT BYTE (8, 'OCTAWORD'),
+	DBG$CS_FLOAT		= UPLIT BYTE (5, 'FLOAT'),
+	DBG$CS_F_FLOAT		= UPLIT BYTE (7, 'F_FLOAT'),
+	DBG$CS_D_FLOAT		= UPLIT BYTE (7, 'D_FLOAT'),
+	DBG$CS_G_FLOAT		= UPLIT BYTE (7, 'G_FLOAT'),
+	DBG$CS_H_FLOAT		= UPLIT BYTE (7, 'H_FLOAT'),
+	DBG$CS_COLON		= UPLIT BYTE (1, dbg$k_colon),
+	DBG$CS_SLASH		= UPLIT BYTE (1, dbg$k_slash),
+	DBG$CS_EQUAL_SIGN	= UPLIT BYTE (1, dbg$k_equal),
+	DBG$CS_CR		= UPLIT BYTE (1, dbg$k_car_return);
+
+    LOCAL
+	ADDR_EXP_DESC	: REF dbg$aed,		! Address expression descriptor
+	NOUN_NODE 	: REF dbg$noun_node,	! Object
+	ADVERB_NODE 	: REF dbg$adverb_node,	! Adverb
+	LINK,					! Pointer
+	RADIX,					! Radix for numeric literals
+	TYPE,					! Type of target
+	LENGTH,					! Length of target
+	ADDRESS 	: VECTOR [2],		! Address of target
+	STATUS;					! Return status
+
+    ! Create and link a noun node to contain the target
+    !
+    IF NOT dbg$nlist_freez (dbg$k_noun_node_size, noun_node, .message_vect)
+    THEN
+	RETURN sts$k_severe;
+
+    verb_node [dbg$l_verb_object_ptr] = .noun_node;
+
+
+    ! Initialize target type and length 
+    !
+    type = -1;		! -1 indicates that we have not found an override type
+    length = 0;
+
+
+    ! Accept any command switches. We start out with a verb composite representing
+    ! a plain DEPOSIT. This may change as a result of command or user set overrides.
+    ! We changes the composite to DEPOSIT_INSTRUCTION if we find /INSTRUCTION.
+    ! We do not create an adverb node for radix switches - only types.
+    !
+    verb_node [dbg$b_verb_composite] = deposit;
+    radix = dbg$nget_radix ();
+
+    WHILE dbg$nmatch (.input_desc, dbg$cs_slash, 1)
+    DO
+	BEGIN
+	SELECTONE true
+	    OF
+	    SET
+
+	    [dbg$nmatch (.input_desc, dbg$cs_instruction, 1)] : !DEPOSIT/INSTRUCION
+		BEGIN
+		type = dsc$k_dtype_zi;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_byte, 1)] : ! DEPOSIT/BYTE
+		BEGIN
+		type = dsc$k_dtype_b;
+		length = byte_length;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_word, 1)] : ! DEPOSIT/WORD
+		BEGIN
+		type = dsc$k_dtype_w;
+		length = word_length;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_longword, 1)] : ! DEPOSIT/LONGWORD
+		BEGIN
+		type = dsc$k_dtype_l;
+		length = long_length;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_quadword, 1)] : ! DEPOSIT/QUAD
+		BEGIN
+		type = dsc$k_dtype_q;
+		length = 8;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_octaword, 5)] : ! DEPOSIT/OCTAWORD
+		BEGIN
+		type = dsc$k_dtype_o;
+		length = 16;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_float, 1),
+	     dbg$nmatch (.input_desc, dbg$cs_f_float, 1)] : ! DEPOSIT/FLOAT
+		BEGIN
+		type = dsc$k_dtype_f;
+		length = 4;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_d_float, 2)] : ! DEPOSIT/D_FLOAT
+		BEGIN
+		type = dsc$k_dtype_d;
+		length = 8;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_g_float, 1)] : ! DEPOSIT/G_FLOAT
+		BEGIN
+		type = dsc$k_dtype_g;
+		length = 8;
+		END;
+
+	    [dbg$nmatch( .input_desc, dbg$cs_h_float, 2)] : ! DEPOSIT/H_FLOAT
+		BEGIN
+		type = dsc$k_dtype_h;
+		length = 16;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_ascii, 1)] : ! DEPOSIT/ASCII
+		BEGIN
+
+		! Accept the ':' and integer. If there is no colon, we assume
+		! a length of 4
+		!
+		IF NOT dbg$nmatch (.input_desc, dbg$cs_colon, 1)
+		THEN
+		    BEGIN
+		    length = 4;
+		    END
+		ELSE
+		    BEGIN
+
+		    ! We found the colon. Accept the integer
+		    !
+		    IF NOT dbg$nsave_decimal_integer (.input_desc, length, .message_vect)
+		    THEN
+		    RETURN sts$k_severe;
+		    END;
+
+		type = dsc$k_dtype_t;
+
+
+		! Check to see that the length of the ascii deposit is not 0
+		!
+		IF .length LEQ 0
+	  	THEN
+		    BEGIN
+		    OWN
+			num_desc : dbg$stg_desc;
+
+		    num_desc [dsc$w_length] = 1;
+		    num_desc [dsc$a_pointer] = UPLIT TYPE ('0');
+		    .message_vect = dbg$nmake_arg_vect (dbg$_invnumber, 1, num_desc);
+		    RETURN sts$k_severe;
+		    END;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_octal, 1)] : ! DEPOSIT/OCTAL
+		BEGIN
+		radix = dbg$k_octal;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_decimal, 1)] : ! DEPOSIT/DECIMAL
+		BEGIN
+		radix = dbg$k_decimal;
+		END;
+
+	    [dbg$nmatch (.input_desc, dbg$cs_hexadecimal, 1)] : ! DEPOSIT/HEX
+		BEGIN
+		radix = dbg$k_hex;
+		END;
+
+	    [OTHERWISE] :	! Some flavor of user error
+		BEGIN
+		.message_vect =
+		( IF dbg$nmatch (.input_desc, dbg$cs_cr, 1)
+		  THEN
+		      dbg$nmake_arg_vect (dbg$_needmore)
+		  ELSE
+		      dbg$nsyntax_error (dbg$nnext_word (.input_desc)));
+		RETURN sts$k_severe;
+		END;
+	    
+	    TES;
+
+	END;
+
+
+    ! Obtain the target of the DEPOSIT in the form of an address expression descriptor
+    !
+    status = dbg$nparse_address (.input_desc, noun_node [dbg$l_noun_value],
+				 .radix,
+				 .message_vect);
+
+
+    ! The Address Expression Interpreter MUST give us a warning return to
+    ! indicate the '=' that seperates the target from the source.
+    !
+    IF .status NEQ sts$k_warning
+    THEN
+	BEGIN
+	IF .status EQL sts$k_success ! Missing '='
+	THEN
+	    .message_vect = dbg$nmake_arg_vect (dbg$_needmore);
+	RETURN sts$k_severe;
+	END;
+
+
+    ! Gobble the '='
+    !
+    IF NOT dbg$nmatch (.input_desc, dbg$cs_equal_sign, 1)
+    THEN
+	BEGIN
+	.message_vect =
+	( IF dbg$nmatch (.input_desc, dbg$cs_cr, 1)
+	  THEN
+	      dbg$nmake_arg_vect (dbg$_needmore)
+	  ELSE
+	      dbg$nsyntax_error (dbg$nnext_word (.input_desc)));
+	RETURN sts$k_severe;
+	END;
+
+
+    ! Recover the target address expression descriptor
+    !
+    addr_exp_desc = .noun_node [dbg$l_noun_value];
+
+
+    ! Create an adverb node which we may use to type the target, but don't link
+    ! it to the verb node until we need to.
+    !
+    IF NOT dbg$nlist_freez (dbg$k_adverb_node_size, adverb_node, .message_vect)
+    THEN
+	RETURN sts$k_severe;
+
+
+    ! Type the target based on command overrides, user set overrides, current
+    ! location typing, address expression descriptor contents, or user set defaults.
+    ! Check for command override.
+    !
+    IF .type NEQ -1
+    THEN
+	BEGIN
+	    
+	! Check for instruction deposit
+	!
+	IF .type EQL dsc$k_dtype_zi
+	THEN
+	    BEGIN
+	    verb_node [dbg$b_verb_composite] = deposit_instruction;
+	    END
+	ELSE
+	    BEGIN
+	    verb_node [dbg$l_verb_adverb_ptr] = .adverb_node;
+	    adverb_node [dbg$b_adverb_literal] = .type;
+	    adverb_node [dbg$l_adverb_value] = .length;
+	    END;
+	END
+    ELSE
+	BEGIN
+
+	! There was no command override. Check for a type/override.
+	!
+	IF dbg$nget_override_type (type, length)
+	THEN
+	    BEGIN
+
+	    ! Check for instruction override
+	    !
+	    IF .type EQL dsc$k_dtype_zi
+	    THEN
+		BEGIN
+		verb_node [dbg$b_verb_composite] = deposit_instruction;
+		END
+	    ELSE
+		BEGIN
+		verb_node [dbg$l_verb_adverb_ptr] = .adverb_node;
+		adverb_node [dbg$b_adverb_literal] = .type;
+		adverb_node [dbg$l_adverb_value] = .length;
+		END;
+	    END
+	ELSE
+	    BEGIN
+
+	    ! There was no type override. We supply a type based on the contents
+	    ! of the address expression descriptor, current location type,
+	    ! and/or default type. We may also change the verb composite value.
+	    !
+	    ! Check for a current loc type. If this is other than 0 or notype,
+	    ! then we use this type for display.
+	    !
+	    dbg$nget_potential_type (type, length);
+
+	    IF .type NEQ dbg$k_notype AND .type NEQ 0
+	    THEN
+		BEGIN
+
+		! If an instruction, then change the verb composite.
+		!
+		IF .type EQL dsc$k_dtype_zi
+		THEN
+		    BEGIN
+		    verb_node [dbg$b_verb_composite] = deposit_instruction;
+		    END
+		ELSE
+		    BEGIN
+		    verb_node [dbg$l_verb_adverb_ptr] = .adverb_node;
+		    adverb_node [dbg$b_adverb_literal] = .type;
+		    adverb_node [dbg$l_adverb_value] = .length;
+		    END;
+		END
+	    ELSE
+		BEGIN
+
+		! No type on current location. Use the contents of the address
+		! expression descriptor to type the source location.
+		!
+		CASE .addr_exp_desc [dbg$b_aed_type] FROM dbg$k_primary_desc TO dbg$k_notype
+		    OF
+		    SET
+
+		    [dbg$k_primary_desc] :
+			BEGIN
+			
+			! Check for nc_other and nc_instruction
+			!
+			IF NOT dbg$nget_type (.addr_exp_desc [dbg$l_aed_value],
+					      type, .message_vect)
+			THEN
+			    RETURN sts$k_severe;
+
+			IF .type EQL dbg$k_nc_instruction
+			THEN
+			    BEGIN
+			    verb_node [dbg$b_verb_composite] = deposit_instruction;
+			    END
+			ELSE
+			    BEGIN
+			    IF .type EQL dbg$k_nc_other
+			    THEN
+				BEGIN
+
+				! Attach the default type
+				!
+				dbg$nget_default_type (type, length);
+
+				IF .type EQL dsc$k_dtype_zi
+				THEN
+				    BEGIN
+				    verb_node [dbg$b_verb_composite] = deposit_instruction;
+				    END
+				ELSE
+				    BEGIN
+				    verb_node [dbg$l_verb_adverb_ptr] = .adverb_node;
+				    adverb_node [dbg$b_adverb_literal] = .type;
+				    adverb_node [dbg$l_adverb_value] = .length;
+				    END;
+				END;
+			    END;
+			END;
+
+		    [dbg$k_perm_desc] :
+			BEGIN
+			verb_node [dbg$l_verb_adverb_ptr] = .adverb_node;
+			adverb_node [dbg$b_adverb_literal] = dsc$k_dtype_l;
+			adverb_node [dbg$l_adverb_value] = long_length;
+			END;
+
+		    [dbg$k_instruction] :
+			BEGIN
+			verb_node [dbg$b_verb_composite] = deposit_instruction;
+			END;
+
+		    [dbg$k_notype] :
+			BEGIN
+
+			! We have an untyped virtual address. Use the default type.
+			!
+			dbg$nget_default_type (type, length);
+
+			IF .type EQL dsc$k_dtype_zi
+			THEN
+			    BEGIN
+			    verb_node [dbg$b_verb_composite] = deposit_instruction;
+			    END
+			ELSE
+			    BEGIN
+			    verb_node [dbg$l_verb_adverb_ptr] = .adverb_node;
+			    adverb_node [dbg$b_adverb_literal] = .type;
+			    adverb_node [dbg$l_adverb_value] = .length;
+			    END;
+			END;
+
+		    [INRANGE, OUTRANGE] :
+			BEGIN
+			SIGNAL (dbg$_debugbug, 1, dbg$k_bad_aed_field);
+			RETURN sts$k_severe;
+			END;
+
+		    TES;
+		END;
+	    END;
+	END;
+				
+
+    ! The adverb node has been set up, and the command has been classified as
+    ! either DEPOSIT or DEPOSIT_INSTRUCTION. The target has been placed in the
+    ! first noun node. Now the source must be obtained. We allocate another
+    ! noun node and link it to the first one for this purpose. This second
+    ! noun node will point either to a value descriptor or to a buffer containing
+    ! a potential instruction counted string.
+    !
+    link = noun_node [dbg$l_noun_link];
+
+    IF NOT dbg$nlist_freez (dbg$k_noun_node_size, noun_node, .message_vect)
+    THEN
+	RETURN sts$k_severe;
+
+    .link = .noun_node;	! This links the new noun node
+
+
+    ! Check for instruction deposit
+    IF .verb_node [dbg$b_verb_composite] EQL deposit_instruction
+    THEN
+	BEGIN ! dep/inst	
+	! Collect the quoted instruction string
+	IF NOT save_quoted_string (.input_desc,
+				   noun_node [dbg$l_noun_value],
+				   .message_vect)
+	THEN
+	    RETURN sts$k_severe;
+	END   ! dep/inst
+    ELSE  
+	BEGIN ! deposit
+	! Kill quoted string flag - innocent 'till proven....
+	quoted_string_flag = FALSE;
+	! Check for regular or asci deposit
+	IF .adverb_node NEQA 0
+	THEN
+	    BEGIN ! type override may be present
+	    IF .adverb_node [dbg$b_adverb_literal] EQL dsc$k_dtype_t
+	    OR
+	    (.adverb_node[dbg$b_adverb_literal] NEQ 0 AND
+	    ! Accept quoted string as source of deposit,
+	    ! as in DEP/H_FLOAT X = '1.2222E50'.
+	    ! (This mechanism provides an escape from the 
+	    ! language-specific expression interpreters)
+		(LOCAL lahead_char;
+		 lahead_char = lahead(.input_desc);
+		 .lahead_char EQL '"' OR .lahead_char EQL ''''))
+		! Next char is a quote.
+	    THEN 
+		BEGIN ! source is a quoted string
+	        ! Save the quoted string
+		IF NOT save_quoted_string (.input_desc,
+					   noun_node [dbg$l_noun_value],
+					   .message_vect)
+		THEN
+		    RETURN sts$k_severe;
+		quoted_string_flag = TRUE;
+		END ! source is a quoted string
+	    ELSE 
+	        BEGIN ! source is not a quoted string
+	        ! Obtain a value descriptor
+	        IF NOT (status = dbg$nparse_expression (.input_desc,
+						.radix,
+						noun_node [dbg$l_noun_value],
+						.message_vect))
+	        THEN
+		    BEGIN
+		    IF .status EQL sts$k_warning
+		    THEN
+			.message_vect = 
+			    dbg$nsyntax_error (dbg$nnext_word (.input_desc));
+		    RETURN sts$k_severe;
+		    END;
+		END; ! source is not a quoted string
+	    END ! type override may be present
+	ELSE 
+	    BEGIN ! no type override
+	    ! Obtain a value descriptor
+	    IF NOT (status = dbg$nparse_expression (.input_desc, 
+						.radix,
+						noun_node [dbg$l_noun_value],
+						.message_vect))
+	    THEN
+	    	BEGIN
+	    	! We do not expect more input after the expression
+	    	IF .status EQL sts$k_warning
+	    	THEN
+		    .message_vect = dbg$nsyntax_error (dbg$nnext_word (.input_desc));
+	    	RETURN sts$k_severe;
+	    	END;
+	    END; ! no type override
+	END; ! deposit
+
+    RETURN sts$k_success;
+
+    END;			! End of dbg$nparse_deposit
+
+ROUTINE LAHEAD(INPUT_DESC) =
+!++
+!	This routine performs lookahead on the input string descriptor.
+!	It returns the next significant (non-blank) character.
+!	It is used above in dbg$parse_deposit to determine whether the
+!	source is a quoted string. This routine does not alter the
+!	pointer into the input string.
+!--
+    BEGIN
+    MAP
+	input_desc : REF dbg$stg_desc;
+    LOCAL
+	temp_ptr,	! Pointer into input string
+	temp_len;	! Length of remaining string
+    ! Get current pointer and length
+    temp_ptr = .input_desc [dsc$a_pointer];
+    temp_len = .input_desc [dsc$w_length];
+    ! Skip white space	
+    WHILE ch$rchar(.temp_ptr) EQL ' '
+	AND .temp_len GTR 0 DO
+	BEGIN
+	temp_ptr = ch$plus(.temp_ptr, 1);
+	temp_len = .temp_len - 1;
+	END;
+    ! If input string exhausted, just return a blank.
+    IF .temp_len EQL 0 
+    THEN 
+	' '
+    ELSE
+	! Return the next character
+	ch$rchar(.temp_ptr)
+    END; ! lahead
+
+
+GLOBAL ROUTINE DBG$NEXECUTE_DEPOSIT (VERB_NODE, MESSAGE_VECT) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine accepts as input the command execution tree constructed
+!	by the parse network and performs the semantic actions corresponding to
+!	the parsed DEPOSIT command. If the command cannot be executed, a message
+!	argument vector is constructed and returned.
+!
+!	Upon entrance to this routine, the command has classified as plain
+!	DEPOSIT or Instruction DEPOSIT. Likewise, all default and override
+!	types have been set up in the adverb nodes.
+!
+!	There should be two noun nodes. The first is the target of the deposit
+!	(always represented by an address expression descriptor), while the 
+!	second represents the source (either a value descriptor, or a pointer
+!	to a counted string for instruction DEPOSITS). We handle Instruction
+!	DEPOSITS and ASCI DEPOSITS ourselves. The type converter handles all 
+!	other deposits.
+!
+! FORMAL PARAMETERS:
+!
+!	VERB_NODE	- A longword containing the address of the verb (head)
+!			  node of the command execution tree
+!
+!	MESSAGE_VECT	- The address of a longword to contain the address of a
+!			  standard message argument vector to describe errors
+!
+! IMPLICIT INPUTS:
+!
+!	The entire command execution tree linked list pointed to by the verb node
+!
+! IMPLICIT OUTPUTS:
+!
+!	On failure, a message argument vector is constructed and returned.
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS (1)	- Success. Command executed and semantic actions
+!				  performed.
+!
+!	STS$K_SEVERE  (4)	- Failure. Error detected. Command not executed.
+!				  Message argument vector consturcted and returned.
+!
+! SIDE EFFECTS:
+!
+!	The semantic actions corresponding to the parsed input command will be
+!	performed.
+!
+!--
+    BEGIN
+
+    MACRO
+	CHECK_PC (start_loc, affected_bytes) =
+
+	    ! This macro checks to see if the user is changing his stored PC value.
+	    ! If he is, the FPD bit in the user's PSL is cleared.
+	    !
+	    BEGIN
+	
+	    IF start_loc LEQA dbg$gl_runframe [dbg$l_user_pc] + 4
+				AND
+	       start_loc + affected_bytes GEQA dbg$gl_runframe [dbg$l_user_pc]
+	    THEN
+		dbg$gl_runframe [dbg$l_user_psl] = %X'F7FFFFFF' 
+							AND
+						   .dbg$gl_runframe [dbg$l_user_psl];    
+	    END %;
+
+    MAP
+	VERB_NODE 	: REF dbg$verb_node;
+
+    LOCAL
+	SOURCE 		: REF dbg$noun_node,		! Source of deposit
+	TARGET 		: REF dbg$noun_node;		! Target of deposit
+
+    ! Recover the source and target
+    !
+    target = .verb_node [dbg$l_verb_object_ptr];
+    source = .target [dbg$l_noun_link];
+
+
+    ! Perform the regular or instruction deposit
+    !
+    CASE .verb_node [dbg$b_verb_composite] FROM deposit TO deposit_instruction
+	OF
+	SET
+
+	[deposit] :	! Plain DEPOSIT
+	    BEGIN
+	    LOCAL
+		PAGE_LIST,		 	   ! List of pages to set protection for
+		ADVERB_NODE : REF dbg$adverb_node, ! Contains qualifier info
+		VAX_DESC    : dbg$stg_desc; 	   ! VAX standard descriptor (quadword type)
+
+	    ! Recover the adverb node
+	    !
+	    adverb_node = .verb_node [dbg$l_verb_adverb_ptr];
+
+
+	    ! Check to see if we have any flavor of override type
+	    !
+	    IF .adverb_node NEQA 0
+	    THEN
+		BEGIN
+
+		! Here we override the type of the target. All we want is an
+		! address.
+		!
+		LOCAL
+		    ADDRESS : VECTOR [2],
+		    TYPE;
+
+		IF NOT dbg$nget_address (.target [dbg$l_noun_value],
+					 address [0],
+					 type,
+					 .message_vect)
+		THEN
+		    RETURN sts$k_severe;
+
+		! Set up the VAX standard descriptor for the target
+		!
+		vax_desc [dsc$b_class] = dsc$k_class_s;
+	  	vax_desc [dsc$b_dtype] = .adverb_node [dbg$b_adverb_literal];
+		vax_desc [dsc$w_length] = .adverb_node [dbg$l_adverb_value];
+		vax_desc [dsc$a_pointer] = .address [0];
+
+
+		! Perform PC check
+		!
+		check_pc (.vax_desc [dsc$a_pointer], .vax_desc [dsc$w_length]);
+
+
+		! Construct the page list and set protections
+		!
+		IF NOT create_page_list (.vax_desc [dsc$a_pointer],
+					 .vax_desc [dsc$w_length],
+					 page_list,
+					 .message_vect)
+		THEN
+		    RETURN sts$k_severe;
+
+		IF NOT set_page_prot (page_list, false, .message_vect)
+		THEN
+		    RETURN sts$k_severe;
+
+
+		! Do the actual DEPOSIT. We handle the case of DEPOSIT/ASCII
+		!
+		IF NOT (
+			    IF .quoted_string_flag
+			    THEN
+				! source is an ascii string.
+				BEGIN
+				LOCAL
+				    source_string : REF VECTOR [,BYTE];
+				! Call the appropriate old debugger routine
+				! to do the deposit in a language independent
+				! fashion. These routines use the globals
+				! dbg$deposit_source and dbg$deposit_target.
+				
+				! Initialize source and target descriptors.
+				ch$fill(%X'00',12,dbg$deposit_source);
+				ch$fill(%X'00',12,dbg$deposit_target);
+				! Fill in source descriptor.
+				source_string = .source[dbg$l_noun_value];
+				dbg$deposit_source[dsc$b_class] =
+				    dsc$k_class_s;
+				dbg$deposit_source[dsc$b_dtype] =
+				    dsc$k_dtype_t;
+				dbg$deposit_source[dsc$a_pointer] =
+				    source_string[1];
+				dbg$deposit_source[dsc$w_length] =
+				    .source_string[0];
+				! Fill in the target descriptor.
+				ch$move(8,vax_desc,dbg$deposit_target);
+				! Call the appropriate old debugger routine
+				dbg$perform_deposit()
+				END
+			    ELSE
+				! Let the type converter do the DEPOSIT
+			    	!
+			    	BEGIN
+
+			    
+				dbg$ntype_conv (.source [dbg$l_noun_value],
+				       0,		! Radix doesn't matter
+				       dbg$k_vax_desc,
+				       vax_desc,
+				       .message_vect)
+			    	END)
+		THEN
+		    BEGIN
+		   
+		    ! We want to reset protection to the original state
+		    ! before we return
+		    !
+		    LOCAL
+			JUNK;
+		    set_page_prot (page_list, true, junk); 
+		    RETURN sts$k_severe;
+		    END;
+
+
+		! Reset protection
+		!
+		IF NOT set_page_prot (page_list, true, .message_vect)
+		THEN
+		    RETURN sts$k_severe;
+		
+
+		! Save current location
+		!
+		dbg$nsave_last_loc (.target [dbg$l_noun_value],
+				    .vax_desc [dsc$b_dtype],	! Override type
+				    .vax_desc [dsc$w_length]);	! and length
+		
+		END 	! End of override deposit code
+
+	    ELSE
+		BEGIN
+
+		! We don't have any overrides. We just convert the primary descriptor
+		! pointed to by target into a value descriptor and let the type
+		! converter do it's thing. We assume that no primary descriptor
+		! talks about DEBUG space, so we don't do the PC check
+		!
+		LOCAL
+		    ADDR_EXP_DESC : REF dbg$aed,	! address expression descriptor
+		    VALUE_DESC;				! Pointer to value descriptor
+
+		! Recover the address expression descriptor
+		!
+		addr_exp_desc = .target [dbg$l_noun_value];
+
+
+		! Construct the value descriptor
+		!
+		IF NOT dbg$nmake_val_desc (.addr_exp_desc [dbg$l_aed_value],
+					   true,	! We want a target descriptor
+					   value_desc,
+					   .message_vect)
+		THEN
+		    RETURN sts$k_severe;
+
+
+		! Obtain the page list
+		!
+		IF NOT dbg$nget_pages (.addr_exp_desc [dbg$l_aed_value],
+				       page_list,
+				       .message_vect)
+		THEN
+		    RETURN sts$k_severe;
+
+
+		! Set the protection on the pages
+		!
+		IF NOT set_page_prot (page_list, false, .message_vect)
+		THEN
+		    RETURN sts$k_severe;
+
+
+		! Perform the DEPOSIT
+		!
+		IF NOT dbg$ntype_conv (.source [dbg$l_noun_value],
+				       0,	! Don't care about radix
+				       dbg$k_value_desc,
+				       .value_desc,
+				       .message_vect)
+		THEN
+		    BEGIN
+
+		    ! Reset the protection
+		    !
+		    LOCAL
+			junk;
+
+		    set_page_prot (page_list, true, junk);
+		    RETURN sts$k_severe;
+		    END;
+
+
+		! Reset protection 
+		!
+		IF NOT set_page_prot (page_list, true, .message_vect)
+		THEN
+		    RETURN sts$k_severe;
+
+
+		! Save current location
+		!
+		dbg$nsave_last_loc (.addr_exp_desc,
+				    -1,		! No type or length override
+				    -1);
+
+		END;
+
+
+	    ! Save last value as long as there was not an asci deposit
+	    !
+	    IF NOT .quoted_string_flag
+	    THEN
+		dbg$nsave_last_val (.source [dbg$l_noun_value])
+	    ELSE
+		! reset quoted_string_flag
+		quoted_string_flag = FALSE;
+
+	    END;
+
+	[deposit_instruction] : 	! DEPOSIT/INSTRUCTION
+	    BEGIN
+	    LOCAL
+		PAGE_LIST,				 ! Points to page list
+		PC_VALUE 	   : VECTOR [2],	 ! Target address
+		TYPE,					 ! Target type
+		INSTRUCTION_STRING : VECTOR [256, BYTE]; ! String for instruction
+
+	    ! Obtain the address of the target.
+	    !
+	    IF NOT dbg$nget_address (.target [dbg$l_noun_value],
+				     pc_value [0],
+				     type,
+				     .message_vect)
+	    THEN
+		RETURN sts$k_severe;
+
+
+	    ! The quoted string is pointed to by the source node. Try to decode 
+	    ! the instruction.
+	    !
+	    IF NOT dbg$ins_encode (.source [dbg$l_noun_value], 
+				   instruction_string [0],
+				   .pc_value [0],
+				   .message_vect)
+	    THEN
+		RETURN sts$k_severe;
+
+
+	    ! Do the PC check
+	    !
+	    check_pc (.pc_value [0], .instruction_string [0]);
+	
+
+	    ! Change protection so that we may do the deposit. The length that
+	    ! we use is the length of the source instruction.
+	    !
+	    IF NOT create_page_list (.pc_value [0], .instruction_string [0],
+				     page_list, .message_vect)
+	    THEN
+		RETURN sts$k_severe;
+
+	    IF NOT set_page_prot (page_list, false, .message_vect)
+	    THEN
+		RETURN sts$k_severe;
+
+
+	    ! Perform the DEPOSIT
+	    !
+	    ch$move (.instruction_string [0], 
+		     instruction_string [1], .pc_value [0]);
+
+
+	    ! Reset protection
+	    !
+	    IF NOT set_page_prot (page_list, true, .message_vect)
+	    THEN
+		RETURN sts$k_severe;
+
+
+	    ! Save current location
+	    !
+	    dbg$nsave_last_loc (.target [dbg$l_noun_value],
+				dsc$k_dtype_zi,		  ! Instruction override
+				.instruction_string [0]); ! Instruction length
+
+
+	    ! Never set last value for instruction deposits.
+	    !
+	    dbg$nsave_last_val (0);
+
+	    END;
+
+	[INRANGE,OUTRANGE] :
+	    BEGIN
+	    .message_vect = dbg$nmake_arg_vect (dbg$_notimplan, 1,
+			    UPLIT BYTE (17, 'full verb support'));
+	    RETURN sts$k_severe;
+	    END;
+
+	TES;
+
+
+    ! Set registers context and return
+    !
+    dbg$sta_setregisters ();
+
+    RETURN sts$k_success;
+
+    END;		! End of dbg$nexecute_deposit
+
+
+ROUTINE SAVE_QUOTED_STRING (INPUT_DESC, BUFFER_PTR, MESSAGE_VECT) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine extracts a quoted string from the input stream.
+!	The string may begin with single or double quotes and must end with the
+!	same character.
+!
+!	Command temporary (listed) storage is allocated to contain the string.
+!	It winds up as a counted string - that is, with the count of the number
+!	of bytes in the first byte of the resulting buffer.
+!
+! FORMAL PARAMETERS:
+!
+!	INPUT_DESC		- The address of a VAX standard ascii string 
+!				  descriptor describing the user input
+!
+!	BUFFER_PTR		- The address of a longword to contain the address
+!				  of the resulting ascii string
+!
+!	MESSAGE_VECT		- The address of a longword to contain the address
+!				  of a message argument vector for errors
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	A counted ascii string is generated from dynamic listed storage
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS (1)	- Success. String constructed and returned.
+!
+!	STS$K_SEVERE  (4)	- Failure. No string constructed. Message
+!				  argument vector constructed and returned
+!
+! SIDE EFFECTS:
+!
+!	The input buffer is updated to one character past the terminal quote.
+!
+!--
+    BEGIN
+
+    MAP
+	INPUT_DESC 	: REF dbg$stg_desc;
+
+    BIND
+	DBG$CS_QUOTE 	= UPLIT BYTE (1, dbg$k_quote),
+	DBG$CS_DQUOTE	= UPLIT BYTE (1, dbg$k_dblquote),
+	DBG$CS_CR	= UPLIT BYTE (1, dbg$k_car_return);
+
+    LOCAL
+	QUOTE_CHAR,				! Begining quote character
+	BUFFER 		: REF VECTOR [,BYTE],	! Buffer for instruction string
+	STATUS,					! Holds return status'
+	POINTER,				! Pointer to buffer character
+	COUNT;					! Count of characters in instruction string
+
+    ! We must find a beginning quote or double quote.
+    !
+    SELECTONE true
+	OF
+	SET
+
+	[dbg$nmatch (.input_desc, dbg$cs_quote, 1)] :
+	    BEGIN
+	    quote_char = dbg$k_quote;
+	    END;
+
+	[dbg$nmatch (.input_desc, dbg$cs_dquote, 1)] :
+	    BEGIN
+	    quote_char = dbg$k_dblquote;
+	    END;
+
+	[OTHERWISE] :
+	    BEGIN
+	    .message_vect =
+   	    ( IF dbg$nmatch (.input_desc, dbg$cs_cr, 1)
+	      THEN
+		  dbg$nmake_arg_vect (dbg$_needmore)
+	      ELSE
+		  dbg$nsyntax_error (dbg$nnext_word (.input_desc)));
+	    RETURN sts$k_severe;
+	    END;
+
+	TES;
+
+
+    ! The leading delimiter has been stripped. Save a pointer to the present
+    ! character.
+    !
+    pointer = .input_desc [dsc$a_pointer];
+
+
+    ! Find the end of the string
+    !
+    IF .quote_char EQL dbg$k_quote
+    THEN
+	status = ch$find_ch (.input_desc [dsc$w_length], 
+			     .input_desc [dsc$a_pointer],
+			     dbg$k_quote)
+    ELSE
+	status = ch$find_ch (.input_desc [dsc$w_length],
+			     .input_desc [dsc$a_pointer],
+			     dbg$k_dblquote);
+
+
+    ! Check for the string not being terminated properly
+    !
+    IF .status EQLA 0
+    THEN
+	BEGIN
+
+	! Set up things properly for the error message. Delete the <cr> at the
+	! end of the input string.
+	!
+	input_desc [dsc$w_length] = .input_desc [dsc$w_length] - 1;
+	.message_vect = dbg$nmake_arg_vect (dbg$_noend, 3,
+					    .input_desc,
+					    1, quote_char);
+	RETURN sts$k_severe;
+	END;
+
+
+    ! We found the terminal quote mark. The match has left the input pointer
+    ! one position beyond the mark. Calculate how large a buffer we will need,
+    ! allocate it, and copy over all the good stuff.
+    !
+    count = .status - .pointer;
+
+    IF NOT dbg$nlist_freez ((.count / %UPVAL) + 1, buffer, .message_vect)
+    THEN
+	RETURN sts$k_severe;
+
+    ch$move (.count, .input_desc [dsc$a_pointer], buffer [1]);
+    buffer [0] = .count;
+
+
+    ! Update the input string
+    !
+    input_desc [dsc$w_length] = .input_desc [dsc$w_length] - .count - 1;
+    input_desc [dsc$a_pointer] = ch$plus (.status, 1); ! This skips the terminal quote
+
+
+    ! Return the buffer and success
+    !
+    .buffer_ptr = .buffer;
+
+    RETURN sts$k_success;
+
+    END;	! End of save_quoted_string
+
+
+
+ROUTINE CREATE_PAGE_LIST (ADDRESS, LENGTH, LIST_PTR, MESSAGE_VECT) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Creates a linked list of page numbers from a beginning address and a
+!	length. This routine produces the same output as dbg$nget_pages, only
+!	for entities without primary descriptors.
+!
+! FORMAL PARAMETERS:
+!
+!	ADDRESS		- A longword containing the beginning address of an entity
+!
+!	LENGTH		- A longword containing the length of the entity in bytes
+!
+!	LIST_PTR	- The address of a longword to contain the address of the
+!			  generated page list
+!
+!	MESSAGE_VECT	- The address of a longword to contain the address of a
+!			 message argument vector for errors
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	On success, the generated linked page list.
+!
+!	On failure, a message argument vector
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	sts$k_success (1)	- Success. List created and returned.
+!
+!	sts$k_severe  (4)	- Failure. Message argument vector returned.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+
+    MACRO
+
+	! This macro extracts a page number.
+	!
+	PAGE_NUMBER (ADDRESS) =			
+	   (address AND %B'11111111111111111111111000000000') %;
+	
+    LITERAL
+	PAGE_SIZE = 512;			! Bytes/page
+
+    LOCAL
+	LINK_NODE : REF dbg$link_node,		! List node
+	PAGE,					! Page number
+	END_ADDRESS,				! Entities ending address
+	LINK;					! Temporary pointer
+
+    ! Calculate the address of the last byte
+    !
+    end_address = .address + .length - 1;
+
+
+    ! Set up a loop and create and link a node for each page
+    !
+    link = .list_ptr;
+
+    WHILE page_number (.address) LEQ page_number (.end_address)
+    DO
+	BEGIN
+
+	! Create and link a page node
+	!
+	IF NOT dbg$nlist_freez (dbg$k_link_node_size, link_node, .message_vect)
+	THEN
+	    RETURN sts$k_severe;
+
+	.link = .link_node;
+	link = link_node [dbg$l_link_node_link];
+
+
+	! Calculate the page number and place it into the node field
+	!
+	page = page_number (.address);
+	link_node [dbg$l_link_node_value] = .page;
+	
+
+	! Update address to the next page
+	!
+	address = .address + page_size;
+
+	END;	! End loop
+
+
+    ! Place a zero in the last node's link field and return.
+    !
+    link_node [dbg$l_link_node_link] = 0;
+
+    RETURN sts$k_success;
+
+    END;	! End of create_page_list
+
+
+ROUTINE SET_PAGE_PROT (PAGE_LIST, RESET_FLAG, MESSAGE_VECT) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine accepts the page list data structure produced by dbg$nget_pages
+!	or create_page_list and changes the protection of each page so specified
+!	to provide write access for DEPOSIT's. As this is done, a new data structure
+!	is constructed in which each node in the tree is replace with a node that
+!	has one more field. This extra field contains the old protection of the
+!	page so that it may be reset after the deposit.
+!
+!	When called upon to reset the page protections, this routine uses the data
+!	structure it produced in the first step, and changes all page protections
+!	back to their original values.
+!
+! FORMAL PARAMETERS:
+!
+!	PAGE_LIST		- The address of a longword containing the address
+!				  of the first node in the page list.
+!
+!	RESET_FLAG		- A longword containing true or false. If false,
+!				  protection is changed to allow write access. If
+!				  true, protection for each page is set back to
+!				  the original value
+!
+!	MESSAGE_VECT		- The address of a longword to contain the address
+!				  of a message argument vector for errors
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	When NOT .reset_flag, a new page list is constructed.
+!	When .reset_flag, page protections are reset to original values.
+!
+!	On failure, a message argument vector is constructed.
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	sts$k_success	(1) - Success. Page protection set or reset.
+!
+!	sts$k_severe	(4) - Failure. Message argument vector produced.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+
+    FIELD PROT_NODE_FIELDS =
+	SET
+	NODE_LINK	= [0, 0, 32, 0],	! Link field
+	PAGE_NUM	= [1, 0, 32, 0],	! Page number field
+	OLD_PROT	= [2, 0, 8, 0]		! Old protection field
+	TES;
+
+    LITERAL
+	PROT_NODE_SIZE	= 3;			! Length of node in longwords
+
+    MACRO
+	PROT_NODE	= BLOCK [prot_node_size] FIELD (prot_node_fields) %;
+
+    LOCAL
+	PAGE_VECT 	: VECTOR [2];		! Vector to hold page numbers
+
+    ! Check to see if we are setting or resetting protections
+    !
+    IF .reset_flag
+    THEN
+	BEGIN
+
+	! We are restoring protection. Therefore, page_list contains the address
+	! of a longword that contains the address of the modified page list.
+	!
+	LOCAL
+	    NODE : REF prot_node;	! Modified page list node
+
+     	! Obtain the address of the list.
+	!
+	node = ..page_list;
+	
+
+	! Loop and reset the page protections
+	!
+	WHILE .node NEQA 0
+	DO
+	    BEGIN
+
+	    ! Reset the old protection
+	    !
+	    page_vect [0] = .node [page_num];
+	    page_vect [1] = .node [page_num];	! We don't use a range
+
+	    $SETPRT (inadr = page_vect [0], prot = .node [old_prot]);
+
+
+	    ! Obtain the next node
+	    !
+	    node = .node [node_link];
+
+	    END;	! End of loop
+
+    	END
+
+    ELSE
+	BEGIN
+
+	! We are changing protections. Therefore, we must construct the modified
+	! page list.
+	!
+	LOCAL
+	    LINK,				! Temporary pointer
+	    NEW_NODE : REF prot_node,		! Modified list node
+	    OLD_NODE : REF dbg$link_node;	! Old list node
+
+	! Recover the head node of the unmodified page list
+	!
+	old_node = ..page_list;
+
+
+	! Loop, changing protection and constructing the new list
+	!
+	link = .page_list;
+
+	WHILE .old_node NEQA 0
+	DO
+	    BEGIN
+
+	    ! Allocate a modified node and link it
+	    !
+	    IF NOT dbg$nlist_freez (prot_node_size, new_node, .message_vect)
+	    THEN
+		RETURN sts$k_severe;
+
+	    .link = .new_node;
+	    link = new_node [node_link];
+
+	    ! Copy over relevant info
+	    !
+	    new_node [page_num] = .old_node [dbg$l_link_node_value];
+
+
+	    ! Change the protection, if possible
+	    !
+	    page_vect [0] = .new_node [page_num];
+	    page_vect [1] = .new_node [page_num];
+
+	    IF NOT $SETPRT (inadr = page_vect [0], 
+			    prot = prt$c_uw,
+			    prvprt = new_node [old_prot])
+	    THEN
+		BEGIN
+		.message_vect = dbg$nmake_arg_vect (dbg$_badtarget);
+		RETURN sts$k_severe;
+		END;
+
+	    ! Pick up the next node
+	    !
+	    old_node = .old_node [dbg$l_link_node_link];
+
+	    END;	! End of loop
+
+	END;
+
+    RETURN sts$k_success;
+
+    END;	! End of set_page_prot
+	
+
+
+END				!End of module
+ELUDOM

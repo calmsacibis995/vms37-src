@@ -1,0 +1,1762 @@
+MODULE tabman (IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  Command language editor
+!
+! ABSTRACT:
+!
+!	This facility is used to enhance the command language
+!	and allow user-written commands to be available in the
+!	language.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. unprivileged user mode,
+!
+! AUTHOR:  Tim Halvorsen, Feb 1980
+!
+! Modified by:
+!
+!	V011	DWT0030		Dave Thiel	01-Mar-1982
+!		Fix read_database to handle gtr 128 block tables.
+!		Remove buggy attempt to reclaim some space.
+!
+!	V010	DWT0022		Dave Thiel	19-Jan-1982
+!		Generate structure level 5 tables (real
+!		pointers to internal routine)
+!
+!	V009	TMH0009		Tim Halvorsen	 2-Dec-1981
+!		Add REQUIRE for new DCLDEF definitions, in order
+!		to obtain the symbol PRC_L_TAB_VEC.
+!
+!	V008	BLS0099		Benn Schreiber	 6-Nov-1981
+!		Fix write_database to handle gtr 128 block tables
+!
+!	V007	BLS0089		Benn Schreiber	15-Oct-1981
+!		Generate structure level 4 tables (MCR support)
+!
+!	V006	TMH0006		Tim Halvorsen	09-Aug-1981
+!		Generate structure level 3 tables: pointer table
+!		is now longword offsets rather than word offsets.
+!
+!	V005	TMH0005		Tim Halvorsen	15-Apr-1981
+!		Change method of determining address of CLI
+!		process work area (its no longer at CTL$AG_CLIDATA).
+!
+!	V004	TMH0004		Tim Halvorsen	28-Mar-1981
+!		Accept a list of synonym verb names to be
+!		associated with a new command descriptor block.
+!		Prevent signed pointers in the pointer table
+!		from overflowing when the absolute offset from
+!		the pointer entry to the command descriptor block
+!		is greater than 7FFF.
+!
+!	V003	TMH0003		Tim Halvorsen	11-Feb-1981
+!		Make parameter keywords work for parameters in
+!		change lists as well as verb definitions until
+!		keyword processing is completed in the CLI.
+!
+!	V002	TMH0002		Tim Halvorsen	05-Jan-1981
+!		Return offset to stored CMD block for user routine
+!		relocations.
+!
+!	V001	TMH0001		Tim Halvorsen	26-Nov-1980
+!		Add routine to create a new set of tables
+!		(to be used if /NOTABLES or /OBJECT is specified).
+!		Make the cell containing next free address and
+!		the address of the tables global so that the
+!		tables can be output as an object module.
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:LIB';		! VAX/VMS internal definitions
+
+REQUIRE 'LIB$:PPDDEF';			! Process permanent definitions
+
+REQUIRE 'SRC$:CLEDEF';			! Definitions for this utility
+
+REQUIRE 'SHRLIB$:DCLDEF';		! Get PRC_L_TAB_VEC to locate tables
+
+!
+! Table of contents
+!
+
+LINKAGE
+    alloc_room_linkage = JSB(REGISTER=0); ! Linkage for alloc_room routine
+
+FORWARD ROUTINE
+    create_database,			! Create new command tables
+    read_database,			! Read input command tables
+    write_database,			! Write output command tables
+    read_current,			! Read current command tables
+    write_current,			! Write current command tables
+    delete_tables,			! Delete tables in executive mode
+    overwrite_tables,			! Overwrite tables in executive mode
+    long_move:		NOVALUE,	! Move a large (>65k) buffer
+    map_new_tables,			! Map new tables in executive mode
+    set_p1_base,			! Set new base address of fixed P1 area
+    setup_pointers,			! Setup tables pointers
+    convert_to_3:	NOVALUE,	! Convert level 2 to level 3 structure
+    convert_to_4:	NOVALUE,	! Convert level 3 to level 4 structure
+    convert_to_5:	NOVALUE,	! Convert level 4 to level 5 structure
+    alloc_room:	alloc_room_linkage,	! Allocate free space in tables
+    add_command,			! Add a command (verb,quals,prompts)
+    add_verb,				! Add a new verb
+    double_verb_table:	NOVALUE,	! Double size of verb table
+    add_entity_list,			! Add a entity descriptor list
+    add_change,				! Add a change list
+    delete_command,			! Delete command and assoc. data
+    delete_verb,			! Delete a verb from verb/ptr tables
+    find_command;			! Find command data for a given verb
+
+!
+! Literals
+!
+
+LITERAL
+    table_extend_size = %X'20000',	! Granularity of in-memory allocation
+    prealloc_verbs = 1024;		! Preallocate 1024 verbs if new file
+
+!
+! Macro to relocate external offsets to another structure
+!
+
+MACRO
+    relocate(str) =
+	IF .str [%REMAINING] NEQ 0
+	THEN
+	    str [%REMAINING] = .str [%REMAINING] - (.str - .tables)%;
+
+!
+! OWN storage
+!
+
+GLOBAL					! Used by object module output routine
+    tables:	REF BBLOCK;		! Address of command tables
+
+OWN
+    header:	REF BBLOCK,		! Address of image header
+    symbols:	REF BBLOCK,		! Address of symbol table descriptor
+    section:	REF BBLOCK,		! Address of first ISD
+    p1_tables:	REF BBLOCK,		! Address of tables in control region
+    p1_size:	REF BBLOCK,		! Size of tables in control region
+    table_alloc,			! Allocated size of in-memory tables
+    table_size,				! Size of table in bytes
+    verb_table:		VECTOR [2],	! Descriptor of built-in verb table
+    ptr_table,				! Address of built-in pointer table
+    image_table,			! Address of built-in image table
+    remaining_verbs:	WORD,		! # remaining verbs which can be added
+    modified:		BYTE INITIAL(false); ! True if tables were modified
+
+!
+! External storage
+!
+
+EXTERNAL
+    clitype:	BYTE,				! CLI type from command or tables
+    ctl$gl_ctlbasva: ADDRESSING_MODE(GENERAL),	! Base of fixed P1
+    ctl$ag_clidata: ADDRESSING_MODE(GENERAL);	! Process permanent data
+
+BIND
+    ppd = ctl$ag_clidata:	BBLOCK;		! Address of PPD structure
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    rms_error,				! Report RMS errors
+    allocate,				! Allocate dynamic memory
+    deallocate;				! Deallocate dynamic memory
+
+GLOBAL ROUTINE create_database =
+
+!---
+!
+!	This routine creates a new set of command tables so that
+!	command definitions can be added.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+allocate(table_extend_size,tables);	! Allocate space
+table_alloc = table_extend_size;	! Allocated size of in-memory tables
+table_size = vec_c_length;		! Set length to vector size
+CH$FILL(0,vec_c_length,.tables);	! Zero the vector initially
+tables [vec_l_free] = vec_c_length;	! Set next available byte to allocate
+tables [vec_b_strlvl] = vec_c_strlvl;	! Set to current structure level
+tables [vec_b_cli] = .clitype;		! Set cli type
+tables [vec_w_size] = vec_c_length;	! Set vector length
+
+setup_pointers();			! Setup misc. pointers
+
+modified = true;			! Mark tables modified already
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE read_database (rab) =
+
+!---
+!
+!	This routine reads the command language data base.
+!	The file must be a PIC sharable image containing
+!	a single read-only image section.  The image header
+!	is read, verified, and the rest of the file is read
+!	into dynamic memory.
+!
+! Inputs:
+!
+!	rab = Address of RAB for input command tables
+!
+! Outputs:
+!
+!	routine = Status (already signaled)
+!---
+
+BEGIN
+
+MAP
+    rab:	REF BBLOCK;		! RAB for input tables
+
+LOCAL
+    status,
+    nbytes,
+    ptr,				! Character pointer
+    section2:	REF BBLOCK,		! Address of second ISD
+    fab:	REF BBLOCK;		! FAB for input tables
+
+fab = .rab [rab$l_fab];				! Get address of FAB
+
+!
+!	Open the input command tables file
+!
+
+status = $OPEN(FAB = .fab);		! Open input data base
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(openin),.fab);	! then report error
+    RETURN emsg(openin);
+    END;
+
+status = $CONNECT(RAB = .rab);		! Connect to stream
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(openin),.fab,.rab);	! then report it
+    RETURN emsg(openin);
+    END;
+
+!
+!	Read the image header into dynamic memory
+!
+
+allocate(.rab [rab$w_usz], rab [rab$l_ubf]);
+
+rab [rab$l_bkt] = 1;				! Set to read first block
+
+status = $READ(RAB = .rab);			! Read the block
+IF NOT .status					! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(readerr),.fab, .rab);	! then signal error
+    RETURN emsg(readerr);
+    END;
+
+header = .rab [rab$l_ubf];			! Address of image header
+symbols = .header + .header [ihd$w_symdbgoff];	! Address of symbol descriptor
+section = .header + .header [ihd$w_size];	! Address of ISD
+section2 = .section + .section [isd$w_size];	! Address of second ISD
+table_size = .section [isd$w_pagcnt] * 512;	! Set size of command tables
+
+!
+!	Verify image attributes
+!
+
+IF NOT (.header [ihd$b_imgtype] EQL ihd$k_lim	! Must be sharable image
+    AND .header [ihd$b_hdrblkcnt] EQL 1		! and only 1 block of header
+    AND .header [ihd$v_picimg]			! and must be PIC image
+    AND .symbols [ihs$l_gstvbn] NEQ 0		! Must have global symbol table
+    AND .symbols [ihs$w_gstrecs] NEQ 0
+    AND .symbols [ihs$l_dstvbn] EQL 0		! Cannot have debugger symbols
+    AND .symbols [ihs$w_dstblks] EQL 0
+    AND .section [isd$l_vbn] EQL 2		! Section must start at VBN 2
+    AND NOT .section [isd$v_wrt]		! and must be read-only
+    AND .section [isd$w_pagcnt] NEQ 0		! must have non-null section
+    AND .section [isd$l_vbn] + .section [isd$w_pagcnt]
+	EQL .symbols [ihs$l_gstvbn]		! GST must follow section
+    AND .section2 [isd$w_size] EQL 0)		! 2nd ISD must not exist
+THEN
+    BEGIN
+    rab [rab$l_sts] = emsg(imagefmt);		! Set primary error
+    rms_error(emsg(openin),.fab, .rab);		! and signal error
+    RETURN emsg(openin);
+    END;
+
+!
+!	Read entire image section into virtual memory
+!
+
+table_alloc = ((.table_size / table_extend_size) + 1) * table_extend_size;
+
+allocate(.table_alloc,tables);			! Allocate section space
+
+nbytes = .table_size;				! Set length of transfer
+rab [rab$l_ubf] = .tables;			! Set address of buffer
+rab [rab$l_bkt] = .section [isd$l_vbn];		! Set VBN of image section
+rab [rab$w_usz] = 0;				! Fake size of last read
+WHILE .nbytes NEQ 0 DO
+    BEGIN
+
+    ! Compute new read buffer address and block number
+    !
+    rab [rab$l_ubf] = .rab [rab$l_ubf] + .rab [rab$w_usz];
+    rab [rab$l_bkt] = .rab [rab$l_bkt] + (.rab [rab$w_usz]/512);
+
+    rab [rab$w_usz] = MINU (.nbytes, 64*512);	! Compute size of next read
+
+    status = $READ(RAB = .rab);			! Read entire image section
+    IF NOT .status				! If error detected,
+    THEN
+	BEGIN
+	rms_error(emsg(readerr),.fab, .rab);	! then signal error
+	RETURN emsg(readerr);
+	END;
+
+    nbytes = .nbytes - .rab [rab$w_usz];	! Update byte count
+
+    END;
+
+!
+!	Position input file to symbol table records appended
+!	to the end of the sharable image as variable length records.
+!
+
+rab [rab$b_rac] = rab$c_rfa;			! Set for find by RFA
+rab [rab$l_rfa0] = .symbols [ihs$l_gstvbn];	! Set for appended symbol table
+rab [rab$w_rfa4] = 0;				! First record in block
+
+status = $FIND(RAB = .rab);			! Find symbol table records
+IF NOT .status					! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(readerr),.fab, .rab);	! then signal error
+    RETURN emsg(readerr);
+    END;
+
+fab [fab$v_esc] = true;			! Setup for RMS escape
+fab [fab$b_rfm] = fab$c_var;		! VAR record format
+fab [fab$l_ctx] = rme$c_setrfm;		! Change RFM of IFAB
+fab [fab$w_mrs] = 3*512;		! Max length of symbol records
+
+status = $MODIFY(FAB = .fab);		! Change IFAB fields
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(readerr),.fab);	! then signal error
+    RETURN emsg(readerr);
+    END;
+
+rab [rab$b_rac] = rab$c_seq;		! Set back to GET sequential
+
+IF .tables [vec_b_strlvl] LEQU 3	! Determine cli type associated
+    THEN
+	clitype = vec_c_dcl
+    ELSE
+	clitype = .tables [vec_b_cli];
+
+setup_pointers();			! Setup table pointers
+
+modified = true;			! Mark tables should be written
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE write_database (inrab, outrab) =
+
+!---
+!
+!	This routine is called after the command language
+!	tables have been edited to write the result to the
+!	output file.  The vector table is updated and the
+!	global symbol records are copied from the input file
+!	to the output file.
+!
+! Inputs:
+!
+!	inrab = Address of original input file RAB
+!	outrab = Address of output file RAB
+!	The input file is positioned to the symbol records
+!
+! Outputs:
+!
+!	routine = status (already signaled)
+!---
+
+BEGIN
+
+MAP
+    inrab:	REF BBLOCK,		! RAB for input tables
+    outrab:	REF BBLOCK;		! RAB for output tables
+
+LOCAL
+    status,
+    blocks,				! # blocks in new image section
+    nbytes,
+    infab:	REF BBLOCK,		! Address of input FAB
+    outfab:	REF BBLOCK;		! FAB for output tables
+
+outfab = .outrab [rab$l_fab];		! Get address of output FAB
+infab = .inrab [rab$l_fab];		! Get address of input FAB
+
+!
+!	Create output command tables file
+!
+
+table_size = .tables [vec_l_free];	! Get table size
+blocks = (.table_size + 511)/512;	! Compute # blocks in new section
+outfab [fab$l_alq] = .blocks+1;		! Guess at allocation size
+
+status = $CREATE(FAB = .outfab);	! Create output file
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(openout),.outfab);	! then report it
+    RETURN emsg(openout);
+    END;
+
+status = $CONNECT(RAB = .outrab);	! Connect to output stream
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(openout), .outfab, .outrab);	! then report it
+    RETURN emsg(openout);
+    END;
+
+outrab [rab$w_rsz] = 512;		! Set size to image header
+outrab [rab$l_rbf] = .header;		! Set address of new image header
+outrab [rab$l_bkt] = 1;			! Set to write first block
+
+section [isd$w_pagcnt] = .blocks;	! Set new size of section
+symbols [ihs$l_gstvbn] = .blocks + 2;	! Set VBN of symbol records
+
+status = $WRITE(RAB = .outrab);		! Write image header block
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(writeerr), .outfab, .outrab); ! then signal error
+    RETURN emsg(writeerr);
+    END;
+
+outrab [rab$l_rbf] = .tables;		! Set address of start of tables
+outrab [rab$w_rsz] = 0;
+outrab [rab$l_bkt] = 2;			! Set VBN of image section
+nbytes = .blocks*512;
+WHILE .nbytes GTRU 0
+DO BEGIN
+    outrab [rab$l_rbf] = .outrab [rab$l_rbf]	! Set address of next write
+			+ .outrab [rab$w_rsz];
+    outrab [rab$l_bkt] = .outrab [rab$l_bkt]
+			+ (.outrab [rab$w_rsz]/512);
+    outrab [rab$w_rsz] = MINU(.nbytes,
+			64*512);	! Set size of write (64 blocks/shot)
+    status = $WRITE(RAB = .outrab);	! Write image section
+    IF NOT .status			! If error detected,
+    THEN
+	BEGIN
+	rms_error(emsg(writeerr),
+			.outfab, .outrab); ! then signal error
+	RETURN emsg(writeerr);
+	END;
+    nbytes = .nbytes - .outrab [rab$w_rsz]; ! Compute bytes left
+    END;
+
+!
+!	Copy all the symbol table records from the original
+!	input file to the output file following the image section.
+!
+
+status = $DISCONNECT(RAB = .outrab);	! Disconnect output stream
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(writeerr), .outfab, .outrab); ! then signal error
+    RETURN emsg(writeerr);
+    END;
+
+outfab [fab$v_esc] = true;		! Setup for RMS escape
+outfab [fab$b_rfm] = fab$c_var;		! VAR record format
+outfab [fab$l_ctx] = rme$c_setrfm;	! Change RFM of IFAB
+outfab [fab$w_mrs] = 3*512;		! Max length of symbol records
+
+status = $MODIFY(FAB = .outfab);	! Change IFAB attributes
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(writeerr), .outfab, .outrab); ! then signal error
+    RETURN emsg(writeerr);
+    END;
+
+outrab [rab$v_eof] = true;		! Connect to end of file
+status = $CONNECT(RAB = .outrab);	! Connect stream back again
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(writeerr), .outfab, .outrab); ! then signal error
+    RETURN emsg(writeerr);
+    END;
+
+inrab [rab$v_loc] = true;		! Input in locate mode
+inrab [rab$w_usz] = 3*512;		! Set max size of symbol record
+inrab [rab$l_ubf] = .tables;		! Use tables as transfer buffer
+
+INCRU i FROM 1 TO .symbols [ihs$w_gstrecs] ! For each symbol table record,
+DO
+    BEGIN
+    status = $GET(RAB = .inrab);	! Get record from input file
+    IF NOT .status			! If error detected,
+    THEN
+	BEGIN
+	rms_error(emsg(readerr), .inrab [rab$l_fab], .inrab);
+	RETURN emsg(readerr);
+	END;
+    outrab [rab$w_rsz] = .inrab [rab$w_rsz];	! Copy record length
+    outrab [rab$l_rbf] = .inrab [rab$l_rbf];	! and record address
+    status = $PUT(RAB = .outrab);	! Write record to output file
+    IF NOT .status			! If error detected,
+    THEN
+	BEGIN
+	rms_error(emsg(writeerr), .outfab, .outrab);
+	RETURN emsg(writeerr);
+	END;
+    END;
+
+status = $GET(RAB = .inrab);		! Attempt to read next record
+
+IF .status NEQ rms$_eof			! If not end of file,
+THEN
+    RETURN emsg(toomnygst);		! Too many GST records on input file
+
+status = $CLOSE(FAB = .infab);		! Close input file
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(closedel), .infab);	! then report it
+    RETURN emsg(closedel);
+    END;
+
+outfab [fab$b_rfm] = fab$c_fix;		! Reset output to fixed length
+outfab [fab$w_mrs] = 512;		! 512 byte records
+status = $MODIFY(FAB = .outfab);	! Modify attributes
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(writeerr), .outfab, .outrab); ! then signal error
+    RETURN emsg(writeerr);
+    END;
+
+status = $CLOSE(FAB = .outfab);		! Close output file
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(closedel),.outfab);	! then report it
+    RETURN emsg(closedel);
+    END;
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE read_current =
+
+!---
+!
+!	This routine reads the current command language data base.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	routine = Status (already signaled)
+!---
+
+BEGIN
+
+BIND
+    prc = .ppd [ppd$l_prc]:	BBLOCK;		! Address of CLI process data
+
+!
+!	Read entire tables into virtual memory
+!
+
+p1_tables = .prc [prc_l_tab_vec];	! Get address of tables
+table_size = (.p1_tables [vec_l_free]+511) AND NOT 511; ! Figure size of tables
+
+table_alloc = ((.table_size / table_extend_size) + 1) * table_extend_size;
+
+allocate(.table_alloc,tables);		! Allocate space
+
+long_move(.table_size, .p1_tables, .tables);	! Copy the tables
+
+IF .tables [vec_b_strlvl] LEQU 3	! Determine cli type associated
+    THEN
+	clitype = vec_c_dcl
+    ELSE
+	clitype = .tables [vec_b_cli];
+
+setup_pointers();			! Setup pointers to tables
+
+modified = false;			! Indicate tables not yet modified
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE write_current =
+
+!---
+!
+!	This routine is called after the command language
+!	tables have been edited to modify the existing
+!	command tables currently mapped in the control region.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	routine = status (already signaled)
+!---
+
+BEGIN
+
+BIND
+    prc = .ppd [ppd$l_prc]:	BBLOCK;		! Address of CLI process data
+
+IF NOT .modified			! If tables not modified at all,
+THEN
+    BEGIN
+    SIGNAL(emsg(nomods));		! then signal warning
+    RETURN true;			! and do nothing
+    END;
+
+p1_tables = .prc [prc_l_tab_vec];	! Get address of tables
+p1_size = (.p1_tables [vec_l_free]+511) AND NOT 511; ! Figure size of tables
+
+table_size = .tables [vec_l_free];	! Get new table size
+
+signal_if_error($CMEXEC(ROUTIN=delete_tables));		! Delete old tables
+
+IF .table_size GTRU .p1_size		! If new one bigger than old
+THEN
+    signal_if_error($CMEXEC(ROUTIN=map_new_tables))	! Map new set of tables
+ELSE
+    signal_if_error($CMEXEC(ROUTIN=overwrite_tables));	! else overwrite old
+
+RETURN true;
+
+END;
+
+ROUTINE delete_tables = 
+
+!---
+!
+!	This routine deletes the address space holding the command tables
+!	in the control region.  If the address space happens to be the
+!	lowest pages in the fixed portion of P1 space, then the base address
+!	is reset.
+!
+! Inputs:
+!
+!	Access mode is executive.
+!
+!	p1_tables = Address of existing tables
+!	p1_size = Length of existing tables
+!
+! Outputs:
+!
+!	p1_size may be zeroed to indicate tables address space no longer exists
+!	routine = status (not signaled)
+!---
+
+BEGIN
+
+LOCAL
+    range:	VECTOR [2];		! Address range
+
+IF (.p1_tables AND 511) NEQ 0		! If tables not on page boundary
+THEN
+    BEGIN
+    p1_size = 0;			! then do NOT delete - we can only
+    RETURN true;			! delete in multiples of pages
+    END;
+
+range [0] = .p1_tables;
+range [1] = .p1_tables + .p1_size - 1;
+
+return_if_error($DELTVA(INADR=range));	! Delete existing tables
+
+IF .p1_tables EQL .ctl$gl_ctlbasva	! If deleting bottom of fixed P1,
+THEN					! then reset base address higher
+    BEGIN
+    return_if_error($CMKRNL(ROUTIN=set_p1_base,ARGLST=.p1_tables+.p1_size));
+    p1_size = 0;			! Mark no tables exist anymore
+    END;
+
+RETURN true;
+
+END;
+
+ROUTINE overwrite_tables = 
+
+!---
+!
+!	This routine overwrites the command tables in the control region
+!	with a modified command tables.  This can be done only if the new
+!	tables are less than or equal to the size of the existing tables.
+!
+! Inputs:
+!
+!	Access mode is executive.
+!
+!	p1_tables = Address of existing tables
+!	tables = Address of new version of tables
+!	table_size = Length of new version of tables
+!
+! Outputs:
+!
+!	routine = status (not signaled)
+!---
+
+BEGIN
+
+LOCAL
+    range:	VECTOR [2];		! Address range
+
+range [0] = .p1_tables;
+range [1] = .p1_tables + .p1_size - 1;
+
+return_if_error($CRETVA(INADR=range,ACMODE=psl$c_super)); ! Allocate space
+
+long_move(.table_size, .tables, .p1_tables);	! Overwrite existing tables
+
+return_if_error($SETPRT(INADR=range, PROT=prt$c_ur));	! Make pages readonly
+
+RETURN true;
+
+END;
+
+ROUTINE long_move (length, source, dest): NOVALUE =
+
+!---
+!
+!	This routine is used to move a buffer which may be
+!	larger than 65K, which exceeds the maximum allowable
+!	size of a single MOVC instruction.
+!
+! Inputs:
+!
+!	length = Length to move
+!	source = Address of source buffer
+!	dest = Address of destination buffer
+!
+!	Access mode may be executive or user.
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+LOCAL
+    move_length,
+    length_left;
+
+length_left = .length;
+
+INCRU offset FROM 0 TO .length BY %X'8000'
+DO
+    BEGIN
+    move_length = MINU(.length_left, %X'8000');
+    CH$MOVE(.move_length, .source + .offset, .dest + .offset);
+    length_left = .length_left - .move_length;
+    END;
+
+END;
+
+ROUTINE map_new_tables = 
+
+!---
+!
+!	This routine maps a new command tables in the control region
+!	and resets the pointer to the command tables for the CLI.
+!	This is done when the newer tables are larger than the existing
+!	tables and there is insufficient address space to fit the new one.
+!
+! Inputs:
+!
+!	Access mode is executive.
+!
+!	tables = Address of new version of tables
+!	table_size = Length of new version of tables
+!
+! Outputs:
+!
+!	routine = status (not signaled)
+!---
+
+BEGIN
+
+BIND
+    prc = .ppd [ppd$l_prc]:	BBLOCK;		! Address of CLI process data
+
+LOCAL
+    range:	VECTOR [2];		! Address range
+
+return_if_error($EXPREG(PAGCNT=(.table_size+511)/512,	! Allocate space
+			REGION=1,
+			ACMODE=psl$c_super,
+			RETADR=range));
+
+!** Note that EXPREG in P1 returns range backwards, [1]=base, [0]=end
+
+return_if_error($CMKRNL(ROUTIN=set_p1_base,ARGLST=.range [1])); ! Set P1 base
+
+long_move(.table_size, .tables, .range [1]);	! Copy tables to new space
+
+return_if_error($SETPRT(INADR=range, PROT=prt$c_ur));	! Make pages readonly
+
+prc [prc_l_tab_vec] = .range [1];	! Point CLI to new tables
+
+RETURN true;
+
+END;
+
+ROUTINE set_p1_base =
+
+!---
+!
+!	This routine resets the base address of the fixed portion
+!	of the control region.
+!
+! Inputs:
+!
+!	Access mode is kernel.
+!
+!	ap = New base address for fixed P1
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+BUILTIN
+    ap;
+
+ctl$gl_ctlbasva = .ap;			! Set new base of fixed P1 region
+
+RETURN true;
+
+END;
+
+ROUTINE setup_pointers =
+
+!---
+!
+!	This routine initializes the pointers in OWN storage
+!	which describe the command tables just read.
+!
+! Inputs:
+!
+!	tables = Address of command tables
+!	table_size = Length of command tables
+!
+! Outputs:
+!
+!	routine = status (signaled)
+!---
+
+BEGIN
+
+LOCAL
+    ptr;				! Temporary pointer
+
+verb_table [0] = .tables [vec_l_verbend]	! Length of verbs
+			- .tables [vec_l_verbtbl];
+verb_table [1] = .tables + .tables [vec_l_verbtbl];! Address of verbs
+ptr_table = .tables + .tables [vec_l_comdptr];	! Address of ptr table
+
+IF .tables [vec_b_strlvl] EQL 2		! If structure level 2,
+THEN
+    convert_to_3();			! then convert to level 3
+
+IF .tables [vec_b_strlvl] EQL 3		! If structure level 3
+THEN
+    convert_to_4();
+
+IF .tables [vec_b_strlvl] EQL 4		! If structure level 4
+THEN
+    convert_to_5();			! then convert to level 5
+
+IF .tables [vec_b_strlvl] NEQ vec_c_strlvl! If not structure level 5,
+THEN
+    SIGNAL_STOP(emsg(badstrlvl));	! then report error and exit
+
+image_table = .tables + .tables [vec_l_imagetbl]; ! Address of image table
+
+ptr = CH$FIND_CH(.verb_table [0], .verb_table [1], 0);
+
+IF .ptr EQL 0				! If no zeros found at all
+THEN
+    remaining_verbs = 0			! then set no room left
+ELSE
+    remaining_verbs = (.verb_table [0] -	! Compute # verbs free
+		(.ptr - .verb_table [1]))/4;
+
+RETURN true;
+
+END;
+
+ROUTINE convert_to_3: NOVALUE =
+
+!---
+!
+!	This routine converts structure level 2 tables to structure
+!	level 3, so that this utility can be used as an automatic
+!	conversion for old format tables.
+!
+!	Structure level 3 is the same as 2, except that the pointer
+!	table entries are signed longword offsets rather than word
+!	offsets.
+!
+! Inputs:
+!
+!	tables = Address of the start of the tables.
+!	ptr_table = Address of current pointer table
+!	verb_table = Descriptor of corresponding verb table.
+!
+! Outputs:
+!
+!	New pointer table constructed and the vector table updated
+!	to point to it.  The old vector table becomes waste space.
+!---
+
+BEGIN
+
+LOCAL
+    array_size,					! Size of array (in entries)
+    old_ptr:	REF VECTOR [,WORD,SIGNED],	! Address of old pointer table
+    new_ptr:	REF VECTOR [,LONG,SIGNED];	! Address of new pointer table
+
+old_ptr = .ptr_table;			! Get address of old pointer
+array_size = .verb_table [0]/4;		! # entries in verb/pointer table
+tables [vec_b_strlvl] = 3;		! Indicate structure level 3
+new_ptr = alloc_room(4*.array_size);	! Allocate a longword pointer table
+
+INCRU i FROM 0 TO .array_size-1		! For each entry in old array
+DO
+    BEGIN
+    LOCAL cmd;
+    cmd = .old_ptr [.i] + old_ptr [.i+1];	! Compute address of CMD block
+    new_ptr [.i] = .cmd - new_ptr [.i+1];	! Set offset in new array
+    END;
+
+tables [vec_l_comdptr] = .new_ptr - .tables;	! Make vector point to new table
+ptr_table = .new_ptr;			! Likewise for "known" address
+
+modified = true;			! Mark tables modified
+
+END;
+
+ROUTINE convert_to_4: NOVALUE =
+
+!---
+!
+!	This routine converts structure level 3 tables to structure
+!	level 4.
+!
+!	Structure level 4 is identical to 3 except that the vector
+!	at the front of the tables has been extended to contain the
+!	cli type and room for future expansion.
+!
+! Inputs:
+!
+!	tables = Address of the start of the tables
+!
+! Outputs:
+!
+!	New tables constructed, tables updated to point at it.
+!---
+
+BEGIN
+
+LOCAL
+    new_tables : REF BBLOCK;
+
+LITERAL
+    vec_c_inc3_to_4 = vec_c_length - vec_c_length3;
+
+allocate(.table_alloc+vec_c_inc3_to_4,new_tables);	! Get new table space
+CH$MOVE(vec_c_length3,.tables,.new_tables);		! Copy str 3 vec out
+new_tables [vec_b_strlvl] = 4;				! Set structure level
+new_tables [vec_b_cli] = .clitype;
+new_tables [vec_w_size] = vec_c_length;
+long_move(.table_alloc-vec_c_inc3_to_4,			! Copy rest
+		.tables+vec_c_length3,
+		.new_tables+vec_c_length);
+new_tables [vec_l_imagetbl] = .new_tables[vec_l_imagetbl] + vec_c_inc3_to_4;
+new_tables [vec_l_promptbl] = .new_tables[vec_l_promptbl] + vec_c_inc3_to_4;
+new_tables [vec_l_qualtbl] = .new_tables[vec_l_qualtbl] + vec_c_inc3_to_4;
+new_tables [vec_l_verbtbl] = .new_tables[vec_l_verbtbl] + vec_c_inc3_to_4;
+new_tables [vec_l_verbend] = .new_tables[vec_l_verbend] + vec_c_inc3_to_4;
+new_tables [vec_l_usrcmd] = .new_tables[vec_l_usrcmd] + vec_c_inc3_to_4;
+new_tables [vec_l_usrend] = .new_tables[vec_l_usrend] + vec_c_inc3_to_4;
+new_tables [vec_l_comdptr] = .new_tables[vec_l_comdptr] + vec_c_inc3_to_4;
+new_tables [vec_l_userptr] = .new_tables[vec_l_userptr] + vec_c_inc3_to_4;
+new_tables [vec_l_free] = .new_tables[vec_l_free] + vec_c_inc3_to_4;
+
+deallocate(.table_alloc,.tables);
+tables = .new_tables;
+table_alloc = .table_alloc+vec_c_inc3_to_4;
+
+setup_pointers();
+
+RETURN;
+END;
+
+ROUTINE convert_to_5: NOVALUE =
+
+!---
+!
+!	This routine converts structure level 4 tables to structure
+!	level 5.
+!
+!	Structure level 5 is identical to 4 except that in an object
+!	module, internal routines are referenced by a SRO to a
+!	longword containing the routine address rather than by a SRO
+!	to a longword containing the self-relative offset of the
+!	routine.  This change allows internal routines to be in
+!	shareable libraries.
+!
+!	No changes need to take place here, except for updating the
+!	structure level stored in the tables, since an object module
+!	is not a possible input to CLEDITOR.
+!
+! Inputs:
+!
+!	tables = Address of the start of the tables
+!
+! Outputs:
+!
+!	structure level of existing tables is updated
+!---
+
+BEGIN
+
+tables [vec_b_strlvl] = 5;				! Set structure level
+
+RETURN;
+END;
+
+ROUTINE alloc_room (bytes): alloc_room_linkage =
+
+!---
+!
+!	This routine is called to allocate some free space in
+!	the tables.  All free space is allocated from the free
+!	block at the end of the tables.  No space reclamation
+!	is done, due to the complexity of the table linkages.
+!
+! Inputs:
+!
+!	bytes = Number of bytes to allocate
+!
+! Outputs:
+!
+!	Routine value is the address of the allocated space.
+!
+!	All errors are signaled.
+!---
+
+BEGIN
+
+LOCAL
+    start;				! Start of allocated space
+
+IF .tables [vec_l_free] + .bytes GTRU .table_alloc ! If beyond size of extent,
+THEN
+    BEGIN
+    LOCAL new_tables;
+    allocate(.table_alloc+table_extend_size,new_tables); ! Get bigger table
+    long_move(.table_alloc,.tables,.new_tables); ! Copy old to new
+    deallocate(.table_alloc,.tables); 		! Deallocate old tables
+    tables = .new_tables;			! Point to new in-memory tables
+    table_alloc = .table_alloc + table_extend_size; ! Set new allocated size
+    setup_pointers();				! Reset pointers into table
+    END;
+
+start = .tables + .tables [vec_l_free];	! Save starting address of space
+tables [vec_l_free] = .tables [vec_l_free] + .bytes;	! Adjust new free ptr
+
+RETURN .start;				! and return starting address
+
+END;
+
+GLOBAL ROUTINE add_command (verb_list, cmdblk, qua_list, parm_list, retoffset) =
+
+!---
+!
+!	This routine is called to add a new command to the
+!	command language tables.
+!
+! Inputs:
+!
+!	verb_list = Address of list head of verb names
+!	cmdblk = Address of command descriptor block
+!	qua_list = Address of qualifier list head
+!	parm_list = Address of parameter list head
+!	retoffset = Address of longword to receive final offset to CMD
+!
+! Outputs:
+!
+!	retoffset = Offset to stored CMD from start of tables
+!	routine = status (already signaled)
+!---
+
+BEGIN
+
+MAP
+    cmdblk:	REF BBLOCK;		! Address of CMD to be stored
+
+LOCAL
+    offset,
+    entry:	REF VECTOR,		! Address of entry in verb list
+    cmd:	REF BBLOCK;		! Address of CMD in tables
+
+!
+! Lookup all the verb names, and if any of them already exist, then
+! delete the verb and all associated command descriptor blocks.  Note
+! that all verb synonyms are deleted when the associated command descriptor
+! block is deleted, so the first verb will usually take care of everything.
+!
+
+entry = ..verb_list;			! Point to first record in list
+
+WHILE .entry NEQ 0			! For each entry in list,
+DO
+    BEGIN
+    LOCAL desc: VECTOR [2];
+    desc [0] = .entry [1];		! Construct descriptor of verb name
+    desc [1] = .entry + 8;
+    IF find_command(desc, offset)	! If its already defined,
+    THEN
+	delete_command(desc);		! Delete command and all associated
+					! control blocks and vern synonyms
+    entry = .entry [0];			! Link to next in list
+    END;
+
+!
+! Store the command descriptor block into the tables
+!
+
+cmd = alloc_room(.cmdblk [cmd_b_size]);	! Allocate space for CMD in tables
+CH$MOVE(.cmdblk [cmd_b_size], .cmdblk, .cmd);	! Store CMD
+.retoffset = .cmd - .tables;		! Return offset to stored CMD
+
+!
+! Add all the verb names to the verb table
+!
+
+entry = ..verb_list;			! Point to first record in list
+
+WHILE .entry NEQ 0			! For each entry in list,
+DO
+    BEGIN
+    LOCAL desc: VECTOR [2];
+    desc [0] = .entry [1];		! Construct descriptor of verb name
+    desc [1] = .entry + 8;
+    return_if_error(add_verb(desc, .cmd));	! Add verb to verb table
+    entry = .entry [0];			! Link to next in list
+    END;
+
+!
+!	Add all prompt descriptor blocks and link them
+!	to the command descriptor block.
+!
+
+IF ..parm_list NEQ 0			! If non-empty prompt list,
+THEN
+    BEGIN
+    add_entity_list(.parm_list, offset); ! Store parameters, get table offset
+    cmd [cmd_w_parms] = .tables + .offset - .cmd; ! Point to first parameter
+    END;
+
+!
+!	Add the qualifier descriptor blocks and link them
+!	to the command descriptor block.
+!
+
+IF ..qua_list NEQ 0			! If non-empty qualifier list,
+THEN
+    BEGIN
+    add_entity_list(.qua_list, offset);	! Store qualist, get table offset
+    cmd [cmd_w_quals] = .tables + .offset - .cmd; ! Point to first qualifier
+    END;
+
+!
+! Until CLI can handle parameters which take keyword values, make options
+! work by setting the qualifier list to the keyword list.
+!
+
+IF ..parm_list NEQ 0			! If at least 1 parameter,
+    AND ..qua_list EQL 0		! and no qualifiers specified,
+THEN
+    BEGIN
+    BIND pro = ..parm_list+8: BBLOCK;	! Address the first parameter block
+    IF .pro [ent_w_keywords] NEQ 0	! If the first parameter takes keywords
+    THEN
+	cmd [cmd_w_quals] = .tables + .pro [ent_w_keywords] - .cmd;
+    END;
+
+RETURN true;
+
+END;
+
+ROUTINE add_verb (verb_name, cmd) =
+
+!---
+!
+!	This routine is called to add a verb name to the
+!	command language tables.  Only the first 4 characters
+!	of the verb name is inserted into the verb entry.
+!
+! Inputs:
+!
+!	verb_name = Descriptor of verb name
+!	cmd = Address of CMD block already stored in tables
+!
+! Outputs:
+!
+!	routine = status (already signaled)
+!---
+
+BEGIN
+
+MAP
+    verb_name:	REF BBLOCK;		! Address of verb listhead
+
+LOCAL
+    verb:	REF VECTOR,		! Address as vector of longwords
+    pointer:	REF VECTOR,		! Address as vector of longwords
+    verb_chars,				! First 4 chars of new verb
+    addpos,				! Index to add position in verb table
+    bubble;				! Index to bubble when displacing verb
+
+IF .remaining_verbs EQL 0		! If no room left for verb entry,
+THEN
+    double_verb_table(); 		! then make another one twice as big
+
+remaining_verbs = .remaining_verbs - 1;	! and decrement verb slots left
+
+verb = .verb_table [1];			! Get address of verb table
+pointer = .ptr_table;			! and address of pointer table
+
+verb_chars = ..verb_name [dsc$a_pointer] OR %X'80';	! Set top bit on first char.
+
+INCRU i FROM 0 TO (.verb_table [0]/4)-1	! For each verb in table,
+DO
+    BEGIN
+    IF .verb [.i] EQL 0			! If empty slot,
+    THEN
+	EXITLOOP addpos = .i;		! then put it here
+    IF CH$LSS(MIN(4,.verb_name [dsc$w_length]), verb_chars, 4, verb [.i], ' ') ! If verb goes here,
+    THEN
+	EXITLOOP addpos = .i;		! then put it here
+    END;
+
+bubble = (CH$FIND_CH(.verb_table [0], .verb_table [1], 0)
+	- .verb_table [1])/4;		! Compute index of first empty slot
+
+WHILE .bubble NEQ .addpos		! Until we reach add position,
+DO
+    BEGIN
+    bubble = .bubble - 1;		! Move bubble upwards in table
+    verb [.bubble+1] = .verb [.bubble];	! Propagating entries downward
+    pointer [.bubble+1] = .pointer [.bubble]-4;	! And adjusting pointer entries
+    END;
+
+CH$COPY(MIN(4,.verb_name [dsc$w_length]), verb_chars, ' ', 4, verb [.addpos]); ! Insert verb
+
+pointer [.addpos] = .cmd - pointer [.addpos+1];	! Set pointer of cmd data
+
+modified = true;			! Mark tables should be written
+
+RETURN true;
+
+END;
+
+ROUTINE double_verb_table: NOVALUE =
+
+!---
+!
+!	This routine is called when the verb table is full and
+!	another verb must be added.  It allocates another verb
+!	table twice as big as the last one and copies the existing
+!	verb table into it.  The relative pointers are updated
+!	when inserted into the new table.  The old verb table
+!	becomes unused wasted space.
+!
+! Inputs:
+!
+!	verb_table = Descriptor of verb table
+!	ptr_table = Address of pointer table
+!	tables = Base address of tables
+!
+! Outputs:
+!
+!	verb_tables = New descriptor of verb table
+!	ptr_table = New address of pointer table
+!	remaining_verbs = Number of free verbs in new table
+!---
+
+BEGIN
+
+LOCAL
+    verb:	REF VECTOR,		! Address as vector of longwords
+    pointer:	REF VECTOR,		! Address as vector of longwords
+    old_num_verbs,			! Number of verbs in old table
+    new_num_verbs,			! Number of verbs in new table
+    new_verb:	REF VECTOR,		! Address of new verb table
+    new_ptr:	REF VECTOR;		! Address of new pointer table
+
+verb = .verb_table [1];			! Get address of verb table
+pointer = .ptr_table;			! and address of pointer table
+
+old_num_verbs = .verb_table [0]/4;		! Old number of verbs
+new_num_verbs = MAXU(2*.old_num_verbs,25);	! Make new at least 25 verbs
+new_verb = alloc_room(4*.new_num_verbs);	! Allocate another verb table
+new_ptr = alloc_room(4*.new_num_verbs);		! Allocate pointer table
+tables [vec_l_verbtbl] = .new_verb - .tables;	! Point to new tables
+tables [vec_l_verbend] = .new_verb + 4*.new_num_verbs - .tables;
+tables [vec_l_comdptr] = .new_ptr - .tables;
+remaining_verbs = .new_num_verbs - .old_num_verbs; ! Reset # verbs left
+
+INCR i FROM 0 TO .old_num_verbs-1	! For each verb in old table,
+DO
+    BEGIN
+    new_verb [.i] = .verb [.i];	! Copy first 4 chars of verb name
+    new_ptr [.i] = .pointer [.i] + (pointer [.i+1] - new_ptr [.i+1]);
+    END;
+
+verb_table [0] = 4*.new_num_verbs;	! Reset verb table descriptor
+verb_table [1] = .new_verb;
+ptr_table = .new_ptr;			! Reset address of pointer table
+
+END;
+
+GLOBAL ROUTINE add_entity_list (entity_list, retoffset) =
+
+!---
+!
+!	This routine adds a given entity list to the
+!	command tables and returns the offset from the
+!	start of the tables where the first entity
+!	descriptor block was stored.
+!
+! Inputs:
+!
+!	entity_list = Listhead of entity list
+!	retoffset = Address of longword to return the table offset
+!				of the first descriptor block
+!
+! Outputs:
+!
+!	retoffset = Address of table offset to first entity
+!---
+
+BEGIN
+
+LOCAL
+    entity:	REF BBLOCK,		! Address of new entity descriptor
+    entry:	REF VECTOR;		! Address of current entry in list
+
+.retoffset = .tables [vec_l_free];	! Store table offset to 1st quablk
+
+IF (entry = ..entity_list) EQL 0	! Start at first in list
+THEN
+    RETURN true;			! If empty list, return
+
+WHILE .entry NEQ 0			! For each entry in list,
+DO
+    BEGIN
+    entity = alloc_room(.entry [1]);	! Remember where entry will be put
+    CH$MOVE(.entry [1], .entry+8, .entity);
+    relocate(entity,ent_w_syntax);	! Relocate reference to syntax list
+    relocate(entity,ent_w_keywords);	! and keyword list
+    entity [ent_b_next] = .tables [vec_l_free] - (.entity - .tables);
+					! Set offset to next one
+    entry = .entry [0];			! Link to next in list
+    END;
+
+entity [ent_b_next] = 0;		! Terminate list
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE add_change (chgblk, qua_list, parm_list, retoffset) =
+
+!---
+!
+!	This routine is called to add a series of misc.
+!	definitions to the command language tables and
+!	return the offset to the header block.  This offset
+!	will be used later to reference these attributes
+!	by other verb definitions.
+!
+! Inputs:
+!
+!	chgblk = Address of change list block
+!	qua_list = Address of qualifier list head
+!	parm_list = Address of parameter list head
+!	retoffset = Address of longword to receive offset from start
+!		of tables to the stored chg block.
+!
+! Outputs:
+!
+!	retoffset = Table offset to stored chg.
+!
+!	routine = status (already signaled)
+!---
+
+BEGIN
+
+MAP
+    chgblk:	REF BBLOCK;		! Address of original change block
+
+LOCAL
+    chg:	REF BBLOCK;		! Address of change list block
+
+.retoffset = .tables [vec_l_free];	! Return offset to start of chg
+
+!
+! Add the change descriptor first.
+!
+
+chg = alloc_room(.chgblk [chg_b_size]);	! Set address of stored chg
+CH$MOVE(.chgblk [chg_b_size], .chgblk, .chg);
+
+!
+! Add all prompt descriptor blocks and link them to the change block.
+!
+
+IF ..parm_list NEQ 0			! If non-empty prompt list,
+THEN
+    BEGIN
+    LOCAL offset;
+    add_entity_list(.parm_list,offset);	! Store parameter entities
+    chg [chg_w_parms] = .tables + .offset - .chg; ! Point to first parameter
+    END;
+
+!
+! Add the qualifier descriptor blocks and link them to the change block.
+!
+
+IF ..qua_list NEQ 0			! If non-empty qualifier list,
+THEN
+    BEGIN
+    LOCAL offset;			! Table offset to first quablk
+    add_entity_list(.qua_list, offset);	! Store qualist, get table offset
+    chg [chg_w_quals] = .tables + .offset - .chg; ! Point to first qualifier
+    END;
+
+!
+! Until CLI can handle parameters which take keyword values, make options
+! work by setting the qualifier list to the keyword list.
+!
+
+IF ..parm_list NEQ 0			! If at least 1 parameter,
+    AND ..qua_list EQL 0		! and no qualifiers specified,
+THEN
+    BEGIN
+    BIND pro = ..parm_list+8: BBLOCK;	! Address the first parameter block
+    IF .pro [ent_w_keywords] NEQ 0	! If the first parameter takes keywords
+    THEN
+	BEGIN
+	chg [chg_v_quals] = true;	! Mark qualifiers to be changed
+	chg [chg_w_quals] = .tables + .pro [ent_w_keywords] - .chg;
+	END;
+    END;
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE delete_command (verb_name) =
+
+!---
+!
+!	This routine deletes a specified verb and the associated
+!	information (if possible) from the command data base.
+!	All verb synonyms are also deleted.
+!
+! Inputs:
+!
+!	verb_name = Address of verb name descriptor
+!
+! Outputs:
+!
+!	routine = status (already signaled)
+!---
+
+BEGIN
+
+LOCAL
+    string: REF VECTOR [,BYTE],		! Address string as character array
+    end_of_data,			! Address of end of command data
+					! for this particular verb
+    cmd:	REF BBLOCK;		! Address of command descriptor block
+
+return_if_error(delete_verb(.verb_name,cmd));	! Delete the verb from table
+
+%(
+!	BEGINNING OF DISABLED BUGGY SPACE RECLAMATION ALGORITHM
+!
+! The following code DOES NOT WORK and has therefore been commented out.
+! The problem arises in that add_command allocates the cmd block and then
+! calls add_verb.  Add verb may expand the verb table which will result in a
+! verb table following the cmd block and preceding the entity blocks for
+! parameters and qualifiers.  This space reclamation code will reclaim the
+! verb table along with the verb!  This has disastrous consequences.
+!
+! The following code also fails when several synonym verbs are defined.  They
+! all point to the same structures and when any one of the synonyms is
+! deleted, the following algorithm may remove the structure referenced by all
+! of the synonyms, leaving dangling pointers.
+!
+!
+!!
+!!	Try and figure out where all the associated data for
+!!	this verb ends in the command data area.  We do know
+!!	that all associated data for the command is contiguous.
+!!	If the end of the verb data is the end of the data base,
+!!	then reduce the size of the data base to conserve space.
+!!
+!
+!end_of_data = .cmd + .cmd [cmd_b_size];	! Assume nothing but cmd alone
+!
+!IF .cmd [cmd_w_parms] NEQ 0		! If parameters on command,
+!THEN					! then set just after descriptors
+!    BEGIN
+!    LOCAL pro: REF BBLOCK;
+!    pro = .cmd + .cmd [cmd_w_parms];	! Point to first parameter descriptor
+!    end_of_data = .pro + .pro [ent_b_size];
+!    END;
+!
+!IF .cmd [cmd_w_quals] NEQ 0		! If qualifiers on command,
+!THEN
+!    BEGIN
+!    LOCAL qua: REF BBLOCK;
+!    qua = .cmd + .cmd [cmd_w_quals];
+!    WHILE .qua [ent_b_next] NEQ 0	! While more on qualifier list,
+!    DO
+!	qua = .qua + .qua [ent_b_next];	! Link to next on chain
+!    end_of_data = .qua + .qua [ent_b_size]; ! Assume end of last qualifier block
+!    END;
+!
+!IF .tables [vec_l_free] - (.end_of_data - .tables) LSSU 3 ! If within 3 bytes of end of data,
+!THEN
+!    BEGIN				! then remove all associated data
+!    CH$FILL(0,.tables [vec_l_free] - (.cmd-.tables), .cmd); ! Zero from CMD to end of data
+!    tables [vec_l_free] = .cmd - .tables; ! Set user free address at end
+!    END;
+!
+!	END OF DISABLED BUGGY SPACE RECLAMATION ALGORITHM
+)%
+
+RETURN true;
+
+END;
+
+ROUTINE delete_verb (verb_name, cmd) =
+
+!---
+!
+!	This routine removes a given verb from the verb
+!	and pointer tables.
+!
+! Inputs:
+!
+!	verb_name = Address of descriptor of verb name
+!	cmd = Address to return address of command descriptor block
+!
+! Outputs:
+!
+!	routine = status (already signaled)
+!---
+
+BEGIN
+
+MAP
+    verb_name:	REF BBLOCK;		! Address of verb descriptor
+
+BIND
+    verb = .verb_table [1]: VECTOR,	! Address as vector of longwords
+    pointer = .ptr_table: VECTOR;	! Address as vector of longwords
+
+LOCAL
+    verb_len,				! Length of verb name
+    verb_chars,				! First 4 chars of verb name
+    delpos,				! Index to delete position in table
+    emptypos;				! Index to first empty slot in table
+
+verb_len = MIN(.verb_name [dsc$w_length],4);	! Only check up to first 4 chars
+
+verb_chars = ..verb_name [dsc$a_pointer] OR %X'80';	! Set top bit on first char.
+
+delpos = -1;				! Assume verb will not be found
+
+INCRU i FROM 0 TO (.verb_table [0]/4)-1	! For each verb in table,
+DO
+    BEGIN
+    IF .verb [.i] EQL 0			! If empty slot,
+    THEN
+	EXITLOOP;			! then unable to find verb
+    IF CH$EQL(.verb_len, verb_chars, 4, verb [.i], ' ') ! If verb goes here,
+    THEN
+	EXITLOOP delpos = .i;		! then set delete position
+    END;
+
+IF .delpos LSS 0			! If verb not found
+THEN
+    BEGIN
+    SIGNAL(emsg(verbnotfnd),1,.verb_name); ! Signal verb not found
+    RETURN emsg(verbnotfnd);
+    END;
+
+.cmd = .pointer [.delpos] + pointer [.delpos+1]; ! Return address of CMD data
+
+emptypos = (CH$FIND_CH(.verb_table [0], .verb_table [1], 0)
+	- .verb_table [1])/4;		! Compute index of first empty slot
+
+WHILE .delpos LSS .emptypos-1		! Until end of table,
+DO
+    BEGIN
+    delpos = .delpos + 1;		! Move downwards in table
+    verb [.delpos-1] = .verb [.delpos];	! Propagating entries upward
+    pointer [.delpos-1] = .pointer [.delpos]+4;	! And adjusting pointer entries
+    END;
+
+verb [.delpos] = 0;			! Zero verb table entry
+pointer [.delpos] = 0;			! and pointer table entry
+
+remaining_verbs = .remaining_verbs + 1;	! Increment verb slots left
+
+modified = true;			! Mark tables should be written
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE find_command (verb_name, retcmd) =
+
+!---
+!
+!	This routine locates a given verb in the command data base
+!	and returns the address of the command descriptor block.
+!
+! Inputs:
+!
+!	verb_name = Address of verb name descriptor
+!	retcmd = Address of longword to receive address of CMD block
+!
+! Outputs:
+!
+!	r0 = true if found, false if no such verb
+!---
+
+BEGIN
+
+MAP
+    verb_name:	REF BBLOCK;		! Address of verb descriptor
+
+BIND
+    verb = .verb_table [1]: VECTOR,	! Address as vector of longwords
+    pointer = .ptr_table: VECTOR;	! Address as vector of longwords
+
+LOCAL
+    verb_chars,				! First 4 chars of verb name
+    index;				! Index to verb position in table
+
+verb_chars = ..verb_name [dsc$a_pointer] OR %X'80';	! Set top bit on first char.
+
+index = -1;				! Assume verb not found
+
+INCRU i FROM 0 TO (.verb_table [0]/4)-1	! For each verb in table,
+DO
+    BEGIN
+    IF .verb [.i] EQL 0			! If empty slot,
+    THEN
+	EXITLOOP;			! then exit not found
+    IF CH$EQL(MIN(4,.verb_name [dsc$w_length]), verb_chars, 4, verb [.i], ' ') ! If verb goes here,
+    THEN
+	EXITLOOP index = .i;		! then set delete position
+    END;
+
+IF .index LSS 0				! If verb not found
+THEN
+    RETURN false;			! then return not found
+
+.retcmd = .pointer [.index] + pointer [.index+1]; ! Return address of CMD data
+
+RETURN true;
+
+END;
+
+END
+ELUDOM

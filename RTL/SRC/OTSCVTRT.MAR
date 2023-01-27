@@ -1,0 +1,854 @@
+	.TITLE	OTS$$CVTRT - Kernel Convert real (G and H) to text
+	.IDENT	/1-007/			; File: OTSCVTRT.MAR  Edit: SBL1007
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;
+;++
+; FACILITY: Language-independent Support Library
+;
+; ABSTRACT:
+;
+;	A routine to convert G and H floating values to a string of
+;	ASCII digits and an exponent.  It is meant to be used as
+;	a base for floating point output conversion routines.
+;
+; ENVIRONMENT: User Mode, AST Reentrant
+;
+;--
+; AUTHOR: Tom Eggers and Steven Lionel, CREATION DATE: 25-Jun-1979
+;
+
+	.SBTTL	Edit History
+;
+; 1-001 - Original.  Algorithm implemented by Tom Eggers.  SBL 25-Jun-1979
+; 1-002 - Remove STRING_LEN from frame.  SBL 11-Jul-1979
+; 1-003 - Keep sign when right rounding to zero.  SBL 16-July-1979
+
+; 1-004 - When using RT_RND, if rounding would be to the right of the
+;	  number of significant digits, use the latter.  SBL 27-July-1979
+; 1-005 - Add CVT_HANDLER for correct processing of reserved operands.
+;	  SBL 8-Jan-1980
+; 1-006 - Don't loop if a reserved operand gets replaced by another.  SBL 29-Oct-81
+; 1-007 - Fix bug introduced by 1-006 for G_floating.  SBL 4-Feb-1982
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+;
+; EXTERNAL DECLARATIONS:
+;
+	.DSABL	GBL				; Prevent undeclared
+						; symbols from being
+						; automatically global.
+
+;
+; MACROS:
+;
+	$SSDEF
+	$CHFDEF
+;
+; EQUATED SYMBOLS:
+;
+
+; Stack frame offsets from R7
+;; Common frame for kernel convert routines
+	PACKED = -8			; Temp for packed representation
+	FLAGS = PACKED - 4		; Flags for outer and inner routines
+	SIG_DIGITS = FLAGS - 4		; Significant digits
+	STRING_ADDR = SIG_DIGITS - 4	; Address of temp string
+	SIGN = STRING_ADDR - 4		; Sign
+	DEC_EXP = SIGN - 4		; Decimal exponent
+	OFFSET = DEC_EXP - 4		; Offset
+	RT_RND = OFFSET - 4		; Right round point
+	COMMON_FRAME = RT_RND		; Common frame size
+
+
+				; BINNUM HOLDS THE 4 LONG-WORDS OF
+				; THE BINARY FRACTION. IT IS INITIALIZED
+				; WITH THE "STRAIGHTENED OUT" FRACTION
+				; BITS FROM THE H-FLOATING NUMBER.
+				; BINNUM+0<0> IS THE LEAST SIGNIFICANT BIT
+				; BINNUM+12<31> IS THE MOST SIG BIT
+	BINNUM = 0
+	INT = BINNUM + 16	; INT MUST BE 1ST WORD AFTER THE 4
+				; LONGWORDS OF BINNUM. IT IS USED TO CATCH
+				; THE BINARY FOR THE 9 DECIMAL DIGITS
+				; WHEN BINNUM IS MULTIPLIED BY 10**9.
+	.IF NE, <BINNUM+16-INT>
+		.ERROR		; INT MUST FOLLOW THE 4 L-WORDS OF BINNUM
+	.ENDC
+
+	BINEXP = INT + 4	; THE BINARY EXPONENT. IT IS INITIALIZED
+				; FROM THE H-FLOATING EXPONENT.
+	PRODF_4  = BINEXP + 4	; A TEMPORARY FOR HELPING WITH THE
+				; 4X4 MULTIPLE PRECISION MULTIPLY.
+				; THIS WORD NEVER GETS ALL
+				; THE APPROPRIATE CROSS-PRODUCTS ADDED IN
+				; AND IS NOT REALLY PART OF THE RESULT.
+				; IT'S HERE BECAUSE "EMUL" ALWAYS GIVES
+				; DOUBLE L-WORD PRODUCTS EVEN WHEN THE LOW
+				; WORD ISN'T NEEDED (WANTED).
+
+	PRODF = PRODF_4 + 4	; THE 4 LONG-WORDS OF PRODF MUST START
+				; JUST AFTER PRODF_4 (WHICH IS ALWAYS
+				; USED AS PRODF-4).
+	.IF NE, <PRODF_4+4-PRODF>
+		.ERROR		; PRODF MUST FOLLOW THE L-WORD OF PRODF_4
+	.ENDC
+
+	CRY = PRODF + 16	; USED FOR A "CARRY SAVE" MULTIPLY.
+
+	LOCAL_FRAME = CRY + 16	; SIZE OF DATA AREA TO ALLOCATE ON STACK
+
+
+;
+; PSECT DECLARATIONS:
+;
+	.PSECT _OTS$CODE PIC, USR, CON, REL, LCL, SHR, -
+			EXE, RD, NOWRT, LONG
+
+;
+; OWN STORAGE:
+;
+
+
+	.SBTTL	OTS$$CVT_x_T  - Convert G and H to text
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine converts a G or H floating point value to a string
+;	of ASCII digits.  It is intended to form the base of a
+;	language's floating point output conversion routine.
+;
+;
+; CALLING SEQUENCE:
+;
+;	MOVAB	common_frame, R1	; See common_frame definition above
+;	MOVL	string_address, STRING_ADDR(R1)
+;	MOVL	sig_digits, SIG_DIGITS(R1)
+;	MOVL	user_flags, FLAGS(R1)
+;	MOVL	rt_round, RT_RND(R1)	;  Optional
+;	MOVAB	value, R0
+;	JSB	OTS$$CVT_x_T_R8		; x is the datatype, G or H
+;	; outputs are:
+;	;	OFFSET(R1) - offset
+;	;	DEC_EXP(R1) - decimal exponent
+;	;	SIGN(R1) - sign
+;
+; INPUT PARAMETERS:
+;
+;	VALUE				; floating value to be converted
+;	SIG_DIGITS(R1)			; Number of significant digits to
+;					; generate.  If neither V_TRUNCATE
+;					; or V_ROUND_RIGHT is set, the
+;					; value will be rounded to this
+;					; many digits.
+;	FLAGS(R1)			; Caller supplied flags:
+	    V_TRUNCATE = 24		; Truncate, don't round.
+	    V_ROUND_RIGHT = 25		; Round "rt_round" digits to
+					; right of decimal point.
+;	RT_RND(R1)			; Number of places to the right
+;					; of the decimal point to round
+;					; after.  Ignored if V_ROUND_RIGHT
+;					; is clear.
+;
+; IMPLICIT INPUTS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	out_string			; String with result.  It will
+;					; Not have valid digits after the
+;					; requested number of significant
+;					; digits.
+;					; The length MUST be at least:
+					; (9*INT((sig_digits+8)/9))+2
+;	offset				; The offset into out_string at
+					; which the first significant digit
+					; may be found.  It is guaranteed
+					; to be either 0 or 1.
+;	exponent			; The signed decimal exponent of
+					; the value, assuming a radix point
+					; immediately to the left of the
+					; most significant digit.
+;	sign				; -1 if the value is negative
+					; 0 if the value is zero
+					; 1 if the value is positive
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	Alters registers R0 through R8.
+;
+;	SS$_ROPRAND	- If the value is a reserved operand
+;	SS$_ACCVIO	, or other nasty errors if the length of
+;			  out_string is not enough (see formula above).
+;			  This routine does not check the length, it
+;			  is up to the caller to insure the correct
+;			  length is present.
+;
+;--
+
+
+	.SBTTL	OTS$$CVT_H_T_R8
+
+;+
+; JSB entry point
+;-
+
+OTS$$CVT_H_T_R8::
+	MOVL	R1, R7			; Use R7 as base
+	CLRL	DEC_EXP(R7)		; INIT DECIMAL EXPONENT
+TSTVAL_H:
+	CVTWL	(R0), R1		; Test for zero and negative
+	BNEQ	10$			; Not zero
+	BRW	ZERO			; Is zero
+10$:	BLSS	NEG_VAL_H		; Negative?
+	MOVL	#1, SIGN(R7)		; No, set sign
+	BRB	NOTRES_H		; Continue
+NEG_VAL_H:
+	EXTZV	#0, #15, R1, R1		; Reserved operand?
+	BNEQ	10$			; No
+	MOVL	(FP), R8		; Save handler address
+	CALLS	#0, 5$			; Reserved operand
+	CMPW	(R0), ^X8000		; Still reserved?
+	BNEQ	TSTVAL_H		; No, try again
+	BRW	ZERO			; Yes, call it zero and quit
+5$:	.WORD	^M<>
+	MOVAB	W^CVT_HANDLER, (FP)	; Enable condition handler
+	TSTH	(R0)			; Force reserved operand fault
+	RET				; Continue
+
+10$:	MNEGL	#1, SIGN(R7)		; Set negative sign
+NOTRES_H:
+	SUBL2	#LOCAL_FRAME, SP	; ALLOCATE LOCAL DATA ON STACK
+	MOVL	SP, R8			; SETUP POINTER TO LOCAL DATA AREA
+	SUBL3	#^X4000, R1, BINEXP(R8)	; REMOVE EXCESS FROM EXPONENT
+
+		; PICK UP H-FLOATING FRACTION AND STORE AS A LEFT
+		; NORMALIZED UNSIGNED 4-LONGWORD INTEGER WITH THE BINARY
+		; POINT BETWEEN BITS 32 & 31 OF "BINNUM+12"
+
+	ROTL	#16, 2(R0), R4		; GET BYTES #5,4,3,2; STORE 3,2,5,4
+	ROTL	#16, 6(R0), R3		; GET 9,8,7,6; STORE 7,6,9,8
+	ROTL	#16, 10(R0), R2		; GET 13,12,11,10; STORE 11,10,13,12
+
+	MOVZWL	14(R0), R1		; GET Z,Z,15,14
+	ROTL	#16, R1, R1		; STORE 15,14,Z,Z
+
+		; DENORMALIZE BY 1 BIT TO INSERT
+		; THE HIDDEN BIT. THIS WILL LEAVE 15 GUARD BITS.
+
+	EXTV	#1, #32, R1, BINNUM+0(R8)
+	EXTV	#1, #32, R2, BINNUM+4(R8)
+	EXTV	#1, #32, R3, BINNUM+8(R8)
+	EXTZV	#1, #31, R4, R4
+	BISL3	#^X80000000, R4, BINNUM+12(R8)	; AND SET HIDDEN BIT
+	BRW	BEGSRC		; Now convert the value
+
+	.SBTTL	OTS$$CVT_G_T_R8
+
+;+
+; JSB entry point
+;-
+
+OTS$$CVT_G_T_R8::
+	MOVL	R1, R7			; Use R7 as base
+	CLRL	DEC_EXP(R7)		; INIT DECIMAL EXPONENT
+TSTVAL_G:
+	EXTV	#4, #12, (R0), R1	; Test for zero and negative
+	BNEQ	10$			; Not zero
+	BRW	ZERO			; Is zero
+10$:	BLSS	NEG_VAL_G		; Negative?
+	MOVL	#1, SIGN(R7)		; No, set sign
+	BRB	NOTRES_G		; Continue
+NEG_VAL_G:
+	EXTZV	#0, #11, R1, R1		; Reserved operand?
+	BNEQ	10$			; No
+	CALLS	#0, 5$			; Reserved operand
+	CMPZV	#4, #12, (R0), #^X800	; Still reserved?
+	BNEQ	TSTVAL_G		; No, try again
+	BRW	ZERO			; Still reserved, call it zero
+5$:	.WORD	^M<>
+	MOVAB	W^CVT_HANDLER, (FP)	; Enable condition handler
+	TSTG	(R0)			; Force reserved operand fault
+	RET				; Continue
+
+10$:	MNEGL	#1, SIGN(R7)		; Set negative sign
+NOTRES_G:
+	SUBL2	#LOCAL_FRAME, SP	; ALLOCATE LOCAL DATA ON STACK
+	MOVL	SP, R8			; SETUP POINTER TO LOCAL DATA AREA
+	SUBL3	#^X400, R1, BINEXP(R8)	; REMOVE EXCESS FROM EXPONENT
+
+		; PICK UP G-FLOATING FRACTION AND STORE AS A LEFT
+		; NORMALIZED UNSIGNED 4-LONGWORD INTEGER WITH THE BINARY
+		; POINT BETWEEN BITS 32 & 31 OF "BINNUM+12"
+
+	ROTL	#16, (R0), R4		; Get high fraction
+	ROTL	#16, 4(R0), R3		; Get low fraction
+
+		; DENORMALIZE BY 1 BIT TO INSERT
+		; THE HIDDEN BIT. 
+
+	CLRQ	BINNUM+0(R8)		; Clear low order bits
+	CLRL	R2
+	EXTV	#21, #32, R2, BINNUM+8(R8)
+	EXTZV	#21, #31, R3, R4
+	BISL3	#^X80000000, R4, BINNUM+12(R8)	; AND SET HIDDEN BIT
+	BRW	BEGSRC		; Now convert the value
+
+		; NOW SEARCH THE POWER-OF-TEN TABLE TO FIND
+		; AN ENTRY CLOSE TO THE VALUE STORED
+		; IN BINEXP & BINNUM. THEN DIVIDE (OR RATHER
+		; MULTIPLY BY THE RECIPROCAL) BINEXP & BINNUM
+		; BY THAT TABLE ENTRY TO GET THE RESULTANT
+		; FRACTION INTO THE RANGE:
+		;	 1.0 .GT. (FRACTION * 2** EXPONENT) .GE. 0.1
+
+		; THE TABLE SEARCH IS BROKEN INTO THREE PIECES: THE
+		; BIG NUMBER EXPONENTIAL SEARCH (STARTING AT BIGEXP), 
+		; THE SMALL NUMBER EXPONENTIAL SEARCH (STARTING AT
+		; SMLEXP), AND THE MIDDLE NUMBER SEARCH OF THE LINEAR
+		; PORTION OF THE TABLE (STARTING AT SRCLIN).
+
+BEGSRC:	MOVAW	TM16, R2		; GET 1ST ADR OF LINEAR TABLE
+	CMPW	T_BEXP(R2), BINEXP(R8)	; COMPARE WITH ENTRY'S BIN EXP
+	BGTR	SMLEXP			; BRANCH FOR SMALL NUMBERS
+	CMPW	<T16-TM16>+T_BEXP(R2), BINEXP(R8)
+					; COMPARE WITH LAST LINEAR ENTRY
+	BGTR	SRCLIN			; BRANCH FOR LINEAR SEARCH
+
+		; THE TWO SEARCHES WHICH FOLLOW (BIGEXP & SMLEXP) FIND
+		; THE TABLE ENTRY CLOSEST TO THE NUMBER STORED IN
+		; BINEXP(R8). THIS TABLE ENTRY IS USED TO DIVIDE (OR
+		; MULTIPLY BY THE RECIPROCAL) BINEXP & BINNUM.
+
+BIGEXP:	MOVAW	T16, R2			; EXPONENTIAL SEARCH FOR BIG NUMBERS
+	BRB	BIGEX1
+
+SMLEXP:	MOVAW	TSMALL, R2		; EXPONENTIAL SEARCH FOR SMALL NUMBERS
+BIGEX1:	CVTWL	T_BEXP(R2), R0		; GET POWER-OF-2 FROM TABLE
+	ASHL	#-1, R0, R1		; FOR LARGE, CALC: 1.5*ENTRY
+	BGEQ	BIGEX2			; XFER FOR BIG NUMS (POSITIVE EXPONENT)
+	ASHL	#-1, R1, R1		; FOR SMALL, CALC: .75*ENTRY
+	MNEGL	R1, R1
+BIGEX2:	ADDL2	R1, R0			; FORM .75*ENTRY OR 1.5*ENTRY
+					; R0 NOW CONTAINS VALUE HALF WAY
+					; BETWEEN THIS AND NEXT ENTRY.
+	CMPW	R0, BINEXP(R8)		; IS THIS CLOSEST TABLE ENTRY?
+	BGEQ	BIGEX3			; IF YES, XFER
+	ADDL2	#<T1-T0>, R2		; NO, GO LOOK AT NEXT ENTRY
+	BRB	BIGEX1
+
+BIGEX3:	BSBW	RMUL			; YES, GO MUL BY RECIPROCAL
+	BRB	BEGSRC			;   AND GO TRY AGAIN
+
+SRCLIN:
+		; THE CONVERSION WILL TAKE PLACE FROM THE LINEAR (IN
+		; POWERS OF TEN) PART OF THE TABLE.
+		; The DECIMAL_EXPONENT = 1 + LOG10(2) * (BIN_EXP - 1). Use this
+		; approximation to get the 1st probe into the table.
+		; This approx may be 1 small, but no more than that.
+		; The approx has been tested exhaustively over the
+		; range -106 .LE. BIN_EXP .LE. +108 and always works
+		; except for BIN_EXP=1 which has a special code hack.
+
+	SUBL3	#1, BINEXP(R8), R1	; GET (BINEXP - 1)
+	BEQL	SRCL1			; IF BINEXP=+1, RETURN 0 (hack)
+	MULL2	#1233, R1		; 1233 = 4096 * LOG10(2)
+	ASHL	#-12, R1, R1		; REMOVE THE 4096 FACTOR
+	INCL	R1			; FINAL +1
+
+SRCL1:	MULL2	#<T1-T0>, R1		; MUL BY SIZE OF TABLE ENTRY
+	ADDL2	R1, R2			; GET INDEX*size+TM16
+	ADDL2	#<T0-TM16>, R2		; GET INDEX*size+T0
+
+	CMPW	T_BEXP(R2), BINEXP(R8)	; COMPARE EXPONENTS
+	BGTR	FOUND			; XFER IF ENTRY .GT. BINNUM
+
+		; THE NEXT INSTRUCTION IS COMMENTED OUT. IT CAN NOT XFER.
+;	BLSS	SMALL			; XFER IF ENTRY TOO SMALL
+	CMPL	12(R2), BINNUM+12(R8)	; COMPARE HIGH-ORDER FRACTION
+	BGTRU	FOUND
+	BLSSU	SMALL
+	CMPL	8(R2), BINNUM+8(R8)
+	BGTRU	FOUND
+	BLSSU	SMALL
+	CMPL	4(R2), BINNUM+4(R8)
+	BGTRU	FOUND
+	BLSSU	SMALL
+	CMPL	0(R2), BINNUM+0(R8)	; COMPARE LOW-ORDER FRACTION
+	BGTRU	FOUND
+SMALL:	ADDL2	#<T1-T0>, R2		; ADVANCE TO NEXT TABLE ITEM
+
+		; FINAL CHECK FOR DEBUGGING. REMOVE THESE NEXT THREE
+		; INSTRUCTIONS AFTER ALL THE TESTING IS DONE. (OR
+		; LEAVE THEM IN-- THEY DON'T REALLY HURT.)
+
+;	CMPW	T_BEXP(R2), BINEXP(R8)	; FINAL SIZE CHECK
+;	BGTR	FOUND
+;	HALT				; BAD INDEX FORMULA
+
+FOUND:	MOVAW	T0, R0			; GET TABLE BASE ADR
+	CMPL	R2, R0
+	BEQL	MULDUN			; IF 0, DON'T MUL BY 1.0
+	BSBW	RMUL			; AND MULTIPLY BY RECIPROCAL
+
+MULDUN:		; BINEXP SHOULD NOW CONTAIN 0, -1, -2, OR -3.
+		; SHIFT BINNUM RIGHT BY THAT NUMBER OF PLACES
+		; IN ORDER TO REDUCE BINEXP TO ZERO, THUS
+		; FINALLY FINISHING WITH THE BINARY EXPONENT
+		; ROUND USING THE BITS SHIFTED OFF TO THE RIGHT
+
+	MNEGL	BINEXP(R8), R0			; FIND BIT # FROM BINEXP
+	BEQL	GETDIG				; IF 0, SKIP RIGHT SHIFT
+
+	SUBL3	#1, R0, R1			; GET POS OF 1ST DISCARDED BIT
+	EXTZV	R1, #1, BINNUM+0(R8), R1	; GET 1ST DISCARDE BIT
+
+	EXTV	R0, #32, BINNUM+0(R8), BINNUM+0(R8)
+	EXTV	R0, #32, BINNUM+4(R8), BINNUM+4(R8)
+	EXTV	R0, #32, BINNUM+8(R8), BINNUM+8(R8)
+	CLRL	BINNUM+16(R8)			; NEXT EXTV WILL GET 0'S HERE
+	EXTV	R0, #32, BINNUM+12(R8), BINNUM+12(R8)
+;	CLRL	BINEXP(R8)			; BINEXP NOW REDUCED TO ZERO
+
+	ADDL2	R1, BINNUM+0(R8)		; ROUND WITH 1ST DISCARDED BIT
+	ADWC	#0, BINNUM+4(R8)
+	ADWC	#0, BINNUM+8(R8)
+	ADWC	#0, BINNUM+12(R8)
+
+GETDIG:	MOVL	STRING_ADDR(R7), R5		; GET ADR FOR DIGIT STRING
+	ADDL3	#1, SIG_DIGITS(R7), R6		; Number of digits wanted
+	MOVL	#1, OFFSET(R7)			; Initial offset
+	MOVB	#^A/0/, (R5)+			; Start out with a zero
+
+		; NOW MUL THE BINNUM FRACTION BY 10**9 IN ORDER TO
+		; FORCE 9 DIGITS TO THE LEFT OF THE DECIMAL POINT.
+		; THEN CONVERT THAT 9 DIGIT BINARY INTEGER TO A
+		; STRING FOR OUTPUT IN THE FINAL ANSWER. REPEAT
+		; THE PROCESS UNTIL ENOUGH DIGITS ARE OUTPUT.
+
+.MACRO IMUL2 I, R, ?L
+	EMUL	I, R, #0, R0
+	TSTL	R
+	BGEQ	L
+	ADDL2	I, R1
+L:	MOVL	R0, R
+	ADDL2	R1, 4+R
+.ENDM IMUL2
+
+DIGLUP:	CLRL	INT(R8)			; CLEAR FOR DIGITS LEFT OF BIN POINT
+
+		; MULTIPLY 4-LONG-WORDS BY 10**9, PROPOGATING CARRIES
+		; ACROSS THE LONG-WORD BOUNDARIES.
+
+	MOVL	#1000000000, R2			; SETUP 10**9
+
+	IMUL2	R2, BINNUM+12(R8)
+	IMUL2	R2, BINNUM+8(R8)
+	ADWC	#0, INT(R8)
+	IMUL2	R2, BINNUM+4(R8)
+	ADWC	#0, BINNUM+12(R8)
+	ADWC	#0, INT(R8)
+	IMUL2	R2, BINNUM+0(R8)
+	ADWC	#0, BINNUM+8(R8)
+	ADWC	#0, BINNUM+12(R8)
+	ADWC	#0, INT(R8)
+
+		; CONVERT BINARY NUM NOW LEFT OF DECIMAL POINT INTO
+		; 9 PACKED DIGITS.
+
+	CVTLP	INT(R8), #9, PACKED(R7)	; STORE 9 PACKED DIGITS
+	MOVB	-(R5), R4			; Save byte
+	CVTPS	#9, PACKED(R7), #9, (R5)	; Convert to separate
+	MOVB	R4, (R5)+			; Restore byte
+	ADDL2	#9, R5				; ADVANCE OUTPUT STRING ADR
+	SUBL2	#9, R6				; 9 more digits
+	BLEQ	ROUND				; Loop for more?
+	BRW	DIGLUP				; Yes
+
+;+
+; This routine rounds the value to the given number of significant
+; digits, unless flag V_TRUNCATE is on.  If so, the value is truncated
+; at the next digit.
+;-
+ROUND:
+	DECL	R6
+	ADDL2	R6, R5			; Find least significant + 1
+	BBS	#V_TRUNCATE, FLAGS(R7), FINIS	; Truncate if desired
+	BBC	#V_ROUND_RIGHT, FLAGS(R7), 5$	; Round to right of dec pt?
+	ADDL3	DEC_EXP(R7), RT_RND(R7), R1	; Yes, find it
+	BLSS	FINIS			; Exit if round to zero
+	CMPL	R1, SIG_DIGITS(R7)	; Round to right of # sig digits?
+	BGEQ	5$			; Yes, use number of significant
+					; digits instead.
+	INCL	R1			; Finish calculation
+	ADDL3	R1, STRING_ADDR(R7), R5	; Get rounding character address
+5$:	CMPB	(R5), #^A/5/		; Round?
+	BLSS	FINIS			; No, just finish
+	MOVL	R5, R0			; Save position
+10$:	CMPB	-(R0), #^A/9/		; If this is a 9...
+	BLSS	20$
+	MOVB	#^A/0/, (R0)		; Then it becomes a zero
+	BRB	10$			; And we continue
+20$:	INCB	(R0)			; Else this is last carry
+	SUBL2	STRING_ADDR(R7), R0	; Do we need to change offset
+	BGTR	FINIS			; No
+	CLRL	OFFSET(R7)		; Yes, set new offset
+	INCL	DEC_EXP(R7)		; Set new exponent
+
+;+
+; All done.
+;-
+FINIS:
+	ADDL2	#LOCAL_FRAME, SP		; Restore stack pointer
+	MOVL	R7, R1			; Restore frame pointer
+	RSB				; Return to caller
+
+ZERO:
+	MOVL	STRING_ADDR(R7), R1	; Get string address
+	MOVC5	#0, (SP), #^A/0/, SIG_DIGITS(R7), (R1) ; Zero fill string
+	CLRQ	OFFSET(R7)		; Clear offset and exponent
+	CLRL	SIGN(R7)		; Clear sign
+	MOVL	R7, R1			; Restore frame pointer
+	RSB				; Return to caller
+
+	.SBTTL	CVT_HANDLER - Local condition handler
+
+;++
+;
+;	CVT_HANDLER allows OTS$$CVT_G_T_R8 and OTS$$CVT_H_T_R8 to detect
+;	reserved operands using the TSTG and TSTH instructions, regardless of
+;	whether the processor supports those instructions.
+;
+;	When a reserved operand is seen, a TSTG or a TSTH is executed with
+;	the reserved operand at (R0).  If the processor knows
+;	about TSTG or TSTH, a reserved operand fault is signaled.  However,
+;	if it doesn't support TSTG or TSTH, an "opcode reserved to Digital"
+;	fault will occur. CVT_HANDLER turns this into a reserved operand
+;	fault.
+;
+;	If the condition being signaled is not SS$_OPCDEC or if the
+;	signaled instruction is not in the frame that established this
+;	handler, then the exception is resignaled.  A test is made to
+;	see if (R0) is a reserved operand.  It
+;	will be on the initial fault, but might not be if it has been
+;	fixed up by another condition handler (i.e. LIB$FIXUP_FLT).
+;	If it is a reserved operand, the signal name is changed to
+;	SS$_ROPRAND and the exception is resignaled.  Otherwise,
+;	execution continues with the instruction following the TSTx.
+;
+;--
+
+CVT_HANDLER:
+	.WORD	^M<R2>
+	MOVL	4(AP), R0		; signal argument list
+	CMPL	CHF$L_SIG_NAME(R0), #SS$_OPCDEC	; Opcode reserved to Digital fault?
+	BNEQ	RESIGNAL		; No, resignal
+	MOVL	8(AP), R1		; mechanism argument list
+	TSTL	CHF$L_MCH_DEPTH(R1)	; Is depth zero?
+	BNEQ	RESIGNAL		; If not, can't be this routine
+	SUBL3	#1, CHF$L_SIG_ARGS(R0), R2  ; Get position of PC
+	MOVAL	(R0)[R2], R2		; R2 has position of PC
+	CMPW	@(R2), #^X73FD		; TSTH?
+	BEQL	10$			; Yes
+	CMPZV	#4, #12, @CHF$L_MCH_SAVR0(R1), #^X800	; G reserved operand?
+	BNEQ	CONTINUE		; No, continue execution
+	BRB	20$
+10$:	CMPW	@CHF$L_MCH_SAVR0(R1), #^X8000	; H reserved operand?
+	BNEQ	CONTINUE		; No, continue execution
+20$:	MOVL	#SS$_ROPRAND, CHF$L_SIG_NAME(R0)  ; Change condition code name
+RESIGNAL:
+	MOVL	#SS$_RESIGNAL, R0	; Resignal exception
+	RET
+
+CONTINUE:
+	SUBL3	#1, CHF$L_SIG_ARGS(R0), R1 ; Get position of PC
+	ADDL2	#3, (R2)		; Add length of TSTG or TSTH
+					; to instruction PC, causing
+					; next instruction to be executed.
+	MOVL	#SS$_CONTINUE, R0	; Continue execution
+	RET
+
+
+; THIS IS THE SUBROUTINE WHICH DOES THE MULTIPLE
+; PRECISION MULTIPLIES. IT IS CALLED WITH BSB OR JSB
+; WITH R2 CONTAINING A POINTER TO AN APPROPRIATE
+; ENTRY IN THE POWER-OF-TEN TABLE. BINEXP & BINNUM
+;  ARE MULTIPLIED BY THE RECIPROCAL OF THIS ENTRY, 
+; WITH THE RESULTS GOING TO
+; BINEXP & BINNUM, AND DECEXP IS UPDATED WITH THE
+; POWER_OF_TEN VALUE.
+; THIS ROUTINE CLOBBERS R0-R1, R3-R6, AND CHANGES R2.
+
+
+OTS$$CVT_MUL::
+RMUL:					; ENTRY POINT	
+
+		; FIND THE RECIPROCAL TABLE ENTRY POINTED TO BY R2.
+		; R2 CONTAINS THE BASE (T0) PLUS AN "INDEX". THE
+		; RECIPROCAL ENTRY HAS AN ADR OF "T0-INDEX" WHICH
+		; IS CALCULATED BY 2*T0-(T0+INDEX), OR 2*T0-R2.
+
+	MOVAL	T0, R1			; GET BASE ADR
+	ADDL2	R1, R1			; 2*BASE
+	SUBL3	R2, R1, R2		; GET ADR OF RECIPROCAL ENTRY
+
+	CLRL	PRODF-4(R8)		; INIT PRODUCT
+	CLRQ	PRODF+0(R8)
+	CLRQ	PRODF+8(R8)
+
+	CLRQ	CRY+0(R8)		; CLEAR CARRIES
+	CLRQ	CRY+8(R8)
+
+		; THIS MACRO HAS THE FUNCTION R=A*B, WITH THE CARRIES
+		; GOING INTO THE 4 L-WORDS AT "CRY". A AND B ARE
+		; UNSIGNED LONG-WORDS. R IS AN UNSIGNED DOUBLE LONG-WORD.
+		;  REMOVING THIS MACRO DEFINITION (WHICH IS ONLY USED ONCE), 
+		;  AND EXPANDING THE CODE WHERE IT IS USED, OBSCURES THE FUNCTION.
+
+.MACRO LMUL A, B, R, ?L1, ?L2, ?L3
+	MOVL	A, R0			; Get first operand
+	BEQL	L3			; Skip if zero
+	MOVL	B, R1			; Get second operand
+	BEQL	L3			; Skip if zero
+	EMUL	R0, R1, #0, R0		; FORM PRODUCT OF A AND B
+	TSTL	A
+	BGEQ	L1
+	ADDL2	B, R1			; IF A<0, FIXUP FOR NEG SIGN
+L1:	TSTL	B
+	BGEQ	L2
+	ADDL2	A, R1			; IF B<0, FIXUP FOR NEG SIGN
+L2:	ADDL2	R0, R			; ADD LOW PRODUCT INTO RESULT
+	ADWC	R1, 4+R			; ADD HI PRODUCT INTO RESULT
+	ADWC	#0, CRY+8-PRODF+R	; AND SAVE CARRIES
+L3:
+	.ENDM LMUL
+
+		; THE FOLLOWING LOOP FORMS ALL THE CROSS-PRODUCTS
+		; REQUIRED FOR A 4-LONG-WORD BY 4-LONG-WORD MULTIPLY.
+		; ONLY THE HIGH 4 LONG-WORDS ARE ACCUMULATED. THE BYTE
+		; TABLE AT "BYTAB" SHOWS THE INDICIES USED FOR THE
+		; LONG-WORD OPERANDS AND THE RESULTING DOUBLE-LONG-
+		; WORD PRODUCTS.
+
+	MOVAW	BYTAB, R3		; INIT BYTE TABLE INDEX
+BYTLUP:	CVTBL	(R3)+, R4		; SETUP 1ST INDEX
+	BLSS	BYTDUN			; AND TEST FOR END
+	CVTBL	(R3)+, R5		; SETUP 2ND INDEX
+	CVTBL	(R3)+, R6		; SETUP 3RD INDEX
+
+	LMUL	BINNUM(R8)[R4], 0(R2)[R5], PRODF_4(R8)[R6]
+	BRB	BYTLUP			; LOOP
+
+BYTDUN:
+;	INCL	CRY+0(R8)		; SMALL EXTRA FUDGE
+	ADDL2	CRY+0(R8), PRODF+0(R8)	; PUT CARRIES INTO SUM
+	ADWC	CRY+4(R8), PRODF+4(R8)
+	ADWC	CRY+8(R8), PRODF+8(R8)
+	ADWC	CRY+12(R8), PRODF+12(R8)
+
+	EXTZV	#31, #1, PRODF+12(R8), R1	; GET NORMALIZE BIT
+
+		; NORMALIZED OPERANDS CANNOT PRODUCE A RESULT
+		; UN-NORMALIZED BY MORE THAN ONE BIT POSITION. SO
+		; IF NORM_BIT=1, SHIFT LEFT BY 0
+		; IF NORM_BIT=0, SHIFT LEFT BY 1 AND SUB 1 FROM EXP
+
+	BNEQ	NOSUB1			; XFER IF NORM_BIT = 1
+	DECL	BINEXP(R8)		; NORM_BIT = 0, SUB 1 FROM EXPONENT
+
+		; MOVE THE PRODUCT FROM PRODF TO BINNUM, NORMALIZING
+		; IT ONE BIT POSITION IF REQUIRED.
+
+NOSUB1:	ADDL2	#31, R1				; DO EXTV'S FROM BIT 31 OR 32
+
+	EXTV	R1, #32, PRODF-4(R8), BINNUM+0(R8)	; SHIFT LEFT 0 OR 1 BIT
+	EXTV	R1, #32, PRODF+0(R8), BINNUM+4(R8)
+	EXTV	R1, #32, PRODF+4(R8), BINNUM+8(R8)
+	EXTV	R1, #32, PRODF+8(R8), BINNUM+12(R8)
+
+	CVTWL	T_BEXP(R2), R1		; EXTRACT BINARY EXPONENT
+	ADDL2	R1, BINEXP(R8)		; ADD EXPONENTS FOR MUL
+
+		; THE BINARY EXPONENT MOVES TOWARD ZERO WHILE THE
+		; DECIMAL EXPONENT MOVES AWAY FROM ZERO BY AN AMOUNT
+		; ABOUT EQUAL TO LOG(BIN EXP).
+
+	CVTWL	T_DEXP(R2), R1		; GET EQUIVALENT DECIMAL EXPONENT
+	SUBL2	R1, DEC_EXP(R7)		; AND SUB IT FROM RESULT EXP
+
+	RSB				; RETURN
+
+	.SBTTL	TABLES
+
+
+.MACRO NUMBER A1, A2, A3, A4, A5, A6, A7
+	.LONG ^X'A5+<<^X'A6@-31>&1>, ^X'A4, ^X'A3, ^X'A2
+	.WORD ^D<A1>, ^D<A7>
+.ENDM NUMBER
+
+		; THIS MACRO CREATES A TABLE ENTRY OF THE FOLLOWING FORM:
+
+		;	.LONG < LEAST SIG BITS>	:     0(R2)
+		;	.LONG <   ........    >	:     4(R2)
+		;	.LONG <   ........    >	:     8(R2)
+		;	.LONG < MOST SIG BITS >	:    12(R2)
+		;	.WORD < BINARY EXP    >	:T_BEXP(R2)
+		;	.WORD < DECIMAL EXP   >	:T_DEXP(R2)
+
+T_BEXP=16	; THE BINARY EXPONENT IS BYTES 16-17 OF EACH TABLE ENTRY
+T_DEXP=18	; THE DECIMAL EXPONENT IS BYTES 18-19
+
+
+;            VALUE = FRACTION * 2**POWER_OF_2 = 10**POWER_OF_10
+
+;	THE HEX FRACTION IS STORED AS A 4 LONG-WORD UNSIGNED INTEGER,
+;	LEFT NORMALIZED, WITH THE BINARY POINT LEFT OF BIT 31
+;	OF THE MOST SIGNIFICANT LONG-WORD.
+
+;	THE FRACTION IS GUARANTEED CORRECT FOR THE FOUR HIGH-ORDER
+;	LONG-WORDS. ABOUT 16 BITS OF THE FIFTH LOW-ORDER LONG-WORD MAY
+;	BE IN ERROR. THE CHECK LINE AT THE BOTTOM OF THE TABLE IS
+;	THE PRODUCT OF THE FIRST AND LAST TABLE ENTRIES. IT WOULD
+;	EQUAL EXACTLY 1.0 IF EVERY BIT OF THE 5 LONG-WORDS WERE CORRECT.
+
+;	      DECIMAL,<-------5 LONG-WORD HEX FRACTION----------->, DECIMAL
+;	       POWER ,<--MSB--------------------------------LSB-->,  POWER
+;	       OF 2                                                  OF 10
+TSMALL:
+;	NUMBER -27213,D986C20B,686DA869,5D1D4FD8,5B05F4C2,EEF0FB87,-8192
+	NUMBER -13606,A6DD04C8,D2CE9FDE,2DE38123,A1C3CFFC,203028DA,-4096
+	NUMBER  -6803,CEAE534F,34362DE4,492512D4,F2EAD2CB,8263AA10,-2048
+	NUMBER  -3401,A2A682A5,DA57C0BD,87A60158,6BD3F698,F53E881E,-1024
+	NUMBER  -1700,9049EE32,DB23D21C,7132D332,E3F204D4,E73177C2, -512
+	NUMBER   -850,C0314325,637A1939,FA911155,FEFB5308,A23E2B15, -256
+	NUMBER   -425,DDD0467C,64BCE4A0,AC7CB3F6,D05DDBDE,E26CA3DF, -128
+	NUMBER   -212,A87FEA27,A539E9A5,3F2398D7,47B36224,2A1FED70,  -64
+; TM32:
+	NUMBER   -106,CFB11EAD,453994BA,67DE18ED,A5814AF2, B5B1A20,  -32
+;	NUMBER   -102,81CEB32C,4B43FCF4,80EACF94,8770CED7,4718F05A,  -31
+;	NUMBER    -99,A2425FF7,5E14FC31,A1258379,A94D028D,18DF2C73,  -30
+;	NUMBER    -96,CAD2F7F5,359A3B3E, 96EE458,13A04330,5F16F793,  -29
+;	NUMBER    -93,FD87B5F2,8300CA0D,8BCA9D6E,188853FC,76DCB57B,  -28
+;	NUMBER    -89,9E74D1B7,91E07E48,775EA264,CF55347D,CA49F16F,  -27
+;	NUMBER    -86,C6120625,76589DDA,95364AFE, 32A819D,3CDC6DCD,  -26
+;	NUMBER    -83,F79687AE,D3EEC551,3A83DDBD,83F52204,8C138944,  -25
+;	NUMBER    -79,9ABE14CD,44753B52,C4926A96,72793542,D78C35CE,  -24
+;	NUMBER    -76,C16D9A00,95928A27,75B7053C, F178293,8D6F434A,  -23
+;	NUMBER    -73,F1C90080,BAF72CB1,5324C68B,12DD6338,70CB1420,  -22
+;	NUMBER    -69,971DA050,74DA7BEE,D3F6FC16,EBCA5E03,467EEC97,  -21
+;	NUMBER    -66,BCE50864,92111AEA,88F4BB1C,A6BCF584,181EA7C0,  -20
+;	NUMBER    -63,EC1E4A7D,B69561A5,2B31E9E3,D06C32E5,1E2651B1,  -19
+;	NUMBER    -59,9392EE8E,921D5D07,3AFF322E,62439FCF,32D7F311,  -18
+;	NUMBER    -56,B877AA32,36A4B449, 9BEFEB9,FAD487C2,FF8DEFDB,  -17
+TM16:	NUMBER    -53,E69594BE,C44DE15B,4C2EBE68,7989A9B3,BF716BD5,  -16
+	NUMBER    -49,901D7CF7,3AB0ACD9, F9D3701,4BF60A10,57A6E369,  -15
+	NUMBER    -46,B424DC35, 95CD80F,538484C1,9EF38C94,6D909C46,  -14
+	NUMBER    -43,E12E1342,4BB40E13,2865A5F2, 6B06FB9,88F4C35A,  -13
+	NUMBER    -39,8CBCCC09,6F5088CB,F93F87B7,442E45D3,F598FA1C,  -12
+	NUMBER    -36,AFEBFF0B,CB24AAFE,F78F69A5,1539D748,F2FF38A8,  -11
+	NUMBER    -33,DBE6FECE,BDEDD5BE,B573440E,5A884D1B,2FBF06D5,  -10
+	NUMBER    -29,89705F41,36B4A597,31680A88,F8953030,FDD76447,   -9
+	NUMBER    -26,ABCC7711,8461CEFC,FDC20D2B,36BA7C3D,3D4D3D5C,   -8
+	NUMBER    -23,D6BF94D5,E57A42BC,3D329076, 4691B4C,8CA08CB8,   -7
+	NUMBER    -19,8637BD05,AF6C69B5,A63F9A49,C2C1B10F,D7E457F7,   -6
+	NUMBER    -16,A7C5AC47,1B478423, FCF80DC,33721D53,CDDD6DF6,   -5
+	NUMBER    -13,D1B71758,E219652B,D3C36113,404EA4A8,C154C978,   -4
+	NUMBER     -9,83126E97,8D4FDF3B,645A1CAC, 83126E9,78D4FDEE,   -3
+	NUMBER     -6,A3D70A3D,70A3D70A,3D70A3D7, A3D70A3,D70A3D6C,   -2
+	NUMBER     -3,CCCCCCCC,CCCCCCCC,CCCCCCCC,CCCCCCCC,CCCCCCCC,   -1
+OTS$$A_CVT_TAB::
+T0:	NUMBER      1,80000000,       0,       0,       0,       0,    0
+T1:	NUMBER      4,A0000000,       0,       0,       0,       0,    1
+	NUMBER      7,C8000000,       0,       0,       0,       0,    2
+	NUMBER     10,FA000000,       0,       0,       0,       0,    3
+	NUMBER     14,9C400000,       0,       0,       0,       0,    4
+	NUMBER     17,C3500000,       0,       0,       0,       0,    5
+	NUMBER     20,F4240000,       0,       0,       0,       0,    6
+	NUMBER     24,98968000,       0,       0,       0,       0,    7
+	NUMBER     27,BEBC2000,       0,       0,       0,       0,    8
+	NUMBER     30,EE6B2800,       0,       0,       0,       0,    9
+	NUMBER     34,9502F900,       0,       0,       0,       0,   10
+	NUMBER     37,BA43B740,       0,       0,       0,       0,   11
+	NUMBER     40,E8D4A510,       0,       0,       0,       0,   12
+	NUMBER     44,9184E72A,       0,       0,       0,       0,   13
+	NUMBER     47,B5E620F4,80000000,       0,       0,       0,   14
+	NUMBER     50,E35FA931,A0000000,       0,       0,       0,   15
+T16:	NUMBER     54,8E1BC9BF, 4000000,       0,       0,       0,   16
+;	NUMBER     57,B1A2BC2E,C5000000,       0,       0,       0,   17
+;	NUMBER     60,DE0B6B3A,76400000,       0,       0,       0,   18
+;	NUMBER     64,8AC72304,89E80000,       0,       0,       0,   19
+;	NUMBER     67,AD78EBC5,AC620000,       0,       0,       0,   20
+;	NUMBER     70,D8D726B7,177A8000,       0,       0,       0,   21
+;	NUMBER     74,87867832,6EAC9000,       0,       0,       0,   22
+;	NUMBER     77,A968163F, A57B400,       0,       0,       0,   23
+;	NUMBER     80,D3C21BCE,CCEDA100,       0,       0,       0,   24
+;	NUMBER     84,84595161,401484A0,       0,       0,       0,   25
+;	NUMBER     87,A56FA5B9,9019A5C8,       0,       0,       0,   26
+;	NUMBER     90,CECB8F27,F4200F3A,       0,       0,       0,   27
+;	NUMBER     94,813F3978,F8940984,40000000,       0,       0,   28
+;	NUMBER     97,A18F07D7,36B90BE5,50000000,       0,       0,   29
+;	NUMBER    100,C9F2C9CD, 4674EDE,A4000000,       0,       0,   30
+;	NUMBER    103,FC6F7C40,45812296,4D000000,       0,       0,   31
+; T32:
+	NUMBER    107,9DC5ADA8,2B70B59D,F0200000,       0,       0,   32
+	NUMBER    213,C2781F49,FFCFA6D5,3CBF6B71,C76B25FB,50F80800,   64
+	NUMBER    426,93BA47C9,80E98CDF,C66F336C,36B10137, 234F3FC,  128
+	NUMBER    851,AA7EEBFB,9DF9DE8D,DDBB901B,98FEEAB7,851E4CBB,  256
+	NUMBER   1701,E319A0AE,A60E91C6,CC655C54,BC5058F8,9C658389,  512
+	NUMBER   3402,C9767586,81750C17,650D3D28,F18B50CE,526B9865, 1024
+	NUMBER   6804,9E8B3B5D,C53D5DE4,A74D28CE,329ACE52,6A31978C, 2048
+	NUMBER  13607,C4605202,8A20979A,C94C153F,804A4A92,65761F39, 4096
+;	NUMBER  27214,96A3A1D1,7FAF211A, C7C2892,305F4E12, 72B205F, 8192
+;                   0,FFFFFFFF,FFFFFFFF,FFFFFFFF,FFFFFFFF,FFFF5EB4	; 1.0 IF EXACT
+
+		; THIS TABLE CONTAINS THE BYTE INDICIES FOR THE
+		; MULTIPLE PRECISION MULTIPLY CROSS PRODUCTS.
+		; THE 1ST AND 2ND ENTRIES ON EACH LINE ARE THE INDICIES
+		; FOR THE MULTIPLICAND AND THE MULTIPLIER. THE THIRD
+		;  ENTRY IS THE PRODUCT INDEX.
+
+BYTAB:	.BYTE	0,3,0
+	.BYTE	3,0,0
+	.BYTE	2,1,0
+	.BYTE	1,2,0
+	.BYTE	1,3,1
+	.BYTE	3,1,1
+	.BYTE	2,2,1
+	.BYTE	2,3,2
+	.BYTE	3,2,2
+	.BYTE	3,3,3
+	.BYTE	-1		; END FLAG
+
+	.END

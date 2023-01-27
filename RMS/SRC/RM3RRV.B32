@@ -1,0 +1,981 @@
+MODULE RM3RRV (LANGUAGE (BLISS32) ,
+		IDENT = 'V03-001'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+
+!++
+!
+! FACILITY:	RMS32 INDEX SEQUENTIAL FILE ORGANIZATION
+!
+! ABSTRACT:
+!                ROUTINES TO UPDATE RRV'S
+!
+!
+! ENVIRONMENT:
+!
+!		VAX/VMS OPERATING SYSTEM
+!
+!--
+
+!
+! AUTHOR:        Wendy Koenig	     CREATION DATE:        	25-JUL-78  15:24
+!
+! Modified by:
+!
+!	V03-001 SPR39795	L J Anderson		12-Mar-1982
+!		In the case of a bucket split when run out of IDs, do
+!		NOT update an RRV of a deleted record.  The deleted RRV
+!		has the pointer space squished out, updating the RRV 
+!		results in a trashed bucket.
+!
+!	V02-018	KBT0007		K B Thompson		15-Feb-1982
+!		Add code to handle reclaimed bucket next-record-IDs and
+!		add subtitles
+!
+!	V02-017	MCN0011		Maria del C. Nasr	28-May-1981
+!		More changes required for prologue 3 files.
+!
+!	V02-016	MCN0006		Maria del C. Nasr	16-Mar-1981
+!		Increase size of record identifier to a word in NRP, and
+!		other local structures.
+!
+!	V02-015	REFORMAT	C Saether	01-Aug-1980	22:38
+!
+!
+! REVISION HISTORY:
+!
+!   Wendy Koenig, 	28-SEP-78  9:11
+!   X0002 - SET RRV_ERR ON UPDATE ERROR, AND GO ON TO NEXT RRV
+!
+!   Wendy Koenig, 	29-SEP-78  14:46
+!   X0003 - ADJUST POS_INS ON ANY SQUISH, NOT JUST IF BIG_SPLIT
+!
+!   Christian Saether, 	12-OCT-78  12:20
+!   X0004 - do not release rrv buffer when in update mode
+!
+!   Wendy Koenig, 	12-OCT-78  14:45
+!   X0005 - TAKE ALL THE NRP STUFF OUT OF HERE
+!
+!   Wendy Koenig, 	17-OCT-78  15:40
+!   X0006 - CHANGE UPDATE_RRV FOR $UPDATE
+!
+!   Wendy Koenig, 	24-OCT-78  14:03
+!   X0007 - MAKE CHANGES CAUSED BY SHARING CONVENTIONS
+!
+!   Christian Saether, 	24-OCT-78  17:38
+!   X0008 - give UPDATE_RRV 1 more byte at end of buffer
+!
+!   Wendy Koenig, 	26-OCT-78  11:29
+!   X0009 - GET RID OF DEFINITION OF IRC$B_RRV_ID WHICH IS NOW IN THE LIBRARY
+!
+!   Wendy Koenig, 	31-OCT-78  14:09
+!   X0010 - FIX BIG, ONLY USE VBN_MID IF BIG_SPLIT
+!
+!   Christian Saether, 	3-NOV-78  8:21
+!   X0011 - fix incorrect use of BDB$W_SIZE to BDB$W_NUMB
+!
+!   Wendy Koenig, 	28-NOV-78  11:38
+!   X0012 - LOCK BUCKET WHEN UPDATING RRV'S
+!
+!   Christian Saether, 	15-JAN-79  21:41
+!   X0013 - eliminate potential deadlock going for rrv's
+!
+!   Wendy Koenig, 	26-JAN-79  9:20
+!   X0014 - GET RID OF SETTING VALID
+!
+!*****
+
+LIBRARY 'RMSLIB:RMS';
+
+REQUIRE 'RMSSRC:RMSIDXDEF';
+
+! define default psects for code
+!
+
+PSECT
+    CODE = $$RMSSPLIT3(PSECT_ATTR),
+    PLIT = $$RMSSPLIT3(PSECT_ATTR);
+
+! define some local macros
+!
+
+MACRO
+    IRC$L_RRV_VBN = 3,0,32,0 %,			! location of RRV VBN in record
+    IR3$L_RRV_VBN = 5,0,32,0 %,			! new location in prologue 3 files
+
+    ! The following macros which define the entries in the local table used for
+    ! RRV updating, have been reordered to optimize prologue 3 file processing.
+    ! Those fields that have not changed in size, have been placed up front, so
+    ! that there are the least possible position variants.  The size of each
+    ! RRV entry in the table is 9 bytes long for prologue 3 files, and 7 bytes
+    ! for previous prologue versions.
+    !
+    TBL$W_FFB = 0,0,16,0 %,			! stores table size
+    TBL$B_NEW_VBN = 0,0,8,0 %,			! new VBN index
+    TBL$L_OLD_VBN = 1,0,32,0 %,			! old VBN value
+    TBL$B_NEW_ID = 5,0,8,0 %,			! new record id
+    TBL$W_NEW_ID = 5,0,16,0 %,			! new record id (plg 3)
+    TBL$B_OLD_ID = 6,0,8,0 %,			! old record id
+    TBL$W_OLD_ID = 7,0,16,0 %,			! old record id (plg 3)
+
+    FLG$V_POS_INS = 0,0,1,0 %,
+    FLG$V_SPLIT_1 = 0,1,1,0 %,
+    FLG$V_SPLIT_2 = 0,2,1,0 %,
+    FLG$V_UPD_POS = 0,3,1,0 %;
+
+! Linkages
+!
+
+LINKAGE
+    L_GETNEXT_REC,
+    L_CODE_VBN,
+    L_RECORD_VBN,
+    L_RELEASE,
+    L_RLSBKT,
+    L_GETBKT,
+    L_FIND_BY_ID,
+    L_SELECT_VBN,
+    L_UPDATE_RRV_2,
+    L_UPDATE_RRV,
+
+    ! local linkages
+    !
+    RL$SQUISH 	= JSB (REGISTER = 3, REGISTER = 4) : GLOBAL (R_REC_ADDR);
+
+! Forward Routines
+!
+
+FORWARD ROUTINE
+    RM$SQUISH	: RL$SQUISH,
+    RM$UPDATE_RRV	: RL$UPDATE_RRV NOVALUE,
+    RM$UPDATE_RRV_2	: RL$UPDATE_RRV_2 NOVALUE;
+
+! External Routines
+!
+
+EXTERNAL ROUTINE
+    RM$RECORD_VBN	: RL$RECORD_VBN,
+    RM$RELEASE	: RL$RELEASE,
+    RM$RLSBKT	: RL$RLSBKT,
+    RM$GETBKT	: RL$GETBKT,
+    RM$FIND_BY_ID	: RL$FIND_BY_ID,
+    RM$CODE_VBN	: RL$CODE_VBN,
+    RM$SELECT_VBN	: RL$SELECT_VBN,
+    RM$GETNEXT_REC	: RL$GETNEXT_REC;
+
+
+%SBTTL	'RM$SQISH'
+ROUTINE RM$SQUISH (EOB, SQUISH) : RL$SQUISH =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+! do the squishing w/o destroying all the registers
+!
+! CALLING SEQUENCE:
+!	bsbw rm$squish (.eob, .squish);
+!
+! INPUT PARAMETERS:
+!	eob -- address of end of data to be moved
+!	squish -- address of where data is to be moved into
+!
+! IMPLICIT INPUTS:
+!	rec_addr -- address of beginning of data to be moved
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	rmssuc always
+!
+! SIDE EFFECTS:
+!	some data records have been squished out
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	R_REC_ADDR_STR;
+
+    CH$MOVE(.EOB - .REC_ADDR, .REC_ADDR, .SQUISH);
+    RETURN RMSSUC();
+
+    END;					! { end of routine }
+
+
+%SBTTL	'RM$UPDATE_RRV'
+GLOBAL ROUTINE RM$UPDATE_RRV : RL$UPDATE_RRV NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!    Create RRV's for records that moved out of this bucket w/o RRV's
+!    and make a table so that records that moved before can be updated later.
+!    Do not make an entry in the table if the record has been deleted.
+!
+! CALLING SEQUENCE:
+!    bsbw rm$update_rrv
+!
+! INPUT PARAMETERS:
+!    NONE
+!
+! IMPLICIT INPUTS:
+!    IRAB -- curbdb in irab describing the original bucket
+!	     nxtbdb describing the extra buffer being used to build the table
+!    IDX_DFN - IDX$V_DUPKEYS
+!    IFAB - IFB$B_PLG_VER
+!
+! OUTPUT PARAMETERS:
+!    NONE
+!
+! IMPLICIT OUTPUTS:
+!    NONE
+!
+! ROUTINE VALUE:
+!	nothing
+!
+! SIDE EFFECTS:
+!    The records that were moved out are physically deleted and rrv's are
+!	built for all of them.
+!    The bucket is marked dirty and valid.
+!    Another buffer pointed to by nxtbdb is used to make a table to be used
+!	to update rrv's in other buckets.
+!    The split points except split itself and possibly pos_ins are destroyed.
+!    Those two can still apply to the existing bucket
+!    REC_ADDR is destroyed, but it was not an input.
+!    Some convuluting stuff is done in the $update case, when there was an
+!	original record.
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	R_REC_ADDR_STR,
+	R_IFAB_STR,
+	R_IRAB_STR,
+	R_IDX_DFN_STR;
+
+    LOCAL
+	TABLE	: REF BBLOCK,
+	NXTID	: WORD,
+	REAL_END	: REF BBLOCK,
+	EOB	: REF BBLOCK,
+	SQUISH	: REF BBLOCK,
+	VBN,
+	POS_INS	: REF BBLOCK,
+	FLAG	: BLOCK [1],
+	RRV_VBN,
+	VBN1,
+	OLD_ID	: WORD;
+
+    GLOBAL REGISTER
+	R_BKT_ADDR_STR;
+
+    FLAG = 0;
+    TABLE = .BBLOCK[.IRAB[IRB$L_NXTBDB], BDB$L_ADDR] + 2;
+    BKT_ADDR = .BBLOCK[.IRAB[IRB$L_CURBDB], BDB$L_ADDR];
+    REC_ADDR = .BKT_ADDR + .IRAB[IRB$W_SPLIT];
+    EOB = .BKT_ADDR[BKT$W_FREESPACE] + .BKT_ADDR;
+    REAL_END = .BKT_ADDR + .BBLOCK[.IRAB[IRB$L_CURBDB], BDB$W_NUMB];
+
+    ! The real end of the bucket for prologue 3 files is different, since
+    ! there is some extra information at the end.
+    !
+    IF .IFAB[IFB$B_PLG_VER] EQLU PLG$C_VER_3
+    THEN
+	BEGIN
+	REAL_END = .REAL_END - BKT$C_DATBKTOVH;
+
+	IF .IDX_DFN[IDX$V_DUPKEYS]
+	THEN
+	    REAL_END = .REAL_END - BKT$C_DUPBKTOVH;
+	END;
+
+    POS_INS = .BKT_ADDR + .IRAB[IRB$W_POS_INS];
+    SQUISH = .REC_ADDR;
+
+    ! Set Flag Position Insert, if intend on inserting the new record ( or
+    ! updating the record ) in the old left hand side bucket
+    !
+    IF .POS_INS LSSU .REC_ADDR
+    THEN
+	FLAG[FLG$V_POS_INS] = 1;
+
+    IF .POS_INS EQLU .REC_ADDR
+	AND
+	.IRAB[IRB$V_REC_W_LO]
+    THEN
+	FLAG[FLG$V_POS_INS] = 1;
+
+    ! Set up the starting vbn and the next-record-ID
+    !
+    IF .IRAB[IRB$V_BIG_SPLIT]
+    THEN
+	BEGIN
+	VBN = .IRAB [ IRB$L_VBN_MID ];
+	NXTID = .IRAB [ IRB$W_NID_MID ]
+	END
+    ELSE
+	BEGIN
+	VBN = .IRAB [ IRB$L_VBN_RIGHT ];
+	NXTID = .IRAB [ IRB$W_NID_RIGHT ]
+	END;
+
+    ! Skip through bucket, deciding where the RRV's for each record should be
+    ! put -- If in the old (left) bucket, put it at the end of that bucket.
+    ! If there is an RRV in another bucket, already; then it needs updating, 
+    ! build an entry in the table.  Do not build an entry, if the record has
+    ! been deleted.
+    !
+
+    WHILE .REC_ADDR LEQU .EOB
+    DO
+	BEGIN
+
+	BUILTIN
+	    AP;
+
+	LOCAL
+	    DIFFERENCE	: WORD;
+
+	! if rec_addr equal to the eob or we're at an rrv (virtual eob ),
+	! we still need to do the update for a potential updated record at the
+	! eob. but don't do it twice
+	!
+
+	IF .REC_ADDR EQLU .EOB
+	    OR
+	    .REC_ADDR[IRC$V_RRV]
+	THEN
+
+	    IF .FLAG[FLG$V_POS_INS]
+		OR
+		NOT .IRAB[IRB$V_UPDATE]
+	    THEN
+		EXITLOOP;
+
+	DIFFERENCE = .REC_ADDR - .BKT_ADDR;
+
+	! if more than 1 new bucket, check to see if we've passed a split point
+	! if so, the vbn and nxtid have to be changed
+	!
+
+	IF .IRAB[IRB$V_BIG_SPLIT]
+	THEN
+	    BEGIN
+
+	    IF .DIFFERENCE EQLU .IRAB[IRB$W_SPLIT_1]
+		AND
+		NOT .FLAG[FLG$V_SPLIT_1]
+	    THEN
+
+		IF (.FLAG[FLG$V_POS_INS]
+		    OR
+		    NOT .IRAB[IRB$V_REC_W_LO])
+		    OR
+		    NOT .IRAB[IRB$V_UPDATE]
+		THEN
+		    BEGIN
+		    FLAG[FLG$V_SPLIT_1] = 1;
+
+		    ! Use the RFA bucket
+		    !
+		    VBN = .IRAB [ IRB$L_RFA_VBN ];
+
+		    ! If there is no RFA bucket then use the right bucket
+		    ! else its ok to use the RFA bucket and next-record-ID
+		    !
+		    IF .VBN EQLU 0
+		    THEN
+			BEGIN
+			VBN = .IRAB [ IRB$L_VBN_RIGHT ];
+			NXTID = .IRAB [ IRB$W_NID_RIGHT ]
+			END
+		    ELSE
+			NXTID = .IRAB [ IRB$W_RFA_NID ]
+
+		    END;
+
+	    IF .DIFFERENCE EQLU .IRAB[IRB$W_SPLIT_2]
+		AND
+		NOT .FLAG[FLG$V_SPLIT_2]
+	    THEN
+		BEGIN
+
+		FLAG [ FLG$V_SPLIT_2 ] = 1;
+
+		VBN = .IRAB [ IRB$L_VBN_RIGHT ];
+		NXTID = .IRAB [ IRB$W_NID_RIGHT ]
+
+		END;
+
+	    END;
+
+	! if this is the pos for insert, and the record really and truly
+	! belongs here, increment the nxtid but make sure that we can never
+	! come back to pos_ins more than once if this is an update and the
+	! record belonged in the middle bkt all by itself, set up vbn1  to
+	! indicate such
+	!
+	VBN1 = .VBN;
+
+	IF .REC_ADDR EQLU .POS_INS
+	    AND
+	    NOT .FLAG[FLG$V_POS_INS]
+	THEN
+	    BEGIN
+	    FLAG[FLG$V_POS_INS] = 1;
+
+	    IF .IRAB[IRB$V_UPDATE]
+	    THEN
+		BEGIN
+		FLAG[FLG$V_UPD_POS] = 1;
+
+		IF .IRAB[IRB$V_BIG_SPLIT]
+		    AND
+		    (.IRAB[IRB$W_SPLIT] EQLU .IRAB[IRB$W_SPLIT_1])
+		THEN
+		    BEGIN
+		    FLAG[FLG$V_SPLIT_1] = 0;
+		    VBN1 = .IRAB[IRB$L_VBN_MID]
+		    END
+		END
+
+	    ELSE
+		BEGIN
+
+		IF .NXTID NEQU 1
+		    OR
+		    .IRAB[IRB$W_SPLIT] NEQU .IRAB[IRB$W_SPLIT_1]
+		    AND
+		    NOT .IRAB[IRB$V_REC_W_LO]
+		THEN
+		    NXTID = .NXTID + 1
+		END
+	    END;
+
+	AP = 3;
+
+	! if the vbn's are equal, then this record has never moved and, thus
+	! it needs an RRV; otherwise, it has an RRV elsewhere.
+	!
+	RRV_VBN = RM$RECORD_VBN();
+
+	IF .FLAG[FLG$V_UPD_POS]
+	THEN
+	    RRV_VBN = .BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$L_RP_VBN];
+
+	IF .RRV_VBN EQLU .BBLOCK[.IRAB[IRB$L_CURBDB], BDB$L_VBN]
+	THEN
+	    BEGIN
+
+	    LOCAL
+		RRV_SIZE;
+
+	    IF .IFAB[IFB$B_PLG_VER] LSSU PLG$C_VER_3
+	    THEN
+		BEGIN
+		OLD_ID = .REC_ADDR[IRC$B_ID];
+		RRV_SIZE = 7;
+		END
+	    ELSE
+		BEGIN
+		OLD_ID = .REC_ADDR[IRC$W_ID];
+		RRV_SIZE = 9;
+		END;
+
+	    IF .FLAG[FLG$V_UPD_POS]
+	    THEN
+		OLD_ID = .BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$W_RP_ID];
+
+	    ! if there is not enough physical room at the end of the bucket to
+	    ! build an rrv, make enough
+	    !
+
+	    IF (.EOB + .RRV_SIZE) GEQU .REAL_END
+	    THEN
+		BEGIN
+
+		IF NOT .FLAG[FLG$V_UPD_POS]
+		THEN
+		    RM$GETNEXT_REC();
+
+		RM$SQUISH(.EOB, .SQUISH);
+		EOB = .EOB - (.REC_ADDR - .SQUISH);
+
+		! unfortunately, if we squash records out, we also have to
+		! update all the pointers to the bucket
+		!
+
+		IF .IRAB[IRB$V_BIG_SPLIT]
+		THEN
+		    BEGIN
+
+		    IF .SQUISH LEQU .BKT_ADDR + .IRAB[IRB$W_SPLIT_1]
+		    THEN
+			BEGIN
+
+			IF .BKT_ADDR + .IRAB[IRB$W_SPLIT_1] LEQU .REC_ADDR
+			THEN
+			    IRAB[IRB$W_SPLIT_1] = .SQUISH - .BKT_ADDR
+			ELSE
+			    IRAB[IRB$W_SPLIT_1] = .IRAB[IRB$W_SPLIT_1] -
+			    (.REC_ADDR - .SQUISH)
+			END;
+
+		    IF .SQUISH LEQU .BKT_ADDR + .IRAB[IRB$W_SPLIT_2]
+		    THEN
+			BEGIN
+
+			IF .BKT_ADDR + .IRAB[IRB$W_SPLIT_2] LEQU .REC_ADDR
+			THEN
+			    IRAB[IRB$W_SPLIT_2] = .SQUISH - .BKT_ADDR
+			ELSE
+			    IRAB[IRB$W_SPLIT_2] = .IRAB[IRB$W_SPLIT_2] -
+			    (.REC_ADDR - .SQUISH)
+			END;
+
+		    END;
+
+		IF .SQUISH LEQU .POS_INS
+		THEN
+		    BEGIN
+
+		    IF .POS_INS LEQU .REC_ADDR
+		    THEN
+			POS_INS = .SQUISH
+		    ELSE
+			POS_INS = .POS_INS - (.REC_ADDR - .SQUISH)
+		    END;
+
+		REC_ADDR = .SQUISH;
+		END
+
+	    ! Else we do not have to squish a record out.
+	    !
+	    ELSE
+
+		IF NOT .FLAG[FLG$V_UPD_POS]
+		THEN
+		    RM$GETNEXT_REC();
+
+	    ! build the rrv at the end of the bucket and update eob
+	    !
+	    EOB[IRC$B_CONTROL] = 0;
+	    EOB[IRC$V_PTRSZ] = 2;
+	    EOB[IRC$V_RRV] = 1;
+
+	    IF .IFAB[IFB$B_PLG_VER] LSSU PLG$C_VER_3
+	    THEN
+		BEGIN
+		EOB[IRC$B_ID] = .OLD_ID;
+		EOB[IRC$B_RRV_ID] = .NXTID;
+		EOB[IRC$L_RRV_VBN] = .VBN1;
+		EOB = .EOB + $BYTEOFFSET(IRC$L_RRV_VBN) + $BYTESIZE(IRC$L_RRV_VBN);
+		END
+	    ELSE
+		BEGIN
+		EOB[IRC$W_ID] = .OLD_ID;
+		EOB[IRC$W_RRV_ID] = .NXTID;
+		EOB[IR3$L_RRV_VBN] = .VBN1;
+		EOB = .EOB + $BYTEOFFSET(IR3$L_RRV_VBN) + $BYTESIZE(IR3$L_RRV_VBN);
+		END;
+	    END
+
+        ! the record has moved before, so make an entry in the table so we can
+        ! update the record's old RRV, later.  Make an entry only if the record
+	! is present (ie, do not update deleted RRV's).  The only time there will
+	! be a deleted record in the middle of the bucket, is if this split is
+	! happening because of no more id's available (not because of lack of 
+	! space).  In this case, the routine to squish the deleted records out
+	! of the bucket is not called, as space is not the problem.
+	!
+	! 
+	ELSE
+	    IF NOT .REC_ADDR [ IRC$V_DELETED ] 
+	    THEN
+		BEGIN
+		TABLE[TBL$B_NEW_VBN] = RM$CODE_VBN(.VBN1);
+		TABLE[TBL$L_OLD_VBN] = .RRV_VBN;
+
+		IF .IFAB[IFB$B_PLG_VER] LSSU PLG$C_VER_3
+		THEN
+	  	    BEGIN
+		    TABLE[TBL$B_NEW_ID] = .NXTID;
+		    TABLE[TBL$B_OLD_ID] = .REC_ADDR[IRC$B_RRV_ID];
+		    IF .FLAG[FLG$V_UPD_POS]
+		    THEN
+			TABLE[TBL$B_OLD_ID] = .BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$W_RP_ID];
+		    TABLE = .TABLE + 7;
+		    END
+		ELSE
+ 	 	    BEGIN
+		    TABLE[TBL$W_NEW_ID] = .NXTID;
+		    TABLE[TBL$W_OLD_ID] = .REC_ADDR[IRC$W_RRV_ID];
+		    IF .FLAG[FLG$V_UPD_POS]
+		    THEN
+		        TABLE[TBL$W_OLD_ID] = .BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$W_RP_ID];
+		    TABLE = .TABLE + 9;
+		    END;
+	
+	        IF NOT .FLAG[FLG$V_UPD_POS]
+	        THEN
+		    RM$GETNEXT_REC()
+
+	        END   		! end of else record has moved before !
+
+	    ! Else the current record is a deleted record, then just get the next
+	    ! record.  (Do not need to check FLG$V_UPD_POS, because on a bucket
+	    ! split because of no more id's available, it was on an insert oper-
+	    ! ation, not an update).
+	    !
+	    ELSE
+		RM$GETNEXT_REC();
+
+	! bump the nxtid
+	!
+	NXTID = .NXTID + 1;
+
+	! clear the "at pos_for_insert in update mode" flag
+	!
+	FLAG[FLG$V_UPD_POS] = 0;
+	END;					! { end of while loop }
+
+    ! if there still are records that need to be squashed out, do it
+    !
+
+    IF .SQUISH NEQU .REC_ADDR
+    THEN
+	BEGIN
+	RM$SQUISH(.EOB, .SQUISH);
+	EOB = .EOB - (.REC_ADDR - .SQUISH);
+	REC_ADDR = .SQUISH;
+	END;
+
+    ! update the freespace word
+    !
+    BKT_ADDR[BKT$W_FREESPACE] = .EOB - .BKT_ADDR;
+
+    ! mark the end of the table in its first word for future reference
+    !
+    BEGIN
+
+    LOCAL
+	BEG_TABLE	: REF BBLOCK;
+
+    BEG_TABLE = .BBLOCK[.IRAB[IRB$L_NXTBDB], BDB$L_ADDR];
+    BEG_TABLE[TBL$W_FFB] = .TABLE - .BEG_TABLE
+    END;
+    RETURN;
+
+    END;					! { end of routine }
+
+
+%SBTTL	'RM$UPDATE_RRV_2'
+GLOBAL ROUTINE RM$UPDATE_RRV_2 : RL$UPDATE_RRV_2 NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+! update the rrv's from other buckets.  Return with IRAB[IRB$V_RRV_ERR] set,
+! if an error occurs during the update if it will cause the bucket to be trashed.
+!
+! CALLING SEQUENCE:
+!	bsbw rm$update_2
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	irab --
+!	    nxtbdb -- referring to table of rrv's
+!	    vbn_right, vbn_mid, rfa_vbn
+!	    abovelckd - set when level 1 was locked coming down tree
+!	rab -- to store stv in
+!	idx_dfn, IFAB, impure area, for rm$getbkt
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	nxtbdb is released and cleared if not update or no update deletes
+!	rrv_err is set in the irab on any error
+!
+! ROUTINE VALUE:
+!	none -- rrv_err is set in the irab on any error
+!		and the stv contains the actual status
+!
+! SIDE EFFECTS:
+!	rec_addr, ap, and bkt_addr are destroyed
+!	nxtbdb is released and cleared if not update or no update deletes
+!	many buckets may be accessed and written out
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_IO_STR,
+	R_REC_ADDR_STR,
+	COMMON_RAB_STR,
+	R_IDX_DFN_STR;
+
+    LOCAL
+	TABLE	: REF BBLOCK,
+	EOT;
+
+    LABEL
+	INNER,
+	INNERMOST,
+	BLK,
+	BLOCK;
+
+BLOCK :
+    BEGIN
+
+    LOCAL
+	RRV_SIZE;
+
+    TABLE = .BBLOCK[.IRAB[IRB$L_NXTBDB], BDB$L_ADDR];
+    EOT = .TABLE + .TABLE[TBL$W_FFB];
+    TABLE = .TABLE + 2;
+
+    IF .IFAB[IFB$B_PLG_VER] LSSU PLG$C_VER_3
+    THEN
+	RRV_SIZE = 7
+    ELSE
+	RRV_SIZE = 9;
+
+    ! while there are still entries in the table, update each rrv individually
+    !
+
+    WHILE .TABLE LSSU .EOT
+    DO
+	BEGIN
+
+	! if the table entry has already been taken care of, its vbn has 
+	! been cleared, so ignore it.
+	!
+
+	IF .TABLE[TBL$L_OLD_VBN] NEQ 0
+	THEN
+INNER :
+	    BEGIN
+
+	    ! get the bucket to be updated
+	    !
+BLK :
+	    BEGIN
+
+	    LOCAL
+		ST,
+		SIZE;
+
+	    SIZE = .IDX_DFN[IDX$B_DATBKTSZ]*512;
+	    IRAB[IRB$B_CACHEFLGS] = CSH$M_LOCK;
+
+	    ! if level above locked we must read the bucket with nowait to
+	    ! avoid potential deadlock situation
+	    !
+
+	    IF .IRAB[IRB$V_ABOVELCKD]
+	    THEN
+		BBLOCK[IRAB[IRB$B_CACHEFLGS], CSH$V_NOWAIT] = 1;
+
+	    ST = RM$GETBKT(.TABLE[TBL$L_OLD_VBN], .SIZE);
+
+	    IF .ST
+	    THEN
+		LEAVE BLK;
+
+	    IF .ST<0, 16> EQL RMSERR(RLK)
+	    THEN
+		BEGIN
+
+		! we got a record lock error on the bucket so clear the flag
+		! and release the level 1 bucket to remove the deadlock
+		! potential
+		!
+		IRAB[IRB$V_ABOVELCKD] = 0;
+		BDB = .IRAB[IRB$L_LOCK_BDB];
+		IRAB[IRB$L_LOCK_BDB] = 0;
+		RM$RLSBKT(0);
+
+		! re-read the bucket we want and wait for it this time
+		!
+		IRAB[IRB$B_CACHEFLGS] = CSH$M_LOCK;
+		ST = RM$GETBKT(.TABLE[TBL$L_OLD_VBN], .SIZE);
+
+		IF .ST
+		THEN
+		    LEAVE BLK;
+
+		END;
+
+	    ! if here there was a hard failure on either the first or second
+	    ! getbkt
+	    !
+	    RAB[RAB$L_STV] = .ST;
+	    IRAB[IRB$V_RRV_ERR] = 1;
+	    LEAVE INNER;
+
+	    END;				! of local ST
+	    BEGIN
+
+	    LOCAL
+		PTR	: REF BBLOCK;
+
+	    PTR = .TABLE;
+
+	    ! Do all the rrv's in this bucket that we have accessed.  Scan
+	    ! through the rest of the table, comparing vbn's if we find one that
+	    ! is the same as this one, take care of it now
+	    !
+
+	    WHILE .PTR LSSU .EOT
+	    DO
+		BEGIN
+
+		IF .PTR[TBL$L_OLD_VBN] EQLU .TABLE[TBL$L_OLD_VBN]
+		THEN
+INNERMOST :
+		    BEGIN
+
+		    BUILTIN
+			AP;
+
+		    IF .IFAB[IFB$B_PLG_VER] LSSU PLG$C_VER_3
+		    THEN
+			AP = .PTR[TBL$B_OLD_ID]
+		    ELSE
+			AP = .PTR[TBL$W_OLD_ID];
+
+		    BEGIN
+
+		    LOCAL
+			ST;
+
+		    ST = RM$FIND_BY_ID();
+
+		    ! If bad status returned (ex: could not find by RFA)
+		    ! or this is NOT an RRV, or it is a DELETED RRV, 
+		    ! then indicate error and mark entry done.
+		    IF NOT .ST
+			OR
+			NOT .REC_ADDR[IRC$V_RRV]
+			OR (.REC_ADDR[IRC$V_RRV] AND .REC_ADDR[IRC$V_DELETED])
+		    THEN
+			BEGIN
+			RAB[RAB$L_STV] = .ST;
+			IRAB[IRB$V_RRV_ERR] = 1;
+
+			! Indicates that this table entry has been taken
+			! care of.
+			!
+			IF .PTR NEQ .TABLE
+			THEN
+			    PTR[TBL$L_OLD_VBN] = 0;
+
+			LEAVE INNERMOST
+
+			END;
+
+		    END;			! { end of block defining st }
+
+		    IF .IFAB[IFB$B_PLG_VER] LSSU PLG$C_VER_3
+		    THEN
+			BEGIN	
+			REC_ADDR[IRC$B_RRV_ID] = .PTR[TBL$B_NEW_ID];
+			REC_ADDR[IRC$L_RRV_VBN] = RM$SELECT_VBN(.PTR[TBL$B_NEW_VBN]);
+			END
+		    ELSE
+			BEGIN	
+			REC_ADDR[IRC$W_RRV_ID] = .PTR[TBL$W_NEW_ID];
+			REC_ADDR[IR3$L_RRV_VBN] = RM$SELECT_VBN(.PTR[TBL$B_NEW_VBN]);
+			END;
+
+		    PTR[TBL$L_OLD_VBN] = 0;
+		    END;		! { end of vbns match -- innermost }
+
+		PTR = .PTR + .RRV_SIZE;
+		END;				! {end of while loop }
+
+	    END;				! of local PTR
+
+	    ! if we're done w/ this vbn, release it, writing it out
+	    !
+	    BEGIN
+	    BDB[BDB$V_DRT] = 1;
+	    BEGIN
+
+	    LOCAL
+		ST;
+
+	    IF NOT (ST = RM$RLSBKT(RLS$M_WRT_THRU))
+	    THEN
+		BEGIN
+		RAB[RAB$L_STV] = .ST;
+		IRAB[IRB$V_RRV_ERR] = 1;
+		LEAVE INNER
+
+		END;
+
+	    END;	! { end of block defining st for call to rlsbkt }
+	    END;
+	    END;		! {end of table entry is valid -- inner }
+
+	TABLE = .TABLE + .RRV_SIZE;
+	END;					! {end of while loop }
+
+    END;					! { end of block }
+
+    ! release the buffer we used as a work space can't use rm$rlsbkt since it
+    ! makes too many checks & i've clobbered the buffer
+    !
+
+    IF NOT .IRAB[IRB$V_UPDATE]
+	OR
+	NOT .BBLOCK[.IRAB[IRB$L_UPDBUF], UPD$V_OLD_DEL]
+    THEN
+	(BDB = .IRAB[IRB$L_NXTBDB];
+	IRAB[IRB$L_NXTBDB] = 0;
+	BDB[BDB$B_FLGS] = 0;
+	RM$RELEASE(0));
+
+    END;
+
+END
+
+ELUDOM

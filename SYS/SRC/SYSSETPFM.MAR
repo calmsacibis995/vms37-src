@@ -1,0 +1,587 @@
+
+	.TITLE  SYSSETPFM - SET PAGE FAULT MONITORING
+	.IDENT	'V03-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY: Measurement System Service
+;
+; ABSTRACT:
+;
+;	This module enables a page fault monitoring service within the
+;	operating system.  A file is created in which fault information
+;	will be stored for post processing.  On each page fault, the
+;	virtual address and the PC are saved in a buffer to be output
+;	to the file.
+;
+; ENVIRONMENT: Kernel Mode
+;
+; AUTHOR: Henry M. Levy	, CREATION DATE: 7-May-1977
+;
+; MODIFIED BY:
+;
+;	02	RIH0033		R. I. HUSTVEDT	16-OCT-1979
+;		CHANGE PCB$W_BYTCNT TO JIB$L_BYTCNT.
+;
+;	03	BLS0001		B. L. SCHREIBER 28-NOV-1979
+;		CORRECT PAGE FAULT ERROR
+;
+;	04	BLS0002		B.L. SCHREIBER	28-JAN-1980
+;		CORRECT ERROR IN PURGE ROUTINE.
+;
+;	05	BLS0003		B.L. SCHREIBER	30-JAN-1980
+;		MORE ERRORS IN PURGE ROUTINE
+;
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+;
+; MACROS:
+;
+
+	$IODEF				; define I/O function codes
+	$IPLDEF				; define interrupt priority levels
+	$JIBDEF				; define job information block
+	$PCBDEF				; define process control block
+	$PHDDEF				; define process header
+	$PMBDEF				; define page fault monitor control block
+	$PQLDEF				; define process quota codes
+	$PRDEF				; define processor registers
+	$SGNDEF				; define system parameters
+	$SSDEF				; define service status codes
+
+	.MACRO	$QUOTA	NAME=LISTEND,VALUE=0
+	.BYTE	PQL$_'NAME
+	.LONG	VALUE
+	.ENDM	$QUOTA
+
+;
+; EQUATED SYMBOLS:
+;
+
+BUFCNT = 5				; number of buffers to allocate
+BUFSIZ = 512+12				; size of buffers
+FAULTVA = <4*7>+4+<6*4>			; offset to va of faulting instruction
+FAULTPC = <4*7>+8+<6*4>			; offset to pc of faulting instruction
+WSSIZE = 20				; size of working set
+
+;
+; OWN STORAGE:
+;
+
+
+	.PSECT	$$$215,LONG
+;
+; PMBLST is a list of pointers to page fault monitor control blocks.
+; There can be one entry for each process in the system and the list is
+; indexed by process index.  This allows the created subprocess to find
+; its queue header in the PMB by using the process index of its creator.
+;
+
+;
+; do not change order
+;
+
+PFM$GL_SIZE::				; size of allocated block
+	.LONG	0
+PFM$GL_PMBLST::				; pointer to PMB list
+	.LONG	0
+PFMCOUNT:
+	.LONG	-1			; number of processes using monitor
+
+	.PSECT	YEXEPAGED,LONG
+
+;
+; Data for creation of subprocess to output filled
+; buffers to disk file.
+;
+
+PFMFILWRT:				; subprocess image name descriptor
+	.LONG	20$-10$
+	.LONG	10$
+10$:	.ASCII	/SYS$SYSTEM:PFMFILWRT.EXE/
+20$:
+PFMQUOTA:				; subprocess quota name
+	$QUOTA	CPULM,0			; infinite CPU time
+	$QUOTA	BYTLM,1024		; byte limit for buffered I/O
+	$QUOTA	FILLM,1			; open file count limit
+	$QUOTA	PGFLQUOTA,256		; paging file quota
+	$QUOTA	PRCLM,0			; no subprocesses
+	$QUOTA	TQELM,1			; timer queue entry
+	$QUOTA	LISTEND			; end of list
+FILWRT:					; subprocess process name
+	.LONG	20$-10$
+	.LONG	10$
+10$:	.ASCII	/PFMFILWRT/
+20$:
+FILWRTPRV:				; subprocess privilege vector
+	.LONG	-1,-1			; all privileges
+
+	.SBTTL	SYSSETPFM - Initialize Page Fault Monitoring
+	.LIST	MEB
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	Page fault monitoring initialization.  Buffers are allocated from
+;	the nonpaged pool and queued for use by the monitor.  A subprocess
+;	is created which outputs buffers which have been filled.
+;	When the process calls SETPFM to turn off monitoring, all
+;	buffers are returned to the system and the subprocess is
+;	deleted.  In case of abnormal termination, the buffers
+;	are returned by SYSRUNDWN.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/CALLG
+;
+; INPUT PARAMETERS:
+;
+;	PFMFLG - low bit set -> begin page fault monitoring
+;		 low bit clear -> turn off monitoring
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUT PARAMETERS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL - service successful
+;	SS$_EXQUOTA - process does not have sufficient buffered I/O
+;		     limit
+;	SS$_INSFMEM - not enough dynamic memory was available 
+;		      for buffering
+;
+; SIDE EFFECTS:
+;
+;	none
+;
+;--
+
+
+
+	.PSECT	YEXEPAGED
+EXE$SETPFM::
+
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8> ; register save mask
+	MOVZWL	SGN$GW_MAXPRCCT,R1	; compute PMB size for allocation
+	MULL	#4,R1			; 
+	JSB	PFM$ALLPMBLST		; allocate PMBLST if needed
+	BLBS	R0,5$			; continue if success
+	BRW	80$			; else take error path
+5$:
+	MOVL	SCH$GL_CURPCB,R4	; get our PCB address
+	MOVZWL	PCB$L_PID(R4),R0	; get current process index
+	MOVAL	@PFM$GL_PMBLST[R0],R7	; load address of PMB pointer slot
+	MOVL	@#CTL$GL_PHD,R8		; load process header address
+	BLBS	4(AP),10$		; branch if initialization call
+	BRW	CLEANUP			; else close up 
+10$:
+	TSTL	(R7)			; see if block already allocated
+	BEQL	20$			; branch if not
+	MOVZWL	#SS$_PFMBSY,R0		; else already in use
+	RET
+
+;
+; Check that process has sufficient buffered I/O quota for
+; the data buffers.  Allocate Page Fault Monitor Control Block (PMB)
+; and link to PMBLST.
+;
+
+20$:
+	MOVZWL	#BUFCNT,R5		; number of data buffers to allocate
+	MOVZWL	#PMB$C_LENGTH,R1	; get length of PMB block to allocate
+	PUSHL	#SS$_EXQUOTA		; stack no quota error code
+	SETIPL	#IPL$_ASTDEL		; go to AST delivery level
+
+;
+; Process should have enough quota for data buffers and subprocess to
+; be created, plus some left over.
+;
+
+	MOVL	PCB$L_JIB(R4),R0	; get JIB address
+	CMPL	#<BUFSIZ*BUFCNT>+1024+256,JIB$L_BYTCNT(R0) ; quota left?
+	BGTRU	30$			; error if not
+	MOVZWL	#SS$_INSFMEM,(SP)	; assume memory not available
+	JSB	EXE$ALLOCBUF		; allocate control block
+	BLBS	R0,40$			; check that memory available
+30$:	SETIPL	#0			; error, exit at IPL 0
+	BRW	EXIT			; take error exit
+40$:	MOVL	R2,R6			; copy PMB block address
+	MOVL	R6,(R7)			; insert PMB address in PMBLST slot
+
+;
+; Initialize queue headers in PMB and allocate and queue data buffers.
+;
+
+	MOVAB	PMB$Q_HDR(R6),R0	; get queue header address
+	MOVAL	(R0),(R0)		; init empty queue flink
+	MOVAL	(R0)+,(R0)+		; init empty queue blink
+	MOVAL	(R0),(R0)		; init subprocess queue flink
+	MOVAL	(R0)+,(R0)		; init subprocess queue blink
+	CLRL	PMB$L_CURBUF(R6)	; note no current buffer
+
+50$:
+	MOVZWL	#BUFSIZ,R1		; get size of buffer to allocate
+	JSB	EXE$ALLOCBUF		; allocate buffer
+	BLBC	R0,30$			; take error path if no memory available
+	INSQUE	(R2),PMB$Q_HDR(R6)	; queue on empty buffer list
+	SOBGTR	R5,50$			; back for more buffers
+	MOVL	PCB$L_JIB(R4),R0	; get address of JIB
+	SUBL	#BUFSIZ*BUFCNT,JIB$L_BYTCNT(R0) ; adjust quota
+	SETIPL	#0			; drop back to IPL 0
+
+;
+; Create a termination mailbox for the subprocess.
+;
+
+	$CREMBX_S CHAN=PMB$W_MBXCHN(R6),MAXMSG=#120,- ; create termination mailbox
+		BUFQUO=#120,PROMSK=#0
+60$:	BLBC	R0,80$			; check return status
+	SUBL	#16,SP			; buffer space for GETCHN on stack
+	PUSHL	SP			; build descriptor for buffer
+	PUSHL	#16			; length of buffer
+	MOVAL	(SP),R2			; get descriptor address
+	$GETCHN_S CHAN=PMB$W_MBXCHN(R6),PRIBUF=(R2) ; get mailbox unit #
+
+;
+; Create subprocess at higher priority, with fill privilege and
+; termination mailbox
+;
+
+	$CREPRC_S	PIDADR=PMB$L_PID(R6),- ; pid of created process
+			IMAGE=PFMFILWRT,-
+			PRCNAM=FILWRT,-
+			PRVADR=FILWRTPRV,-
+			BASPRI=#7,-
+			QUOTA=PFMQUOTA,-
+			MBXUNT=8+12(R2),- ; unit from get channel information
+			STSFLG=#4	; disable swapping
+	BLBC	R0,80$			; check for error
+
+;
+; Turn on monitoring bit in process header before exiting
+;
+
+	MOVZWL	#SS$_NORMAL,R0		; successful completion
+	BBSS	#PHD$V_PFMFLG,PHD$W_FLAGS(R8),70$ ; turn on monitoring
+70$:	RET				; return to caller
+
+80$:	PUSHL	R0			; save status code
+	BRW	RETQUO			; return quota and exit
+
+	.SBTTL	CLEANUP - Termination Processing
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Cleanup routine called to terminate page fault monitoring.  If
+;	there is a current buffer, the next entry is zeroed to note the
+;	end of valid data, and the buffer is placed on the end of
+;	the subprocess queue.  The subprocess is forced to exit, and its
+;	termination handler outputs all buffers and closes the file.  Then
+;	all buffers are returned to the nonpaged pool.
+;
+; INPUTS:
+;
+;	R4 = process PCB address
+;	R7 = address of pointer in PMBLST to control block
+;	R8 = process header address
+;
+;--
+
+CLEANUP:
+	PUSHL	#SS$_NORMAL		; assume normal termination
+	BBSC	#PHD$V_PFMFLG,PHD$W_FLAGS(R8),10$ ; check that monitor in use, branch if so
+10$:
+	MOVL	(R7),R6			; get control block address
+	BEQL	EXIT			; exit if nothing allocated
+	SETIPL	#IPL$_ASTDEL		; lock moving of buffer
+	MOVL	PMB$L_CURBUF(R6),R0	; get current buffer address
+	BEQL	20$			; branch if no buffer
+	CLRL	(R0)+			; insert zero entry in buffer
+	SUBL3	#BUFSIZ,PMB$L_BUFEND(R6),R0 ; compute buffer start address
+	INSQUE	(R0),@PMB$Q_SBPHDR+4(R6) ; insert at end of subprocess queue
+	CLRL	PMB$L_CURBUF(R6)	; note buffer no longer there
+20$:
+	SETIPL	#0			; return to IPL 0
+	$FORCEX_S PIDADR=PMB$L_PID(R6)	; force subprocess to exit
+	BLBC	R0,30$			; don't wait for message if force failed
+	$QIOW_S	CHAN=PMB$W_MBXCHN(R6),FUNC=#IO$_READVBLK,-
+		P1=PMB$L_PID(R6),-	; buffer four bytes of termination
+		P2=#4			; ...message in unneeded PID slot
+30$:
+	$DASSGN_S CHAN=PMB$W_MBXCHN(R6)	; release mailbox
+
+;
+; Return buffered I/O quota to system.  Call purge to return any
+; system memory still held.
+;
+
+RETQUO:
+	MOVL	PCB$L_JIB(R4),R0	; get address of JIB
+	ADDL	#BUFSIZ*BUFCNT,JIB$L_BYTCNT(R0) ; return buffered I/O quota
+EXIT:
+	BSBB	PFM$PURGE		; return buffers
+	POPR	#^M<R0>			; restore status code
+	RET				; return to caller
+
+
+	.SBTTL	PFM$PURGE - Return all buffers to pool
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	All data buffers and the control block are returned to
+;	the pool.  Routine is called by internal cleanup and by
+;	SYSRUNDWN to ensure that all buffer space is deallocated.
+;	If this is the only user, deallocate PMBLST.
+;
+; CALLING SEQUENCE:
+;
+;	BSB/JSB
+;
+; INPUTS:
+;
+;	none
+;
+; IMPLICIT INPUTS:
+;
+;	PFM$AL_PMBLST - pfm data base list
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; SIDE EFFECTS:
+;
+;	none - all registers preserved
+;
+; ROUTINE VALUE:
+;
+;	none
+;--
+
+
+PFM$PURGE::
+	SETIPL	W^IPLSCHED		; stop context switch
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; save registers
+	MOVL	SCH$GL_CURPCB,R1	; get our pcb address
+	MOVZWL	PCB$L_PID(R1),R4	; get process index
+	MOVL	PFM$GL_PMBLST,R0	; get address of PMB list
+	BEQL	40$			; exit if none there
+	DSBINT	#IPL$_SCHED		; stop context switch
+	MOVL	(R0)[R4],R5		; Get PMB block address
+	CLRL	(R0)[R4]		; and clear the slot
+	DECL	PFMCOUNT		; one less process
+	BGEQ	5$			; continue if not last one
+	MOVW	PFM$GL_SIZE,PMB$W_SIZE(R0) ; Set size in block
+	BSBB	50$			; deallocate block
+	CLRQ	PFM$GL_SIZE		; indicate no pmb list
+5$:	ENBINT				; restore IPL
+	TSTL	R5			; was there a PMB
+	BEQL	40$			; exit if not
+	DSBINT	#IPL$_ASTDEL		; go to ast delivery level
+	TSTL	PMB$L_CURBUF(R5)	; check if current buffer there
+	BEQL	10$			; branch if none there
+	SUBL3	#BUFSIZ,PMB$L_BUFEND(R5),R0 ; else compute buffer address
+	BSBB	50$			; return to system
+10$:	REMQUE	@PMB$Q_HDR(R5),R0	; remove buffer from queue
+	BVS	20$			; exit if none there
+	BSBB	50$			; return buffer
+	BRB	10$			; go back for more buffers
+20$:	REMQUE	@PMB$Q_SBPHDR(R5),R0	; check that subprocess queue is clear
+	BVS	30$			; exit if no entry
+	BSBB	50$			; else return buffer to system pool
+	BRB	20$			; check for any more
+30$:	MOVL	R5,R0			; get back PMB block address
+	BSBB	50$			; deallocate control block
+	ENBINT				; restore IPL
+40$:	POPR	#^M<R0,R1,R2,R3,R4,R5>	; restore registers
+	SETIPL	#0			; restore IPL
+	RSB				; return to caller
+
+;
+; Return buffer to pool.
+;
+
+50$:
+	CLRW	PMB$W_SIZE+2(R0)	; Clear type field for EXE$DEANONPAGED
+	JSB	EXE$DEANONPAGED		; deallocate memory
+	RSB
+IPLSCHED: .LONG	IPL$_SCHED		;
+
+	.SBTTL	PFM$MON - Resident Monitoring Code
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Resident code called by memory management to record
+;	page fault PC and VA.  Data is inserted into a buffer.
+;	When the buffer is full, it is queued for a cooperating
+;	process which outputs the data to disk.
+;
+; CALLING SEQUENCE:
+;
+;	BSB/JSB
+;
+; INPUTS:
+;
+;	none
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; ROUTINE VALUE:
+;
+;	none
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+
+	.PSECT	AEXENONPAGED,LONG
+PFM$MON::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; save registers
+	MOVL	SCH$GL_CURPCB,R5	; get pcb address
+	MOVZWL	PCB$L_PID(R5),R5	; get process index
+	MOVL	@PFM$GL_PMBLST[R5],R5	; get PMB address
+	MOVL	PMB$L_CURBUF(R5),R1	; get buffer address
+	BNEQ	10$			; branch if buffer exists
+	BSBB	GETBUF			; try to get next buffer
+	BVS	30$			; exit if none there, lose data
+10$:	MOVL	FAULTPC(SP),(R1)+	; insert pc of instruction
+	MOVL	FAULTVA(SP),(R1)+	; insert va which faulted
+	CMPL	R1,PMB$L_BUFEND(R5)	; check for end of buffer
+	BLSSU	20$			; branch if ok
+
+;
+; Buffer is full, queue it and wake the writing process
+;
+
+	SUBL3	#BUFSIZ,PMB$L_BUFEND(R5),R1 ; compute buffer start address
+	INSQUE	(R1),@PMB$Q_SBPHDR+4(R5) ; insert buffer at end of write queue
+	MOVL	PMB$L_PID(R5),R1	; get params to wake up other
+	BSBW	W^SCH$WAKE		;   process
+	CLRL	PMB$L_CURBUF(R5)	; note no buffer there now
+	BSBB	GETBUF			; pick up next buffer
+	BVS	30$			; exit if none available
+20$:	MOVL	R1,PMB$L_CURBUF(R5)	; save current buffer pointer
+30$:	POPR	#^M<R0,R1,R2,R3,R4,R5>	; restore registers
+	RSB
+
+GETBUF:					; get next buffer from queue
+	REMQUE	@PMB$Q_HDR(R5),R1	; dequeue next buffer
+	BVS	10$			; leave with V set if none there
+	MOVAL	BUFSIZ(R1),PMB$L_BUFEND(R5) ; save buffer end address
+	ADDL	#12,R1			; skip buffer header part, clear V bit
+10$:	RSB				; return with V set or clear
+
+	.SBTTL	ALLPMBLST - Allocate list of control block addresses
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Check to see if PMBLST has already been created, and exit if
+;	so, else create the list and store its address and length.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSB
+;
+; INPUTS:
+;
+;	R1 = number of bytes to allocate for PMBLST
+;
+; IMPLICIT INPUTS:
+;
+;	PFMCOUNT - number of processes using monitoring (begins at -1)
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	PFMCOUNT - incremented
+; 	PFM$GL_SIZE - size of PMB if allocated
+;	PFM$GL_PFMLST - address of list if allocated
+;
+; ROUTINE VALUE:
+;
+;	R0 = 1 -> success
+;	     0 -> allocation failure
+;
+; SIDE EFFECTS:
+;
+;	R0 - R5 destroyed
+;--
+
+PFM$ALLPMBLST:
+
+	SETIPL	#IPL$_SCHED		; stop context switching
+	INCL	PFMCOUNT		; one more process
+	BNEQ	20$			; branch if not first process
+	JSB	EXE$ALONONPAGED		; else allocate control block
+	BLBC	R0,30$			; exit on error
+	MOVQ	R1,PFM$GL_SIZE		; store size and address
+10$:	SETIPL	#0			; restore IPL
+	MOVC5	#0,(SP),#0,R1,(R2)	; zero array
+20$:	MOVZBL	#1,R0			; set success code
+30$:	SETIPL	#0			; restore IPL
+	RSB				; exit with status code
+
+
+	.END

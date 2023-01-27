@@ -1,0 +1,370 @@
+MODULE RDHOME (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  MOUNT Utility Structure Levels 1 & 2
+!
+! ABSTRACT:
+!	 This routine reads the home block, if any, of the volume being mounted.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  13-Oct-1977  21:29
+!
+! MODIFIED BY:
+!
+!
+!	V02-004	STJ0002		Steven T. Jeffreys,	29-Aug-1980
+!		Liberal re-write to facilitate operator assisted mount.
+!		As a result, the code indentation is screwed up.
+!
+!	V02-003	ACG0167		Andrew C. Goldstein,	18-Apr-1980  13:39
+!		Previous revision history moved to MOUNT.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:INIDEF.B32';
+
+
+FORWARD ROUTINE
+	READ_HOMEBLOCK,			! read the home block
+	SET_VALID,			! set volume valid bit
+	CLEAR_VALID;			! clear volume valid bit
+
+GLOBAL ROUTINE READ_HOMEBLOCK (VOLUME_LABEL, FULL_SEARCH) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads the home block, if any, of the volume being mounted.
+!	Various statuses are returned to be interpreted in the context of the
+!	operation; errors that are clear losers are signalled.
+!
+!
+! CALLING SEQUENCE:
+!	READ_HOMEBLOCK (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of volume label string descriptor
+!	ARG2: 1 if search whole disk for home block
+!	      0 if limited search
+!
+! IMPLICIT INPUTS:
+!	CHANNEL: channel number assigned to device being mounted
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	HOME_BLOCK: buffer contains home block if found
+!	HOMEBLOCK_LBN: LBN of home block read
+!
+! ROUTINE VALUE:
+!	1 if valid and correct home block found
+!	SS$_NOHOMEBLK if home block not found
+!	SS$_INCVOLLABEL if home block found but wrong volume name
+!	SS$_DEVOFFLINE
+!	SS$_MEDOFL
+!	SS$_FILESTRUCT
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+MAP
+	VOLUME_LABEL	: REF VECTOR;	! volume label string descriptor
+
+LOCAL
+	STATUS,				! system service status
+	IO_STATUS	: VECTOR[2],	! I/O status block
+	DELTA,				! home block search delta
+	BLOCKFACT,			! device blocking factor
+	LBN;				! current LBN being tried
+
+EXTERNAL
+	CHANNEL,			! channel number for I/O
+	DEVICE_CHAR	: BBLOCK,	! disk device characteristics
+	DEVCHAR_DESC	: VECTOR,	! device characteristics descriptor
+	HOME_BLOCK	: BBLOCK,	! home block buffer
+	HOMEBLOCK_LBN,			! LBN of home block read
+	CTL$GL_PHD	: REF BBLOCK ADDRESSING_MODE (ABSOLUTE);
+					! pointer to process header
+
+EXTERNAL ROUTINE
+	READ_BLOCK,			! read a disk block
+	CHECK_HOMEBLK1,			! verify structure level 1 home block
+	CHECK_HOMEBLK2;			! verify structure level 2 home block
+
+
+
+! Issue a pack acknowlege so we can talk to the disk.
+! Inhibit error logging to avoid saturating the error log
+! with media/device offline errors.  These errors cause
+! us to return and try an operator assisted mount.
+!
+
+STATUS = $QIOW (CHAN = .CHANNEL,
+		FUNC = (IO$_PACKACK OR IO$M_INHERLOG),
+		IOSB = IO_STATUS[0]);
+IF .STATUS THEN STATUS = .(IO_STATUS[0])<0,16>;
+IF NOT .STATUS
+THEN
+    !
+    ! Allow ILLIOFUNC errors, as devices that have
+    ! no PACKACK function will return this status.
+    !
+    IF .STATUS NEQ SS$_ILLIOFUNC
+    THEN
+	ERR_EXIT (.STATUS);
+
+! Set the volume valid bit to indicate presence of a volume.
+!
+
+KERNEL_CALL (SET_VALID);
+
+! Re-read the device characteristics. (For some devices, packack causes the
+! correct characteristics to be determined and recorded in the I/O data base.)
+!
+
+$GETCHN (CHAN = .CHANNEL, PRIBUF = DEVCHAR_DESC);
+
+! Compute the home block search delta from the volume geometry in the
+! device table. This is done according to the following rules, where volume
+! geometry is expressed in the order sectors, tracks, cylinders:
+!
+!	n x 1 x 1:	1
+!	1 x n x 1:	1
+!	1 x 1 x n:	1
+!
+!	n x m x 1:	n+1
+!	n x 1 x m:	n+1
+!	1 x n x m:	n+1
+!
+!	s x t x c:	(t+1)*s+1
+!
+
+BLOCKFACT = (.DEVICE_CHAR[DIB$B_SECTORS]
+	   * .DEVICE_CHAR[DIB$B_TRACKS]
+	   * .DEVICE_CHAR[DIB$W_CYLINDERS])
+	   / .DEVICE_CHAR[DIB$L_MAXBLOCK];
+
+DELTA = 1;
+IF  .DEVICE_CHAR[DIB$W_CYLINDERS] GTR 1
+AND .DEVICE_CHAR[DIB$B_TRACKS] GTR 1
+THEN DELTA = .DELTA + .DEVICE_CHAR[DIB$B_TRACKS];
+
+IF  .DEVICE_CHAR[DIB$B_SECTORS] GTR 1
+AND (.DEVICE_CHAR[DIB$W_CYLINDERS] GTR 1
+OR .DEVICE_CHAR[DIB$B_TRACKS] GTR 1)
+THEN DELTA = (.DELTA * .DEVICE_CHAR[DIB$B_SECTORS] + .BLOCKFACT) / .BLOCKFACT;
+
+IF .DELTA EQL 0
+OR .DELTA GTRU .DEVICE_CHAR[DIB$L_MAXBLOCK] / 10
+THEN DELTA = 1;
+
+! Search for the home block. If the device is being mounted foreign, we
+! limit the home block search to 10 hits to save time. If the device is
+! being mounted Files-11 then we try all the way just in case the home block
+! is in a weird location. Note the potential protection hole: Disks with the
+! home block far into the disk are not protected from being mounted foreign
+! by non-privileged users. C'est la vie.
+!
+
+LBN = 1;
+
+IF (
+    DECRU J FROM (IF .FULL_SEARCH THEN -1 ELSE 10) TO 1 DO
+    BEGIN
+	STATUS = READ_BLOCK (.LBN, HOME_BLOCK);
+	IF .STATUS
+	THEN
+	    BEGIN
+	    IF .HOME_BLOCK[HM2$B_STRUCLEV] EQL 1
+	    THEN STATUS = CHECK_HOMEBLK1 (HOME_BLOCK, .LBN, .VOLUME_LABEL)
+	    ELSE IF .HOME_BLOCK[HM2$B_STRUCLEV] EQL 2
+	    THEN STATUS = CHECK_HOMEBLK2 (HOME_BLOCK, .LBN, .VOLUME_LABEL)
+	    ELSE STATUS = 0;
+	    IF .STATUS
+	    OR .STATUS EQL SS$_INCVOLLABEL
+	    THEN EXITLOOP 0;
+	    END
+	ELSE
+	    BEGIN
+	    IF .STATUS EQL SS$_ILLBLKNUM
+	    THEN EXITLOOP -1;
+	    IF  .STATUS NEQ SS$_PARITY
+	    AND .STATUS NEQ SS$_FORMAT
+	    AND .STATUS NEQ SS$_DATACHECK
+	    THEN ERR_EXIT (.STATUS);
+	    END;
+
+	IF NOT .FULL_SEARCH
+	AND .BBLOCK [CTL$GL_PHD[PHD$Q_PRIVMSK], PRV$V_VOLPRO]
+	THEN RETURN (SS$_NOHOMEBLK);
+
+	LBN = .LBN + .DELTA;
+	END
+    )
+THEN
+    BEGIN
+    READ_BLOCK (1, HOME_BLOCK);
+    RETURN (SS$_NOHOMEBLK);
+    END;
+
+HOMEBLOCK_LBN = .LBN;
+
+RETURN .STATUS;
+
+END;					! end of routine READ_HOMEBLK
+
+GLOBAL ROUTINE SET_VALID =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine sets the volume valid bit in the UCB, causing
+!	PACKACK to be reissued in case of a power failure or volume
+!	status transition.
+!
+!
+! CALLING SEQUENCE:
+!	SET_VALID ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CHANNEL: channel number assigned to device
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1
+!
+! SIDE EFFECTS:
+!	valid bit set in UCB
+!
+!--
+
+BEGIN
+
+LOCAL
+	UCB		: REF BBLOCK;	! pointer to UCB
+
+EXTERNAL
+	CHANNEL;			! channel assigned to device
+
+EXTERNAL ROUTINE
+	GET_CHANNELUCB;			! get UCB of channel
+
+
+! Get the UCB address from the channel and set the bit.
+!
+
+UCB = GET_CHANNELUCB (.CHANNEL);
+UCB[UCB$V_VALID] = 1;
+
+RETURN 1;
+
+END;					! end of routine SET_VALID
+
+GLOBAL ROUTINE CLEAR_VALID =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine clears the volume valid bit in the UCB.
+!
+!
+! CALLING SEQUENCE:
+!	CLEAR_VALID ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CHANNEL: channel number assigned to device
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1
+!
+! SIDE EFFECTS:
+!	valid bit clear in UCB
+!
+!--
+
+BEGIN
+
+LOCAL
+	UCB		: REF BBLOCK;	! pointer to UCB
+
+EXTERNAL
+	CHANNEL;			! channel assigned to device
+
+EXTERNAL ROUTINE
+	GET_CHANNELUCB;			! get UCB of channel
+
+
+! Get the UCB address from the channel and clear the bit.
+!
+
+UCB = GET_CHANNELUCB (.CHANNEL);
+UCB[UCB$V_VALID] = 0;
+
+RETURN 1;
+
+END;					! end of routine CLEAR_VALID
+
+END
+ELUDOM

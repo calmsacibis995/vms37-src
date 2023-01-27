@@ -1,0 +1,1504 @@
+	$BEGIN	RM0BUFMGR,026,F$RMSCOM,<BUFFER MANAGER>
+
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: rms32
+;
+; Abstract:
+;		this module contains the basic buffer management
+;		routines for rms32.  the following routines are
+;		included:
+;
+;			rm$getpag	allocate empty pages
+;			rm$getspc	allocate space
+;			rm$retpag	deallocate pages
+;			rm$retspc	deallocate space
+;			rm$aldbuf	allocate bdb and i/o buffer
+;			rm$albdb	allocate bdb
+;			rm$alblb	allocate blb
+;			rm$retbdb	deallocate bdb and i/o
+;					buffer (if any)
+;			rm$gets0page	allocate a page from system paged pool
+;			rm$rets0page	return a page to system paged pool
+;
+; Environment:
+;		star processor running starlet exec.
+;
+; Author: L F Laverdure	, creation date: 30-DEC-1976
+;
+; Modified By:
+;
+;	V02-026	CDS0003		C Saether	17-Jan-1982
+;		Add RM$ALGBPB and RM$RETGBPB routines.
+;
+;	V02-025	CDS0002		C Saether	 9-Nov-1981
+;		Add and remove pages from s0 page list in
+;		kernel mode for multi-proc.
+;
+;	V02-024	CDS0001		C Saether	21-Aug-1981
+;		Add RM$ALBLB to allocate and initialize BLB's.
+;		Add RM$RETBLB to deallocate BLB's.
+;		Remove BCB allocation routine.
+;
+;	V02-023	SPR34112	C Saether	16-Jun-1981
+;		Always allocate and deallocate in 16 byte units.
+;		This solves the growing invisible hole problem.
+;		It also solves the irab alignment problem.
+;
+;	V02-022	REFORMAT	C Saether	30-Jul-1980	22:25
+;
+;	V021	CDS0046		C Saether	27-Oct-1979	13:40
+;		change aldbuf so buff size=0 just allocates bdb.
+;		store requested, not allocated size in bdb as buffer size to
+;		fix bug if ffff (hex) bytes are requested for buffer.
+;		keep count of current pages in use and max used ever pages
+;		in shared file database.  all shared pages now allocated
+;		initially by rmsshare - don't allocate on demand.
+;
+;	V020	RAN0013		R A Newell	12-Mar-1979	 8:35
+;		remove debug code in return page logic
+;
+;	V019	CDS0001		C D Saether	22-Feb-1979	13:30
+;		zero allocated space from system paged pool
+;
+;	V018	RAN0005		R A Newell	4-Jan-1979	16:40
+;		clear imp$v_temp1 on sys space dme error
+;
+;	V017	RAN0004		R A Newell	19-Dec-1978	16:45
+;		file sharing bug fixes
+;
+;	V016	RAN0003		R A Newell	9-Nov-1978	09:06
+;		file sharing code enhancements
+;
+;	V015	RAN0002		R A Newell	28-Aug-1978	10:15
+;		fix for rms32-isam to allow buffer requests of more than 512 bytes
+;
+; Revision history:
+;
+;	R A Newell,      3-OCT-1978  13:18	; ast block allocation
+;	R A Newell,      22-SEP-1978  8:49	; s0 space allocation routines
+;	R A Newell,      28-AUG-1978  10:15	; fix for space > 512 bytes
+;--
+
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+
+;
+; Macros:
+;
+
+	$SIFBDEF			; shared ifab definitions
+	$BLBDEF				; bucket lock block defs
+	$SFSBDEF			; shared file sync block defs
+	$VADEF				; virtual address definitions
+	$CMKRNLDEF			; change mode to kernel argument defs
+	$PTEDEF				; define page table entry defs
+	$SFDDEF				; shared file data definitions
+	$ACBDEF				; ast control block definitions
+	$PSLDEF				; psl definitions
+	$PCBDEF				; process control block definitions
+	$IMPDEF				; impure area definitions
+	$BDBDEF
+	$IFBDEF
+	$IRBDEF
+	$PRTDEF
+	$IRPDEF
+	$RMSDEF
+	$GBPBDEF
+
+;
+; Equated Symbols:
+;
+
+;
+; Own Storage:
+;
+
+C511:	.LONG	511			; constant for getting to page boundaries
+	MASK=	^X1FF			; mask for getting to page boundary
+
+	.SBTTL	RM$GETPAG - PAGE ALLOCATION ROUTINE
+
+;++
+; RM$GET1PAG - entry point to get only a single page
+; RM$GETPAG - entry point to get requested number of pages
+;
+;  this routine allocates a specified number of pages.
+;  the pages are not zero filled.
+;
+;  it performs this function by scanning the free page
+;  list of the current (process or image) i/o segment
+;  for the first fit.
+;
+;  if the request cannot be satisfied from the
+;   free page list, the routine checks for new
+;  (i.e. never-used) pages available in the i/o segment
+;  and allocates from there.
+;
+;  if insufficient pages in the i/o segment then
+;      if in the process i/o segment
+;	or if rms is inhibited from using program
+;	region (p0) space, return a dme error,
+;      else allocate the page(s) from the program
+;	region.
+;
+;  the pages will have exec write protection and
+;  either supervisor or user read depending upon
+;  the current i/o segment (i.e., for process and user
+;  i/o segments respectively).
+;
+;
+; Calling sequence:
+;
+;	BSBW	RM$GETPAG
+;
+;  alternate entry at rm$get1pag to allocate a single
+;  page of memory.  same outputs but only r11 input required.
+;
+; Input Parameters:
+;
+;	r11	impure area pointer
+;	r2	# of bytes required
+;
+; Implicit Inputs:
+;
+;	none
+;
+; Output Parameters:
+;
+;	r3	addr of starting page
+;	r2	total length of buffer allocated
+;		(i.e., r2 on input rounded up
+;		 to next page boundary)
+;	r0	status code
+;	r1	destroyed
+;
+; Implicit Outputs:
+;
+;	the affected free page list is updated.
+;
+; Completion Codes:
+;
+;	standard rms.  in particular, success or rm$_dme.
+;
+; Side Effects:
+;
+;	none
+;
+;--
+
+
+;
+;	this is not the entry point.
+;
+;
+;	bug check for s0 requests of other than a page in length.  this
+;	requirement is enforced so that the sfd does not have to be owned
+;	to get space from the free page list.
+;
+
+ERRBUG0:
+	RMSTBUG	FTL$_BADBUFSIZ		; bug check
+
+GETS0P:
+	CMPL	R2,#512			; are we getting one page?
+	BNEQ	ERRBUG0			; no, bugcheck
+	$CMKRNL_S ROUTIN=GETS0PK	; get the page in kernel mode.
+	MOVL	R0, R3			; get address of page allocated.
+	BEQL	10$			; EQL then no pages available.
+	RMSSUC
+10$:	RSB
+
+	.ENTRY	GETS0PK,0		; kernel mode routine
+	MOVL	@#RMS$GL_SFDBASE,R1	; get addr of sfd
+	REMQUE	@SFD$L_FREEPGLH(R1),R0	; remove a page from the free pg lh
+	BVS	10$			; branch if none left
+	INCL	SFD$L_PAGECOUNT(R1)	; bump count of pages in use
+	CMPL	SFD$L_PAGECOUNT(R1),SFD$L_PAGEMAX(R1) ; is this the highest yet?
+	BLEQU	20$			; all done, exit with success
+	MOVL	SFD$L_PAGECOUNT(R1),SFD$L_PAGEMAX(R1) ; save this as highest used
+	BRB	20$			; and exit
+10$:	CLRL	R0			; can't get any more pages
+20$:	RET				; return
+
+RM$GET1PAG::
+					; entry to allocate 1 page
+	MOVL	#1,R2			; asking for 1 byte gets 1 page
+
+;
+;  setup to scan free page list for first fit
+;
+
+RM$GETPAG::
+	ADDL2	C511,R2			; round up required size
+	BICL2	C511,R2			; to length of pages
+	BBS	#IMP$V_TEMP1,(R11),GETS0P ; branch if s0 request
+
+;
+;  scan free page list
+;
+
+	MOVAL	IMP$L_FREEPGLH(R11),R1	; get free page list head
+10$:	CMPL	R1,IMP$L_FREEPGLH+4(R11) ; end of list?
+	BEQL	30$			; branch if yes
+	MOVL	(R1),R1			; get next node
+	CMPL	8(R1),R2		; long enough?
+	BLSS	10$			; branch if not
+	BEQL	20$			; branch if exact fit
+
+;
+;  we have a fit but we don't need all of the pages in the hole
+;  - must return extras
+;
+
+15$:	ADDL3	R1,R2,R0		; get addr of new hole
+	SUBL3	R2,8(R1),8(R0)		; compute and store its length
+	INSQUE	(R0),(R1)		; insert the new hole
+
+;
+;  the hole at r1 is just the right size
+;  remove it from the list
+;
+
+20$:	REMQUE	(R1),R3			; address of hole to r3
+22$:	RMSSUC
+	RSB
+
+;
+;  no space in s0 free page list.  must get a page from the system
+;  paged pool.  this s0 space will never be returned to the system, but
+;  will eventually be returned to the s0 free page list.
+;
+;
+;25$:	PUSHL	R2			; save registers
+;	ROTL	#23,R2,-(SP)		;request page(s) of paged pool
+;	PUSHL	#1			;one parameter to routine
+;	BSBW	RM$GETS0PAGE		;get 1 s0 page
+;	POPR	#^M<R2>			;restore registers
+;	RSB				;return to caller
+;
+;  there is no space in the free page list
+;  check for space in the unallocated pages of the i/o segment
+;
+
+30$:	CMPL	R2,IMP$L_IOSEGLEN(R11)	; enough space?
+	BGTR	200$			; branch if not
+
+;
+;  take the required space from the i/o segment
+;
+
+	MOVL	IMP$L_IOSEGADDR(R11),R1	; addr of space
+	SUBL2	R2,IMP$L_IOSEGLEN(R11)	; adjust length of remaining
+					; space
+	ADDL2	R2,IMP$L_IOSEGADDR(R11)	; and its start addr
+
+;
+;  the required number of pages have now been allocated.
+;  set the protection on them.
+;
+;  build a descriptor for the memory
+;
+
+100$:	DECL	R2			; length-1 to give end addr
+	ADDL3	R1,R2,-(SP)		; ending page addr
+	PUSHL	R1			; starting page addr
+
+;
+
+110$:	MOVL	SP,R0			; save descriptor addr
+	MOVZBL	IMP$B_PROT(R11),R3	; pick up protection for pages
+	$SETPRT_S	INADR=(R0),RETADR=(R0),ACMODE=#PSL$C_EXEC,PROT=R3
+
+	MOVL	(SP)+,R3		; addr of starting page
+	SUBL3	R3,(SP)+,R2		; get length-1 into r2
+	INCL	R2			; and make it length
+	.IF	NE $$RMSTEST&$$RMS_TBUGCHK
+	BLBC	R0,ERRBUG		; service should not fail
+	.ENDC
+	RSB
+
+;
+;  there is no space in the free page list or in the i/o segment.
+;  if this is not the pio segment, allocate the required space
+;  from the program region unless prohibited by user.
+;
+
+	ASSUME	IMP$W_RMSSTATUS EQ 0
+	ASSUME	IMP$V_IIOS EQ 0
+200$:	BLBC	(R11),ERRDME		; branch if process i/o seg.
+	TSTL	IMP$L_IOSEGADDR(R11)	; is there any image i/o seg.?
+	BEQL	ERRDME			; branch if none (error)
+	BBS	#IMP$V_NOP0BUFS,(R11),ERRDME ; branch if p0 off limits
+
+;
+;  expand the program region
+;
+
+	ASHL	#-9,R2,R2		; convert length to pages
+	CLRQ	-(SP)			; temp array to receive results
+	MOVL	SP,R0			; and save its addr
+	$EXPREG_S	PAGCNT=R2,RETADR=(R0),ACMODE=#PSL$C_EXEC,REGION=#0
+
+	BLBS	R0,110$			; branch if successful
+ERRDME1:
+	POPR	#^M<R0,R1>		; clean up stack
+	BBC	#IMP$V_TEMP1,(R11),ERRDME ; branch if not s0 request
+	BSBW	RM$RLS_SFD		; release the sfd
+
+;
+;  no dynamic memory available
+;
+
+ERRDME:	$PSECT_BR	L$RMS0
+	RMSERR	DME
+	CSB	#IMP$V_TEMP1,(R11)
+	RSB
+	$PSECT_RESTORE
+
+;
+;  the change protection system service failed
+;
+
+ERRBUG:	RMSTBUG	FTL$_SETPRTFAIL
+
+	.SBTTL	RM$GETSPC MEMORY ALLOCATION ROUTINE
+
+;++
+; RM$GETS0SPC - get space from rms global pages
+; RM$GETSPC1 - set up free space header and get space
+; RM$GETSPC - get space
+; RM$GETSPC_ALT - yet another entry point to get space
+; RM$GETBLK - get space by longwords
+;
+;
+;  this routine allocates space within a page on a first
+;  fit basis.  the allocated space is zero filled.
+;
+;  if insufficient space is available, another page is
+;  added to the free space list.
+;
+;
+;  calling sequence:
+;
+;	BSBW	RM$GETSPC
+;
+;  alternate entry at rm$gets0spc for allocated space within pages allocated
+;	from the system paged pool  (r9 must contain ifab/irab address)
+;  alternate entry at rm$getspc_alt if r1 has exact address of list head
+;  alternate entry at rm$getblk if r2 has # of longwords required and
+;  this # is to be stored in byte 9 of the gotten space
+;
+;  input parameters:
+;
+;	r11	impure area addr
+;	r2	# of bytes required (11 < r2 < 513)
+;	r1	any address within page
+;		(space header must be at the start
+;		 of this page)
+;
+;  implicit inputs:
+;
+;	the status of the impure area.
+;
+;  output parameters:
+;
+;	r1	addr of block of memory
+;	r0	status
+;	r2,r3,r4  destroyed
+;
+;  implicit outputs:
+;
+;  the free space list is updated.
+;
+;
+;  completion codes:
+;
+;	standard rms32, in particular, success and dme.
+;
+;  side effects:
+;
+;	none.
+;
+;--
+
+
+;
+;  alternate entry here for getting space from s0 page
+;
+
+RM$GETS0SPC::
+	SSB	#IMP$V_TEMP1,(R11)	; set flag for s0 request
+	BRB	RM$GETSPC		; go get the space
+
+;
+;  alternate entry here for getting space from ifab free space list
+;
+;  additonal input:	r9 = address of ifab/irab
+;  r1 is not an input
+;
+
+RM$GETSPC1::
+	BSBW	SETHDR1			; set up free space header page addr
+					; and fall thru into rm$getspc
+
+;
+;  normal entry point
+;
+
+RM$GETSPC::
+	BICL2	C511,R1			; get header addr
+RM$GETSPC_ALT::
+					; entry if r1 is exact header addr
+	MOVL	R1,R4			; save addr for end test
+	ADDL2	#15,R2			; turn request into multiple of
+	BICL2	#15,R2			; 16 bytes.
+
+;
+;  scan for first fit
+;
+
+10$:	CMPL	(R1),R4			; end of list?
+	BEQL	50$			; branch if yes - no space found
+15$:	MOVL	(R1),R1			; get next node
+	CMPL	8(R1),R2		; long enough?
+	BLSS	10$			; branch if not
+	BEQL	20$			; branch if exact fit
+
+;
+;  we have a fit but don't need extra bytes
+;  return them to the free space list
+;
+
+	ADDL3	R2,R1,R0		; get new hole addr
+	SUBL3	R2,8(R1),R3		; compute its length
+	CMPL	R3,#16			; at least 16 bytes?
+	BLSS	20$			; branch if not, as not
+					; big enough for a node
+	MOVL	R3,8(R0)		; store hole length
+	INSQUE	(R0),(R1)		; & insert the new hole
+
+;
+;  the hole at r1 is just the right size (imagine that!)
+;  (actually could be 8 bytes longer than needed)
+;  remove it from the list and zero fill it
+;
+
+20$:	REMQUE	(R1),R1
+	PUSHR	#^M<R1,R5>
+	MOVC5	#0,(SP),#0,R2,(R1)	; zero the space
+	POPR	#^M<R1,R5>
+	BBCC	#IMP$V_TEMP1,(R11),25$	; branch around next if not s0
+25$:	RMSSUC
+	RSB
+
+;
+;
+;  found no space of required size
+;  get another page and add it to the free space list
+;
+
+50$:	PUSHR	#^M<R1,R2>
+	BSBW	RM$GETPAG		; get required pages (r3 = addr)
+	BLBC	R0,ERRDME1		; error if not available
+	MOVL	R2,8(R3)		; store length of space
+	POPR	#^M<R1,R2>
+
+;
+;  insert the new space in ascending memory address sequence
+;
+;  note: r1 points to last hole (i.e., highest in memory)
+;
+
+60$:	CMPL	R3,R1			; is this the right spot?
+	BGTRU	70$			; branch if yes
+	MOVL	4(R1),R1		; get previous hole
+	CMPL	R1,R4			; back at list head?
+	BNEQ	60$			; branch if not
+70$:	INSQUE	(R3),(R1)		; insert the hole
+	BRB	15$			; and go use it
+
+;
+;  alternate entry here for getting block from ifab free space list
+;
+;  additonal input:	r9 = address of ifab/irab
+;  r1 is not an input
+;
+
+RM$GETBLK1_ALT:
+	BSBB	SETHDR1			; set up free space header page addr
+					; and fall thru into rm$getblk
+
+;
+;
+;  alternate entry to get space by # of longwords and store that
+;  number in byte 9 of the returned space
+;
+
+RM$GETBLK::
+	PUSHL	R2			; save # longwords
+	ROTL	#2,R2,R2		; make into # bytes
+	BSBW	RM$GETSPC		; go get the space
+	BLBC	R0,10$			; get out on error
+	CVTLB	(SP)+,9(R1)		; store length
+	RSB
+10$:	POPR	#^M<R1>			; clean stack
+	RSB
+
+;++
+;  subroutine to load ifab addr into r1
+;
+;--
+
+SETHDR1:
+	MOVL	R9,R1			; assume ifab addr in r1
+	ASSUME	<IRB$C_BID&1> EQ 0
+	ASSUME	<IFB$C_BID&1> EQ 1
+	ASSUME	IFB$B_BID EQ IRB$B_BID
+	BLBS	IFB$B_BID(R9),10$	; branch if structure is ifab
+	MOVL	IRB$L_IFAB_LNK(R9),R1	; get ifab address from irab
+10$:	RSB
+
+	.SBTTL	RM$RETPAG - PAGE DEALLOCATION ROUTINE
+
+;
+;++
+; RM$RET1PAG - return one (1) page
+; RM$RETPAG - deallocate pages
+;
+;	this routine returns pages to the free page list.
+;	the list is kept in order of ascending memory addresses.
+;
+;
+;  calling sequence:
+;
+;	BSBW	RM$RETPAG
+;
+;  alternate entry at rm$ret1pag to return a single page.
+;  r11,r4 are only inputs.
+;
+;  input parameters:
+;
+;	r11	impure area address
+;	r5	length in bytes of pages to be returned
+;	r4	address of first page to be returned
+;
+;  outputs:
+;
+;	r0 thru r5 destroyed
+;	someone is calling this routine to return an s0 page and gets
+;	upset if r0 is clobbered.
+;
+;
+;  implicit outputs:
+;
+;	the free page list is updated.
+;
+;  completion codes:
+;
+;	none
+;
+;  side effects:
+;
+;	none
+;
+;--
+;
+
+RETS0P:
+	PUSHL	R0			; save r0 -somebody wants it...
+	PUSHL	R4			; pass R4 as arg.
+	PUSHL	#1			; one argument.
+	$CMKRNL_S ROUTIN=RETS0PK,ARGLST=(SP) ; do the operation in kernel.
+	ADDL2	#8, SP			; clean stack
+	POPL	R0			; restore r0
+	RSB				; and return.
+
+	.ENTRY	RETS0PK,0
+	MOVL	4(AP), R0		; address of page to return
+	MOVL	@#RMS$GL_SFDBASE,R1	; get addr of sfd
+	INSQUE	(R0),SFD$L_FREEPGLH(R1)	; insque free page into list
+	DECL	SFD$L_PAGECOUNT(R1)	; note one less page in use
+	RET				; return to caller
+
+
+;
+;  entry to return a single page
+;
+
+RM$RET1PAG::
+	MOVL	#1,R5			; 1 byte gets 1 page
+
+;
+;
+
+RM$RETPAG::
+	MOVZWL	#511,R2			; get page boundary mask
+	ADDL2	R2,R5			; round up length
+	BICL2	R2,R5			;  "
+	BICL	R2,R4			; get start of page
+	BBS	#IMP$V_TEMP1,(R11),RETS0P ; branch if s0 request
+	MOVAL	IMP$L_FREEPGLH(R11),R2	; addr of header
+	MOVL	R2,R3			; save for end of list test
+
+;
+;  scan for a hole having a higher address
+;
+
+10$:	MOVL	(R2),R2			; get next hole addr
+	CMPL	R2,R3			; end of list?
+	BEQL	40$			; branch if yes
+	CMPL	R2,R4			; higher than hole being returned?
+	BLSSU	10$			; branch if not
+
+;
+;  the hole at r2 has a higher address than that being returned.
+;  insert the returning hole and try to combine it with either the
+;  previous hole, the next hole, or both
+;
+
+20$:	ADDL3	R5,R4,R1		; get address past returning hole
+	CMPL	R1,R2			; same as start of next hole?
+	BNEQ	40$			; branch if not
+
+;
+;  combine this hole with next hole
+;
+
+	ADDL2	8(R2),R5		; get new hole size
+	REMQUE	(R2),R2			; get rid of high hole
+	MOVL	(R2),R2			; get next node addr
+					; *****
+					;NOTE:
+					; note: assumes the address
+					; in the deleted node is still
+					; valid!
+					; (it should be.)
+					; ******
+
+;
+;  check if the hole can be combined with the previous hole
+;
+
+40$:	MOVL	4(R2),R0		; get previous hole addr
+	CMPL	R0,R3			; is it the head?
+	BEQL	60$			; branch if yes
+	ADDL3	8(R0),R0,R1		; get end of previous hole
+	CMPL	R1,R4			; same as start of hole
+					; being returned?
+	BNEQ	60$			; branch if not
+	ADDL2	R5,8(R0)		; just add in the additional
+					; size and that's all
+	RSB				; return to caller
+
+;
+;  must create a new node for hole being returned
+;
+
+60$:	MOVL	R5,8(R4)		; set its size
+	INSQUE	(R4),(R0)		; and insert it
+65$:	RSB
+
+	.SBTTL	RM$RETSPC - MEMORY DEALLOCATION ROUTINE
+
+;
+;++
+; RM$RETS0SPC - return rms global space
+; RM$RETSPC1 - set up free list header and return space
+; RM$RETSPC - return space
+; RM$RETBLK1 - set up header and return space with length field
+; RM$RETBLK - return space with length field
+;
+;  this routine returns memory to the free space list, or to the system
+;  paged pool.
+;
+;  the list is kept in ascending memory sequence to facilitate
+;  combining holes.  holes are not combined across page
+;  boundaries however.
+;  \ perhaps this routine might be altered to return pages
+;    to the free page list whenever an entire page becomes free.
+;    the disadvantage of this is in possible thrashing in the retpage/
+;    getpage for every needed asb.  for now, only return the pages
+;    on file close or i/o rundown. also, if the return request is for s0 space,
+;    full pages will be return to the sfd free page list.
+;
+;  note that any hole less than 12 bytes in length is implicit
+;  (i.e., it has no header linking it into the list).
+;
+;
+;  calling sequence:
+;
+;	BSBW	RM$RETSPC
+;
+;  alternate entry at rm$retblk to return a block having
+;  its length stored as a # of longwords in byte 9 of the returning space.
+;  for this entry the r2 input is not required.
+;
+;  alternate entry point rm$rets0spc is used to return space allocated from
+;  the system paged pool.
+;
+;  input parameters:
+;
+;	r11	impure area address
+;	r4	addr of space being returned
+;	r3	any addr in page having free space header
+;	r2	length in bytes of space being returned
+;
+;  inplicit inputs:
+;
+;	none
+;
+;  output parameters:
+;
+;	r0 thru r5 destroyed
+;
+;  implicit outputs:
+;
+;	the free space list is updated.
+;
+;  completion codes:
+;
+;	none.
+;
+;  side effects:
+;
+;	none
+;
+;--
+;
+
+
+;
+;  alternate entry to return space allocated in pages from the sys paged pool.
+;
+
+RM$RETS0SPC::
+	BICL2	#MASK,R3		; get space header address
+	SSB	#IMP$V_TEMP1,(R11)	; set flag for s0 request
+	BRB	RM$RETSPC		; return the space
+
+;
+;  alternate entry to return space to ifab free space list
+;  additional input:	r9 = ifab/irab addr
+;  r3 is not an input
+;
+
+RM$RETSPC1::
+	BSBB	SETHDR3			; get ifab addr into r3
+	BRB	RM$RETSPC		; and go do normal return
+
+;++
+;  subroutine to load ifab addr into r3
+;
+;--
+
+SETHDR3:
+	MOVL	R9,R3			; assume ifab addr in r3
+	ASSUME	<IRB$C_BID&1> EQ 0
+	ASSUME	<IFB$C_BID&1> EQ 1
+	ASSUME	IFB$B_BID EQ IRB$B_BID
+	BLBS	IFB$B_BID(R9),10$	; branch if structure is ifab
+	MOVL	IRB$L_IFAB_LNK(R9),R3	; get ifab address from irab
+10$:	RSB
+
+;
+;  alternate entry to return block to ifab free space list
+;  additional input:	r9 = ifab/irab addr
+;  r3 is not an input
+;
+
+RM$RETBLK1::
+	BSBB	SETHDR3			; get ifab addr into r3
+					; and fall into normal return blk
+
+;
+;  alternate entry here to return a block having a length code
+;
+
+RM$RETBLK::
+	MOVZBL	9(R4),R2		; pick up length from block
+	ROTL	#2,R2,R2		; convert to # bytes
+
+;
+;
+
+RM$RETSPC::
+	ADDL2	#15,R2			; always round to multiple
+	BICL2	#15,R2			; of 16 bytes.
+	CMPL	R2,#512			; returning at least a page?
+	BLSS	5$			; branch if not
+3$:	PUSHR	#^M<R2,R3,R4>		; save registers
+	BSBW	RM$RET1PAG		; return 1 page to free page list
+	POPR	#^M<R2,R3,R4>		; restore registers
+	ADDL2	#512,R4			; adjust address of returning space
+	SUBL2	#512,R2			; addjust length of space left
+	BNEQ	4$			; branch if more space to return
+	BRW	90$			; return,  no more space to return
+4$:	CMPL	R2,#512			; still more than 1 page left?
+	BGEQU	3$			; branch if at least a page left
+5$:	BICL2	C511,R3			; get free space list head addr
+	MOVL	R3,R5			; save for end test
+
+;
+;  scan for a hole having a higher address
+;
+
+10$:	CMPL	(R3),R5			; end of list?
+	BEQL	50$			; branch if yes
+	MOVL	(R3),R3			; get next hole addr
+	CMPL	R3,R4			; higher than hole being returned?
+	BLSSU	10$			; branch if not
+
+;
+;  the hole at r3 has a higher address than hole being returned.
+;  try to combine with either the next or the previous hole or both.
+;
+
+20$:	BSBW	100$			; both buffers in same page?
+	BNEQ	40$			; branch if not
+	SUBL3	R4,R3,R1		; get difference between the
+					; buffer addresses
+	SUBL2	R2,R1			; less the length of the
+					; returning buffer
+	BNEQ	40$			; branch if not exact
+
+;
+;  combine the returning hole with the next hole
+;
+
+	ADDL2	8(R3),R2		; get new hole size
+					; = old + new
+	REMQUE	(R3),R3			; get rid of high hole
+	MOVL	(R3),R3			; get addr of next higher
+					; hole
+					;NOTE:
+					; note: assumes link still
+					;  valid.
+
+;
+;  check if hole can be combined with previous hole
+;
+
+40$:	MOVL	4(R3),R3		; get addr previous hole
+50$:	CMPL	R3,R5			; is it the head?
+	BEQL	60$			; branch if yes
+	BSBW	100$			; two buffers in same page?
+	BNEQ	60$			; branch if not
+	SUBL3	R3,R4,R1		; get difference between the
+					; buffer addresses
+	SUBL2	8(R3),R1		; less previous buffer length
+	BNEQ	60$			; branch if not exact
+	ADDL2	R2,8(R3)		; merely add size of
+					; new returning space
+					; to previous hole size
+	MOVL	R3,R4			; copy hole addr
+	BRB	80$			; go check end condition
+
+;
+;  create a new node for hole being returned
+;
+
+60$:	BBC	#IMP$V_TEMP1,(R11),65$	; branch if not an s0 request
+	CMPL	R2,#512			; have we got an entire page of free space?
+	BNEQ	65$			; branch if we don't
+
+;
+;  we have determined that the hole is an entire page in length.  therefore, we
+;  can return this page to the system paged pool.
+;
+
+62$:	BSBW	RM$RET1PAG		; return page to system paged pool
+	BRB	90$			; ok, done
+65$:	MOVL	R2,8(R4)		; set hole size
+	INSQUE	(R4),(R3)		; & insert it
+
+;
+;  check for invisible space at end of page and reclaim if any
+;
+
+80$:	BBC	#IMP$V_TEMP1,(R11),82$	; s0 request?
+	CMPL	8(R4),#512		; check for full page size hole
+	BNEQ	82$			; branch if not a page
+	REMQUE	(R4),R3			; remove page from queue
+	BSBW	RM$RET1PAG		; return the page
+	BRB	90$			;
+82$:	ADDL3	8(R4),R4,R1		; addr + size
+	BICL2	#^C 511,R1		; get offset in page
+	SUBW2	#512-8,R1		; 8 bytes from end?
+	BNEQU	90$			; branch if not
+	ADDW2	#8,8(R4)		; update the length
+	CMPL	8(R4),#512		; is it now a page in length?
+	BNEQ	90$			; no, branch
+	BBC	#IMP$V_TEMP1,(R11),90$	; branch if not an s0 request
+	REMQUE	(R4),R4			; remove this entry
+	MOVL	R4,R3			; move addr of page to r3 for call
+	BRB	62$			; branch to return the page
+90$:	BBCC	#IMP$V_TEMP1,(R11),95$	; clear s0 request flag
+95$:	RSB
+
+;
+;!!!!!
+;  \check for return of entire page would go here.\
+;!!!!!
+;
+;
+;  subroutine to check if addresses in r3 and r4 are in same page
+;
+;  inputs: r3,r4 = addresses to check
+;  outputs: z-bit set if in same page
+;	   r1 destroyed
+;
+
+100$:	XORL3	R3,R4,R1		; set bits 9-31 to 0
+					; if in same page
+	BICL2	C511,R1			; clear bits 0-8
+					; z - set if 9-31 also zero
+	RSB
+
+
+	.SBTTL	RM$ALDBUF - BDB AND I/O BUFFER ALLOCATION ROUTINE
+
+;++
+; RM$ALDBUF - allocate buffer and bdb to go with it
+;
+;  this routine performs the following functions:
+;
+;	1. allocate and init a bdb
+;	2. allocate an i/o buffer (of an integral
+;	   number of pages) if r5 non-zero
+;
+;  calling sequence:
+;
+;	BSBW	RM$ALDBUF
+;
+;  input parameters:
+;
+;	r11	impure area address
+;	r10	ifab address
+;	r5	length of buffer in bytes
+;
+;  implicit inputs:
+;
+;	none
+;
+;  output parameters:
+;
+;	r4	address of bdb
+;	r3	address of buffer
+;	r2	total size in bytes of allocation
+;	r0	status code
+;	r1	destroyed
+;	r4,r5	also destroyed if r0 indicates an error
+;
+;  implicit outputs:
+;
+;  the affected free space and free page lists are updated.
+;
+;  completion codes:
+;
+;	standard rms, in particular, success or dme.
+;
+;  side effects:
+;
+;	none.
+;
+;--
+
+RM$ALDBUF::
+	BSBB	RM$ALBDB		; get a bdb
+	BLBC	R0,20$			; branch on error
+	MOVL	R1,R4			; save bdb addr
+	MOVL	R5,R2			; move buffer len to right reg
+	BEQL	20$			; eql then wants only bdb (no buffer)
+	BSBW	RM$GETPAG		; and get an i/o buffer
+					; (len/addr returned in r2,r3)
+	BLBC	R0,50$			; branch on error
+
+;
+;  set buffer size and address into bdb
+;
+
+	MOVW	R5,BDB$W_SIZE(R4)
+	MOVL	R3,BDB$L_ADDR(R4)
+20$:	RSB				; note: r0 still valid.
+
+;
+;
+;
+;  error allocating the page  -  must return the bdb
+;
+
+50$:	BSBB	RM$RETBDB
+ERRDME_BR:
+	BRW	ERRDME			; restore error code
+
+	.SBTTL	RM$ALBDB - BDB ALLOCATION ROUTINE
+
+;++
+; RM$ALBDB -  allocate and initialize a buffer descriptor block (bdb)
+;
+;  calling sequence:
+;
+;	BSBW	RM$ALBDB
+;
+;  input parameters:
+;
+;	r11	impure area address
+;	r10	ifab address
+;
+;  implicit inputs:
+;
+;	none
+;
+;  output parameters:
+;
+;	r1	address of bdb
+;	r0	status code
+;	r2,r3,r4 destroyed
+;
+;  implicit outputs:
+;
+;  the bdb has its block length and block id fields filled in
+;  and it is linked into the ifab's bdb list.
+;
+;  completion codes:
+;
+;	standard rms, in particular, success and dme.
+;
+;  side effects:
+;
+;	none
+;
+;--
+
+RM$ALBDB::
+	MOVL	R10,R1			; copy ifab addr as this
+					; defines the page for the
+					; free space list header
+	MOVL	#BDB$C_BLN/4,R2		; # longwords required
+	BSBW	RM$GETBLK		; allocate zeroed space
+					; (r1 set to addr)
+	BLBC	R0,10$			; branch on error
+
+;
+;  set id into bdb and link at end of the ifab's bdb list
+;
+
+	MOVB	#BDB$C_BID,BDB$B_BID(R1)
+	INSQUE	(R1),@IFB$L_BDB_BLNK(R10)
+10$:	RSB				; note: r0 still has status code.
+
+	.SBTTL	RM$ALGBPB - GBPB ALLOCATION ROUTINE
+
+;++
+; RM$ALGBPB -  allocate and initialize a buffer descriptor block (gbpb)
+;
+;  calling sequence:
+;
+;	BSBW	RM$ALGBPB
+;
+;  input parameters:
+;
+;	r11	impure area address
+;	r10	ifab address
+;
+;  implicit inputs:
+;
+;	none
+;
+;  output parameters:
+;
+;	r1	address of gbpb
+;	r0	status code
+;	r2,r3,r4 destroyed
+;
+;  implicit outputs:
+;
+;  the gbpb has its block length and block id fields filled in
+;  and it is linked into the ifab's gbpb list.
+;
+;  completion codes:
+;
+;	standard rms, in particular, success and dme.
+;
+;  side effects:
+;
+;	none
+;
+;--
+
+RM$ALGBPB::
+	MOVL	R10,R1			; copy ifab addr as this
+					; defines the page for the
+					; free space list header
+	MOVL	#GBPB$C_BLN/4,R2		; # longwords required
+	BSBW	RM$GETBLK		; allocate zeroed space
+					; (r1 set to addr)
+	BLBC	R0,10$			; branch on error
+
+;
+;  set id into gbpb and link at end of the ifab's gbpb list
+;
+
+	MOVB	#GBPB$C_BID,GBPB$B_BID(R1)
+	INSQUE	(R1),@IFB$L_BDB_BLNK(R10)
+10$:	RSB				; note: r0 still has status code.
+
+	.SBTTL	RM$RETBLB - BLB DEALLOCATION ROUTINE
+;++
+; RM$RETBLB - return specified BLB
+;
+; This routine deallocate the space used by a BLB, and removes it
+; from the ifab list.
+;
+; Calling sequence:
+;
+;	BSBW	RM$RETBLB
+;
+; Input parameters:
+;
+;	R4 - address of BLB to be returned.
+;	R10 - ifab address
+;
+; Output parameters:
+;
+;	R0 - R5 destroyed.
+;
+; Completion status:
+;
+;	none - success is assumed
+;
+;--
+RM$RETBLB::
+	REMQUE	(R4),R4			; Remove from BLB chain.
+	TSTL	BLB$L_LOCK_ID(R4)	; Make sure no lock is held.
+	BNEQ	10$			; NEQ lock not released.
+	MOVL	R10, R3			; Free space header into R3.
+	BSBW	RM$RETBLK		; Return the blb.
+	RSB				; Return.	
+10$:	RMSPBUG	FTL$_LOCKHELD		; This is a problem.
+
+	.SBTTL	RM$RETGBPB - GBPB DEALLOCATION ROUTINE
+;++
+; RM$RETGBPB - return specified GBPB
+;
+; This routine deallocate the space used by a GBPB, and removes it
+; from the ifab list.
+;
+; Calling sequence:
+;
+;	BSBW	RM$RETGBPB
+;
+; Input parameters:
+;
+;	R4 - address of GBPB to be returned.
+;	R10 - ifab address
+;
+; Output parameters:
+;
+;	R0 - R5 destroyed.
+;
+; Completion status:
+;
+;	none - success is assumed
+;
+;--
+RM$RETGBPB::
+	REMQUE	(R4),R4			; Remove from BDB chain.
+	MOVL	R10, R3			; Free space header into R3.
+	BSBW	RM$RETBLK		; Return the gbpb.
+	RSB				; Return.	
+
+	.SBTTL	RM$RETBDB - BDB AND I/O BUFFER DEALLOCATION ROUTINE
+
+;++
+; RM$RET1STBDB - return first bdb from list
+; RM$RETBDB - return specified bdb
+;
+;  This routine deallocates the space occupied by a bdb,
+;  removes it from the ifab's bdb list, and deallocates
+;  the associated i/o buffer, if any.  Also adjust the
+;  buffer count if a buffer is deallocated.
+;
+;  calling sequence:
+;
+;	BSBW	RM$RETBDB
+;
+;  alternate entry to return first bdb in ifab chain:
+;
+;	BSBW	RM$RET1STBDB
+;
+;  input parameters:
+;
+;	r11	impure area address
+;	r10	ifab address (entry at rm$retbdb only)
+;	r9	ifab address (entry at rm$ret1stbdb only)
+;	r4	bdb address
+;
+;  implicit inputs:
+;
+;	none
+;
+;  output parameters:
+;
+;	r10	ifab address (entry at rm$ret1stbdb only)
+;	r0 thru r5 destroyed
+;
+;  implicit outputs:
+;
+;  the free space and free page lists are updated.
+;
+;  completion codes:
+;
+;	none
+;
+;  side effects:
+;
+;	none
+;
+;--
+
+;
+;  entry point to return the first bdb in the ifab bdb chain
+;
+
+RM$RET1STBDB::
+	MOVL	R9,R10			; ifab addr to r10
+	MOVL	IFB$L_BDB_FLNK(R9),R4	; get first bdb addr
+
+;
+;  entry to return bdb whose address is in r4
+;
+
+RM$RETBDB::
+	.IF	NE $$RMSTEST&$$RMS_TBUGCHK
+	CMPB	BDB$B_BID(R4),#BDB$C_BID ; is it a bdb?
+	BNEQ	ERRBUG1			; branch if not
+	.ENDC
+	ASSUME	BDB$L_FLINK EQ 0
+	REMQUE	(R4),R4			; remove from ifab bdb list
+
+;
+;  return i/o buffer if any
+;
+
+	MOVZWL	BDB$W_SIZE(R4),R5	; length of i/o buffer
+	BEQL	50$			; branch if none
+
+
+20$:	PUSHL	R4			; save bdb addr
+	MOVL	BDB$L_ADDR(R4),R4	; get buffer addr
+	BSBW	RM$RETPAG		; and deallocate the page(s)
+	POPR	#^M<R4>			; restore bdb addr
+
+;
+;  check for bdb referenced in curbdb field of any irab and if so zero
+;
+
+50$:	ASSUME	IFB$L_IRAB_LNK EQ IRB$L_IRAB_LNK
+	MOVL	R10,R0			; get ifab addr to right reg
+60$:	MOVL	IRB$L_IRAB_LNK(R0),R0	; pick up next irab
+	BEQL	70$			; branch if no more
+	CMPL	IRB$L_CURBDB(R0),R4	; using this bdb?
+	BNEQ	60$			; branch if not
+	CLRL	IRB$L_CURBDB(R0)	; invalidate
+	BRB	60$			; and continue
+
+;
+;  now return the bdb
+;
+
+70$:	MOVL	R10,R3			; copy of ifab addr
+					; (free space header in this
+					; page)
+	BSBW	RM$RETBLK		; return the bdb space
+	RSB
+
+;
+;
+;  bad problem  -  the returning block was not a bdb!
+;
+
+ERRBUG1:
+	RMSTBUG	FTL$_BADBDB
+
+	.SBTTL	RM$ALBLB - Allocate bucket lock block
+;++
+;
+;	Function Description
+;
+;	Allocate and initialize static fields in the BLB.
+;	Link into BLB queue off the ifab.
+;
+;	Input Parameters:
+;
+;	R11	impure pointer
+;	R10	ifab address
+;
+;	Output Parameters:
+;
+;	R1	address of BLB
+;	R0	status code
+;	R2, R3, R4 destroyed.
+;
+;	Implicit outputs:
+;
+;	Many fields in the argument block portion of the BLB are initialized.
+;
+;	Completion codes:
+;
+;	Standard RMS - usually SUC or DME
+;
+;--
+RM$ALBLB::
+	MOVL	R10, R1			; Get free space header into R1.
+	MOVL	#BLB$C_BLN/4, R2	; Want length in longwords in R2.
+	BSBW	RM$GETBLK		; Get the block.
+	BLBC	R0, 10$			; Exit on error.
+	MOVB	#BLB$C_BID, BLB$B_BID(R1) ; Set BID.
+	MOVL	#4, BLB$L_RESDSC(R1)	; Stuff size of resource to 4.
+	MOVAL	BLB$L_VBN(R1),-		; Set address of resource name
+		BLB$L_RESDSC+4(R1)	; into descriptor.
+	INSQUE	(R1), @IFB$L_BLBBLNK(R10) ; Link into BLB queue.
+10$:
+	RSB
+
+	.SBTTL	RM$GETS0 - GET S0 POOL SPACE (PAGED OR NON-PAGED)
+
+;++
+;
+;	Functional Description:
+;
+;	this routine actually calls the system procedure which allocates the
+;	pages from the system paged pool.
+;		additional parameters for non-paged pool requests are:
+;			8(ap) - ast parameter (ifab/irab address)
+;
+;	Output Parameters:
+;		r0 - status code (1=success, 0=failure)
+;		r1 - starting address of space allocated
+;
+;	considerations:
+;
+;	this subroutine must run in kernel mode.  however, because rms runs in
+;	exec ring, no additional privileges are required for this subroutine.
+;
+;--
+;
+;--
+
+
+;
+;RM$GETS0::
+;	.word	^m<r2,r3,r4,r5,r6>		; entry mask
+;	movl	@#rms$gl_sfdbase,r6		; get sfd address
+;	movl	4(ap),r1			; get # of pages requested
+;	addl3	r1,sfd$l_pagecount(r6),r0	; get resultant pagecount
+;	cmpl	r0,sfd$l_pagelimit(r6)		; have we exceeded maximum?
+;	bgtr	notavail			; branch if yes
+;	movl	r0,sfd$l_pagecount(r6)		; set new pagecount into sfd
+;	ashl	#9,r1,r5			; convert size to bytes
+;	movab	511(r5),r1			; get extra space to assure
+;						; req amount is page-aligned
+;	jsb	@#exe$alopaged			; allocate the space
+;	blbc	r0,notavail1			; branch if memory not available
+;	addl3	r1,r2,r4			; save original ending addr
+;						; r1 = size, r2 = address
+;	movab	511(r2),r1			; round up starting addr
+;	bicw	#mask,r1			; page align starting addr
+;	pushl	r1				; save starting addr
+;	subl3	r2,r1,irp$w_size(r2)		; set up for deallocation
+;	beql	5$				; branch if nothing to
+;						; deallocate
+;	movl	r2,r0				; set up for deallocation
+;	jsb	@#exe$deapaged			; dealloc portion not page-align
+;5$:	ADDL3	(SP),R5,R0			; get ending addr
+;;
+;;	no check is made to avoid return of space to the paged pool after the
+;;	allocated buffer as there will always be at least one 16-byte
+;;	block left to return.
+;;
+;	subl3	r0,r4,irp$w_size(r0)		; set up for deallocation
+;	jsb	@#exe$deapaged			; dealloc portion not page-align
+;	movl	@#mmg$gl_sptbase,r3		; get system page table addr
+;	extzv	#va$v_vpn,#va$s_vpn,(sp),r0	; extract virtual page number
+;	movl	4(ap),r4			; get # of pages
+;15$:	MOVAL	(R3)+[R0],R1			; get addr of page table entry
+;	insv	#prt$c_ew,#pte$v_prot,#pte$s_prot,(r1) ; change prot to
+;						; exec write
+;	sobgtr	r4,15$				; loop through all pte's
+;	invalid					; invalidate xlation buffer
+;	ashl	#9,4(ap),r2			; get number of bytes alloc
+;	movc5	#0,(sp),#0,r2,@(sp)		; zero allocated space
+;	movl	(sp)+,r1			; move address into r1
+;	movl	#1,r0				; indicate success
+;	ret					; return
+;NOTAVAIL1:
+;	subl2	4(ap),sfd$l_pagecount(r6)	; readjust pagecount
+;NOTAVAIL:
+;	clrl	r0				; indicate failure
+;	ret					; return
+;	.page
+;	.sbttl	rm$gets0page - routine called to get s0 space
+;;++
+;;
+;;	functional description:
+;;
+;;	this routine is the one which is actually called to get s0 space.
+;;	this routine does a change mode to kernel (cmkrnl) and executes the
+;;	subroutine rm$gets0.
+;;
+;;	input parameters:
+;;
+;;		(sp)	- number of parameters given to the routine (always 1)
+;;		4(sp) 	- size of buffer requested (in pages)
+;;
+;;	output parameters:
+;;
+;;		r0 - status code (1=success, 0=failure)
+;;		r1,r2 destroyed
+;;		r3 - starting address of buffer allocated
+;;
+;;--
+;;
+;RM$GETS0PAGE::
+;	movl	(sp)+,r2			; save return pc
+;	assume cmkrnl$_nargs eq 2		;
+;	assume cmkrnl$_arglst eq 8		;
+;	$cmkrnl_s	rm$gets0,(sp)		; get the space from paged pool
+;	addl2	#8,sp				; adjust the stack
+;	movl	r1,r3				; set address of buffer in r3
+;	jmp	(r2)				; return
+;
+
+	.END
+

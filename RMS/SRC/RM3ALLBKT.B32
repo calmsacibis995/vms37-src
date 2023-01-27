@@ -1,0 +1,948 @@
+
+MODULE RM3ALLBKT (LANGUAGE (BLISS32) ,
+		IDENT = 'V03-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:	RMS32 INDEX SEQUENTIAL FILE ORGANIZATION
+!
+! ABSTRACT:
+!		This module handles the allocation of buckets and their formatting
+!
+!
+! ENVIRONMENT:
+!
+!		VAX/VMS OPERATING SYSTEM
+!
+!--
+
+!
+! AUTHOR:        D. H. Gillespie	     	28-Jul-1978
+!
+!
+! MODIFIED BY:
+!
+!	V02-010	TMK0001		Todd M. Katz		09-Feb-1982
+!		Fix linkage bug by describing the external routine
+!		RM$MAKESUM with ADDRESSING_MODE(RELATIVE).
+!
+!	V02-009	kpl0002		Peter Lieberwirth	23-Nov-1981
+!		Fix bug in v02-008.  Keep lock on area descriptor where
+!		commentary says to...
+!
+!	V02-008	kpl0001		Peter Lieberwirth	11-Aug-1981
+!		Add routines to reclaim buckets off the
+!		AVAIL list.  (space reclamation)
+!
+!	V02-007	MCN0011		Maria del C. Nasr	26-May-1981
+!		Add code to format prologue 3 buckets.
+!
+!	V02-006	REFORMAT	Frederick E. Deen, Jr.	23-Jul-1980
+!		This code was reformatted to adhere to RMS standards
+!
+!	V0004	RAN0005		R A Newell	24-Jan-1978
+!		Update high block on area extend
+!
+!
+! REVISION HISTORY:
+!
+!   Wendy Koenig, 	24-Oct-1978
+!   X0002 - Make changes caused by sharing conventions
+!
+!   Wendy Koenig, 	25-Jan-1979
+!   X0005 - Set valid on a new bkt
+!
+!*****
+
+LIBRARY 'RMSLIB:RMS';
+
+REQUIRE 'RMSSRC:RMSIDXDEF';
+
+
+! define default psects for code
+!
+
+PSECT
+    CODE = $$RMS3(PSECT_ATTR),
+    PLIT = $RMS3(PSECT_ATTR);
+
+! Linkage
+!
+
+LINKAGE
+    RL$LOCK_AREA 	= JSB () : GLOBAL (R_BDB, COMMON_RABREG, AREA_DESC = 7)
+    NOPRESERVE (2, 3),
+    L_AL_FRMT_BKT,
+    L_ALLOC_BKT,
+    L_ALLOC3,
+    L_CACHE,
+    L_CHKSUM,
+    L_MAKSUM,
+    L_RELEASE;
+
+LINKAGE
+    RL$GET_BKT		= JSB () :
+	GLOBAL (COMMON_RABREG, R_BDB, NEXT_RECID = 6),
+    RL$FORMAT_BKT	= JSB () : GLOBAL (COMMON_RABREG, R_IDX_DFN),
+    RL$GET_VBN		= JSB () : GLOBAL (COMMON_RABREG, VBN = 6),
+    RL$RECLAIM_BKT	= JSB () :
+	GLOBAL (R_IDX_DFN, COMMON_RABREG),
+    RL$CHECK_FOR_RO 	= JSB () :
+	GLOBAL (COMMON_RABREG, R_BDB, VBN = 6, AREA_DESC = 7);
+
+
+! Forward Routines
+!
+
+FORWARD ROUTINE
+    RM$LOCK_AREA	: RL$LOCK_AREA;
+
+
+! External Routines
+!
+
+EXTERNAL ROUTINE
+    RM$ALLOC3	: RL$ALLOC3,
+    RM$CACHE	: RL$CACHE,
+    RM$CHKSUM	: RL$CHKSUM,
+    RM$MAKSUM	: ADDRESSING_MODE(LONG_RELATIVE) RL$MAKSUM,
+    RM$RELEASE	: RL$RELEASE;
+
+ROUTINE GET_BKT (AREA_NO) : RL$GET_BKT =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine attempts to reclaim a bucket from the area AVAIL list.
+! 	it updates the area descriptor and writes it out to the disk if
+!	necessary.  It is called only by RECLAIM_BKT.
+!
+! CALLING SEQUENCE:
+!	GET_BKT (.AREA_NO);
+!
+! INPUT PARAMETERS:
+!	AREA_NO	- area from which to reclaim the bucket
+!
+! IMPLICIT INPUTS:
+!	IRAB	- address of internal RAB
+!	IFAB	- address of IFAB needed for I/O and prologue version
+!	IMPURE	- address of impure region(needed for I/O)
+!	IDX_DFN - index descriptor to get key of reference
+!
+! OUTPUT PARAMETERS:
+!	NEXT_RECID - value of lowest record id permitted for reclaimed bucket
+!
+! IMPLICIT OUTPUTS:
+!	IRAB[IRB$L_NXTBDB] - address of BDB describing new reclaimed and
+!			     partially formatted bucket.
+!
+! ROUTINE VALUE:
+!	various errors, including those from CACHE and RELEASE
+!
+! SIDE EFFECTS:
+!	If there is a reclaimable bucket, it is reclaimed.
+!	The area descriptor is updated and written to the disk.
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	NEXT_RECID = 6,
+	R_BDB_STR,
+	COMMON_RAB_STR;
+
+    GLOBAL REGISTER
+	AREA_DESC = 7	: REF BBLOCK;
+
+    ! Lock the area descriptor
+    !
+    RETURN_ON_ERROR( RM$LOCK_AREA( .AREA_NO ));
+
+    ! Check the available list for reclaimable buckets
+    !
+    IF .AREA_DESC[AREA$L_AVAIL] NEQU 0
+    THEN
+	BEGIN
+
+	LOCAL
+	    BUCKET	: REF BBLOCK,
+	    AVAIL_VBN,
+	    NEXT_VBN;
+
+	BEGIN
+
+	GLOBAL REGISTER
+	    R_BKT_ADDR_STR;
+
+	! Release the area descriptor with keep lock, so no one else tries
+	! to get our reclaimed VBN.
+	!
+	RETURN_ON_ERROR( RM$RELEASE(RLS$M_KEEP_LOCK) );
+
+	! Remember the available bucket
+	!
+	AVAIL_VBN = .AREA_DESC[AREA$L_AVAIL];
+
+	! Get the reclaimed bucket in the cache
+	!
+	RETURN_ON_ERROR( RM$CACHE( .AVAIL_VBN,
+				   .BBLOCK[.IRAB[IRB$L_CURBDB],BDB$W_NUMB],
+				   CSH$M_LOCK));
+
+	! Get from the reclaimed bucket the VBN of the next reclaimable bucket
+	! and the lowest record ID usable for this incarnation of the bucket.
+	!
+	BUCKET = .BDB[BDB$L_ADDR];
+
+	NEXT_VBN = .BUCKET[BKT$L_NXTBKT];
+
+	IF .IFAB[IFB$B_PLG_VER] LSSU PLG$C_VER_3
+	THEN
+	    NEXT_RECID = .BUCKET[BKT$B_NXTRECID]
+	ELSE
+	    NEXT_RECID = .BUCKET[BKT$W_NXTRECID];
+
+	END;					! of global register definition
+
+	! Release the reclaimed bucket, freeing space in the cache for the
+	! area descriptor again.
+	!
+	RETURN_ON_ERROR( RM$RELEASE(0) );
+
+	! Get the area descriptor again
+	!
+	RETURN_ON_ERROR( RM$LOCK_AREA( .AREA_NO ));
+
+	! Update the area descriptor avail listhead, calculate the new bucket
+	! checksum, and write the modified area descriptor back to disk.
+	!
+	! ** DO WE NEED TO BACK OUT THE AREA DESCRIPTOR IF THE SPLIT FAILS? **
+	!
+	AREA_DESC[AREA$L_AVAIL] = .NEXT_VBN;
+
+	RM$MAKSUM( .BDB[BDB$L_ADDR] );
+
+	BDB[BDB$V_VAL] = 1;
+	BDB[BDB$V_DRT] = 1;
+
+	RETURN_ON_ERROR( RM$RELEASE( RLS$M_WRT_THRU ));
+
+	BEGIN
+
+	GLOBAL REGISTER
+	    R_BKT_ADDR_STR;
+
+	! Now, get a free buffer to format the new bucket.  Note that we
+	! don't need to read in the reclaimed bucket again because we saved
+	! everything we needed from it the last time it was here.
+	!
+	RETURN_ON_ERROR( RM$CACHE( .AVAIL_VBN,
+				   .BBLOCK[.IRAB[IRB$L_CURBDB],BDB$W_NUMB],
+				   CSH$M_NOREAD OR CSH$M_LOCK));
+
+	END;				! of global register definition
+	IRAB[IRB$L_NXTBDB] = .BDB;
+
+	BDB[BDB$V_VAL] = 1;
+
+	RETURN 1;
+
+	END
+
+    ELSE
+
+	BEGIN
+
+	! Release the area descriptor after all
+	!
+	RETURN_ON_ERROR( RM$RELEASE (0));
+
+	RETURN 0;
+
+	END;
+
+    END;
+
+ROUTINE FORMAT_BKT (AREA_NO, RECORD_ID, NO_BYTES) : RL$FORMAT_BKT =
+
+!++
+!
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine begins the bucket formatting process.  It is called by
+!	RECLAIM_BKT and AL_FRMT_BKT.
+!
+! CALLING SEQUENCE:
+!	FORMAT_BKT( AREA_NO, RECORD_ID, NO_BYTES );
+!
+! INPUT PARAMETERS:
+!	AREA_NO		-	area from which to reclaim the bucket
+!	RECORD_ID	-	lowest record ID allowable for this bucket
+!	NO_BYTES	-	size in bytes of bucket to format
+!
+! IMPLICIT INPUTS:
+!	IFAB	- address of internal FAB
+!	IRAB	- address of internal RAB
+!	IDX_DFN - index descriptor to get key of reference
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	None
+!
+! ROUTINE VALUE:
+!	success
+!
+! SIDE EFFECTS:
+!	bucket partially formatted (see code)
+!
+!--
+    BEGIN
+
+    LOCAL
+	BUCKET : REF BBLOCK;
+
+    EXTERNAL REGISTER
+	COMMON_RAB_STR,
+	R_IDX_DFN_STR;
+
+    GLOBAL REGISTER
+	COMMON_IO_STR;
+
+    BUCKET = .BBLOCK[.IRAB[IRB$L_NXTBDB], BDB$L_ADDR];
+
+    CH$FILL(0, .NO_BYTES, .BUCKET);
+
+    BUCKET[BKT$W_ADRSAMPLE] = .(BBLOCK[.IRAB[IRB$L_NXTBDB], BDB$L_VBN])<0, 16>;
+
+    BUCKET[BKT$W_FREESPACE] = BKT$C_OVERHDSZ;
+	
+    IF .IFAB[IFB$B_PLG_VER] LSSU PLG$C_VER_3
+    THEN
+	BEGIN
+	BUCKET[BKT$B_AREANO] = .AREA_NO;		! area number is input
+	BUCKET[BKT$B_NXTRECID] = .RECORD_ID;
+	BUCKET[BKT$B_LSTRECID] = 255;
+	END
+    ELSE
+	BEGIN
+	BUCKET[BKT$B_INDEXNO] = .IDX_DFN[IDX$B_KEYREF];
+	BUCKET[BKT$W_NXTRECID] = .RECORD_ID;
+	END;
+
+    RETURN 1;
+
+    END;
+
+ROUTINE RECLAIM_BKT (AREA_NO) : RL$RECLAIM_BKT =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine serves as the high level control routine for bucket
+!	reclamation.  It calls the routine GET_BKT, which handles reading
+!	and updating the area descriptor if necessary.  This requires
+!	that the reclaimed bucket be read, in order to get the VBN of
+!	the next reclaimable VBN.  Finally, FORMAT_BKT is called to begin
+!	the process of formatting the bucket.
+!
+!	Note that this code will run faster if at least three buffers are
+!	available.  One is used for CURBDB, one for the area descriptor,
+!	and one for NXTBDB.  CURBDB represents the bucket being split,
+!	and NXTBDB represents the new bucket being split into.
+!
+! CALLING SEQUENCE:
+!	RECLAIM_BKT( .AREA_NO );
+!
+! INPUT PARAMETERS:
+!	AREA_NO	- area from which to reclaim the bucket
+!
+! IMPLICIT INPUTS:
+!	IRAB	- address of internal RAB
+!	IFAB	- address of IFAB needed for I/O and prologue version
+!	IMPURE	- address of impure region(needed for I/O)
+!	IDX_DFN - index descriptor to get key of reference
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	IRAB[IRB$L_NXTBDB] - address of BDB describing new reclaimed and
+!			     partially formatted bucket.
+!
+! ROUTINE VALUE:
+!	success or failure
+!
+! SIDE EFFECTS:
+!	None, see GET_BKT.
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	R_IDX_DFN_STR,
+	COMMON_RAB_STR;
+
+    GLOBAL REGISTER
+	COMMON_IO_STR,
+	NEXT_RECID = 6;
+
+    LOCAL
+	STATUS;
+
+    ! Go try to reclaim a bucket
+    !
+    STATUS = GET_BKT( .AREA_NO );
+
+    IF .STATUS
+    THEN
+	BEGIN
+
+	! Format the new bucket and return to caller
+	!
+	FORMAT_BKT( .AREA_NO, .NEXT_RECID,
+		    .BBLOCK[.IRAB[IRB$L_CURBDB], BDB$W_NUMB] );
+
+	RETURN 1;
+
+	END
+    ELSE
+	RETURN .STATUS;
+
+
+    END;
+
+ROUTINE CHECK_FOR_ROOM : RL$CHECK_FOR_RO =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine checks for room in current extent. If there is room,
+! 	it updates the area descriptor and writes it out to the disk returning
+!	the VBN to use.
+!
+! CALLING SEQUENCE:
+!	CHECK_FOR_ROOM()
+!
+! INPUT PARAMETERS:
+!	None
+!
+! IMPLICIT INPUTS:
+!	BDB		- address of BDB for area descriptor's buffer
+!	AREA_DESC	- address in memory of area descriptor
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	VBN		- number of VBN to use for bucket
+!			  if equal to zero, no room
+!
+! ROUTINE VALUE:
+!	various errors from RM$RELEASE
+!
+! SIDE EFFECTS:
+!	If there is room in current extention,
+!	the area descriptor is updated and written to the disk.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	NO_VBN;
+
+    EXTERNAL REGISTER
+	COMMON_RAB_STR,
+	R_BDB_STR,
+	AREA_DESC = 7	: REF BBLOCK,
+	VBN = 6;
+
+    NO_VBN = .AREA_DESC[AREA$B_ARBKTSZ];	! number of blocks needed
+    VBN = 0;
+
+    ! There is room when the number used and the number needed is less than
+    ! or equal to total # in extent.
+    !
+
+    IF (.AREA_DESC[AREA$L_USED] + .NO_VBN) LEQU .AREA_DESC[AREA$L_CNBLK]
+    THEN
+	BEGIN
+
+	! update # used
+	!
+	AREA_DESC[AREA$L_USED] = .AREA_DESC[AREA$L_USED] + .NO_VBN;
+	VBN = .AREA_DESC[AREA$L_NXTVBN];	! VBN to be used
+
+	! update next vbn to use
+	!
+	AREA_DESC[AREA$L_NXTVBN] = .AREA_DESC[AREA$L_NXTVBN] + .NO_VBN;
+	RM$MAKSUM(.BDB[BDB$L_ADDR]);		! recalculate checksum
+	BDB[BDB$V_VAL] = 1;		! write out updated area descriptor
+	BDB[BDB$V_DRT] = 1;
+
+	RETURN_ON_ERROR (RM$RELEASE(RLS$M_WRT_THRU));
+
+	END;
+
+    RETURN 1;
+
+    END;				! end of routine CHECK_FOR_ROOM
+
+
+GLOBAL ROUTINE RM$GET_VBN (AREA_NO) : RL$GET_VBN =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine attempts to allocate VBN's from the current extent, next it
+!	tries the next extents and then lastly extends the file.
+!
+! CALLING SEQUENCE:
+!	RM$GET_VBN(AREA_NO)
+!
+! INPUT PARAMETERS:
+!	AREA_NO 	- area number to allocate VBN from
+!
+! IMPLICIT INPUTS:
+!	IRAB		- address of internal RAB
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	VBN - VBN to use for bucket
+!
+! ROUTINE VALUE:
+!	None
+!
+! SIDE EFFECTS:
+!	None
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	STATUS;
+
+    GLOBAL REGISTER
+	R_BDB_STR,
+	AREA_DESC = 7	: REF BBLOCK;
+
+    EXTERNAL REGISTER
+	COMMON_RAB_STR,
+	VBN = 6;
+
+    IF .IRAB[IRB$L_NXTBDB] NEQ 0
+    THEN
+	RETURN RMSERR(BUG);
+
+    RETURN_ON_ERROR (RM$LOCK_AREA(.AREA_NO));
+
+    ! examine the primary and secondary extents
+    !
+
+    WHILE 1
+    DO
+	BEGIN
+
+	RETURN_ON_ERROR (CHECK_FOR_ROOM());
+
+	IF .VBN NEQ 0
+	THEN
+	    RETURN 1;
+
+	IF .AREA_DESC[AREA$L_NXT] EQL 0
+	THEN
+	    EXITLOOP;
+
+	AREA_DESC[AREA$L_CVBN] = .AREA_DESC[AREA$L_NXT];
+	AREA_DESC[AREA$L_CNBLK] = .AREA_DESC[AREA$L_NXBLK];
+	AREA_DESC[AREA$L_USED] = 0;
+	AREA_DESC[AREA$L_NXTVBN] = .AREA_DESC[AREA$L_CVBN];
+	AREA_DESC[AREA$L_NXT] = 0;
+	END;
+
+    ! The file must be extended.  Lock VBN 1.
+    !
+    BEGIN
+
+    LOCAL
+	SAV_BDB;
+
+    GLOBAL REGISTER
+	R_BKT_ADDR_STR;
+
+    SAV_BDB = .BDB;
+
+    RETURN_ON_ERROR (RM$CACHE(1, 0,
+	    CSH$M_NOREAD
+	    OR
+	    CSH$M_LOCK
+	    OR
+	    CSH$M_NOBUFFER));
+
+    IRAB[IRB$L_NXTBDB] = .BDB;
+    BDB = .SAV_BDB;			! end of local definition of SAV_BDB
+    END;
+
+    ! do extend
+    !
+    BEGIN
+
+    GLOBAL REGISTER
+	ENDVBNP1 = 2,
+	STARTVBN = 1;
+
+    STATUS = RM$ALLOC3();
+
+    IF .STATUS
+    THEN
+	BEGIN
+
+	! Update EOF block of file attributes
+	!
+	IFAB[IFB$L_EBK] = .ENDVBNP1;
+	IFAB[IFB$L_HBK] = .ENDVBNP1 - 1;
+
+	BEGIN
+
+	LOCAL
+	    PTR	: REF BBLOCK;
+
+	IF .IFAB[IFB$L_FRB_PTR] NEQ 0
+	THEN
+	    (PTR = .BBLOCK[.IFAB[IFB$L_FRB_PTR], FRB$L_SIFAB_PTR];
+	    PTR[SIFB$L_EBK] = .IFAB[IFB$L_EBK];
+	    PTR[SIFB$L_HBK] = .IFAB[IFB$L_HBK]);
+	END;
+
+	AREA_DESC[AREA$L_CNBLK] = .ENDVBNP1 - .STARTVBN;
+	AREA_DESC[AREA$L_USED] = 0;
+	AREA_DESC[AREA$L_CVBN] = .STARTVBN;
+	AREA_DESC[AREA$L_NXTVBN] = .STARTVBN;
+	AREA_DESC[AREA$L_NXT] = 0;
+	STATUS = CHECK_FOR_ROOM();
+
+	IF .STATUS
+	    AND
+	    .VBN EQL 0
+	THEN
+	    BEGIN
+	    RM$RELEASE(0);
+	    STATUS = RMSERR(FUL);
+	    END;
+
+	END
+    ELSE
+	BEGIN
+	RM$RELEASE(0);
+	END;
+    END;
+    ! If caller doesn't have VBN 1 locked for it's own usage, then unlock it.
+    !
+    BDB = .IRAB[IRB$L_NXTBDB];
+    IRAB[IRB$L_NXTBDB] = 0;
+
+    IF .BDB NEQ .IRAB[IRB$L_LOCK_BDB]
+    THEN
+	BEGIN
+	RM$RELEASE(0);
+	END;
+
+    RETURN .STATUS;
+
+    END;
+
+
+GLOBAL ROUTINE RM$AL_FRMT_BKT (AREA_NO, NO_BYTES) : RL$AL_FRMT_BKT =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine gets a bucket allocated in the given area.  The bucket is
+! 	cleared for its entire length and then the basic formatting is done.
+!
+! CALLING SEQUENCE:
+!	RM$AL_FRMT_BKT(AREA_NO, NO_BYTES)
+!
+! INPUT PARAMETERS:
+!	AREA_NO	- area number to allocate bucket from
+!	NO_BYTES - number of bytes in bucket
+!
+! IMPLICIT INPUTS:
+!	IRAB	- address of internal RAB
+!	RAB	- address of user RAB
+!	IFAB	- address of IFAB needed for I/O and prologue version
+!	IMPURE	- address of impure region(needed for I/O)
+!	IDX_DFN - index descriptor to get key of reference
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	IRAB[IRB$L_NXTBDB] - address of BDB describing newly allocated and
+!			     partially formatted bucket
+!
+! ROUTINE VALUE:
+!	Various I/O errors, extend errors
+!
+! SIDE EFFECTS:
+!	None
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_RAB_STR,
+	R_IDX_DFN_STR;
+
+    BEGIN
+
+    GLOBAL REGISTER
+	COMMON_IO_STR,
+	VBN = 6;
+
+    RETURN_ON_ERROR (RM$GET_VBN(.AREA_NO));
+
+    RETURN_ON_ERROR (RM$CACHE(.VBN, .NO_BYTES,
+	    CSH$M_NOREAD
+	    OR
+	    CSH$M_LOCK));
+
+    IRAB[IRB$L_NXTBDB] = .BDB;
+    BDB[BDB$V_VAL] = 1;				! mark the new bucket valid
+    END;					! end of GLOBAL REGISTER definition
+
+    ! Set up the bucket overhead fields
+    !
+    FORMAT_BKT( .AREA_NO, 1, .NO_BYTES );
+
+    RETURN 1;
+
+    END;
+
+
+GLOBAL ROUTINE RM$ALLOC_BKT : RL$ALLOC_BKT =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine allocates and formats a bucket for use by index sequential
+!	files.
+!
+! CALLING SEQUENCE:
+!	RM$ALLOC_BKT()
+!
+! INPUT PARAMETERS:
+!	None
+!
+! IMPLICIT INPUTS:
+!	IDX_DFN		- address of index descriptor for current key of reference
+!	IRAB		- address of internal RAB
+!	CURBDB		- address of BDB describing bucket which precedes bucket
+!			  about to be allocated and formatted
+!	IFAB		- address of IFAB needed for I/O and prologue version
+!	IMPURE		- address of impure region ( needed for I/O)
+!	RAB		- address of user's RAB
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	IRAB
+!		NXTBDB	- address of BDB describing newly allocated and formatted
+!			  bucket
+!
+! ROUTINE VALUE:
+!	Various I/O and extend errors
+!
+! SIDE EFFECTS:
+!	The new bucket is allocated from the area described by the index descriptor
+!	and the level of the bucket preceding it.  The new bucket has the same
+!	length as the previous one.  It's forward link becomes that of the previous
+!	one whereas the previous one's forward link is the newly allocated bucket.
+!	If the previous bucket was the last bucket on that level then the new
+!	bucket becomes the last.
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_RAB_STR,
+	R_IDX_DFN_STR;
+
+    LOCAL
+	BUCKET	: REF BBLOCK,
+	PREV_BKT	: REF BBLOCK;
+
+    PREV_BKT = .BBLOCK[.IRAB[IRB$L_CURBDB], BDB$L_ADDR];
+
+    ! The area number is either the data area number, the lower index area
+    ! number or the index area number.  This is done in a tricky way taking
+    ! advantage of the way the area numbers are allocated in memory.
+    !
+
+    BEGIN
+
+    LOCAL
+	AREA_NO;
+
+    AREA_NO = .PREV_BKT[BKT$B_LEVEL];
+
+    IF .AREA_NO GTRU 2
+    THEN
+	AREA_NO = 2;
+
+    AREA_NO = .(IDX_DFN[IDX$B_DANUM] - .AREA_NO)<0, 8>;
+
+    ! First try to reclaim a bucket from the AVAIL list, if that fails
+    ! try the extent logic.
+    !
+    IF NOT RECLAIM_BKT(.AREA_NO,
+	    .BBLOCK[.IRAB[IRB$L_CURBDB],
+		BDB$W_NUMB])
+    THEN
+	RETURN_ON_ERROR (RM$AL_FRMT_BKT(.AREA_NO,
+		.BBLOCK[.IRAB[IRB$L_CURBDB],
+		    BDB$W_NUMB]));
+
+    END;					! end of LOCAL definition
+
+    BUCKET = .BBLOCK[.IRAB[IRB$L_NXTBDB], BDB$L_ADDR];
+    BUCKET[BKT$B_LEVEL] = .PREV_BKT[BKT$B_LEVEL];
+    BUCKET[BKT$L_NXTBKT] = .PREV_BKT[BKT$L_NXTBKT];
+    PREV_BKT[BKT$L_NXTBKT] = .BBLOCK[.IRAB[IRB$L_NXTBDB], BDB$L_VBN];
+
+    IF .PREV_BKT[BKT$V_LASTBKT]
+    THEN
+	BEGIN
+	BUCKET[BKT$V_LASTBKT] = 1;
+	PREV_BKT[BKT$V_LASTBKT] = 0;
+	END;
+
+    RETURN 1;
+
+    END;					! end of routine
+
+
+GLOBAL ROUTINE RM$LOCK_AREA (AREA_NO) : RL$LOCK_AREA =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine locks the area prologue block for this area descriptor
+!	and makes a few basic checks on its validity.
+!
+! CALLING SEQUENCE:
+!	RM$LOCK_AREA(AREA_NO)
+!
+! INPUT PARAMETERS:
+!	AREA_NO	- area number to lock
+!
+! IMPLICIT INPUTS:
+!	None
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	BDB	- address of lock BDB
+!	AREA_DESC	- address within buffer of specified area
+!
+! ROUTINE VALUE:
+!	1	- success
+!	AID	- bad area number
+!	PLG	- read error on prologue block
+!	various hardware errors
+!
+! SIDE EFFECTS:
+!	None
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_RAB_STR,
+	R_BDB_STR,
+	AREA_DESC = 7	: REF BBLOCK;
+
+    LOCAL
+	AREA_VBN;
+
+    IF .AREA_NO<0, 8> GEQU .IFAB[IFB$B_AMAX]	! check range of input
+    THEN
+	RETURN RMSERR(AID);
+
+    ! Calculate the VBN in which this area descriptor is located
+    !
+    AREA_VBN = (.AREA_NO/8) + .IFAB[IFB$B_AVBN];
+    AREA_DESC = .AREA_NO AND %X'00000007';
+
+    ! Lock VBN containing area descriptor.
+    !
+    BEGIN
+
+    GLOBAL REGISTER
+	R_BKT_ADDR_STR;
+
+    RETURN_ON_ERROR (RM$CACHE(.AREA_VBN, 512, CSH$M_LOCK));
+
+    ! Set buffer invalid so that changes made to area descriptor need not be
+    ! backed out.
+    !
+    BDB[BDB$V_VAL] = 0;
+
+    RETURN_ON_ERROR ( RM$CHKSUM(), RM$RELEASE(0) );
+
+    ! calc location in buffer of area desc
+    !
+    AREA_DESC = (.AREA_DESC*AREA$K_BLN) + .BKT_ADDR;
+    END;
+
+    IF .AREA_DESC[AREA$B_AREAID] NEQ .AREA_NO<0, 8>
+    THEN
+	BEGIN
+	RM$RELEASE(0);
+	RETURN RMSERR(PLG);
+	END;					! end definition of BKT_ADDR
+
+    RETURN 1;
+
+    END;
+
+END
+
+ELUDOM

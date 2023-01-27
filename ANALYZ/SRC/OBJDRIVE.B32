@@ -1,0 +1,545 @@
+%title 'OBJDRIVE - Drive Analysis of Object Files'
+	module objdrive	(
+			ident='V03-000') = begin
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! Facility:	VAX/VMS Analyze Facility, Object File Analyzer
+!
+! Abstract:	This module is the main control for the analysis of object
+!		files.
+!
+!
+! Environment:
+!
+! Author: Paul C. Anagnostopoulos, Creation Date: 6 January 1981
+!
+! Modified By:
+!
+! , : Version
+! 01 -
+!--
+
+%sbttl 'Module Declarations'
+!
+! Libraries and Requires:
+!
+
+library 'starlet';
+require 'objexereq';
+
+!
+! Table of Contents:
+!
+
+forward routine
+	anl$object: novalue,
+	anl$object_positionals: novalue,
+	anl$object2: novalue,
+	anl$object_record_line: novalue,
+	anl$object_statistics: novalue;
+
+!
+! External References:
+!
+
+external routine
+	anl$error_count,
+	anl$format_error,
+	anl$format_hex,
+	anl$format_line,
+	anl$get_object_record,
+	anl$interact,
+	anl$object_eom,
+	anl$object_gsd,
+	anl$object_hdr,
+	anl$object_lnk,
+	anl$object_record_size,
+	anl$object_tir,
+	anl$open_next_object_file,
+	anl$prepare_report_file,
+	anl$report_line,
+	anl$report_page,
+	cli$get_value: addressing_mode(general),
+	cli$present: addressing_mode(general);
+
+!
+! Global Variables:
+!
+! The following variable tells people whether this is an interactive session.
+
+global
+	anl$gb_interactive: byte;
+
+!
+! Own Variables:
+!
+! The following variables contain various positional qualifier values.
+
+own
+	type_flag: bitvector[256],
+	range: vector[2,long];
+
+! The following flag tells us whether we are currently "within" a module.
+
+own
+	within_module: byte initial(false);
+
+! The following two vectors keep track of the count of each object record
+! type and the total bytes for each type. 
+
+own
+	record_count: vector[obj$c_maxrectyp+1,long]
+				initial(rep obj$c_maxrectyp+1 of (0)),
+	byte_total:   vector[obj$c_maxrectyp+1,long]
+				initial(rep obj$c_maxrectyp+1 of (0));
+
+%sbttl 'ANL$OBJECT - Control Analysis of Object Files'
+!++
+! Functional Description:
+!	This routine is responsible for controlling the analysis of object
+!	files.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$object: novalue = begin
+
+own
+	own_described_buffer(report_file_spec,nam$c_maxrss);
+
+local
+	status: long,
+	type_flag: bitvector[256],
+	range: vector[2,long];
+
+
+! Get the global qualifiers that can be specified for ANALYZE/OBJECT.
+! The first one is the /INTERACTIVE qualifier.
+
+anl$gb_interactive = cli$present(describe('INTERACTIVE'));
+
+! The second one is the /OUTPUT qualifier, specifying the report file
+! spec.  However, if this is an interactive session, we will use SYS$OUTPUT.
+
+if .anl$gb_interactive then
+	ch$copy(10,uplit byte ('SYS$OUTPUT'),
+		' ',.report_file_spec[len],.report_file_spec[ptr])
+else
+	cli$get_value(describe('OUTPUT'),report_file_spec);
+
+! We go into a loop, once through for each object file or library member.
+
+loop (
+	local
+		local_described_buffer(resultant_file_spec,nam$c_maxrss);
+
+	status = anl$open_next_object_file(resultant_file_spec);
+
+exitif (not .status);
+
+	! Prepare the file to receive the object analysis report.
+
+	anl$prepare_report_file(report_file_spec,resultant_file_spec,anl$_objheading);
+
+	! Analyze the object file.
+
+	anl$object2();
+);
+
+return;
+
+end;
+
+%sbttl 'ANL$OBJECT_POSITIONALS - Process Positional Qualifiers'
+!++
+! Functional Description:
+!	This routine is called by the OBJINPUT module whenever it scans
+!	off the next file spec from the command line.  We need to process
+!	positional qualifiers.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$object_positionals: novalue = begin
+
+local
+	all_types: byte;
+
+
+! First we process the qualifiers that specify which record types are to be
+! analyzed.  If none are specified, we analyze all records.  If any are
+! specified, we analyze only those specified.  NOTE that we always analyze
+! module headers and end-of-module records, as well as any invalid records.
+
+all_types = not cli$present(describe('DBG')) and
+	    not cli$present(describe('EOM')) and
+	    not cli$present(describe('GSD')) and
+	    not cli$present(describe('LNK')) and
+	    not cli$present(describe('MHD')) and
+	    not cli$present(describe('TBT')) and
+	    not cli$present(describe('TIR'));
+
+ch$fill(%x'ff', %allocation(type_flag),type_flag);
+type_flag[obj$c_dbg] = .all_types or cli$present(describe('DBG'));
+type_flag[obj$c_gsd] = .all_types or cli$present(describe('GSD'));
+type_flag[obj$c_lnk] = .all_types or cli$present(describe('LNK'));
+type_flag[obj$c_tbt] = .all_types or cli$present(describe('TBT'));
+type_flag[obj$c_tir] = .all_types or cli$present(describe('TIR'));
+
+! There used to be other positional qualifiers, but not any more.
+
+return;
+
+end;
+
+%sbttl 'ANL$OBJECT2 - Generate Object Analysis Report'
+!++
+! Functional Description:
+!	This routine is responsible for generating the analysis report
+!	for a single object file.  The object file is ready to read, and the
+!	report file is ready to write.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$object2: novalue = begin
+
+local
+	status: long,
+	record_number: long,
+	record_dsc: descriptor,
+	scanp: ref block[,byte],
+	type: byte;
+
+
+! This is the main record analysis loop.  We go through once for each record
+! in the object file.
+
+incru record_number from 1 do (
+
+	! Get the next object record.  If we reach end-of-file, we're done
+	! with this loop.
+
+	status = anl$get_object_record(record_dsc);
+
+exitif (not .status);
+
+	! See if there is a type code in the record.  If not, that's an error.
+
+	scanp = .record_dsc[ptr];
+	if .record_dsc[len] gtru 0 then (
+
+		! Now we know we have a record type, so we can see if the
+		! user wants to analyze it.  If so, select on the type code.
+		! If not, just ignore it.
+
+		if .type_flag[.scanp[obj$b_rectyp]] then (
+
+			selectoneu .scanp[obj$b_rectyp] of set
+			[obj$c_hdr]:	anl$object_hdr(.record_number,record_dsc);
+
+			[obj$c_gsd]:	anl$object_gsd(.record_number,record_dsc);
+
+			[obj$c_tir,
+			 obj$c_dbg,
+			 obj$c_tbt]:	anl$object_tir(.record_number,record_dsc);
+
+			[obj$c_eom,
+			 obj$c_eomw]:	anl$object_eom(.record_number,record_dsc);
+
+			[obj$c_lnk]:	anl$object_lnk(.record_number,record_dsc);
+
+			[otherwise]:	(anl$format_error(anl$_objbadtype,.record_number,.scanp[obj$b_rectyp]);
+					anl$format_hex(1,record_dsc););
+			tes;
+
+			! Make sure that this record isn't longer than the
+			! maximum specified in the module header.
+
+			anl$object_record_size(.record_dsc[len]);
+
+			! Skip a couple of lines to make it look nice.
+
+			anl$report_line(-1);
+			anl$report_line(-1);
+
+			! If this is an interactive session, let's find out if
+			! the user wants to continue or quit.
+
+			if .anl$gb_interactive then
+exitif (not anl$interact());
+
+		);
+
+	) else (
+
+		! There was no record type.  Tell the user.
+
+		anl$format_error(anl$_objnullrec,.record_number);
+		anl$report_line(-1);
+		anl$report_line(-1);
+	);
+
+);
+
+! We have read all the records of the object file.  If we are still within
+! a module, then an end-of-module record is missing.  We have to force one
+! so that various error checks can be made.
+
+if .within_module then (
+	anl$format_error(anl$_objeommissing);
+	anl$object_eom();
+	within_module = false;
+);
+
+! Now we can print the summary statistics on a new page.
+
+anl$report_page();
+anl$object_statistics();
+
+! Tell the user how many errors were uncovered.
+
+anl$error_count();
+
+! Finally, print the command line that was used to generate the report.
+
+begin
+local
+	local_described_buffer(command_line,80);
+
+cli$get_value(describe('$LINE'),command_line);
+anl$format_line(0,0,anl$_anything,command_line);
+end;
+
+return;
+
+end;
+
+%sbttl 'ANL$OBJECT_RECORD_LINE - Print Record Lines'
+!++
+! Functional Description:
+!	This routine is responsible for printing the major record line
+!	for each object record to be analyzed.  Because of this, the
+!	routine gets a good summary of the object file.  Thus it is also
+!	responsible for some simple checking of the order of records and
+!	some overall statistics.
+!
+! Formal Parameters:
+!	record_msg	The message code for the major record line.
+!	record_number	The number of this record.
+!	the_record	Address of descriptor of the record.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$object_record_line(record_msg,record_number,the_record): novalue = begin
+
+bind
+	record_dsc = .the_record: descriptor;
+
+local
+	scanp: ref block[,byte],
+	module_header: byte;
+
+
+! The record is guaranteed to be at least one byte long.  Therefore we can
+! always print the record line.
+
+anl$format_line(4,0,.record_msg,.record_number,.record_dsc[len]);
+
+! Now we want to check a little bit of the overall structure of the module
+! Split up depending upon whether we are within a module or not.
+
+scanp = .record_dsc[ptr];
+module_header = false;
+if .scanp[obj$b_rectyp] eqlu obj$c_hdr then
+	if .record_dsc[len] gequ 2 then
+		if .scanp[obj$b_subtyp] eqlu obj$c_hdr_mhd then
+			module_header = true;
+
+if not .within_module then (
+
+	! We are not within a module, so this had better be a module header.
+	! If not tell the user.
+
+	if not .module_header then
+		anl$format_error(anl$_objmhdmissing);
+	within_module = true;
+
+) else (
+
+	! We are within a module, so this had better not be a module header.
+	! If it is, tell the user.  If it is an end of module record, then
+	! we are done with the module.
+
+	if .module_header then
+		anl$format_error(anl$_objeommissing)
+	else
+		within_module = not (.scanp[obj$b_rectyp] eqlu obj$c_eom or
+				     .scanp[obj$b_rectyp] eqlu obj$c_eomw);
+);
+
+! Now we can collect some statistics.  For each record type, we will count
+! the number of such records and add up the number of bytes.
+
+increment (record_count[.scanp[obj$b_rectyp]]);
+byte_total[.scanp[obj$b_rectyp]] = .byte_total[.scanp[obj$b_rectyp]] + .record_dsc[len];
+
+return;
+
+end;
+
+%sbttl 'ANL$OBJECT_STATISTICS - Print Summary Statistics'
+!++
+! Functional Description:
+!	This routine is called to print the summary statistics with
+!	record counts and byte totals.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$object_statistics: novalue = begin
+
+own
+	type_msg: vector[obj$c_maxrectyp+1,long] initial(
+				uplit byte(%ascic 'HDR'),
+				uplit byte(%ascic 'GSD'),
+				uplit byte(%ascic 'TIR'),
+				uplit byte(%ascic 'EOM'),
+				uplit byte(%ascic 'DBG'),
+				uplit byte(%ascic 'TBT'),
+				uplit byte(%ascic 'LNK'),
+				uplit byte(%ascic 'EOMW'));
+
+local
+	i: long,
+	total_record_count: long,
+	total_byte_total: long;
+
+
+!  First we print some heading lines.
+
+anl$format_line(0,0,anl$_objstatheading1);
+anl$report_line(0);
+anl$format_line(0,0,anl$_objstatheading2);
+anl$report_line(0);
+
+! Now we loop through the statistics vectors and print a line for each one.
+! We also total the record count and byte total.
+
+total_record_count = total_byte_total = 0;
+incru i from 0 to obj$c_maxrectyp do (
+	anl$format_line(0,0,anl$_objstatline,.type_msg[.i],.record_count[.i],.byte_total[.i]);
+	total_record_count = .total_record_count + .record_count[.i];
+	total_byte_total   = .total_byte_total   + .byte_total[.i];
+);
+
+! Now we can print the totals.
+
+anl$report_line(0);
+anl$format_line(0,0,anl$_objstattotal,.total_record_count,.total_byte_total);
+anl$report_line(0);
+anl$report_line(0);
+
+! Finally, clear the statistics vectors for the next module.
+
+ch$fill(%x'00', %allocation(record_count),record_count);
+ch$fill(%x'00', %allocation(byte_total),  byte_total);
+
+return;
+
+end;
+
+end eludom

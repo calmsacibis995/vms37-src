@@ -1,0 +1,725 @@
+
+MODULE NXTVOL (LANGUAGE (BLISS32) ,
+		IDENT = 'V03-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  MTAACP
+!
+! ABSTRACT:
+!	This module gets the next volume for read and write
+!
+!
+! ENVIRONMENT:
+!
+!	VMS operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+
+!
+!
+! AUTHOR:  D. H. GILLESPIE,	 CREATION DATE:  20-AUG-1977
+!
+! MODIFIED BY:
+!
+!	V02-015 DMW00060	David Michael Walp	 7-Dec-1981
+!		Rename TRANSLATION_TABLE to ANSI_A_GOOD
+!
+!	V02-014 DMW00037	David Michael Walp	17-Sep-1981
+!		Set MVL entry used when GTNEXT_VOL_READ places the label
+!		in the MVL
+!
+!	V02-013 DMW00031	David Michael Walp	18-Aug-1981
+!		Volume Access project
+!
+!	V02-012 DMW00018	David Michael Walp	20-May-1981
+!		Checks for File-Set-Id changed to look at the MVL rather
+!		then VCB ( 1st mounted volume label ).
+!
+!	V02-011	REFORMAT	Maria del C. Nasr	30-Jun-1980
+!
+!	A0010	MCN0003		Maria del C. Nasr	15-Oct-1979   9:26
+!		Add HDR3 processing
+!
+!	A0009	ACG0047		Andrew C. Goldstein,	9-Aug-1979  14:17
+!		Protection check interface changes
+!
+!**
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+
+REQUIRE 'LIBD$:[VMSLIB.OBJ]MOUNTMSG.B32';
+
+REQUIRE 'SRC$:MTADEF.B32';
+
+LINKAGE
+    CHECK_PROT	 	= JSB (REGISTER = 0, REGISTER = 1, REGISTER = 2)
+				    : NOTUSED (3, 4, 5, 6, 7, 8, 9, 10, 11),
+    L$CHECK_HDR		= JSB : GLOBAL (SCRATCH = 9, CURRENT_VCB = 11)
+				    NOTUSED (7, 8, 10);
+
+FORWARD ROUTINE
+    CHECK_HDR		: L$CHECK_HDR,	    ! check that HDR can be overwritten
+    FORMAT_VOLOWNER	: NOVALUE,	    ! format the owner field in VOL1
+    GTNEXT_VOL_READ	: NOVALUE L$GTNEXT_VOL_RE,  ! get next volume for read
+    GTNEXT_VOL_WRIT	: NOVALUE L$GTNEXT_VOL_WR,  ! get next volume for write
+    INC_VOL_SECTION	: COMMON_CALL NOVALUE,	    ! incr rel vol and sect #
+    RESET_UNIT		: COMMON_CALL NOVALUE,
+    UPDATE_MVL_LBL	: COMMON_CALL NOVALUE;	    ! update label in MVL entry
+
+EXTERNAL
+    CURRENT_UCB		: REF BBLOCK,	    ! addr current unit control block
+    HDR1		: REF BBLOCK,	    ! addr of HDR1(EOF1) label
+    IO_PACKET		: REF BBLOCK,	    ! addr current I/O request packet
+    SCH$GL_PCBVEC	: REF VECTOR ADDRESSING_MODE (ABSOLUTE),
+    WORK_AREA;
+
+EXTERNAL ROUTINE
+    EXPIRED		: COMMON_CALL,		! determine if file has expired
+    ISSUE_IO		: L$ISSUE_IO,		! issue I/O
+    MOUNT_VOL		: COMMON_CALL,		! mount relative vol
+    PRINT_OPR_MSG	: L$PRINT_OPR_MSG,	! print a system mess for oper
+    READ_HDR		: COMMON_CALL,		! read headers
+    REWIND_AND_WAIT	: COMMON_CALL;
+
+GLOBAL ROUTINE GTNEXT_VOL_READ : NOVALUE L$GTNEXT_VOL_RE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine gets the next volume for read and checks that the file
+!	sequence number, file section number and volume set identifier
+! 	are those sought
+!
+! CALLING SEQUENCE:
+!	GTNEXT_VOL_READ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB - address of current volume control block
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	next relative volume mounted
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    LOCAL
+	VOLLBL	: BBLOCK [6],		! current tape volume label
+	FLAGS,
+	FID,				! file identifier
+	MVL_ENTRY,			! addr of current rel vol entry in MVL
+   	RVN,				! current relative volume number
+	MVL	: REF BBLOCK;		! magnetic tape volume list
+
+    FLAGS = $FIELDMASK(MOU$V_REWIND) OR $FIELDMASK(MOU$V_CHKIFSPC);
+    KERNEL_CALL(INC_VOL_SECTION);	! incr sequence # and relative vol #
+    FID = .CURRENT_VCB[VCB$L_CUR_FID];	! pickup current file id
+    RVN = .CURRENT_VCB[VCB$B_CUR_RVN];	! pickup cur relative volume #
+
+    WHILE 1
+    DO
+	BEGIN
+
+	LOCAL
+	    SCRATCH	: REF BBLOCK;
+
+	! mount vol, rewind it, check the label if the operator specifies it
+	!
+	MVL_ENTRY = MOUNT_VOL(.RVN, .FLAGS);
+
+	SCRATCH = .HDR1 + 240;
+	CH$MOVE(VL1$S_VOLLBL, SCRATCH[VL1$T_VOLLBL], VOLLBL);
+
+	IF NOT READ_HDR()
+	THEN
+	    BEGIN
+	    ERR_EXIT(SS$_TAPEPOSLOST);
+	    END;
+
+	! on read the next volume has the same volume set id and the fid of the
+	! next section for the current file
+	!
+	IF .FID NEQ .CURRENT_VCB[VCB$L_CUR_FID]
+	THEN
+	    PRINT_OPR_MSG(MOUN$_NOTRELVOL, 0, .CURRENT_VCB[VCB$B_CUR_RVN],
+			    BBLOCK[.CURRENT_UCB[UCB$L_DDB], DDB$T_NAME],
+			    .CURRENT_UCB[UCB$W_UNIT])
+
+	ELSE
+	    BEGIN
+
+	    ! pickup the addr of the MVL
+	    !
+	    MVL = .CURRENT_VCB[VCB$L_MVL];
+	    IF CH$NEQ(MVL$S_SET_ID, MVL[MVL$T_SET_ID],
+		      HD1$S_FILESETID, HDR1[HD1$T_FILESETID], ' ')
+	      AND
+
+		! not override set identifier with privs
+		!
+		NOT (	  .CURRENT_VCB[VCB$V_OVRSETID]
+		      AND .BBLOCK[ MVL+(MVL$C_LENGTH*(.RVN-1)),MVL$V_OVERIDE ])
+		      
+	    THEN
+		PRINT_OPR_MSG(MOUN$_NOTVOLSET, 0, 
+			      BBLOCK[.CURRENT_UCB[UCB$L_DDB],DDB$T_NAME],
+			      .CURRENT_UCB[UCB$W_UNIT], 6,
+			      MVL[MVL$T_SET_ID])
+
+	    ELSE
+		EXITLOOP;
+
+	    END;
+
+	FLAGS = $FIELDMASK(MOU$V_REWIND) + $FIELDMASK(MOU$V_MOUNTERR);
+	KERNEL_CALL(RESET_UNIT);
+	END;					! end of while loop
+
+    KERNEL_CALL(UPDATE_MVL_LBL, .MVL_ENTRY, VOLLBL);
+    END;					! end of routine
+
+
+GLOBAL ROUTINE GTNEXT_VOL_WRIT : NOVALUE L$GTNEXT_VOL_WR =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine gets the next volume for write.  The volume
+! 	is mounted, rewound and the label is verified. The VOL1
+!	label is rewritten to insure same density throughout volume set.
+!	The tape in initialized at the operator's request.
+!
+! CALLING SEQUENCE:
+!	GTNEXT_VOL_WRIT()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CURRENT_UCB - address of current unit control block
+!	CURRENT_VCB - address of current volume control block
+!	operator input
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	relative volume number incremented
+!	section number increment
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LITERAL
+	BLANK = 0,
+	INIT = 1;
+
+    LOCAL
+	ERROR_NO,
+	FLAGS,
+	MVL_ENTRY	: REF BBLOCK,
+	SAVE_DEVCHAR	: VECTOR [2],
+	OPR_FLAG	: BITVECTOR [2],
+	ACCESS_CHAR	: BYTE,
+	STATUS;
+
+    GLOBAL REGISTER
+	SCRATCH = 9	: REF BBLOCK;
+
+    BIND
+	MAIL = WORK_AREA	: BBLOCK [MSGSIZE],
+	MAILSZ = MAIL + MSGSIZE;
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    KERNEL_CALL(INC_VOL_SECTION);
+    SAVE_DEVCHAR[0] = .(CURRENT_UCB[UCB$B_DEVCLASS])<0, 32>;
+    SAVE_DEVCHAR[1] = .CURRENT_UCB[UCB$L_DEVDEPEND];
+    SCRATCH = .HDR1 + 240;
+    FLAGS = $FIELDMASK(MOU$V_REWIND);
+
+    WHILE 1
+    DO
+	BEGIN
+
+	WHILE 1
+	DO
+	    BEGIN
+
+	    ! mount the volume, check if overwrite is possible
+	    !
+	    MVL_ENTRY = MOUNT_VOL(.CURRENT_VCB[VCB$B_CUR_RVN], .FLAGS);
+
+	    ! set operator flag for "/INIT" and "/BLANK"
+	    !
+	    OPR_FLAG [ BLANK ] = (.MAIL [ OPC$W_MS_STATUS ] EQL 
+				    ( OPC$_BLANKTAPE AND %X'FFFF' ));
+	    OPR_FLAG [ INIT ]  = (.MAIL [ OPC$W_MS_STATUS ] EQL
+				    ( OPC$_INITAPE AND %X'FFFF' ));
+
+	    ! do not check things on "/BLANK"
+	    !
+	    IF .OPR_FLAG[BLANK] THEN EXITLOOP;
+
+	    ! see if we can overwrite the 1st file, save the VOL1 access
+	    ! character ( for defaulting ) before scratching the scratch area
+	    !
+	    ACCESS_CHAR = .SCRATCH [ VL1$B_VOLACCESS ];
+	    ERROR_NO    = CHECK_HDR(.MVL_ENTRY,.OPR_FLAG[INIT]);
+
+	    ! check on the results
+	    !
+	    IF .ERROR_NO OR (.OPR_FLAG[INIT] AND (.ERROR_NO EQL MOUN$_NOTANSI))
+	    THEN EXITLOOP;
+
+	    ! the tape is not ANSI without /INIT or /BLANK
+	    !
+	    PRINT_OPR_MSG(.ERROR_NO, 0,
+		    BBLOCK[.CURRENT_UCB[UCB$L_DDB],
+		    DDB$T_NAME], .CURRENT_UCB[UCB$W_UNIT]);
+
+	    ! force physical mount
+	    !
+	    FLAGS = $FIELDMASK(MOU$V_REWIND) + $FIELDMASK(MOU$V_MOUNTERR);
+	    KERNEL_CALL(RESET_UNIT);
+	    END;
+
+	ERROR_NO = MOUN$_IOERROR;
+
+	! try to initialize
+	!
+	IF REWIND_AND_WAIT()
+	THEN
+	    BEGIN
+
+	    ! fill with spaces
+	    !
+	    CH$FILL(' ', 80, .SCRATCH);
+
+	    ! put in constants
+	    !
+	    .SCRATCH = 'VOL1';
+	    (SCRATCH[VL1$T_VOLOWNER])<0, 32> = 'D%C ';
+	    SCRATCH[VL1$B_DECSTDVER] = '1';
+	    SCRATCH[VL1$B_LBLSTDVER] = '3';
+
+	    ! get the volume label from the MVL
+	    !
+	    CH$COPY(MVL$S_VOLLBL, MVL_ENTRY[MVL$T_VOLLBL], ' ',
+		    VL1$S_VOLLBL, SCRATCH[VL1$T_VOLLBL]);
+
+	    ! fill in the VOL owner field
+	    !
+	    FORMAT_VOLOWNER(.SCRATCH, .CURRENT_UCB[UCB$L_OWNUIC],
+			    .CURRENT_UCB[UCB$W_VPROT]);
+
+	    ! if the operator supplied a label, the ANSI volume access
+	    ! character from the MVL will be used, else the one currently
+	    ! on the tape will be used
+	    !
+	    IF (.MAILSZ NEQ 0) OR .OPR_FLAG [ INIT ] OR .OPR_FLAG [ BLANK ]
+	    THEN ACCESS_CHAR = .BBLOCK[.CURRENT_VCB[VCB$L_MVL],MVL$B_VOL_ACC];
+	    SCRATCH [ VL1$B_VOLACCESS ] = .ACCESS_CHAR;
+
+	    ! set the same characteristics
+	    !
+	    IF ISSUE_IO(IO$_SETMODE, SAVE_DEVCHAR, 0)
+	    THEN
+
+		! write the label
+		!
+		STATUS = ISSUE_IO(IO$_WRITELBLK, .SCRATCH, 80);
+
+	    ! if it worked exit ( all done )
+	    !
+	    IF .STATUS THEN EXITLOOP;
+
+	    IF .STATUS<0,16> EQL SS$_WRITLCK THEN ERROR_NO = MOUN$_WRITLCK;
+
+	    END;
+
+	PRINT_OPR_MSG(.ERROR_NO, 0,
+	    BBLOCK[.CURRENT_UCB[UCB$L_DDB], DDB$T_NAME],
+	    .CURRENT_UCB[UCB$W_UNIT]);
+
+	! force physical mount
+	!
+	FLAGS = $FIELDMASK(MOU$V_REWIND) + $FIELDMASK(MOU$V_MOUNTERR);
+	KERNEL_CALL(RESET_UNIT);
+	END;
+
+    END;					! end of routine
+
+
+ROUTINE INC_VOL_SECTION : COMMON_CALL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine increments the relative volume number
+! 	and the file section number
+!
+! CALLING SEQUENCE:
+!	INC_VOL_SECTION(), CALLED IN KERNEL MODE
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB - address of volume control block
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	CURRENT_VCB[VCB$B_CUR_RVN] incremented
+!	CURRENT_VCB[VCB$W_CUR_SEQ] incremented
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    CURRENT_VCB[VCB$B_CUR_RVN] = .CURRENT_VCB[VCB$B_CUR_RVN] + 1;
+    CURRENT_VCB[VCB$W_CUR_SEQ] = .CURRENT_VCB[VCB$W_CUR_SEQ] + 1;
+    CURRENT_VCB[VCB$B_TM] = 0;
+    CURRENT_VCB[VCB$L_ST_RECORD] = 0;
+    END;					! end of routine
+
+ROUTINE UPDATE_MVL_LBL (MVL_ENTRY, ADDR) : COMMON_CALL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine updates the relative volume label from the vol1 label
+!
+! CALLING SEQUENCE:
+!	UPDATE_MVL_LBL(ARG1,ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1 - address of mvl entry for current volume
+!	ARG2 - address of volume label on this tape volume
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+! USER ERRORS:
+!	NONE
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER COMMON_REG;
+
+    EXTERNAL 
+	ANSI_A_GOOD  : VECTOR [ , BYTE ];! translation table for ANSI 'a' char
+
+    MAP
+	MVL_ENTRY    : REF BBLOCK;
+
+    ! translate the label into upper case and put in ' ' for any non-ANSI
+    !  'a' characters found
+    !
+    CH$TRANSLATE (ANSI_A_GOOD, VL1$S_VOLLBL, .ADDR, ' ',
+			       MVL$S_VOLLBL, MVL_ENTRY [MVL$T_VOLLBL] );
+    MVL_ENTRY [ MVL$V_UNUSED ] = 0;
+    END;
+
+ROUTINE FORMAT_VOLOWNER (VOL_LABEL, OWNER, PROTECTION) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine formats the volume owner filed in vol1
+!
+! CALLING SEQUENCE:
+!	FORMAT_VOLOWNER(ARG1,ARG2,ARG3)
+!
+! INPUT PARAMETERS:
+!	ARG1 - address of vol1 label
+!	ARG2 - owner of tape
+!	ARG3 - tape protection
+!
+! IMPLICIT INPUTS:
+!	D%C preinitialized
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+! USER ERRORS:
+!	NONE
+!
+!--
+
+    BEGIN
+
+    MAP
+	VOL_LABEL	: REF BBLOCK,		! address of vol1 label
+	PROTECTION	: BITVECTOR;		! protection to be encoded on tape
+
+    LOCAL
+	DESCR	: VECTOR [2],			! descriptor
+	P;					! pointer
+
+    LITERAL
+	WORLD_WRITE = 13,
+	WORLD_READ = 12,
+	GROUP_WRITE = 9,
+	GROUP_READ = 8;
+
+    ! first convert binary owner to ascii
+    !
+    DESCR[0] = 10;
+    DESCR[1] = VOL_LABEL[VL1$T_VOLOWNER] + 3;
+    $FAO(DESCRIPTOR('!5OW!5OW'), 0, DESCR[0], .OWNER<16, 16>, .OWNER<0, 16>);
+
+    ! now format protection
+    !
+
+    IF NOT .PROTECTION[GROUP_READ]
+	OR
+	NOT .PROTECTION[WORLD_READ]
+    THEN
+	BEGIN
+	P = VOL_LABEL[VL1$T_VOLOWNER] + 8;
+	(.P)<0, 8> = .(.P)<0, 8> + ('A' - '0');
+	END;
+
+    ! now if group can also write, blank fill member field
+    !
+
+    IF NOT .PROTECTION[GROUP_WRITE]
+    THEN
+	CH$FILL(' ', 5, VOL_LABEL[VL1$T_VOLOWNER] + 8);
+
+    IF NOT .PROTECTION[WORLD_READ]
+    THEN
+	BEGIN
+	P = VOL_LABEL[VL1$T_VOLOWNER] + 3;
+	(.P)<0, 8> = .(.P)<0, 8> + ('A' - '0');
+	END;
+
+    IF NOT .PROTECTION[WORLD_WRITE]
+    THEN
+	CH$FILL(' ', 10, VOL_LABEL[VL1$T_VOLOWNER] + 3);
+
+    END;					! end of routine format_volowner
+
+ROUTINE CHECK_HDR ( MVL_ENTRY, SLASH_INIT ) : L$CHECK_HDR =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine checks that the tape can be overwritten.
+!
+! CALLING SEQUENCE:
+!	CHECK_HDR(ARG1,ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1 - address of current mounted volume entry
+!	ARG2 - is this a "/INIT"
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1 - ok to write
+!	various error codes
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+    BEGIN
+
+    MAP
+	MVL_ENTRY	: REF BBLOCK;
+
+    EXTERNAL REGISTER
+	SCRATCH = 9	: REF BBLOCK,
+	COMMON_REG;
+
+    BIND
+	USER_VOL_LABEL	= UPLIT ( 'UVL' ),	! user's volume labels code
+	VOLUME_LABEL	= UPLIT ( 'VOL' );	! other volume labels code
+
+    !  loop till we find HDR1
+    !
+    WHILE 1
+    DO
+	BEGIN
+
+	LOCAL STATUS;
+
+	STATUS = ISSUE_IO(IO$_READLBLK, .SCRATCH, 80);
+
+	IF (.STATUS<0,16> EQL SS$_ENDOFFILE) AND .SLASH_INIT
+	THEN RETURN TRUE;
+
+	IF (NOT .STATUS) AND (.STATUS<0,16> NEQ SS$_DATAOVERUN)
+	THEN RETURN MOUN$_IOERROR;
+
+	IF .(.SCRATCH) EQL 'HDR1' THEN EXITLOOP;
+
+	! if we do not see a valid member of the volume label group THEN FAIL
+	!
+	IF NOT (   ( CH$EQL ( 3, .SCRATCH, 3, USER_VOL_LABEL ))
+		OR ( CH$EQL ( 3, .SCRATCH, 3, VOLUME_LABEL ))
+	       )
+	THEN RETURN MOUN$_NOTANSI;
+
+	END;
+
+    IF NOT (   (.CURRENT_VCB[VCB$V_OVRACC] AND .MVL_ENTRY [ MVL$V_OVERIDE ] )
+	    OR
+	       (.SCRATCH[HD1$B_FILACCESS] EQL ' ')
+	   )
+    THEN RETURN MOUN$_ACCERR;
+
+    IF NOT (	(.CURRENT_VCB[VCB$V_OVREXP] AND .MVL_ENTRY [ MVL$V_OVERIDE ])
+	     OR
+		EXPIRED ( SCRATCH[HD1$T_EXPIREDT] )
+	   )
+    THEN RETURN  MOUN$_FILNOTEXP;
+
+    RETURN TRUE;
+
+    END;					! end of routine CHECK_HDR
+
+
+GLOBAL ROUTINE RESET_UNIT : COMMON_CALL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine resets the unit so that after an error message
+!	the same unit is choosen for mount
+!
+!
+! CALLING SEQUENCE:
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    IF .CURRENT_VCB[VCB$W_RVN] NEQ 0
+    THEN
+	CURRENT_VCB[VCB$W_RVN] = .CURRENT_VCB[VCB$W_RVN] - 1
+    ELSE
+	CURRENT_VCB[VCB$W_RVN] = .BBLOCK[.CURRENT_VCB[VCB$L_RVT], RVT$B_NVOLS]
+	- 1;
+
+    END;
+
+END
+
+ELUDOM

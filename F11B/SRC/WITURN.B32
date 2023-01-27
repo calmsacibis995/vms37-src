@@ -1,0 +1,606 @@
+MODULE WITURN (
+		LANGUAGE (BLISS32),
+		ADDRESSING_MODE (EXTERNAL = GENERAL),
+		IDENT = 'V03-007'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This module generates a window mapping the desired VBN from
+!	the supplied file header.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	CREATION DATE:  7-Dec-1976  14:38
+!
+! MODIFIED BY:
+!
+!	V03-007	ACG0285		Andrew C. Goldstein,	12-Apr-1982  16:58
+!		Correct cathedral window logic for empty headers
+!
+!	V03-006	LMP0016		L. Mark Pilant,		25-Mar-1982  13:23
+!		Remove diddling of the COMPLETE bit in the window segments.
+!
+!	V02-005	LMP0013		L. Mark Pilant,		14-Mar-1982  13:25
+!		Fix window building logic to correctly handle Cathedral
+!		windows as well as the garden variety windows.
+!
+!	V02-004	ACG0229		Andrew C. Goldstein,	23-Dec-1981  21:13
+!		Move counting of window turn to MAPVBN
+!
+!	V02-003 LMP0003		L. Mark Pilant,		17-Nov-1981  14:35
+!		Added cathedral (segmented) window support.
+!
+!	V02-002	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:28
+!		Previous revision history moved to F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+!
+! Lock the code into the working set since this routine runs at raised IPL.
+!
+
+LOCK_CODE;
+
+GLOBAL ROUTINE TURN_WINDOW (WINDOW, HEADER, DESIRED_VBN, START_VBN) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine scans the map area of the supplied file header
+!	and builds retrieval pointers in the window until
+!	(1) the entire header has been scanned, or
+!	(2) the first retrieval pointer in the window maps the desired VBN
+!
+! CALLING SEQUENCE:
+!	TURN_WINDOW (ARG1, ARG2, ARG3, ARG4)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of window block or 0 if to be created
+!	ARG2: address of file header
+!	ARG3: desired VBN
+!	ARG4: starting VBN of file header
+!
+! IMPLICIT INPUTS:
+!	CURRENT_RVN: RVN of current volume
+!
+! OUTPUT PARAMETERS:
+!	updated window
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	address of created window
+!	or 1 if none created
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+MAP
+	WINDOW		: REF BBLOCK,	! pointer to window
+	HEADER		: REF BBLOCK;	! pointer to file header
+
+LINKAGE
+	L_MAP_POINTER	= JSB :
+			  GLOBAL (COUNT = 6, LBN = 7, MAP_POINTER = 8);
+
+GLOBAL REGISTER
+	COUNT		= 6,		! retrieval pointer count
+	LBN		= 7,		! retrieval pointer start LBN
+	MAP_POINTER	= 8 : REF BBLOCK; ! pointer to scan header map area
+
+LABEL
+	WINDOW_INIT,			! window initialization logic
+	MAP_BUILD;			! loop to build window map
+
+LOCAL
+	WINDOW_BUFFER	: BBLOCK [MAX_WINDOW*6], ! buffer in which to build window
+	POINTER_COUNT,			! count of pointers in window
+	WINDOW_SIZE,			! size of window in pointers
+	BASE_VBN,			! starting VBN in window
+	VBN,				! VBN in scanning window
+	W_POINTER	: REF BBLOCK,	! pointer to scan window
+	M_POINTER	: REF BBLOCK,	! previous header pointer
+	NEW_WINDOW	: REF BBLOCK,	! address of newly allocated window
+	WINDOW_COUNT,			! number of block mapped by the window
+	PRIMARY_WINDOW	: REF BBLOCK;	! address of the primary window segment
+
+MACRO
+	WINDOW_MAP	= (.WINDOW+WCB$C_MAP)%;	!start of window map area
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR,	! Cleanup action and status flags
+	CURRENT_RVN,			! RVN of current volume
+	CURRENT_WINDOW	: REF BBLOCK;	! address of the current primary window
+
+EXTERNAL ROUTINE
+	ALLOCATE;			! allocate system dynamic memory
+
+EXTERNAL ROUTINE
+	GET_MAP_POINTER	: L_MAP_POINTER; ! get value of next header map pointer
+
+! There are two general cases that can occur upon entering the window turner:
+! 1) a window previously exists, in which case things get a little messy; or
+! 2) no window previously exists, in which case things are very simply.
+!
+
+W_POINTER = WINDOW_BUFFER;
+WINDOW_COUNT = 0;
+
+M_POINTER = 0;
+MAP_POINTER = .HEADER + .HEADER[FH2$B_MPOFFSET] * 2;	! point to map area
+
+IF .WINDOW EQL 0
+THEN
+
+! Create a new window.  All that is necessary is to initialize a few variables
+! and pointers and then start reading the file header.
+!
+
+    BEGIN
+    BASE_VBN = .START_VBN;
+    WINDOW_SIZE = MAX_WINDOW;
+    PRIMARY_WINDOW = NEW_WINDOW = 0;
+    POINTER_COUNT = 0;
+    END
+ELSE
+
+! Use an existing window.  Several situation may occur in this case: 1) the
+! window must be turned to point to a different portion of the file; 2) the
+! header contains pointers which may be added after truncating the existing
+! window, this usually occurs when a file is extended without causing a new
+! file header to be created; 3) the desired VBN is less than the specifed
+! starting VBN and the starting VBN is greater than 1, this occurs when a
+! file is extended and a new file header had to be created; or 4) the window
+! already maps a portion of the header and only the new pointers (which may
+! include a partial map pointer if two contiguous extents were collapsed into
+! one map pointer in the header).
+!
+
+    WINDOW_INIT: BEGIN
+    BASE_VBN = .WINDOW[WCB$L_STVBN];
+    WINDOW_SIZE = MINU ((.WINDOW[WCB$W_SIZE] - WCB$C_LENGTH) / 6, MAX_WINDOW);
+    PRIMARY_WINDOW = NEW_WINDOW = .WINDOW;
+    POINTER_COUNT = .WINDOW[WCB$W_NMAP];
+    CH$MOVE (.POINTER_COUNT * 6, WINDOW_MAP, WINDOW_BUFFER);	! copy current
+    VBN = .BASE_VBN;
+
+    IF .START_VBN LEQU .VBN
+    OR
+
+! Determine if the existing window may be truncated.
+!
+
+	BEGIN
+	INCR J FROM 1 TO .POINTER_COUNT
+	DO
+	    BEGIN
+	    VBN = .VBN + .W_POINTER[WCB$W_COUNT];	! VBN at the end of the pointer
+	    WINDOW_COUNT = .WINDOW_COUNT + .W_POINTER[WCB$W_COUNT];
+	    W_POINTER = .W_POINTER + 6;
+	    IF .START_VBN EQL .VBN
+	    THEN
+		BEGIN
+		POINTER_COUNT = .J;			! note where window truncated
+		LEAVE WINDOW_INIT;
+		END;
+	    END;
+	NOT .WINDOW[WCB$V_CATHEDRAL]
+	END
+    THEN
+
+! Either the window cannot be truncated or the header maps before the beginning
+! of the existing window.  In the latter case if cathedral windows are not in
+! use the window may be discarded; if cathedral windows are in use then it is
+! possible that a beginning portion of the header may be discarded.
+!
+	BEGIN
+	IF .WINDOW[WCB$V_CATHEDRAL]
+	THEN
+	    BEGIN
+	    IF .BASE_VBN EQL .START_VBN
+	    THEN
+		BEGIN
+		POINTER_COUNT = 0;
+		LEAVE WINDOW_INIT;
+		END;
+	    IF
+		BEGIN
+		VBN = .START_VBN;
+		UNTIL .MAP_POINTER GEQA .HEADER + (.HEADER[FH2$B_MPOFFSET] + .HEADER[FH2$B_MAP_INUSE]) * 2
+		DO
+		    BEGIN
+		    M_POINTER = .MAP_POINTER;
+		    GET_MAP_POINTER ();
+		    IF .BASE_VBN GEQ .VBN
+		    AND .BASE_VBN LSS .VBN + .COUNT
+		    THEN
+			BEGIN
+			MAP_POINTER = .M_POINTER;	! back up the header pointer
+			POINTER_COUNT = 0;
+			LEAVE WINDOW_INIT;
+			END;
+		    VBN = .VBN + .COUNT;
+		    END
+		END
+	    THEN BUG_CHECK (WCBFCBMNG, FATAL, 'WCB/FCB correspondence broken');
+	    END
+	ELSE
+	    BEGIN
+	    IF .VBN EQLU .BASE_VBN
+	    AND .DESIRED_VBN LSSU .START_VBN
+	    AND .START_VBN GTRU 1
+	    THEN RETURN 1;			! note window already best fit
+	
+! The header maps before the existing window and cathedral windows are not in
+! use, or a window truncation was attempted and starting VBN of the FCB was not
+! found in the window.  In either case a new window must be formed.
+!
+
+	    POINTER_COUNT = 0;
+	    WINDOW_COUNT = 0;
+	    BASE_VBN = .START_VBN;
+	    W_POINTER = WINDOW_BUFFER;
+	    END;
+	END;
+    END;					! end of block WINDOW_INIT
+
+! The window is now suitably initialized. Set up necessary pointers.
+! Now scan the map area, extracting retrieval pointers.
+!
+
+MAP_BUILD: BEGIN
+UNTIL .MAP_POINTER GEQA .HEADER + (.HEADER[FH2$B_MPOFFSET] + .HEADER[FH2$B_MAP_INUSE]) * 2
+DO
+    BEGIN
+
+    GET_MAP_POINTER ();
+
+! If the existing window's first map pointer is part of a set needed to map
+! a map pointer from the header (this only occurs if the map pointer from the
+! file header maps more than 65535 blocks), it is necessary to adjust the
+! block count and LBN returned from the header.
+!
+
+    IF .M_POINTER NEQ 0
+    THEN
+	BEGIN
+	COUNT = .COUNT - (.BASE_VBN - .VBN);
+	LBN = .LBN + (.BASE_VBN - .VBN);
+	M_POINTER = 0;				! only needed once
+	END;
+
+! Build new retrieval pointers, using as many as needed to run out the
+! count. If the window is full, and segmented windows are not allowed,
+! shuffle the entries up by one. If this would cause the pointer mapping
+! the desired VBN to fall off the top, we are done. If segmented windows
+! are allowed, write out the current segment, allocate room for the next
+! segment, reset the critical counts and pointers, and continue on my
+! merry way.
+!
+
+    IF .COUNT NEQ 0
+    THEN
+	WHILE 1 DO
+	BEGIN
+	IF .POINTER_COUNT GEQU .WINDOW_SIZE
+	THEN
+	    BEGIN
+	    IF .WINDOW NEQ 0 AND NOT .WINDOW[WCB$V_CATHEDRAL]
+	    THEN
+		BEGIN
+		CLEANUP_FLAGS[CLF_INCOMPLETE] = 1;
+		IF .BASE_VBN + .WINDOW_BUFFER[WCB$W_COUNT] GTRU .DESIRED_VBN
+		THEN LEAVE MAP_BUILD;
+
+		POINTER_COUNT = .POINTER_COUNT - 1;
+		BASE_VBN = .BASE_VBN + .WINDOW_BUFFER[WCB$W_COUNT];
+		CH$MOVE (.POINTER_COUNT*6, WINDOW_BUFFER+6, WINDOW_BUFFER);
+		W_POINTER = .W_POINTER - 6;
+		END
+	    ELSE
+		BEGIN
+		LOCAL	TEMP_LINK	: REF BBLOCK;	! addr of temp window link
+		IF .PRIMARY_WINDOW EQL 0
+		THEN
+		    BEGIN
+		    PRIMARY_WINDOW = NEW_WINDOW = ALLOCATE ((MAXU (.POINTER_COUNT, MIN_WINDOW))
+							    * 6 + WCB$C_LENGTH, WCB_TYPE);
+		    IF .NEW_WINDOW EQL 0
+		    THEN
+			BEGIN
+			CLEANUP_FLAGS[CLF_INCOMPLETE] = 1;
+			RETURN 0;
+			END;
+		    END;
+		IF .NEW_WINDOW[WCB$L_LINK] NEQ 0
+		THEN TEMP_LINK = .NEW_WINDOW[WCB$L_LINK]
+		ELSE
+		    BEGIN
+		    WINDOW_SIZE = MAX_WINDOW;
+		    TEMP_LINK = ALLOCATE (.WINDOW_SIZE * 6 + WCB$C_LENGTH, WCB_TYPE);
+		    IF .TEMP_LINK EQL 0
+		    THEN
+			BEGIN
+			CLEANUP_FLAGS[CLF_INCOMPLETE] = 1;
+			LEAVE MAP_BUILD;
+			END;
+		    END;
+		SET_IPL (IPL$_SYNCH);
+
+! Copy the needed information from the previous window segment.
+!
+
+		TEMP_LINK[WCB$L_PID] = .NEW_WINDOW[WCB$L_PID];
+		TEMP_LINK[WCB$L_ORGUCB] = .NEW_WINDOW[WCB$L_ORGUCB];
+		TEMP_LINK[WCB$W_ACON] = .NEW_WINDOW[WCB$W_ACON];
+		TEMP_LINK[WCB$L_FCB] = .NEW_WINDOW[WCB$L_FCB];
+		TEMP_LINK[WCB$B_ACCESS] = .NEW_WINDOW[WCB$B_ACCESS];
+		TEMP_LINK[WCB$L_RVT] = .NEW_WINDOW[WCB$L_RVT];
+
+! Finish up the current segment and create another.
+!
+
+		NEW_WINDOW[WCB$L_LINK] = .TEMP_LINK;
+		NEW_WINDOW[WCB$V_CATHEDRAL] = 1;
+		NEW_WINDOW[WCB$W_NMAP] = .POINTER_COUNT;
+		NEW_WINDOW[WCB$L_STVBN] = .BASE_VBN;
+		CH$MOVE (.POINTER_COUNT*6, WINDOW_BUFFER, .NEW_WINDOW+WCB$C_MAP);
+		NEW_WINDOW = .NEW_WINDOW[WCB$L_LINK];
+		BASE_VBN = .BASE_VBN + .WINDOW_COUNT;
+		NEW_WINDOW[WCB$L_WLFL] = 0;	! note that link not in queue
+		NEW_WINDOW[WCB$W_NMAP] = 0;
+		NEW_WINDOW[WCB$L_STVBN] = .BASE_VBN;
+		NEW_WINDOW[WCB$V_CATHEDRAL] = 1;
+		SET_IPL (0);
+		W_POINTER = WINDOW_BUFFER;
+		POINTER_COUNT = 0;
+		WINDOW_COUNT = 0;
+		END;
+	    END;
+
+! Finally build the pointer and count it.
+!
+
+	W_POINTER[WCB$W_COUNT] = MINU (.COUNT, 65535);
+	WINDOW_COUNT = .WINDOW_COUNT + .W_POINTER[WCB$W_COUNT];
+	W_POINTER[WCB$L_LBN] = .LBN;
+	(W_POINTER[WCB$L_LBN])<24,8> = .CURRENT_RVN;
+	W_POINTER = .W_POINTER + 6;
+	POINTER_COUNT = .POINTER_COUNT + 1;
+	LBN = .LBN + 65535;
+	COUNT = .COUNT - MINU (.COUNT, 65535);
+	IF .COUNT EQL 0 THEN EXITLOOP;
+	END;
+
+    END;					! end of header scan loop
+END;						! end of block MAP_BUILD
+
+! Having built a new window in the buffer, update the real one. Then interlock
+! the system data base and copy the buffer into the window.
+!
+
+IF .NEW_WINDOW EQL 0
+THEN
+    BEGIN
+    IF .WINDOW EQL 0
+    THEN
+	BEGIN
+	PRIMARY_WINDOW =  NEW_WINDOW = ALLOCATE ((MAXU (.POINTER_COUNT, MIN_WINDOW))
+						 * 6 + WCB$C_LENGTH, WCB_TYPE);
+	IF .NEW_WINDOW EQL 0
+	THEN
+	    BEGIN
+	    CLEANUP_FLAGS[CLF_INCOMPLETE] = 1;
+	    RETURN 0;
+	    END;
+	NEW_WINDOW[WCB$V_CATHEDRAL] = 1;
+	END
+    ELSE NEW_WINDOW = .WINDOW;
+    END;
+
+SET_IPL (IPL$_SYNCH);
+NEW_WINDOW[WCB$W_NMAP] = .POINTER_COUNT;
+NEW_WINDOW[WCB$L_STVBN] = .BASE_VBN;
+CH$MOVE (.POINTER_COUNT*6, WINDOW_BUFFER, .NEW_WINDOW+WCB$C_MAP);
+SET_IPL (0);					! unlock the data base
+
+IF .WINDOW EQL 0
+THEN RETURN .PRIMARY_WINDOW
+ELSE RETURN 1;
+
+END;						! end of routine TURN_WINDOW
+
+GLOBAL ROUTINE MARK_INCOMPLETE (FIRST_BLOCK) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine starts from the specified window and marks all
+!	successive windows in the list as being incomplete.  The list
+!	may start with the CURRENT_WINDOW; in which case the current
+!	and all successive window segments are marked as incomplete.
+!	It may also start with the PRIMARY_FCB; in which case all the
+!	window segments associated with the file are marked incomplete.
+!
+! CALLING SEQUENCE:
+!	MARK_INCOMPLETE (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of the first block in the list (either a WCB or FCB)
+!
+! IMPLICIT INPUTS:
+!	none
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	none
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	none
+!
+!--
+
+BEGIN
+
+MAP
+	FIRST_BLOCK	: REF BBLOCK;		! address of the first block
+
+LOCAL
+	POINTER		: REF BBLOCK;		! address of the current block
+
+! Determine what type of block the first one is.  If it is an FCB then it is
+! necessary to traverse the WCB queue and mark all the WCB's associated with
+! the FCB as incomplete.  If it is a WCB then simply follow the links marking
+! the WCB's as incomplete until a zero link is found.
+!
+
+SELECTONE .FIRST_BLOCK[WCB$B_TYPE] OF
+    SET
+
+    [DYN$C_WCB]:	BEGIN
+			SET_IPL (IPL$_SYNCH);
+			POINTER = .FIRST_BLOCK;
+			DO
+			    BEGIN
+			    IF .POINTER[WCB$B_TYPE] NEQ DYN$C_WCB
+			    THEN BUG_CHECK (NOTWCBWCB, FATAL, 'Currupted WCB list');
+			    POINTER[WCB$V_COMPLETE] = 0;
+			    POINTER = .POINTER[WCB$L_LINK];
+			    END
+			UNTIL .POINTER EQL 0;
+			SET_IPL (0);
+			RETURN;
+			END;
+
+    [DYN$C_FCB]:	BEGIN
+			SET_IPL (IPL$_SYNCH);
+			POINTER = .FIRST_BLOCK[FCB$L_WLFL];
+			UNTIL .POINTER EQL FIRST_BLOCK[FCB$L_WLFL]
+			DO
+			    BEGIN
+			    IF .POINTER[WCB$B_TYPE] NEQ DYN$C_WCB
+			    THEN BUG_CHECK (NOTWCBWCB, FATAL, 'Currupted WCB list');
+			    POINTER[WCB$V_COMPLETE] = 0;
+			    POINTER = .POINTER[WCB$L_WLFL];
+			    END;
+			SET_IPL (0);
+			RETURN;
+			END;
+
+    [OTHERWISE]:	BUG_CHECK (WCBFCBMNG, FATAL, 'WCB/FCB correspondence broken');
+
+    TES
+
+END;						! end of routine MARK_INCOMPLETE
+
+GLOBAL ROUTINE MARK_COMPLETE (WINDOW) : NOVALUE =
+
+!++
+!
+! ROUTINE DESCRITION:
+!
+!	This routine is used to mark the specified window as complete.
+!	It must be execured in kernel mode.
+!
+! CALLING SEQUENCE:
+!	MARK_COMPLETE (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of the window list to mark
+!
+! IMPLICIT INPUTS:
+!	none
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	none
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	none
+!
+!--
+
+BEGIN
+
+MAP
+	WINDOW		: REF BBLOCK;		! address of the window to mark
+
+LOCAL
+	NEXT_SEGMENT	: REF BBLOCK;		! address of the next segment
+
+NEXT_SEGMENT = .WINDOW;
+
+SET_IPL (IPL$_SYNCH);
+
+DO
+    BEGIN
+    NEXT_SEGMENT[WCB$V_COMPLETE] = 1;		! mark as complete
+    NEXT_SEGMENT = .NEXT_SEGMENT[WCB$L_LINK];
+    END
+UNTIL .NEXT_SEGMENT EQL 0;
+
+SET_IPL (0);
+
+RETURN;
+
+END;						! end of routine MARK_COMPLETE
+
+END
+ELUDOM

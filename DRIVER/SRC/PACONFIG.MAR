@@ -1,0 +1,2002 @@
+	.TITLE	PACONFIG
+	.IDENT	'V03-004'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1981, 1982                                                *
+;*  BY DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASS.			    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND  COPIED  *
+;*  ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH  LICENSE AND WITH THE  *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR  ANY  OTHER  *
+;*  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY  *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE  IS  HEREBY  *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE  WITHOUT  NOTICE  *
+;*  AND  SHOULD  NOT  BE  CONSTRUED  AS  A COMMITMENT BY DIGITAL EQUIPMENT  *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF  ITS  *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; FACILITY:
+;
+;	VAX/VMS EXECUTIVE, I/O DRIVERS
+;
+; ABSTRACT:  CI CLUSTER CONFIGURATION DATABASE MAINTENANCE
+;
+; AUTHOR:  N. KRONENBERG,  MAY 1981
+;
+; MODIFIED BY:
+;
+;	V03-004	NPK2020		N. Kronenberg		23-Apr-1982
+;		Modified ENTER_PB to discard formative PB for system
+;		that is already in the database but with a different
+;		incarnation number.  Prevents configuration of two
+;		different systems that have the same system ID.
+;
+;	V03-003	NPK2019		N. Kronenberg		9-Apr-1982
+;		Fixed PB allocation failure bug.
+;		Made PB lookup failure in CNF$DGREC recoverable.
+;	
+;	V03-002	NPK2018		N. Kronenberg		25-Mar-1982
+;		Fixed to use short datagrams instead of LRP's for
+;		REQID and SETCKT's.
+;		Fixed to not do start handshake with remote port
+;		in other than an enabled state.  If IDREC arrives
+;		from port to which VC is open and remote port is
+;		in other than an enabled state, crash the VC.
+;		Updated format of start/stack dg.
+;		Modify to allocate and attach a dg pkt to each
+;		PB for use during VC crash.
+;
+;	V03-001	NPK2016		N. Kronenberg		18-Mar-1982
+;		Fixed .TITLE
+;
+;--
+
+;++
+; This module of the CI port driver is responsible for polling the
+; nodes in the cluster for new arrivals and for conducting the
+; START handshake protocol necessary to opening port-port virtual 
+; circuits to new nodes.
+;
+; The system wide configuration database consists of:
+;
+;
+;	SCS$GQ_CONFIG
+;	     |
+;	     v
+;	System Block ----> Path Block ----> Path Block ---->...
+;	     |
+;	     v
+;	System Block ----> Path Block ---->...
+;	     |
+;	     v
+;	    ...
+;
+; Only systems and paths with open port-port VC's are kept on the
+; above list.
+;
+; When an IDREC datagram is received for a node which is currently
+; unknown, a PB is created for it and linked to the formative PB
+; list for this port.  When a START/STACK datagram is received from
+; that port as part of the START handshake, a formative SB is 
+; created and linked to the PB.  The formative datastructure looks
+; like:
+;
+;	PDT
+;	 |
+;	 v
+;	Path Block ----> (System Block)
+;	 |
+;	 v
+;	Path Block ----> (System Block)
+;	 |
+;	 v
+;	...
+;
+; When the START handshake is complete, a matching SB is sought in
+; the system configuration database.  If one is found, then the 
+; formative SB is discarded and the formative PB linked to the
+; existing SB.  If no matching SB is found, then the formative SB
+; is moved to the system configuration database and, with it, its
+; formative PB.
+;
+; The configuration poller is awakened periodically for each local 
+; port by the timer scan module.  Each time it wakes up, it allocates
+; n (SCS$GB_PANPOLL) datagrams from pool and uses these datagrams
+; to send REQID's to the next n ports.
+;
+; Datagram management is as follows:  Upon port initialization
+; SGN$GB_PPDDG datagrams are preallocated and linked to the 
+; datagram free queue for receipt of IDREC's.  When any start
+; handshake datagram is received (including IDREC) which is turned 
+; around to send the next protocol message, it is sent with
+; RETFLAG=FALSE so that the datagram is returned to the free
+; queue.  A received datagram which does not result in a new 
+; datagram being sent is simply returned to the free queue.  
+; Datagrams that must be allocated from pool because there is no
+; received datagram to turn around (e.g., START/STACK retries)
+; are sent out with RETFLAG=TRUE to return them on the response
+; queue.  Datagram buffers returned via the response queue are
+; deallocated to pool again.
+;
+; The major routines in this module (in order of appearance) are:
+;
+; CNF$POLL		-The configuration poller which wakes up
+;			 periodically and sends REQID's.
+;
+; CNF$IDREC		-Called by the interrupt service module when
+;			 an unsolicited (XCT_ID=0) IDREC arrives.  
+;			 If the sending port (station) currently has 
+;			 no PB in either the system wide database or
+;			 in the PDT formative PB list, then a PB is
+;			 created and START handshake initiated.  Else
+;			 the IDREC is discarded.
+;
+; CNF$DGREC		-Called by the interrupt service module when
+;			 a START, STACK, or ACK dg is received.  The
+;			 action dispatcher, ACTION_DISP is called.
+;
+; ACTION_DISP		-Based on the path's current state and the
+;			 event that just occurred, a sequence of 
+;			 action routines is called.  These correspond 
+;			 to the handshake steps described in the 
+;			 SCA spec.  The actions are table driven.
+;
+; Assorted action	-E.g., send a START dg, set a timer on the
+; routines		 path, build a system block...
+;
+;--
+
+	.SBTTL	DEFINITIONS
+
+;
+; Set PSECT to driver code:
+;
+
+	.PSECT	$$$115_DRIVER,LONG
+
+
+;
+; System definitions (LIB.MLB):
+;
+
+	$CDTDEF				; Connection Descriptor Table
+	$CRBDEF				; Channel Request Block offsets
+	$DDBDEF				; Device Datablock offsets
+	$DYNDEF				; Structure type codes
+	$IPLDEF				; IPL definitions
+	$PBDEF				; Path Block offsets
+	$PDTDEF				; Port Descriptor Table offsets
+	$PRDEF				; Internal Processor Registers
+	$SBDEF				; System Block offsets
+	$SCSDEF				; SCS message format
+	$UCBDEF				; Unit Control Block offsets
+
+
+;
+; PADRIVER definitions (PALIB.MLB):
+;
+
+	$PAPBDEF			; CI extension to PB
+	$PAPDTDEF			; CI extension to PDT
+	$PAREGDEF			; CI port register formats
+	$PPDDEF				; PPD layer of message/dg header
+
+
+	.SBTTL	CNF$POLL, PERIODICALLY SEND REQID TO PORTS
+
+;+
+; CNF$POLL is awakened periodically by CNF$TIMER.  It
+; allocates as many datagram buffers as there can be ports
+; in the cluster and sends a REQID to each port.  The sent buffers
+; are reclaimed on the response queue and returned to pool.  
+;
+; If datagram receipt is currently inhibited from this remote port,
+; then datagrams are first reenabled via a SETCKT command.
+;
+; If the sweep does not complete due to lack of pool, CNF$POLL returns
+; without error.
+;
+; Later receipt of the IDREC's will cause the START 
+; handshake to begin for the remote systems not currently known.
+;
+; The poller also initiates various diagnostic activities to 
+; check for physical connection problems or other errors in the 
+; cluster:
+;
+;	-Before polling begins, a loopbacke datagram is sent out.
+;	 Later, successful receipt of the LB dg is recorded in routine
+;	 CNF$LBREC.  Successful receipt of the last LB dg sent on this
+;	 path is checked here in LB_CHECK, before sending a new LB dg.
+;
+;	-REQID's are sent to all ports even if we have already 
+;	 succeeded in a START handshake.  REQID's are sent with 
+;	 explicit path select thus forcing the port to try the path
+;	 even if it thinks it is bad.  Later receipt of an IDREC on this
+;	 path forces the port to bring it back if it was previously
+;	 marked bad.  It also lets us log the transition of a path
+;	 from bad to good.
+;
+; Inputs:
+;
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	other registers		-Preserved
+;
+;-
+
+	.ENABL	LSB
+
+CNF$POLL::
+
+	PUSHR	#^M<R3,R5,R6,R7>	; Save some registers
+	CLRL	R6			; Zero # of next port to probe
+	MOVZBL	PDT$B_MAX_PORT(R4),R5	; Get maximum port #
+	MOVZBL	PDT$B_REQIDPS(R4),R7	; Get value of path to select
+
+LB_CHECK:
+
+	MOVB	PDT$B_P0_LBSTS-1(R4)[R7],R0  ; Get LB status byte for
+					     ;  current path.  
+	BICL3	#^C<PDT$M_CUR_LBS>,R0,R1     ; Isolate current status in R1
+	CMPZV	#PDT$V_PRV_LBS,#1,R0,R1	     ; Previous status = current?
+	BEQL	10$			; Branch if so
+					; ***Else log change
+
+10$:	ADDL3	R1,R1,R3		; Position current status as
+					;  previous and save
+
+SEND_LB:
+
+	BRB	NEXT_REQID		; ***Bypass loopback dg
+	BSBW	SCS$ALLOC_DG		; Get a dg buffer for the 
+					;  loopback dg
+	BLBC	R0,20$			; Branch if no pool -- skip
+					;  poller altogether
+	MOVB	R3,PDT$B_P0_LBSTS-1(R4)[R7]  ; Else update LB status
+					     ;  with current and set 
+					     ;  current to pending
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers
+	MOVL	PDT$L_LBDG(R4),R0	; Get addr of LB dg template
+	MOVC3	#<PPD$C_LB_LENGTH-PPD$B_PORT>,-
+		PPD$B_PORT(R0),-	; Copy LB dg from tmplate
+		PPD$B_PORT(R2)		;  to actual dg buffer
+	POPR	#^M<R2,R3,R4,R5>	; Restore registers
+	INSV	R7,#PPD$V_PS,-		; Insert current path
+		#PPD$S_PS,PPD$B_FLAGS(R2)    ;  select in LB dg
+	$INS_COMQLOW			; Send loopback dg on its way
+
+NEXT_REQID:
+
+	BBC	R6,PDT$B_DQIMAP(R4),40$	; Branch if dg rec'v enabled on
+					;  this port
+	BSBW	SCS$ALLOC_PPDDG		; Else get a dg for SETCKT
+	BLBS	R0,30$			; Branch if got it.
+
+20$:	BRW	CONFIG_EXIT		; Else skip polling altogether
+
+30$:	$SETCKT	RETFLAG=TRUE,-		; Else command port to
+		PORT=R6,-		;  enable dg reception
+		MASK=#PPD$M_DQI,-	;  from specified remote port
+		MVAL=#0,-		;
+		DQI=FALSE		;
+40$:	BSBW	SCS$ALLOC_PPDDG		; Allocate a buffer from pool
+	BLBC	R0,CONFIG_EXIT		; Branch if none available
+	$REQID	PORT=R6,-		; Send REQID to next port
+		PATH=R7			;  on current path
+	INCL	R6			; Step to next port
+	CMPB	R6,R5			; Past last?
+	BGTRU	50$			; Branch if so
+	BRW	NEXT_REQID		; Else go to probe next port
+
+50$:	INCL	R7			; Step to next path to use
+	CMPL	R7,#PPD$C_PSP1		; More than max legal?
+	BLEQ	60$			; Branch if not
+	MOVB	#PPD$C_PSP0,R7		; Else reset to path A
+	
+60$:	MOVB	R7,PDT$B_REQIDPS(R4)	; Put next path to use in PDT
+
+CONFIG_EXIT:
+
+	POPR	#^M<R3,R5,R6,R7>	; Restore registers
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	CNF$IDREC, PROCESS UNSOLICITED IDREC
+
+;+
+; CNF$IDREC is called from IDREC for IDREC's with transaction 
+; ID = 0.  CNF$IDREC checks the port bitmap to see if the IDREC
+; is from a path already established or with START handshake in
+; progress.  If not, and if the remote port is enabled, then
+;  a formative path block is set up and a START handshake initiated.
+;
+; If the PB does exist, then go to UPDATE_CBL_STS.  UPDATE_CBL_STS
+; checks if the path is fully open.  If not, no cable or path status
+; information is maintained, and the IDREC is simply discarded.  If
+; the path is open, and the remote port is in a state other than enabled,
+; then the virtual circuit is crashed.  If the remote port is enabled,
+; then cabling status is recorded in the path block as follows:
+;
+;	current cable status = 1 (OK) if the send path =
+;			       receive path in IDREC;
+;
+;			     = 0 (bad) otherwise.
+;
+; If the new current status differs from the previous, then a cable status
+; transition is logged.
+;
+; The arrival of the IDREC says that the receive path of the ID must
+; be good.  Therefore, the path status in the PB is also updated as follows:
+;
+;	current path status  = 1 (OK).
+;
+; If the current path status differs from the previous, then a path status
+; transition is logged.
+;
+; Inputs:
+;
+; 	R2			-Addr of IDREC datagram
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+;
+; Assumptions about PB format:
+;
+
+ASSUME	PB$W_SIZE+2	EQ  PB$B_TYPE
+ASSUME	PB$B_TYPE+1	EQ  PB$B_SUBTYP
+ASSUME	PB$B_SUBTYP+1	EQ  PB$B_RSTATION
+ASSUME	PB$B_RSTATION+6	EQ  PB$W_STATE
+ASSUME	PB$W_STATE+2	EQ  PB$L_RPORT_TYP
+ASSUME	PB$L_RPORT_TYP+4   EQ  PB$L_RPORT_REV
+ASSUME	PB$L_RPORT_REV+4   EQ  PB$L_RPORT_FCN
+ASSUME	PB$L_RPORT_FCN+4   EQ  PB$B_RST_PORT
+ASSUME	PB$B_RST_PORT+1	EQ  PB$B_RSTATE
+ASSUME	PB$B_RSTATE+1	EQ  PB$W_RETRY
+ASSUME	PB$W_RETRY+2	EQ  PB$T_LPORT_NAME
+ASSUME	PB$T_LPORT_NAME+4  EQ  PB$L_PDT
+ASSUME	PB$L_PDT+4	EQ  PB$L_CDTLST
+ASSUME	PB$L_CDTLST+4	EQ  PB$L_WAITQFL
+ASSUME	PB$L_WAITQFL+4	EQ  PB$L_WAITQBL
+ASSUME	PB$L_WAITQBL	EQ  PB$L_DUETIME
+ASSUME	PB$L_DUETIME+4	EQ  PB$L_SCSMSG
+ASSUME	PB$L_SCSMSG+4	EQ  PB$W_STS
+ASSUME	PB$W_STS+2	EQ  PB$B_CBL_STS
+ASSUME	PB$B_CBL_STS+1	EQ  PB$B_P0_STS
+ASSUME	PB$B_P0_STS+1	EQ  PB$B_P1_STS
+
+	.ENABL	LSB
+
+CNF$IDREC::
+	
+	MOVZBL	PPD$B_PORT(R2),R1	; Get sender port #
+	BBC	R1,PDT$B_PORTMAP(R4),-	; Branch if this path is
+		NEW_PATH		;  currently unknown
+	BRW	UPDATE_CBL_STS		; Go update cabling status info
+
+NEW_PATH:
+
+	EXTZV	#PPD$V_STATE,-		; Get state of remote
+		#PPD$S_STATE,-		;  port from ID
+		PPD$B_RSTATE(R2),R0	; 
+	CMPB	R0,#PPD$C_ENAB		; Is remote enabled or enab maint?
+	BEQL	10$			; Branch if yes
+	BRW	NEW_PATH_ERR		; Else dont try for start handshake
+
+10$:	PUSHL	R3			; Save registers
+	PUSHL	R2			; Save copy of IDREC dg addr
+	MOVL	#PB$C_PALENGTH,R1	; Get size of a pathblock
+	JSB	G^EXE$ALONONPAGED	; Allocate one from pool
+	BLBC	R0,NEW_PATH_ERR_RG	; Branch if no pool
+	MOVL	R2,R3			; Set PB addr in standard register
+	POPL	R2			; Retreive IDREC dg addr
+	MOVAL	PB$W_SIZE(R3),R0	; Get addr within PB of struct size
+	MOVW	R1,(R0)+		; Set structure size
+	MOVW	#DYN$C_SCS+<DYN$C_SCS_PB@8>,(R0)+  ; Set struct type, subtype
+	MOVZBL	PPD$B_PORT(R2),R1	; Get remote port #
+	BBCS	R1,PDT$B_PORTMAP(R4),20$  ; Mark port has PB in map
+20$:	MOVZBL	PPD$B_PORT(R2),(R0)+	; Set PB parameters:  remote station,
+	CLRW	(R0)+			;
+	MOVW	#PB$C_CLOSED,(R0)+	;  state = closed,
+	MOVQ	PPD$L_RPORT_TYP(R2),(R0)+  ;  port type, dual path bit,
+					   ;  and ucode revision,
+	MOVL	PPD$L_RPORT_FCN(R2),(R0)+  ;  port function mask,
+	MOVZWL	PPD$B_RST_PORT(R2),(R0)+   ;  reset port (owning port),
+					   ;  and remote port state,
+					   ;  zero retry count,
+	MOVL	PDT$L_UCB0(R4),R1	; Trace back through
+	MOVL	UCB$L_DDB(R1),R1	;  the UCB and DDB to device
+	MOVL	DDB$T_NAME+1(R1),(R0)+	;  name, assumed to be format 'PAc0'
+	MOVL	R4,(R0)+		; Fill in addr of PDT
+	CLRL	(R0)+			; Zero CDT list pointer
+	CLRQ	(R0)+			; Clear formative SB link
+					;  and due time
+	CLRL	(R0)+			; Clear SCS msg addr
+	CLRW	(R0)+			; Zero handshake status
+	MOVB	#PB$M_CUR_CBL,(R0)+	; Set current cable status ok --
+					;  will update later when PB is	
+					;  fully open
+	MOVB	#PB$M_CUR_PS,(R0)+	; Set current path status good,
+	MOVB	#PB$M_CUR_PS,(R0)+	;  both paths
+	CLRL	PB$L_CLSCKT_DG(R3)	; Zero addr of emergency SETCKT dg
+	INSQUE	(R3),@PDT$Q_FORMPB+4(R4); Link PB to formative PB list
+	MOVZBL	#EV$C_SEND_START,R1	; Set event=send a start
+	BSBW	ACTION_DISP		; Init START handshake
+	POPL	R3			; Restore register
+	RSB				; Return
+
+NEW_PATH_ERR_RG:
+
+	MOVQ	(SP)+,R2		; Restore saved registers
+
+GOT_PATH:
+NEW_PATH_ERR:
+
+	BRW	SCS$DISCARD_DG		; Return dg to free queue and return
+
+UPDATE_CBL_STS:
+
+	BSBW	CNF$LKP_PB_MSG		; Look up path block
+	BLBC	R0,GOT_PATH		; Branch if only formative
+	MOVL	R1,R3			; Copy PB addr to standard register
+	EXTZV	#PPD$V_STATE,-		; Get remote port state
+		#PPD$S_STATE,-		;  from ID
+		PPD$B_RSTATE(R2),R0	;
+	CMPB	R0,#PPD$C_ENAB		; Is remote enabled or maint enab?
+	BEQL	30$			; Branch if so
+	BRW	ERR$CRASHVC_PB		; Else go crash VC
+
+30$:	CLRL	R1			; Set assumed new path status = bad
+	EXTZV	#PPD$V_RP,#PPD$S_RP,-	; Isolate rec'v path in R0
+		PPD$B_FLAGS(R2),R0	;
+	PUSHL	R0			; Save rec'v path for later
+	CMPZV	#PPD$V_SP,#PPD$S_SP,-	; Send path =
+		PPD$B_FLAGS(R2),R0	;  receive path?
+	BNEQ	40$			; Branch if not -- paths are crossed
+	INCL	R1			; Else set new cable status ok
+
+40$:	CMPZV	#PB$V_CUR_CBL,#1,-	; Previous status
+		PB$B_CBL_STS(R3),R1	;  = new status?
+	BEQL	50$			; Branch if so
+					;***Else log change
+
+50$:	INSV	R1,#PB$V_CUR_CBL,#1,-	; Record new status 
+		PB$B_CBL_STS(R3)	;  as the current status
+	POPL	R0			; Retreive receive path number
+	BEQL	GOT_PATH		 ; Branch if internal loopback
+
+UPDATE_PTH_STS:
+
+	MOVAB	PB$B_P0_STS-1(R3)[R0],R0  ; Get addr of path status byte
+	BLBS	(R0),60$		  ; Branch if previous status ok
+					; ***Log path status change
+
+60$:	BISB	#PB$M_CUR_PS,(R0)	; Set current status good
+	BRB	GOT_PATH		; Clean up IDREC dg and return
+
+	.DSABL	LSB
+
+	.SBTTL	CNF$LBREC,	VERIFY REC'D LOOPBACK DG
+
+;+
+; CNF$LBREC checks the data in the received loopback datagram with
+; the data stored in the template lb dg linked to the PDT.  If the
+; data agrees, then the loopback status for the path on which the LB
+; dg was received is updated to good.  (Transitions in the status are
+; checked and logged in CNF$POLL.)
+;
+; Inputs:
+;
+;	R2			-Addr of loopback datagram
+;	R4			-Addr of PDT
+;	PDT$L_LBDG(R4)		-Addr of template LB dg
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+CNF$LBREC::
+
+	MOVL	PDT$L_LBDG(R4),R1	; Get addr of template
+	MOVQ	R2,-(SP)		; Save registers
+	CMPC	#<PPD$L_LBCRC - PPD$W_LENGTH>,-
+		PPD$W_LENGTH(R1),-	; Verify rec'd data against template
+		PPD$W_LENGTH(R2)	;  including LB dg length
+	MOVQ	(SP)+,R2		; Restore registers
+	TSTL	R0			; Check results of comparison
+	BNEQ	10$			; Branch if don't match
+	EXTZV	#PPD$V_PS,#PPD$S_PS,-	; Else get the path 
+		PPD$B_FLAGS(R2),R0	;  this LB dg went on and
+	BISB	#PDT$M_CUR_LBS,-	;  and set LB status
+		PDT$B_P0_LBSTS-1(R4)[R0];  good for this path
+
+10$:	BRW	SCS$DEAL_DG		; Deallocate LB dg and return to
+					;  interrupt service from there
+
+	.DSABL	LSB
+
+	.SBTTL	CNF$DGREC, DISPATCH A START/STACK/ACK DATAGRAM
+
+;+
+; CNF$DGREC first checks the port bit map to see if a path
+; block exists for the incoming datagram.  If not, the datagram
+; is deallocated.  Otherwise, the formative path block list and 
+; system configuration data base are searched for the path block
+; with matching station address.  When the path block is found,
+; the ACTION_DISP routine is called to handle the datagram. 
+;
+; Inputs:
+;
+;	R2			-Addr of datagram
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R3			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+CNF$DGREC::
+
+	MOVZBL	PPD$B_PORT(R2),R1	; Get remote port #
+	BBS	R1,PDT$B_PORTMAP(R4),-	; Look PB existence up in
+		PB_EXISTS		;  path map; branch if exists
+	BRW	SCS$DISCARD_DG		; Discard datagram and return
+					;  from there to interrupt service
+
+PB_EXISTS:
+
+	MOVAL	PDT$Q_FORMPB(R4),R3	; Get formative PB listhead
+	BSBW	SEARCH_PATHS		; Search path list for PB
+	BLBS	R0,FOUND_PB		; Branch if success
+
+CONFIG_LIST:
+
+	PUSHL	R5			; Save a register
+	MOVAL	G^SCS$GQ_CONFIG,R5	; Get system config listhead
+	PUSHL	R5			; Hold starting point
+
+10$:	MOVL	(R5),R5			; Get next SB
+	CMPL	R5,(SP)			; Back at starting point?
+	BEQL	CONFIG_ERR		; Branch if so--inconsistent
+					;  database
+	MOVAL	SB$L_PBFL(R5),R3	; Get path block listhead addr
+	BSBW	SEARCH_PATHS		; Search path list
+	BLBC	R0,10$			; Branch if failed
+	TSTL	(SP)+			; Clear stack
+	POPL	R5			; Restore register
+
+FOUND_PB:
+
+	MOVZWL	PPD$W_MTYPE(R2),R1	; Set event = rec'd dg type
+	BRW	ACTION_DISP		; Transfer to action dispatcher
+					;  and return from there
+
+CONFIG_ERR:
+
+	BUGCHECK	CIPORT,NONFATAL	; Inconsistent database
+
+	BRW	SCS$DISCARD_DG		; If nonfatal, discard dg
+					;  and forget it happened
+
+	.DSABL	LSB
+
+	.SBTTL	ACTION DISPATCHING
+	.SBTTL	-	ACTION TABLE FORMAT
+
+;+
+; The ACTION_TABLE is a list of action routines to execute for
+; each combination of port-port VC state and event.  The format
+; of the table is a list of VC state entries.  Each state entry
+; is followed by a list of events possible for that state.  Each
+; event entry is followed by a list of actions to be taken for
+; the event.  The table is arranged linearly.
+;
+; The various entries are generated by the macros STATE, EVENT,
+; ACTION, and ENDACTION defined in the next section.  Actions
+; may return status or not.  For actions which do return status,
+; the action dispatcher checks R0 for success/fail status.  In
+; case of failure the action disRatcher calls routine CLEANUP
+; and terminates action routine execution.
+;
+; The format of the various types of entry in the action table:
+;
+;	STATE:		+--------+--------+--------+--------+
+;			|offset to nxt st |  state code     |
+;			+--------+--------+--------+--------+
+;
+;	EVENT:		+--------+--------+--------+--------+
+;			|offset to nxt evt|  event code     |
+;			+--------+--------+--------+--------+
+;	
+;	ACTION:		+--------+--------+--------+--------+
+;			|offset to routine|  arg   |  code  |
+;			+--------+--------+--------+--------+
+;
+; Standard inputs to action routines are:
+;
+;	R1		-Argument in action table entry
+;	R2		-Addr of IDREC/START/STACK/ACK dg, if any
+;	R3		-Addr of PB
+;	R4		-Addr of PDt
+;
+; The end action actin type is special:  it moves the argument
+; into the PB state word and terminates the list of actions.  End 
+; action entries are a single word long.
+;-
+
+	.SBTTL	-	ACTION TABLE MACROS
+;
+; Macro to define a state entry:
+;
+
+	.MACRO	STATE	CODE
+	 .NOSHOW
+	 $$$=.				; Save start of state entry
+	 .WORD	CODE			; State code
+	 .IF DF $$$LAST_STATE		; If there was a previous
+	 .=$$$LAST_STATE+ST$W_NEXT	;  state entry, go back and
+	 .WORD	$$$-$$$LAST_STATE	;  file in its fwd link
+	 .=$$$+ST$W_NEXT		;  and reset pointer to this entry
+	 .ENDC				;
+	 .WORD	0			; Allocate word for fwd link
+	 $$$LAST_STATE=$$$		; Define start of this entry
+	 $$$LAST_EVENT=0		; Reset addr of last event to
+					;  show start of new list of events
+	 .SHOW
+	.ENDM	STATE
+
+;
+; Macro to define event entry:
+;
+
+	.MACRO	EVENT	CODE
+	 .NOSHOW
+	 $$$=.				; Save start of entry
+	 .WORD	CODE			; Event code
+	 .IF NE $$$LAST_EVENT		; If there was a previous event,
+	 .=$$$LAST_EVENT+EV$W_NEXT	;  then go back to it and
+	 .WORD	$$$-$$$LAST_EVENT	;  fill in its fwd link
+	 .=$$$+EV$W_NEXT		;  and return to current entry
+	 .ENDC				;
+	 .WORD	0			; Allocate word for fwd link
+	 $$$LAST_EVENT=$$$		; Define addr of this entry
+	 .SHOW
+	.ENDM	EVENT
+
+;
+; Macro to define action entry:
+;
+
+	.MACRO	ACTION ROUTINE,FLAG=0,ARG=0,CODE=AC$C_CONTINUE
+	 .NOSHOW
+	 $$$=.				; Save start of entry
+	 .BYTE	CODE!FLAG		; Action type code
+	 .BYTE	ARG			; Argument
+	 .WORD	ROUTINE-$$$		; Offset to action routine
+	 .SHOW
+	.ENDM	ACTION			
+
+;
+; Macro to define an endaction entry:
+;
+
+	.MACRO	ENDACTION NEWSTATE
+	 .NOSHOW
+	 .BYTE	AC$C_END		; Action type code
+	 .WORD	NEWSTATE		; Action arg =  new PB state
+	 .SHOW
+	.ENDM	ENDACTION
+
+	.SBTTL	-	ACTION TABLE OFFSETS AND DEFINITIONS
+
+;
+; Offsets to state, event and action entries in the action
+; dispatch table:
+;
+
+ST$W_CODE = 0			; State code (codes defined in $PBDEF)
+ST$W_NEXT = 2			; Offset to next state entry
+
+EV$W_CODE = 0			; Event code
+EV$W_NEXT = 2			; Offset to next event entry
+
+AC$B_CODE = 0			; Action code
+AC$B_ARG = 1			; Action routine argument
+AC$W_NEWST = 1			; New path blk state on end action
+AC$W_ACTION = 2			; Offset to action routine
+
+;
+; Event code definitions:
+;
+
+				; Following 3 codes assumed equal
+				;  to the corresponding PPD msg types:
+EV$C_START = 0			;  START dg received
+EV$C_STACK = 1			;  STACK dg reveived
+EV$C_ACK = 2 			;  ACK dg received
+EV$C_SCSMSG = 3			; SCS control msg received (connx
+				;  management or credit)
+EV$C_TIMEOUT = 4		; Path timer expired
+EV$C_SEND_START = 5		; Send 1st START, initiate handshake
+
+;
+; Action code definitions:
+;
+
+AC$C_END = 0			; No more action routines, update PB state
+AC$C_CONTINUE = 1		; More action routines.
+STATUS = ^X80			; If set, action routine returns status
+
+	.SBTTL	-	ACTION TABLE
+
+
+ACTION_TABLE::
+
+	STATE	PB$C_CLOSED		; New PB just created
+	  
+	  EVENT	EV$C_SEND_START		; Initiate START handshake
+	    ACTION	SEND_1ST_START		; Send 1st START dg
+	    ACTION	START_TIMER		; Enable timer
+	    ENDACTION	PB$C_ST_SENT		; State moves to start sent
+
+	STATE	PB$C_ST_SENT			; State= start sent
+	
+	  EVENT		EV$C_STACK		; Received STACK dg
+	    ACTION	STOP_TIMER		; Disable timer
+	    ACTION	BUILD_SB,STATUS		; Build a formative SB
+	    ACTION	SET_CIRCUIT		; Tell port to open VC
+	    ACTION	ENTER_PB,STATUS		; Move PB to system database
+	    ACTION	SEND_ACK		; Send ACK
+	    ENDACTION	PB$C_OPEN		; Move PB state to open
+
+	  EVENT		EV$C_START		; Received START dg
+	    ACTION	BUILD_SB,STATUS		; Build formative SB
+	    ACTION	SET_CIRCUIT		; Tell port to open VC
+	    ACTION	SEND_1ST_STACK		; Send STACK dg
+	    ACTION	START_TIMER		; Start a timer
+	    ENDACTION	PB$C_ST_REC		; Move PB state to start rec'd
+
+	  EVENT		EV$C_TIMEOUT		; Timer expired
+	    ACTION	SEND_START,STATUS	; Retry send of START dg
+	    ACTION	START_TIMER		; Restart timer
+	    ENDACTION	PB$C_ST_SENT		; PB state stays start sent
+
+	STATE		PB$C_ST_REC		; State is start rec'd
+
+	  EVENT		EV$C_ACK		; Rec'd ACK dg
+	    ACTION	IGNORE_DG		; Return dg to DFREEQ
+	    ACTION	STOP_TIMER		; Disable timer
+	    ACTION	ENTER_PB,STATUS		; Move PB to system database
+	    ENDACTION	PB$C_OPEN		; Move PB state to open
+
+						;***Not being invoked now
+	  EVENT		EV$C_SCSMSG		; Rec'd SCS control msg
+	    ACTION	STOP_TIMER		; Stop timer
+	    ACTION 	ENTER_PB,STATUS		; Move PB to system database
+	    ENDACTION	PB$C_OPEN		; Move PB state to open
+
+	  EVENT		EV$C_STACK		; Rec'd STACK dg
+	    ACTION	STOP_TIMER		; Disable timer	
+	    ACTION	ENTER_PB,STATUS		; Move PB to system database
+	    ACTION	SEND_ACK		; Send ACK dg
+	    ENDACTION	PB$C_OPEN		; Move PB state to open
+
+	  EVENT		EV$C_START		; Rec'd START dg
+	    ACTION	SEND_1ST_STACK		; Send STACK dg
+	    ACTION	START_TIMER		; Start timer
+	    ENDACTION	PB$C_ST_REC		; PB state stays same
+
+	  EVENT		EV$C_TIMEOUT		; Timer expired
+	    ACTION	SEND_STACK,STATUS	; Try another STACK dg
+	    ACTION	START_TIMER		; Start up the timer again
+	    ENDACTION	PB$C_ST_REC		; PB state stays same
+
+	STATE		PB$C_OPEN		; Path state is open
+
+	  EVENT		EV$C_STACK		; Rec'd STACK dg
+	    ACTION	SEND_ACK		; Send ACK dg
+	    ENDACTION	PB$C_OPEN		; Leave PB state open
+
+
+	  EVENT		EV$C_ACK		; Rec'd ACK dg
+	    ACTION	IGNORE_DG		; Return dg to DFREEQ
+	    ENDACTION	PB$C_OPEN		; Leave PB state open
+
+	  EVENT		EV$C_START		; Rec'd START dg on open VC
+	    ACTION	BREAK_PATH		; Collapse path 
+	    ENDACTION	PB$C_VC_FAIL		;  leaving PB state as set
+						;  by BREAK_PATH
+
+	STATE		PB$C_VC_FAIL		; VC failure in progress
+	
+	  EVENT		EV$C_START		; Rec'd START dg
+	    ACTION	IGNORE_DG		; Discard without action
+	    ENDACTION	PB$C_VC_FAIL		;
+
+	  EVENT		EV$C_STACK		; Rec'd STACK dg
+	    ACTION	IGNORE_DG		; Discard without action
+	    ENDACTION	PB$C_VC_FAIL		;
+
+	  EVENT		EV$C_ACK		; Rec'd ACK dg
+	    ACTION	IGNORE_DG		; Discard without action
+	    ENDACTION	PB$C_VC_FAIL		;
+
+
+
+	.SBTTL	-	ACTION_DISP, ACTION DISPATCHER
+
+;+
+; The action dispatcher looks up in the action table the list of
+; action routines to execute for the current path block state and
+; the event that occurred.  If an action routine specifies that it
+; returns status, the R0 is checked upon return for success (LBS)
+; or failure (LBC).  On failure the cleanup routine, CLEANUP, is called 
+; and ACTION_DISP exits.  Normally, action routines are executed 
+; until an end action routine is encountered.  The end action automatically
+; sets the path block state to the value specified in the end action
+; argument.
+;
+; The following register conventions apply for action routines:
+;
+;	R2		-Addr of START/STACK/ACK/IDREC dg, if any
+;	R3		-Addr of formative PB
+;	R4		-Addr of PDT
+;	R5		-Addr of current action entry
+;
+; Actions may use R0 and R1, but must use R2 with care.  Action
+; routines must preserve all other registers.
+;
+; Inputs to ACTION_DISP:
+;
+;	R1			-Event code
+;	R2-R4			-As shown above
+;
+; Outputs:
+;
+;	R0-R2 			-Destroyed
+;	other registers		-Preserved
+;-
+
+ASSUME	PB$C_CLOSED	EQ  0		; Assume that all the 
+ASSUME	PB$C_ST_SENT	EQ  1		;  formative path block states
+ASSUME	PB$C_ST_REC	EQ  2		;  are .LE. 2
+
+	.ENABL	LSB
+
+ACTION_DISP:
+
+	PUSHL	R5			; Save a register
+	MOVAL	ACTION_TABLE,R5		; Get addr of action table
+
+NEXT_STATE:
+
+	MOVW	ST$W_CODE(R5),R0	; Get next state code
+	CMPW	R0,PB$W_STATE(R3)	; State codes match?
+	BEQL	LOOKUP_EVENT		; Branch if so
+	MOVW	ST$W_NEXT(R5),R0	; Get offset to next state
+	BEQL	PB_STATE_ERR		; Branch if no more states
+	ADDW	R0,R5			; Else step to nxt state entry
+	BRB	NEXT_STATE		;  and try it
+
+LOOKUP_EVENT:
+
+	TSTL	(R5)+			; Step to start of event list
+
+NEXT_EVENT:
+
+	CMPW	EV$W_CODE(R5),R1	; Event codes match?
+	BEQL	NEXT_ACTION		; Branch if yes
+	MOVW	EV$W_NEXT(R5),R0	; Get offset to next event
+	BEQL	PB_STATE_ERR		; Branch if no more events
+	ADDW	R0,R5			; Else step to next event entry
+	BRB	NEXT_EVENT		;  and try it
+
+NEXT_ACTION:
+
+	TSTL	(R5)+			; Step to 1st/next action entry
+	TSTB	(R5)			; end of action routines?
+	BEQL	END_ACTION		; Branch if so
+	MOVZBL	AC$B_ARG(R5),R1		; Pick up argument
+	CVTWL	AC$W_ACTION(R5),R0	; Get offset to routine
+	JSB	(R5)[R0]		; Call action routine
+	TSTB	(R5)			; Does routine return status?
+	BGTR	NEXT_ACTION		; Branch if not
+	BLBS	R0,NEXT_ACTION		; Branch if status good
+
+10$:	POPL	R5			; Restore R5
+	BRW	CLEANUP			; Else xfer to cleanup and return
+					;  from there
+
+END_ACTION:
+
+	MOVW	AC$W_NEWST(R5),-	; Update state of path block
+		PB$W_STATE(R3)		;
+
+20$:	POPL	R5			; Restore R5
+	RSB				; Return
+
+PB_STATE_ERR:
+
+	BSBW	SCS$DISCARD_DG		; Return PPD handshake dg
+					;  to free queue
+	CMPW	PB$W_STATE(R3),-	; Is path state in formative
+		#PB$C_ST_REC		;  state?
+	BLEQU	10$			; Branch if so to abandon
+					;  start attempt 
+	BRB	20$			; Else ignore, join common exit
+
+	.DSABL	LSB
+
+	.SBTTL	ACTION ROUTINES
+	.SBTTL	-	SEND_1ST_START, SEND 1ST START DG
+	.SBTTL	-	SEND_START, SEND A START DATAGRAM
+
+;+
+; SEND_START allocates a dtagram buffer from nonpaged pool,
+; formats a START message in it and sends the datagram.  The data
+; that goes into the START message is assembled into the message
+; by routine FMT_START_DATA.
+;
+; SEND_START has two entries:  SEND_1ST_START which resets the START
+; retry count and SEND_START which decrements and checks the retry
+; count before sending the datagram.
+;
+; SEND_START may fail for two reasons:  insufficient pool to
+; allocate the datagram buffer, or retry count exceeded.
+;
+; Inputs:
+;
+;	R2			-Addr of datagram to turn around (1ST_START)
+;	R3			-Addr of PB
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-0/1 for fail/success (SEND_START only)
+;	R1,R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+;
+; PPD message format assumption:
+;
+
+ASSUME	PPD$W_LENGTH+2	EQ PPD$W_MTYPE
+
+	.ENABL	LSB
+
+SEND_1ST_START:
+
+	MOVW	G^SCS$GW_PASTRTRY,-	; Reset retry count
+		PB$W_RETRY(R3)		;
+	BSBW	FMT_START_DATA		; Set up start data
+	MOVL	#<PPD$C_START@16 + PPD$C_START_LEN>,-
+		PPD$W_LENGTH(R2)	; Set dg size and type
+	BSBW	SNDDG_NORET		; Send dg with RETFLAG=FALSE
+					;  to channel dg buffer back
+					;  to free queue
+	RSB				; Return without status
+
+SEND_START:
+
+	DECW	PB$W_RETRY(R3)		; Decrement retry count
+	BEQL	SEND_ERR		; Branch if no retries left
+	BSBW	SCS$ALLOC_DG		; Allocate buffer from pool
+	BLBC	R0,SEND_ERR		; Branch if no pool
+
+10$:	BSBW	FMT_START_DATA		; Set up start data
+	MOVL	#<PPD$C_START@16 + PPD$C_START_LEN>,-
+		PPD$W_LENGTH(R2)	; Set dg size and type
+	BSBW	SNDDG_RET		; Send dg with RETFLAG=TRUE
+					;  to channel dg to response
+					;  queue for return to pool
+
+SEND_SUCCESS:
+
+	MOVZBL	#SS$_NORMAL,R0		; Status is success
+	RSB				; Return
+
+SEND_ERR:
+
+	CLRL	R0			; Set status = fail
+	RSB				;
+
+	.DSABL	LSB
+
+	.SBTTL	-	SEND_STACK, SEND A STACK DATAGRAM
+
+;+
+; This routine has two entries:  
+;
+; SEND_1ST_STACK resets the retry count for sending STACK's and
+; recycles the received START datagram into a STACK message.  This
+; entry always completes with success.
+;
+; SEND_STACK is called when the timer expires and a retry is
+; necessary.  It decrements and checks the retry count.  If more retries
+; remain, it allocates a datagram buffer from pool.  This entry can
+; fail due to expired retry count or insufficient pool.
+;
+; Both entries wind up by formatting and sending a STACK datagram.
+;
+; Inputs:
+;
+;	R2			-Addr of rec'd datagram (if 1ST_STACK)A
+;	R3			-Addr of PB
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-0/1 for fail/success
+;	R1,R2			-Destroyed
+;	other registers		-Preserved
+;-
+
+;
+; PPD message format assumption:
+;
+
+
+	.ENABL	LSB
+
+SEND_1ST_STACK:
+
+	MOVW	G^SCS$GW_PASTRTRY,-	; Reset retry count
+		PB$W_RETRY(R3)		;
+	BSBW	FMT_START_DATA		; Set up start data
+	MOVL	#<PPD$C_STACK@16 + PPD$C_STACK_LEN>,-
+		PPD$W_LENGTH(R2)	; Set dg size and type
+	BSBW	SNDDG_NORET		; Send dg with RETFLAG=FALSE
+					;  to channel dg buffer back to
+					;  free queue
+	BRB	SEND_SUCCESS		; Take success exit
+
+SEND_STACK:
+
+	DECW	PB$W_RETRY(R3)		; Decrement retry counter
+	BEQL	SEND_ERR		; Branch if no retries left
+	BSBW	SCS$ALLOC_DG		; Allocate dg buffer
+	BLBC	R0,SEND_ERR		; Branch if no pool
+	BSBW	FMT_START_DATA		; Set up start data
+	MOVL	#<PPD$C_STACK@16 + PPD$C_STACK_LEN>,-
+		PPD$W_LENGTH(R2)	; Set dg size and type
+	BSBW	SNDDG_RET		; Send dg with RETFLAG=TRUE
+					;  to channel dg to response 
+					;  queue when sent
+	BRW	SEND_SUCCESS		; Take success exit
+
+	.DSABL	LSB
+
+	.SBTTL	-	SEND_ACK, SEND ACK DATAGRAM
+
+;+
+; SEND_ACK turns a previously received STACK datagram into an
+; ACK and sends the datagram.  No failures are possible.
+;
+; Inputs:
+;
+;	R2			-Addr of dg being turned around
+;	R3			-Addr of PB
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0,R1			-Destroyed
+;	other registers		-Preserved
+;-
+
+;
+; PPD message format assumption:
+;
+
+ASSUME	PPD$W_LENGTH+2	EQ PPD$W_MTYPE
+
+	.ENABL	LSB
+
+SEND_ACK:
+
+	MOVL	#<PPD$C_ACK@16 + PPD$C_ACK_LEN>,-
+		PPD$W_LENGTH(R2)	; Set dg size and type
+	BSBW	SNDDG_NORET		; Send dg with RETFLAG=FALSE
+					;  to channel dg buffer back
+					;  free queue.
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	ENTER_PB, MOVE PB (AND SB) FROM FORMATIVE
+	.SBTTL	-		  LISTS TO SYSTEM WIDE DATABASE
+
+;+
+; ENTER_PB moves a pathblock and, if necessary, its associated system
+; block from the formative pathblock list to the system wide
+; configuration database.  In the process, and SCS send message 
+; buffer and receive buffer, and SETCKT dg are allocated.  The send
+; buffer address is stored in the PB and the receive buffer is queued to
+; the port. If the allocation fails, the path block ad system block remain
+; on the formative list and error exit is taken.
+;
+; Inputs:
+;
+;	R3			-Addr of formative PB
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-0/1 for fail/success
+;	R1			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+ENTER_PB:
+
+	PUSHL	R2			; Save R2
+	BSBW	SCS$ALLOC_MSG		; Allocate a msg buffer
+	BLBS	R0,5$			; Branch if got it
+	BRW	ENTER_ERR		; Else go to error
+
+5$:	MOVL	R2,PB$L_SCSMSG(R3)	; Assign buffer to PB for SCS 
+					;  control messages sent
+	BSBW	SCS$ALLOC_PPDDG		; Allocate a PPD dg buffer
+	BLBS	R0,6$			; Branch if got it
+	BRW	ENTER_ERR1		; Else go clean up
+
+6$:	MOVL	R2,PB$L_CLSCKT_DG(R3)	; Save addr of PPD dg
+	BSBW	SCS$ALLOC_MSG		; Allocate a msg buffer for
+					;  SCS control msg receive
+	BLBS	R0,7$			; Branch if got it
+	BRW	ENTER_ERR2		; Else handle error
+
+7$:	$INS_MFREEQ			; Queue buffer to port
+	MOVL	PB$L_SB(R3),R0		; Get addr of formative SB
+	MOVAL	G^SCS$GQ_CONFIG,R2	; Get SB listhead
+	MOVL	R2,R1			; Hold starting point
+
+10$:	MOVL	(R2),R2			; Get next SB in list
+	CMPL	R2,R1			; Back where we started?
+	BEQL	MOVE_SB			; Branch if so, this system
+					;  isn't here
+	CMPL	SB$B_SYSTEMID(R0),-	; Check for system ID match
+		SB$B_SYSTEMID(R2)	;  on low 4 bytes
+	BNEQ	10$			; Branch if no match
+	CMPW	SB$B_SYSTEMID+4(R0),-	; Check high 2 bytes
+		SB$B_SYSTEMID+4(R2)	; 
+	BNEQ	10$			; Branch if no match
+	CMPL	SB$Q_SWINCARN(R0),-	; Is this the same incarnation of
+		SB$Q_SWINCARN(R2)	;  of the system we've already got?
+	BNEQ	ENTER_ERR3		; Branch if not because this means
+	CMPL	SB$Q_SWINCARN+4(R0),-	;  the system is really a different
+		SB$Q_SWINCARN+4(R2)	;  system with the same system ID
+	BNEQ	ENTER_ERR3		;
+
+;
+; This system already has an SB in the database.  Delete formative
+; SB and insert formative path block only into the system wide
+; configuration database.  R0 has the address of the formative SB.
+;
+
+DELETE_SB:
+
+	JSB	G^COM$DRVDEALMEM	; Deallocate it to pool
+	BRB	MOVE_PB			; Join common PB move
+
+;
+; This system is new.  Move the formative SB to the system wide
+; configuration database and link formative PB to it.  R0 has the 
+; address of the formative SB.
+;
+
+MOVE_SB:
+
+	MOVL	R0,R2			; Copy addr of formative SB
+	INSQUE	(R2),@4(R1)		; Insert formative SB on tail of
+					;  system configuration list
+	MOVL	R3,SB$L_PBCONNX(R2)	; Set formative PB as first
+					;  path to use for a connection
+
+MOVE_PB:
+
+	REMQUE	(R3),R3			; Remove formative path block
+	INSQUE	(R3),@SB$L_PBBL(R2)	;  and link to system block
+	MOVAL	PB$L_WAITQFL(R3),-	; Set PB general wait queue
+		PB$L_WAITQFL(R3)	;  to no entries
+	MOVAL	PB$L_WAITQFL(R3),-	; 
+		PB$L_WAITQBL(R3)	;
+	INCW	PDT$W_PBCOUNT(R4)	; Step count of PB's on this PDT
+	MOVZWL	#SS$_NORMAL,R0		; Set status = success
+
+ENTER_DONE:
+
+	POPL	R2			; Restore saved register
+	RSB				; Return
+
+ENTER_ERR:
+
+	CLRL	R0			; Set status=fail
+	BRB	ENTER_DONE		; Join common exit
+
+ENTER_ERR2:
+
+	MOVL	PB$L_CLSCKT_DG(R3),R2	; Get addr of SETCKT dg
+	BSBW	SCS$DEAL_PKT		;  and return to pool
+
+ENTER_ERR1:
+
+	MOVL	PB$L_SCSMSG(R3),R2	; Get addr of SCS send buffer
+	BSBW	SCS$DEAL_PKT		;  and return to pool
+	BRB	ENTER_ERR		; Join common error exit
+
+ENTER_ERR3:
+
+	$REM_MFREEQ			; Remove queued SCS recv buffer
+	BVS	30$			; Branch if couldn't get it
+	BSBW	SCS$DEAL_MSG		; Return it to pool
+
+30$:	BRB	ENTER_ERR2		; Join rest of error handling
+
+	.DSABL	LSB
+
+	.SBTTL	-	BUILD_SB, BUILD A FORMATIVE SYSTEM BLOCK
+
+;+
+; BUILD_SB allocates a system block from nonpaged pool and sets
+; it up with information from the received START or STACK datagram.
+; If insufficient pool is available, then the routine returns failure.
+;
+; Inputs:
+;
+;	R2			-Addr of START/STACK dg
+;	R3			-Addr of formative PB
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-0/1 for fail/success
+;	R1			-Destroyed
+;	other registers 	-Preserved
+;-
+
+;
+; Data structure adjacency assumptions:
+;
+
+ASSUME	SB$B_SYSTEMID+8 EQ SB$W_MAXDG
+ASSUME	SB$W_MAXDG+2	EQ SB$W_MAXMSG
+ASSUME	SB$W_MAXMSG+2	EQ SB$T_SWTYPE
+ASSUME	SB$T_SWTYPE+4	EQ SB$T_SWVERS
+ASSUME	SB$T_SWVERS+4	EQ SB$Q_SWINCARN
+
+ASSUME	PPD$B_SYSTEMID+8 EQ PPD$W_MAXDG
+ASSUME	PPD$W_MAXDG+2	EQ PPD$W_MAXMSG
+ASSUME	PPD$W_MAXMSG+2	EQ PPD$T_SWTYPE
+ASSUME	PPD$T_SWTYPE+4	EQ PPD$T_SWVERS
+ASSUME	PPD$T_SWVERS+4	EQ PPD$Q_SWINCARN
+
+DATA_LEN = <SB$Q_SWINCARN+8> - <SB$B_SYSTEMID>
+
+	.ENABL	LSB
+
+BUILD_SB:
+
+	PUSHR	#^M<R2,R3,R4,R5>	; Save a bunch of registers
+	MOVL	#SB$K_LENGTH,R1		; Get size of SB
+	JSB	G^EXE$ALONONPAGED	; Allocate from nonpaged pool
+	BLBC	R0,SB_DONE		; Branch if no pool
+	MOVW	R1,SB$W_SIZE(R2)	; Set struct size
+	MOVW	#DYN$C_SCS+<DYN$C_SCS_SB@8>,-  ; Set structure type
+		SB$B_TYPE(R2)		       ;  and subtype
+	MOVAL	SB$L_PBFL(R2),-		; Set path block list head
+		SB$L_PBFL(R2)		;  to empty
+	MOVAL	SB$L_PBFL(R2),-		;
+		SB$L_PBBL(R2)		;
+	MOVL	R2,R1			; Copy SB addr to R1
+	MOVL	(SP),R2			; Retreive dg addr
+	MOVL	4(SP),R3		;  and PB addr
+	MOVL	R1,PB$L_SB(R3)		; Link new SB to PB
+	MOVC3	#DATA_LEN,-		; Copy system ID, dg and msg
+		PPD$B_SYSTEMID(R2),-	;  sizes, sw type, version, and
+		SB$B_SYSTEMID(R1)	;  and incarnation
+	MOVZWL	#SS$_NORMAL,R0		; Set status = success
+
+SB_DONE:
+
+	POPR	#^M<R2,R3,R4,R5>	; Restore registers
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	BREAK_PATH,	INITIATE CRASH
+	.SBTTL	-			OF VIRTUAL CIRCUIT
+
+;+
+; BREAK_PATH is the action routine called when a START is received
+; on a VC we think is open.  The START implies that the remote system
+; has crashed the VC and that we should do the same.  Therefore, the 
+; start datagram is discarded and ERR$CRASHVC_PB is called to start
+; the process of crashing the virtual circuit.
+;
+; Inputs:
+;
+;	R2			-Addr of START dg
+;	R3			-Addr of PB
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+BREAK_PATH:
+
+	BSBW	SCS$DISCARD_DG		; Return start dg to 
+					;  free queue
+	BSBW	ERR$CRASHVC_PB		; Start crash of VC on its
+					;  way
+	RSB				; Return to action dispatcher
+
+	.DSABL	LSB
+
+	.SBTTL	-	IGNORE_DG,		DISCARD DATAGRAM WITHOUT ACTION
+
+;+
+; IGNORE_DG is the action routine called for received start handshake datagrams
+; for a path block with VC failure in progress.  The datagram is returned to
+; the free queue and no further action taken.
+;
+; Inputs:
+;
+;	R2			-Addr of handshake dg
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+IGNORE_DG:
+
+	BSBW	SCS$DISCARD_DG		; Return dg to free queue
+	RSB				; Return to action dispatcher
+
+	.DSABL	LSB
+
+	.SBTTL	UTILITY ROUTINES
+	.SBTTL	-	FMT_START_DATA, FORMAT START DATA IN A
+	.SBTTL	-			START/STACK DATAGRAM
+
+;+
+; FMT_START_DATA fills in the start data in a STACK or START datagram.
+; Data is drqwn from sysgen paramters, SCS global locations, the
+; system ID register, and constants. 
+;
+; Inputs:
+;
+;	R2			-Addr of datagram
+;	R3			-Addr of PB
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0,R1			-Destroyed
+;	other registers		-Preserved
+;-
+;
+; Message format adjacency assumptions:
+;
+
+	ASSUME	PPD$B_SYSTEMID+8 EQ PPD$W_MAXDG
+	ASSUME	PPD$W_MAXDG+2	EQ PPD$W_MAXMSG
+	ASSUME	PPD$W_MAXMSG+2	EQ PPD$T_SWTYPE
+	ASSUME	PPD$T_SWTYPE+4	EQ PPD$T_SWVERS
+	ASSUME	PPD$T_SWVERS+4	EQ PPD$Q_SWINCARN
+	ASSUME	PPD$Q_SWINCARN+8 EQ PPD$T_HWTYPE
+	ASSUME	PPD$T_HWTYPE+4 	EQ PPD$L_HWVERS
+
+	.ENABL	LSB
+
+FMT_START_DATA:
+
+	MOVAL	PPD$B_SYSTEMID(R2),R0	; Get system ID field addr
+	MOVQ	G^SCS$GB_SYSTEMID,(R0)+	; Copy system ID
+	CLRW	-2(R0)			; Zero previous 2 bytes
+	MOVL	G^SCS$GW_MAXDG,(R0)+	; Specify max bytes of dg and
+					;  msg application data
+	MOVL	#^A/VMS /,(R0)+		; Set operating system name
+	MOVL	#SYS$K_VERSION,(R0)+	; Set operating system version
+	MOVQ	G^EXE$GQ_TODCBASE,(R0)+	; Set system boot seq #
+	MOVL	#^A/V780/,(R0)+		; Set processor name
+	MOVQ	G^EXE$GB_CPUDATA,(R0)+	; Copy CPU data (hardware/ ucode
+	MOVQ	G^EXE$GB_CPUDATA+8,(R0)+ ;  rev levels)
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	CLEANUP, REMOVE FORMATIVE PB AND SB
+
+;+
+; CLEANUP is called by the ACTION_DISP routine when fail status
+; has been returned by an action routine.  The action routine
+; detecting the error is expected to perform all cleanup other
+; than deleting the formative path block and system block.  CLEANUP
+; deletes the formative system block (if any) and formative
+; path block.  The start handshake is simply abandoned to be
+; restarted by a new IDREC later.
+;
+; Inputs:
+;
+;	R3			-Addr of formative PB
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+CLEANUP:
+
+	MOVL	PB$L_SB(R3),R0		; Get addr of formative SB
+	BEQL	10$			; Branch if none
+	JSB	G^COM$DRVDEALMEM	; Else deallocate SB
+	
+10$:	BBCC	PB$B_RSTATION(R3),-	; Mark no PB in path map
+		PDT$B_PORTMAP(R4),20$	;
+20$:	REMQUE	(R3),R0			; Remove PB from formative list
+	JSB	G^COM$DRVDEALMEM	; Deallocate PB
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SEARCH_PATHS, SEARCH FOR PB WITH STATION ADDR MATCH
+
+;+
+; SEARCH_PATHS searches a doubly linked list of PB's for the first
+; PB with station address matching a specified station address.  The
+; match is done only on the low order 8 bits of station address since
+; CI station addresses are known to fit in 8 bits.
+;
+; Inputs:
+;
+;	R1			-Station address to match
+;	R3			-Addr of PB listhead
+;
+; Outputs:
+;
+;	R0			-0/1 for fail/success on search
+;	R3			-PB address if success
+;	other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SEARCH_PATHS:
+
+	MOVL	R3,R0			; Hold start point
+
+SEARCH_CONT:
+
+	MOVL	(R3),R3			; Get next PB
+	CMPL	R3,R0			; Back at start?
+	BEQL	20$			; Branch if so
+	CMPB	PB$B_RSTATION(R3),R1	; Low byte matches?
+	BNEQ	SEARCH_CONT		; Branch if not
+	MOVZWL	#SS$_NORMAL,R0		; Else return success
+	RSB				; Return
+
+20$:	CLRL	R0			; Status = fail
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	CNF$LKP_PB_MSG,	LOOK UP THE PB CORRESPONDING
+	.SBTTL	-			TO A PDT AND REMOTE STATION ADDR
+
+;+
+; CNF$LKP_PB_MSG extracts the remote station addr from a received message
+; and looks through the system wide configuration database for the
+; PB correxponding to the remote station and PDT.  Only the low order
+; 8 bits of the station address are matched since CI station addresses
+; always fit in 8 bits.
+;
+; Inputs:
+;
+;	R2			-Addr of message
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-0/1 for fail/success on search
+;	R1			-PB addr if success
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+CNF$LKP_PB_MSG::
+
+	PUSHL	R5			; Save a couple of registers
+	PUSHL	R3			;
+	MOVZBL	PPD$B_PORT(R2),R1	; Get remote station addr
+	MOVAL	G^SCS$GQ_CONFIG,R5	; Get addr of listhead for system
+					;  configuration database
+
+10$:	MOVL	(R5),R5			; Get next system block
+	CMPL	R5,#SCS$GQ_CONFIG	; Back at start of list?
+	BEQL	PB_NOT_FOUND		; Branch if so
+	MOVAL	SB$L_PBFL(R5),R3	; Get addr of PB listhead
+	BSBB	SEARCH_PATHS		; See if there is matching station
+
+20$:	BLBC	R0,10$			; Branch if no matching station
+	CMPL	PB$L_PDT(R3),R4		; Is this path block a path from
+					;  the same PDT?
+	BEQL	PB_FOUND		; Branch if yes
+	MOVAL	SB$L_PBFL(R5),R0	; Else set up PB listhead addr again
+	BSBB	SEARCH_CONT		; Continue PB search
+	BRB	20$			;  and check results
+
+PB_FOUND:
+
+	MOVL	R3,R1			; Move PB addr to R1
+
+30$:	POPL	R3			; Retreive caller's R3
+	POPL	R5			;  and R5
+	RSB				; Return
+
+PB_NOT_FOUND:
+
+	CLRL	R0			; Show failure status
+	BRB	30$			; Join common exit
+	
+	.DSABL	LSB
+
+	.SBTTL	-	CNF$LKP_PB_PDT,	LOOK UP FIRST/NEXT
+	.SBTTL	-			PB ASSOC WITH PDT
+
+;+
+; CNF$LKP_PB_PDT looks through the configuration database for PB's
+; associated with a specified PDT.  For each one found, the caller is
+; called back with the PB address in R3.  When the whole database has
+; been searched, return is taken to the caller with failure status in R0.
+;
+; This routine is called during power failure to cleanup PB's and SB's
+; associated with the local failing port.  Therefore, when a PB is 
+; delivered to the caller, the PB and its SB may have been deleted
+; upon return from the coroutine.  The forward links to the next PB and
+; next SB in the configuration database will be destroyed in this case.
+; Whenever an SB is being processed, the link to the next SB is saved on
+; the stack.  When a PB is about to be delivered to the coroutine, the 
+; link to the next PB is saved on the stack and, upon return, the saved
+; link used as the address of the next PB to look at.
+;
+; Inputs:
+;
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R0			-Status:  LBS/C if PB found/not found
+;	R3			-PB addr if success
+;	R1,R2			-Destroyed
+;	Other registers		-Preserved
+;-
+
+ASSUME  PB$L_FLINK	EQ 0
+ASSUME  SB$L_FLINK	EQ 0
+
+	.ENABL	LSB
+
+CNF$LKP_PB_PDT::
+
+	MOVAL	G^SCS$GQ_CONFIG,R2	; Get configuration database ptr
+	MOVL	(R2),R2			; Get next system blk
+
+10$:	CMPL	R2,#SCS$GQ_CONFIG	; Back at header?
+	BEQL	NOT_FOUND		; Branch if so
+	PUSHL	(R2)			; Save link to next SB
+	MOVAL	SB$L_PBFL(R2),R3	; Get PB list header
+	MOVL	R3,R1			; Save listhead addr
+
+20$:	MOVL	(R3),R3			; Get next PB
+
+30$:	CMPL	R3,R1			; Back at start of list?
+	BEQL	NEXT_SB			; Branch if so -- move to next SB
+	CMPL	PB$L_PDT(R3),R4		; Is PB on this PDT?
+	BNEQ	20$			; Branch if not
+	MOVZWL	#SS$_NORMAL,R0		; Set success status for caller
+					;  coroutine
+	PUSHL	(R3)			; Save link to next PB
+	PUSHR	#^M<R1,R2>		; Save registers caller destroys
+	JSB	@<4*4>(SP)		; Call caller back to process PB
+					;  (There are 2 flinks and 2
+					;  registers saved on the stack)
+	POPR	#^M<R1,R2>		; Restore registers
+	POPL	R3			; Retreive addr of next PB
+	BRB	30$			; Check next PB
+
+NEXT_SB:
+
+	POPL	R2			; Retreive addr of next SB
+	BRB	10$			; Check next SB
+NOT_FOUND:
+
+	CLRL	R0			; Set fail status for caller coroutine
+	RSB				; Return to caller
+
+	.DSABL	LSB
+
+	.SBTTL	-	CNF$REMOVE_PB,	REMOVE PB(SB) FROM 
+	.SBTTL	-			CONFIG DATABASE
+
+;+
+; CNF$REMOVE_PB is called by ERR$VCCLOSED_MSG/PB or ERR$VC_CACHECLR
+; when all connections associated with a failing path block have
+; been cleaned up.  CNF$REMOVE_PB marks the remote port as unknown in 
+; the port bitmap.  If this is a virutal circuit failure  due to reasons
+; other than local port/system power failure, then the path block SCS 
+; receive buffer and, if available, the sCS send buffer, are reclaimed from
+; the message free queue and returned to pool.  In the case of a power 
+; failure this step is omitted because all queue elements for all
+; paths on the local port are collected together later.
+;
+; Finally, the path block is unlinked from the system block.  If this
+; leaves the SB with no paths, then the SB is also unlinked from the
+; configuration database and returned to pool.  The PB is returned to 
+; pool too and return taken.
+;
+; Inputs:
+;
+;	IPL			-Fork IPL
+;	
+;	R3			-PB addr
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+CNF$REMOVE_PB::
+
+	TSTL	PB$L_CDTLST(R3)		; Verify no CDT's remain
+	BEQL	10$			; Branch if none do
+	BRW	CONFIG_ERR		; Else inconsistent database
+
+10$:	BBCC	PB$B_RSTATION(R3),-	; Mark the remote port unknown
+		PDT$B_PORTMAP(R4),20$	;  to poller
+20$:	DECW	PDT$W_PBCOUNT(R4)	; Decr count of PB's on this PDT
+	CMPW	PB$W_STATE(R3),-	; Is this a power fail recovery?
+		#PB$C_PWR_FAIL		; 
+	BEQL	40$			; Branch if so
+	MOVL	PB$L_SCSMSG(R3),R2	; Else get SCS send buffer
+	BNEQ	30$			; Branch if available
+	$REM_MFREEQ			; If unavailable, get it from
+					;  message free queue
+
+30$:	BSBW	SCS$DEAL_MSG		; Deallocate to pool
+	$REM_MFREEQ			; Get SCS receive buffer from
+	BSBW	SCS$DEAL_MSG		;  free queue and return to pool
+
+40$:	MOVL	PB$L_CLSCKT_DG(R3),R2	; Get CLSCKT dg addr
+	BEQL	45$			; Branch if none
+	BSBW	SCS$DEAL_PKT		; Else return to pool
+
+45$:	REMQUE	(R3),R3			; Remove PB from PB list
+	BNEQ	50$			; Branch if not last PB
+	MOVL	(R3),R2			; Get addr of offset SB$L_PBFL
+					;  in system blk
+	REMQUE	-SB$L_PBFL(R2),R2	; Remove SB from SB list
+	BSBW	SCS$DEAL_MSG		; Deallocate SB to pool (same
+					;  as deallocating msg)
+
+50$:	MOVL	R3,R2			; Copy PB addr for deallocation
+	BSBW	SCS$DEAL_MSG		; Deallocate PB to pool
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	-	SNDDG_RET,	SEND DG, RETURN BUFFER
+	.SBTTL	-			TO RESPONSE QUEUE
+	.SBTTL	-	SNDDG_NORET,	SEND DG, RETURN BUFFER
+	.SBTTL	-			TO FREE QUEUE
+
+;+
+; The datagram is put on the low priority command queue with
+; the response flag set/clear for the SEND_RET/NORET call.
+;
+; Inputs:
+;
+;	R2			-Addr of dg buffer
+;	R3			-Addr of PB
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SNDDG_RET:
+
+	$SNDDG	RETFLAG=TRUE,-		; Complete PPD header
+		PRIORITY=LOW,-		;  and send datagram out
+		DISPOSAL=POOL,-		;
+		PORT=PB$B_RSTATION(R3)	;
+	RSB				; Return
+
+SNDDG_NORET:
+
+	$SNDDG	RETFLAG=FALSE,-		; Complete PPD header
+		PRIORITY=LOW,-		;  and send datagram out
+		PORT=PB$B_RSTATION(R3)	;
+	RSB				; Return
+
+	.DSABL	LSB
+
+
+	.SBTTL	CNF$TIMER,	PERIODIC WAKEUP ROUTINE
+	.SBTTL	CNF$CALCINTDUE,	RESET WAKEUP DUE TIME
+
+;+
+; CNF$TIMER is called from exec module TIMESCHDL once per n
+; seconds, where n is the basic CI interval timeout.  Timer
+; intervals are specifed in SYSGEN as follows:
+;
+;  Parameter name		Units			Variable name
+;
+;	PASIMTOUT	seconds (2, 2^15-1)	SCS$GW_PASTMOUT
+;	PAPOLLINTERVAL	seconds (2, 2^15-1)	SCS$GW_PAPOLINT
+;	PAPOOL_INTERVAL	seconds (2, 2^15-1)	SCS$GW_PAPOOLIN
+;
+; Note that if the poller interval and pool checking interval are not
+; exact multiples of the basic interval, then they will be effecitvely
+; rounded up to the nearest multiple of the basic interval.  The basic
+; interval is equal to the start handshake timeout interval.
+;
+; Inputs:
+;
+;	R3			-Addr of CRB
+;	IPL			-IPL$_POWER
+;
+; Outputs:
+;
+;	IPL			-IPL$_SCS
+;	R0-R2,R4,R5		-Destroyed
+;	Other registers		-Preserved
+;
+; Entry CNF$CALCINTDUE computes the due time for the next basic interval wakeup.
+; It expects as inputs R3/CRB, R4/PDT and destroys R0.
+;
+;-
+
+	.ENABL	LSB
+
+CNF$TIMER::
+
+	MOVL	CRB$L_AUXSTRUC(R3),R4	; Get PDT address
+	BNEQ	5$			; Branch if there is a PDT
+	RSB				; Else port init aborted, can't
+					;  use port
+
+5$:	MOVL	PDT$L_UCB0(R4),R5	; Get UCB address
+	BBS	#UCB$V_ONLINE,-		; Branch if controller/unit is
+		UCB$W_STS(R5),CONT_POLL	;  on line
+	BRW	CNF$CALCINTDUE		; Else bypass poller and other activity
+					;  and compute next wakeup time
+
+CONT_POLL:
+
+	MOVL	#1,@PDT$L_MTC(R4)	; Poke the maint timer in the
+					;  port to tell it we are alive
+	SETIPL	#IPL$_SCS		; Lower IPL for rest of polling, etc.
+	PUSHL	R3			; Save CRB address
+	MOVAL	PDT$Q_FORMPB(R4),R3	; Get formative PB listhead addr
+	PUSHL	R3			;  and save a copy
+	MOVL	(R3),R3			; Get addr of 1st entry in PB list
+
+SCAN_FORMPB:
+
+	CMPL	R3,(SP)			; Back at start of list?
+	BEQL	FORM_PB_DONE		; Branch if so
+	MOVL	(R3),R5			; Save addr of next PB in
+					;  case this one gets deleted
+	BBC	#PB$V_TIM,-		; Branch if no timeout 
+		PB$W_STS(R3),10$	;  is in progress
+	CMPL	PB$L_DUETIME(R3),-	; Passed this PB's duetime?
+		G^EXE$GL_ABSTIM		;
+	BLSSU	10$			; Branch if not
+	MOVZBL	#EV$C_TIMEOUT,R1	; Set event = timed out
+	BSBW	ACTION_DISP		; Call action dispatcher for
+					;  this PB
+
+10$:	MOVL	R5,R3			; Step to next formative  PB
+	BRB	SCAN_FORMPB		; Check next PB
+FORM_PB_DONE:
+
+	TSTL	(SP)+			; Clear PB listhd from stack
+	CMPL	PDT$L_POOLDUE(R4),-	; Passed pool chekcer's time?
+		G^EXE$GL_ABSTIM		;
+	BGTRU	CHECK_POLLER		; Branch if not
+	MOVAL	PDT$L_WAITQBL(R4),R5	; Get pool waiter listhead addr
+	CMPL	R5,(R5)			; List empty?
+	BEQL	POOL_DONE		; Branch if so
+	MOVL	(R5),R5			; Else get addr of last waiter (if any)
+	
+20$:	MOVL	PDT$L_WAITQFL(R4),R3	; Get addr of next CDRP we are
+					;  going to try to wake
+	$RESUME_FP	-		; Resume next waiter
+		@PDT$L_WAITQFL(R4),-	; 
+		QEMPTY=POOL_DONE	; If none, go to POOL_DONE
+	CMPL	R3,R5			; Was this waiter the last one when
+					;  we started scanning the list?
+					;  (More on the list now are
+					;  repeat failures.)
+	BNEQ	20$			; Branch if not
+
+POOL_DONE:
+
+	MOVZWL	G^SCS$GW_PAPOOLIN,R0	; Get pool check interval
+	ADDL3	R0,G^EXE$GL_ABSTIM,-	; Add pool interval to current
+		PDT$L_POOLDUE(R4)	;  time and store as due time
+
+CHECK_POLLER:
+
+	POPL	R3			; Retreive CRB addr
+	CMPL	PDT$L_POLLERDUE(R4),-	; Passed poller's duetime?
+		G^EXE$GL_ABSTIM		;
+	BGTRU	CNF$CALCINTDUE		; Branch if not
+	BSBW	CNF$POLL		; Call poller
+
+	MOVZWL	G^SCS$GW_PAPOLINT,R0	; Get poller interval
+	ADDL3	R0,G^EXE$GL_ABSTIM,-	; Add poll interval to current time and
+		PDT$L_POLLERDUE(R4)	;  store as poller duetime
+	
+CNF$CALCINTDUE::
+
+	MOVZWL	G^SCS$GW_PASTMOUT,R0	; Get basic timer interval
+	ADDL3	R0,G^EXE$GL_ABSTIM,-	; Add it to current time and
+		CRB$L_DUETIME(R3)	;  and save in CRB
+
+30$:	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	START_TIMER, START A PATH BLOCK TIMER
+;+
+; START_TIMER computes the due time for PB timeout and sets the
+; timeout in porgress bit (PB$V_TIM in PB$W_STS) for the specified
+; pathblock.
+;
+; Inputs:
+;
+;	R3			-Addr of PB
+;	
+; Outputs:
+;
+;	R0			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+START_TIMER:
+
+	MOVZWL	G^SCS$GW_PASTMOUT,R0	; Get basic timer interval
+	ADDL3	R0,G^EXE$GL_ABSTIM,-	; Add it to the current time
+		PB$L_DUETIME(R3)	;  and save in PB due time
+	BBSS	#PB$V_TIM,-		; Set timeout in progress
+		PB$W_STS(R3),10$	;  in pathblock
+10$:	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	STOP_TIMER, STOP PATH BLOCK TIMER
+
+;+
+; STOP_TIMER disables path block timeout by clearing the timeout
+; in progress bit in the pathblock.
+;
+; Inputs:
+;
+;	R3			-Addr of PB
+;
+; Outputs:
+;
+;	All registers		-Preserved
+;-
+
+STOP_TIMER:
+
+	BBCC	#PB$V_TIM,-		; Clear the timeout in progress bit
+		PB$W_STS(R3),10$	;  in specified pathblock
+10$:	RSB				; Return
+
+	.SBTTL	SET_CIRCUIT, PORT OPENS A PORT-PORT VIRTUAL CIRCUIT
+
+;+
+; SET_CIRCUIT allocates a datagram buffer.  If none are available, 
+; return with error status.  Otherwise, send the SETCKT datagram
+; to the port.
+;
+; Inputs:
+;
+;	R2			-Addr of START/STACK dg
+;	R3			-Addr of formative PB
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0			-0/1 for fail/success
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+SET_CIRCUIT:
+
+	PUSHL	R2			; Save dg addr
+	BSBW	SCS$ALLOC_PPDDG		; Allocate a dg buffer
+	BLBC	R0,SET_ERR		; Branch if none
+	MOVL	#<<PPD$M_RSP@24>+<PPD$C_INVTC@16>>,-
+		PPD$B_PORT(R2)		; Set opcode and ask for response
+	$INS_COMQLOW			; Issue the invalidate command
+	BSBW	SCS$ALLOC_DG		; Allocate a datagram buffer
+					;  for the open circuit command
+	BLBC	R0,SET_ERR		; Branch if insufficient pool
+	$SETCKT	PORT=PB$B_RSTATION(R3),-; Open VC, reset sequence #'s
+		MASK=#<PPD$M_CST!PPD$M_NR!PPD$M_NS>,-  
+		MVAL=#PPD$M_CST,-	;
+		RETFLAG=TRUE		; Get SETCKT back for pool
+	MOVZBL	#SS$_NORMAL,R0		; Set status to success
+
+10$:	POPL	R2			; Retreive dg addr
+	RSB				; Return
+
+SET_ERR:
+
+	CLRL	R0			; Set status to failure
+	BRB	10$			; Take common exit
+
+	.DSABL	LSB
+
+
+
+	.END

@@ -1,0 +1,1864 @@
+MODULE LBR_GETPUT (			! GET and PUT routines for librarian
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  Library access procedures
+!
+! ABSTRACT:
+!
+!	The VAX/VMS librarian procedures implement a standard access method
+!	to libraries through a shared, common procedure set.
+!
+! ENVIRONMENT:
+!
+!	VAX native, user mode.
+!
+!--
+!
+! AUTHOR:  Benn Schreiber
+!
+! CREATION DATE: June, 1979
+!
+! MODIFIED BY:
+!
+!	V02-118		RPG0118		Bob Grosso	02-Feb-1982
+!		Fix decr_refs deallocation bug.
+!
+!	V02-117		RPG0117		Bob Grosso	25-Jan-1982
+!		Complete random access by record rfa.
+!
+!	V02-116		RPG0116		Bob Grosso	15-Jan-1982
+!		Random access by record rfa.
+!		Fix history record boundary problem.
+!
+!	V02-115		RPG00115	Bob Grosso	17-Dec-1981
+!		Enhance update history deletion.
+!
+!	V02-114		RPG00114	Bob Grosso	16-Nov-1981
+!		Change lbr$get_record to support locate mode.
+!
+!	V02-113		RPG00113	Bob Grosso	25-Aug-1981
+!		Add messages to lbr$get_history and lbr$put_history.
+!
+!	V02-012		RPG00052	Bob Grosso	30-Jul-1981
+!		Correct the setting of control indexes.
+!		Convert messages.
+!
+!	V02-008		RPG00044	Bob Grosso	18-Jun-1981
+!		Replace lbr$c_maxluhlen with lbr$c_maxrecsiz
+!		Fix delete_data for multiple block spanning records.
+!
+!	V02-007		RPG00043	Bob Grosso	12-Jun-1981
+!		Comment history code.
+!
+!	V02-006		RPG00042	Bob Grosso	2-Jun-1981
+!		Correct delete_data to avoid looping on RFA past EOF.
+!
+!	V02-005		RPG00041	Bob Grosso	8-May-1981
+!		Refine lbr$get_history and lbr$put_history.
+!
+!	V02-004		RPG00035	Bob Grosso	22-Apr-1981
+!		Add lbr$put_history and lbr$get_history.
+!		Remove lbr_rkcache reference.
+!
+!	V02-003		RPG00006	Bob Grosso	5-Jan-1981
+!		Correct the BUILTIN declaration
+!
+!	V02-002		RPG34250	Bob Grosso	16-Dec-1980
+!		Correct the conversion of module insertion dates
+!		entered prior to Version 2 Librarian.
+!
+!--
+
+
+
+%SBTTL  'Declarations';
+LIBRARY
+	'SYS$LIBRARY:STARLET.L32';	! System data structures
+REQUIRE
+	'PREFIX';
+REQUIRE
+	'LBRDEF';
+REQUIRE
+	'OLDFMTDEF';			!Old format library structure definitions
+
+EXTERNAL ROUTINE
+    SYS$FAO : ADDRESSING_MODE (GENERAL), !Formatted ascii output
+    lookup_cache : JSB_2,	! Lookup disk vbn in cache table
+    add_cache : JSB_2,		! Add vbn to cache table
+    validate_ctl : JSB_1,	! Validate library control index
+    get_mem : JSB_2,		! Allocate dynamic memory
+    dealloc_mem : JSB_2,	! Deallocate dynamic memory
+    find_key,			! Find key in index and return position
+    mark_dirty,			! Mark block dirty
+    alloc_block : JSB_2,	! Allocate a disk block
+    dealloc_block : JSB_1,	! Deallocate a disk block
+    read_block : JSB_2,		! Read disk block
+    incr_rfa : JSB_2 NOVALUE,	! Update RFA
+    find_block : JSB_3,		! Locate a block and cache it if not there already
+    get_zmem  : JSB_2;		! Allocate VM and zero it
+
+FORWARD ROUTINE
+    update_nextrfa : JSB_1,	! Update next RFA in library header
+    incr_refcnt,		! Increment module reference count
+    decr_refcnt,		! Decrement module reference count
+    set_module,			! Read and optionally update module header
+    map_blk_to_mem,		! Find/allocate block and map into memory
+    delete_data,		! Delete data 
+    write_record,		! Write record to library
+    read_old_record : JSB_2,	! Read record from old format library
+    read_record : JSB_2,	! Read record from library
+    add_luhrecord,		! Store the LUH record
+    delete_luhrecord;		! Skip first luh record and return any freed blocks
+
+EXTERNAL
+    lbr$gl_maxread,		! Max number blocks to read at once
+    lbr$gl_rmsstv,		! Return STV on errors here
+    lbr$gt_eotdesc : VECTOR [4,BYTE], ! End of text ASCIC record
+    lbr$gl_control: REF BBLOCK;  ! Pointer to control block
+
+EXTERNAL LITERAL
+    lbr$_emptyhist,
+    lbr$_hdrtrunc,
+    lbr$_illop,
+    lbr$_intrnlerr,
+    lbr$_invrfa,
+    lbr$_lkpnotdon,
+    lbr$_nohistory,
+    lbr$_normal,
+    lbr$_reclng,
+    lbr$_rectrunc,
+    lbr$_rfapasteof,
+    lbr$_stillkeys;
+
+PSECT OWN = $CODE$;				!Own data is all shareable
+
+OWN
+    fao_old2newdate : countedstring ('!ZW-!AC-19!ZW 00:00:00'),
+    jan :    countedstring ('JAN'),	!ASCIC strings for months **MUST BE ONLY 3 BYTES LONG TO FIT IN A WORD**
+    feb :    countedstring ('FEB'),
+    mar :    countedstring ('MAR'),
+    apr :    countedstring ('APR'),
+    may :    countedstring ('MAY'),
+    jun :    countedstring ('JUN'),
+    jul :    countedstring ('JUL'),
+    aug :    countedstring ('AUG'),
+    sep :    countedstring ('SEP'),
+    oct :    countedstring ('OCT'),
+    nov :    countedstring ('NOV'),
+    dec :    countedstring ('DEC');
+
+BIND
+    months = jan : VECTOR [,LONG]; 	!Months of year table
+
+%SBTTL 'LBR$FIND';
+GLOBAL ROUTINE lbr$find (control_index, txtrfa) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs a lookup on a module given the RFA
+!
+! Inputs:
+!
+!	control_index	is the address of a longword containing the
+!			control index for th library.
+!	txtrfa		is the address of a 6-byte buffer containing
+!			the module RFA to find.
+!
+! Outputs:
+!
+!	The file is positioned to read the module's text
+!
+!--
+
+MAP
+    txtrfa: REF BBLOCK;			! Pointer to RFA
+
+LOCAL
+    descrip : BBLOCK [dsc$c_s_bln];
+
+BIND
+    length = descrip [dsc$w_length] : WORD,
+    addr = descrip [dsc$a_pointer] : REF BBLOCK;
+
+perform (validate_ctl (..control_index));	! Validate control table index
+
+BEGIN
+    BIND
+	header = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK, ! Pointer to header
+	context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK, ! Pointer to context block
+	eomodrfa = context [ctx$b_eomodrfa] : BBLOCK,	! End of module RFA
+	readrfa = context [ctx$b_readrfa] : BBLOCK;	! Next RFA for read
+
+    IF .context [ctx$v_oldlib]				! If old format library
+    THEN
+	BEGIN
+	    CH$MOVE (rfa$c_length, .txtrfa, readrfa);	! Set RFA for reading
+	    eomodrfa [rfa$l_vbn] = 0;			! Disable end of module
+	    eomodrfa [rfa$w_offset] = 0;		! until after header read
+	    perform (read_old_record (readrfa, descrip)); ! Read and skip header
+	    IF .length NEQ omh$c_size
+		THEN RETURN lbr$_invrfa
+		ELSE
+		    BEGIN
+			BIND
+			    modsizwords = addr [omh$l_modsiz] : VECTOR [,WORD];
+
+			CH$MOVE (rfa$c_length, .txtrfa, eomodrfa);
+			incr_rfa (.modsizwords [1] + .modsizwords [0] * 
+						%X'10000', eomodrfa);
+			END
+	    END
+    ELSE
+	BEGIN
+	    CH$MOVE (rfa$c_length, .txtrfa, readrfa);
+	    perform (read_record (readrfa, descrip)); ! Read module header to skip it
+	    IF .length NEQ mhd$c_mhdlen+.header [lhd$b_mhdusz] ! If module header not correct length
+	    OR .addr [mhd$l_refcnt] EQL 0			  !  or ref count is 0
+	    THEN RETURN lbr$_invrfa;			  !  then RFA is bad
+	    END;
+    context [ctx$v_lkpdon] = true;		! Indicate lookup_key done
+    END;
+
+RETURN true;
+
+END;
+
+%SBTTL  'LBR$PUT_RECORD';
+GLOBAL ROUTINE lbr$put_record (control_index, bufdesc, txtrfa) =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine writes the record passed to it out to the library.
+!
+!
+! CALLING SEQUENCE:
+!
+!	status = lbr$put_record (control_index, bufdesc, txtrfa)
+!
+! INPUT PARAMETERS:
+!
+!	control_index		is the index returned from lbr$ini_control
+!	bufdesc			is the string descriptor for the record
+!				 to be output
+!
+!
+! OUTPUT PARAMETERS:
+!
+!	txtrfa			is a pointer to a two-longword array that
+!				 is filled in with the RFA of the record
+!				 (i.e. the module header if first PUT)
+!
+!--
+
+MAP
+    bufdesc : REF BBLOCK,			!Pointer to string descriptor
+    txtrfa  : REF BBLOCK;			!Pointer to array
+
+LOCAL
+    localrfa : BBLOCK [dsc$c_s_bln];
+
+perform (validate_ctl (..control_index));
+
+BEGIN
+    BIND
+	context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK, !Point to context block
+	header = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK, !and header
+	nxtputrfa = context [ctx$b_nxtputrfa] : BBLOCK,	 !RFA for next PUT
+	hdrnxtrfa = header [lhd$b_nextrfa] : BBLOCK; !Name next RFA
+
+    IF .context [ctx$v_oldlib]			!Cannot write to old library
+	OR .context [ctx$v_ronly]		! or read only library
+    THEN RETURN lbr$_illop;
+
+    IF .bufdesc [dsc$w_length] GTRU lbr$c_maxrecsiz	!If record length illegal
+    THEN RETURN lbr$_reclng;			! then return with error
+
+!
+!	Create the module header record if this is the first put.
+!
+    CH$MOVE (rfa$c_length, nxtputrfa, localrfa);
+    IF NOT .context [ctx$v_mhdout]		!If module header needs to be written
+    THEN BEGIN
+	BIND
+	    mhdlen = .header [lhd$b_mhdusz] + mhd$c_mhdlen; !Length of module header
+
+	LOCAL
+	    mhdrec : BBLOCK [lbr$c_maxhdrsiz]; !buffer for module header
+
+	CH$FILL (0, lbr$c_maxhdrsiz, mhdrec);	!Zero the module header
+        mhdrec [mhd$b_id] = mhd$c_mhdid;	!Set ident
+        $GETTIM (TIMADR = mhdrec [mhd$l_datim]);!Set in time of insertion
+	header [lhd$l_updtim] = .mhdrec [mhd$l_datim]; !Set new time into header
+	header [lhd$l_updtim] + 4 = .(mhdrec [mhd$l_datim] + 4);
+	CH$MOVE (rfa$c_length, hdrnxtrfa, localrfa);
+        perform (write_record (mhdlen, mhdrec, localrfa, false, .txtrfa)); !write the header
+        context [ctx$v_mhdout] = true;		!No longer need module header
+	header [lhd$l_modhdrs] = .header [lhd$l_modhdrs] + 1; !Count another module header
+	update_nextrfa (localrfa);			!Update next RFA
+        perform (write_record (.bufdesc [dsc$w_length], .bufdesc [dsc$a_pointer],
+			localrfa, false));
+        END
+    ELSE
+        perform (write_record (.bufdesc [dsc$w_length], .bufdesc [dsc$a_pointer],
+			localrfa, false));
+
+    update_nextrfa (localrfa);				!Update next RFA
+    CH$MOVE (rfa$c_length, localrfa, nxtputrfa);
+    context [ctx$v_hdrdirty] = true;		!Flag header is dirty
+    RETURN ss$_normal
+    END
+END;					! Of lbr$put_record
+
+%SBTTL  'LBR$PUT_END';
+GLOBAL ROUTINE lbr$put_end (control_index) =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called to finish putting text into the library.
+!
+!
+! CALLING SEQUENCE:
+!
+!	status = lbr$put_end (control_index)
+!
+! INPUT PARAMETERS:
+!
+!	control_index		is the control index returned from lbr$ini_control
+!
+! IMPLICIT OUTPUTS:
+!
+!	An end of text record is written.
+!
+!--
+
+LOCAL
+    localrfa : BBLOCK [dsc$c_s_bln];
+
+perform (validate_ctl (..control_index));		!Validate control index
+BEGIN
+    BIND
+	context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK, !Get context block address
+	header = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK,  !Get header address
+	nxtputrfa = context [ctx$b_nxtputrfa] : BBLOCK;
+
+    IF .context [ctx$v_oldlib]			!Error if old library
+	OR .context [ctx$v_ronly]
+    THEN RETURN lbr$_illop;
+
+    CH$MOVE (rfa$c_length, nxtputrfa, localrfa);
+    perform (write_record (.lbr$gt_eotdesc [0], lbr$gt_eotdesc [1],
+			localrfa, false));
+    update_nextrfa (localrfa);				!Update next RFA
+    nxtputrfa [rfa$l_vbn] = 0;			!Zero next put RFA
+    context [ctx$v_mhdout] = false;		!Need module header next PUT
+    context [ctx$v_hdrdirty] = true;		!Flag header is dirty
+    END;
+RETURN ss$_normal
+END;					! Of lbr$put_end
+
+%SBTTL  'LBR$GET_RECORD';
+GLOBAL ROUTINE lbr$get_record (control_index, inbufdesc, outbufdesc, txtrfa) =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Read a record from the library
+!
+! INPUT PARAMETERS:
+!
+!	control_index	Address of longword containing valid control index
+!	inbufdesc	Address of string descriptor for user-supplied buffer
+!	outbufdesc	(optional) Address of string descriptor for record if locate mode
+!	txtrfa		(optional) Address of rfa.
+!			    If empty then return rfa of retrieved record
+!			    If non-empty then retrieve record located by it.
+!
+! IMPLICIT INPUTS:
+!
+!	An lbr$lookup_key or lbr$find must have been done to position to the module
+!
+!--
+
+MAP
+    inbufdesc : REF BBLOCK,
+    outbufdesc : REF BBLOCK;
+
+LOCAL
+    status,
+    use_call_rfa,				! remember whether caller supplied an rfa
+    descrip : BBLOCK [dsc$c_s_bln];
+
+BIND
+    call_rfa = .txtrfa : BBLOCK,		! caller supplied rfa, or slot to return rfa
+    reclen = descrip [dsc$w_length] : WORD,
+    recaddr = descrip [dsc$a_pointer];
+
+BUILTIN
+    NULLPARAMETER;		! True if parameter not specified
+
+perform (validate_ctl (..control_index));		!Validate control index
+
+use_call_rfa = (IF (NOT NULLPARAMETER (4) )		! if caller has supplied a non-zero rfa then use it.
+		THEN (.call_rfa [rfa$l_vbn] NEQ 0)
+		ELSE false);
+BEGIN
+    BIND
+	context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK, !Name context block
+	lrab = .context [ctx$l_recrab] : BBLOCK,
+	readrfa = context [ctx$b_readrfa] : BBLOCK,
+	header = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK;
+
+    IF .use_call_rfa
+    THEN
+	BEGIN
+	context [ctx$v_lkpdon] = true;
+	readrfa [rfa$l_vbn] = .call_rfa [rfa$l_vbn];
+	readrfa [rfa$w_offset] = .call_rfa [rfa$w_offset];
+	END
+    ELSE
+	BEGIN
+	IF (NOT .context [ctx$v_lkpdon])
+	THEN RETURN lbr$_lkpnotdon;
+	IF NOT NULLPARAMETER (4)
+	THEN
+	    BEGIN	! return rfa of retrieved record
+	    call_rfa [rfa$l_vbn] = .readrfa [rfa$l_vbn];
+	    call_rfa [rfa$w_offset] = .readrfa [rfa$w_offset];
+	    END;
+	END;
+
+    status = (IF NOT .context [ctx$v_oldlib]
+		THEN read_record ( readrfa, descrip)
+		ELSE read_old_record ( readrfa,	descrip) );
+
+    IF .status					!If successful read
+    THEN BEGIN
+	IF .lbr$gl_control [lbr$v_locate]	!Locate mode?
+	THEN
+	    BEGIN
+	    IF NOT NULLPARAMETER (3)			!Want buffer length?
+	    THEN
+		BEGIN
+		outbufdesc [dsc$w_length] = .reclen;	!yes--update descriptor
+		outbufdesc [dsc$a_pointer] = .recaddr;
+		END;
+	    END
+	ELSE BEGIN
+
+	    CH$MOVE (MIN (.reclen, .inbufdesc [dsc$w_length]),
+				 .recaddr, .inbufdesc [dsc$a_pointer]);
+	    IF .reclen GTR .inbufdesc [dsc$w_length]
+		THEN status = lbr$_rectrunc;
+	    IF NOT NULLPARAMETER (3)			!Want buffer length?
+		THEN BEGIN
+		    outbufdesc [dsc$w_length] = .reclen;
+		    outbufdesc [dsc$a_pointer] = .inbufdesc [dsc$a_pointer];
+		    END;
+	    END;	! if move mode
+
+	END		! if successful read
+    ELSE IF .status EQL rms$_eof		!Otherwise, if end of module
+	    THEN context [ctx$v_lkpdon] = false;
+
+    END;
+RETURN .status
+END;					! Of lbr$get_record
+
+%SBTTL  'LBR$DELETE_DATA';
+GLOBAL ROUTINE lbr$delete_data (control_index, txtrfa) =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Delete a text module from the library
+!
+! INPUT PARAMETERS:
+!
+!	control_index		Address of valid control index
+!	txtrfa			Pointer to RFA of text to delete
+!
+! IMPLICIT OUTPUTS:
+!
+!	text is deleted
+!--
+
+perform (validate_ctl (..control_index));
+
+BEGIN
+    BIND
+	context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK;
+
+    IF .context [ctx$v_oldlib]			!Can't delete in old library
+	OR .context [ctx$v_ronly]		! or read only
+    THEN RETURN lbr$_illop;
+    END;
+
+perform (delete_data (.txtrfa));
+RETURN true;
+END;						!OF lbr$delete_data
+
+%SBTTL  'delete_data';
+GLOBAL ROUTINE delete_data (txtrfa) =
+BEGIN
+!
+! Delete data starting with the given RFA
+!
+
+ROUTINE decr_refs (startrfa, endrfa) =
+BEGIN
+!
+! Local routine to decrement record count for a given vbn.  If
+! record count goes to zero, deallocate the block.
+!
+MAP
+    startrfa : REF BBLOCK,
+    endrfa : REF BBLOCK;
+
+
+LOCAL
+    cachentry : REF BBLOCK,
+    blkadr : REF BBLOCK,
+    link;
+
+perform (lookup_cache (.startrfa [rfa$l_vbn], cachentry));!Find the block
+blkadr = .cachentry [cache$l_address];			!Point to it
+blkadr [data$b_recs] = .blkadr [data$b_recs] - 1;	!Count one less
+cachentry [cache$v_dirty] = true;			!Mark block as dirty
+link = .blkadr [data$l_link];				! Save link to next block
+IF .blkadr [data$b_recs] EQL 0				! and if all gone
+	THEN dealloc_block (.startrfa [rfa$l_vbn]);	! then deallocate the block
+
+IF (.startrfa [rfa$l_vbn] NEQ .endrfa [rfa$l_vbn])	!If record spans multiple blocks
+THEN
+    IF (.link NEQ .endrfa [rfa$l_vbn])  ! Spans more than two blocks
+    THEN
+	BEGIN
+	LOCAL
+	    start_rfa : BBLOCK [rfa$c_length];
+        start_rfa [rfa$l_vbn] = .link;
+	decr_refs (start_rfa, .endrfa);
+	END
+    ELSE						! Spans two blocks
+	IF .endrfa [rfa$w_offset] NEQ data$c_data	! and does not end at end of previous block
+	THEN decr_refs (.endrfa, .endrfa);		! then decrement ref count in ending block
+RETURN true;
+END;							!Of dec_recs
+
+!
+! Main body of delete_data
+!
+MAP
+    txtrfa : REF BBLOCK;
+LOCAL
+    read_status,
+    localrfa : BBLOCK [rfa$c_length],
+    recrfa   : BBLOCK [rfa$c_length],
+    cachentry : REF BBLOCK,
+    descrip : BBLOCK [dsc$c_s_bln];
+
+BIND
+    header = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK,
+    hdrnxtrfa = header [lhd$b_nextrfa] : BBLOCK,
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK,
+    length = descrip [dsc$w_length] : WORD,
+    addr = descrip [dsc$a_pointer] : REF BBLOCK;
+
+IF .context [ctx$v_oldlib]				!Can't delete text
+    THEN RETURN lbr$_illop;				! from old library
+
+CH$MOVE (rfa$c_length, .txtrfa, localrfa);
+CH$MOVE (rfa$c_length, .txtrfa, recrfa);
+perform (read_record (localrfa, descrip));		!read module header
+IF .addr [mhd$b_id] NEQ mhd$c_mhdid			!check that it really is
+   THEN RETURN lbr$_invrfa;				!and return error if not
+IF .addr [mhd$l_refcnt] NEQ 0				!There should be no other keys
+    THEN RETURN lbr$_stillkeys;				! still pointing at the data
+decr_refs (recrfa, localrfa);				!Decrement record counts
+!
+! Read the text until end, deleteing empty blocks
+!
+CH$MOVE (rfa$c_length, localrfa, recrfa);		!Save RFA of first data record
+WHILE (read_status = read_record (localrfa, descrip)) NEQ rms$_eof
+DO BEGIN
+    IF NOT .read_status THEN RETURN .read_status;	!Avoid looping on read error
+    decr_refs (recrfa, localrfa);			!Decrement record counts
+    CH$MOVE (rfa$c_length, localrfa, recrfa);		!Copy RFA of next record
+    END;
+
+decr_refs (recrfa, localrfa);				!Discount end of file record too
+
+header [lhd$l_modhdrs] = .header [lhd$l_modhdrs] - 1;	!One less module header
+IF .header [lhd$l_modhdrs] EQL 0			!If that was the last one,
+THEN BEGIN
+    hdrnxtrfa [rfa$l_vbn] = .header [lhd$l_hipreal] + 1;!Reset next VBN
+    hdrnxtrfa [rfa$w_offset] = 0;			  !And offset
+    END;
+context [ctx$v_hdrdirty] = true;			!flag header is dirty
+RETURN true
+END;							! Of delete_data
+
+%SBTTL 'write_record';
+GLOBAL ROUTINE write_record (bytcnt, addr, writerfa, rewrite, retrfa) =
+BEGIN
+!
+! This routine does the actual output to the library
+! Inputs:
+!
+!	bytcnt = Number of bytes in record
+!	addr = Address of record
+!	writerfa = RFA to store record in file
+!	rewrite = true if rewriting previous record
+!	retrfa (optional) = Address to receieve RFA of record
+!			    (the requested RFA may be modified)
+!
+ROUTINE next_block (lastblkadr, rfa, rewrite, newblkadr) =
+BEGIN
+!
+! Local routine to map the next block into memory and
+! handle the links.
+!
+MAP
+    lastblkadr : REF BBLOCK,
+    rfa : REF BBLOCK,
+    newblkadr : REF BBLOCK;
+
+LOCAL
+    newblock : REF BBLOCK,
+    cachentry : REF BBLOCK;
+
+IF .rewrite					!If rewriting the record
+THEN BEGIN
+    rfa [rfa$l_vbn] = .lastblkadr [data$l_link];!link to next block
+    rfa [rfa$w_offset] = data$c_data;
+    END;
+update_nextrfa (.rfa);				!Update next RFA
+perform (map_blk_to_mem (.rfa, .rewrite, .newblkadr, !Bring block into memory
+		cachentry));
+newblock = ..newblkadr;				!Get memory address
+IF NOT .rewrite					!If writing (not rewriting)
+THEN newblock [data$b_recs] = 1;		! then this is first record in block
+update_nextrfa (.rfa);				!Update next RFA (map_blk_to_mem
+						! may modify RFA if needed)
+cachentry [cache$v_dirty] = true;		!Mark block as dirty
+IF NOT .rewrite					!Unless rewriting the block
+THEN lastblkadr [data$l_link] = .cachentry [cache$l_vbn];!Then set the link in last block
+RETURN true
+END;						!Of next_block
+!
+! Main body of write_record
+!
+MAP
+    writerfa : REF BBLOCK;	!Pointer to RFA to write at
+LOCAL
+    bytes,
+    blkadr : REF BBLOCK,		!Pointer to disk block in memory
+    movecount,
+    cachentry : REF BBLOCK,
+    bufptr;
+
+BIND
+    blkvector = blkadr : REF VECTOR [,BYTE],
+    header = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK, !point to the header
+    hdrnxtrfa = header [lhd$b_nextrfa] : BBLOCK,      !name next RFA part
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK;
+
+BUILTIN
+    NULLPARAMETER;		! True if parameter not specified
+
+bytes = .bytcnt;			!and the byte count
+bufptr = .addr;				!Point to the data buffer
+IF .writerfa [rfa$l_vbn] GTRU .hdrnxtrfa [rfa$l_vbn] !Check for illegal vbn request
+    THEN RETURN lbr$_rfapasteof;
+perform (map_blk_to_mem (.writerfa, .rewrite, blkadr, cachentry)); !Map block
+cachentry [cache$v_dirty] = true;	!Mark block as dirty
+IF NOT .rewrite				!Unless rewriting the record
+THEN blkadr [data$b_recs] = .blkadr [data$b_recs] + 1; ! then count another record in block
+update_nextrfa (.writerfa);		!Update next RFA
+
+DO BEGIN
+
+    IF .bytes EQL .bytcnt		!If this is first time in here
+    THEN BEGIN				!then we need to set the byte count
+	IF .writerfa [rfa$w_offset] EQL 0	!If just went to new page
+	THEN perform (next_block (.blkadr, .writerfa, .rewrite, blkadr)); ! then get next block in
+	IF NOT NULLPARAMETER (5)	! If retrfa specified,
+	THEN				! then return to caller
+	    CH$MOVE (rfa$c_length, .writerfa, .retrfa);
+	BEGIN
+	BIND
+	    bytecount = blkvector [.writerfa [rfa$w_offset]] : WORD; !Name the spot where it goes
+	bytecount = .bytcnt;		!Set the byte count
+	END;
+	incr_rfa (2, .writerfa);	!Bump the RFA
+	update_nextrfa (.writerfa);	!Update next RFA
+	IF .writerfa [rfa$w_offset] EQL 0	!gone to new block?
+	THEN perform (next_block (.blkadr, .writerfa, .rewrite, blkadr)); !yes--bring in the block
+	END;				!bytes eql bytcnt
+    movecount = MINU (.bytes, data$c_length - .writerfa [rfa$w_offset]); !Figure length of move
+    CH$MOVE (.movecount, .bufptr, blkvector [.writerfa [rfa$w_offset]]); !and move it in
+    incr_rfa (.movecount, .writerfa);		!increment RFA
+    update_nextrfa (.writerfa);			!Update next RFA
+    bufptr = .bufptr + .movecount;		!update the pointer
+    bytes = .bytes - .movecount;		!and bytes to go
+    IF .writerfa [rfa$w_offset] EQL 0		!going to new page?
+	THEN BEGIN
+	    perform (next_block (.blkadr,	!yes--bring next page in
+		.writerfa, .rewrite, blkadr));
+	    IF .bytes EQL 0			!However, if done with record
+		AND NOT .rewrite		! and not rewriting record
+		THEN blkadr [data$b_recs] = 0;	! then really no records in there yet
+	    END;
+END						!End of repeat loop
+UNTIL .bytes EQL 0;				!End of repeat loop
+
+RETURN true
+END;					!Of write_record
+
+%SBTTL  'read_record';
+GLOBAL ROUTINE read_record (readrfa, descrip) : JSB_2 =
+BEGIN
+!++
+! This routine does the actual input from the library
+!
+! Inputs:
+!
+!	readrfa		Address of RFA to read from
+!	descrip		address of string descriptor to return record description
+!
+! Outputs:
+!
+!	record is read, descriptor returned in descrip
+!	readrfa is updated
+!
+!--
+
+MAP
+    readrfa : REF BBLOCK,
+    descrip : REF BBLOCK;
+
+LOCAL
+    blkadr : REF BBLOCK,			!Pointer to disk block in memory
+    cachentry : REF BBLOCK,		!Pointer to cache entry for block
+    movecount,
+    bytcnt,
+    bufptr;
+
+BIND
+    blkvector = blkadr : REF VECTOR [,BYTE],
+    context = lbr$gl_control [lbr$l_ctxptr] : REF BBLOCK;
+
+perform (map_blk_to_mem (.readrfa, true, blkadr, cachentry));
+IF .readrfa [rfa$w_offset] EQL 0				!Starting new block?
+    THEN readrfa [rfa$w_offset] = data$c_data;			!start at top of block
+
+    BEGIN
+    BIND
+	bytecount = blkvector [.readrfa [rfa$w_offset]] : WORD;	!Name bytecount
+    descrip [dsc$w_length] = .bytecount;			!and return it to caller
+    IF .bytecount GTRU lbr$c_maxrecsiz		!Make sure it's really a record
+	THEN RETURN lbr$_invrfa;		! and return error if not
+    IF .bytecount+.readrfa [rfa$w_offset] + 2 LEQU data$c_length !If record on one block
+    THEN BEGIN
+	descrip [dsc$a_pointer] = blkvector [.readrfa [rfa$w_offset]] + 2; !return the address
+	incr_rfa (.descrip [dsc$w_length] + 2, .readrfa);	!increment RFA
+	IF .readrfa [rfa$w_offset] EQL 0		!If went to next block
+	THEN BEGIN
+	    readrfa [rfa$l_vbn] = .blkadr [data$l_link]; !Link to next block
+	    readrfa [rfa$w_offset] = data$c_data;
+	    END;
+	END
+!
+! Record is split across multiple blocks
+!
+    ELSE BEGIN
+	incr_rfa (2, .readrfa);			!skip the byte count
+	IF .readrfa [rfa$w_offset] EQL 0	! and if went to new block
+	    THEN BEGIN
+		readrfa [rfa$l_vbn] = .blkadr [data$l_link];	!Link to next block
+		readrfa [rfa$w_offset] = data$c_data;
+		END;
+
+	IF .context [ctx$l_readbuf] EQL 0		!If no buffer allocated
+	THEN perform (get_mem (lbr$c_maxrecsiz, context [ctx$l_readbuf]));
+	descrip [dsc$a_pointer] = .context [ctx$l_readbuf];	!Return address to caller
+	bufptr = .context [ctx$l_readbuf];	!Init buffer pointer
+	bytcnt = .bytecount;			!Set up byte count
+	DO BEGIN				!Read whole record into buffer
+	    perform (map_blk_to_mem (.readrfa, true, blkadr, cachentry)); !Map into memory
+	    movecount = MINU (.bytcnt, data$c_length - .readrfa [rfa$w_offset]); !Compute length of move
+	    bufptr = CH$MOVE (.movecount,
+		blkvector [.readrfa [rfa$w_offset]], .bufptr); !Copy partial record
+	    bytcnt = .bytcnt - .movecount;	!Update bytes left to go
+	    incr_rfa (.movecount, .readrfa);	!Update RFA
+	    IF .readrfa [rfa$w_offset] EQL 0	!If went to new page
+		THEN BEGIN
+		    readrfa [rfa$l_vbn] = .blkadr [data$l_link]; !next block
+		    readrfa [rfa$w_offset] = data$c_data;
+		    END;
+	    END
+	UNTIL .bytcnt EQL 0;
+	END;
+    END;
+!
+! Check to see if this is the end of text record, and return
+! rms$_eof if so.
+!
+
+IF .descrip [dsc$w_length] EQL .lbr$gt_eotdesc [0]		!If the length is correct
+AND CH$EQL  (.descrip [dsc$w_length], .descrip [dsc$a_pointer], ! and its an eof record
+		.lbr$gt_eotdesc [0], lbr$gt_eotdesc [1])	!
+THEN RETURN rms$_eof				!then it is end of file
+ELSE RETURN true				!otherwise return good record
+END;				! Of read_record
+
+%SBTTL  'read_old_record';
+GLOBAL ROUTINE read_old_record (readrfa, descrip) : JSB_2 =
+BEGIN
+!++
+! This routine does the actual input from the library for old format libraries
+!
+! Inputs:
+!
+!	readrfa		Address of RFA to start reading from
+!	descrip		Address of string descriptor to fill in
+!
+! Outputs:
+!
+!	Record is read, descrip filled in, readrfa updated
+!
+!--
+
+MAP
+    readrfa : REF BBLOCK,
+    descrip : REF BBLOCK;
+
+LOCAL
+    blkadr : REF VECTOR [,BYTE],			!Pointer to disk block in memory
+    cachentry : REF BBLOCK,		!Pointer to cache entry for block
+    movecount,
+    bytcnt,
+    bufptr;
+
+LITERAL
+     bsize = 2;
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK,
+    eofrfa = context [ctx$b_eomodrfa] : BBLOCK;
+
+!
+! Check for end of module
+!
+IF .eofrfa [rfa$l_vbn] NEQ 0
+AND .readrfa [rfa$l_vbn] EQL .eofrfa [rfa$l_vbn]
+AND .readrfa [rfa$w_offset] EQL .eofrfa [rfa$w_offset]
+THEN BEGIN
+    eofrfa [rfa$l_vbn] = 0;
+    RETURN rms$_eof;
+    END;
+
+perform (map_blk_to_mem (.readrfa, true, blkadr, cachentry));
+BEGIN
+    BIND
+	bytecount = blkadr [.readrfa [rfa$w_offset]] : WORD;	!Name bytecount
+    descrip [dsc$w_length] = .bytecount;			!and return it to caller
+    IF .bytecount GTRU lbr$c_maxrecsiz		!Make sure it's really a record
+	THEN RETURN lbr$_invrfa;		! and return error if not
+    IF .bytecount+.readrfa [rfa$w_offset]+bsize LEQU data$c_length !If record on one block
+    THEN BEGIN
+	descrip [dsc$a_pointer] = blkadr [.readrfa [rfa$w_offset]]+bsize; !return the address
+	incr_rfa (.descrip [dsc$w_length] +bsize, .readrfa);			!increment RFA
+	RETURN true
+	END
+!
+! Record is split across multiple blocks
+!
+    ELSE BEGIN
+	IF .lbr$gl_control [lbr$b_func] EQL lbr$c_read	!If reading the library
+	AND .context [ctx$l_rdbufr] NEQ 0		! and read buffer is allocated
+	THEN BEGIN
+!
+! See if whole record is in the read buffer
+!
+	    LOCAL
+		endrfa : BBLOCK [rfa$c_length];
+
+	    CH$MOVE (rfa$c_length, .readrfa, endrfa);
+	    incr_rfa (.descrip [dsc$w_length] + bsize, endrfa);		!Compute ending rfa
+	    IF .endrfa [rfa$l_vbn] LSSU			!If whole record in buffer
+		.context [ctx$l_rdvbn1] + .context [ctx$l_rdblks]
+	    THEN BEGIN
+		descrip [dsc$a_pointer] = blkadr [.readrfa [rfa$w_offset]]+bsize; !Return address to caller
+		incr_rfa (.descrip [dsc$w_length] + bsize, .readrfa);	!Update rfa
+		RETURN true
+		END;
+	    END;
+
+	incr_rfa (bsize, .readrfa);		!skip the byte count
+
+	IF .context [ctx$l_readbuf] EQL 0		!If no buffer allocated
+	THEN perform (get_mem (lbr$c_maxrecsiz, context [ctx$l_readbuf]));
+	descrip [dsc$a_pointer] = .context [ctx$l_readbuf];	!Return address to caller
+	bufptr = .context [ctx$l_readbuf];	!Init buffer pointer
+	bytcnt = .bytecount;			!Set up byte count
+	DO BEGIN				!Read whole record into buffer
+	    perform (map_blk_to_mem (.readrfa, true, blkadr, cachentry)); !Map into memory
+	    movecount = MINU (.bytcnt, data$c_length - .readrfa [rfa$w_offset]); !Compute length of move
+	    bufptr = CH$MOVE (.movecount, blkadr [.readrfa [rfa$w_offset]], .bufptr); !Copy partial record
+	    bytcnt = .bytcnt - .movecount;	!Update bytes left to go
+	    incr_rfa (.movecount, .readrfa);	!Update RFA
+	    END
+	UNTIL .bytcnt EQL 0;
+	END;
+    END;
+RETURN true			! return good record
+END;				! Of read_record
+
+%SBTTL  'map_blk_to_mem';
+ROUTINE map_blk_to_mem (rfadr, reading, blkadr, cachentry) =
+BEGIN
+!++
+!
+! Find block in memory, given RFA
+!
+! Inputs:
+!
+!	rfadr		Address of RFA to find
+!	reading		true if reading/updateing, otherwise false
+!
+! Outputs:
+!
+!	blkadr		Address of block if found
+!	cachentry	Address of cache entry for block
+!
+!	RFA requested may be modified if writing.
+!
+!--
+MAP
+    rfadr : REF BBLOCK,
+    cachentry : REF BBLOCK;
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK,
+    diskvbn = rfadr [rfa$l_vbn],
+    offset = rfadr [rfa$w_offset] : WORD,
+    header = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK,
+    next_vbn = header [lhd$l_nextvbn];		! Library end of file
+
+LOCAL
+    status,
+    newvbn,
+    cacheaddr : REF BBLOCK;
+
+!
+! If just reading the file, use a block buffer instead. Allocate it now if needed
+!
+IF .lbr$gl_control [lbr$b_func] EQL lbr$c_read		!Reading the library?
+!***AND .context [ctx$v_oldlib]				! and its old format
+THEN BEGIN
+    IF .context [ctx$l_rdbufr] EQL 0			!Need a buffer?
+	THEN perform (get_mem (.lbr$gl_maxread * lbr$c_pagesize, ! then allocate one
+				context [ctx$l_rdbufr]));
+    IF .diskvbn GEQU .context [ctx$l_rdvbn1]		!Is block in the buffer?
+	AND .diskvbn LSSU .context [ctx$l_rdvbn1] + .context [ctx$l_rdblks]
+	THEN BEGIN
+	    .blkadr = .context [ctx$l_rdbufr] +		!Yes! return block address
+			(.diskvbn - .context [ctx$l_rdvbn1]) * lbr$c_pagesize;
+	    RETURN true;
+	    END
+	ELSE BEGIN
+	    BIND
+		lrab = .context [ctx$l_recrab] : BBLOCK; !RAB for I/O
+	    LOCAL
+		status;
+
+	    lrab [rab$l_bkt] = .diskvbn;		!Set starting block
+	    lrab [rab$l_ubf] = .context [ctx$l_rdbufr];	!and buffer address
+	    lrab [rab$w_usz] = .lbr$gl_maxread * lbr$c_pagesize; !Set buffer size
+	    IF (status = $READ (RAB = lrab))		!If good read
+		OR .status EQL rms$_eof			! or we read to eof
+		THEN BEGIN				!Then things look good
+		    .blkadr = .context [ctx$l_rdbufr];	!Return buffer address
+		    context [ctx$l_rdblks] = .lrab [rab$w_rsz] / lbr$c_pagesize;
+		    context [ctx$l_rdvbn1] = .diskvbn;	!Set vbn into context block
+		    RETURN true;
+		    END
+		ELSE BEGIN
+		    lbr$gl_rmsstv = .lrab [rab$l_stv];	!Return stv on error
+		    RETURN .status;
+		    END;
+	    END
+    END
+ELSE BEGIN						! Also writing, so cache disk blocks
+IF .diskvbn LSSU .next_vbn				!Disk block already allocated?
+OR .context [ctx$v_oldlib]				! or an old format library (always!)
+THEN BEGIN						!Yes--look in cache first
+    IF (status = lookup_cache (.diskvbn, cacheaddr))	! and if it is found
+	AND .cacheaddr [cache$v_data]			! and it is a data block
+	AND (.reading OR (.offset NEQ 0))		! and we are reading or writing and
+							!  not just starting the block
+	THEN BEGIN
+	    .blkadr = .cacheaddr [cache$l_address];	! then use it
+	    .cachentry = .cacheaddr;
+	    RETURN true;
+	    END
+	ELSE IF NOT .reading				!Not found--if writing the record
+	THEN BEGIN					! then allocate a new block
+	    alloc_block (newvbn, .blkadr);		!allocate a new block
+	    offset = data$c_data;			!Set offset
+	    CH$FILL (0, data$c_data, ..blkadr);		!Zero info at start of block
+	    diskvbn = .newvbn;				!Fill in block allocated
+	    END
+	ELSE BEGIN					!Otherwise, read it from the disk
+	    perform (read_block (.diskvbn, .blkadr));
+	    END;
+    END
+ELSE IF .diskvbn GTRU .next_vbn				!Not allocated--is this a bad call?
+THEN RETURN lbr$_rfapasteof				!yes, return error
+ELSE BEGIN
+    IF .offset EQL 0					!Just starting the new block?
+    AND NOT .reading					! and writing
+	THEN BEGIN
+	    alloc_block (newvbn, .blkadr);		!yes--allocate it
+	    offset = data$c_data;			!Set correct offset
+	    CH$FILL (0, data$c_data, ..blkadr);		!Zero info in block
+	    diskvbn = .newvbn;				!update vbn gotten
+	    END
+	ELSE BEGIN					!We've already touched the block
+	    IF lookup_cache (.diskvbn, cacheaddr)	!So find the cache entry
+	    THEN BEGIN
+		.blkadr = .cacheaddr [cache$l_address];	!Get the data block address
+		.cachentry = .cacheaddr;
+		RETURN true;
+		END
+	    ELSE BEGIN					!It's not in memory, read it in
+		perform (read_block (.diskvbn, .blkadr)); !it wasn't so read it in
+		END;
+	    END;
+    END;
+perform (add_cache (.diskvbn, cacheaddr));		!Insert into disk block cache
+.cachentry = .cacheaddr;				!Return cache entry address to caller
+cacheaddr [cache$l_address] = ..blkadr;
+cacheaddr [cache$v_data] = true;
+RETURN true
+END;
+END;							!Of map_blk_to_mem
+
+%SBTTL  'update_nextrfa';
+ROUTINE update_nextrfa (rfa) : JSB_1 =
+BEGIN
+!++
+! Update the next RFA location (LHD$B_NEXTRFA) in library header if
+! needed.
+!
+! Inputs:
+!
+!	rfa		Address of new rfa
+!
+! Outputs:
+!
+!	nextrfa in header updated if new rfa is greater.
+!
+!--
+
+MAP
+    rfa : REF BBLOCK;
+
+BIND
+    header = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK,
+    hdrnxtrfa = header [lhd$b_nextrfa] : BBLOCK;
+
+IF .rfa [rfa$l_vbn] GTRU .hdrnxtrfa [rfa$l_vbn]
+    OR ((.rfa [rfa$l_vbn] EQL .hdrnxtrfa [rfa$l_vbn])
+    AND (.rfa [rfa$w_offset] GTRU .hdrnxtrfa [rfa$w_offset]))
+THEN
+    CH$MOVE (rfa$c_length, .rfa, hdrnxtrfa);
+
+RETURN true;
+END;
+
+%SBTTL  'incr_refcnt';
+GLOBAL ROUTINE incr_refcnt (txtrfa) =
+BEGIN
+!++
+! Increment the module reference count in the module header
+!
+! Inputs:
+!
+!	txtrfa		Address of rfa for module header
+!
+! Outputs:
+!
+!	Reference count in module header is incremented.
+!
+!--
+
+MAP
+    txtrfa : REF BBLOCK;
+
+LOCAL
+    header : BBLOCK [lbr$c_maxhdrsiz],
+    hdrdesc : BBLOCK [dsc$c_s_bln],
+    hdrlen,
+    blockaddr : REF VECTOR [,BYTE],
+    cachentry : REF BBLOCK,
+    localrfa : BBLOCK [rfa$c_length];
+
+CH$MOVE (rfa$c_length, .txtrfa, localrfa);
+perform (map_blk_to_mem (localrfa, true, blockaddr, cachentry));
+IF (.txtrfa [rfa$w_offset] + mhd$c_reflng + 2) LEQU data$c_length
+THEN BEGIN
+    BIND
+	libhdr = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK,	!Library header
+	reclen = blockaddr [.txtrfa [rfa$w_offset]] : WORD,	!Length of record
+	refcnt = blockaddr [.txtrfa [rfa$w_offset] + mhd$c_reflng - 2];
+
+    IF .reclen NEQ mhd$c_mhdlen + .libhdr [lhd$b_mhdusz]
+	THEN RETURN lbr$_invrfa;
+    refcnt = .refcnt + 1;
+    cachentry [cache$v_dirty] = true;		!Mark block dirty
+    END
+!
+! Module header is split across blocks
+!
+ELSE BEGIN
+    hdrdesc [dsc$w_length] = lbr$c_maxhdrsiz;
+    hdrdesc [dsc$a_pointer] = header;
+    perform (set_module (.txtrfa, hdrdesc, hdrlen));
+    header [mhd$l_refcnt] = .header [mhd$l_refcnt] + 1;
+    CH$MOVE (rfa$c_length, .txtrfa, localrfa);
+    perform (write_record (.hdrlen, header, localrfa, true));
+    END;
+
+RETURN true
+END;
+
+%SBTTL  'decr_refcnt';
+GLOBAL ROUTINE decr_refcnt (txtrfa) =
+BEGIN
+!++
+! Decrement the module reference count in the module header
+!
+! Inputs:
+!
+!	txtrfa		Address of rfa of module header
+!
+! Outputs:
+!
+!	reference count in module header is decremented.
+!
+!--
+
+MAP
+    txtrfa : REF BBLOCK;
+
+LOCAL
+    header : BBLOCK [lbr$c_maxhdrsiz],
+    hdrdesc : BBLOCK [dsc$c_s_bln],
+    hdrlen,
+    blockaddr : REF VECTOR [,BYTE],
+    cachentry : REF BBLOCK,
+    localrfa : BBLOCK [rfa$c_length];
+
+CH$MOVE (rfa$c_length, .txtrfa, localrfa);
+perform (map_blk_to_mem (localrfa, true, blockaddr, cachentry));
+IF (.txtrfa [rfa$w_offset] + mhd$c_reflng + 2) LEQU data$c_length
+THEN BEGIN
+    BIND
+	libhdr = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK,	!Library header
+	reclen = blockaddr [.txtrfa [rfa$w_offset]] : WORD,	!Length of record
+	refcnt = blockaddr [.txtrfa [rfa$w_offset] + mhd$c_reflng - 2];
+
+    IF .reclen NEQ mhd$c_mhdlen + .libhdr [lhd$b_mhdusz]
+	THEN RETURN lbr$_invrfa;
+
+    refcnt = .refcnt - 1;
+    cachentry [cache$v_dirty] = true;
+    END
+!
+! Module header is split across blocks
+!
+ELSE BEGIN
+    hdrdesc [dsc$w_length] = lbr$c_maxhdrsiz;
+    hdrdesc [dsc$a_pointer] = header;
+    perform (set_module (.txtrfa, hdrdesc, hdrlen));
+    header [mhd$l_refcnt] = .header [mhd$l_refcnt] - 1;
+    CH$MOVE (rfa$c_length, .txtrfa, localrfa);
+    perform (write_record (.hdrlen, header, localrfa, true));
+    END;
+
+RETURN true
+END;
+
+%SBTTL  'LBR$INSERT_TIME';
+GLOBAL ROUTINE lbr$insert_time (control_index, txtrfa, newtime) =
+BEGIN
+!++
+! Replace the module inserted date/time with the provided newtime
+!
+! Inputs:
+!
+!	control_index		Address of control index for library
+!	txtrfa			Address of rfa for module header
+!	newtime			Address of quadword containing new time to set in header
+!
+!--
+
+MAP
+    newtime : REF VECTOR,
+    txtrfa : REF BBLOCK;
+
+LOCAL
+    header : BBLOCK [lbr$c_maxhdrsiz],
+    hdrdesc : BBLOCK [dsc$c_s_bln],
+    hdrlen,
+    blockaddr : REF VECTOR [,BYTE],
+    cachentry : REF BBLOCK,
+    localrfa : BBLOCK [rfa$c_length];
+
+perform (validate_ctl (..control_index));
+CH$MOVE (rfa$c_length, .txtrfa, localrfa);
+perform (map_blk_to_mem (localrfa, true, blockaddr, cachentry));
+IF (.txtrfa [rfa$w_offset] + mhd$c_instime + 10) LEQU data$c_length
+THEN BEGIN
+    BIND
+	libhdr = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK,	!Library header
+	reclen = blockaddr [.txtrfa [rfa$w_offset]] : WORD,	!Length of record
+	daytime = blockaddr [.txtrfa [rfa$w_offset] + mhd$c_instime + 2];
+
+    IF .reclen NEQ mhd$c_mhdlen + .libhdr [lhd$b_mhdusz]
+	THEN RETURN lbr$_invrfa;
+
+    CH$MOVE (8, .newtime, daytime);		!Set new time
+    cachentry [cache$v_dirty] = true;		!Mark block dirty
+    END
+ELSE BEGIN
+    hdrdesc [dsc$w_length] = lbr$c_maxhdrsiz;
+    hdrdesc [dsc$a_pointer] = header;
+    perform (set_module (.txtrfa, hdrdesc, hdrlen));
+    CH$MOVE (8, .newtime, header [mhd$l_datim]); !Set new time
+    CH$MOVE (rfa$c_length, .txtrfa, localrfa);
+    perform (write_record (.hdrlen, header, localrfa, true));
+    END;
+
+RETURN true
+END;
+
+%SBTTL  'LBR$SET_MODULE';
+GLOBAL ROUTINE lbr$set_module (control_index, txtrfa,
+		bufdesc, buflen, updatedesc) =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads and optionally updates the module header
+!	associated with the given RFA.
+!
+!
+! CALLING SEQUENCE:
+!
+!	status = lbr$set_module (control_index, txtrfa[,bufdesc,buflen,updatedesc])
+!
+! INPUT PARAMETERS:
+!
+!	control_index		Address of library control index
+!	txtrfa			Address of rfa for module header
+!	bufdesc			Address of string descriptor for return
+!	buflen			Address to return length of header
+!	updatedesc		Address of string descriptor to update module header user data
+!
+!--
+
+BUILTIN
+    NULLPARAMETER;		! True if parameter not specified
+
+perform (validate_ctl (..control_index));		!Validate control index
+
+BEGIN
+    BIND
+	context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK;
+
+    IF NOT NULLPARAMETER (5)				!If updating header
+	AND (.context [ctx$v_oldlib]
+		OR .context [ctx$v_ronly])
+	THEN RETURN lbr$_illop;
+    END;
+
+perform (set_module (.txtrfa, (IF NOT NULLPARAMETER (3) THEN .bufdesc
+						     ELSE 0),
+			    (IF NOT NULLPARAMETER (4) THEN .buflen
+						     ELSE 0),
+			    (IF NOT NULLPARAMETER (5) THEN .updatedesc
+						    ELSE 0)));
+RETURN true
+END;
+
+%SBTTL 'set_module';
+GLOBAL ROUTINE set_module (txtrfa, bufdesc, buflen, updatedesc) =
+BEGIN
+!
+! Read and optionally update module header
+!
+MAP
+    txtrfa : REF BBLOCK,
+    bufdesc : REF BBLOCK,
+    updatedesc : REF BBLOCK;
+
+LOCAL
+    recdesc : BBLOCK [dsc$c_s_bln],
+    header : REF BBLOCK,
+    descptr : REF BBLOCK,
+    faodesc : BBLOCK [dsc$c_s_bln],
+    localrfa : BBLOCK [rfa$c_length],
+    myheader : BBLOCK [lbr$c_maxhdrsiz],
+    mydesc   : BBLOCK [dsc$c_s_bln];
+
+BUILTIN
+    NULLPARAMETER;
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK, !Context block
+    reclen = recdesc [dsc$w_length] : WORD,
+    recaddr = recdesc [dsc$a_pointer] : REF BBLOCK;
+
+IF NOT NULLPARAMETER (4)
+THEN IF .context [ctx$v_oldlib]
+	OR .context [ctx$v_ronly]
+	THEN RETURN lbr$_illop;
+
+CH$MOVE (rfa$c_length, .txtrfa, localrfa);
+header = .lbr$gl_control [lbr$l_hdrptr];
+IF NOT NULLPARAMETER (2)				!bufdesc passed by caller?
+THEN descptr = .bufdesc
+ELSE BEGIN
+    mydesc [dsc$w_length] = lbr$c_maxhdrsiz;
+    mydesc [dsc$a_pointer] = myheader;
+    descptr = mydesc;
+    END;
+IF .context [ctx$v_oldlib]
+THEN BEGIN
+    BIND
+	eomodrfa = context [ctx$b_eomodrfa] : BBLOCK;
+
+    LOCAL
+	savendrfa : BBLOCK [rfa$c_length];
+
+    CH$MOVE (rfa$c_length, eomodrfa, savendrfa);	!Save end of module RFA in case reading
+    eomodrfa [rfa$l_vbn] = 0;				!Disable end of module check
+    perform (read_old_record (localrfa, recdesc));
+    CH$MOVE (rfa$c_length, savendrfa, eomodrfa);	!Restore end of module RFA
+    IF .reclen NEQ omh$c_size				!Must be the right length
+    THEN RETURN lbr$_invrfa;
+    reclen = mhd$c_objident+ofl$c_maxsymlng;		!Adjust record length
+    END
+ELSE BEGIN
+    perform (read_record (localrfa, recdesc));		!Read the module header
+    IF .reclen NEQ mhd$c_mhdlen+.header [lhd$b_mhdusz]	!If header the wrong size
+    OR .recaddr [mhd$b_id] NEQ mhd$c_mhdid		! or it doesn't look like a header
+    THEN RETURN lbr$_invrfa;
+    END;
+IF NOT NULLPARAMETER (3)			!Want header length returned?
+THEN .buflen = .reclen;
+CH$COPY (MINU (.reclen, .descptr [dsc$w_length]),  .recaddr, 0,	!Copy header with 0 fill
+		 .descptr [dsc$w_length], .descptr [dsc$a_pointer]); 
+IF .context [ctx$v_oldlib]			!Old format library?
+THEN BEGIN
+    LOCAL
+	datebuffer : BBLOCK [20],
+	datedesc : BBLOCK [dsc$c_s_bln],
+	datelen;
+    BIND
+	recptr = .descptr [dsc$a_pointer] : BBLOCK,
+	insertdate = recaddr [omh$t_insdate] : VECTOR [,WORD]; !Name old fmt insert date
+
+    CH$MOVE (.recptr [omh$b_midlng] + 1, recptr [omh$b_midlng], !Convert to new format
+	recptr [mhd$b_objidlng]);
+    recptr [mhd$b_objstat] = .recptr [omh$b_modatr];	!Copy module attributes
+    datedesc [dsc$w_length] = 20;
+    datedesc [dsc$a_pointer] = datebuffer;
+    datelen = 0;
+    
+    faodesc [dsc$w_length] = .fao_old2newdate [0];
+    faodesc [dsc$a_pointer] = fao_old2newdate [1];
+
+!    $FAO (CTRSTR = faodesc, OUTLEN = datelen, 
+!		OUTBUF = datedesc, P1 = .insertdate [2],
+!		P2 = .months [(.insertdate [1] - 1) * 2],
+!		P3 = .insertdate [0]);
+    SYS$FAO (faodesc, datelen, 
+		datedesc, .insertdate [2],
+		months [ (.insertdate [1] - 1)],
+		.insertdate [0]);
+    datedesc [dsc$w_length] = .datelen;			!Update descriptor
+    $BINTIM (TIMBUF = datedesc, TIMADR = recptr [mhd$l_datim]); !Now convert to binary
+    recptr [mhd$l_refcnt] = %X'FFFFFFFF';		!Set ref. count to a lot
+    END;
+IF NOT NULLPARAMETER (4)			!Updating the module header?
+AND NOT .context [ctx$v_oldlib]			! and not old format library
+THEN BEGIN
+    BIND
+	mhdusrdat = .descptr [dsc$a_pointer] + mhd$c_usrdat;
+    CH$COPY (MINU (.header [lhd$b_mhdusz], .updatedesc [dsc$w_length]),
+		.updatedesc [dsc$a_pointer], 0, .header [lhd$b_mhdusz], mhdusrdat);
+    CH$MOVE (rfa$c_length, .txtrfa, localrfa);	!Refresh RFA
+    perform (write_record (.reclen, .descptr [dsc$a_pointer], localrfa, true)); !Rewrite the header
+    END;
+IF .reclen GTR .descptr [dsc$w_length]
+    THEN RETURN lbr$_hdrtrunc
+    ELSE RETURN true
+END;						!Of lbr$set_module
+
+%SBTTL  'LBR$PUT_HISTORY';
+GLOBAL ROUTINE lbr$put_history (control_index, record_desc) =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Add an update history record to the end of the update history list.
+!	If the list is full, delete the oldest record before the addition.
+!
+!
+!  CALLING SEQUENCE:
+!
+!	status = lbr$put_history (control_index, record_desc)
+!
+!
+!  INPUT PARAMETERS:
+!
+!	control_index	is the index returned from lbr$ini_control
+!	record_desc	is the address of string descriptor for the
+!			 record to be added to the library update history
+!
+!  ROUTINE VALUE:
+!
+!	lbr$_illop		Illegal operation for access requested
+!	lbr$_intrnlerr		Internal librarian error
+!	lbr$_normal		Normal exit
+!	lbr$_nohistory		This library does not have an update history
+!	lbr$_reclng		Record length was greater than lbr$c_maxrecsiz
+!
+!---
+perform (validate_ctl (..control_index));	! Validate the control index
+BEGIN
+BIND
+    header = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK;
+
+IF .header [lhd$w_maxluhrec] EQL 0	! History not maintained for this library
+THEN RETURN lbr$_nohistory;
+IF lbr$gl_control [lbr$b_func] EQL lbr$c_read	! Shouldn't be here on read
+THEN RETURN lbr$_illop;
+IF .header [lhd$w_numluhrec] GTR .header [lhd$w_maxluhrec]
+THEN RETURN lbr$_intrnlerr; 		! somehow there are more than allowed
+
+IF .header [lhd$w_numluhrec] EQL .header [lhd$w_maxluhrec]
+THEN perform ( delete_luhrecord () );	! History full, so drop oldest record
+
+perform (add_luhrecord ( .record_desc));
+
+RETURN lbr$_normal;			! return success 
+END;
+END;	! lbr$put_history
+
+
+%SBTTL  'add_luhrecord';
+ROUTINE add_luhrecord ( rec_desc ) =
+BEGIN
+!+++
+!
+!	This routine copies the library update history record from the
+!	descriptor at address rec_desc to the end of the linked list of
+!	library update history records.
+!
+!---
+MAP 
+    rec_desc : REF BBLOCK;	! caller's descriptor for LUH record
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK,	! Context block
+    header = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK,	! library header block
+    endrfa = header [lhd$b_endluhrfa] : BBLOCK,		! rfa of end of youngest LUH record in list
+    endluhvbn = endrfa [rfa$l_vbn],			! VBN of block containing end of luh list
+    endoffset = endrfa [rfa$w_offset] : WORD,		! offset to end of LUH list
+    recrdlen = rec_desc [dsc$w_length],			! length of LUH record
+    recrd = rec_desc [dsc$a_pointer] : BBLOCK;		! starting location of LUH record
+LOCAL
+    cache_entry : REF BBLOCK,	! cache entry of new block
+    cpyrecadr,			! how much of the record is left to copy into LUH block
+    endblkadr : REF BBLOCK,	! address of cached end LUH block
+    endvbn,			! VBN of first free space in history blocks
+    offset,			! offset to first available space 
+    rec : REF BBLOCK,		! address where LUH record will be stored
+    reclenlft;			! address of remainder of record to be copied in.
+
+IF .recrdlen GTR lbr$c_maxrecsiz	! record too long
+THEN RETURN lbr$_reclng;
+
+endvbn = .endluhvbn;
+offset = .endoffset;
+IF .header [lhd$w_numluhrec] EQL 0 
+THEN
+    BEGIN	! Get some space to store record
+    BIND
+	begluhrfa = header [lhd$b_begluhrfa] : BBLOCK,
+	begvbn = begluhrfa [rfa$l_vbn],
+	begoffset = begluhrfa [rfa$w_offset] : WORD;
+    LOCAL
+	newvbn,
+	newblkadr;
+    IF .begvbn OR .endluhvbn THEN RETURN lbr$_intrnlerr; ! both of these should be 0
+					! logic error may result in some blocks being lost
+    !
+    !    Get a free block, cache it and set header pointers to it's vbn.
+    !
+    perform ( alloc_block (newvbn, newblkadr) );
+    CH$FILL (0, luh$c_length, .newblkadr);
+    add_cache (.newvbn, cache_entry);
+    cache_entry [cache$l_address] = .newblkadr;
+    cache_entry [cache$v_data] = true;
+    cache_entry [cache$v_dirty] = true;
+    endblkadr = .newblkadr;
+    endvbn = .newvbn;
+    begvbn = .newvbn;
+    begoffset = 0;
+    END
+ELSE
+    !
+    !    Find the last block in the chain of history records and cache
+    !
+    BEGIN
+    perform ( find_block (.endvbn, endblkadr, cache_entry) );	! Cache end of history block
+    cache_entry [cache$v_data] = true;	! Mark as data
+    cache_entry [cache$v_dirty] = true;	! Mark to write 
+    END;
+
+IF .offset GTR luh$c_datfldlen THEN RETURN lbr$_intrnlerr;	! Offset can't point beyond end of record
+IF luh$c_rechdrlen GTR luh$c_datfldlen - .offset 	! if there isn't enough room left for record header
+THEN 
+    BEGIN	! not enough room left for the record length so get new block
+    LOCAL
+	newvbn,
+	newblkadr;
+    perform ( alloc_block (newvbn, newblkadr) );
+    CH$FILL (0, luh$c_length, .newblkadr);	! zero out whole block
+    add_cache (.newvbn, cache_entry);		! cache it
+    cache_entry [cache$l_address] = .newblkadr;	! fill in cache entry
+    cache_entry [cache$v_data] = true;
+    cache_entry [cache$v_dirty] = true;
+    endblkadr[luh$l_nxtluhblk] = .newvbn;	! link it in to list of LUH record blocks
+    endblkadr = .newblkadr;			! Update rfa of free space.
+    endvbn = .newvbn;
+    offset = 0;	
+    END;
+
+!
+!   Each update history record starts with a word to mark it for error checking
+!   followed by a word containing the length of the record.
+!
+rec = .endblkadr + luh$c_data + .offset;	! New record begins at end of last
+rec [luh$w_rechdr] = luh$c_rechdrmrk;		! Mark the new record
+rec [luh$w_reclen] = .recrdlen;			! Store the length
+reclenlft = .recrdlen;				! Set length to copy entire record
+offset = .offset + luh$c_rechdrlen;		! Bump offset to account for mark and length words
+cpyrecadr = .recrd;    				! Begin copy from start of record
+WHILE ( .reclenlft GTR 0 ) DO			! While there is more to copy
+    BEGIN
+    LOCAL
+	cpylen;			! How much to copy with each move
+    If ( (.offset EQL luh$c_datfldlen) AND (.reclenlft GTR 0) )
+    THEN
+        BEGIN	! used up last of that block, get next ready
+        LOCAL
+	    newvbn,
+	    newblkadr;
+        perform ( alloc_block (newvbn, newblkadr) );
+        CH$FILL (0, luh$c_length, .newblkadr);
+        add_cache (.newvbn, cache_entry);
+        cache_entry [cache$l_address] = .newblkadr;
+        cache_entry [cache$v_data] = true;
+        cache_entry [cache$v_dirty] = true;
+        endblkadr[luh$l_nxtluhblk] = .newvbn;	! Link the new block to the last
+        endblkadr = .newblkadr;			! Use new block
+        endvbn = .newvbn;
+        offset = 0;				! Reset offset to beginning of new block
+        END;
+    cpylen = MIN( luh$c_datfldlen - .offset, .reclenlft);	! Either copy enough record to fill the rest of the current block
+								! or copy to the end of the record if it wil fit in current block
+    CH$MOVE( .cpylen, .cpyrecadr, .endblkadr + luh$c_data +.offset);	! Copy record 
+    cpyrecadr = .cpyrecadr + .cpylen;
+    reclenlft = .reclenlft - .cpylen;
+    offset = .offset + .cpylen;
+    END;	! WHILE copying record
+
+endoffset = .offset;		! Update the header to point to end of record
+endluhvbn = .endvbn;		! Update header to point to the last block in the linked list
+header [lhd$w_numluhrec] = .header [lhd$w_numluhrec] + 1;	! There is one more record in the history
+context [ctx$v_hdrdirty] = true;	! Make sure header is written out when cache is deallocated
+RETURN true;
+END;	! add_luhrecord
+
+
+%SBTTL  'delete_luhrecord';
+ROUTINE delete_luhrecord =
+BEGIN
+!+++
+!
+!	Remove the oldest LUH record by moving offset to bypass it.  If record 
+!	crosses block boundaries than return freed blocks to library header
+!	free list.  If there is only one record in the history then the history
+!	is completely emptied with all blocks returned and all pointers zeroed.
+!
+!---
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK,	! Context block
+    header = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK,
+    begluhrfa = header [lhd$b_begluhrfa] : BBLOCK,
+    begvbn = begluhrfa [rfa$l_vbn],
+    begoffset = begluhrfa [rfa$w_offset] : WORD;
+
+!
+!   Check if there is only one record in history.
+!
+IF .header [lhd$w_numluhrec] EQL 1
+THEN
+    BEGIN	! Return all blocks in history
+    BIND
+	endluhrfa = header [lhd$b_endluhrfa] : BBLOCK,
+	endoffset = endluhrfa [rfa$w_offset] : WORD;
+    LOCAL
+        blkadr : REF BBLOCK,
+        cache_entry : REF BBLOCK,
+	vbn;
+
+    vbn = .begvbn;	! First vbn in history linked list
+    DO 		! As long as there are more luh blocks in list
+        BEGIN			! keep deallocating them.
+	LOCAL
+	    ret_vbn;
+	ret_vbn = .vbn;				! Block to deallocate
+	perform ( find_block (.vbn, blkadr, cache_entry)); ! Cache it
+	cache_entry [cache$v_data] = true;
+	cache_entry [cache$v_dirty] = true;
+	vbn = .blkadr [luh$l_nxtluhblk];	! Follow link to next block
+	perform ( dealloc_block ( .ret_vbn ));	! return it to free list
+        END
+    UNTIL .vbn EQL 0;				! End of list
+    !
+    !    Zero all header pointers and offsets to mark history empty
+    !
+    begluhrfa = 0;
+    begoffset = 0;
+    endluhrfa = 0;
+    endoffset = 0;
+    END
+ELSE		! There was more than one record in history, so remove the
+    BEGIN	! oldest, or first in the list
+    LOCAL
+        cache_entry : REF BBLOCK,	! location in cache of luhblk
+        blkadr : REF BBLOCK,		! address of VBN in cache
+        reclenlft,			! length of the LUH record
+        rec : REF BBLOCK,		! address of record within luhblk
+	offset,
+	vbn;
+
+    vbn = .begvbn;		
+    offset = .begoffset;
+    perform ( find_block (.begvbn, blkadr, cache_entry) );	! ensure the block is in cache.
+    cache_entry [cache$v_data] = true;
+    cache_entry [cache$v_dirty] = true;
+    rec = .blkadr + luh$c_data + .offset;	! compute address of record start
+    !
+    !    Check mark word in header
+    !
+    IF .rec [luh$w_rechdr] NEQ luh$c_rechdrmrk THEN RETURN lbr$_intrnlerr;
+    !
+    !    To delete the record, the offset and beginning vbn pointer are reset to point to
+    !    the second record.  This is done a block at a time.  If any blocks are freed in
+    !    the process, they are returned to the free-list.
+    !
+    reclenlft = .rec [luh$w_reclen] + luh$c_rechdrlen;	! Length of record not yet skipped over
+    WHILE .reclenlft GTR 0 DO				! While there is still part of the record left
+	BEGIN
+	IF ( .offset + .reclenlft ) LEQ ( luh$c_datfldlen - luh$c_rechdrlen)
+	THEN		! the record is entirely contained in this block
+            BEGIN	! Set offset to end of record and don't return the block cause next record is in it
+            offset = .offset + .reclenlft;
+	    reclenlft = 0;	! skipped past entire record
+            END
+	ELSE
+	    BEGIN	! The record fills or overflows this block so deallocate block
+	    Local
+		ret_vbn;
+	    reclenlft = .reclenlft - (luh$c_datfldlen - .offset);
+	    offset = 0;
+	    ret_vbn = .vbn;
+            vbn = .blkadr [luh$l_nxtluhblk];
+	    perform ( dealloc_block ( .ret_vbn ));
+	    perform ( find_block ( .vbn, blkadr, cache_entry) );
+	    cache_entry [cache$v_data] = true;
+	    cache_entry [cache$v_dirty] = true;
+	    END;
+	END;
+    begvbn = .vbn;		! Second record is now first
+    begoffset = .offset;
+    END;
+header [lhd$w_numluhrec] = .header [lhd$w_numluhrec] - 1;
+context [ctx$v_hdrdirty] = true;	! Make sure header is written out
+RETURN true;
+END;	! routine delete_luhrecord
+
+
+%SBTTL  'LBR$GET_HISTORY';
+GLOBAL ROUTINE lbr$get_history (control_index, action_routine) =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	For each Library Update History record copy the record to a buffer
+!	and call the action_routine with a descriptor for the buffer.
+!
+!
+!  CALLING SEQUENCE:
+!
+!	status = lbr$get_history (control_index, action_routine)
+!
+!
+!  INPUT PARAMETERS:
+!
+!	control_index	is the index returned from lbr$ini_control
+!	action_routine  is a user supplied routine which is called for each
+!			LUH record, being passed a descriptor for the buffer
+!			containing a copy of the record.
+!
+!  ROUTINE VALUE:
+!
+!	lbr$_intrnlerr		Internal librarian error
+!	lbr$_normal		Normal exit
+!	lbr$_nohistory		This library does not have an update history
+!	lbr$_emptyhist		The history is empty
+!---
+perform (validate_ctl (..control_index));	! Validate the control index
+BEGIN
+BIND
+    header = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK,	! library header
+    luhblkrfa = header [lhd$b_begluhrfa] : BBLOCK,	! rfa of the oldest LUH record
+    beg_offset = luhblkrfa [rfa$w_offset] : WORD,	! offset to first record
+    beg_vbn = luhblkrfa [rfa$l_vbn];			! VBN of first record
+LOCAL
+    blkadr : REF BBLOCK,	! block address of cached block
+    cache_entry : REF BBLOCK,	! cache entry locating luh block
+    numrecs : WORD,		! number of history records in library history
+    offset,			! offset to current LUH record being copied
+    vbn,			! VBN of current LUH record being copied
+    status;
+
+IF .header [lhd$w_maxluhrec] EQL 0    		! History not maintained for this library
+THEN RETURN lbr$_nohistory;
+IF .header [lhd$w_numluhrec] EQL 0    		! History is empty for this library
+THEN RETURN lbr$_emptyhist;
+!
+!    For as many LUH records as are in the library history, locate next record,
+!    copy it to buffer, and call action_routine with buffer descriptor.
+!
+vbn = .beg_vbn;			! vbn of first record
+offset = .beg_offset;		! Offset within block to first record
+status = find_block (.vbn, blkadr, cache_entry);	! cache the block
+cache_entry [cache$v_data] = true;
+numrecs = .header [lhd$w_numluhrec];			! Number of LUH records
+INCR i FROM 1 TO .numrecs BY 1 DO	! for each record in history
+    BEGIN
+    LOCAL
+        cpyrecadr,
+        dstadr,
+        luhrec : REF BBLOCK,
+        pass_desc : BBLOCK [dsc$c_s_bln],	! Descriptor to pass to user routine
+        save_desc : BBLOCK [dsc$c_s_bln],	! Descriptor to use to dealloc buffer (In case user diddles pas_desc)
+        reclen,
+        reclenlft;
+
+    luhrec = .blkadr + luh$c_data + .offset;	! beginning address of first record
+    IF .luhrec [luh$w_rechdr] NEQ luh$c_rechdrmrk	! history is corrupted if mark header not here
+    THEN RETURN lbr$_intrnlerr;
+    reclen = .luhrec [luh$w_reclen];
+    reclenlft = .reclen;
+    save_desc [dsc$w_length] = .reclen;
+    perform ( get_zmem (.reclen, save_desc [dsc$a_pointer]) ); ! get buffer to put record in
+    pass_desc = .save_desc;					! Pass_desc is a copy of save_desc
+    pass_desc [dsc$a_pointer] = .save_desc [dsc$a_pointer];
+    !
+    !    now get record into buffer
+    !    Since record can span several blocks, copy as much of record as is in current block.
+    !    then follow link to next block.  Continue until entire record copied into buffer.
+    !    Then call user routine with a descriptor of the copy of the record.
+    !
+    cpyrecadr = .luhrec + luh$c_rechdrlen;
+    offset = .offset + luh$c_rechdrlen;
+    dstadr = .save_desc [dsc$a_pointer];
+    WHILE .reclenlft GTR 0 DO	! While there is more left, keep copying it over
+        BEGIN
+        LOCAL
+            cpylen;
+        cpylen = MIN( .reclenlft, luh$c_datfldlen - .offset);
+        CH$MOVE (.cpylen, .cpyrecadr, .dstadr);
+        reclenlft = .reclenlft - .cpylen;
+        offset = .offset + .cpylen;
+        dstadr = .dstadr + .cpylen;
+        IF (.offset GTR (luh$c_datfldlen - luh$c_rechdrlen))
+	THEN
+	    BEGIN
+            vbn = .blkadr [luh$l_nxtluhblk];
+	    offset = 0;
+	    status = find_block (.vbn, blkadr, cache_entry);
+            cache_entry [cache$v_data] = true;
+            cpyrecadr = .blkadr + luh$c_data
+	    END;
+        END;					! while copying over record to buffer
+    perform ( (.action_routine) (pass_desc) );	! Call user routine
+    perform (validate_ctl (..control_index));	! Validate the control index
+    perform ( dealloc_mem ( .save_desc [dsc$w_length], .save_desc [dsc$a_pointer] ));	! Return the buffer
+    END;		! INCRement thru the history list
+RETURN lbr$_normal;
+END;
+END;	! lbr$get_history
+
+END
+ELUDOM					! Of module

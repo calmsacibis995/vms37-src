@@ -1,0 +1,764 @@
+MODULE LIB$VM (					! Virtual memory allocation/deallocation
+		IDENT = '2-044'			! File: LIBVM.B32  Edit: RKR2044
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY: Resource allocation library
+!
+! ABSTRACT:  Dynamic virtual memory allocation and deallocation.
+!
+!	Dynamic virtual memory allocation and deallocation.
+!	This facility is the only user mode procedure for allocating
+!	and deallocation virtual memory.  By having all procedures use
+!	this facility, allocation conflict is eliminated.
+!
+! ENVIRONMENT: User access mode; mixture of AST level or not.
+!
+! AUTHOR:	Trevor J. Porter, CREATION DATE: 14-Jan-77; Version 01
+!
+! MODIFIED BY:
+!
+!	Thomas N. Hastings, 31-may-77: Version 02
+! 01	- original in linker
+! 02-10	- Add new entry point names LIB$GET_VM, LIB$FREE_VM.  TNH 8-Oct-77
+! 02-15	- Use RTLMSG error codes.  TNH 21-Nov-77
+! 02-16	- Change LIB$_NORMAL to LIB$_NORMAL.  TNH 21-Nov-77
+! 02-17	- Don't clear memory.  TNH 19-Dec-77.
+! 02-18	- Remove LIB$VM_GET, LIB$VM_RET entry points.  TNH 30_Jan-78
+! 02-19	- Change expand size to 128., keep track of largest area
+!	  allocated so far for validity check in FREE_VM.  JMT 5-Mar-78
+! 02-22	- Change REQUIRE files for VAX system build.  DGP 28-Apr-78
+! 02-23	- Return SS$_NORMAL instead of LIB$_NORMAL.  TNH 15-July-78
+! 02-24	- Use partial allocation from $EXPREG.  TNH 29-July-78
+! 02-25	- Don't initialize MINADDRESS.  TNH 31-July-78
+! 02-30	- Make AST re-entrant.  TNH 9-Aug-78
+! 2-034	- Update copyright notice and require file names.  JBS 22-NOV-78
+! 2-035	- Run through PRETTY and put in redundent values to
+!	   keep the new BLISS compiler happy.  JBS 22-NOV-78
+! 2-036	- Put in routine headers for the internal routines ALLOCATE
+!	   and DEALLOCATE, remove false comments and generally fix
+!	   up the format to conform to RTL standards.  JBS 02-APR-1979
+! 2-037	- Make the entry points LIB$$GET_VM and LIB$$FREE_VM, since
+!	   the string package is taking over the job of allocating
+!	   and deallocating small amounts of storage.  LIB$$GET_VM
+!	   will still be called for large amounts of storage;
+!	   LIB$$FREE_VM will free those large amounts.  JBS 02-APR-1979
+! 2-038	- Correct the consistency check in LIB$$FREE_VM: it was off
+!	   by 1.  JBS 09-APR-1979
+! 2-039	- Add some comments based on the code review.  JBS 12-JUN-1979
+! 2-040	- Undo edit 037.  JBS 27-JUN-1979
+! 2-041	- Remove the redundent values added in edit 035; the new BLISS compiler
+!	   doesn't need them.  JBS 06-SEP-1979
+! 2-042	- Add statistics cells for LIB$STAT_VM, and clean up compare operators
+!	   to use address form when appropriate.  JBS 28-OCT-1979
+! 2-043 - When calling $EXPREG, ask for at least enough pages to fulfil the
+!	  user's request.  Make MAX_ADDRESS 1 greater than the maximum
+!	  address allocated so that the compare in LIB$FREE_VM is easier.
+!	  SBL 14-Aug-1981
+! 2-044 - Add logic to try to alleviate, if not cure, problem whereby
+!	  caller gets into a pattern of allocating space at Non-AST
+!	  level and freeing the space at AST level.  Eventually all
+!	  available space migrates to the AST-level queue and not
+!	  enough remains available at Non-AST level.  Strategy is for
+!	  ALLOCATE, before resorting to a $EXPREG, to repeatedly try to
+!	  pull some space from the AST-level queue (if any is there) and
+!	  ALLOCATE itself is running at Non-AST level.
+!	  (In response to QAR 893)
+!	  RKR 12-JAN-1982
+!--
+
+!<BLF/PAGE>
+
+!
+! SWITCHES:
+!
+
+SWITCHES ADDRESSING_MODE (EXTERNAL = GENERAL, NONEXTERNAL = WORD_RELATIVE);
+
+!
+! LINKAGES:
+!
+!	NONE
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    LIB$GET_VM,					! Allocate virtual memory - interface
+    ALLOCATE,					! Allocate virtual memory - body
+    LIB$FREE_VM,				! Deallocate virtual memory - interface
+    DEALLOCATE;					! Deallocate virtual memory - body
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'RTLIN:RTLPSECT';			! Define DECLARE_PSECTS macro
+
+LIBRARY 'RTLSTARLE';				! System symbols
+
+!
+! MACROS:
+!
+!	NONE
+!
+! EQUATED SYSMBOLS:
+!
+
+LITERAL
+    K_VM_MAX_ADR = %X'40000000',		! Max. possible address (in control region)
+    K_EXPAND_SIZE = 128,			! No. of pages to expand program region each call
+    K_MAX_NEST_LEV = 4;				! Max. re-entrant nest level.
+
+						! Must be at least 2 for AST and non-AST level.
+						! Any more allows some multiplexing from AST level.
+!
+! PSECT DECLARATIONS:
+!
+DECLARE_PSECTS (LIB);				! declare PSECTs LIB$ facility
+!
+! OWN AND GLOBAL STORAGE:
+!
+
+OWN
+    MIN_ADDRESS : INITIAL (0),			! Lowest address ever allocated for any nest level
+    						! 0 is special case
+    MAX_ADDRESS : INITIAL (0),			! Max address allocated so far for any nest level
+						! Value is actually the next
+						! byte after the highest allocated.
+    						! 0 is special case.
+!+
+! Free memory list heads
+! one list for each nest level.
+! 1-origin so 0th entry not used.
+!-
+    Q_LIST_HEAD : VECTOR [K_MAX_NEST_LEV*2 + 2] INITIAL ( REP K_MAX_NEST_LEV + 1 OF (0, 0)),
+!+
+! Current re-entrant nest level.
+! Counted up each enrty to LIB$GET_VM or LIB$FREE_VM.
+! Counted down on each exit.
+! Starts at 0, so runs from 1...K_MAX_NEST_LEV.
+!-
+    NEST_LEVEL : INITIAL (0);
+
+!+
+! The following statistical cells are reported by LIB$STAT_VM.
+!-
+
+GLOBAL
+    LIB$$GL_GETVM_C : INITIAL (0),		! Number of successful calls to LIB$GET_VM
+    LIB$$GL_FREVM_C : INITIAL (0),		! Number of successful calls to LIB$FREE_VM
+    LIB$$GL_VMINUSE : INITIAL (0);		! Bytes still allocated
+
+!
+! EXTERNAL REFERENCES:
+!
+!+
+! The following are the error codes used in this module:
+!-
+
+EXTERNAL LITERAL
+    LIB$_BADBLOADR : UNSIGNED (%BPVAL),		! Bad block address
+    LIB$_BADBLOSIZ : UNSIGNED (%BPVAL),		! Bad block size
+    LIB$_FATERRLIB : UNSIGNED (%BPVAL),		! Fatal error in library
+    LIB$_INSVIRMEM : UNSIGNED (%BPVAL);		! Insufficient virtual memory
+
+
+GLOBAL ROUTINE LIB$GET_VM (			! Allocate dynamic virtual memory
+	NUM_BYTES, 				! Adr. of longword size in bytes
+	BLK_ADR					! Adr. of longword to receive assigned adr.
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Allocate n virtually contiguous bytes at an arbitrary place in
+!	the program region and return the virtual address of the first
+!	byte. The number of bytes is rounded up so that the smallest
+!	number of whole quad words (8 bytes) are allocated starting at a
+!	quad word boundary.  Procedures cannot count on successive calls
+!	to allocate adjacent blocks of bytes, since an AST, exception or
+!	called procedure could also have asked for virtual memory.
+!	Usually, the bytes are allocated at the end of the Program
+!	region.  However, if there is a sufficiently large hole, it will
+!	be used instead. Should there not be enough virtual memory
+!	of the required size, the operating system
+!	is called to expand the program region by K_EXPAND_SIZE*512 bytes.
+!	The new area is linked (by deallocating it) into the free list
+!	and the requested memory is allocated from the free list. The
+!	free list is therefore initialized on the first allocaton call.
+!	AST and non-AST levels are assigned from differrent pools.
+!
+! CALLING SEQUENCE:
+!
+!	STATUS.WLC.V = LIB$GET_VM  (NUM_BYTES.rlu.r, BLK_ADR.wa.r)
+!
+! INPUT PARAMETERS:
+!
+!	NUM_BYTES is the address of an unsigned  longword  integer
+!		specifying the number of virtually contiguous bytes to
+!		be allocated.  Sufficient pages are allocated  to
+!		satisfy the request. However, the program should not
+!		reference before the first byte address assigned
+!		(base_address) or beyond the last byte assigned
+!		(base_adr+num_bytes - 1) since it may be assigned to
+!		another procedure.
+!
+! OUTPUT PARAMETERS:
+!
+!     BLK_ADR the address of a longword which is set to the
+!		first virtual address of the newly assigned contiguous
+!		block of bytes.
+!
+! IMPLICIT INPUTS:
+!
+!	Own storage is used to keep track of unallocated pages in the
+!	program region.  The first call after an image is activated
+!	causes the OWN storage to be initialized.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE.
+!
+! COMPLETION STATUS:
+!
+!	SS$_NORMAL indicates normal successful completion.
+!	LIB$_INSVIRMEM indicates 'INSUFFICIENT VIRTUAL MEMORY' when the
+!		program region was attempted to be expanded.
+!	LIB$_BADBLOSIZ indicates 'BAD BLOCK SIZE (0)
+!		No partial assignment is made.
+!
+! SIDE EFFECTS:
+!
+!	An appropriate number of virtual bytes are removed from the image
+!	free memory list.  If needed the program region is expanded by
+!	calling the SYS$EXPREG system service.  After this is done ASTs are
+!	disabled for a few instructions to update some OWN storage.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	STATUS,
+	L_BLK_SIZE;				! size of block in bytes modulo quad word
+
+    L_BLK_SIZE = (..NUM_BYTES + 7) AND ( NOT 7);	! Round up to multiple of 8 bytes
+!+
+! If the requested block size is zero, give an error indication.
+!-
+
+    IF (.L_BLK_SIZE EQL 0) THEN RETURN (LIB$_BADBLOSIZ);
+
+!+
+! Arg ok, increment re-entrant nest level index and select corresponding
+! nest level queue header.  Usually this is level 1, since rare to be
+! called at AST level while in LIB$GET_VM or LIB$FREE_VM at non-AST
+! level.
+!-
+    NEST_LEVEL = .NEST_LEVEL + 1;
+
+    IF (.NEST_LEVEL GTRU K_MAX_NEST_LEV) THEN RETURN (LIB$_FATERRLIB);
+
+!+
+! Allocate space by removing from corresponding queue for this nest level.
+!-
+    STATUS = ALLOCATE (.L_BLK_SIZE, .BLK_ADR, Q_LIST_HEAD [.NEST_LEVEL*2]);
+!+
+! Now count re-entrant nest level back down.
+! Usually this just goes from 1 back to 0.
+!-
+    NEST_LEVEL = .NEST_LEVEL - 1;
+    RETURN (.STATUS);
+    END;					!  end of LIB$GET_VM routine
+
+
+ROUTINE ALLOCATE (				! Internal allocation subroutine
+	SIZE, 					! Number of bytes to allocate
+	ADDRESS, 				! Store base address here
+	LISTHEAD				! Free list for this level
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+! 	Allocate storage from the given list.  If the list does not
+!	contain any piece big enough to satisfy the request, expand
+!	the program region.
+!
+! INPUT PARAMETERS:
+!
+!	SIZE.rl.v	The number of bytes to allocate.  This is always
+!			a multiple of 8.
+!	LISTHEAD.ra.v	The beginning of the list of free blocks at this
+!			reentrancy level.  This list is linked by its
+!			first longword.
+!
+! OUTPUT PARAMETERS:
+!
+!	ADDRESS.wa.r	The address of the block allocated, or 0.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE.
+!
+! COMPLETION STATUS:
+!
+!	SS$_NORMAL indicates normal successful completion.
+!	LIB$_INSVIRMEM indicates 'INSUFFICIENT VIRTUAL MEMORY' when the
+!		program region was attempted to be expanded.
+!
+! SIDE EFFECTS:
+!	An appropriate number of virtual bytes are removed from the image
+!	free memory list.  If needed the program region is expanded by
+!	calling the SYS$EXPREG system service.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	GOT_SPACE,				! logical to record
+						! whether we got space
+						! from other queue
+	NEWBLOCK : REF VECTOR [2],		! Current block pointer
+	NEXTBLOCK : REF VECTOR [2],		! Next block pointer
+	LASTBLOCK : REF VECTOR [2],		! Previous block pointer
+	MEMLIMITS : VECTOR [2],			! args to $EXPREG
+	AST_STATUS;				! AST enable state
+
+!+
+! The following loop is terminated by one of several RETURN statements.
+!-
+
+    WHILE -1 DO
+	BEGIN
+	LASTBLOCK = .LISTHEAD;			! Initially at top of free list
+!+
+! The following loop scans down the free list looking for a free block
+! which will satisfy the request.  If it finds one it deallocates it
+! and returns.  Otherwise it falls into the next section of code which
+! will attempt to expand the program region.
+!-
+
+	WHILE (NEWBLOCK = .LASTBLOCK [0]) NEQA 0 DO 	! Follow down free list
+	    BEGIN
+
+	    IF (.NEWBLOCK [1] EQLU .SIZE)	! Look for suitable free block
+	    THEN 				! Exact size match
+		BEGIN
+		LASTBLOCK [0] = .NEWBLOCK [0];	! So last points where this one pointed
+		.ADDRESS = NEWBLOCK [0];
+		LIB$$GL_GETVM_C = .LIB$$GL_GETVM_C + 1;
+		LIB$$GL_VMINUSE = .LIB$$GL_VMINUSE + .SIZE;
+		RETURN (SS$_NORMAL);		! and we are done
+		END;
+
+	    IF (.NEWBLOCK [1] GTRU .SIZE)	! Larger than requested
+	    THEN
+		BEGIN
+!+
+! We have found a block larger than the size requested.  Divide it in
+! two, with the front used to satisfy the request and the back remaining
+! on the free list.
+!-
+		NEXTBLOCK = NEWBLOCK [0] + .SIZE;
+		NEXTBLOCK [0] = .NEWBLOCK [0];
+		NEXTBLOCK [1] = .NEWBLOCK [1] - .SIZE;
+		LASTBLOCK [0] = NEXTBLOCK [0];
+		.ADDRESS = NEWBLOCK [0];
+		LIB$$GL_GETVM_C = .LIB$$GL_GETVM_C + 1;
+		LIB$$GL_VMINUSE = .LIB$$GL_VMINUSE + .SIZE;
+		RETURN (SS$_NORMAL);		! and we are done
+		END;
+
+	    LASTBLOCK = NEWBLOCK [0];		! When not suitable this block becomes previous block
+	    END;				! of while loop
+
+!+
+! If we reach this point we know that there is not enough contiguous
+! space in the queue pointed to by the current queue header.  Before
+! resorting to an $EXPREG we check:
+!	1. Is there any space in the AST-level queue ?
+!	2. Are we ourselves at non-AST level ?
+! If both are true, then we may be able to resolve our problem by
+! moving some space from the AST-level queue to the Non-AST level queue.
+! If we are at non-AST level (NEST_LEVEL = 1) then we don't have to
+! worry about messing up some interrupted queue manipulation.  However,
+! we must protect ourselves from being interrupted during the critical
+! operation of removing a queue entry from the AST-level queue.
+!-
+
+    GOT_SPACE = 0 ;		! Initialize to got no space
+    IF ( .Q_LIST_HEAD [4] NEQ 0 )
+    THEN
+	BEGIN 	! There was space in AST-level
+	!+
+	! Disable AST's while we figure out if we are at AST level and
+	! if so, while we pull off 1st entry of AST-level queue.
+	!-
+	AST_STATUS = $SETAST (ENBFLG = 0) ; ! Disable ASTs
+	IF ( .Q_LIST_HEAD [4] NEQ 0 ) 		! Still avail. after
+	THEN					! disabling AST's ?
+	    BEGIN	! Safe to proceed
+	    IF ( .NEST_LEVEL EQL 1 )
+	    THEN
+		BEGIN	! We're at non-AST level
+		MEMLIMITS [0] = .Q_LIST_HEAD [4] ; ! addr of 1st chunk
+		MEMLIMITS [1] = .(.MEMLIMITS [0] + 4) ; ! size of chunk
+		Q_LIST_HEAD [4] = ..Q_LIST_HEAD [4] ; ! 1st off head
+		END ;	! We're at non-AST level
+
+	    !+
+	    ! Renable ASTs while we coalesce this chunk with the rest 
+	    ! of the space at non-AST level.
+	    !-
+	    IF (.AST_STATUS EQL SS$_WASSET) THEN $SETAST ( ENBFLG = 1) ;
+	    !+
+	    ! Put this chunk of space on non-AST level queue as if we
+	    ! had gotten it from $EXPREG.
+	    !-
+	    IF ( NOT DEALLOCATE ( .MEMLIMITS [1],   ! size of chunk
+			          .MEMLIMITS [0],   ! address of chunk
+			          .LISTHEAD ) )
+	    THEN
+		RETURN (LIB$_FATERRLIB) ; ! Should never happen
+	    !+
+	    ! Must back out the modifications made to the statistic 
+	    ! cells by DEALLOCATE.
+	    !-
+	    LIB$$GL_VMINUSE = .LIB$$GL_VMINUSE +  .MEMLIMITS [1]  ;
+	    LIB$$GL_FREVM_C = .LIB$$GL_FREVM_C - 1 ;
+	    GOT_SPACE = 1 ; ! record fact we got space
+	    END ; ! Safe to proceed
+	END ;	! There was space in AST-level
+
+    IF (NOT .GOT_SPACE) 	! If code above failed to produce more
+    THEN			! space
+
+	BEGIN	! do $EXPREG
+!+
+! At this point we have reached the end of the free
+! memory list without finding a block of required size and no more can
+! be liberated from the AST-level queue.
+! Thus, we expand the address space and attempt to
+! allocate from additional virtual memory.
+! If we only get partial allocation, use what we can get.
+! MEMLIMITS[0] is the first virtual address assigned,
+! and MEMLIMITS[1] is the highest virtual address in last page assigned.
+! Both are -1 if nothing was able to be assigned.
+!-
+	$EXPREG (PAGCNT = (IF .SIZE LSSU K_EXPAND_SIZE*512 THEN K_EXPAND_SIZE
+							   ELSE (.SIZE/512)+1),
+		 RETADR = MEMLIMITS);
+
+	IF (.MEMLIMITS [0] LSS 0)
+	THEN 					! Unsuccessfully expanded program region
+	    RETURN (LIB$_INSVIRMEM);
+
+!+
+! Now disable ASTs and update minimum and maximum addresses ever allocated.
+!-
+	AST_STATUS = $SETAST (ENBFLG = 0);
+
+	IF ((.MEMLIMITS [0] LSSA .MIN_ADDRESS) OR (.MIN_ADDRESS EQL 0)) THEN MIN_ADDRESS = .MEMLIMITS [0];
+
+	IF ((.MEMLIMITS [1] GTRA .MAX_ADDRESS) OR (.MAX_ADDRESS EQL 0)) THEN MAX_ADDRESS = .MEMLIMITS [1] + 1;
+
+	IF (.AST_STATUS EQL SS$_WASSET) THEN $SETAST (ENBFLG = 1);
+
+!+
+! Deallocate the space acquired, thus putting it in the free list.
+! Don't disturb the statistics cells.
+!-
+
+	IF ( NOT DEALLOCATE ((.MEMLIMITS [1] - .MEMLIMITS [0]) + 1, .MEMLIMITS [0], LASTBLOCK [0]))
+	THEN
+	    RETURN (LIB$_FATERRLIB);		! should never happen
+
+	LIB$$GL_VMINUSE = .LIB$$GL_VMINUSE + (.MEMLIMITS [1] - .MEMLIMITS [0]) + 1;
+	LIB$$GL_FREVM_C = .LIB$$GL_FREVM_C - 1;
+	END;		! do $EXPREG
+!+
+! Now we loop back to search the free list again
+!-
+	END;					! Of WHILE -1 loop
+
+    RETURN (LIB$_FATERRLIB);
+    END;					! of ALLOCATE routine
+
+
+
+GLOBAL ROUTINE LIB$FREE_VM (			! Deallocate virtual memory
+	NUM_BYTES, 				! Adr. of longword containing size in bytes
+	BLK_ADR_ADR				! Adr. of longword containing adr. of block
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Deallocate n virtually contiguous bytes starting at the
+!	specified virtual address. The number of bytes actually
+!	deallocated is rounded up so that the smallest number of whole
+!	quadwords are de-allocated. Numerous error checks are made to
+!	make sure that the block being returned is a legitimate free
+!	area.
+!
+! CALLING SEQUENCE:
+!
+!	CALL LIB$FREE_VM (NUM_BYTES.rlu.r, BLK_ADR_ADR.ra.r)
+!
+! INPUT PARAMETERS:
+!
+!	NUM_BYTES is the address of an unsigned longword integer
+!		specifying the number of virtually contiguous bytes to
+!		be deallocated.
+!
+!	BLK_ADR_ADR is the address of a longword containing the address
+!	 	of the first byte to be deallocated.
+!
+! OUTPUT PARAMETERS:
+!
+!	NONE.
+!
+! IMPLICIT INPUTS
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS
+!
+!	The pages are deallocated by putting them in the list maintained
+!	for LIB$GET_VM to search before calling $EXPREG.
+!
+! COMPLETION STATUS:
+!
+!	SS$_NORMAL indicates normal successful completion.
+!	LIB$_BADBLOADR indicates BAD BLOCK ADDRESS
+!
+! SIDE EFFECTS:
+!
+!	Puts the indicated block back on the the image free storage
+!	list.
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	STATUS,					! Return status
+	L_BLK_SIZE;
+
+!+
+! Round up size to be a multiple of quadwords
+!-
+    L_BLK_SIZE = (..NUM_BYTES + 7) AND ( NOT 7);
+!+
+! Perform various checks for the validity of the request.
+!-
+
+    IF (((..BLK_ADR_ADR + .L_BLK_SIZE) GTRA .MAX_ADDRESS) OR (..BLK_ADR_ADR LSSA .MIN_ADDRESS))
+    THEN
+	RETURN (LIB$_BADBLOADR);
+
+!+
+! Arg ok, increment re-entrant nest level index and select corresponding
+! nest level queue header.  Usually this is level 1, since need to be
+! called at AST level while in LIB$GET_VM or LIB$FREE_VM at non-AST
+! level.
+!-
+    NEST_LEVEL = .NEST_LEVEL + 1;
+
+    IF (.NEST_LEVEL GTRU K_MAX_NEST_LEV) THEN RETURN (LIB$_FATERRLIB);
+
+!+
+! Deallocate space by merging into the corresponding queue for this nest level.
+!-
+    STATUS = DEALLOCATE (.L_BLK_SIZE, ..BLK_ADR_ADR, Q_LIST_HEAD [.NEST_LEVEL*2]);
+!+
+! Now count re-entrant nest level back down.
+! Usually this just goes from 1 back to 0.
+!-
+    NEST_LEVEL = .NEST_LEVEL - 1;
+    RETURN (.STATUS);
+    END;					! of routine LIB$FREE_VM
+
+
+ROUTINE DEALLOCATE (				! Internal routine to actually deallocate
+	SIZE, 					! The number of bytes to deallocate
+	ADDRESS, 				! Base of the area to deallocate
+	LISTHEAD				! List to merge this area into
+    ) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Deallocate storage onto the given list.
+!
+! INPUT PARAMETERS:
+!
+!	SIZE.rl.v	The number of bytes to deallocate.  This is
+!			always a multiple of 8.
+!	ADDRESS.ra.r	The address of the block to be deallocated.
+!	LISTHEAD.ra.v	The beginning of the list of free blocks at this
+!			reentrancy level.  This list is linked by its
+!			first longword.
+!
+! OUTPUT PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	SS$_NORMAL	The deallocation was successful
+!	LIB$_BADBLOADR	The block address/length was bad, since it
+!			conflicts with the existing free list.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	NEWBLOCK : REF VECTOR [2],		! Current block pointer
+	NEXTBLOCK : REF VECTOR [2],		! Next block pointer
+	LASTBLOCK : REF VECTOR [2];		! Previous block pointer
+
+    LASTBLOCK = .LISTHEAD;			! Previous block initially the listhead
+    NEWBLOCK = .ADDRESS;			! Current block is to be inserted
+!+
+! Follow down the free list until we reach the end, or the place to
+! insert this block.  The free list is kept sorted so that adjacent
+! free areas can be merged together.
+!-
+
+    WHILE ((NEXTBLOCK = .LASTBLOCK [0]) NEQA 0) DO
+	BEGIN
+
+	IF (NEWBLOCK [0] LEQA NEXTBLOCK [0])
+	THEN
+	    BEGIN
+!+
+! This is the position for insertion of the block in the free list.
+!-
+
+	    IF ((NEWBLOCK [0] + .SIZE) EQLA NEXTBLOCK [0])
+	    THEN
+		BEGIN				! Here we compact with next block
+		NEWBLOCK [0] = .NEXTBLOCK [0];
+		NEWBLOCK [1] = .NEXTBLOCK [1] + .SIZE;
+		END
+	    ELSE
+		BEGIN
+!+
+! If this block overlaps the next free block, we have an error.
+!-
+
+		IF ((NEWBLOCK [0] + .SIZE) GTRA NEXTBLOCK [0]) THEN RETURN (LIB$_BADBLOADR);
+
+						! BAD BLOCK ADDRESS code
+		NEWBLOCK [0] = NEXTBLOCK [0];	! else set pointer and size since no
+		NEWBLOCK [1] = .SIZE;		! forward compaction needed
+		END;
+
+	    IF (NEWBLOCK [0] EQLA (LASTBLOCK [0] + .LASTBLOCK [1]))
+	    THEN
+		BEGIN				! Here we compact with previous
+		LASTBLOCK [0] = .NEWBLOCK [0];	! block
+		LASTBLOCK [1] = .NEWBLOCK [1] + .LASTBLOCK [1];
+		END
+	    ELSE 				! No backward compaction but...
+		BEGIN				! must check that block to
+
+		IF (NEWBLOCK [0] LSSA (LASTBLOCK [0] + .LASTBLOCK [1]))	! deallocate is not partially in
+		THEN
+		    RETURN (LIB$_BADBLOADR);	! previous hole--failure if so
+
+		LASTBLOCK [0] = NEWBLOCK [0];	! If ok previous points to new one.
+		END;				! and we are done compacting
+
+	    LIB$$GL_FREVM_C = .LIB$$GL_FREVM_C + 1;
+	    LIB$$GL_VMINUSE = .LIB$$GL_VMINUSE - .SIZE;
+	    RETURN (SS$_NORMAL);
+	    END
+	ELSE
+	    LASTBLOCK = NEXTBLOCK [0];		! Not there yet so last block is one just tested
+
+	END;					! of WHILE loop
+
+!+
+! The block to deallocate is beyond the last hole.
+! It must not start within that last hole.
+!-
+
+    IF (NEWBLOCK [0] LSSA (LASTBLOCK [0] + .LASTBLOCK [1]))
+    THEN
+	RETURN (LIB$_BADBLOADR)
+    ELSE
+	BEGIN
+!+
+! Check to see if the new block goes right after the last old block.
+! If it does we can just extend the last old block.
+!-
+
+	IF (NEWBLOCK [0] EQLA (LASTBLOCK [0] + .LASTBLOCK [1]))
+	THEN
+	    LASTBLOCK [1] = .LASTBLOCK [1] + .SIZE
+	ELSE
+!+
+! Otherwise, just put the new block on the end of the free list.
+!-
+	    BEGIN
+	    NEWBLOCK [0] = 0;
+	    NEWBLOCK [1] = .SIZE;
+	    LASTBLOCK [0] = NEWBLOCK [0];
+	    END;
+
+	LIB$$GL_FREVM_C = .LIB$$GL_FREVM_C + 1;
+	LIB$$GL_VMINUSE = .LIB$$GL_VMINUSE - .SIZE;
+	RETURN (SS$_NORMAL);
+	END;
+
+    END;					! of DEALLOCATE routine
+END						! of LIB$VM module
+
+ELUDOM

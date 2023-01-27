@@ -1,0 +1,915 @@
+	.TITLE	OTS$CVTTR	; Convert text to real (D, G and H)
+	.IDENT	/1-010/			; File: OTSCVTTR.MAR  Edit: JAW1010
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;
+; FACILITY: Language-independent support library
+;++
+; ABSTRACT:
+;
+; Performs conversion of character strings containing numbers to
+; floating datatypes.  This routine supports FORTRAN F, E, D and
+; G format conversion, as well as similar types in other languages.
+;
+;--
+;
+; VERSION: 1
+;
+; HISTORY:
+;
+; AUTHOR:
+;	Steven B. Lionel, 2-Jul-79: Version 1
+;
+;
+
+	.SBTTL	HISTORY		; Detailed Current Edit History
+
+
+; EDIT HISTORY:
+;
+; 1-001 - Adapted from OTS$CVTTH version 1-003, changed to use Tom
+; 1-002 - Add forgotten FOR$CNV_IN_DEFG entry point.  SBL 6-Jul-1979
+; 1-003 - Fix bug in SCALE.  SBL 6-Jul-1979
+; 1-004 - Use Tom
+;	  Eggers' multi-precision multiply routine in OTS$$CVTRT.
+;	  SBL 2-Jul-1979
+; 1-005 - Compensate for removal of STRING_LEN from convert frame.
+;	  SBL 11-Jul-79
+; 1-006	- Correct a typo in a comment.  JBS 30-JUL-1979
+; 1-007 - Correct implementation of V_SKIPTABS.  SBL 5-Sept-1979
+; 1-008 - Implement V_EXP_LETTER.  SBL 4-Dec-1979
+; 1-009 - Improve check for overflow, underflow to catch extreme cases.
+;	  Previously, extreme overflow could give invalid answer with
+;	  success status.  SBL 17-June-1980
+; 1-010 - Speed up operations on FAC when it fits in a longword (9 or
+;	  fewer digits) or a quadword (18 or fewer digits).  Improve
+;	  multiplication by 10, test for zero, and normalization.  JAW
+;	  28-Apr-1981
+
+	.SBTTL	DECLARATIONS
+
+;
+; INCLUDE FILES:
+;
+
+;
+; EXTERNAL SYMBOLS:
+;
+	.DSABL	GBL
+	.EXTRN	OTS$_INPCONERR		; Input conversion error
+	.EXTRN	OTS$$A_CVT_TAB		; Convert table address
+	.EXTRN	OTS$$CVT_MUL		; Conversion multiply routine
+
+;
+; MACROS:
+;
+
+;
+; PSECT DECLARATIONS:
+;
+
+	.PSECT	_OTS$CODE	PIC, SHR, LONG, EXE, NOWRT
+
+;
+; EQUATED SYMBOLS:
+;
+
+
+	REGMASK		= ^M<R2, R3, R4, R5, R6, R7, R8, R9>
+					; register save mask
+					; Note: integer overflow not enabled
+
+;+
+; The following symbols are used to indicate the bit position of the flag
+; register.
+;-
+
+	V_NEGATIVE	= 31		; flag bit: 1 if negative sign
+	V_DEC_POINT	= 30		; flag bit: 1 if decimal point is seen
+	M_DEC_POINT	= 1@30		; mask for V_DEC_POINT
+	V_NEG_DECEXP	= 29		; flag bit: 1 if exponent has negative sign
+	M_NEG_DECEXP	= 1@29		; mask for V_NEG_DEXEXP
+	V_DECEXP	= 28		; flag bit: 1 if exponent field exist
+	M_DECEXP	= 1@28		; mask for V_DECEXP
+	V_EXT_BITS	= 27		; flag bit: 1 if extension bits
+					; wanted
+	M_EXT_BITS	= 1@27		; mask for V_EXT_BITS
+
+
+;+
+; Literals for data types
+;-
+	K_DTYPE_D	= 0		; D-floating
+	K_DTYPE_G	= 1		; G-floating
+	K_DTYPE_H	= 2		; H-floating
+
+;+
+; Temporary stack offsets
+;-
+
+	TEMP		= 0		; temporary storage during
+					; 8 word shift
+	FLAG		= 4		; flag storage
+					; was R6 in FOR$CNV_IN_DEFG
+	DIGITS		= 8		; digits to right of decimal
+					; point (was R7)
+	DECEXP		= 12		; Decimal exponent
+	DTYPE		= 16		; Datatype code
+
+;+
+; Stack offsets for OTS$$CVT_MUL routine
+;-
+	BINNUM		= 20		; Binary fraction storage
+	INT		= 36		; Overflow area for BINNUM
+	BINEXP		= 40		; Binary exponent
+	PRODF_4		= 44		; Multiply temporary
+	PRODF		= 48		; Multiply temporary
+	CRY		= 64		; Carry save area
+	FRAME		= CRY + 16	; Stack frame size
+
+;+
+; Constants
+;-
+
+	L_2P31_DIV_10	= 214748364	; (2**31)/10
+
+
+	.SBTTL	OTS$CVT_T_x - convert text to floating
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	OTS$CVT_T_x converts a text string containing a representation
+;	of a numeric value to a floating representation of that
+;	value.  The routine supports FORTRAN F,E,D and G input type
+;	conversion as well as similar types for other languages.
+;
+;	The description of the text representation converted by
+;	OTS$CVT_T_x is as follows:
+;
+;		<0 or more blanks>
+;		<"+", "-" or nothing>
+;		<0 or more decimal digits>
+;		<"." or nothing>
+;		<0 or more decimal digits>
+;		<exponent or nothing, where exponent is:
+;			<	<<"E", "e", "D", "d", "Q", "q">
+;				<0 or more blanks>
+;				<"+", "-" or nothing>>
+;				or
+;				<"+" or "-">>
+;			<0 or more decimal digits>>
+;		<end of string>
+;
+;		Notes:	1. Unless "caller_flags" bit V_SKIPBLANKS
+;			   is set, blanks are equivalent to
+;			   decimal "0".  If V_SKIPBLANKS is set,
+;			   blanks are always ignored.
+;			2. There is no difference in semantics
+;			   between any of the 6 valid exponent
+;			   letters.
+;			3. If "caller_flags" bit V_ONLY_E is set,
+;			   the only valid exponent letters are
+;			   "E" and "e"; any others will be treated
+;			   as an invalid character.
+;			4. If "caller_flags" bit V_SKIPTABS is set,
+;			   tab characters are ignored else they are
+;			   an error.
+;			5. If "caller_flags" bit V_EXP_LETTER is set,
+;			   the exponent, if present, must start with
+;			   a valid exponent letter, i.e. 1.2E32.
+;			   If clear, the exponent letter may be omitted,
+;			   i.e. 1.2+32.
+;
+;
+; CALLING SEQUENCE:
+;
+;	status.wlc.v = OTS$CVT_T_x (in_str.rt.dx, value.wfx.r 
+;			[, digits_in_fract.rlu.v
+;			[, scale_factor.rl.v
+;			[, caller_flags.rlu.v,
+;			[, ext_bits.wx.r]]]])
+;
+;	where "x" is the datatype of the floating value, either
+;	D, G or H.
+;
+;
+; INPUT PARAMETERS:
+;
+	in_str		= 4		; input string descriptor by 
+					; reference.
+	digits_in_fract	= 12		; If no decimal point is
+					; present in input, specifies
+					; how many digits are to be
+					; treated as being to the
+					; right of the decimal point.
+					; If omitted, 0 is the default.
+	scale_factor	= 16		; signed scale factor.   If
+					; present, and exponent absent,
+					; the result value is 
+					; multiplied by 10**factor.
+					; If "caller_flags" bit
+					; V_FORCESCALE is on, the
+					; scale factor is always applied.
+	caller_flags	= 20		; flags supplied by caller
+   ;+
+   ; Definitions of caller supplied flags
+   ;-
+
+	V_SKIPBLANKS	= 0		; If set, blanks are ignored
+	V_ONLY_E	= 1		; If set, only E or e exponents
+					; allowed (BASIC+2, PL/I)
+	V_ERR_UFLO	= 2		; If set, error on underflow
+	V_DONTROUND	= 3		; If set, don't round value
+	M_DONTROUND	= 1@3		; Mask for V_DONTROUND
+	V_SKIPTABS	= 4		; If set, tabs are ignored.
+					; If clear, tabs are illegal.
+	V_EXP_LETTER	= 5		; If set, an exponent must begin
+					; with a valid exponent letter.
+					; If clear, the exponent letter
+					; may be omitted.
+	V_FORCESCALE	= 6		; If set, the scale factor is
+					; always applied.  If clear, it
+					; is only applied if there is
+					; no exponent present in the
+					; string.
+
+	NO_OF_FLAGS	= 7		; Number of flags
+
+;
+; IMPLICIT INPUTS:
+;
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+	value		= 8		; floating result by ref
+	ext_bits	= 24		; If present, the value will
+					; NOT be rounded and the first
+					; n bits after truncation will
+					; be returned in this argument.
+					; For D-floating, the next 8 bits
+					; are returned as a byte.
+					; For G and H floating, 11 and 15
+					; bits are returned, respectively,
+					; as a word, left-adjusted.
+					; These values are suitable for
+					; use as the extension operand
+					; in an EMOD instruction.
+					; WARNING:  The bits returned for
+					; H-floating may not be precise,
+					; due to the fact that calculations
+					; are only carried to 128 bits.
+					; However, the error should be
+					; small.  D and G datatypes
+					; return guaranteed exact bits,
+					; but they are not rounded.
+
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	OTS$_INPCONERR 	- Error if illegal character in input or
+;			  overflow.
+;	SS$_NORMAL 	- success
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+
+
+	.ENTRY	OTS$CVT_T_H, REGMASK
+					; entry for OTS$CVT_T_H
+	SUBL2	#FRAME, SP		; Create stack frame
+	MOVL	#K_DTYPE_H, DTYPE(SP)	; Set datatype code
+	BRB	COMMON			; Go to common code
+
+	.ENTRY	OTS$CVT_T_G, REGMASK
+					; entry for OTS$CVT_T_G
+	SUBL2	#FRAME, SP		; Create stack frame
+	MOVL	#K_DTYPE_G, DTYPE(SP)	; Set datatype code
+	BRB	COMMON			; Go to common code
+
+FOR$CNV_IN_DEFG::
+	.ENTRY	OTS$CVT_T_D, REGMASK
+	SUBL2	#FRAME, SP		; Create stack frame
+	MOVL	#K_DTYPE_D, DTYPE(SP)	; Set datatype code
+;	BRB	COMMON			; Go to common code
+
+;+
+;	Register usage and abbreviations:
+;
+;	R0 - Generally count of input characters remaining.
+;	R1 - Generally pointer to input character.
+;	R2 - Generally holds decimal exponent.
+;	R3 - Used first to hold current character, then as
+;	     extra precision bits for the fraction.
+;	R4-R7 - The 128 bit binary fraction.
+;	R8 - Count of digits seen after overflow.
+;	R9 - Count of significant digits seen in fraction (number of
+;	      digits currently held in R4:R7).
+;
+;	FAC: Binary fraction, R4-R7.
+;-
+
+COMMON:
+	CLRL	FLAG(SP)		; clear flags
+	CMPB	(AP), #<caller_flags/4> ; is optional caller_flags
+					; argument present?
+	BLSSU	5$			; if not, skip
+	INSV	caller_flags(AP), #0, #NO_OF_FLAGS, FLAG(SP)
+					; set caller flags
+	CMPB	(AP), #<ext_bits/4>	; is optional ext_bits argument
+					; present?
+	BLSSU	5$			; if not, skip
+	BISL	#<M_EXT_BITS+M_DONTROUND>, FLAG(SP)
+					; set bit indicating it is there
+					; plus dont round bit
+5$:	MOVQ	@in_str(AP), R0		; R0 will get string length, the
+					; CLASS and TYPE fields will go
+					; away after the first SKPC.
+					; R1 points to input string.
+	CLRL	R2			; R2 = DECIMAL_EXPONENT = 0
+	CLRQ	R4			; R4-R7 = FAC = 0
+	CLRQ	R6
+	CLRL	DIGITS(SP)		; digits in fraction
+	CMPB	(AP), #<digits_in_fract/4>                                      
+					; is digits_in_fract present?
+	BLSSU	10$			; skip if not
+	MOVL	digits_in_fract(AP), DIGITS(SP)	; set if present
+10$:	CLRQ	R8			; Clear digit counts (R8 & R9).
+
+
+;+
+; Find first non-blank.  If none, return zero.  Otherwise process
+; character.
+;-
+
+20$:	SKPC	#^A/ /, R0, (R1)	; skip blanks
+					; R0 = #CHAR_REMAINING
+					; R1 = POINTER_TO_INPUT
+					; Z bit is set if all blanks
+	BGTR	30$			; non-blank found?
+	BRW	ZERO			; if not, return zero
+30$:	MOVZBL	(R1), R3		; R3 = ASCII(current_char)
+	BBC	#V_SKIPTABS, FLAG(SP), 35$  ; Not skipping tabs?
+	CMPL	R3, #9			; Is character a tab?
+	BNEQ	35$			; No
+	INCL	R1			; Yes, bump pointer
+	SOBGTR	R0, 20$			; Decrement character count
+	BRW	ZERO			; Value is zero
+35$:	CMPB	R3, #^A/-/		; is current char a "-" sign?
+	BNEQ	40$			; branch if not
+	BBCS	#V_NEGATIVE, FLAG(SP), DIGIT_LOOP
+					; set negative flag and continue
+40$:	CMPB	R3, #^A/+/		; is current char a "+" sign?
+	BEQL	DIGIT_LOOP		; yes, ignore and continue
+	CMPB	R3, #^A/./		; is current char a "."?
+	BNEQ	CHECK_DIGIT		; no, should be a digit
+	BISL	#M_DEC_POINT, FLAG(SP)	; set decimal point encountered
+	CLRL	DIGITS(SP)		; ignore digits_in_fract
+
+
+;+
+; Collect integer and fraction digits.  Blanks are zeroes unless
+; V_SKIPBLANKS is set in which case they are ignored.
+; Tabs are illegal unless V_SKIPTABS is on in which case they are ignored.
+;-
+
+DIGIT_LOOP:
+	BSBW	RGET			; get a new character
+	TSTL	R0			; check for end of string
+	BGTR	CHECK_DIGIT		; continue if positive
+	BRW	SCALE			; done if string empty
+CHECK_DIGIT:
+	SUBL	#^A/0/, R3		; convert to numeric
+	CMPL	R3, #9			; is it a digit?
+	BGTRU	NOT_DIGIT		; no
+	CMPL	R7, #L_2P31_DIV_10	; check highest part of FAC to
+					; see if it is too big to
+					; multiply by 10.
+	BLEQU	10$			; it's ok
+	INCL	R8			; overflow, bump counter
+	BRB	2$			; skip multiplication
+10$:	BSBW	MUL10_R9		; Multiply FAC by 10 and add R3.
+2$:	BBC	#V_DEC_POINT, FLAG(SP), DIGIT_LOOP
+					; check to see if decimal
+					; point has been seen
+					; - continue if not.
+	INCL	DIGITS(SP)		; bump DIGITS
+	BRB	DIGIT_LOOP		; branch back to read more
+
+
+;+
+; A non-digit has been found.  Check for sign or exponent letter.
+;-
+
+NOT_DIGIT:
+	CMPL	R3, #<^A/./-^A/0/>	; check if current char is a "."
+	BEQL	DECIMAL_POINT		; branch to DECIMAL_POINT if yes
+	CMPL	R3, #<^A/+/-^A/0/>	; "+"?
+	BEQL	EXP_PLUS		; Exponent starts with plus
+	CMPL	R3, #<^A/-/-^A/0/>	; "-"?
+	BEQL	EXP_MINUS		; Exponent starts with a minus
+	CMPL	R3, #<^A/E/-^A/0/>	; "E"?
+	BEQL	EXPON			; process exponent
+	CMPL	R3, #<^A/e/-^A/0/>	; "e"?
+	BEQL	EXPON			; process exponent
+	BBS	#V_ONLY_E, FLAG(SP), 10$	; ERROR
+					; error if only E, e allowed
+	CMPL	R3, #<^A/D/-^A/0/>	; "D"?
+	BEQL	EXPON			; process exponent
+	CMPL	R3, #<^A/d/-^A/0/>	; "d"?
+	BEQL	EXPON			; process exponent
+	CMPL	R3, #<^A/Q/-^A/0/>	; "Q"?
+	BEQL	EXPON			; process exponent
+	CMPL	R3, #<^A/q/-^A/0/>	; "q"?
+	BEQL	EXPON			; process exponent
+10$:	BRW	ERROR			; error since illegal char.
+
+;+
+; The exponent did not start with a letter.  This is not allowed
+; if V_EXP_LETTER is set.
+;-
+EXP_PLUS:
+	BBC	#V_EXP_LETTER, FLAG(SP), EXP_LOOP
+	BRW	ERROR			; Not allowed
+EXP_MINUS:
+	BBS	#V_EXP_LETTER, FLAG(SP), ERROR
+	BRW	EXP_NEG			; Ok
+;+
+; Decimal point has been found
+;-
+
+DECIMAL_POINT:
+	BBSS	#V_DEC_POINT, FLAG(SP), ERROR	; error if duplicate
+	CLRL	DIGITS(SP)		; reset DIGITS
+	BRW	DIGIT_LOOP		; get fraction digits
+
+;+
+; Loop to collect digits, store the accumulated DECIMAL_EXPONENT in R2
+;-
+
+EXPON:
+	DECL	R0			; skip over letter
+	BLEQ	EXP_DONE		; done if string empty
+	INCL	R1			; R1 points to next character
+	SKPC	#^A/ /, R0, (R1)	; skip blanks
+	BLEQ	EXP_DONE		; done if end of string
+	MOVZBL	(R1), R3		; R3 = current char
+	BBC	#V_SKIPTABS, FLAG(SP), 10$  ; Not skipping tabs?
+	CMPL	R3, #9			; Is it a tab?
+	BEQL	EXPON			; Yes, skip it
+10$:	CMPL	R3, #^A/+/		; "+"?
+	BEQL	EXP_LOOP		; yes, get digits
+	CMPL	R3, #^A/-/		; "-"?
+	BNEQ	EXP_CHECK		; no, go check digit
+EXP_NEG:
+	BISL	#M_NEG_DECEXP, FLAG(SP)	; exponent is negative
+EXP_LOOP:
+	BSBW	RGET			; get next character
+	TSTL	R0			; is string empty?
+	BLEQ	EXP_DONE		; done if true
+EXP_CHECK:
+	SUBL	#^A/0/, R3		; convert to numeric
+	BLSS	ERROR			; If negative, illegal character
+	CMPL	R3, #9			; is it a digit?
+	BGTRU	ERROR			; branch to ERROR if not
+	MULL	#10, R2			; add in new digit
+	BVS	ERROR			; overflow?
+	ADDL	R3, R2			; to exponent
+	BVS	ERROR			; overflow?
+	BRB	EXP_LOOP		; get more exponent digits
+
+EXP_DONE:
+	BBC	#V_NEG_DECEXP, FLAG(SP), 1$	; check for negative 
+	MNEGL	R2, R2			; negate DECIMAL_EXPONENT
+1$:	BISL	#M_DECEXP, FLAG(SP)	; exponent field exists
+
+
+
+;+
+; Done collecting input characters for digits and/or exponent
+; If FAC=0, no scaling is necessary, just store 0.0 and return.
+;-
+
+SCALE:
+	TSTL	R9			; Check FAC for zero.
+	BNEQ	INIT_BINEXP		; Branch if not.
+
+;+
+; Value is zero.
+;-
+
+ZERO:
+	MOVL	#1, R0			; SS$_NORMAL
+ZERO_VALUE:
+	MOVL	value(AP), R1		; Get address of value
+	CMPB	DTYPE(SP), #K_DTYPE_H	; Check length of datatype
+	BLSS	10$
+	CLRQ	(R1)+
+10$:	CLRQ	(R1)
+	RET				; return with status in R0
+
+;+
+; ERROR return
+;-
+
+ERROR:
+	MOVL	#OTS$_INPCONERR, R0	; R0 = error return code
+	BRB	ZERO_VALUE		; Set value to zero and exit
+
+;+
+; Set R1 to the binary exponent [exponent bias + 128 - 1].
+; 128 is number of fraction bits and 1 is
+; for the MSB fraction bit which will be hidden later.
+; BINARY_EXPONENT will be modified during normalization process.
+;-
+
+INIT_BINEXP:
+	CASEB	DTYPE(SP), #K_DTYPE_D, #K_DTYPE_H  ; Select on datatype
+1$:	.WORD	D_EXP-1$
+	.WORD	G_EXP-1$
+	.WORD	H_EXP-1$
+D_EXP:	MOVZWL	#<^X80+^X7F>, R1	; D-Floating
+	BRB	EXP_COMMON
+G_EXP:	MOVZWL	#<^X400+^X7F>, R1	; G-Floating
+	BRB	EXP_COMMON
+H_EXP:	MOVZWL	#<^X4000+^X7F>, R1	; H-Floating
+;	BRB	EXP_COMMON
+
+;+
+; Find the true decimal exponent for the value expressed in FAC.
+; True decimal exponent = Explicit exponent - [scale factor] -
+; digits in fraction + number of overflows
+;-
+
+EXP_COMMON:
+	MOVL	R2, R0			; R0 = DECIMAL_EXPONENT
+	CMPB	(AP), #<scale_factor/4>	; is scale_factor present
+	BLSSU	20$			; no
+	BBS	#V_FORCESCALE, FLAG(SP), 10$	; force scaling
+	BBS	#V_DECEXP, FLAG(SP), 20$  ; ignore factor if exponent
+					; exists
+10$:	SUBL	scale_factor(AP), R8	; adjust decimal exponent for
+					; scale factor
+20$:	SUBL	DIGITS(SP), R8		; adjust for digits in fraction
+
+	ADDL3	R8, R0, DECEXP(SP)	; adjust decimal exponent for overflow
+	BVS	ERROR			; If overflow, error
+
+
+;+
+; Normalization.  Shift the value left until bit 31 of R7 is on.
+; Adjust the binary exponent appropriately.
+;-
+
+	CMPL	R9, #9			; Are there more than 9 digits?
+	BLEQ	N1			; If not, use N1.
+	CMPL	R9, #18			; Are there more than 18 digits?
+	BLEQ	N2			; If not, use N2.
+;+
+; Process all four longwords, since there are more than 18 digits.
+;-
+N4:	BBS	#31, R7, REBASE		; Quit when R7<31> = 1.
+	EXTZV	#31, #1, R5, TEMP(SP)	; Save bit lost in shift.
+	ASHQ	#1, R4, R4		; Shift low part by one bit.
+	ASHQ	#1, R6, R6		; Shift high part by one bit.
+	INSV	TEMP(SP), #0, #1, R6	; Replace bit lost in shift.
+	DECL	R1			; Adjust exponent by one.
+	BRB	N4			; Go back and retest.
+;+
+; Process two low-order longwords only, since there are <= 18 digits.
+;-
+N2:	SUBL	#64, R1			; Adjust exponent by 64.
+	MOVQ	R4, R6			; "Shift" by 64 bits.
+10$:	DECL	R1			; Adjust exponent by one.
+	ASHQ	#1, R6, R6		; Shift one bit.
+	BGEQ	10$			; If R7<31> = 0, repeat.
+	CLRQ	R4			; Clear low-order 64 bits.
+	BRB	REBASE			; Continue with next phase.
+;+
+; Process only the low-order longword, since there are <= 9 digits.
+;-
+N1:	SUBL	#96, R1			; Adjust exponent by 96.
+	MOVL	R4, R7			; "Shift" by 96 bits.
+20$:	DECL	R1			; Adjust exponent.
+	ASHL	#1, R7, R7		; Shift one bit.
+	BGEQ	20$			; If R7<31> = 0, repeat.
+	CLRL	R4			; Clear low-order longword.
+
+;+
+; Rebasing.  R4-R7 now contains a binary fraction normalized with
+; the radix point to the left of bit 31 of R7.  R1 contains the
+; current binary exponent and DECEXP(SP) contains the current decimal
+; exponent.
+;
+; Therefore, the number can be represented as:
+;	2**b * fraction * 10**d
+; where b is the binary exponent and d is the decimal exponent.  We
+; call OTS$$CVT_MUL to multiply the number by some power of 10 such
+; that d goes to zero and b goes to the appropriate value.  When d is
+; zero, b contains the proper binary exponent.
+;-
+
+REBASE:
+	MOVAB	BINNUM(SP), R8		; R8 is used by subroutine as base
+	MOVL	R1, BINEXP(SP)		; Store binary exponent
+	MOVQ	R4, BINNUM+0(SP)	; Store fraction
+	MOVQ	R6, BINNUM+8(SP)
+	MOVL	#13, R7			; Highest bit number possibly
+					; on in decimal exponent.
+10$:	MNEGL	#20, R2			; Initially, negative offset
+	MOVL	DECEXP(SP), R0		; Get decimal exponent
+	BEQL	FLOAT			; If zero, we're done
+	BGTR	20$			; Positive?
+	MOVL	#20, R2			; No, use positive offset
+	MNEGL	R0, R0			; Absolute value
+20$:	CMPL	R0, #16			; Within linear table range?
+	BLEQ	50$			; Yes
+30$:	BBS	R7, R0, 40$		; Is the R7th bit of R0 on?
+	SOBGEQ	R7, 30$			; No, try again.
+					; This can never fall through.
+40$:	ADDL3	#12, R7, R0		; Index is 12+bit position
+					; because table is linear
+					; from 0-16.
+50$:	MULL2	R0, R2			; Get table offset
+	MOVAB	OTS$$A_CVT_TAB[R2], R2	; Table entry address
+	MOVL	R7, TEMP(SP)		; Save hi bit position
+	MOVAB	DECEXP+28(SP), R7	; This is "common convert routine"
+					; table base.  The +28 offsets
+					; the -28 location of DEC_EXP
+					; referenced in OTS$$CVT_MUL.
+	JSB	OTS$$CVT_MUL		; Do the multiplication
+	SUBL3	#1, TEMP(SP), R7	; Get next bit position
+	BGEQ	10$			; Loop back if more
+
+;+
+; If we fall through here, then there are no more bits to reduce.
+; Test DECEXP to make sure.
+;-
+
+	TSTL	DECEXP(SP)		; Any bits still on?
+	BEQL	FLOAT			; No, ok
+	BLSS	UNDERFLOW		; Negative, underflow
+	BRW	ERROR			; Yes, exponent too big
+
+;+
+; Create a floating number from the fraction in BINNUM and the
+; binary exponent in R1.  Each datatype has a separate routine
+; to do this.
+;-
+
+
+FLOAT:
+	TSTL	BINEXP(SP)		; Underflow?
+	BLSS	UNDERFLOW		; Yes
+	CASEB	DTYPE(SP), #K_DTYPE_D, #K_DTYPE_H
+10$:	.WORD	FLOAT_D-10$
+	.WORD	FLOAT_G-10$
+	.WORD	FLOAT_H-10$
+
+;+
+; Value underflowed.  Check to see if it's allowed.  If so, set
+; value to zero, else error.
+;-
+
+UNDERFLOW:
+	BBS	#V_ERR_UFLO, FLAG(SP), 10$	; Allowed?
+	BRW	ZERO			; Yes
+10$:	BRW	ERROR			; No
+
+FLOAT_D:
+	MOVQ	BINNUM+8(SP), R6	; Restore fraction
+	ASHL	#23, BINEXP(SP), R1	; Put exponent in proper place
+	BVS	ERROR_D			; Error if overflows
+	MOVZBL	R6, R8			; Extract rounding bits
+	ASHQ	#-8, R6, R6		; Shift fraction right 8 places
+	BICL	#^XFF000000, R7		; clear possibly shifted bits
+	ADDL	R1, R7			; Add in exponent
+	BVS	ERROR_D			; overflow if hidden bit bumps
+					; exponent too far
+	BBS	#V_DONTROUND, FLAG(SP), 15$	; round?
+	BBC	#7, R8, 15$		; round bit is zero
+	INCL	R6			; round
+	ADWC	#0, R7
+	BVS	ERROR_D			; Error?
+15$:	BBC	#V_EXT_BITS, FLAG(SP), 17$
+	MOVB	R8, @ext_bits(AP)
+17$:	BBC	#V_NEGATIVE, FLAG(SP), 20$  ; Set sign bit
+	BBCS	#31, R7, 20$		; insert sign bit to 1
+20$:	MOVL	value(AP), R2		; R2 = reference to result
+	ROTL	#16, R7, (R2)+		; rotate and store result
+	ROTL	#16, R6, (R2)
+	BRW	EXIT			; All done
+
+ERROR_D:
+	BRW	ERROR			; error return
+
+
+FLOAT_G:
+	MOVQ	BINNUM+8(SP), R6	; Restore fraction
+	ASHL	#20, BINEXP(SP), R1	; Put exponent in proper place
+	BVS	ERROR_G			; Error if overflows
+	EXTZV	#0, #11, R6, R8		; Extract rounding bits
+	ROTL	#5, R8, R8		; Left adjust
+	ASHQ	#-11, R6, R6		; Shift fraction right 11 places
+	BICL	#^XFFE00000, R7		; clear possibly shifted bits
+	ADDL	R1, R7			; Add in exponent
+	BVS	ERROR_G			; overflow if hidden bit bumps
+					; exponent too far
+	BBS	#V_DONTROUND, FLAG(SP), 15$	; round?
+	BBC	#15, R8, 15$		; round bit is zero
+	INCL	R6			; round
+	ADWC	#0, R7
+	BVS	ERROR_D			; Error?
+15$:	BBC	#V_EXT_BITS, FLAG(SP), 17$
+	MOVW	R8, @ext_bits(AP)
+17$:	BBC	#V_NEGATIVE, FLAG(SP), 20$	; Set sign bit
+	BBCS	#31, R7, 20$		; insert sign bit to 1
+20$:	MOVL	value(AP), R2		; R2 = reference to result
+	ROTL	#16, R7, (R2)+		; rotate and store result
+	ROTL	#16, R6, (R2)
+	BRW	EXIT			; All done
+
+ERROR_G:
+	BRW	ERROR			; error return
+
+
+FLOAT_H:
+	MOVQ	BINNUM+0(SP), R4	; Restore fraction
+	MOVQ	BINNUM+8(SP), R6
+	ASHL	#16, BINEXP(SP), R1	; Step 1
+	BVS	ERROR_H			; Error if overflows
+	EXTZV	#0, #15, R4, R8		; Extract rounding bits
+	ROTL	#1, R8, R8		; Left adjust
+	EXTZV	#0, #15, R6, R0		; shift right 15 places
+	ASHQ	#-15, R4, R4
+	ASHQ	#-15, R6, R6
+	INSV	R0, #17, #15, R5
+	BICL	#^XFFFE0000, R7		; clear possibly shifted bits
+	ADDL	R1, R7			; Step 3
+	BVS	ERROR_H			; overflow if hidden bit bumps
+					; exponent too far
+	BBS	#V_DONTROUND, FLAG(SP), 15$	; round?
+	BBC	#15, R8, 15$		; round bit is zero
+	INCL	R4			; round
+	ADWC	#0, R5
+	ADWC	#0, R6
+	ADWC	#0, R7
+	BVS	ERROR_H			; Error?
+15$:	BBC	#V_EXT_BITS, FLAG(SP), 17$
+	MOVW	R8, @ext_bits(AP)
+17$:	BBC	#V_NEGATIVE, FLAG(SP), 20$	; Step 4
+	BBCS	#31, R7, 20$		; insert sign bit to 1
+20$:	MOVL	value(AP), R2		; R2 = reference to result
+	ROTL	#16, R7, (R2)+		; rotate and store result
+	ROTL	#16, R6, (R2)+
+	ROTL	#16, R5, (R2)+
+	ROTL	#16, R4, (R2)
+
+
+;
+; Success exit
+;
+
+EXIT:
+	MOVL	#1, R0			; R0 = success return code
+	RET				; return result in @value (AP)
+
+ERROR_H:
+	BRW	ERROR			; error return
+
+
+	.SBTTL	RGET - get next character
+
+;+
+; Subroutine RGET
+;	input:
+;		R0 = number of characters remaining in string
+;		R1 = address of current character
+;	output:
+;		R0 is decremented by 1.  If R0 is now non-positive,
+;		RGET returns immediately, indicating that the end
+;		of the string has been reached.
+;		If there is string remaining, R1 now points to the
+;		new current character, and R3 has that character.
+;
+;		If V_SKIPBLANKS is set in caller_flags, blanks are
+;		ignored, otherwise a blank is converted to '0'.
+;
+;		If V_SKIPTABS is set, tabs are ignored.
+;-
+
+RGET:
+	DECL	R0			; decrement length counter
+	BLEQ	20$			; If string empty, return
+	INCL	R1			; R1 points to new character
+	MOVZBL	(R1), R3		; R3 gets character
+	BBC	#V_SKIPTABS, FLAG+4(SP), 10$
+					; Not skipping tabs?
+					; FLAG is offset by 4 to allow
+					; for JSB to RGET.
+	CMPL	R3, #9			; Is it a tab?
+	BEQL	RGET			; Yes
+10$:	CMPL	R3, #^A/ /		; is character a blank?
+	BNEQ	20$			; return if not
+	BBS	#V_SKIPBLANKS, FLAG+4(SP), RGET
+					; if it is a blank, and
+					; V_SKIPBLANKS is set, ignore
+					; this character.  FLAG must
+					; be offset by 4 to adjust
+					; for the JSB to RGET.
+	MOVL	#^A/0/, R3		; set R3 to zero
+20$:	RSB				; return
+
+	.SBTTL	MUL10_R9  -  multiply FAC by 10 and add digit in R3
+
+;+
+; Subroutine MUL10_R9
+;	input:
+;	R4-R7 - FAC
+;	R9 - count of decimal digits currently held in FAC
+;	output:
+;	R4-R7 - FAC*10 + digit in R3
+;	R9 - updated count
+;-
+
+MUL10_R9:
+	AOBLEQ	#9, R9, M1		; If 9 or fewer digits, use M1.
+	CMPL	R9, #18			; If 18 or fewer digits,
+	BLEQ	M2			;  use M2.
+;+
+; Process entire octaword (four longwords), since there are > 18 digits.
+;-
+M4:	PUSHL	R0			; Free up a scratch register.
+	EXTZV	#31, #1, R5, R0		; Save bit that will be lost.
+	ASHQ	#1, R6, R6		; Multiply high part by 2.
+	ADDL	R0, R6			; Replace bit lost in shift.
+	ASHQ	#1, R4, R4		; Multiply low part by 2.
+	EXTZV	#30, #2, R5, R0		; Save bits that will be lost.
+	ASHQ	#2, R6, -(SP)		; Multiply high part by 4.
+	ADDL	R0, (SP)		; Replace bits lost in shift.
+	ASHQ	#2, R4, -(SP)		; Multiply low part by 4.
+	ADDL	(SP)+, R4		; Add 8*FAC to 2*FAC.
+	ADWC	(SP)+, R5		; ...
+	ADWC	(SP)+, R6		; ...
+	ADWC	(SP)+, R7		; ...
+	ADDL	R3, R4			; Add digit in R3.
+	BCC	20$			; If no carry, quit now.
+	ADWC	#0, R5			; ...
+	ADWC	#0, R6			; ...
+	ADWC	#0, R7			; ...
+20$:	MOVL	(SP)+, R0		; Restore scratch register.
+	RSB				; Return to caller.
+;+
+; Process two low-order longwords only, since there are <= 18 digits.
+;-
+M2:	ASHQ	#1, R4, R4		; Multiply R4:R5 by 2.
+	ASHQ	#2, R4, R6		; Multiply R4:R5 by 4.
+	ADDL	R6, R4			; Add 8*FAC to 2*FAC (low).
+	ADWC	R7, R5			; Add 8*FAC to 2*FAC (high).
+	ADDL	R3, R4			; Add digit in R3.
+	ADWC	#0, R5			; ...
+	CLRQ	R6			; Restore R6:R7.
+	RSB				; Return to caller.
+;+
+; Process low-order longword only, since there are 9 or fewer digits.
+;-
+M1:	MOVAL	(R4)[R4], R4		; Multiply R4 by 5.
+	MOVAW	(R3)[R4], R4		; Multiply R4 by 2 and add R3.
+	BNEQ	10$			; If nonzero, quit now.
+	CLRL	R9			; Reset digit count, since digit
+					;  was not significant.
+10$:	RSB				; Return to caller.
+
+	.END

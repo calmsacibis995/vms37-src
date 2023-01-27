@@ -1,0 +1,261 @@
+MODULE INIFCP (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This routine does the one time initialization for FCP.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines. This routine must be called
+!	in kernel mode.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  20-Dec-1976  16:30
+!
+! MODIFIED BY:
+!
+!	V02-001	ACG0245		Andrew C. Goldstein,	22-Dec-1981  20:35
+!		Add job controller mailbox
+!
+!	V02-000	ACG0167		Andrew C. Goldstein,	7-May-1980  18:50
+!		Previous revision history moved to F11A.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+! Dummy vectors to bracket the locked down code and data psects.
+!
+
+PSECT	OWN	= $LOCKEDC0$ (NOWRITE, EXECUTE, ALIGN (9));
+OWN	L_CODE_START	: VECTOR [0];
+
+PSECT	OWN	= $LOCKEDC9$ (NOWRITE, EXECUTE, ALIGN (2));
+OWN	L_CODE_END	: VECTOR [0];
+
+PSECT	OWN	= $LOCKEDD0$;
+OWN	L_DATA_START	: VECTOR [0];
+
+PSECT	OWN	= $LOCKEDD9$;
+OWN	L_DATA_END	: VECTOR [0];
+
+PSECT	OWN	= $LOCKEDD1$;
+
+GLOBAL ROUTINE INIT_FCP : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine does the one time initialization for FCP.
+!
+! CALLING SEQUENCE:
+!	INIT_FCP ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	system I/O data base
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	IO_CHANNEL: gets channel number of I/O channel
+!	QUEUE_HEAD: points to ACP queue block
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	FCP hooked up to system data base
+!
+!--
+
+BEGIN
+
+LITERAL
+	EXEC_MODE	= 1;		! exec mode
+
+LOCAL
+	SYSEXV		: VECTOR [2],	! place to save system exception vectors
+	MBX_CHANNEL,			! channel number of mailbox created
+	WORKING_SET,			! desired ACP working set
+	STATUS,				! system status return
+	AQB		: REF BBLOCK,	! pointer to scan AQB list
+	CCB		: REF BBLOCK;	! pointer to channel control block
+
+EXTERNAL
+	IO_CHANNEL,			! I/O channel number
+	DISK_UCB	: REF BBLOCK,	! UCB address of 'SYS$DISK'
+	QUEUE_HEAD	: REF BBLOCK,	! address of queue header
+	IOC$GL_AQBLIST	: REF BBLOCK ADDRESSING_MODE (ABSOLUTE),
+					! system AQB listhead
+	SCH$GL_CURPCB	: REF BBLOCK ADDRESSING_MODE (ABSOLUTE),
+					! address of our PCB
+	ACP$GW_WORKSET	: WORD ADDRESSING_MODE (ABSOLUTE),
+					! user specified ACP working set
+	ACP$GW_MAPCACHE	: WORD ADDRESSING_MODE (ABSOLUTE),
+					! storage map cache size
+	ACP$GW_HDRCACHE	: WORD ADDRESSING_MODE (ABSOLUTE),
+					! file header cache size
+	ACP$GW_DIRCACHE	: WORD ADDRESSING_MODE (ABSOLUTE),
+					! directory cache size
+	EXE$GL_FLAGS	: BITVECTOR ADDRESSING_MODE (ABSOLUTE);
+					! system flags vector
+
+EXTERNAL LITERAL
+	EXE$V_INIT	: UNSIGNED (6);	! bit position of FCP init flag
+
+EXTERNAL ROUTINE
+	GET_CCB,			! get CCB address of channel
+	INIT_POOL,			! initialize buffer pool
+	MAKE_JBCMAILBOX;		! create job controller mailbox
+
+
+! Clear the exec exception vectors to avoid interference
+! with FCP's error reporting logic.
+!
+
+$SETEXV (VECTOR = 0, ACMODE = EXEC_MODE, PRVHND = SYSEXV[0]); ! primary exec handler
+$SETEXV (VECTOR = 1, ACMODE = EXEC_MODE, PRVHND = SYSEXV[1]); ! secondary exec handler
+
+! If the previous handler addresses are found to be in process space,
+! restore them since they belong to the debugger.
+!
+
+IF .SYSEXV[0] GTR 0
+THEN $SETEXV (VECTOR = 0, ADDRES = .SYSEXV[0], ACMODE = EXEC_MODE); ! primary exec handler
+IF .SYSEXV[1] GTR 0
+THEN $SETEXV (VECTOR = 1, ADDRES = .SYSEXV[1], ACMODE = EXEC_MODE); ! secondary exec handler
+
+! Find the queue header for this ACP by searching the system AQB list
+! for an AQB with a matching PID. Then assign a channel to
+! 'SYS$DISK' (as good a device as any) and record the channel number.
+! Said channel number is used for all I/O - it is assigned to the
+! right device simply by stuffing the UCB pointer in the CCB.
+! Also save the UCB address in the channel so that it can be restored
+! to properly deassign the channel when we exit.
+!
+
+AQB = .IOC$GL_AQBLIST;
+UNTIL .AQB EQL 0 OR .AQB[AQB$L_ACPPID] EQL .SCH$GL_CURPCB[PCB$L_PID]
+DO AQB = .AQB[AQB$L_LINK];
+
+IF .AQB NEQ 0
+THEN QUEUE_HEAD = .AQB
+ELSE $EXIT (CODE = SS$_NOAQB);		! no queue header found - quit
+
+! Now adjust the working set. Get the working set size from the system
+! parameters if non-zero. Else, compute it from the buffer cache sizes.
+! This is done as follows: Add up the requested cache size. Add in the
+! buffer descriptor overhead. Add in 48 pages of FCP code and other overhead.
+! Add in additional charge for extra page tables.
+!
+
+WORKING_SET = .ACP$GW_WORKSET;
+IF .WORKING_SET EQL 0
+THEN
+    BEGIN
+    WORKING_SET = MAXU (4, .ACP$GW_MAPCACHE
+			 + .ACP$GW_HDRCACHE
+			 + .ACP$GW_DIRCACHE);
+    WORKING_SET = .WORKING_SET + (.WORKING_SET*161 + 4095) / 4096;
+    WORKING_SET = .WORKING_SET + 48;
+    WORKING_SET = .WORKING_SET + .WORKING_SET/128;
+    END;
+IF .AQB[AQB$B_ACPTYPE] EQL AQB$K_F11V2
+THEN WORKING_SET = .WORKING_SET + 6;	! allow extra space for structure level 2
+
+$ADJWSL (PAGCNT = -10000);		! adjust working set to minimum
+$ADJWSL (PAGCNT = .WORKING_SET);	! then add size desired
+
+! Now lock appropriate areas into the working set. These are code and data that
+! are used at raised IPL.
+!
+
+STATUS = $LKWSET (INADR = UPLIT (L_CODE_START, L_CODE_END));
+IF NOT .STATUS THEN $EXIT (CODE = .STATUS);
+
+STATUS = $LKWSET (INADR = UPLIT (L_DATA_START, L_DATA_END));
+IF NOT .STATUS THEN $EXIT (CODE = .STATUS);
+
+INIT_POOL ();
+
+IO_CHANNEL = 0;
+IF NOT $ASSIGN (DEVNAM = DESCRIPTOR ('SYS$SYSTEM'),
+		CHAN   = IO_CHANNEL,
+		ACMODE = EXEC_MODE)
+THEN BUG_CHECK (NOACPCHAN, FATAL, 'Failure to assign ACP channel');
+
+CCB = GET_CCB (.IO_CHANNEL);
+DISK_UCB = .CCB[CCB$L_UCB];
+
+! Create the mailbox for job controller responses.
+!
+
+MAKE_JBCMAILBOX ();
+
+! Finally set the FCP inited bit in the system flags word to indicate that
+! a file system now exists (significant only during system startup). If
+! this bit was clear, we are the first up, so also create the bad block
+! scanner mailbox. Also clear the transition bit in the AQB to tell
+! MOUNT that we are alive and well.
+!
+
+IF TESTBITCS (EXE$GL_FLAGS[EXE$V_INIT])
+THEN
+    BEGIN
+    $CREMBX (
+		CHAN   = MBX_CHANNEL,
+		MAXMSG = BBS$C_LENGTH,
+		BUFQUO = BBS$C_LENGTH * 100,
+		PROMSK = %X'FF0F',
+		ACMODE = EXEC_MODE,
+		LOGNAM = DESCRIPTOR ('ACP$BADBLOCK_MBX')
+	    );
+    END;
+
+QUEUE_HEAD[AQB$V_CREATING] = 0;
+
+END;					! end of routine INIT_FCP
+
+END
+ELUDOM

@@ -1,0 +1,636 @@
+	$BEGIN	RM1INPSCN,006,$RMS1,<SYS$INPUT $, $EOD, & $DECK ROUTINES>
+
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; Facility: rms32
+;
+; Abstract:
+;		this module performs end of file checking, as well as
+;		$deck processing for $get /$find on sys$input
+;		processing for the sequential file organization.
+;
+;
+; Environment:
+;		star processor running starlet exec.
+;
+; Author:	L F Laverdure,	 creation date: 29-JAN-1978
+;
+; Modified By:
+;
+;	V02-006 RAS0017		Ron Schaefer	21-Jul-1981
+;		Change buffer management so it can work with stream files.
+;		In particular, this routine only scans the current buffer,
+;		the caller must provide an adequate buffer size.
+;
+;	V005	REFORMAT	Ken Henderson	30-JUL-1980	6:24
+;		the code was reformatted
+;
+; Revision History:
+;
+;	L F Laverdure,   17-JUN-1978  20:57
+; 01	-
+;--
+;
+
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+
+;
+; Macros:
+;
+
+	$IRBDEF
+	$IFBDEF
+	$DEVDEF
+	$BDBDEF
+	$PIODEF
+	$RMSDEF
+
+;
+;  macro to call dcl_scan subroutine, setting up in-line argument list
+;  of match string and equality branch offset
+;
+
+	.MACRO	DCL_SCAN STR=,EQUAL=,DISP=B,?L
+	BSB'DISP	DCL_SCAN
+	.ASCIC	%STR%
+L:	.BYTE	EQUAL-L			; offset to "equals" routine
+	.ENDM	DCL_SCAN
+
+;
+; Equated Symbols:
+;
+
+	TAB	= 9			; horizontal tab
+	LOWERCASE_A	= 97		; lower case a
+	LOWERCASE_Z	= 122		; lower case z
+
+	EODSTR_MAXLEN	= 15		; max. len. of end-of-data scan string
+
+;
+;
+; Own Storage:
+;
+
+
+	.SBTTL	RM$INPUT_SCAN - CHECK SYS$INPUT FOR $, $EOD, OR $DECK RECORD
+
+;++
+; RM$INPUT_SCAN
+;
+;  rm$input_scan routine to check the current (non-terminal) record for
+;  matching the current sys$input end-of-data scan string.  this will be
+;  either a single '$' or some user-defined string.  if the record matches
+;  a user-defined string, cause this record to be skipped and return a
+;  single rms$_eof error (i.e., do not latch), allowing further reads to
+;  access subsequent records.
+;
+;  if matching a single '$', check if the pio$v_eod flag is on, specifying
+;  that only a match of '$eod' is to be scanned for.  if so, then proceed as
+;  for a match of a user-defined string above if the record contains $eod.
+;
+;  if not matching $eod, try for a match on $deck, and if so perform appropriate
+;  processing.  if the record is not $deck, (i.e., it is some other record
+;  beginning with a '$'), return rms$_eof  error and do not skip this record
+;  so that subsequent $gets or $finds by the user will also encounter this
+;  eof record.
+;
+;  if the record matches none of the above cases, simply return.  the record
+;  will be processed normally, that is, it will be gotten or found for the user.
+;
+; Input Parameters:
+;
+;	r11	impure area addr
+;	r10	ifab addr
+;	r9	irab addr
+;	r8	rab addr
+;	r7	addr of end of buffer+1
+;	r6	size of record in bytes
+;	r1	addr of record in the buffer
+;
+; Implicit Inputs:
+;
+;	the contents of the various structures.
+;	pio$gt_endstr	the current end-of-data scan string
+;	pio$v_eod	$eod flag
+;	note: if sys$input is from a disk file and records are allowed to
+;	      cross block boundaries, irb$b_mbc must be greater than 0,
+;	      otherwise the processing of a record crossing a block boundary
+;	      will cause rms to loop.  it is assumed that rm$connect1 has
+;	      forced mbc > 0.
+;
+;  (note: it has already been determined externally to this routine that
+;   this is the sys$input stream, indirectly accessed, on a non-terminal device.
+;
+; outputs:
+;
+;	r2-r5,ap	destroyed
+;	r0		status code
+;
+; Implicit Outputs:
+;
+;	irb$l_curbdb	may be cleared
+;	irb$v_find	set if record is to be skipped ($eod, user-defined
+;			eod, or $deck)
+;	irb$v_ppf_eof	set if $eod or user-defined eod.  after record is
+;			skipped, flags return of rms$_eof status.  in this
+;			case return status from rm$input_scan is rms$_suc.
+;	irb$v_ppf_skip	set if record is $deck.  causes next record to be
+;			processed after $deck record is skipped.
+;	irb$v_ppf_fndsv	saves original state of irb$v_find when irb$v_ppf_skip
+;			is set
+;
+; completion code:
+;
+;	standard rms (suc or eof), except that a special code of hex 10000 will be
+;	 returned in r0 to indicate that record to be matched was not entirely
+;	 contained within the buffer.  in this case the current bdb has been
+;	 released and the buffer need merely be refilled.
+;
+; Side Effects:
+;
+;	matching the eod string resets the eod string to a single '$'.
+;	$deck may set this to something else.
+;	invalid syntax on '$' records will cause a hard eof, which will cause
+;	the cli to process the offending record.
+;
+;--
+
+
+RM$INPUT_SCAN::
+
+;
+;  Assume entire record is contained in the buffer.
+;
+	PUSHL	R1			; save the current record offset
+
+;++
+;
+;  now try to match against end of data string
+;
+;--
+
+	MOVAB	@#PIO$GT_ENDSTR,R3	; get addr of end of data string
+	MOVZBL	(R3)+,R2		; get string length
+	CMPW	R6,R2			; is record at least this long?
+	BLSSU	SUCXIT			; no = no match
+	CMPC3	R2,(R1),(R3)		; eod string match?
+	BEQL	EOD_MATCH		; branch if yes
+
+;
+; no - simply return
+;
+
+SUCXIT:	RMSSUC
+SCNXIT:	POPR	#^M<R1>			; restore record address
+SCNRSB:	RSB
+
+
+;++
+;
+;  have matched the current end-of-data string
+;
+;  if matching a single '$', must check for $eod and $deck, else have
+;  matched a user-defined (via $deck) string and must skip it, giving
+;  a single eof error.
+;
+;--
+
+EOD_MATCH:
+	CMPW	@#PIO$GT_ENDSTR,#1+<^A/$/@8>; are we matching single '$'?
+	BNEQ	END_OF_DATA		; branch if not
+	SUBL3	#1,R6,R0		; set remaining byte count
+	DCL_SCAN	<EOD>,EQUAL=END_OF_DATA1; scan for 'eod'
+
+;
+; record not $eod
+;
+
+	BBS	#PIO$V_EOD,@#PIO$GW_STATUS,SUCXIT; branch if only matching '$eod'
+	DCL_SCAN	<DECK>,EQUAL=GOT_DECK; scan for 'deck'
+
+;++
+;
+;  have found a '$' record that is neither $eod nor $deck.
+;
+;  return rms$_eof and reset the nrp to find this record again.
+;
+;--
+
+SETEOF:	RMSERR	EOF
+	MOVQ	IRB$L_RP_VBN(R9),IRB$L_NRP_VBN(R9)
+	BRB	SCNXIT
+
+
+;++
+;
+;  have encounter user-defined end-of-data string
+;
+;  reset end-of-data scan string to match a single '$'
+;
+;--
+
+END_OF_DATA:
+	MOVW	#1+<^A/$/@8>,@#PIO$GT_ENDSTR
+	BRB	EOD1
+
+;++
+;
+;  have encounter $eod
+;
+;  clear irb$v_ppf_eod so that any '$' record will give eof error, and
+;  set irb$v_ppf_eof to cause eof to be returned after record has been skipped.
+;
+;--
+
+END_OF_DATA1:
+	BICB2	#1@PIO$V_EOD,@#PIO$GW_STATUS; clear eod flag
+	TSTL	R0			; any other tokens seen?
+	BNEQ	SETEOF			; branch if yes (error)
+EOD1:	SSB	#IRB$V_PPF_EOF,(R9)	; cause eof to be returned
+SET_FIND:
+	SSB	#IRB$V_FIND,(R9)	; set find bit to skip record
+SUC_BR:	BRB	SUCXIT
+
+
+;++
+;
+;  have found $deck
+;
+;  scan for /dollars qualifier
+;
+;--
+
+GOT_DECK:
+	DCL_SCAN  </DOLL>,EQUAL=GOT_DOLLARS ; scan for '/doll'
+	BNEQ	SETEOF			; branch if something other than
+
+;
+; '/doll' seen (error)
+;++
+;
+;  saw $deck, either with no qualifier or with /dollars and either a null or
+;  no argument.
+;
+;  in any case, set pio$v_eod to indicate '$eod' is the locical end-of-data string
+;
+;--
+;
+
+SETEOD:	BISB2	#1@PIO$V_EOD,@#PIO$GW_STATUS
+SET_SKIP:
+	SSB	#IRB$V_PPF_SKIP,(R9)	; set flag to skip $deck record
+
+;
+; and read the next
+;
+
+	BBC	#IRB$V_FIND,(R9),SET_FIND; branch if doing $get
+	BBCS	#IRB$V_PPF_FNDSV,(R9),SUC_BR; save find bit and branch
+
+
+;++
+;
+;  have found $deck /dollars
+;
+;  scan for end-of-data string value indicator ('=' or ':')
+;
+;--
+
+GOT_DOLLARS:
+	$PSECT_BR	L$RMS1GETPPF
+DCL_SCAN <:>,EQUAL=GOT_ARG,DISP=W	; scan for ':'
+	BEQL	SETEOD_BR		; branch if nothing else in record
+	DCL_SCAN	<=>,EQUAL=GOT_ARG,DISP=W; scan for '='
+SETEOF_BR:
+	BRW	SETEOF			; bad syntax - give eof error
+SETEOD_BR:
+	BRW	SETEOD			; extended branch
+
+;++
+;
+;  have found $deck /dollars :
+;
+;  scan for end-of-data string value
+;
+;--
+
+GOT_ARG:
+	DCL_SCAN	<">,EQUAL=GOT_QUOTE,DISP=W; scan for quoted string
+	BEQL	SETEOD_BR		; branch if nothing else
+
+;++
+;
+;  have an unquoted, non-null end-of-data string value described by r0,r1
+;
+;  copy characters to end of data string up to first blank, tab or "!",
+;  converting them to upper case.
+;
+;--
+
+	MOVL	#1,R2			; flag unquoted string value
+	BRB	UNQUOTED
+
+;++
+;
+;  have found $deck /dollars : "
+;
+;  scan for closing quote, moving characters to end of data string.
+;  process such that successive double quotes cause a single double quote
+;  to be entered into the end of data string.
+;
+;--
+
+GOT_QUOTE:
+	CLRL	R2			; flag quoted string
+UNQUOTED:
+	CLRL	R5			; build string count here
+	MOVAB	@#PIO$GT_ENDSTR,R4	; addr of eod string length
+	MOVAB	1(R4),R3		; addr of eod string text
+	BRB	20$			; go process characters
+10$:	MOVB	(R1)+,(R3)+		; copy char to eod string
+20$:	DECL	R0			; any more characters?
+	BLSS	60$			; branch if not
+	BLBS	R2,45$			; branch if unquoted string
+	CMPB	(R1),#^A/"/		; matching quote?
+	BEQL	50$			; branch if yes
+30$:	AOBLEQ	#EODSTR_MAXLEN,R5,10$	; count char. and branch if ok
+
+;++
+;
+;  exceeded max character count.  reset eod match string to single '$'.
+;
+;--
+
+40$:	MOVB	#^A/$/,1(R4)		; restore match string
+	BRB	SETEOF_BR		; go give error
+
+;++
+;
+;  unquoted string
+;
+;  move character to e-o-d string unless it's blank, tab, or "!"
+;  and convert to upper case.
+;
+;--
+
+45$:	CMPB	(R1),#^A/ /		; space?
+	BEQL	55$			; branch if yes
+	CMPB	(R1),#TAB		; tab?
+	BEQL	55$			; branch if yes
+	CMPB	(R1),#^A/!/		; "!"?
+	BEQL	55$			; branch if yes
+	CMPB	(R1),#LOWERCASE_A	; lower case char?
+	BLSSU	30$			; branch if not
+	CMPB	(R1),#LOWERCASE_Z	; well, is it?
+	BGTRU	30$			; branch if not
+	AOBLEQ	#EODSTR_MAXLEN,R5,48$	; count char. & branch if ok
+	BRB	40$			; go process eod length error
+48$:	SUBB3	#LOWERCASE_A-^A/A/,(R1)+,(R3)+; convert to upper case
+	BRB	20$			; go get next char.
+
+
+;++
+;
+;  found a double quote character while processing quoted string
+;
+;  check next char. for double quote and include only one if found
+;
+;--
+
+50$:	DECL	R0			; any more characters?
+	BLSS	60$			; branch if not
+	INCL	R1			; point to next char
+	CMPB	(R1),#^A/"/		; is it another " ?
+	BEQL	30$			; branch if yes
+
+;++
+;
+;  have completed string value, but remaining string is non-null.
+;
+;  give an error if anything other than blanks, tabs, or comment.
+;
+;--
+
+55$:	INCL	R0			; restore character count
+	BSBW	BLNK_SKIP		; skip blanks and tabs
+	BNEQ	40$			; branch if other than comment
+
+;++
+;
+;  end of data string set up o.k.
+;
+;  store length and go skip record.
+;
+;--
+
+60$:	TSTB	R5			; any chars processed?
+	BEQL	SETEOD_BR		; branch if none
+	MOVB	R5,(R4)			; store count
+	BRW	SET_SKIP		; go skip record
+	$PSECT_RESTORE
+
+	.SBTTL	DCL_SCAN SUBROUTINE
+
+;++
+;
+;  dcl_scan subroutine to scan for next token and compare it to one
+;  being searched for.  case is not significant for the compare.
+;  any initial blanks or tabs are skipped over.
+;
+;  if the strings match, the return is made to the address specified in the
+;  "equal" input argument, otherwise return is made in line.
+;  note that the dcl_scan macro is used to set up the in-line argument list
+;
+;  in the case of strings other than length 1, any characters following
+;  the matched characters and before the next terminator are considered
+;  to be part of the token and are also skipped in setting the remaining
+;  string descriptor, as are any trailing blanks or tabs.
+;
+;  inputs:
+;
+;	r0		remaining string length
+;	r1		remaining string start address
+;	(sp)		counted, upper-case string to match
+;	(sp)+count	branch byte offset for equal compare
+;
+;  outputs:
+;
+;	r0		length of remaining string (past token and possible
+;			trailing blanks if matched)
+;	r1		address of remaining string
+;	r2-r5,ap	destroyed
+;
+;  notes:
+;
+;	1. if no match, r0 & r1 will be updated to point past any initial
+;	   spaces and or tabs
+;	2. r0 will be set to 0 on return if no string or only a comment remains
+;	3. z-bit will be set based on r0
+;
+;--
+
+TRMLST:	.ASCII	\ !=:/\<TAB>
+	TLSTSZ=.-TRMLST
+
+DCL_SCAN:
+	MOVL	(SP),R5			; get addr of counted ascii
+
+;
+;  match string
+;
+
+	MOVZBL	(R5)+,R4		; get length of string
+
+;
+;  (r5 now points to string)
+;
+
+	ADDL2	R4,(SP)			; bump return address ...
+	INCL	(SP)			; ... to point past ascii string
+
+;++
+;
+;  skip initial spaces and tabs
+;
+;--
+
+	BSBB	BLNK_SKIP		; skip tabs and blanks
+	BEQL	NULL_STRING		; branch if nothing left
+
+;++
+;
+;  the string desribed by r0, r1 is of non-zero length and does not begin
+;  with tab, space, or "!"
+;
+;  see if it matches the scan string (described by r4 & r5)
+;
+;--
+
+	MOVQ	R0,R2			; save remaining len and addr
+	SUBL2	R4,R0			; at least match count long?
+	BLSS	NOMATCH			; branch if not
+	PUSHL	R4			; save match string count
+10$:	MOVB	(R1)+,AP		; get next byte
+	CMPB	AP,#LOWERCASE_A		; lower case?
+	BLSSU	20$			; branch if not
+	CMPB	AP,#LOWERCASE_Z		; well, is it?
+	BGTRU	20$			; branch if not
+	SUBB2	#LOWERCASE_A - <^A/A/>,AP; convert to upper case
+20$:	CMPB	AP,(R5)+		; match?
+	BNEQ	UNEQUAL			; branch if not
+	SOBGTR	R4,10$			; loop
+
+
+;++
+;
+;  strings are equal
+;
+;  if match count is not = 1, scan to end of token and then to start of next token
+;  (end of token is indicated by space, tab, !, /, =, or :)
+;
+;  in any case, take the "equal=" exit
+;
+;++
+;--
+
+	DECL	(SP)+			; was match count = 1?
+	BEQL	60$			; branch if yes
+	MOVQ	R0,R2			; save remaining descriptor
+	BRB	40$
+30$:	LOCC	(R3)+,#TLSTSZ,TRMLST	; is character a delimiter?
+	BNEQ	50$			; branch if yes
+40$:	SOBGEQ	R2,30$			; loop if more characters
+50$:	INCL	R2			; don't count terminator
+	DECL	R3			; or point past it
+	MOVQ	R2,R0			; descriptor to right regs
+	BSBB	BLNK_SKIP		; go skip tabs and blanks
+60$:	CVTBL	@(SP),R2		; pick up "equal" branch offset
+	ADDL2	R2,(SP)			; add in offset to return pc
+	BRB	SCAN_XIT
+
+;++
+;
+;  the input string didn't contain the match string
+;
+;  leave r0,r1 describing any remaining string and take in-line (non-equal) return
+;
+;--
+
+UNEQUAL:
+	TSTL	(SP)+			; pop saved match count
+NOMATCH:
+	MOVQ	R2,R0			; restore save descriptor
+NULL_STRING:
+	INCL	(SP)			; skip past "equal" return offset
+SCAN_XIT:
+	TSTL	R0			; set z bit according to r0
+	RSB
+
+
+;++
+;
+;  blnk_skip subroutine to skip past blanks and tabs, up to possible comment
+;  or end of input string
+;
+;  inputs:
+;
+;	r0	input string length
+;	r1	input string address
+;
+;  outputs:
+;
+;	r0	remaining string length after blanks and tabs skipped
+;		(if only a comment left, r0 will be set to zero)
+;	r1	remaining string address
+;	z-bit	set if no more input (other than comment), else clear
+;
+;--
+
+BLNK_SKIP:
+10$:	SKPC	#^A/ /,R0,(R1)		; skip spaces
+	BEQL	30$			; branch if nothing but spaces
+	CMPB	#TAB,(R1)		; is char tab?
+	BNEQ	20$			; branch if not (done)
+	DECL	R0			; yes - decrement count
+	INCL	R1			; skip tab
+	BRB	10$			; and continue skipping
+20$:	CMPB	#^A/!/,(R1)		; do we have a comment?
+	BNEQ	30$			; branch if not
+	CLRL	R0			; yes - say end of input
+30$:	RSB				; return with z-bit set if no
+
+;
+; more input
+;
+
+
+	.END

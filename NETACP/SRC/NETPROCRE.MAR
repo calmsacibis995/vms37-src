@@ -1,0 +1,929 @@
+	.TITLE	NETPROCRE - PROCESS CREATION
+	.IDENT	'V03-000'
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+
+;++
+; FACILITY:	NETWORK ACP
+;
+; ABSTRACT:
+;	THIS MODULE PERFORMS PROCESS CREATION FOR AN INBOUND CONNECT.
+;
+; ENVIRONMENT:
+;	MODE = KERNEL
+;--
+	.SBTTL	HISTORY
+; AUTHOR:	SCOTT G. DAVIS, CREATION DATE: 10-AUG-77
+;
+; MODIFIED BY:
+;
+;	V03-06	ADE0035		A.Eldridge	11-Feb-1982
+;		Move check for specific OBI proxy access state to allow objects
+;		not in the database and with an object number zero to use the
+;		proxy access specified for the TASK OBI.
+;
+;	V03-05	ADE0034		A.Eldridge	10-Feb-1982
+;		Return error (instead of bug_check) if call to $CREMBX fails.
+;
+;	V03-04	ADE0033		A.Eldridge	18-Jan-1981
+;		Fix bug in proxy login.  If the access control string received
+;		in the connect message is non-null then don't allow proxy 
+;		login.
+;
+;	V03-03	ADE0032		A.Eldridge	26-Dec-1981
+;		Allow maximum task name of 12 characters in NCB.
+;
+;	V03-02	ADE0031		A.Eldridge	18-Dec-1981
+;		Make sure that the NCB, the taskname, the process name, and
+;		the access control strings passed to LOGINOUT, are properly 
+;		uppercased.
+;
+;	V03-01	ADE0030		A.Eldridge	30-Nov-1981
+;		Added proxy login (access) support.
+;
+;	V03-00	ADE0029		A.Eldridge	01-Nov-1981
+;		General cleanup.
+;
+;	V02-17	TMH0017		Tim Halvorsen	04-Sep-1980
+;		Accept SYS$NET parameter as input to NET$STARTUP_OBJ.
+;
+;	V2			A.Eldridge	01-Jan-1980
+;		Rewritten for Phase III
+;---
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+	$ACCDEF
+	$AQBDEF
+	$DRDEF
+	$MSGDEF
+	$PRVDEF
+	$UCBDEF
+	$RCBDEF
+	$LTBDEF
+
+	$CNFDEF
+	$CNRDEF
+	$NFBDEF
+	$NMADEF
+	$XWBDEF
+
+	$WQEDEF
+
+	$NETSYMDEF
+	$NETUPDDEF
+;
+; MACROS:
+;
+
+;
+; EQUATED SYMBOLS:
+;
+STS_M_NOACNT	=   1@3			; Do not generate accounting records
+STS_M_NOAUTH	=   1@6			; use caller's privs/quotas at login
+STS_M_NETLOG	=   1@7			; bit no. for network login
+MBX_MSG_LTH =       150			; size of a mailbox message
+MAX_TASKNAM =        12			; Max size of taskname -- the name
+					; following teh "=" in the NCB
+
+	ASSUME NET$C_UTLBUFSIZ GT 500	; Utility buffer must hold
+					; the following (buffer offsets)
+ACC =   0				; Composite access strings
+PRC = 200				; Process name
+TSK = 300				; Image to run
+
+	ASSUME	MBX_MSG_LTH GE ACC$K_TERMLEN
+
+;
+; OWN STORAGE:
+;
+	.PSECT	NET_IMPURE,WRT,NOEXE,LONG
+
+		.ALIGN	LONG
+NET_L_R0:				;
+NET_L_FCT:	.LONG	0		; Function to pass to NETDRIVER
+NET_L_R1:				;
+NET_L_LPD:				; LPD of line which is starting
+NET_L_PID:	.LONG	0		; PID to pass to NETDRIVER
+NET_L_R2:				;
+NET_L_REASON:	.LONG	0		; Disconnect reason
+NET_L_R3:				;
+NET_L_LNK:	.LONG	0		; Link number
+NET_L_R4:				;
+NET_A_NCB:	.BLKA	1		; For saving address of NCB buffer
+NET_L_R5:				;
+NET_L_UCB:	.LONG	0		; UCB address to pass to NETDRIVER
+
+PTR_NCB_BUF:	.LONG	0		; Address of NCB buffer
+NET_Q_NCB:	.QUAD	0		; NCB descriptor
+NET_Q_PRC:	.QUAD	0		; Process descriptor
+NET_Q_TSK:	.QUAD	0		; Name of file to run 
+NET_Q_ACC:	.QUAD	0		; Descriptor for 3 account
+					; strings preceded by flags word
+
+DET_C_ACC = 5				; Buffer for access control strings
+DET_AB_ACC:	.WORD	0		; for creating detached, privileged
+		.BYTE	0		; processes.  It consists of a flags
+		.BYTE	0		; Word followed by 3 null counted
+		.BYTE	0		; strings.
+
+OBI_B_PRX:	.BYTE	0		; OBI proxy access state
+NDI_B_PRX:	.BYTE	0		; NDI proxy access state
+INT_B_PRX:	.BYTE	0		; Internal proxy access state.  This is
+					; set to "none" if any conditions are
+					; detected internally (other than the
+					; values stored in the OBI or NDI) 
+					; which would disallow proxy access
+;
+;   Fields used for termination mailbox creation, message buffering.  Be
+;!  careful when modifying since some code assumes data ordering without
+;!  using assumes.
+;
+		.ALIGN	LONG
+MBX_CHAN:	.BLKW	1		; Channel number of mailbox
+MBX_RDCNT:	.BLKW	1		; Number of reads posted to mailbox
+MBX_IOSB:				; I/O status block
+		.BLKW	1		;  -- status of i/o completion
+MBX_LEN:	.BLKW	1		;  -- length of operation here
+MBX_PID:	.BLKL	1		;  -- pid of process deleted
+EXIT_MSG:				; Buffer for mailbox message
+EXIT_ID:	.BLKW	1		;  -- message identification
+		.BLKW	1		;  -- not used
+NCB_DATA:				; On connect initiates
+EXIT_CODE:	.BLKL	1		;  status of message
+		.BLKB	MBX_MSG_LTH	; Leave room for message
+
+NET$GQ_WQE_MBX::			; MBX read element
+		.LONG	 .		; FLINK
+		.LONG	 .-4		; BLINK
+		.WORD	 WQE_MBX_LTH	; Length of entry
+		.BYTE	 NET$C_DYN_WQE	; Structure type
+		.BYTE	 WQE$C_SUB_MBX	; Sub-type is "MBX"
+		.ADDRESS MBX_ACTION 	; Action routine address
+		.LONG	 0		; AST parameter
+		.LONG	 0		; "In-use" flag
+WQE_MBX_LTH = .-NET$GQ_WQE_MBX
+;
+;  Buffer to get mailbox unit number for $CREPRC argument
+;
+BBUF:		.BLKL	3		; Device characteristics
+MBX_UNIT:	.BLKW	1		; Unit number for CREPRC argument
+ENDBUF:					; Truncate the rest !
+ZNABUF:		.BLKB	MAX_TASKNAM+8	; Buffer for building ZNA 
+					; the 8 includes 1 byte for the object
+					; number and 7 bytes of slop
+
+
+
+	.PSECT	NET_PURE,NOWRT,NOEXE,LONG
+
+
+NET_Q_NETPREFIX:.ASCID	"NET"		; Prefix for unnamed tasks
+NET_Q_TASKZNA:	.LONG	 5		; Length of TASK ZNA string
+		.ADDRESS TASKZNA	; Its pointer
+TASKZNA:	.BYTE 	 0		; Object type
+		.ASCII	"TASK"		; Object name
+EXIT_BUF:				; Descriptor for channel info
+		.LONG	ENDBUF-BBUF	; Length of buffer
+		.LONG	BBUF		; Address of buffer
+
+NET$GQ_MBX_NAME::
+		.ASCID	"NETACP$MBX"	; Logical name of mailbox
+		.EVEN
+NET_Q_IMAGE:
+		.ASCID	"SYS$SYSROOT:[SYSEXE]LOGINOUT"	; Login image
+
+	.PSECT	NET_CODE,NOWRT,LONG
+	.SBTTL	INITIALIZATION
+;++
+;
+; NET$CREATE_MBX	- Create mailbox
+;
+; *** TBS ***
+;
+;--
+NET$CREATE_MBX::
+	CLRW	W^MBX_RDCNT		; Init oustanding mailbox read
+					; count
+	$CREMBX_S -			;
+	    CHAN   = W^MBX_CHAN -	;
+	    MAXMSG = #MBX_MSG_LTH -	;
+	    BUFQUO = #<MBX_MSG_LTH*16> -;
+	    LOGNAM = W^NET$GQ_MBX_NAME -; mailbox's logical name
+	    PROMSK = #0			;
+	BLBC	R0,10$			; Br if error
+	$GETCHN_S -			; Get mailbox unit number
+	    CHAN   = W^MBX_CHAN,-	;
+	    PRIBUF = W^EXIT_BUF		;
+10$:	RSB				; Return status in R0
+
+
+;++
+; NET$KILL_MBX	- Deassign channel to mailbox causing its deletion
+;
+; *** TBS ***
+;
+;--
+NET$KILL_MBX::				; Delete channel to mailbox
+
+	$DASSGN_S  CHAN = W^MBX_CHAN	; do it
+	RSB
+
+;++
+;
+; NET$SET_MBX_AST - Process the NET channel's associated mbx AST
+;
+;--
+NET$SET_MBX_AST::
+	.WORD	^M<R2,R3,R4,R5>
+
+	MOVAB	W^NET$GQ_WQE_MBX,R0	; Get base of mailbox WQE
+	TSTL	WQE$L_PM2(R0)		; Is it active ?
+	BNEQ	10$			; If NEQ then active, there's a bug
+	MOVL	4(AP),WQE$L_PM1(R0)	; Get the AST parameter
+	MNEGL	#1,WQE$L_PM2(R0)	; Mark WQE busy
+	BSBW	WQE$INSQUE		; Queue the WQE
+	RET				; Done
+
+10$:	BUG_CHECK  NETNOSTATE,FATAL	; Signal the bug
+
+MBX_ACTION:				; Enter upon WQE dispatch
+	CLRL	WQE$L_PM2(R5)		; Mark WQE idle
+	CALLS	#0,B^NET$MBX_AST	; Call the mailbox processor
+	RSB
+;+
+;
+; NET$MBX_AST - THIS ROUTINE SERVICES PROCESS TERMINATIONS
+;		AND INBOUND CONNECT NOTIFICATIONS
+;
+;-
+NET$MBX_AST::	.WORD	0		; Entry point
+	CMPW	W^MBX_IOSB,S^#SS$_ABORT	; Was the i/o cancelled?
+	BEQL	5$			; If EQL yes
+	CMPW	W^MBX_IOSB,#SS$_CANCEL	; Try this code, too
+	BEQL	5$			; If NEQ proceed
+	BSBB	10$			; Dispatch
+	BSBW	NET$MBX_QIO		; Put out another read
+5$:	RET				; Done
+	;
+	;   Dispatch
+	;
+10$:	MOVL	W^NET$GL_NET_UCB,R6	; Point to our NET channel's UCB
+	MOVAB	W^EXIT_ID,R11		; Get address of mbx message
+	MOVL	(R11)+,R0		; Get message type, skip unit number
+	MOVZBL	(R11)+,R10		; Get device name count value
+	ADDL	R10,R11			; Get pointer to mbx "data"
+	$DISPATCH  TYPE=W,R0,-		; Dispatch on mailbox msg type
+	<-
+	  <MSG$_DELPROC,  30$>,-	   ; Process termination
+	  <MSG$_CONNECT,  20$>,-	   ; Inbound connect
+	  <MSG$_PATHLOST, NET$DRV_CANCEL>,-; I/O channel cancelled
+	>
+	RSB				; Ignore the message
+
+;
+;  Connect initiate message received
+;
+;
+;	The mailbox data consists of the address of the NETDRIVER update 
+;	routine and the address of the XWB. 
+;
+20$:	MOVL	4(R11),R6		; Get XWB address
+	BSBW	NET$DELIVER_CI		; Deliver the inbound connect to a user
+	RSB
+
+;
+;  Notify netdriver of process exit
+;
+30$:	MOVW	#NET$C_DR_NOBJ,W^NET_L_REASON	; Assume can't find .com file
+	CMPL	#RMS$_FNF,W^EXIT_CODE		; file-not-found?
+	BEQL	35$				; if EQL yes
+	MOVW	#NET$C_DR_EXIT,W^NET_L_REASON	; assume just an exit
+	TSTL	W^EXIT_CODE			; was it an access problem?
+	BGTR	35$				; if GTR no
+	MOVW	#NET$C_DR_ACCESS,W^NET_L_REASON ; say so
+35$:	MOVL	W^NET$GL_PTR_UCB0,W^NET_L_UCB	; Setup UCB pointer
+	MOVZWL	#NETUPD$_EXIT,W^NET_L_FCT	; Set exit 'fct' code
+	MOVL	W^MBX_PID,W^NET_L_PID		; PID of exiting process
+	CLRL	W^NET_L_LNK			; no local link address
+	BSBW	TELL_DRV			; Inform NETDRIVER
+	;
+	;   If exiting process was started to service a circuit then re-start
+	;   the circuit
+	;
+	MOVL	W^MBX_PID,R8			; Setup the PID address
+	BSBW	NET$DLL_PRC_EXIT		; Inform line (circuit) service
+	RSB
+
+;+
+; NET$CONNECT_FAIL - Notify NETDRIVER of failed logical link connection attempt
+;
+; FUNCTIONAL DESRCRIPTION:
+;
+; An attempt to confirm a logical link has failed.  Notify NETDRIVER so that
+; it can verify the user's access to the link and then notify the remote end of
+; the link that the link is being broken and why.
+;
+; INPUTS:	R3	Local logical link number (0 implies connect initiate)
+;		R2	Reason code to be sent in the disconnect message
+;		R1	User's PID
+;
+; OUTPUTS:	R5-R0	Clobbered
+;
+;		All other registers are preserved
+;
+;-
+NET$CONNECT_FAIL::				; A connect attempt has failed
+	MOVL	W^NET$GL_NET_UCB,W^NET_L_UCB	; Use the ACP's UCB
+	CLRL	W^NET_A_NCB			; No NCB
+	MOVZWL	R3,W^NET_L_LNK			; Specify link number
+	BEQL	10$				; If EQL then connect initiate
+	MOVL	R2,W^NET_L_REASON		; Specify disconnect reason
+	MOVL	R1,W^NET_L_PID			; Specify user's PID
+	MOVL	#NETUPD$_EXIT,W^NET_L_FCT	; Specity "process exit"
+	BSBW	TELL_DRV			; Notify NETDRIVER
+10$:	RSB
+;+
+; NET$MBX_QIO - This routine puts a read out on the mailbox for
+;		process termination and inbound connect notifications
+;-
+NET$MBX_QIO::					; Post read to mailbox
+	$QIO_S  CHAN	= W^MBX_CHAN,-
+		FUNC	= S^#IO$_READVBLK,-
+		EFN	= #NET$C_EFN_ASYN,-
+		ASTADR	= W^NET$SET_MBX_AST,-
+		IOSB	= W^MBX_IOSB,-
+		P1	= W^EXIT_MSG,-
+		P2	= #MBX_MSG_LTH
+	BLBS	R0,10$				; Br unless error
+	BUG_CHECK	ACPMBFAIL,FATAL		;!arrgh
+10$:	RSB					; return
+
+	.SBTTL	SEND PENDING CONNECTS TO DECLARED OBJECT
+;+
+; NET$SCAN_FOR_ZNA
+;
+; FUNCTIONAL DESCRIPTION
+;
+; This routine is called when a task name or object is declared by a user.
+; The function is to scan the XWB list for links in the Connect Initiate
+; state which are intended for the object with the specified ZNA and to build
+; a NCB which is given to NETDRIVER to be put in the declared name's mailbox.
+;
+; INPUTS:	R7,R8 = Descriptor of object ZNA being declared
+;
+; OUTPUTS:	None
+;
+;-
+NET$SCAN_FOR_ZNA::			; Find unclaimed XWBs which match ZNA
+	MOVQ	R7,R9			; Make copy of ZNA descriptor
+	MOVL	W^NET$GL_PTR_VCB,R6	; Get RCB pointer
+	MOVL	RCB$L_PTR_LTB(R6),R6	; Get LTB pointer
+	MOVAB	LTB$L_SLOTS+4(R6),R5	; Point to first XWB (skip slot 0)
+	;
+	;   We must lock out NETDRIVER while the table is being scanned to
+	;   ensure the integrity of the slot vector contents.  However, while
+	;   the XWB is being processed in "deliver_ci" the IPL must allow
+	;   paging (zero is actually the only safe IPL).  If NETDRIVER
+	;   deallocates the XWB while we're looking at no harm is done -- we
+	;   don't write into it and if the contents turn to garbage nothing
+	;   serious happens.
+	;
+5$:	DSBINT	B^NET_IPL		; Lock out NETDRIVER and prevent paging
+10$:	BLBS	(R5)+,10$		; If LBS then pointer is invalid
+	MOVL	-4(R5),R6		; Get the XWB address
+	BEQL	30$			; If EQL then done
+	CMPB	#XWB$C_STA_CIR,-	; In connect initiate state?
+		    XWB$B_STA(R6)	;
+	BNEQ	10$			; If NEQ then keep looking
+	ENBINT				; Allow interrupts
+	MOVAB	XWB$T_LPRNAM(R6),R1	; Setup for subroutine call
+	PUSHR	#^M<R5,R6,R9,R10>	; Save important regs
+	BSBW	GET_PR_ZNA		; Get ZNA string from LRPNAM
+	BLBC	R0,20$			; If LBC then field is not valid
+	CMPC5	R7,(R8),#0,R9,(R10)	; Are they the same?
+	BNEQ	20$			; If NEQ keep looking
+	BSBW	NET$DELIVER_CI		; Build NCB, pass to user in mailbox
+20$:	POPR	#^M<R5,R6,R9,R10>	; Restore regs
+	BRB	5$			; Keep looking
+30$:	ENBINT				; Restore IPL
+	RSB				; Done
+
+NET_IPL:.LONG	NET$C_IPL	
+
+
+	.SBTTL	Startup privileged process if needed
+;+
+; NET$STARTUP_OBJ - Start privileged process for object
+;
+; Startup a privileged object process if it is not already running.  This is
+; used to create EVL for event logging and NML for down-line loading or 
+; up-line dumping.
+;
+; Inputs:
+;
+;	R8    = Object number to start
+;	R2,R3 = Descriptor of string to be passed as SYS$NET to process
+;	R4,R5 = Descriptor of string to be used as process name
+;		If =0 then use the object's name as the process name
+;
+; Outputs:
+;
+;	R1   PID if process has been created
+;	R0   Status
+;
+;-
+NET$STARTUP_OBJ::			; Startup privileged process
+	PUSHR	#^M<R7,R8,R9,R10,R11>	; Save registers
+	MOVQ	R2,W^NET_Q_NCB		; Store descriptor of SYS$NET string
+	MOVL	W^NET$GL_CNR_OBI,R11	; Point to OBI database
+	CLRL	R10			; and start at beginning of list
+	$SEARCH	eql,obi,l,num		; Search for specified object
+	CLRL	R1			; Clear PID
+	BLBC	R0,2$			; Skip if not defined as object
+	;
+	;  If object has already declared itself, then it is running
+	;
+	$GETFLD	obi,l,ucb		; If UCB NE 0, it has declared itself
+	BLBS	R0,2$			; If declared, then its already running
+	;
+	;  If not, get the access control string and process name
+	;
+	$GETFLD	obi,s,sfi		; Get the process file name
+	BLBS	R0,5$			; Skip if specified
+2$:	BRW	80$			; Return with status in R0
+5$:	MOVQ	R7,W^NET_Q_TSK		; Save the descriptor
+	MOVQ	R4,W^NET_Q_PRC		; Setup process name
+	BNEQ	10$			; If NEQ then name is non-null
+	$GETFLD	obi,s,nam		; Else get object name
+	MOVQ	R7,W^NET_Q_PRC		; Use as process name
+10$:	MOVL	#DET_C_ACC,W^NET_Q_ACC	; Setup descriptor of access control
+	MOVAB	DET_AB_ACC,W^NET_Q_ACC+4; data used for create detached,
+					; privileged processes.
+	;
+	;  Start the process with privileges
+	;
+	$CREPRC_S	-		; create a process
+	    INPUT  = W^NET_Q_TSK,-	; Network .COM filename
+	    OUTPUT = W^NET_Q_ACC,-	; Network access control string
+	    ERROR  = W^NET_Q_NCB,-	; SYS$NET logical name string
+	    PRCNAM = W^NET_Q_PRC,-	; Process name
+	    IMAGE  = W^NET_Q_IMAGE,-	; Image (LOGINOUT) to run first
+	    PIDADR = W^NET_L_PID,-	; Place to store process id
+	    MBXUNT = W^MBX_UNIT,-	; MBX for termination
+	    BASPRI = G^SYS$GB_DEFPRI,-	; Priority
+	    UIC    = #<^O1@16+^O4>,-	; UIC is [1,4]
+	    STSFLG = <#STS_M_NETLOG!-	; Network login parameters (IN,OUT,ERR)
+		       STS_M_NOAUTH!-	; Use caller's privs/quotas/etc.
+		       STS_M_NOACNT>	; Do not add any accounting records
+	BLBC	R0,80$			; If LBC then failed
+	MOVL	W^NET_L_PID,R1		; Return the PID
+80$:	POPR	#^M<R7,R8,R9,R10,R11>	; Restore registers
+	RSB
+
+
+	.SBTTL	Process and Deliver Inbound Connect to a User
+;++
+; NET$DELIVER_CI - Process inbound connect and deliver it to a user
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; A non-zero destination object number indicates that NETACP must fetch the 
+; name of the .COM file from the OBJ block - using 'SYS$SYSROOT:[SYSEXE]' as
+; the default directory.  A zero destination object number indicates that the 
+; .COM file name is the same as the destination taskname - the default login 
+; directory account is assumed to contain the taskname.COM. 
+;	\update this to include tasks with a file i.d.\;!
+;
+; If the incoming USER,PSW,ACCT strings are all null, then the default 
+; inbound access control for the specified object (or task) are used (these
+; strings may also be null).  This allows a DECnet-VAX node to serve as a 
+; convenient host particularly for RSX-11S. 
+;
+; This routines determines whether the connect is to be handed to a task
+; which has declared a name or an object type.
+;
+; INPUT PARAMETERS:
+;
+;	R6 - Address of XWB image
+;
+; OUTPUT PARAMETERS:
+;
+;	All registers are clobbered
+;
+; SIDE EFFECTS:
+;
+;	Process created, image started
+;
+;--
+NET$DELIVER_CI:
+	BSBW	NET$GETUTLBUF			; Gain access to utility buffer
+	MOVL	NET$GL_PTR_VCB,R0		; Point to RCB
+	CLRL	W^PTR_NCB_BUF			; No NCB buffer yet
+	MOVB	RCB$B_ECL_DPX(R0),W^NDI_B_PRX	; Set default NDI proxy access
+	MOVB	RCB$B_ECL_DPX(R0),W^OBI_B_PRX	; Set default OBI proxy access
+	MOVB	#NMA$C_ACES_BOTH, W^INT_B_PRX	; Set default internal proxy
+						; access state
+	;
+	;   Initialize parameters for call to NETDRIVER
+	;
+	MOVZWL	XWB$W_LOCLNK(R6),W^NET_L_LNK	; Setup logical link address
+	MOVZBL	#NETUPD$_ABORT,  W^NET_L_FCT	; Assume process couldn't start
+	MOVL	W^NET$GL_NET_UCB,W^NET_L_UCB	; Default is our UCB
+	CLRL			 W^NET_L_PID	; No PID yet
+	CLRL			 W^NET_A_NCB	; No NCB yet
+	;
+	;    Initialize descriptors and data for process creation
+	;
+	MOVAB	W^NET$AB_UTLBUF+ACC,R3		; Get ACC address
+	MOVL	R3,W^NET_Q_ACC+4		; Store it
+	MNEGL	R3,W^NET_Q_ACC			; Bias ACC size
+	MOVAB	W^NET$AB_UTLBUF+PRC,R3		; Get PRC address
+	MOVL	R3,W^NET_Q_PRC+4		; Store it
+	MNEGL	R3,W^NET_Q_PRC			; Bias PRC size
+	MOVAB	W^NET$AB_UTLBUF+TSK,R3		; Get TSK address
+	MOVL	R3,W^NET_Q_TSK+4		; Store it
+	MNEGL	R3,W^NET_Q_TSK			; Bias TSK size
+
+	MOVZWL	#NET$C_MAX_NCB+13,R1		; Length of buffer for an NCB
+	BSBW	NET$ALONPAGED			; Allocate the buffer
+	BLBS	R0,5$				; If LBS then block allocated
+	;
+	;   Tell NETDRIVER about resource error
+	;
+	MOVZBL	#NET$C_DR_RSU,W^NET_L_REASON	; Reason is "resource error"
+	MOVL	W^NET$GL_PTR_VCB,R0		; Get RCB pointer
+	BUMP	W,RCB$W_CNT_XRE(R0)		; Account for resource error
+	BRB	10$				; Continue
+	;
+	;  Build the NCB and pass locate the process to accept it 
+	;
+5$:	MOVL	R2,W^PTR_NCB_BUF		; Save for deallocation
+	MOVAB	13(R2),R3			; Get address of string, leave
+						; room for count and buf header
+	MOVL	R3,W^NET_Q_NCB+4		; Store it
+	MNEGL	R3,W^NET_Q_NCB			; Bias NCB size
+	BSBB	BUILD_NCB			; Build the NCB
+	BLBC	R0,10$				; If LBC then error
+	CMPL	W^NET_Q_NCB,#NET$C_MAX_NCB	; Make sure we didn't write
+						; past end of buffer
+	ASSUME	NET$C_MAX_NCB  LE  255		; Must allow counted string fmt
+	MOVL	W^NET_Q_NCB+4,R0		; Get ptr to NCB
+	MOVB	W^NET_Q_NCB,-(R0)		; Enter count field and 
+	MOVL	R0,W^NET_A_NCB			; save its address in case NCB
+						; is to be passed to NETDRIVER
+						; for a declared name
+	BSBW	GET_PROC			; Find/create process to
+						; receive the connect
+10$:	BSBW	TELL_DRV			; Tell driver about connect
+	MOVL	W^PTR_NCB_BUF,R0		; Address of buffer
+	BSBW	NET$DEALLOCATE			; Deallocate the buffer
+	RSB
+
+BUILD_NCB:				; Build the NCB
+	;
+	;    Enter 'nodename::'
+	;
+	MOVL	W^NET_Q_NCB+4,R3	; Get output buffer pointer
+	MOVL	W^NET$GL_CNR_NDI,R11	; Get root for search
+	CLRL	R10			; Indicate no NDI yet
+	MOVZWL	XWB$W_REMNOD(R6),R8	; Get remote node address
+	$SEARCH	eql,ndi,l,tad		; Find NDI with matching address
+	BLBC	R0,10$			; If LBC none, use node address
+	$GETFLD	ndi,l,prx		; Get proxy login state
+	BLBC	R0,5$			; If LBC then none specified
+	MOVB	R8,W^NDI_B_PRX		; Store it
+5$:	$GETFLD	ndi,s,nna		; Get the node name
+	BLBC	R0,10$			; Invalid if LBC
+	TSTB	R7			; Is name null ?
+	BEQL	10$			; If EQL use node address
+	;
+	;    Enter ASCII nodename
+	;
+	MOVC3	R7,(R8),(R3)		; Move node name
+	BRB	20$
+	;
+	;    Enter node address converted to ASCII
+	;
+10$:	MOVZWL	XWB$W_REMNOD(R6),R0	; Get node address
+	BSBW	NET$BIN2ASC		; Move after conversion to ASCII
+20$:	MOVW	#^A'::',(R3)+		; Move delimiter
+	;
+	;    Enter taskname
+	;
+	MOVB	#^A'"',(R3)+		; Enter delimiter
+	MOVZBL	XWB$T_RPRNAM+1(R6),R0	; Get object number
+	BEQL	30$			; If EQL then use taskname
+	BSBW	NET$BIN2ASC		; Else convert to ASCII and move
+	MOVB	#^A'=',(R3)+		; Enter delimiter
+	BRB	50$			; Continue
+	;
+	;    Enter 0=taskname
+	;
+30$:	MOVW	#^A'0=',(R3)+		; Enter 0=
+	MOVAB	XWB$T_RPRNAM(R6),R1	; Point to process name field
+	PUSHL	R3			; Save pointer
+	BSBW	GET_PR_NAM		; Move the name text
+	POPL	R3			; Recover pointer
+	BLBC	R0,60$			; If LBC then illegal name format
+	MOVC3	R7,(R8),(R3)		; Enter taskname
+	; 
+	;    Enter remainder of NCB
+	;
+50$:	MOVB	#^A'/',(R3)+		; Enter delimiter
+	MOVW	W^NET_L_LNK,(R3)+	; Enter local link number
+	MOVAB	XWB$B_DATA(R6),R1	; Get address of counted data
+	MOVZBL	(R1),R0			; Get its length
+	INCW	R0			; Include its count field
+	MOVC5	R0,(R1),#0,#17,(R3)	; Enter into fixed size field
+	MOVAB	XWB$B_LPRNAM(R6),R1	; Address local task specifier 
+	MOVZBL	(R1)+,R0		; Get its length
+	MOVC3	R0,(R1),(R3)		; Move it
+	MOVB	#^A'"',(R3)+		; Enter terminator
+	ADDL	R3,W^NET_Q_NCB		; Update size in descriptor
+	MOVB	#1,R0			; Indicate success
+60$:	RSB
+
+;
+;  Find the OBI block associated with the local object.  If the OBI is
+;  for a declared name or object then pass the NCB to the declaring
+;  process's mailbox, otherwise create a process to receive the connect.
+;
+GET_PROC:				; Get process to accept the connect
+	MOVL	W^NET$GL_CNR_OBI,R11	; Set up OBI CNR
+	MOVAB	XWB$T_LPRNAM(R6),R1	; Address local task specifier
+	BSBW	GET_PR_ZNA		; Get its ZNA field
+	BLBC	R0,10$			; If LBC then format error
+	;
+	;
+	;   Find the OBI CNF
+	;
+	;
+	MOVZWL	#NET$C_DR_NOBJ,-	; Assume failure due to unknown object
+		    W^NET_L_REASON	;
+	CLRL	R10			; Indicate no current CNF
+	$SEARCH	eql,obi,s,zna		; Find OBI block with this CNF
+	BLBS	R0,20$			; If LBS then CNF was found
+	TSTB	(R8)			; Is this a numbered object connect ?
+	BNEQ	10$			; If NEQ then no such object
+	MOVQ	W^NET_Q_TASKZNA,R7	; Else use default TASK  ZNA descriptor
+	MOVZBL	S^#NFB$C_OP_EQL,R1	; Specify match operator
+	CLRL	R10			; Start from head of list
+	BSBW	CNF$KEY_SEARCH		; Look for the CNF
+	BLBS	R0,25$			; If LBS then found, br to continue
+10$:	BRW	100$			; Complete with error
+	;
+	;
+	;   The OBI CNF has been found.  See if the object has been "declared"
+	;   If not, build the .COM file file i.d. and setup its descriptor.
+	;
+	;
+20$:	$GETFLD	obi,l,ucb		; Get the associated UCB
+	BLBC	R0,30$			; If LBC then not declared name
+	MOVL	R8,W^NET_L_UCB		; Save the UCB pointer
+	$GETFLD	obi,l,pid		; Get the declarer's PID
+	BLBC	R0,30$			; If LBC then treat as undeclared
+	MOVL	R8,W^NET_L_PID		; Save the PID
+	MOVZBL	#NETUPD$_CONNECT,-	; Setup the function code
+		    W^NET_L_FCT		;
+	BRW	100$			; Return to pass NCB to mailbox
+	;
+	;
+	;   Build .COM filename spec for image activation
+	;
+	;
+25$:	MOVAB	XWB$T_LPRNAM(R6),R1	; Address local task specifier
+	BSBW	GET_PR_NAM		; Get its name
+	MOVC3	R7,(R8),@W^NET_Q_TSK+4	; Move the name
+	ADDL	R3,W^NET_Q_TSK		; Update filename size
+	BRB	40$			; Continue
+30$:	MOVZWL	#NET$C_DR_NOBJ,-	; Assume error
+		    W^NET_L_REASON	;
+	$GETFLD	obi,s,sfi		; Get parsed file id
+	BLBC	R0,55$			; If LBC then file id is invalid
+	MOVQ	R7,W^NET_Q_TSK		; Update filename descriptor
+	;
+	;
+	;   Not a declared name/object.  Create a process name.
+	;
+	;
+	$GETFLD	obi,s,nam		; Get object name for prefix
+	BLBS	R0,50$			; If LBS then name was found
+40$:	MOVQ	NET_Q_NETPREFIX,R7	; Setup standard prefix descriptor
+50$:	MOVC3	R7,(R8),@W^NET_Q_PRC+4	; Move the prefix
+	MOVB	#^A'_',(R3)+		; Move the delimiter
+	MOVL	W^NET_L_LNK,R0		; Get the local link number
+	BSBW	NET$BIN2ASC		; Convert to ascii and append as
+					; the suffix
+	ADDL	R3,W^NET_Q_PRC		; Done with process name
+	;
+	;
+	;   If no access control was specified, use default from OBI block
+	;
+	;
+	$GETFLD	obi,l,prx		; Get proxy login state
+	BLBC	R0,52$			; If LBC then none specified
+	MOVB	R8,W^OBI_B_PRX		; Store it
+52$:	MOVAB	XWB$B_LOGIN(R6),R8	; Get address of access info
+	MOVZBL	(R8)+,R7		; Get total size
+	CMPB	R7,#3			; Is it 3 null (counted) strings
+	BEQL	60$			; If so use access info in OBI
+	MOVB	#NMA$C_ACES_NONE,-	; Disallow proxy access
+		    W^INT_B_PRX		; Store it
+	CMPB	R7,#NET$C_MAXACCFLD*3	; Too long ?
+	BLEQU	70$			; If LEQU then move the strings
+	MOVZWL	#NET$C_DR_IMLONG,-	; Indicate network failure type
+		    W^NET_L_REASON	;
+55$:	BRW	100$			; Continue
+					;
+60$:	$GETFLD	obi,s,iac		; Get inbound access control
+70$:	;
+	;
+	;   Enter the flags word followed by the access control strings
+	;
+	;
+	MOVL	W^NET_Q_ACC+4,R3	; Get pointer to access control buffer
+	CLRW	(R3)+			; Clear the flags word
+	$DISPATCH  TYPE=B,W^INT_B_PRX -	; Don't set flag if proxy disallowed
+	<-
+	  <NMA$C_ACES_OUTG, 80$>-
+	  <NMA$C_ACES_NONE, 80$>-
+	>
+	$DISPATCH  TYPE=B,W^NDI_B_PRX -	; Don't set flag if proxy disallowed
+	<-
+	  <NMA$C_ACES_OUTG, 80$>-
+	  <NMA$C_ACES_NONE, 80$>-
+	>
+	$DISPATCH  TYPE=B,W^OBI_B_PRX -	; Don't set flag if proxy disallowed
+	<-
+	  <NMA$C_ACES_OUTG, 80$>-
+	  <NMA$C_ACES_NONE, 80$>-
+	>
+	BISW	#1,-2(R3)		; Say "proxy login allowed"
+80$:	MOVC3	R7,(R8),(R3)		; Move access control strings,
+					; even if it's null
+	ADDL	R3,W^NET_Q_ACC		; Complete string size calc.
+	;
+	;
+	;   Create the user process
+	;
+	BSBW	UP_CASE			; Up-case all pertinent strings
+	$CREPRC_S	-		; create a process
+	    INPUT=  W^NET_Q_TSK,-	; Network .COM filename
+	    OUTPUT= W^NET_Q_ACC,-	; Access control strings
+	    ERROR=  W^NET_Q_NCB,-	; NCB descriptor
+	    PRCNAM= W^NET_Q_PRC,-	; Process name
+	    IMAGE=  W^NET_Q_IMAGE,-	; Image (LOGINOUT) to run first
+	    PIDADR= W^NET_L_PID,-	; Place to store process id
+	    BASPRI= L^SYS$GB_DEFPRI,-	; Priority
+	    UIC=    #<^O10@16+^O40>,-	; UIC is [10,40]
+	    STSFLG= #<STS_M_NETLOG>,-	; This is a network process
+	    MBXUNT= W^MBX_UNIT		; MBX for termination
+					; notification
+	BLBS	R0,90$			; If LBS process was created
+	MOVZWL	#NET$C_DR_RSU,-		; Assume because couldn't get 
+		W^NET_L_REASON		; the resources
+	BRB	100$			; Take common exit
+90$:	MOVZWL	#NETUPD$_PROCRE,-	; Say "process created"
+		    W^NET_L_FCT		;
+100$:	RSB				; Common exit
+
+		.ENABL	LSB
+GET_PR_NAM:				; Get process name
+	MOVAB	W^ZNABUF,R8		; Setup buffer pointer
+	MOVL	R8,R3			; Make a copy
+	BRB	5$			; Continue	
+GET_PR_ZNA:
+	MOVAB	W^ZNABUF,R8		; Point to ZNA buffer
+	MOVL	R8,R3			; Make a copy
+	MOVB	1(R1),(R3)+		; Enter object type
+5$:	CVTWB	(R1)+,R0    		; Get format type, skip over object type
+	BNEQ	20$			; If NEQ then not numbered object
+10$:	TSTB	-1(R1)			; Is object type zero ?
+	BEQL	40$			; If EQL then error
+	BRB	60$			; Else we're done
+20$:	TSTB	-1(R1)			; Is object type zero ?
+	BNEQ	40$			; If NEQ then error
+	CMPB	#1,R0			; Format type 1 is a counted string
+	BEQL	30$			; If EQL then go move the string
+	CMPB	#2,R0			; Format type 2 is UIC + counted string
+	BNEQ	40$			; If NEQ then format type is unknown
+	TSTL	(R1)+			; Skip over UIC
+30$:	MOVZBL	(R1)+,R0		; Get taskname string size
+	BEQL	40$			; If EQL then illegal format
+	CMPB	R0,#MAX_TASKNAM		; Is it within bounds?
+	BLEQU	50$			; If LEQU then legal format
+40$:	CLRL	R0			; Else, indicate error
+	MOVZWL	#NET$C_DR_FMT,-		; Setup network failure code
+		    W^NET_L_REASON	;
+	BRB	70$			; Take common exit
+50$:	MOVC3	R0,(R1),(R3)		; Enter string
+60$:	SUBL3	R8,R3,R7		; Get string size
+	MOVL	#1,R0			; Indicate success
+70$:	RSB
+
+		.DSABL	LSB
+
+
+;++
+; TELL_DRV
+;
+; *** TBS ***
+;--
+TELL_DRV:				; Tell driver about process
+	MOVQ	W^NET_L_R0,R0		; Get regs for call
+	MOVQ	W^NET_L_R2,R2		;
+	MOVQ	W^NET_L_R4,R4		;
+	JSB	@W^NET$GL_PTR_ACR	; Call driver
+	RSB
+
+
+;+
+; UP_CASE	-  Up-case the strings passed to LOGINOUT
+;
+; The NCB (up to the "/"), the access control strings, the taskname, and the
+; process name are up-cased in place.
+;
+; INPUTS:	none
+;
+; OUTPUTS:	none
+;
+;		All register contents are preserved.
+;
+;-
+UP_CASE:				; Up-case strings passed to LOGINOUT
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save regs
+	MOVAB	NET$AB_UPASCNUM,R5	; Get translation table
+	MOVB	#^A'/',R4		; Setup terminator
+	MOVAB	W^NET_Q_NCB,R3		; Point to NCB descriptor
+	BSBB	UP_IT			; Up-case it in place
+	CLRL	R4			; Say "no terminator"
+	MOVAB	W^NET_Q_TSK,R3		; Point to task-name descriptor
+	BSBB	UP_IT			; Up-case it in place
+	MOVAB	W^NET_Q_PRC,R3		; Point to process-name descriptor
+	BSBB	UP_IT			; Up-case it in place
+	MOVAB	W^NET_Q_ACC,R3		; Get access control descriptor
+	MOVL	4(R3),R1		; Get pointer to strings
+	ADDL	#2,R1			; Skip over flags word
+	MOVZBL	(R1)+,R2		; Get count of bytes in username
+	BSBB	UP_CASE_LOOP		; Start at end of loop
+	MOVZBL	(R1)+,R2		; Get count of bytes in password
+	BSBB	UP_CASE_LOOP		; Start at end of loop
+	MOVZBL	(R1)+,R2		; Get count of bytes in account name
+	BSBB	UP_CASE_LOOP		; Start at end of loop
+	ADDL3	(R3),4(R3),-(SP)	; Get address of end of strings
+	CMPL	R1,(SP)+		; Have we gone too far?
+	BGTRU	10$			; If GTRU then yes
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore regs
+	RSB		
+
+
+10$:	BUG_CHECK  NETNOSTATE,FATAL	; Access control strings setup
+					; incorrectly
+
+
+		.ENABL	LSB
+
+UP_IT:	MOVZWL	(R3),R2			; Get string length
+	MOVL	4(R3),R1		; Point to string
+	BRB	UP_CASE_LOOP		; Start at end of loop
+20$:	MOVB	(R1)+,R0		; Get next character
+	CMPB	R0,R4			; Is it the terminator?
+	BEQL	60$			; If EQL yes, we're done
+	MOVB	(R5)[R0],R0		; Up-case it
+	BEQL	UP_CASE_LOOP		; If EQL then not alpha-numeric
+	MOVB	R0,-1(R1)		; Store up-cased value
+
+UP_CASE_LOOP:
+	SOBGEQ	R2,20$			; Loop for each character
+60$:	RSB				; Done
+
+		.DSABL	LSB
+
+
+.END

@@ -1,0 +1,1470 @@
+MODULE RDBLOK (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This module contains routines for basic block I/O, as well
+!	as the buffer management mechanism.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  13-Dec-1976  22:48
+!
+! MODIFIED BY:
+!
+!	V02-011	ACG0262		Andrew C. Goldstein,	4-Feb-1982  15:12
+!		Fix buffer invalidation in moving to bad block cache
+!
+!	V02-010	ACG43264	Andrew C. Goldstein,	12-Jan-1982  13:38
+!		Invalidate BITMAP_BUFFER on storage map write error
+!
+!	V02-009	ACG0233		Andrew C. Goldstein,	4-Dec-1981  16:53
+!		Fix handling of $EXPREG failure
+!
+!	V02-008	ACG0173		Andrew C. Goldstein,	14-May-1980  11:17
+!		Ensure that all dirty buffers are flushed on dismount
+!
+!	V02-007	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:27
+!		Previous revision history moved to F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	INIT_POOL	: NOVALUE,	! initialize the buffer pool
+	FIND_BUFFER,			! find an appropriate I/O buffer
+	READ_BLOCK,			! read a block
+	RESET_LBN	: NOVALUE,	! assign new LBN to a buffer
+	WRITE_BLOCK	: NOVALUE,	! write a block
+	CREATE_BLOCK,			! fabricate a buffer
+	MARK_DIRTY	: NOVALUE,	! mark buffer for write-back
+	INVALIDATE	: NOVALUE,	! invalidate a buffer
+	WRITE_HEADER	: NOVALUE,	! write file header
+	FLUSH_BUFFERS	: NOVALUE,	! flush all dirty buffers
+	FLUSH_FID	: NOVALUE,	! flush a file from the pool
+	SAVE_BAD_BLOCK	: NOVALUE,	! save bad block in the error cache
+	SET_SEC_CHAN,			! reassign secondary I/O channel
+	BUMP_BAD_COUNT;			! adjust volume pending error count
+
+!++
+!
+! Buffer pool data base.
+!
+! The root of the buffer data base is the pool vector which is used to index
+! a block type into the buffer pool used for that type. The buffer pools are
+! managed by 3 vectors, indexed by the pool code. The first vector contains
+! the buffer index of the first buffer assigned to each pool. The second
+! vector contains the number of buffers in each pool. The third vector 
+! contains the listheads for the LRU list of each pool.
+! 
+! The buffers themselves are a block vector. Each buffer is identified by
+! its address to the outside world, and internally by its vector index
+! (the two are interchangeable in the obvious manner.) Associated with the
+! buffers are status vectors: the UCB address of the currently resident
+! block (0 if none), the LBN of the currently resident block, the LRU list
+! entry, the file ID to which the block belongs, the file with which the
+! block is associated, the dirty bit, the newly modified bit, and the
+! error bit.
+!
+! In addition to the above set of buffer pools, there is a separate pool
+! which is used to cache write-back errors. When a write error occurrs
+! due to a cache replacement, and the block does not belong to the current
+! function, it is moved to the error cache and no error is reported. A
+! read of that block will move it to the main cache again. Since pending
+! write errors are counted and deferred write is turned off while there
+! are any, the interested party will be informed of the error when he next
+! attempts to modify it. The error cache has only a partial set of descriptors,
+! and they are stored apart from the main set to improve locality of use.
+!
+!--
+
+
+! Define the layout of the buffer pool. The pool descriptors are filled in
+! by the pool initialization code. Note that each pool must consist of one
+! virtually contiguous area. Note also that the storage map buffers are
+! allocated first. This causes the buffer sweep at the end of each operation
+! to write out the storage map blocks first, resulting in maximum safety.
+!
+
+LITERAL
+	POOL_COUNT	= 3;		! number of pools
+
+MACRO
+	LRU_FLINK	= 0,0,32,0%,	! LRU entry forward link
+	LRU_BLINK	= 4,0,32,0%;	! LRU entry back link
+
+! Buffer pool vector
+!
+
+BIND
+	POOL_TABLE	= UPLIT BYTE (	2,	! file headers
+					0,	! storage map
+					1,	! directories
+					2,	! index file blocks
+					1,	! random data blocks
+					1	! quota file blocks
+			) : VECTOR [,BYTE];
+
+! Base index of each buffer pool
+!
+
+OWN
+	POOL_BASE	: VECTOR [POOL_COUNT, WORD];
+
+! Number of buffers in each pool
+!
+
+OWN
+	POOL_SIZE	: VECTOR [POOL_COUNT, WORD];
+
+! LRU list head for each pool
+!
+
+OWN
+	POOL_LRU	: BLOCKVECTOR [POOL_COUNT, 8, BYTE];
+
+! Pointers to buffer descriptor vectors. The vectors are dynamically allocated
+! at initialization time.
+!
+
+OWN
+	BUFFER_LRU	: REF BLOCKVECTOR [, 8, BYTE],
+	BUFFER_FID	: REF VECTOR,
+	BUFFER_FIL	: REF VECTOR,
+	BUFFER_LBN	: REF VECTOR,
+	BUFFER_UCB	: REF VECTOR,
+	BUFFER_DIRTY	: REF BITVECTOR,
+	BUFFER_BAD	: REF BITVECTOR,
+
+	BADBLOCK_LBN	: REF VECTOR,
+	BADBLOCK_UCB	: REF VECTOR;
+
+GLOBAL
+	BUFFER_NEW	: REF BITVECTOR,
+	BUFFER_COUNT;
+
+! Pointer to the I/O buffers.
+!
+
+STRUCTURE
+	BUFVECTOR [I; N] =
+	[N*512]
+	(BUFVECTOR + I*512)<0, 32>;
+
+OWN
+	BUFFERS		: REF BUFVECTOR,
+
+	BADBLOCKS	: REF BUFVECTOR,
+	BADBLOCK_COUNT,
+	BADBLOCK_USED,
+	BADBLOCK_MAX;
+
+GLOBAL ROUTINE INIT_POOL : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine initializes the buffer pool. It creates sufficient
+!	virtual space for the desired size buffer pool and sets up the
+!	descriptors.
+!
+! CALLING SEQUENCE:
+!	INIT_POOL ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	pool descriptor vectors
+!	ACP$GW_MAPCACHE: number of bitmap buffers to allocate
+!	ACP$GW_HDRCACHE: number of header buffers to allocate
+!	ACP$GW_DIRCACHE: number of directory buffers to allocate
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	pool initialized
+!
+!--
+
+BEGIN
+
+LITERAL
+	EXEC_MODE	= 1;		! code for EXEC access mode
+
+LOCAL
+	MAP_COUNT,			! number of map buffers
+	HDR_COUNT,			! number of header buffers
+	DIR_COUNT,			! number of directory buffers
+	BUFFER_SIZE,			! number of buffers in pool
+	BADBLOCK_SIZE,			! number of buffers in error cache
+	SIZE_NEEDED,			! total virtual space needed
+	PAGE_COUNT,			! space actually obtained
+	SPACE_DESC	: VECTOR [2];	! descriptor of retun from $EXPREG
+
+EXTERNAL
+	ACP$GW_MAPCACHE	: WORD ADDRESSING_MODE (ABSOLUTE),
+					! number of map buffers to use
+	ACP$GW_HDRCACHE	: WORD ADDRESSING_MODE (ABSOLUTE),
+					! number of header buffers to use
+	ACP$GW_DIRCACHE	: WORD ADDRESSING_MODE (ABSOLUTE);
+					! number of directory buffers to use
+
+! Compute the total virtual space needed and create it. The space needed is
+! the total number of buffers plus the descriptor space - 195 bits per buffer.
+!
+
+MAP_COUNT = MAXU (1, .ACP$GW_MAPCACHE);
+HDR_COUNT = MAXU (2, .ACP$GW_HDRCACHE);
+DIR_COUNT = MAXU (2, .ACP$GW_DIRCACHE);
+BUFFER_SIZE = .MAP_COUNT + .HDR_COUNT + .DIR_COUNT;
+BADBLOCK_SIZE = .BUFFER_SIZE * 4;
+SIZE_NEEDED = .BUFFER_SIZE + .BADBLOCK_SIZE
+	    + (.BUFFER_SIZE*195 + 4095) / 4096
+	    + (.BADBLOCK_SIZE*64 + 4095) / 4096;
+
+$EXPREG (PAGCNT = .SIZE_NEEDED, ACMODE = EXEC_MODE, RETADR = SPACE_DESC);
+
+! Compute the space we actually got and make sure it is at least the minimum.
+! If it is less then we asked for, divide it up in the ratio 2:1:5.
+!
+
+PAGE_COUNT = (.SPACE_DESC[1] - .SPACE_DESC[0]) / 512 + 1;
+IF .PAGE_COUNT LSSU 6
+THEN $EXIT (CODE = SS$_INSFMEM);
+
+IF .PAGE_COUNT LSSU .SIZE_NEEDED
+THEN
+    BEGIN
+    BADBLOCK_SIZE = 0;
+    BUFFER_SIZE = (.PAGE_COUNT*4096) / (4096+195);
+    MAP_COUNT = MAXU (.BUFFER_SIZE/8, 1);
+    HDR_COUNT = .MAP_COUNT * 2;
+    DIR_COUNT = .BUFFER_SIZE - (.MAP_COUNT + .HDR_COUNT);
+    END;
+
+! Allocate and set up the pointers for the buffer descriptors and the buffers
+! themselves.
+!
+
+BUFFER_LRU = .SPACE_DESC[0];
+BUFFER_FID = .BUFFER_LRU + .BUFFER_SIZE*8;
+BUFFER_FIL = .BUFFER_FID + .BUFFER_SIZE*4;
+BUFFER_LBN = .BUFFER_FIL + .BUFFER_SIZE*4;
+BUFFER_UCB = .BUFFER_LBN + .BUFFER_SIZE*4;
+BUFFER_DIRTY = .BUFFER_UCB + .BUFFER_SIZE*4;
+BUFFER_NEW = .BUFFER_DIRTY + (.BUFFER_SIZE+7)/8;
+BUFFER_BAD = .BUFFER_NEW + (.BUFFER_SIZE+7)/8;
+BUFFERS = .BUFFER_BAD + (.BUFFER_SIZE+7)/8 + 511 AND NOT 511;
+
+BADBLOCK_COUNT = .BADBLOCK_SIZE;
+IF .BADBLOCK_COUNT NEQ 0
+THEN
+    BEGIN
+    BADBLOCK_LBN = .BUFFERS + .BUFFER_SIZE*512;
+    BADBLOCK_UCB = .BADBLOCK_LBN + .BADBLOCK_SIZE*4;
+    BADBLOCKS = .BADBLOCK_UCB + .BADBLOCK_SIZE*4 + 511 AND NOT 511;
+    END;
+
+POOL_SIZE[0] = .MAP_COUNT;
+POOL_SIZE[1] = .DIR_COUNT;
+POOL_SIZE[2] = .HDR_COUNT;
+POOL_BASE[0] = 0;
+POOL_BASE[1] = .MAP_COUNT;
+POOL_BASE[2] = .MAP_COUNT + .DIR_COUNT;
+BUFFER_COUNT = .BUFFER_SIZE;
+
+! Loop for all pools. First init the LRU list head to be empty. Then loop
+! for all buffers in each pool, linking each buffer into the pool LRU listhead.
+!
+
+INCR POOL FROM 0 TO POOL_COUNT-1 DO
+    BEGIN
+    POOL_LRU[.POOL, LRU_FLINK] = POOL_LRU[.POOL, LRU_FLINK];
+    POOL_LRU[.POOL, LRU_BLINK] = POOL_LRU[.POOL, LRU_FLINK];
+
+    INCR I FROM 0 TO .POOL_SIZE[.POOL]-1 DO
+	INSQUE (BUFFER_LRU[.POOL_BASE[.POOL]+.I, LRU_FLINK],
+		.POOL_LRU[.POOL, LRU_BLINK]);
+    END;
+
+END;					! end of routine INIT_POOL
+
+ROUTINE FIND_BUFFER (LBN, TYPE, COUNT, FOUND_COUNT) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine searches for a buffer suitable for the indicated
+!	block(s). It looks first for a buffer containing that block; failing
+!	that, it finds free buffers or frees them.
+!
+! CALLING SEQUENCE:
+!	FIND_BUFFER (ARG1, ARG2, ARG3, ARG4)
+!
+! INPUT PARAMETERS:
+!	ARG1: LBN of first desired block
+!	ARG2: type code of buffer
+!	ARG3: length of buffer desired in blocks
+!
+! IMPLICIT INPUTS:
+!	CURRENT_UCB: UCB of device in use
+!	DIR_FCB: FCB of directory file
+!
+! OUTPUT PARAMETERS:
+!	ARG4: number of blocks of buffer reserved
+!
+! IMPLICIT OUTPUTS:
+!	BUFFER_LBN: (of returned buffer(s)) LBN of block
+!	BUFFER_UCB: (of returned buffer(s)) CURRENT_UCB if block was resident,
+!		zero if new buffer
+!
+! ROUTINE VALUE:
+!	index of first buffer found
+!
+! SIDE EFFECTS:
+!	LRU list relinked, buffers may be written
+!
+!--
+
+BEGIN
+
+LOCAL
+	I,				! index of found buffer
+	K,				! index to error cache entry
+	N,				! number of found buffers
+	POOL,				! index of pool to use
+	NEXT_LBN,			! next higher LBN in pool
+	LRU_ENTRY	: REF BLOCK;	! pointer to buffer LRU entry
+
+EXTERNAL
+	CURRENT_UCB	: REF BBLOCK,	! UCB of current device
+	CURRENT_VCB	: REF BBLOCK,	! VCB of current device
+	CURRENT_RVT	: REF BBLOCK,	! RVT (or UCB) of current voluem set
+	CURRENT_FIB	: REF BBLOCK,	! address of FIB of current operation
+	CURRENT_RVN,			! RVN of current volume
+	PMS_TOT_CACHE,			! cumulative count of buffer cache hits
+	DIR_FCB		: REF BBLOCK,	! directory FCB
+	ACP$GB_MAXREAD	: BYTE ADDRESSING_MODE (ABSOLUTE);
+					! maximum number of blocks to read
+
+
+! First search the indicated buffer pool for a buffer containing the
+! desired LBN and UCB. Also track the LBN of the next highest block in the
+! cache. Note that we assume that block type classes are
+! nonintersecting sets, and thus avoid having the same block show up in
+! multiple pools by good behavior in the file system.
+!
+
+IF .TYPE GTRU QUOTA_TYPE
+THEN BUG_CHECK (BADBUFTYP, FATAL, 'Bad ACP buffer type code');
+POOL = .POOL_TABLE[.TYPE];
+NEXT_LBN = -1;
+
+I = (
+    INCR J FROM .POOL_BASE[.POOL] TO .POOL_BASE[.POOL] + .POOL_SIZE[.POOL] - 1
+    DO
+    IF .BUFFER_UCB[.J] EQL .CURRENT_RVT
+    AND .(BUFFER_FID[.J])<16,8> EQL .CURRENT_RVN
+    THEN
+	BEGIN
+	IF  .BUFFER_LBN[.J] GEQU .LBN
+	AND .BUFFER_LBN[.J] LSSU .NEXT_LBN
+	THEN NEXT_LBN = .BUFFER_LBN[.J];
+
+	IF .BUFFER_LBN[.J] EQL .LBN
+	THEN EXITLOOP .J
+	END
+    );
+
+! If we found a block, pull the buffer out of the LRU and count a cache hit.
+! Link the buffer onto the end of the LRU list to indicate recent use.
+! On a cache hit, we always return exactly one block.
+!
+
+IF .I NEQ -1
+THEN
+    BEGIN
+    REMQUE (BUFFER_LRU[.I, LRU_FLINK], LRU_ENTRY);
+    INSQUE (.LRU_ENTRY, .POOL_LRU[.POOL, LRU_BLINK]);
+    PMS_TOT_CACHE = .PMS_TOT_CACHE + 1;
+    .FOUND_COUNT = 1;
+    END
+
+! The desired block has not been found in the cache. Search the portion
+! of the error cache that is in use for the block.
+!
+
+ELSE
+    BEGIN
+    K =
+	BEGIN
+	INCR J FROM 0 TO .BADBLOCK_MAX-1
+	DO
+	    IF  .BADBLOCK_LBN[.J] EQL .LBN
+	    AND .BADBLOCK_UCB[.J] EQL .CURRENT_UCB
+	    THEN EXITLOOP .J
+	END;
+
+! Get the first buffer on the LRU. If multiple buffers are requested,
+! grab additional buffers in ascending memory order until we hit the end of the
+! pool. Stop if we hit a block that is already in the cache (recorded by
+! NEXT_LBN). If we still need more, get them in descending memory order. Then
+! loop for all found buffers, relinking them onto the LRU in ascending
+! order and writing them if they are dirty.
+!
+
+    I = (.POOL_LRU[.POOL, LRU_FLINK] - BUFFER_LRU[0, LRU_FLINK]) / 8;
+
+    N = .COUNT;
+    IF .N GTRU .ACP$GB_MAXREAD
+    THEN N = .ACP$GB_MAXREAD;
+    IF .NEXT_LBN NEQ -1
+    AND .NEXT_LBN - .LBN LEQU .N
+    THEN N = .NEXT_LBN - .LBN;
+    IF .K NEQ -1
+    THEN N = 1;
+
+    IF .POOL_SIZE[.POOL] + .POOL_BASE[.POOL] - .I LSS .N
+    THEN
+	BEGIN
+	IF .POOL_SIZE[.POOL] LEQ .N
+	THEN
+	    BEGIN
+	    I = .POOL_BASE[.POOL];
+	    N = .POOL_SIZE[.POOL];
+	    END
+	ELSE
+	    I = .POOL_SIZE[.POOL] + .POOL_BASE[.POOL] - .N;
+	END;
+    .FOUND_COUNT = .N;
+
+   DECR J FROM .N-1 TO 0
+    DO
+	BEGIN
+	REMQUE (BUFFER_LRU[.I+.J, LRU_FLINK], LRU_ENTRY);
+	INSQUE (.LRU_ENTRY, .POOL_LRU[.POOL, LRU_BLINK]);
+
+	IF .BUFFER_DIRTY[.I+.J]
+	THEN WRITE_BLOCK (BUFFERS[.I+.J]);
+
+	IF .BUFFER_BAD[.I+.J]
+	THEN SAVE_BAD_BLOCK (.I+.J);
+
+	BUFFER_NEW[.I+.J] = 1;
+	BUFFER_UCB[.I+.J] = 0;
+	BUFFER_LBN[.I+.J] = .LBN + .J;
+	BUFFER_FIL[.I+.J] = .CURRENT_FIB[FIB$W_FID_NUM]
+			  + .CURRENT_FIB[FIB$W_FID_RVN]^16;
+
+	CASE .TYPE FROM 0 TO 5 OF
+	SET
+	[INDEX_TYPE, HEADER_TYPE]:  BUFFER_FID[.I+.J] = 1 + .CURRENT_RVN^16;
+	[BITMAP_TYPE]:		    BUFFER_FID[.I+.J] = 2 + .CURRENT_RVN^16;
+	[DIRECTORY_TYPE]:	    BUFFER_FID[.I+.J] = .DIR_FCB[FCB$W_FID_NUM]
+				    + .DIR_FCB[FCB$W_FID_RVN]^16;
+	[DATA_TYPE]:		    BUFFER_FID[.I+.J] = .CURRENT_FIB[FIB$W_FID_NUM]
+				    + .CURRENT_FIB[FIB$W_FID_RVN]^16;
+	[QUOTA_TYPE]:		    BUFFER_FID[.I+.J] = .BBLOCK [.CURRENT_VCB[VCB$L_QUOTAFCB], FCB$W_FID_NUM]
+				    + .BBLOCK [.CURRENT_VCB[VCB$L_QUOTAFCB], FCB$W_FID_RVN]^16;
+	[OUTRANGE]:	(BUG_CHECK (BADBUFTYP, FATAL, 'Bad ACP buffer type code'); 0);
+	TES;
+	END;
+
+! If we found the block in the error cache, copy it to the buffer and remove
+! it from the cache. Mark the buffer bad.
+!
+
+    IF .K NEQ -1
+    THEN
+	BEGIN
+	BUFFER_UCB[.I] = .CURRENT_RVT;
+	BUFFER_DIRTY[.I] = 1;
+	BUFFER_BAD[.I] = 1;
+	CH$MOVE (512, BADBLOCKS[.K], BUFFERS[.I]);
+
+	BADBLOCK_UCB[.K] = 0;
+	BADBLOCK_USED = .BADBLOCK_USED - 1;
+	IF .K GEQU .BADBLOCK_MAX-1
+	THEN
+	    BEGIN
+	    BADBLOCK_MAX = 0;
+	    INCR J FROM 1 TO .K
+	    DO
+		IF .BADBLOCK_UCB[.J-1] NEQ 0
+		THEN BADBLOCK_MAX = .J;
+	    END;
+	END;
+
+    END;				! end of cache lookup conditional
+
+RETURN .I;
+
+END;					! end of routine FIND_BUFFER
+
+GLOBAL ROUTINE READ_BLOCK (LBN, COUNT, TYPE) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads the desired block(s) from the disk.
+!	Blocks are categorized by type to aid buffer management.
+!	Note that the caller assumes only one block is ever read; multiple
+!	blocks read ahead are acquired through cache hits on subsequent calls.
+!
+! CALLING SEQUENCE:
+!	READ_BLOCK (ARG1, ARG2, ARG3)
+!
+! INPUT PARAMETERS:
+!	ARG1: LBN of block(s)
+!	ARG2: number of blocks to read
+!	ARG3: block type code
+!
+! IMPLICIT INPUTS:
+!	CURRENT_RVT: RVT or UCB of current volume set
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	IO_STATUS receives status of I/O transfer
+!
+! ROUTINE VALUE:
+!	address of buffer containing block
+!
+! SIDE EFFECTS:
+!	BLOCK READ
+!
+!--
+
+BEGIN
+
+LOCAL
+	I,				! index of buffer used
+	STATUS,				! QIO service status
+	FOUND_COUNT;			! count of buffers gotten
+
+EXTERNAL
+	PMS_TOT_READ,			! cumulative count of disk reads
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	IO_CHANNEL,			! channel number for all I/O
+	CURRENT_RVT	: REF BBLOCK,	! RVT of current volume
+	IO_STATUS	: VECTOR [,WORD], ! common I/O status block
+	ACP$GB_DATACHK	: BITVECTOR ADDRESSING_MODE (ABSOLUTE);
+					! ACP datacheck enable flags
+
+EXTERNAL LITERAL
+	ACP$V_READCHK	: UNSIGNED (6);	! read check enable flag
+
+
+! Find a suitable block buffer. If it does not already contain the block,
+! read it.
+!
+
+I = FIND_BUFFER (.LBN, .TYPE, .COUNT, FOUND_COUNT);
+
+IF .BUFFER_UCB[.I] EQL 0
+THEN
+    BEGIN
+    PMS_TOT_READ = .PMS_TOT_READ + 1;
+    STATUS = $QIOW (
+		EFN   = EFN,
+		CHAN  = .IO_CHANNEL,
+		FUNC  = (IO$_READLBLK
+			 OR .ACP$GB_DATACHK[ACP$V_READCHK]
+			 ^ $BITPOSITION (IO$V_DATACHECK)),
+		IOSB  = IO_STATUS,
+		P1    = BUFFERS[.I],
+		P2    = .FOUND_COUNT*512,
+		P3    = .LBN
+		);
+    IF NOT .STATUS THEN IO_STATUS = .STATUS;
+    IF NOT .IO_STATUS
+    THEN
+	BEGIN
+	INCR J FROM 0 TO .FOUND_COUNT-1
+	DO
+	    INVALIDATE (BUFFERS[.I+.J]);
+	ERR_EXIT (.IO_STATUS[0]);
+	END;
+    INCR J FROM 0 TO .FOUND_COUNT - 1
+    DO
+	BUFFER_UCB[.I+.J] = .CURRENT_RVT;
+    END;
+
+RETURN BUFFERS[.I];
+
+END;					! end of routine READ_BLOCK
+
+GLOBAL ROUTINE RESET_LBN (BUFFER, LBN) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine changes the resident LBN of the indicated block.
+!
+! CALLING SEQUENCE:
+!	RESET_LBN (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of block buffer
+!	ARG2: new LBN
+!
+! IMPLICIT INPUTS:
+!	buffer descriptor arrays
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	backing LBN for buffer altered
+!
+!--
+
+BEGIN
+
+LOCAL
+	I;				! index of buffer
+
+
+! Compute the buffer index from the buffer address supplied. Set the
+! buffer dirty bit and store the new LBN.
+!
+
+IF .BUFFER LSSU BUFFERS[0] OR .BUFFER GEQU BUFFERS[.BUFFER_COUNT]
+THEN BUG_CHECK (BADBUFADR, FATAL, 'ACP buffer address out of range of buffer pool');
+
+I = (.BUFFER - BUFFERS[0]) / 512;
+BUFFER_DIRTY[.I] = 1;
+BUFFER_NEW[.I] = 1;
+
+BUFFER_LBN[.I] = .LBN;
+
+END;					! end of routine RESET_LBN
+
+GLOBAL ROUTINE WRITE_BLOCK (BUFFER) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine writes the indicated block back to the disk.
+!
+! CALLING SEQUENCE:
+!	WRITE_BLOCK (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of block buffer
+!
+! IMPLICIT INPUTS:
+!	BUFFER DESCRIPTOR ARRAYS
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	block written
+!
+!--
+
+BEGIN
+
+LOCAL
+	UCB		: REF BBLOCK,	! UCB of device to write
+	CHANNEL,			! channel number to use
+	STATUS,				! service status of QIO call
+	I;				! index of buffer
+
+EXTERNAL
+	PMS_TOT_WRITE,			! cumulative count of disk writes
+	CURRENT_UCB	: REF BBLOCK,	! UCB of volume in process
+	PREV_UCB	: REF BBLOCK,	! UCB of previous volume
+	IO_CHANNEL,			! channel number for I/O
+	PREV_CHANNEL,			! number of secondary channel
+	IO_STATUS	: VECTOR [,WORD], ! status block for all I/O
+	ACP$GB_DATACHK	: BITVECTOR ADDRESSING_MODE (ABSOLUTE);
+					! ACP datacheck enable flags
+
+EXTERNAL LITERAL
+	ACP$V_WRITECHK	: UNSIGNED (6);	! write check enable flag
+
+EXTERNAL ROUTINE
+	LOCK_VOLUME;			! set volume allocation lock
+
+
+! Compute the buffer index from the buffer address supplied. Clear the
+! buffer dirty bit and make sure the buffer UCB address corresponds to the
+! current UCB.
+!
+
+IF .BUFFER LSSU BUFFERS[0] OR .BUFFER GEQU BUFFERS[.BUFFER_COUNT]
+THEN BUG_CHECK (BADBUFADR, FATAL, 'ACP buffer address out of range of buffer pool');
+
+I = (.BUFFER - BUFFERS[0]) / 512;
+BUFFER_DIRTY[.I] = 0;
+
+! Find out which channel to use: if the primary is, use it. If not, reassign
+! the secondary if necessary.
+!
+
+UCB = .BUFFER_UCB[.I];
+IF .UCB NEQ 0
+AND .(BUFFER_FID[.I])<16,8> NEQ 0
+THEN UCB = .VECTOR [UCB[RVT$L_UCBLST], .(BUFFER_FID[.I])<16,8>-1];
+IF .UCB EQL 0
+THEN BUG_CHECK (WRTINVBUF, FATAL, 'Holding dirty buffer of unmounted volume');
+
+CHANNEL = .IO_CHANNEL;
+IF .UCB NEQ .CURRENT_UCB
+THEN
+    BEGIN
+    CHANNEL = .PREV_CHANNEL;
+    IF .UCB NEQ .PREV_UCB
+    THEN KERNEL_CALL (SET_SEC_CHAN, .UCB);
+    END;
+
+PMS_TOT_WRITE = .PMS_TOT_WRITE + 1;
+STATUS = $QIOW (
+		EFN  = EFN,
+		CHAN = .CHANNEL,
+		FUNC = (IO$_WRITELBLK
+			 OR .ACP$GB_DATACHK[ACP$V_WRITECHK]
+			 ^ $BITPOSITION (IO$V_DATACHECK)),
+		IOSB = IO_STATUS,
+		P1   = BUFFERS[.I],
+		P2   = 512,
+		P3   = .BUFFER_LBN[.I]
+		);
+
+! If a write error occurrs, the action taken depends upon whether this block
+! was modified by the current caller or someone else. If it was someone else,
+! it is being written due to cache replacement. We cannot report this error
+! to the current user, so the block is copied to the error cache, where it
+! will be held until its "owner" attempts to write it again.
+!
+
+IF NOT .STATUS THEN IO_STATUS = .STATUS;
+IF NOT .IO_STATUS
+THEN
+    BEGIN
+
+    IF NOT .BUFFER_NEW[.I]
+    THEN
+	BEGIN
+	SAVE_BAD_BLOCK (.I);
+	INVALIDATE (.BUFFER);
+	END
+
+! If the buffer does belong to the current caller, we bomb out. The error
+! clean up will iterate on write failures if the volume is write locked until
+! the best effort clean up has been done. However, if the write error was on the
+! storage bitmap, we allocation lock the volume to prevent further damage.
+!
+
+    ELSE
+	BEGIN
+	IF .I LSSU .POOL_SIZE[0]
+	THEN KERNEL_CALL (LOCK_VOLUME, FIB$C_LOCK_VOL);
+	INVALIDATE (.BUFFER);
+	ERR_EXIT (.IO_STATUS[0]);
+	END;
+    END;
+
+END;					! end of routine WRITE_BLOCK
+
+GLOBAL ROUTINE CREATE_BLOCK (LBN, COUNT, TYPE, COUNT_FOUND) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine fabricates block buffer(s) containing the designated
+!	block(s). The type code is as for READ_BLOCK and determines the buffer
+!	pool to be used.
+!
+! CALLING SEQUENCE:
+!	CREATE_BLOCK (ARG1, ARG2, ARG3, ARG4)
+!
+! INPUT PARAMETERS:
+!	ARG1: LBN to be assigned to block
+!	ARG2: number of blocks to reserve in buffer
+!	ARG3: block type code
+!
+! IMPLICIT INPUTS:
+!	CURRENT_RVT: RVT or UCB of current volume set
+!
+! OUTPUT PARAMETERS:
+!	ARG4: number of buffers found (optional)
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	address of buffer
+!
+! SIDE EFFECTS:
+!	buffer zeroed and recorded as a block read
+!
+!--
+
+BEGIN
+
+LOCAL
+	I,				! index of buffer to use
+	FOUND_COUNT;			! number of buffers gotten
+
+EXTERNAL
+	CURRENT_RVT	: REF BBLOCK;	! RVT of current volume
+
+
+! Find an available buffer. Mark it resident and dirty and fill it with
+! zeroes.
+!
+
+I = FIND_BUFFER (.LBN, .TYPE, .COUNT, FOUND_COUNT);
+INCR J FROM 0 TO .FOUND_COUNT - 1
+DO
+    BEGIN
+    BUFFER_UCB[.I+.J] = .CURRENT_RVT;
+    CH$FILL (0, 512, BUFFERS[.I+.J]);
+    BUFFER_DIRTY[.I+.J] = 1;
+    END;
+
+IF ACTUALCOUNT GEQU 4
+THEN .COUNT_FOUND = .FOUND_COUNT;
+RETURN BUFFERS[.I];
+
+END;					! end of routine CREATE_BLOCK
+
+GLOBAL ROUTINE MARK_DIRTY (BUFFER) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine marks the indicated buffer for write-back.
+!
+! CALLING SEQUENCE:
+!	MARK_DIRTY (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of block buffer
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	buffer marked for write-back
+!
+!--
+
+BEGIN
+
+LOCAL
+	I;				! index of buffer
+
+
+IF .BUFFER LSSU BUFFERS[0] OR .BUFFER GEQU BUFFERS[.BUFFER_COUNT]
+THEN BUG_CHECK (BADBUFADR, FATAL, 'ACP buffer address out of range of buffer pool');
+
+I = (.BUFFER - BUFFERS[0]) / 512;
+
+BUFFER_DIRTY[.I] = 1;
+BUFFER_NEW[.I] = 1;
+
+END;					! end of routine MARK_DIRTY
+
+GLOBAL ROUTINE INVALIDATE (BUFFER) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine invalidates the indicated buffer.
+!
+! CALLING SEQUENCE:
+!	INVALIDATE (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of block buffer
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	buffer contents forgotten
+!
+!--
+
+BEGIN
+
+LOCAL
+	I,				! index of buffer
+	POOL,				! index of pool
+	LRU_ENTRY,			! address of LRU list entry
+	UCB		: REF BBLOCK;	! UCB of device to which block belongs
+
+EXTERNAL
+	BITMAP_VBN,			! VBN of current storage map block
+	BITMAP_BUFFER,			! buffer address of current map block
+	CURRENT_UCB	: REF BBLOCK;	! UCB of current volume
+
+
+
+! A buffer is invalidated by zeroing its associated UCB address and
+! clearing the dirty bit. Also, we relink the buffer onto the front of the
+! buffer LRU to encourage its re-use.
+!
+
+IF .BUFFER LSSU BUFFERS[0] OR .BUFFER GEQU BUFFERS[.BUFFER_COUNT]
+THEN BUG_CHECK (BADBUFADR, FATAL, 'ACP buffer address out of range of buffer pool');
+
+I = (.BUFFER - BUFFERS[0]) / 512;
+POOL = (
+    INCR J FROM 0 TO POOL_COUNT-1 DO
+    IF .I LSS .POOL_BASE[.J] + .POOL_SIZE[.J]
+    THEN EXITLOOP .J
+    );
+
+IF TESTBITSC (BUFFER_BAD[.I])
+THEN
+    BEGIN
+    UCB = .BUFFER_UCB[.I];
+    IF .UCB NEQ 0
+    AND .(BUFFER_FID[.I])<16,8> NEQ 0
+    THEN UCB = .VECTOR [UCB[RVT$L_UCBLST], .(BUFFER_FID[.I])<16,8>-1];
+    IF .UCB NEQ 0
+    THEN IF .BBLOCK [UCB[UCB$L_DEVCHAR], DEV$V_MNT]
+    THEN KERNEL_CALL (BUMP_BAD_COUNT, .UCB, -1);
+    END;
+
+BUFFER_UCB[.I] = 0;
+BUFFER_DIRTY[.I] = 0;
+BUFFER_NEW[.I] = 0;
+
+REMQUE (BUFFER_LRU[.I, LRU_FLINK], LRU_ENTRY);
+INSQUE (.LRU_ENTRY, POOL_LRU[.POOL, LRU_FLINK]);
+
+! If the buffer being invalidated is the current storage bitmap block,
+! invalidate the allocator's local pointer.
+!
+
+IF .BUFFER EQL .BITMAP_BUFFER
+THEN BITMAP_VBN = 0;
+
+END;					! end of routine INVALIDATE
+
+GLOBAL ROUTINE WRITE_HEADER : NOVALUE  =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine writes out the currently resident file header.
+!
+! CALLING SEQUENCE:
+!	WRITE_HEADER ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	FILE_HEADER: address of current file header
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	IO_STATUS: status of I/O transfer
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	checksum checked, header written
+!
+!--
+
+BEGIN
+
+EXTERNAL
+	FILE_HEADER	: REF BBLOCK;	! address of last file header read
+
+EXTERNAL ROUTINE
+	CHECKSUM;			! compute file header checksum
+
+
+! The checksum of the header should be good, since all routines that modify
+! the header bless it with a new checksum when they are finished. Check the
+! checksum and write the header.
+!
+
+IF NOT CHECKSUM (.FILE_HEADER)
+THEN BUG_CHECK (WRTINVHDR, FATAL, 'ACP attempted to write an invalid file header');
+
+WRITE_BLOCK (.FILE_HEADER);
+
+END;					! end of routine WRITE_HEADER
+
+GLOBAL ROUTINE FLUSH_BUFFERS : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine writes all buffers which were modified back to the
+!	disk from whence they came.
+!
+! CALLING SEQUENCE:
+!	FLUSH_BUFFERS ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	all own storage of this module
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	dirty buffers written.
+!
+!--
+
+BEGIN
+LOCAL
+	UCB		: REF BBLOCK,	! address of UCB or RVT of buffer
+	VCB		: REF BBLOCK,	! address of VCB of buffer
+	WRITE_THRU,			! write-through request flag
+	CURRENT_FILE;			! file ID of file operated on
+
+EXTERNAL
+	CURRENT_WINDOW	: REF BBLOCK,	! window of open file, if any
+	CURRENT_VCB	: REF BBLOCK,	! VCB of this volume
+	CURRENT_UCB	: REF BBLOCK,	! UCB of this volume
+	CURRENT_FIB	: REF BBLOCK,	! address of FIB for operation
+	ACP$GB_WRITBACK	: BYTE ADDRESSING_MODE (ABSOLUTE);
+					! ACP write-back cacheing enable
+
+
+! We simply scan the dirty bit vector and write all buffers marked dirty.
+! We only write back file headers that are relevant to the current operation.
+! If write-back cacheing is enabled, we only write back file headers if
+! the file is not open.
+!
+
+WRITE_THRU = .CURRENT_FIB[FIB$V_WRITETHRU];
+CURRENT_FILE = .CURRENT_FIB[FIB$W_FID_NUM] OR .CURRENT_FIB[FIB$W_FID_RVN] ^ 16;
+
+IF .CURRENT_WINDOW EQL 0
+OR NOT .ACP$GB_WRITBACK
+OR .CURRENT_VCB[VCB$V_WRITETHRU]
+THEN WRITE_THRU = 1;
+
+! The test for whether a buffer is to be written out can get really grim.
+! The conditions are as follows: All dirty buffers in the bitmap and
+! directory cache are written. If write-through is requested anywhere
+! (system wide, per volume, per request, or file not open), headers
+! associated with the current file are also written. Finally, if there
+! are pending write errors (either for the particular buffer's volume or
+! too many for the ACP in total), buffers modified by this request are
+! written.
+!
+
+INCR I FROM 0 TO .BUFFER_COUNT-1
+DO
+    IF .BUFFER_DIRTY[.I]
+    AND (.I LSSU .POOL_BASE[2]
+	 OR (.WRITE_THRU AND .BUFFER_FIL[.I] EQL .CURRENT_FILE)
+	 OR
+	     BEGIN
+	     UCB = .BUFFER_UCB[.I];
+	     IF .UCB NEQ 0
+	     AND .(BUFFER_FID[.I])<16,8> NEQ 0
+	     THEN UCB = .VECTOR [UCB[RVT$L_UCBLST], .(BUFFER_FID[.I])<16,8>-1];
+	     IF .UCB EQL 0
+	     THEN BUG_CHECK (WRTINVBUF, FATAL, 'Holding dirty buffer of unmounted volume');
+	     VCB = .UCB[UCB$L_VCB];
+	     .BBLOCK [UCB[UCB$L_DEVCHAR], DEV$V_DMT]
+	     OR (.BUFFER_NEW[.I]
+		 AND (.VCB[VCB$W_PENDERR] NEQ 0
+		      OR .BADBLOCK_COUNT - .BADBLOCK_USED LEQU .BUFFER_COUNT)
+		)
+	     END
+	)
+    THEN WRITE_BLOCK (BUFFERS[.I]);
+
+END;					! end of routine FLUSH_BUFFERS[0]
+
+GLOBAL ROUTINE FLUSH_FID (FID) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine removes from the buffer cache all blocks contained
+!	within the specified file. Dirty buffers are written.
+!
+! CALLING SEQUENCE:
+!	FLUSH_FID (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: file ID of file to flush
+!	      0 to match all
+!
+! IMPLICIT INPUTS:
+!	all own storage of this module
+!	CURRENT_RVT: RVT or UCB of current volume set
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	dirty buffers written, appropriate buffers invalidated
+!
+!--
+
+BEGIN
+
+MAP
+	FID		: REF BBLOCK;	! file ID arg
+LOCAL
+	ID,				! local copy of composite file ID
+	K;				! highest bad block buffer used
+
+EXTERNAL
+	CURRENT_RVN,			! RVN of current volume
+	CURRENT_RVT	: REF BBLOCK,	! RVT of current volume
+	CURRENT_VCB	: REF BBLOCK,	! address of current VCB
+	CURRENT_UCB	: REF BBLOCK;	! address of current UCB
+
+
+! We scan the UCB and FID vectors looking for matches. Buffers that match
+! are written if dirty and then invalidated.
+!
+
+IF .FID NEQ 0
+THEN
+    BEGIN
+    ID = .FID[FID$W_NUM] OR .FID[FID$W_RVN]^16;
+    IF .ID<16,8> EQL 0
+    THEN ID<16,8> = .CURRENT_RVN;
+    END;
+
+INCR I FROM 0 TO .BUFFER_COUNT-1 DO
+    BEGIN
+    IF .BUFFER_UCB[.I] EQL .CURRENT_RVT
+    AND ((.FID EQL 0 AND .(BUFFER_FID[.I])<16,8> EQL .CURRENT_RVN)
+	 OR .ID EQL .BUFFER_FID[.I]
+	)
+    THEN
+	BEGIN
+	IF .BUFFER_DIRTY[.I]
+	THEN WRITE_BLOCK (BUFFERS[.I]);
+	INVALIDATE (BUFFERS[.I]);
+	END;
+    END;
+
+! If this is a dismount flush (signified by the zero FID), then also
+! scan the bad block cache and invalidate any matching entries. These
+! amount to unreported write errors, but occurr only in very rare
+! circumstances.
+!
+
+IF .FID EQL 0
+THEN
+    BEGIN
+    K = 0;
+    INCR I FROM 0 TO .BADBLOCK_MAX-1
+    DO
+	BEGIN
+	IF .BADBLOCK_UCB[.I] EQL .CURRENT_UCB
+	THEN
+	    BEGIN
+	    BADBLOCK_UCB[.I] = 0;
+	    BADBLOCK_USED = .BADBLOCK_USED - 1;
+	    END
+	ELSE IF .BADBLOCK_UCB[.I] NEQ 0
+	THEN K = .I + 1;
+	END;
+    BADBLOCK_MAX = .K;
+    END;
+
+END;					! end of routine FLUSH_FID
+
+ROUTINE SAVE_BAD_BLOCK (I) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine saves a block on which a write error has occurred in
+!	the error cache. If the error is a new one, the volume's pending error
+!	count is incremented.
+!
+!
+! CALLING SEQUENCE:
+!	SAVE_BAD_BLOCK (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: buffer index of bad buffer
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	buffer moved to error cache
+!
+!--
+
+BEGIN
+
+LOCAL
+	UCB		: REF BBLOCK;	! UCB of device to which block belongs
+
+EXTERNAL
+	CURRENT_UCB	: REF BBLOCK;	! UCB of current volume
+
+
+
+! Get the UCB address of the block by indexing through the RVT.
+!
+
+UCB = .BUFFER_UCB[.I];
+IF .UCB NEQ 0
+AND .(BUFFER_FID[.I])<16,8> NEQ 0
+THEN UCB = .VECTOR [UCB[RVT$L_UCBLST], .(BUFFER_FID[.I])<16,8>-1];
+IF .UCB EQL 0
+THEN BUG_CHECK (WRTINVBUF, FATAL, 'Holding dirty buffer of unmounted volume');
+
+
+! Now find a free buffer in the error cache and move the block in.
+!
+
+INCR J FROM 0 TO .BADBLOCK_COUNT-1
+DO
+    IF .BADBLOCK_UCB[.J] EQL 0
+    THEN
+	BEGIN
+	BADBLOCK_UCB[.J] = .UCB;
+	BADBLOCK_LBN[.J] = .BUFFER_LBN[.I];
+	CH$MOVE (512, BUFFERS[.I], BADBLOCKS[.J]);
+
+	BADBLOCK_USED = .BADBLOCK_USED + 1;
+	IF .J GEQU .BADBLOCK_MAX
+	THEN BADBLOCK_MAX = .J+1;
+	IF TESTBITCC (BUFFER_BAD[.I])
+	THEN KERNEL_CALL (BUMP_BAD_COUNT, .UCB, 1);
+	RETURN;
+	END;
+
+BUG_CHECK (ERRCACHFUL, FATAL, 'Error cache is full');
+
+END;					! end of routine SAVE_BAD_BLOCK
+
+ROUTINE SET_SEC_CHAN (UCB) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine assigns the secondary channel to the indicated UCB.
+!
+!
+! CALLING SEQUENCE:
+!	SET_SEC_CHAN (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of UCB to assign to
+!
+! IMPLICIT INPUTS:
+!	PREV_CHANNEL: channel number to use
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	PREV_UCB: gets UCB address assigned to
+!
+! ROUTINE VALUE:
+!	1
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+	CCB		: REF BBLOCK;	! pointer to channel control block
+
+EXTERNAL
+	PREV_CHANNEL,			! channel number to use
+	PREV_UCB	: REF BBLOCK;	! UCB assigned to channel
+
+EXTERNAL ROUTINE
+	GET_CCB;			! get CCB address of channel
+
+
+CCB = GET_CCB (.PREV_CHANNEL);
+CCB[CCB$L_UCB] = .UCB;
+PREV_UCB = .UCB;
+
+1
+END;					! end of routine SET_SEC_CHAN
+
+ROUTINE BUMP_BAD_COUNT (UCB, DIRECTION) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine adjusts the pending error count of the indicated volume.
+!
+!
+! CALLING SEQUENCE:
+!	BUMP_BAD_COUNT (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of UCB of volume
+!	ARG2: direction to adjust (1 or -1)
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1
+!
+! SIDE EFFECTS:
+!	error count altered
+!
+!--
+
+BEGIN
+
+MAP
+	UCB		: REF BBLOCK;	! UCB in question
+
+LOCAL
+	VCB		: REF BBLOCK;	! address of VCB
+
+
+
+VCB = .UCB[UCB$L_VCB];
+VCB[VCB$W_PENDERR] = .VCB[VCB$W_PENDERR] + .DIRECTION;
+
+1
+END;					! end of routine BUMP_BAD_COUNT
+
+END
+ELUDOM

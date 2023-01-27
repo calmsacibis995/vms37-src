@@ -1,0 +1,11 @@
+$ SRCUPDATE DEVERR.FOR
+$ srcupdate dr32com.for
+$ srcupdate emblmdef.for
+$ srcupdate embspdef.for
+$ srcupdate modes.for
+$ SRCUPDATE MSGHDR.FOR
+$ srcupdate opcodes.for
+$ srcupdate qiocommon.for
+$ SRCUPDATE SSMESSAGE.FOR
+$ SRCUPDATE SYECOM.FOR
+$ SRCUPDATE VOLMOUNT.FOR

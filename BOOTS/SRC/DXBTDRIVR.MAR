@@ -1,0 +1,438 @@
+	.TITLE	DXBTDRIVR - CONSOLE RX01 BOOT DRIVER
+	.IDENT	'V03-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY:	BOOTS
+;
+; ABSTRACT:
+;	This module contains the bootstrap device driver for the
+;	RX01 console floppy.
+;
+; ENVIRONMENT:	IPL 31, kernel mode, code must be PIC
+;
+; AUTHOR:  Steve Beckhardt,	CREATION DATE:   1-Nov-1979
+;
+; MODIFIED BY:
+;	02-04	TCM0001		Trudy C. Matthews	12-Jun-1981
+;		Correct bug in DO_MAPPING routine.
+;
+;
+;	02-03	SRB0001		Steve Beckhardt		10-Jul-1980
+;		Fix bug in change CAS0001
+;
+;	02-02	CAS0001		C.A. Samuelson		30-Apr-1980
+;		Change interface to BOOTDRIVR for UBA purge datapath
+;
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+	$BTDDEF				; Boot device types
+	$IODEF				; I/O function codes
+	$PRDEF				; Processor registers
+	$PTEDEF				; PTE definitions
+	$RPBDEF				; RPB offsets
+	$SSDEF				; Status codes
+	$VADEF				; Virtual address fields
+
+;
+; MACROS:
+;
+
+;
+; EQUATED SYMBOLS:
+;
+
+;
+; 11/780 CONSOLE FLOPPY DEFINITIONS
+;
+
+	$DEFINI	DX			;START OF REGISTER DEFINITIONS
+
+	_VIELD	RXCS,6,<-		;START OF PROC. REG. RXCS DEFS.
+		<IE,,M>,-		; INTERRUPT ENABLE
+		<DONE,,M>,-		; DONE
+	>
+
+	_VIELD	RXDB,0,<-		;START OF PROC. REG. RXDB DEFS
+		<DATA,8>,-		; DATA
+		<SEL,4>,-		; SELECT
+	>
+
+	_VIELD	TXCS,6,<-		;START OF PROC. REG. TXCS DEFS
+		<IE,,M>,-		; INTERRUPT ENABLE
+		<READY,,M>,-		; READY
+	>
+
+	_VIELD	TXDB,0,<-		;START OF PROC. REG. TXDB DEFS
+		<DATA,8>,-		; DATA
+		<SEL,4>,-		; SELECT
+	>
+
+DX_READSECTOR = ^X900			; FUNCTION READ SECTOR
+DX_WRITESECTOR = ^X901			; FUNCTION WRITE SECTOR
+DX_FUNCCOMPLETE = ^X200			; STATUS FUNCTION COMPLETE
+
+	$DEFEND	DX			;END OF 11/780 FLOPPY DEFINITIONS
+;
+; OWN STORAGE:
+;
+
+;
+; Boot driver table entry
+;
+
+	$BOOT_DRIVER	DEVTYPE = BTD$K_CONSOLE,-  ; Device type (console)
+			CPUTYPE = PR$_SID_TYP780,- ; Cpu type (11/780)
+			SIZE = CONSDX_DRVSIZ,-	   ; Driver size
+			ADDR = CONSDX_DRIVER,-	   ; Driver address
+			DRIVRNAME = DXNAME	   ; Driver file name
+
+	.SBTTL	Console Floppy Bootstrap Driver Code
+
+;++
+;
+; Inputs:
+;
+;	R1	Address of page table for virtual -> physical mapping
+;	R2	Base VPN of transfer (Bits 29:9 of R10)
+;	R5	LBN for current piece of transfer
+;	R8	Size of transfer in bytes
+;	R9	Address of the RPB
+;	R10	Starting address of transfer
+;
+;	FUNC(AP)  I/O operation (IO$_READLBLK or IO$_WRITELBLK only)
+;	MODE(AP)  Address interpretation mode:
+;		     0 -> Physical,  1 -> Virtual
+;
+; Outputs:
+;
+;	R0	Status code:
+;
+;		SS$_NORMAL	Successful transfer
+;		SS$_CTRLERR	Fatal controller error
+;--
+
+FUNC = 16
+MODE = 20
+
+CONSDX_DRIVER:
+	PUSHR	#^M<R1,R2,R8,R10,R11>	; Save input registers
+
+;
+; Perform initialization:  Set up a mapping switch in R11, read RXDB
+; if done is set in RXCS, and set up registers.
+; There are 4 possibilities concerning mapping:  the I/O can be 
+; done virtual or physical (MODE(AP)) and we can be executing virtual
+; or physical (contents of processor register PR$_MAPEN).  If both
+; modes match, then we can just copy data to/from the user buffer.
+; If the I/O is to be done virtual and we are executing physical
+; then the buffer address has to be translated using the page table
+; pointed to by R1.  If the I/O is to be done physical and we are
+; executing virtual then we have to double map the buffer using a spare
+; PTE.  At this point, we just compute a mapping switch in R11 as follows:
+;
+;	0	Both modes match, just copy the data
+;	1	Do virtual -> physical translation using page table
+;	-1	Do physical -> virtual mapping using a spare PTE
+;
+5$:	MFPR	#PR$_MAPEN,R11		; Get mapping enabled switch
+	MNEGL	R11,R11			; Negate it
+	ADDL	MODE(AP),R11		; Add I/O mode switch
+
+	MFPR	#PR$_RXCS,R0		; Get RXCS
+	BBC	#RXCS_V_DONE,R0,10$	; Branch if done is clear
+	MFPR	#PR$_RXDB,R0		; Read RXDB and ignore
+10$:	MOVQ	R1,R6			; R6 = Addr. of page tbl, R7 = Base VPN
+
+;
+; Convert logical block number in R5 to a logical sector and cylinder
+; on floppy.  This is saved in R4 and R5 and converted to a physical
+; sector and cylinder as needed.  Note that the console floppy has
+; 26 sectors per track, 1 track per cylinder, and 77 cylinders.
+; Also note that each sector is 128 bytes so the LBN must be
+; multiplied by 4 to convert to sectors.
+;
+	EMUL	#4,R5,#0,R0		; Mult. LBN by 4, Quad result to R0, R1
+	EDIV	#26,R0,R5,R4		; Divide by # of sectors, quotient
+					; (R5) is cyl.  Rem. (R4) is sector
+
+;
+; Set up mapping if required
+;
+	BSBW	DO_MAPPING
+
+;
+; This is the main loop to read or write to the floppy and to get
+; or store in memory.  Register usage is:
+;
+;	R0 - R3		Scratch
+;	R4		Logical sector
+;	R5		Logical cylinder
+;	R6		Address of page table
+;	R7		Virtual page number of buffer
+;	R8		Size of remaining buffer (in bytes)
+;	R9		Address of RPB
+;	R10		Address of current spot in buffer
+;	R11		Mapping switch
+;
+; First convert logical sector and cylinder to physical sector and
+; cylinder.  Then send command, sector, and cylinder to floppy.  Then
+; read or write 128 bytes of data.  Repeat until byte count goes to zero.
+;
+
+	ASSUME		DX_WRITESECTOR  EQ  DX_READSECTOR+1
+
+30$:	BSBB	TRKSEC			; Convert to physical sector and
+					; cylinder in R1 and R2
+	MOVZWL	#DX_READSECTOR,R3	; Assume read
+	CMPL	FUNC(AP),#IO$_READLBLK	; Is it read?
+	BEQL	40$			; Yes
+	INCL	R3			; No, convert to write
+40$:	BSBB	DXOUT			; Output function
+	MOVL	R1,R3
+	BSBB	DXOUT			; Output sector
+	MOVL	R2,R3
+	BSBB	DXOUT			; Output cylinder
+
+	MOVZWL	#128,R2			; Loop counter (128 bytes)
+	CMPL	FUNC(AP),#IO$_READLBLK	; Read or write?
+	BEQL	60$			; Read
+
+;
+; Do a Write to the floppy
+;
+
+50$:	BSBB	GETBYTE			; Get a byte from memory in R3
+	BSBB	DXOUT			; Output it
+	SOBGTR	R2,50$			; Repeat
+
+	BSBB	DXIN			; Get floppy status in R3
+	CMPW	R3,#DX_FUNCCOMPLETE	; Error?
+	BEQL	80$			; No
+
+55$:	; Error from floppy
+
+
+	POPR	#^M<R1,R2,R8,R10,R11>	; Restore registers 
+	MOVZWL	#SS$_CTRLERR,R0		; Set failure status
+	RSB				; Return and retry
+
+;
+; Do a Read from floppy
+;
+60$:	BSBB	DXIN			; Get floppy status in R3
+	CMPW	R3,#DX_FUNCCOMPLETE	; Error?
+	BNEQ	55$			; Yes
+
+70$:	BSBB	DXIN			; Get a byte from floppy
+	BSBB	PUTBYTE			; Store in memory
+	SOBGTR	R2,70$			; Repeat
+
+;
+; Done with this sector.  Repeat loop if byte count is non-zero
+;
+80$:	TSTL	R8			; Test remaining byte count
+	BEQL	90$			; Done
+	INCL	R4			; Not done, incr. sector
+	CMPL	R4,#26			; Overflow to next cylinder?
+	BLSSU	30$			; No, do next sector
+	CLRL	R4			; Yes, clear sector
+	INCL	R5			; Increment cylinder
+	BRB	30$			; Do next sector
+
+90$:	MOVZWL	#SS$_NORMAL,R0		; Successful completion
+	POPR	#^M<R1,R2,R8,R10,R11>	; Restore registers
+	RSB
+
+
+
+;++
+; TRKSEC - Subroutine to convert logical sector/cylinder to physical
+;	   sector/cylinder on floppy by applying sector interleave
+;	   and track-to-track skew (6 sectors).
+;
+; Inputs:
+;	R4	Logical sector
+;	R5	Logical cylinder
+;
+; Outputs:
+;	R1	Physical sector
+;	R2	Physical cylinder
+;
+; Credits:
+;	Thanks to Chuck Monia for this one.
+;--
+
+TRKSEC:	MOVL	R4,R1			; Get logical sector
+	CMPB	#12,R1			; Set C-bit if 12 < sector <= 26
+	ADWC	R1,R1			; Double sector number, add interleave
+	EMUL	#6,R5,R1,R0		; Compute skew (6 * cyl + sector)
+	EDIV	#26,R0,R0,R1		; Modulo sectors per track (26)
+	INCL	R1			; Add 1 to sector because floppy
+					; sectors start at 1 not 0
+	ADDL3	#1,R5,R2		; Add 1 to cylinder because first
+					; floppy cylinder is unused
+	RSB
+
+
+
+;++
+; DXOUT - Subroutine to output a byte to the floppy.
+;
+; Inputs:
+;	R3	Byte to output
+;
+; Outputs:
+;	None
+;--
+
+	ASSUME	TXDB_V_SEL  EQ  8
+
+DXOUT:	MFPR	#PR$_TXCS,R0		; Get status
+	BBC	#TXCS_V_READY,R0,DXOUT	; Branch back if not ready
+	BISW	#^X100,R3		; Set floppy unit number
+	MTPR	R3,#PR$_TXDB		; Send data byte
+	RSB
+
+
+;++
+; DXIN - Subroutine to read a byte from the floppy
+;
+; Inputs:
+;	None
+;
+; Outputs:
+;	R3	Byte read from floppy (in low byte)
+;		(Second byte contains select field)
+;--
+
+DXIN:	MFPR	#PR$_RXCS,R0		; Get status
+	BBC	#RXCS_V_DONE,R0,DXIN	; Branch back if not done
+	MFPR	#PR$_RXDB,R3		; Get data
+	CMPZV	#RXDB_V_SEL,#RXDB_S_SEL,R3,#0	; Ignore if from
+	BEQL	DXIN				; console terminal
+	RSB
+
+
+
+;++
+; GETBYTE - Subroutine to get a byte from memory
+; PUTBYTE - Subroutine to store a byte in memory
+;
+;	These two subroutines do two things special:
+;
+;		1)  Since the floppy always reads or writes 128 bytes
+;		    these routines simply return if the byte count is zero.
+;		2)  These routines take care of page boundaries if
+;		    mapping is required.
+;
+; Inputs:
+;	R3	Byte to store (PUTBYTE)
+;	R6	Address of page table
+;	R7	Virtual page number of buffer
+;	R8	Size of remaining buffer (in bytes)
+;	R10	Address of current spot in buffer
+;	R11	Mapping switch:
+;			-1   Do physical -> virtual map
+;			0    No mapping required
+;			1    Do virtual -> physical translation
+;
+; Outputs:
+;	R3	Byte fetched from memory (GETBYTE)
+;--
+
+	.ENABL	LSB
+
+GETBYTE:
+	CLRL	R3			; Return 0 if byte count = 0
+	TSTL	R8			; Is byte count 0?
+	BEQL	90$			; Yes
+	MOVZBL	(R10)+,R3		; Get byte
+	BRB	10$			; Branch to common code
+
+
+PUTBYTE:
+	TSTL	R8			; Is byte count 0?
+	BEQL	90$			; Yes
+	MOVB	R3,(R10)+		; Store byte
+
+
+10$:	DECL	R8			; Decr. byte count
+	BEQL	90$			; Reached zero
+	BITW	#VA$M_BYTE,R10		; Did address overflow onto new page?
+	BNEQ	90$			; No
+	INCL	R7			; Yes, increment page number
+
+;
+; Fall through to ...
+;
+
+
+;++
+; DO_MAPPING - Subroutine to perform necessary mapping
+;
+; Inputs:
+;	R6	Address of page table
+;	R7	Page number of buffer
+;	R10	Address to map
+;	R11	Mapping switch:
+;			-1	Do physical -> virtual map
+;			0	No mapping required
+;			1	Do virtual -> physical translation
+;
+; Outputs:
+;	R10	Address to use
+;--
+
+DO_MAPPING:
+	TSTL	R11			; Any mapping required?
+	BEQL	90$			; No
+	BLSS	100$			; Yes, map physical to virtual
+	BICL	#^C<VA$M_BYTE>,R10	; Yes, translate virtual to physical
+					; Clear everything but byte offset
+	MOVL	(R6)[R7],R0		; Get PFN in R0
+	INSV	R0,#VA$V_VPN,#PTE$S_PFN,R10   ; Insert PFN after byte offset 
+90$:	RSB
+
+
+; 
+; Map physical to virtual
+;
+100$:	HALT				; Not implemented yet
+
+	.DSABL	LSB
+
+DXNAME:	.ASCIC	/DXDRIVER.EXE/
+
+CONSDX_DRVSIZ=.-CONSDX_DRIVER
+
+	.END

@@ -1,0 +1,407 @@
+	$BEGIN	RM1RELBLK,020,$RMS1,<RELEASE BUFFER FOR SEQ. ORG.>
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; Facility: rms32
+;
+; Abstract:
+;		this module releases a buffer causing its
+;		contents to be written out if dirty.
+;
+; Environment:
+;		star processor running starlet exec.
+;
+; Author: L F Laverdure,	 creation date: 29-march-77
+;
+; Modified By:
+;
+;	V02-020	JWH0002		Jeffrey W. Horn		12-Jan-1982
+;		Allow retry of auto-extend only on quota-exceeded and
+;		device-full errors from ACP.
+;
+;	V02-019	JWH0001		Jeffrey W. Horn		03-NOV-1981
+;		Changes to use new RMS default extend sizes.
+;
+;	V02-018	REFORMAT	P S Knibbe	25-Jul-1980
+;
+;	V017	PSK0009		P S Knibbe	10-JAN-1980	1:00
+;		changes to accomadate disk overdrafting. don't permit auto-extend
+;		if in overdraft. return error when first go into overdraft.
+;
+; Revision History
+;
+;	E H Marison,   7-JUN-1978  13:06
+;			add mbf logic and comments
+; 01	-
+;--
+
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+
+;
+; Macros:
+;
+
+	$IFBDEF
+	$IRBDEF
+	$DEVDEF
+	$BDBDEF
+	$RLSDEF
+	$FIBDEF
+	$RMSDEF
+
+;
+; Equated Symbols:
+;
+
+;
+; Own Storage:
+;
+
+
+
+;++
+; notes on the multi-block buffering scheme
+;
+; this routine causes multiple blocks to be read together
+; (as specified by mbc) but returned one at a time for
+; processing by the calling routines.
+;
+; assumptions:
+;
+;	1.  mbc is never > 0 except for disk(= # vbn's - 1)
+;	2.  records are always written at eof (only updates
+;	    may occur elsewhere in the file).
+;	3.  all sequential i/o calls go thru one of the
+;	    following routines:
+;		rm$nxtblk1
+;		rm$wtlst1
+;		rm$relblk1
+;	4.  there is no write sharing for sequential files.
+;	5.  a direct release will be done only when there
+;	    is no i/o for the buffer.
+;
+; bdb field usage:
+;
+;	1.  bdb$l_vbn = vbn of first block in buffer
+;	2.  (irb$l_rp_vbn = vbn of current block)
+;	3.  bdb$b_rel_vbn = current vbn rel to start vbn for buffer
+;	4.  bdb$b_val_vbns = # of valid vbns in buffer
+;	5.  bdb$b_flgs:
+;		-bdb$v_drt:all blocks up to the greater of the current vbn
+;		 and the number of val_vbns are dirty
+;		-bdb$v_val:the current vbn is valid
+;
+;	6.  the relative vbn = requested vbn - start vbn
+;	7.  current block buffer addr = buff addr + (rel_vbn*512)
+;	8.  bdb$w_numb = # bytes in current block
+;		on reads = (irb$b_mbc+1)*512
+;		on writes = (max(val_vbn,rel_vbn+1))*512
+;	9.  requested vbn is in buffer if its rel_vbn < or = mbc
+;	10. if read required and rel_vbn < val_vbns ok,
+;		else release buffer and reread
+;	11. on release (rm$relblk1) if bdb$v_val is off and the
+;	    bdb$v_drt bit is set, merely decrement the
+;	    current vbn and set the valid bit.
+;--
+
+
+	.SBTTL	RM$RELBLK1 - ROUTINE TO RELEASE BLOCK, REWRITING IF DIRTY
+
+;++
+; RM$RELBLK1 - Release block, rewrite if dirty
+;
+;  this routine releases the block whose bdb address is in r4.
+;  if the block is dirty it is first written.
+;  if the write is to a disk file, the file must have been extended if needed.
+;
+; Calling sequence:
+;
+;	bsbw	rm$relblk1
+;
+; Input Parameters:
+;
+;	r11	impure area address
+;	r10	ifab address
+;	r9	irab address
+;	r8	rab address
+;	r4	bdb address
+;
+; Implicit Inputs:
+;
+;	bdb$b_flgs	  	(drt and val)
+;	bdb$b_rel_vbn	 -	current block if mbc > 0
+;	bdb$w_numb	 -	# bytes to write if magtape
+;	bdb$l_vbn	 -	start block for write
+;	bdb$l_addr	 -	start address for write
+;	ifb$l_hbk	 -	highest allocated block
+;	ifb$w_rtdeq	 -	default extend quanity
+;	ifb$w_chnl	 -	channel
+;	ifb$w_devbufsiz	 -	block buffer size
+;
+; Output Parameters:
+;
+;	r0	status	code
+;	r1,ap	destroyed
+;
+; Implicit Outputs:
+;
+;	bdb$b_flgs	 -	drt is cleared
+;			 -	val is set
+;			 -	iop set if write behind underway
+;	bdb$w_numb	 -	set to size of transfer, if any
+;
+; Completion Codes:
+;
+;	standard rms, in particular, suc, sys, dme, wer, ful, prv, ext.
+;
+; Side Effects:
+;
+;	may have switched to running at ast level
+;	requiring reprobe of all user addresses not in rab.
+;--
+
+
+RM$RELBLK1::
+	$TSTPT	RELBLK1
+	PUSHR	#^M<R2,R3>		; save regs.
+	BBC	#BDB$V_DRT,-
+		BDB$B_FLGS(R4),-
+		RELEASE			; branch if buffer not dirty
+	BBC	#DEV$V_RND,-
+		IFB$L_PRIM_DEV(R10),-
+		RELEASE			; branch if not disk
+
+;
+; bdb marked dirty	-	adjust bdb data for release
+;
+
+	ASSUME	BDB$V_VAL EQ 0
+	BLBS	BDB$B_FLGS(R4),10$	; branch if buffer valid
+
+;
+; buffer dirty but marked invalid.
+; decrement the current vbn data and say valid.
+;
+
+	DECB	BDB$B_REL_VBN(R4)
+	BISB2	#BDB$M_VAL,BDB$B_FLGS(R4)
+
+;
+; adjust byte count for transfer if disk
+; (i.e., transfer all blocks thru current vbn or # val_vbns if greater)
+;
+
+10$:	MOVZBL	BDB$B_REL_VBN(R4),R2	; get current vbn
+	INCW	R2			; get # vbns
+	CMPB	R2,BDB$B_VAL_VBNS(R4)	; is current greater than  # valid vbns?
+	BGEQU	15$			; branch if yes
+	MOVZBL	BDB$B_VAL_VBNS(R4),R2	; no - so use # valid vbns
+15$:	MULW3	R2,-
+		IFB$W_DEVBUFSIZ(R10),-
+		BDB$W_NUMB(R4)		; and set xfer size
+
+;
+; call rm$release to write and release buffer
+;
+
+RELEASE:
+	MOVL	#RLS$M_WRT_THRU,R3	; flag to get write
+	BSBW	RM$RELEASE		; release buffer
+	POPR	#^M<R2,R3>
+	RSB
+
+
+;++
+; RM$AUTOEXTEND - Extend a sequential disk file
+;
+;  this subroutine extends a sequential disk file.
+;  the # of blocks for the extend is =
+;  max (required # blocks, volume default, min (20*bdb$w_numb/512, 256)).
+;  if this many blocks are not available only the minimum required are allocated.
+;
+;  calling sequence:
+;
+;	bsbw	rm$autoextend
+;
+;  input parameters:
+;
+;	r11		impure area address
+;	r10		ifab address
+;	r9		irab address
+;	r8		rab address
+;	r4		bdb address
+;	r2		minimum # of blocks to extend file
+;	bdb$w_numb	number of bytes for xfer
+;
+;  output parameters:
+;
+;	r0		status code
+;	r1,r3,ap	destroyed
+;--
+
+RM$AUTOEXTEND::
+	PUSHR	#^M<R2,R4,R5>		; save regs
+
+;
+; build fib for extend
+;
+
+	MOVL	#FIB$C_EXTDATA,R2	; size of fib
+	MOVL	R10,R1			; space header addr
+	BSBW	RM$GETSPC		; allocate fib
+	BLBS	R0,10$			; continue on success
+	BRW	ERRXIT
+10$:	MOVL	(SP),FIB$L_EXSZ(R1)	; set # blocks required
+	TSTW	FIB$L_EXSZ+2(R1)	; hi-order extend size zero?
+	BNEQ	30$			; branch if not
+	CMPW	(SP),IFB$W_RTDEQ(R10)	; extend size < default?
+	BGEQU	30$			; branch if not
+	MOVW	IFB$W_RTDEQ(R10),-
+		FIB$L_EXSZ(R1)		; yes - use default
+30$:	MOVB	#FIB$M_EXTEND,-
+		FIB$W_EXCTL(R1)		; say it's an extend
+	TSTW	IFB$W_RTDEQ(R10)	; zero default extend size?
+	BNEQ	DOXTND			; branch if not
+
+;
+;  This is an auto extend with deq=0.
+;  Try to use system or process default extention quantity.
+;
+	MOVZWL	@#PIO$GW_RMSEXTEND,R0	; Process deq?
+	BNEQ	33$			; branch if yes
+	MOVZWL	@#SYS$GW_RMSEXTEND,R0	; System deq?
+	BNEQ	33$			; branch if yes
+
+;
+;  No system or process deq,
+;  compute the number of blocks to extend = max(required,min(20*bufsiz,256))
+;
+
+	BISB2	#FIB$M_ALDEF,-
+		FIB$W_EXCTL(R1)		; flag use of volume default
+	MOVL	4(SP),R4		; restore bdb address
+	EXTZV	#9,#7,BDB$W_NUMB(R4),R0	; get # of blocks to xfer
+	MULW2	#20,R0			; times 20
+	CMPW	R0,#256			; > max. default extend size?
+	BLEQ	33$			; branch if not
+	MOVW	#256,R0			; yes - just extend 256 blocks
+33$:	CMPL	R0,(SP)			; > required extend size?
+	BLEQU	36$			; branch if not
+	MOVW	R0,FIB$L_EXSZ(R1)	; use larger default extend size
+	SSB	#IFB$V_TEF,(R10)	; and say used so that we truncate
+					; at eof on close
+36$:
+
+;
+; build the fib descriptor
+;
+
+DOXTND:	PUSHL	R1			; addr of fib
+	PUSHL	#FIB$C_EXTDATA		; length of fib
+
+;
+; do the extend
+;
+
+	BSBW	RM$FCPEXTEND		; & do extend
+	MOVL	R10,R3			; get set for rm$retspc
+	POPR	#^M<R2,R4>		; restore fib length (r2) and addr (r4)
+	CMPW	R0,#SS$_OVRDSKQUOTA	; in overdraft ? (alt success)
+	BEQLU	OVERQUOTA		; go away if overquota
+
+	CMPW	R0,#SS$_DEVICEFULL	; if device full -
+	BEQLU	RETRY			;    retry
+
+	BLBC	R0,ERREXT		; if error code, exit
+
+60$:
+
+
+;
+; extend complete.
+; update ifab hi block field, deallocate the fib, and return
+;
+
+	ADDL3	FIB$L_EXSZ(R4),FIB$L_EXVBN(R4),IFB$L_HBK(R10)
+	DECL	IFB$L_HBK(R10)		; get # of highest allocated blk
+	BSBW	RM$RETSPC		; return the fib space
+	RMSSUC
+ERRXIT:	POPR	#^M<R2,R4,R5>		; restore regs
+	RSB
+
+;
+; extend failed.  if attempted extend was for more than minimum required amount,
+; retry extend for only the minimum required amount, otherwise
+; map error, release buffer & return
+;
+
+RETRY:	BBCC	#FIB$V_ALDEF,-
+		FIB$W_EXCTL(R4),ERREXT	; branch if not first try
+	BRW	DORETRY			; otherwise go do retry
+
+ERREXT:	$PSECT_BR	L$RMS1
+	RMSERR	EXT,R1			; default error code
+	BSBW	RM$MAPERR		; map the error code
+	PUSHL	R0			; save error code
+	BSBW	RM$RETSPC		; return fib buffer
+	POPR	#^M<R0,R2,R4,R5>	; restore regs
+	RSB
+
+;
+;  retry extend for minimum required amount
+;
+
+DORETRY:MOVL	R4,R1			; restore fib address
+	MOVL	(SP),FIB$L_EXSZ(R1)	; must extend this amount
+	BRW	DOXTND			; go retry extend
+	$PSECT_RESTORE
+
+;
+;   we're over-quota on the disk.
+;	1) this is the first time we've gotten the overquota message -
+;	   return an error and make sure we don't do retries now or later
+;	2) we've gotten the message before. ignore it (but don't do retries)
+;
+
+OVERQUOTA:
+	$PSECT_BR	L$RMS1
+	TSTW	IFB$W_RTDEQ(R10)	; if zero, then this is first time we're
+					; in overdraft
+	BNEQU	60$			; no - go away
+	INCW	IFB$W_RTDEQ(R10)	; default extend is now 1, this disables
+					; auto-extend
+	CSB	#FIB$V_ALDEF,-
+		FIB$W_EXCTL(R4)		; prevent second request
+	MOVL	#SS$_EXDISKQUOTA,R0	; set up error now
+60$:	BRW	RETRY			; return to mainline
+	$PSECT_RESTORE
+
+	.END

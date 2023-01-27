@@ -1,0 +1,546 @@
+MODULE DUMP$FILE (
+	IDENT='V03-000',
+	ADDRESSING_MODE(EXTERNAL=GENERAL,
+		NONEXTERNAL=LONG_RELATIVE)
+	) =
+BEGIN
+!
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!
+!++
+!
+! FACILITY:  File dump utility
+!
+! ABSTRACT:
+!	This module contains the routines to do the work of dumping files.
+!
+! ENVIRONMENT:
+!	VAX native, user mode.
+!
+! AUTHOR:  Benn Schreiber, Stephen Zalewski	 CREATION DATE:  22-Jun-1981
+!
+! MODIFIED BY:
+!
+!	V03-001	MLJ0033		Martin L. Jack,	23-Aug-1981  9:48
+!		Extensive rewriting to finish implementation.
+!
+!--
+
+LIBRARY 'SYS$LIBRARY:STARLET';
+REQUIRE 'SRC$:DUMPRE';
+
+
+FORWARD ROUTINE
+    dump$fao_setup:	NOVALUE,	! Set up FAO control strings
+    dump$new_page:	NOVALUE,	! Output new page
+    dump$put_header:	NOVALUE,	! Output heading lines
+    dump$output_getmsg:	NOVALUE,	! Get message and output
+    dump$blank_line:	NOVALUE,	! Write blank line to listing file
+    dump$put_line:	NOVALUE,	! Output record, watching lines
+    dump$dump_buffer:	NOVALUE;	! Dump one record/block
+
+EXTERNAL ROUTINE
+    dump$fao_line:	NOVALUE,	! Format one line
+    dump$header:	NOVALUE,	! Dump file header(s)
+    dump$one_header,			! Dump block as a file header
+    dump$read,				! Read from file
+    dump$write:		NOVALUE,	! Write to output file
+    SYS$FAO;				! Formatted ASCII output routine
+
+EXTERNAL
+    dump$gl_flags : BBLOCK,		! General flags
+    dump$gl_outdesc : BBLOCK,		! Output buffer descriptor
+    dump$gl_idesc : BBLOCK,		! Descriptor for input filename
+    dump$gl_file_efblk,			! End of file block
+    dump$gl_file_hiblk,			! Highest allocated block
+    dump$gl_lpp,			! Number of lines per page
+    dump$gl_ifab : REF BBLOCK,		! Input FAB
+    dump$gl_inam : REF BBLOCK,		! Input NAM block
+    dump$gl_cur_block,			! Current record/block
+    dump$gl_max_block,			! Maximum record/block to dump
+    dump$gl_width,			! Width of listing line
+    dump$gl_number,			! Starting dump index number
+    dump$gl_record,			! Record or block number
+    dump$gq_time;			! Time at beginning of dump
+
+EXTERNAL LITERAL
+    dump$_facility,
+    dump$_dumpofil,
+    dump$_dumpodev,
+    dump$_bn,
+    dump$_lbn,
+    dump$_vbn,
+    dump$_fildnt,
+    dump$_recno,
+    dump$_header;
+
+LITERAL
+    max_fao_size = 40;			! Size of largest of faotables' expanded fao strings
+
+OWN
+    modeindex,				! Index into faotable
+    dumpmode,				! mode for dump$fao_line
+    entrysize,				! Size of one entry
+    entsperline,			! Number of entries on one line
+    linesthispage,			! Number of lines on this page
+    dumpwidth,				! Width of one full dump listing line
+    plinfaostring : BBLOCK[max_fao_size], ! FAO string for partial lines
+    plinfaodesc : BBLOCK[dsc$c_s_bln]	! Descriptor for partial line fao control string
+		INITIAL(max_fao_size,
+			plinfaostring),
+    faoctrstring : BBLOCK[max_fao_size],! FAO control string
+    faoctrdesc : BBLOCK[dsc$c_s_bln]	! FAO control string descriptor
+		INITIAL(max_fao_size,
+			faoctrstring);
+
+BIND
+    sizetbl = UPLIT(BYTE(9,5,3,11,6,4,12,7,4)) : VECTOR[,BYTE],
+    charsperbyte = UPLIT(BYTE(2,3,3)) : VECTOR[,BYTE], ! Number of ascii chars /byte based on radix
+
+    offtable = UPLIT(cstring('6XL'),	! FAO control to print buffer offsets
+			cstring('6SL'),
+			cstring('6OL')) : VECTOR[,LONG],
+
+    faotable = UPLIT(cstring('9XL'),
+			cstring('5XW'),
+			cstring('3XB'),
+			cstring('11SL'),
+			cstring('6SW'),
+			cstring('4SB'),
+			cstring('12OL'),
+			cstring('7OW'),
+			cstring('4OB')) : VECTOR[,LONG],
+
+    sizetable = UPLIT(BYTE(			! Table to round entry's per
+			1,			! line to nearest lower power
+			2,			! of two.  Max length is 32.
+			4,
+			8,
+			16,
+			32,
+			64,
+			128)):VECTOR[,BYTE];
+
+GLOBAL ROUTINE dump$dump_file: NOVALUE=
+BEGIN
+!
+! This routine is the driver for file dumping.
+!
+LOCAL
+    status : BLOCK[4,BYTE],
+    bufdesc : BBLOCK[dsc$c_s_bln],
+    subdesc : BBLOCK[dsc$c_s_bln];		! This desc is used to point to
+						! each individual BLOCK/RECORD in bufdesc
+
+
+dump$fao_setup();				! Set up fao control string
+linesthispage = .dump$gl_lpp;			! Force new page
+
+
+IF .dump$gl_flags[dump$v_header]		! If /HEADER specified
+THEN
+    BEGIN
+    dump$header();				! Dump the header
+    linesthispage = .dump$gl_lpp;		! Force new page
+    END;
+
+
+! Read and dump the file.
+!
+WHILE true DO
+    BEGIN
+    dump$gl_record = .dump$gl_record + 1;	! Increment unit counter
+    IF (NOT .BBLOCK[dump$gl_ifab[fab$l_dev], dev$v_rnd]	! If not disk
+    OR .dump$gl_flags[dump$v_records])		! or record mode
+    AND .dump$gl_record GTRU .dump$gl_max_block	! Stop if already dumped last
+	THEN RETURN;				! needed block
+    status = dump$read(bufdesc);
+    IF .status EQL ss$_endoffile THEN EXITLOOP;
+    IF NOT .BBLOCK[dump$gl_ifab[fab$l_dev], dev$v_rnd]	! If not disk
+    OR .dump$gl_flags[dump$v_records]			! or record mode
+    THEN
+	BEGIN
+	IF .dump$gl_record GEQU .dump$gl_cur_block	! In range to be dumped
+	THEN
+	    BEGIN
+	    IF NOT .dump$gl_flags[dump$v_records]
+		THEN linesthispage = .dump$gl_lpp;	! Force new page
+	    dump$dump_buffer(bufdesc, .status, false);	! Dump entire block
+	    END
+	END
+    ELSE
+	WHILE .bufdesc[dsc$w_length] GTRU 0 DO		! Dump all blocks
+	    BEGIN
+	    subdesc[dsc$w_length] = MINU(512, .bufdesc[dsc$w_length]);
+	    subdesc[dsc$a_pointer] = .bufdesc[dsc$a_pointer];
+	    linesthispage = .dump$gl_lpp;
+	    dump$dump_buffer(subdesc, .status, false);		! Dump a block
+	    status = ss$_normal;
+	    bufdesc[dsc$w_length] = .bufdesc[dsc$w_length] -
+		.subdesc[dsc$w_length];	
+	    bufdesc[dsc$a_pointer] = .bufdesc[dsc$a_pointer] +
+		.subdesc[dsc$w_length];	
+	    END;
+    END;
+END;
+
+ROUTINE dump$fao_setup: NOVALUE=
+BEGIN
+!
+! This routine sets up the FAO control string.  It also
+! calculates the mode and entry widths.
+!
+LOCAL
+    entry;
+
+entry = 0;						! used for entry size calc.
+dumpmode = 0;
+entrysize = 4;						! Assume longword...
+
+IF .dump$gl_flags[dump$v_decimal]
+THEN
+    modeindex = 3
+ELSE IF .dump$gl_flags[dump$v_octal]
+THEN
+    modeindex = 6
+ELSE
+    modeindex = 0;				! Default to hex dump
+
+
+IF .dump$gl_flags[dump$v_word]
+THEN
+    BEGIN
+    entrysize = 2;
+    dumpmode = 1;
+    modeindex = .modeindex + 1;
+    END
+ELSE IF .dump$gl_flags[dump$v_byte]
+THEN
+    BEGIN
+    entrysize = 1;
+    dumpmode = 2;
+    modeindex = .modeindex + 2;
+    END;
+
+
+! Find entries per line and make it the nearest lower power of 2.
+!
+entsperline = ((.dump$gl_width - 5)/(.sizetbl[.modeindex]+.entrysize)) AND NOT 1;
+
+IF .entsperline GTR 64					! Make sure entsperline is reasonable
+THEN SIGNAL_STOP(dump$_facility^16 + shr$_badlogic + sts$k_severe);
+
+WHILE .entsperline GEQ .sizetable[.entry]		! Find nearest larger power of 2
+    DO entry = .entry + 1;				! from entsperline.
+
+entsperline = .sizetable[.entry-1];			! Make entsperline nearest lower
+							! power of two.
+dumpwidth = .entsperline*(.sizetbl[.modeindex] + .entrysize) + 8;
+
+faoctrdesc[dsc$w_length] = max_fao_size;
+SYS$FAO(
+    $descriptor('!!!ZL(!AC) !!!ZLAF !!!AC'),
+    faoctrdesc,
+    faoctrdesc,
+    .entsperline,
+    .faotable[.modeindex],
+    .entsperline * .entrysize,
+    .offtable[.modeindex/3]);
+
+
+! Set up FAO control string to be used for partial lines.
+!
+SYS$FAO(
+    $descriptor('!!!!!!ZL(!AC) !!!!!ZLAF !!!!!AC'),
+    plinfaodesc,
+    plinfaodesc,
+    .faotable[.modeindex],
+    .entsperline * .entrysize,
+    .offtable[.modeindex/3]);
+END;
+
+ROUTINE dump$put_header(bufdesc,header): NOVALUE=
+BEGIN
+MAP
+    bufdesc : REF BBLOCK;
+
+
+IF
+    BEGIN
+    IF .dump$gl_flags[dump$v_records]
+    THEN
+	.linesthispage + 4 GEQ .dump$gl_lpp
+    ELSE
+	true
+    END
+THEN
+    dump$new_page()
+ELSE
+    dump$blank_line();
+
+
+IF NOT .header						! Not dumping header
+THEN
+    dump$output_getmsg(
+	(IF .dump$gl_flags[dump$v_records]
+	    THEN dump$_recno
+	ELSE IF NOT .BBLOCK[dump$gl_ifab[fab$l_dev], dev$v_rnd]
+	    THEN dump$_bn
+	ELSE IF .BBLOCK[dump$gl_ifab[fab$l_dev], dev$v_for]
+	    THEN dump$_lbn
+	    ELSE dump$_vbn),
+	%B'0001',
+	.dump$gl_record,
+	.bufdesc[dsc$w_length])
+ELSE
+    dump$output_getmsg(dump$_header, %B'0001');
+
+dump$blank_line();
+END;
+
+GLOBAL ROUTINE dump$new_page: NOVALUE=
+BEGIN
+!
+! Output a new page
+!
+linesthispage = 0;				! Reset count of lines/page
+dump$write($descriptor(%CHAR(%O'014')));	! Output a form feed
+IF .BBLOCK[dump$gl_ifab[fab$l_dev], dev$v_for]
+OR NOT .BBLOCK[dump$gl_ifab[fab$l_dev], dev$v_fod]
+THEN
+    BEGIN					! Output "dump of device"
+    dump$output_getmsg(
+	dump$_dumpodev,
+	%B'0001',
+	dump$gl_idesc,
+	dump$gq_time);
+    END
+ELSE
+    BEGIN					! Output "dump of file"
+    dump$output_getmsg(
+	dump$_dumpofil,
+	%B'0001',
+	dump$gl_idesc,
+	dump$gq_time);
+    IF .BBLOCK[dump$gl_ifab[fab$l_dev], dev$v_rnd]
+    THEN
+	dump$output_getmsg(			! File ID and size
+	    dump$_fildnt,
+	    %B'0001',
+	    .dump$gl_inam[nam$w_fid_num] + .dump$gl_inam[nam$b_fid_nmx]^16,
+	    .dump$gl_inam[nam$w_fid_seq],
+	    .dump$gl_inam[nam$b_fid_rvn],
+	    .dump$gl_file_efblk,
+	    .dump$gl_file_hiblk);
+    END;
+
+dump$blank_line();
+END;
+
+GLOBAL ROUTINE dump$output_getmsg(messageid,messageflags,args): NOVALUE=
+BEGIN
+!
+! Routine to do a $GETMSG and then FAO and output it.
+!
+! Inputs:
+!
+!	messageid	id of message
+!	messageflags	flags for GETMSG
+!	args		first of n args
+!
+LOCAL
+    status,
+    outbuf : BBLOCK[dump$c_maxlisiz],
+    outbufdesc : BBLOCK[dsc$c_s_bln],
+    faoctrbuf : BBLOCK[dump$c_maxlisiz],
+    faoctrdesc : BBLOCK[dsc$c_s_bln];
+
+
+CH$FILL(0,dsc$c_s_bln,faoctrdesc);
+CH$FILL(0,dsc$c_s_bln,outbufdesc);
+faoctrdesc[dsc$w_length] = dump$c_maxlisiz;
+faoctrdesc[dsc$a_pointer] = faoctrbuf;
+outbufdesc[dsc$w_length] = dump$c_maxlisiz;
+outbufdesc[dsc$a_pointer] = outbuf;
+
+
+status = $GETMSG(
+    msgid=.messageid,
+    msglen=faoctrdesc,
+    bufadr=faoctrdesc,
+    flags=.messageflags);
+IF NOT .status
+THEN
+    SIGNAL_STOP(dump$_facility^16 + shr$_badlogic + sts$k_severe);
+
+
+status = $FAOL(
+    ctrstr=faoctrdesc,
+    outbuf=outbufdesc,
+    outlen=outbufdesc,
+    prmlst=args);
+IF NOT .status
+THEN
+    SIGNAL_STOP(dump$_facility^16 + shr$_badlogic + sts$k_severe);
+
+
+dump$put_line(outbufdesc);
+END;
+
+GLOBAL ROUTINE dump$blank_line: NOVALUE=
+BEGIN
+!
+! Write blank line to listing file.
+!
+dump$put_line($descriptor(''));
+END;
+
+GLOBAL ROUTINE dump$put_line(desc): NOVALUE=
+BEGIN
+!
+! This routine forces a page break if the lines per page is
+! about to be exceeded, provided that the device is a disk.
+!
+IF .linesthispage GEQ .dump$gl_lpp		! If lines per page exceeded
+AND .BBLOCK[dump$gl_ifab[fab$l_dev], dev$v_rnd]	! device is disk
+THEN
+    dump$new_page();				! then new page
+
+
+dump$write(.desc);
+linesthispage = .linesthispage + 1;
+END;
+
+GLOBAL ROUTINE dump$dump_buffer(bufdesc,status,header): NOVALUE=
+BEGIN
+!
+! This routine does all the work of dumping the buffer.
+!
+MAP
+    bufdesc : REF BBLOCK[dsc$c_s_bln];
+BIND
+    buffer = .bufdesc[dsc$a_pointer] : VECTOR[,BYTE];
+LOCAL
+    tempbuffer : BBLOCK[512],
+    tempdesc : BBLOCK[dsc$c_s_bln],
+    tempfaobuf : BBLOCK[max_fao_size],
+    additional,
+    padbytes,
+    bufferpointer,
+    faopointer,
+    number,
+    bytesperline,
+    bytesleft,
+    entsinbuf;
+
+faopointer = faoctrdesc;				! Assume full line
+dump$put_header(.bufdesc, .header);
+IF NOT .status
+THEN
+    BEGIN
+    dump$output_getmsg(.status, %B'1111');		! Put out error status
+    dump$blank_line();
+    END;
+
+IF NOT .header
+AND .dump$gl_flags[dump$v_file_header]
+AND .bufdesc[dsc$w_length] EQL 512
+THEN
+    IF dump$one_header(.bufdesc[dsc$a_pointer])
+    THEN
+	RETURN;
+
+
+number = 0;						! Local index number
+bytesperline = .entsperline*.entrysize;
+entsinbuf = ((.bufdesc[dsc$w_length]+.entrysize-1)
+			AND NOT (.entrysize-1))/.entrysize;
+bytesleft = .bufdesc[dsc$w_length];
+IF NOT .dump$gl_flags[dump$v_number]			! If /NUMBER not used,
+THEN dump$gl_number = 0;				! start each at zero
+
+WHILE .entsinbuf GTR 0 DO
+    BEGIN
+    IF .bytesleft LSSU .bytesperline
+    THEN
+	BEGIN
+	CH$COPY(.bytesleft,buffer[.number],0,.bytesperline,tempbuffer);	! Copy partial line, zero fill to end
+	tempdesc[dsc$w_length] = max_fao_size;					! Set up work area for partial lines
+	tempdesc[dsc$a_pointer] = tempfaobuf;
+	SYS$FAO(plinfaodesc,tempdesc,tempdesc,.entsinbuf);			! Set up fao with # of entries for partial line
+	faopointer = tempdesc;							! Use this fao control string instead
+	bufferpointer = tempbuffer;
+	dump$gl_outdesc[dsc$w_length] = .dump$gl_width;				! Set output length to default value
+	dump$fao_line(.bufferpointer,.entsperline,.entrysize,			! Format the output line
+		.dump$gl_number,.entsinbuf,.dumpmode,.faopointer,dump$gl_outdesc);
+
+
+	! Now that the partial line is ready to be written, suppress any
+	! leading zeros.
+	!
+	! NOTE: Due to  the fact that RMS does reads on WORD offsets, the first
+	!	leading byte of zeros will not be replaced if the dump is in
+	!	block mode and ends up on a byte offset.
+	!
+	additional = 0;
+	padbytes = .dumpwidth - .dump$gl_outdesc[dsc$w_length];		! Calculate padding (word offset)
+	IF NOT .dump$gl_flags[dump$v_decimal]				! If HEX or OCTAL dump
+	THEN
+	    BEGIN							! calculate further padding if necessary
+	    IF (additional = .bytesleft MOD .entrysize) GTR 0		! Find additional offset
+	    THEN additional = (.entrysize - .additional) * 		! Customize it to type of dump
+				   .charsperbyte[.modeindex/3] + 1;
+	    padbytes = .padbytes + .additional;
+	    END;
+
+	CH$MOVE(.dump$gl_outdesc[dsc$w_length] - .additional,
+		.dump$gl_outdesc[dsc$a_pointer] + .additional,
+		.dump$gl_outdesc[dsc$a_pointer] + .padbytes);
+	CH$FILL(%C' ',.padbytes,.dump$gl_outdesc[dsc$a_pointer]);	! Move blanks to pad areas
+	dump$gl_outdesc[dsc$w_length] = .dumpwidth;			! Set output length to
+	END								! device type.
+    ELSE
+	BEGIN
+	bufferpointer = buffer[.number];				! Dump full line
+	dump$gl_outdesc[dsc$w_length] = .dump$gl_width;			! Set output length to default value
+	dump$fao_line(.bufferpointer,.entsperline,.entrysize,		! Format the output line
+		.dump$gl_number,.entsinbuf,.dumpmode,.faopointer,dump$gl_outdesc);
+	END;
+
+    dump$put_line(dump$gl_outdesc);					! Put line out to device
+    number = .number + .bytesperline;				! Calculate next index
+    IF .dump$gl_flags[dump$v_number]					! If /NUMBER qualifier used
+    THEN
+	dump$gl_number = .dump$gl_number + .bytesperline		! then keep cumulative index,
+    ELSE
+	dump$gl_number = .number;					! else make index local
+    entsinbuf = .entsinbuf - .entsperline;				! Update # of entry's in buffer
+    bytesleft = .bytesleft - (.entsperline*.entrysize);			! Calculate how many bytes left in buffer
+    END;
+END;
+
+END
+ELUDOM

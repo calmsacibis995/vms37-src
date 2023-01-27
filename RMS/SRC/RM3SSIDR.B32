@@ -1,0 +1,606 @@
+MODULE RM3SSIDR (LANGUAGE (BLISS32) ,
+		IDENT = 'V03-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:	RMS32 INDEX SEQUENTIAL FILE ORGANIZATION
+!
+! ABSTRACT:
+!                search thru a sidr array and return the 1st non-deleted rec
+!
+!
+! ENVIRONMENT:
+!
+!		VAX/VMS OPERATING SYSTEM
+!
+!--
+
+!
+! AUTHOR:        Wendy Koenig     CREATION DATE:        	1-MAY-78  14:42
+!
+!
+! MODIFIED BY:
+!
+!	V02-010	MCN0007		Maria del C. Nasr	27-Apr-1981
+!		Change calling sequence of RM$FIND_BY_RRV.
+!
+!	V02-009	MCN0006		Maria del C. Nasr	13-Mar-1981
+!		Increase size of the record identifier to a word in the IRB,
+!		NRP, and RLB internal structures.
+!
+!	V02-008	REFORMAT	Keith B. Thompson	23-Jul-1980
+!
+! REVISION HISTORY:
+!
+!	Wendy Koenig, 	21-AUG-78  13:03
+!	X0002 - don't release bucket on rnf error from FIND_BY_RRV
+!
+!	Wendy Koenig, 	18-OCT-78  11:00
+!	X0003 - rnf from follow_ptr should be a bug error
+!
+!	Wendy Koenig, 	24-OCT-78  14:03
+!	X0004 - make changes caused by sharing conventions
+!
+!	Wendy Koenig, 	5-DEC-78  10:26
+!	X0005 - don't return dct field
+!
+!	Wendy Koenig, 	11-DEC-78  13:19
+!	X0006 - get rid of version 2 stuff
+!
+!	Christian Saether, 	9-JAN-79  12:02
+!	X0007 - do not fix sidr-data mismatches if sharing (bucket not locked)
+!
+!*****
+
+LIBRARY 'RMSLIB:RMS';
+
+REQUIRE 'RMSSRC:RMSIDXDEF';
+
+!
+! define default psects for code
+!
+
+PSECT
+    CODE = $$RMS3(PSECT_ATTR),
+    PLIT = $$RMS3(PSECT_ATTR);
+
+!
+! Linkages
+
+LINKAGE
+    L_GETNEXT_REC,
+    L_CSEARCH_TREE,
+    L_RECORD_VBN,
+    L_SEARCH_SIDR,
+    L_RLSBKT,
+    L_COMPARE_REC,
+    L_FIND_BY_RRV;
+
+!
+!
+! Forward Routines
+!
+!
+! External Routines
+
+EXTERNAL ROUTINE
+    RM$GETNEXT_REC	: RL$GETNEXT_REC,
+    RM$CSEARCH_TREE	: RL$CSEARCH_TREE,
+    RM$RECORD_VBN	: RL$RECORD_VBN,
+    RM$RLSBKT		: RL$RLSBKT,
+    RM$COMPARE_REC	: RL$COMPARE_REC,
+    RM$FIND_BY_RRV	: RL$FIND_BY_RRV;
+
+!
+
+LINKAGE
+    RL$FOLLOW_PTR 	= JSB (REGISTER = 3) : GLOBAL (COMMON_RABREG,
+	R_REC_ADDR, R_IDX_DFN);
+
+
+ROUTINE RM$FOLLOW_PTR (KEY_ADDR) : RL$FOLLOW_PTR =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+! this is a routine to follow the pointer out of a sidr
+!
+! CALLING SEQUENCE:
+!	BSBW RM$FOLLOW_PTR (KEY_ADDR)
+!
+! INPUT PARAMETERS:
+!	KEY_ADDR - pointer to the key in the sidr
+!
+! IMPLICIT INPUTS:
+!	COMMON RAB REGISTERS --
+!		RAB, IRAB, IFAB, IMPURE AREA address
+!		INDEX DESCRIPTOR and RECORD ADDRESS
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	if the data record is gotten successfully,
+!	REC_ADDR points to the data record
+!	otherwise REC_ADDR points back to the sidr entry
+!
+! ROUTINE VALUE:
+!	suc or del or some i/o errors
+!
+! SIDE EFFECTS:
+!	if the data record is o.k., its bucket is accessed and it
+!	is described by curbdb, rec_addr, and the rp data otherwise,
+!	the data bucket is released and curbdb describes the accessed sidr
+!	on a hard i/o error, the data bkt is released and nxtbdb describes the
+!	accessed sidr the rfa information is set up (i.e. the nxtbdb and
+!	rfa_vbn)
+!	NOTE: rfa_id is not set up since it is easier for the caller to do that
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_RAB_STR,
+	R_IDX_DFN_STR,
+	R_REC_ADDR_STR;
+
+    LOCAL
+	SAVE_REC_ADDR	: REF BBLOCK;
+
+    SAVE_REC_ADDR = .REC_ADDR;			! in case of deleted rec
+
+    IF NOT (.REC_ADDR[IRC$V_DELETED]
+	OR
+	.REC_ADDR[IRC$V_KEYDELETE])
+    THEN
+
+	! the deleted bits in the SIDR record were not on hopefully the record
+	! itself isn't deleted set up the rfa information (pertaining to the
+	! SIDR record) before losing it & go get the data record itself. if it
+	! is deleted, keep looking for the next 1 on any other error, return it
+	!
+	!
+	BEGIN
+
+	LOCAL
+	    STATUS;
+
+	BUILTIN
+	    AP;
+
+	IRAB[IRB$L_RFA_VBN] = .BBLOCK[.IRAB[IRB$L_CURBDB], BDB$L_VBN];
+	IRAB[IRB$L_NXTBDB] = .IRAB[IRB$L_CURBDB];
+	AP = 2;
+
+	IF STATUS = RM$FIND_BY_RRV(RM$RECORD_VBN(), .REC_ADDR[IRC$B_ID], 0)
+	THEN
+	    BEGIN
+
+	    ! if the keys match, we've got the right record (set level to -1 to
+	    ! signal compare_rec that this is a user data record even though
+	    ! this isn't a primary key) if no match, set the keydeleted bit in
+	    ! the sidr ptr if the file is write accessed
+	    !
+
+	    LOCAL
+		REC_SIZE	: WORD;
+
+	    ! assume fixed len records until proven otherwise
+	    !
+	    REC_SIZE = .IFAB[IFB$W_LRL];
+
+	    IF .IFAB[IFB$B_RFMORG] NEQ FAB$C_FIX
+	    THEN
+		BEGIN
+
+		IF .REC_ADDR[IRC$V_NOPTRSZ]
+		THEN
+		    REC_SIZE = .(.REC_ADDR + 2)<0, 16>
+		ELSE
+		    REC_SIZE = .(.REC_ADDR + .REC_ADDR[IRC$V_PTRSZ] + 5)<0,16>
+		END;
+
+	    IF .REC_SIZE GEQU .IDX_DFN[IDX$W_MINRECSZ]
+	    THEN
+		BEGIN
+
+		IF ( NOT RM$COMPARE_REC(.KEY_ADDR, .IDX_DFN[IDX$B_KEYSZ], -1))
+		THEN
+		    RETURN RMSSUC()
+		END;
+
+	    BEGIN
+
+	    GLOBAL REGISTER
+		R_BDB_STR;
+
+	    RELEASE(IRAB[IRB$L_CURBDB]);
+	    END;
+
+	    IF .BBLOCK[.IRAB[IRB$L_IFAB_LNK], IFB$V_WRTACC]
+
+		! only fix this up and mark the bucket dirty if not sharing as
+		! this bucket was not read with a lock
+		!
+		AND
+		.BBLOCK[.IRAB[IRB$L_IFAB_LNK], IFB$L_FRB_PTR] EQL 0
+	    THEN
+		BEGIN
+		SAVE_REC_ADDR[IRC$V_KEYDELETE] = 1;
+		SAVE_REC_ADDR[IRC$B_ID] = 0;
+		BBLOCK[.IRAB[IRB$L_NXTBDB], BDB$V_DRT] = 1;
+		END;
+
+	    END			! { find_by_rrv returned successfully }
+	ELSE
+	    BEGIN
+
+	    IF .STATUS<0, 16> NEQ RMSERR(DEL)
+	    THEN
+		RETURN .STATUS;
+
+	    ! mark the record as deleted in the sidr, if write accessed
+	    ! and not sharing the file
+	    !
+
+	    IF .BBLOCK[.IRAB[IRB$L_IFAB_LNK], IFB$V_WRTACC]
+		AND
+		.BBLOCK[.IRAB[IRB$L_IFAB_LNK], IFB$L_FRB_PTR] EQL 0
+	    THEN
+		BEGIN
+		SAVE_REC_ADDR[IRC$V_DELETED] = 1;
+		BBLOCK[.IRAB[IRB$L_NXTBDB], BDB$V_DRT] = 1;
+		END;
+
+	    END;		! { find_by_rrv return an error status }
+
+	!	 restore curbdb, nxtbdb is no longer relevant, so zero it
+	!
+	IRAB[IRB$L_CURBDB] = .IRAB[IRB$L_NXTBDB];
+	IRAB[IRB$L_NXTBDB] = 0;
+	END;					! { of is it deleted ? }
+
+    ! if we got this far, the record was deleted, so restore rec_addr into the
+    ! sidr
+    !
+    REC_ADDR = .SAVE_REC_ADDR;
+    RETURN RMSERR(DEL);
+
+    END;					! {  of routine }
+
+
+GLOBAL ROUTINE RM$SEARCH_SIDR : RL$SEARCH_SIDR =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	searches thru the SIDR array, determining its starting pos by SAVE_POS
+!	to find the 1st non-deleted record
+!
+! CALLING SEQUENCE:
+!	BSBW RM$SEARCH_SIDR()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	REC_ADDR -- address of SIDR within bucket
+!	IDX_DFN  -- address of index descriptor describing key
+!	IRAB     -- address of IRAB
+!	    in IRAB --
+!		SAVE_POS -- number in SIDR array at which to start search
+!		CURBDB -- current bdb associated with bucket
+!		KEYBUF2 -- address of key
+!		    ( actually KEYBUF and KBUFSZ in IFAB to get KEYBUF2)
+!		KEYSZ -- size of key in KEYBUF2
+!		PRM bit -- indicates whether permanence should be set
+!			in BDB of sidr
+!
+! OUTPUT PARAMETERS:
+!
+! IMPLICIT OUTPUTS:
+!	REC_ADDR -- points to data record
+!	in IRAB --
+!		RFA_VBN, RFA_ID, SAV_POS --
+!			information describing SIDR array record
+!		NXTBDB -- bdb corresponding to RFA information
+!		CURBDB -- current bdb corresponding to REC_ADDR
+!
+! ROUTINE VALUE:
+!	SUC and RNF
+!
+! SIDE EFFECTS:
+!	AP and R0-R3 are destroyed
+!	on success, data bucket is accessed
+!	on all errors, it will have been released
+!	in all cases except a rnf error, the sidr bucket was released
+!	and may have been marked as dirty and/or permanent
+!
+! NOTE: the "dup_pos" count refers only to those entries in the
+! sidr w/ pointers (i.e. the noptrsz bit is off)
+! this includes all non-deleted records and deleted records from version 1
+! and records which were deleted by fast delete and then identified by this routine
+! the only exception to this at this time are records deleted by rms-11 version 2
+! which leaves a token ( 1 byte) around and compresses out the pointer
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_RAB_STR,
+	R_IDX_DFN_STR,
+	R_REC_ADDR_STR;
+
+    LOCAL
+	SIDR_POS	: WORD,
+	END_OF_SIDR,
+	BEG_SIDR	: REF BBLOCK;
+
+    LABEL
+	SEEK_START,
+	SEEK_NEXT;
+
+    ! execute the same searching algorithm twice
+    !	once, to terminate when the starting position,
+    !		as signaled by SAVE_POS, is found
+    !	the second time, to terminate when the next non-deleted record is found
+    !		this includes checking the deleted bit in the SIDR record
+    !		and also in the data record itself
+    !
+    ! if this is version 2 and duplicates are not allowed, simplify your life
+    !
+    ! IF (.IFAB [IFB$B_PLG_VER] EQL PLG$C_VER_IDX)
+    !	AND NOT .IDX_DFN [IDX$V_DUPKEYS]
+    ! THEN
+    !	BEGIN
+    !	WHILE 1 DO
+    !	    BEGIN
+    !	    LOCAL STATUS;
+    !	    IRAB [IRB$W_RFA_ID] = .REC_ADDR [IRC$B_ID];
+    !
+    !	    IF STATUS = RM$FOLLOW_PTR (.REC_ADDR + .REC_ADDR [IRC$V_PTRSZ] + 5)
+    !	    THEN
+    !		BEGIN
+    !		GLOBAL REGISTER R_BDB_STR;
+    !		BDB = .IRAB [IRB$L_NXTBDB];
+    !
+    !		IF .IRAB [IRB$V_PRM]
+    !		THEN
+    !		    BDB [BDB$V_PRM] = 1;
+    !		RM$RLSBKT(0);
+    !		IRAB [IRB$V_PRM] = 0;
+    !		RETURN RMSSUC()
+    !		END;
+    !
+    !	    IF .STATUS<0,16> NEQ RMSERR(DEL)
+    !	    THEN
+    !		BEGIN
+    !		GLOBAL REGISTER R_BDB_STR;
+    !
+    !		IF .STATUS<0,16> EQL RMSERR(RNF)
+    !		THEN
+    !		    BEGIN
+    !		    IRAB [IRB$L_CURBDB] = .IRAB [IRB$L_NXTBDB];
+    !		    IRAB [IRB$L_NXTBDB] = 0
+    !		    END
+    !		ELSE
+    !		    RELEASE (IRAB [IRB$L_NXTBDB]);
+    !		IRAB [IRB$V_PRM] = 0;
+    !		RETURN .STATUS
+    !		END;
+    !	    IRAB [IRB$V_NORLS_RNF] = 1;
+    !	    RETURN_ON_ERROR (RM$CSEARCH_TREE());
+    !	END; ! { while }
+    ! END; ! { of version 2 and no dups }
+    !
+    ! set up sidr_pos to be a temporary copy of SAVE_POS which can be
+    ! altered	across buckets
+    !
+    SIDR_POS = .IRAB[IRB$W_SAVE_POS];
+
+    !
+    !
+SEEK_START :
+    BEGIN
+
+    WHILE 1
+    DO
+	BEGIN
+	IRAB[IRB$W_SAVE_POS] = 0;
+	BEG_SIDR = .REC_ADDR;
+	RM$GETNEXT_REC();
+	END_OF_SIDR = .REC_ADDR;
+	REC_ADDR = .BEG_SIDR + 4 + .IDX_DFN[IDX$B_KEYSZ];
+
+	IF NOT .BEG_SIDR[IRC$V_NOPTRSZ]
+	THEN
+	    REC_ADDR = .REC_ADDR + .BEG_SIDR[IRC$V_PTRSZ] + 3;
+
+	WHILE .REC_ADDR LSSU .END_OF_SIDR
+	DO
+	    BEGIN
+
+	    IF .IRAB[IRB$W_SAVE_POS] EQL .SIDR_POS
+	    THEN
+		LEAVE SEEK_START;
+
+	    IF .REC_ADDR[IRC$V_NOPTRSZ]
+	    THEN
+		REC_ADDR = .REC_ADDR + 1
+	    ELSE
+		(REC_ADDR = .REC_ADDR + .REC_ADDR[IRC$V_PTRSZ] + 4;
+		IRAB[IRB$W_SAVE_POS] = .IRAB[IRB$W_SAVE_POS] + 1);
+
+	    END;			! { of still in same sidr bucket }
+
+	! rec_addr is equal to end_of_sidr since we left the while loop
+	! don't let it release the bkt on a rnf error
+	!
+	IRAB[IRB$V_NORLS_RNF] = 1;
+
+	RETURN_ON_ERROR (RM$CSEARCH_TREE(),
+	    BEGIN
+	    (IRAB[IRB$V_PRM] = 0)
+	    END);
+
+	SIDR_POS = .SIDR_POS - .IRAB[IRB$W_SAVE_POS];
+	END;		!  { while we still haven't found our position }
+
+    END;					! {seek_start}
+SEEK_NEXT :
+    BEGIN
+
+    WHILE 1
+    DO
+	BEGIN
+
+	! ***** don't return dct field as it is not supported but leave the
+	! code here in case someone wants it later if there is a pointer size
+	! in the sidr AND this is not a position for insert (i.e. it is a get
+	! or find) AND the access mode is key, then return the duplicates count
+	! field to the user
+	!
+	!	IF NOT .BEG_SIDR [IRC$V_NOPTRSZ]
+	!	THEN
+	!	    BEGIN
+	!
+	!	    IF (.RAB [RAB$B_RAC] EQL RAB$C_KEY)
+	!		AND (NOT .IRAB [IRB$V_POSINSERT])
+	!	    THEN
+	!		RAB [RAB$L_DCT] = .(.BEG_SIDR + 2)<0,8 * 
+	!			(3 + .BEG_SIDR [IRC$V_PTRSZ])>;
+	!	    END;
+	!
+
+	WHILE .REC_ADDR LSSU .END_OF_SIDR
+	DO
+	    BEGIN
+
+	    LOCAL
+		STATUS;
+
+	    IRAB[IRB$W_RFA_ID] = .BEG_SIDR[IRC$B_ID];
+	    STATUS = RM$FOLLOW_PTR(.BEG_SIDR + 4 + (
+
+		IF NOT .BEG_SIDR[IRC$V_NOPTRSZ]
+		THEN
+		    .BEG_SIDR[IRC$V_PTRSZ] + 3));
+
+	    IF .STATUS
+	    THEN
+		LEAVE SEEK_NEXT;
+
+	    IF .STATUS<0, 16> NEQ RMSERR(DEL)
+	    THEN
+		BEGIN
+
+		GLOBAL REGISTER
+		    R_BDB_STR;
+
+		RELEASE(IRAB[IRB$L_NXTBDB]);
+		IRAB[IRB$V_PRM] = 0;
+
+		! returning rnf to pos_seq will cause it to keep looking and it
+		! will loop so make it a bug error instead
+		!
+
+		IF .STATUS<0, 16> EQL RMSERR(RNF)
+		THEN
+		    (STATUS = RMSERR(BUG);
+		    RAB[RAB$L_STV] = RMSERR(RNF));
+
+		RETURN .STATUS
+		END;
+
+	    ! if data record is marked deleted, get back into sidr & go on to
+	    ! next 1 if sidr entry is marked deleted ( noptrsz is set) and
+	    ! record consists of solely the control byte
+	    !
+
+	    IF .REC_ADDR[IRC$V_NOPTRSZ]
+	    THEN
+		REC_ADDR = .REC_ADDR + 1
+	    ELSE
+		BEGIN
+		REC_ADDR = .REC_ADDR + .REC_ADDR[IRC$V_PTRSZ] + 4;
+		IRAB[IRB$W_SAVE_POS] = .IRAB[IRB$W_SAVE_POS] + 1
+		END;
+
+	    END;			! { of still in same sidr bucket }
+
+	! rec_addr is equal to end_of_sidr since we left the while loop
+	! don't let it release the bkt on a rnf error
+	!
+	IRAB[IRB$V_NORLS_RNF] = 1;
+
+	RETURN_ON_ERROR (RM$CSEARCH_TREE(),
+	    BEGIN
+	    (IRAB[IRB$V_PRM] = 0)
+	    END);
+
+	IRAB[IRB$W_SAVE_POS] = 0;
+	BEG_SIDR = .REC_ADDR;
+	RM$GETNEXT_REC();
+	END_OF_SIDR = .REC_ADDR;
+	REC_ADDR = .BEG_SIDR + 4 + .IDX_DFN[IDX$B_KEYSZ];
+
+	IF NOT .BEG_SIDR[IRC$V_NOPTRSZ]
+	THEN
+	    REC_ADDR = .REC_ADDR + .BEG_SIDR[IRC$V_PTRSZ] + 3;
+
+	END;		!  { while we still haven't found our position }
+
+    END;					! {seek_next}
+
+    ! found the next non-deleted record release the sidr bucket and return
+    !
+    !
+    BEGIN
+
+    GLOBAL REGISTER
+	R_BDB_STR;
+
+    BDB = .IRAB[IRB$L_NXTBDB];
+
+    IF .IRAB[IRB$V_PRM]
+    THEN
+	BDB[BDB$V_PRM] = 1;
+
+    RM$RLSBKT(0)
+    END;
+    IRAB[IRB$V_PRM] = 0;
+    RETURN RMSSUC();
+
+    END;
+
+END
+
+ELUDOM

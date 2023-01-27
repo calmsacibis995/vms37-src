@@ -1,0 +1,438 @@
+MODULE TINPUT(IDENT='V03-000') =
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!++
+! FACILITY: EDT version 2
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This module handles terminal input for change mode and keypad
+!	mode of EDT.  Two routines are provided:
+!	
+!		1. A routine to read a single character without echo.
+!
+!		2. A routine to read do multi-character reads, which
+!		   handles the delete and control-u functions, and echos
+!		   the read.
+!	
+!	All terminal input is buffered, and every 16 characters, a record
+!	is written to the audit trail file.
+!
+! ENVIRONMENT: User mode, sharable
+!
+! AUTHOR: Bob Kushlis, CREATION DATE:  9-JUN-1979
+!
+! MODIFIED BY:
+!
+! Bob Kushlis, 2-JUL-1979
+!	Make the TI_E_POS global
+!
+! Bob Kushlis, 16-JUL-1979
+!	Remove the cursor position from the TI_CHAR routine,
+!	Leave cursor on message line during promted input.
+!	Change delete to use the <BS> <SPACE> <BS> sequence.
+!
+! Bob Kushlis, 5-AUG-1979
+!	Update P_COL when echoing is done.
+!
+! Bob Kushlis, 5-AUG-1979
+!	Turn off auto-repeat immediately after receiving an escape.
+!--
+
+BEGIN
+LIBRARY 'EDT';
+
+PSECTS
+
+
+EXTERNAL
+    TI_E_FLAG,				! Flag indicating character have been echoed
+    TI_E_POS,				! Position on the echo line
+    TI_BUF_POS,				! Position in journal output buffer
+    TI_CBUF : BLOCK[CH$ALLOCATION(16)],	! The journal output buffer
+    TI_LPOINT,				! Pointer into journal input buffer
+    TI_LLEN,				! Length of journal input record
+    TI_REC_BUF,				! Journal input record buffer
+    TI_LEND;				! Pointer to end of journal input buffer
+
+EXTERNAL ROUTINE
+    K_TRAN_CHAR,
+    IO_GET,
+    IO_TRY,
+    SC_CURSOR,
+    SC_E_LINE,
+    C_CHECK_CC,
+    IO_WTU,
+    E_PUT_AUDIT,
+    E_S_AUDIT,
+    F_CHAR,
+    F_PUT,
+    F_LITERAL,
+    IO_GC;
+
+EXTERNAL
+    E_RECOVER,				! Recovery mode flag
+    E_T_TYPE,				! Terminal type
+    K_REPT,				! Auto repeat flag
+    SY_COM_RAB,				! Journal file RAB
+    C_BUF,				! Command line buffer
+    P_COL,				! Previous cursor column
+    K_RAH,				! Type ahead flag
+    K_RAC;				! Character from type-ahead
+
+LITERAL
+    DEL		= 127,
+    CTRL_U	= 'U' - '@',
+    CTRL_Z	= 'Z' - '@',
+    ESC		= 27,
+    BS		= 8,
+    COMMAND_LINE= 23;
+
+!
+! Sequences to turn auto-repeat on and off on VT100 terminals.
+!
+BIND  NO_REPT = UPLIT(%STRING(%CHAR(ESC),'[?8l')),
+      AUTO_REPT = UPLIT(%STRING(%CHAR(ESC),'[?8h'));
+
+!+
+! This routine writes out the contents of the journal output buffer
+! to the journal file and resets the buffer pointer.
+!-
+
+GLOBAL ROUTINE TI_CLEAR_AUDIT : NOVALUE =
+IF .TI_BUF_POS NEQ 0 THEN
+   BEGIN
+   E_PUT_AUDIT(TI_CBUF,.TI_BUF_POS);
+   TI_BUF_POS = 0;
+   END;
+
+!+
+! This routine saves a character for the journal file.  If the journal
+! output buffer is full, then it is written out, then the character
+! is placed in the buffer.
+!
+! BUF is the character to be saved.
+!-
+
+GLOBAL ROUTINE TI_SAVE(BUF) : NOVALUE =
+BEGIN
+IF .TI_BUF_POS EQL 16 THEN
+    TI_CLEAR_AUDIT();
+CH$WCHAR(.BUF,CH$PTR(TI_CBUF,.TI_BUF_POS));
+TI_BUF_POS = .TI_BUF_POS + 1;
+END;
+
+
+!+
+! This routine turns auto repeat on if necessary.
+!-
+
+GLOBAL ROUTINE TI_AUTO : NOVALUE =
+BEGIN
+IF .E_T_TYPE EQL TERM_VT100 AND
+    .K_REPT EQL 0 THEN
+        BEGIN
+        F_LITERAL(AUTO_REPT,5);
+        K_REPT = .K_REPT+1;
+        END;
+END;
+
+!+
+! This routine gets the next character from input.  If recovery mode is on
+! then the character is read from the journal file.   If not, then we check
+! to see if the character was read previously, and take it from the type-
+! ahead character, otherwise, we read a chraracter from the terminal.  If the
+! character is not coming from the journal file, it is written to it.
+!
+! BUF is the address of a (long)word in which the character is returned.
+!-
+
+GLOBAL ROUTINE TI_CHAR(BUF) : NOVALUE =
+BEGIN
+!
+! Check for recovery mode.
+!
+IF .E_RECOVER THEN
+    BEGIN
+    !
+    ! Make sure we have a character in the buffer.
+    !
+    WHILE CH$PTR_EQL(.TI_LPOINT,.TI_LEND) OR
+          .TI_LPOINT EQL 0 DO
+        BEGIN
+	!
+	! No characters left, try to read a new record from the journal
+	! file.
+	!
+        IF IO_GET(SY_COM_RAB,TI_LPOINT,TI_LLEN) THEN
+	    BEGIN
+	    !
+	    ! Succeeded, move the record to the journal buffer and reset
+	    ! the pointers.
+	    !
+	    CH$MOVE(.TI_LLEN,.TI_LPOINT,TI_REC_BUF);
+            TI_LEND = CH$PTR(TI_REC_BUF,.TI_LLEN);
+	    TI_LPOINT = CH$PTR(TI_REC_BUF,0);
+	    END
+        ELSE
+	    !
+	    ! No more records in the journal file, close the journal
+	    ! file and re-open for output.
+	    !
+            BEGIN
+            E_S_AUDIT();
+            TI_CHAR(.BUF);
+            RETURN;
+            END;
+        END;
+    !
+    ! Return next character from the journal buffer.
+    !
+    .BUF = CH$RCHAR_A(TI_LPOINT);
+    END
+ELSE
+    !
+    ! Not in recovery mode, check for type ahead.
+    !
+    BEGIN
+    IF .K_RAH NEQ 0 THEN
+        BEGIN
+	!
+	! Return the typed ahead character.
+	!
+        K_RAH = 0;
+        .BUF = .K_RAC;
+        END
+    ELSE
+	!
+	! Read the character from the terminal.
+	!
+        IO_GC(.BUF);
+    !
+    ! If the character was an escape, then turn auto-repeat off.
+    !
+    IF ..BUF EQL ESC THEN
+        IF .K_REPT THEN 
+            BEGIN
+            F_LITERAL(NO_REPT,5); F_PUT();
+            K_REPT = 0;
+            END;
+    TI_SAVE(..BUF);
+    END;
+END;
+
+!+
+! This routine checks to see if a character was typed ahead.  If we
+! are in recovery mode, always return false.  If the type-ahead flag
+! is on, return true, and if not, try to read a type-ahead character
+! and if it is read, place it in the type-ahead character buffer.
+!-
+
+GLOBAL ROUTINE TI_TYPE_AHEAD =
+BEGIN
+IF .E_RECOVER THEN RETURN 0;
+IF .K_RAH NEQ 0 THEN RETURN 1;
+IF IO_TRY(K_RAC) THEN
+    BEGIN
+    K_RAH = 1;
+    RETURN 1
+    END
+ELSE
+    RETURN 0;
+END;
+
+!+
+! Echo a character on the echo line.  If the character is a control character
+! it is echoed as ^letter.  The echo flag is set to indicate that the line
+! will need to be erased in the future.
+!
+! C is the character to be echoed.
+!-
+
+GLOBAL ROUTINE TI_ECHO(C) : NOVALUE =
+BEGIN
+IF .TI_E_FLAG EQL 0 THEN SC_CURSOR(COMMAND_LINE,.TI_E_POS);
+IF .C LSS 32 THEN
+    BEGIN
+    F_CHAR('^');
+    TI_E_POS = .TI_E_POS + 1;
+    C = .C + '@';
+    END;
+F_CHAR(.C);
+F_PUT();
+TI_E_POS = .TI_E_POS + 1;
+TI_E_FLAG = 1;
+P_COL = .TI_E_POS;
+END;
+
+!+
+! Echo a string of characters on the echo line.
+!
+! STRING 	is a pointer to the string.
+!
+! LEN 		is the length of the string.
+!-
+
+GLOBAL ROUTINE TI_E_STRING(STRING,LEN) : NOVALUE =
+BEGIN
+SC_CURSOR(COMMAND_LINE,.TI_E_POS);
+F_LITERAL(.STRING,.LEN);
+F_PUT();
+TI_E_POS = .TI_E_POS+.LEN;
+P_COL = .P_COL+.LEN;
+TI_E_FLAG = 1;
+END;
+
+!+
+! Delete the last character on the echo line.  This is done by writing
+! out backspace space backspace.  If the character was a control chraracter,
+! we do it twice.
+!
+! C is the character which is being deleted.
+!-
+
+GLOBAL ROUTINE TI_DELETE(C) : NOVALUE =
+BEGIN
+INCR I FROM 0 TO (.C LSS 32) DO
+    BEGIN
+    TI_E_POS = .TI_E_POS - 1;
+    F_LITERAL(UPLIT(%STRING(%CHAR(BS),' ',%CHAR(BS))),3); F_PUT();
+    END;
+END;
+
+!+
+! Initialize for echoing.  If the echo flag is on, then erase the echo line.
+! Set the echo position to zero and turn off the echo flag.
+!-
+
+GLOBAL ROUTINE TI_START_ECHO : NOVALUE =
+BEGIN
+TI_E_POS = 0;
+IF .TI_E_FLAG THEN 
+    BEGIN
+    SC_CURSOR(COMMAND_LINE,0);
+    SC_E_LINE();
+    F_PUT();
+    END;
+TI_E_FLAG = 0;
+END;
+
+!+
+! Read characters up to a terminator into the command buffer.  The
+! characters are echoed as they are read.  Delete is handled and
+! CTRL/U aborts the operation.
+!
+! C 		Is the first character to be handled (it was read previously)
+!
+! COM_BUF	Pointer into the command buffer where the characters should
+!		be placed.
+!
+! END_COM	A character pointer to receive the pointer after the characters
+!		have been read.
+!
+! TERM		A special terminator.  (escape is always a terminator)
+!
+! Returns one if the string was read, zero if aborted by CTRL/U or CTRL/C
+!-
+
+GLOBAL ROUTINE TI_LINE(C,COM_BUF,END_COM,TERM) =
+BEGIN
+LOCAL
+    COM_POINT,
+    CH : BYTE;
+COM_POINT = .COM_BUF;
+!
+! Use C as the first character.
+!
+CH = .C;
+P_COL = .TI_E_POS;
+WHILE 1 DO
+    BEGIN
+    !
+    ! Check for a control C as abort the read.
+    !
+    IF C_CHECK_CC() THEN
+        BEGIN
+        .END_COM = .COM_BUF;
+        RETURN 0;
+        END;
+    SELECTONE .CH OF
+    SET
+    [DEL]:
+	!
+	! Delete character, delete the previous character if there is one.
+	!
+        IF .COM_POINT NEQ .COM_BUF THEN
+            BEGIN
+            COM_POINT = CH$PLUS(.COM_POINT,-1);
+            TI_DELETE(CH$RCHAR(.COM_POINT));
+            END;
+
+    [.TERM]:
+	!
+	! The special terminator, end the read.
+        EXITLOOP;
+
+    [CTRL_U]:
+	!
+	! Abort the read operation, erasing the echo line.
+	!
+        BEGIN
+        TI_E_FLAG = 1;
+        .END_COM = .COM_BUF;
+        TI_START_ECHO();
+        RETURN 0;
+        END;
+
+    [ESC]:
+	!
+	! Escape, terminate the read and gobble up the rest of the escape
+	! sequence.
+	!
+        BEGIN
+        K_TRAN_CHAR(CH);
+        EXITLOOP;
+        END;
+
+    [OTHERWISE]:
+	!
+	! Place the character in the buffer.
+	!
+        IF CH$PTR_NEQ(.COM_POINT,CH$PLUS(C_BUF,256)) THEN
+            BEGIN
+            CH$WCHAR_A(.CH,COM_POINT);
+            TI_ECHO(.CH);
+            END;
+    TES;
+    TI_CHAR(CH);
+    END;
+!
+! Return a poiter one character beyond the last one read.
+.END_COM = .COM_POINT;
+RETURN 1
+END;
+
+END
+ELUDOM

@@ -1,0 +1,1571 @@
+%TITLE	'Network I/O Routines'
+MODULE NCPNETIO	(IDENT = 'V03-000',
+		ADDRESSING_MODE(EXTERNAL=GENERAL),
+		ADDRESSING_MODE(NONEXTERNAL=GENERAL)) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	Network Control Program (NCP)
+!
+! ABSTRACT:
+!
+!	This module contains the routines which establish and communicate
+!	over a logical link to NML on the executor node.
+!
+! ENVIRONMENT:	VAX/VMS Operating System
+!
+! AUTHOR:	Darrell Duffy	, CREATION DATE: 30-October-1979
+!
+! MODIFIED BY:
+!
+!	V009	TMH0009		Tim Halvorsen		11-Jan-1982
+!		Save verison number of NML server in LCB.
+!		Make NCP$OPENLINK a global routine.
+!
+!	V008	TMH0008		Tim Halvorsen		15-Dec-1981
+!		Print detail messages for FCO NICE errors.
+!
+!	V007	TMH0007		Tim Halvorsen		22-Oct-1981
+!		Fix the spelling on some messages.
+!
+!	V006	LMK0006		Len Kawell		19-Sep-1981
+!		Change version checking to allow current or greater and V2.0.
+!
+!	V005	TMH0005		Tim Halvorsen		11-Aug-1981
+!		Use different detail text table if looking up system-
+!		specific entity number.  When formatting a parameter
+!		detail, use the signed entity in NCP$GL_ENTITY rather
+!		than the option byte, since it doesn't tell whether
+!		its a system-specific entity or not.  Only supply a
+!		comma following an NML response message if there is
+!		a non-blank detail following it.
+!
+!	V004	TMH0004		Tim Halvorsen		10-Jul-1981
+!		Change all non-local references to use general addressing.
+!		Use new callable NML whenever we are communicating with the
+!		local node without any access control string.
+!
+!	V003	TMH0003		Tim Halvorsen		06-Jul-1981
+!		Remove version # checks on NML connect to allow communication
+!		between a 2.2 NCP and a 2.0 NML, which normally should not be
+!		allowed, but will be for compatibility after 2.2 release.
+!
+!	V02-002	LMK0001		Len Kawell		29-Sep-1980
+!		Change $DELMBX call to $DASSGN call.
+!--
+
+%SBTTL	'Definitions'
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	NCP$BLDLCB : NOVALUE,
+	NCP$OPENLINK : NOVALUE,
+	NCP$SIGNETERR : NOVALUE,
+	NCP$CLOSELINK : NOVALUE,
+	NCP$SENDMSG : NOVALUE,
+	STORE_RESPONSE: NOVALUE,
+	NCP$READRSP,
+	NCP$TABLESEARCH
+	;		!
+
+!
+! INCLUDE FILES:
+!
+
+	LIBRARY 'SYS$LIBRARY:STARLET.L32';
+	LIBRARY 'OBJ$:NMALIBRY.L32';
+	LIBRARY 'OBJ$:NCPLIBRY.L32';
+
+!
+! MACROS:
+!
+
+!
+! EQUATED SYMBOLS:
+!
+
+!
+!	Trailing portion of the Network Connect Block (NCB)
+!
+BIND
+
+	NCP$Q_OBJSPEC = ASCID ('::"19=/', %CHAR(0,0),
+!	NCP$Q_OBJSPEC = ASCID ('::"0=NML/', %CHAR(0,0),
+				%CHAR(3, NCP$C_VRS, NCP$C_ECO, NCP$C_UECO),
+				'             ','"'
+				)
+	;
+
+
+
+!
+! OWN STORAGE:
+!
+
+!
+!	Mailbox and Response buffers
+!
+
+GLOBAL
+	NCP$GT_MBXBFR : VECTOR [NCP$C_MBXSIZ, BYTE],
+	NCP$GT_RSPBFR : VECTOR [NCP$C_RSPSIZ, BYTE]
+	;
+
+!
+!	Data to maintain the link control blocks for the executor
+!
+
+GLOBAL
+	NCP$GT_EXECLCB : BBLOCK [LCB$C_SIZE],
+	NCP$GT_TELLLCB : BBLOCK [LCB$C_SIZE],
+
+	NCP$GL_OLDLCB,
+	NCP$GL_EXELCB
+	;
+
+OWN
+	NML_RESP_QUEUE:	VECTOR [2]		! Local NML response queue header
+		INITIAL(NML_RESP_QUEUE,NML_RESP_QUEUE);
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL
+	NCP$GL_FNC_CODE,		! Function code for command message
+	NCP$GL_ENTITY;			! Entity number for command message
+
+EXTERNAL ROUTINE
+	NML$INITIALIZE:	NOVALUE,	! Initialize NML sharable image
+	NML$PROCESS_NICE: NOVALUE,	! Process a single NICE message
+	NML$TERMINATE: NOVALUE,		! Terminate NML sharable image
+	LIB$GET_VM,			! Allocate dynamic memory
+	LIB$FREE_VM,			! Deallocate dynamic memory
+	NCP$FORMATPARM : NOVALUE;	! Format a parameter as text
+
+%SBTTL	'ACT$VRB_TELL  Process TELL Verb'
+GLOBAL ROUTINE ACT$VRB_TELL  =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Action routine to setup an executor node for one command.
+!	Current executor LCB is saved and a newone is setup.
+!	A link is opened to the new executor node.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NCP$GL_OLDLCB		Save the current executor lcb
+!	NCP$GL_EXELCB		The current executor lcb
+!	NCP$GT_TELLLCB		LCB to use for tell
+!
+! IMPLICIT OUTPUTS:
+!
+!	NCP$GT_TELLLCB		Link opened
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Success or error signaled
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    NCP$GL_OLDLCB = .NCP$GL_EXELCB;	! Save the current executor
+    NCP$GL_EXELCB = NCP$GT_TELLLCB;	! Set the new one
+    NCP$BLDLCB (.NCP$GL_EXELCB);	! Build the link control block
+    NCP$OPENLINK (.NCP$GL_EXELCB);	! Open the link
+    RETURN SUCCESS			! Always succeed for action
+
+    END;
+
+
+%SBTTL	'NCP$UNTELL  Remove the TELL Executor Node'
+GLOBAL ROUTINE NCP$UNTELL :NOVALUE =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	If the last command had a TELL prefix, the link to the temporary
+!	executor is broken and the previous executor node is restored.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NCP$GL_OLDLCB		Pointer to previous executor LCB
+!	NCP$GL_EXELCB		Tell executor LCB
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    IF .NCP$GL_OLDLCB NEQ 0		! Is there a TELL outstanding?
+    THEN
+	BEGIN
+	NCP$CLOSELINK (.NCP$GL_EXELCB);	! Close the link to William TELL
+	NCP$GL_EXELCB = .NCP$GL_OLDLCB;	! Restore the old link
+	NCP$GL_OLDLCB = 0		! There is no William TELL now
+	END
+    ;
+    RETURN
+
+    END;
+
+%SBTTL	'ACT$VRB_SETEXEC  Establish the Executor Node'
+GLOBAL ROUTINE ACT$VRB_SETEXEC  =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This is an action routine to establish a link to an executor node.
+!	Any previous link to an executor is broken.
+!	The LCB is built from data left by the parse and a link is
+!	opened.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NCP$GL_OLDLCB		Pointer to the lcb for the exec if tell active
+!	NCP$GL_EXELCB		Pointer to the lcb for the exec
+!	NCP$GT_EXECLCB		LCB to be used by the exec
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Success or an error signaled by called routine
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    NCP$GL_OLDLCB = 0;			! There is no tell active
+    NCP$GL_EXELCB = NCP$GT_EXECLCB;	! The executor data pointer is here
+    NCP$CLOSELINK (.NCP$GL_EXELCB);	! Close any previous link
+    NCP$BLDLCB (.NCP$GL_EXELCB);	! Build the lcb for the new executor
+    NCP$OPENLINK (.NCP$GL_EXELCB);	! Open the link to the new NML
+    RETURN SUCCESS			! Action routine is always successful
+
+    END;
+
+%SBTTL	'ACT$VRB_CLEXEC  Close Link to the Executor'
+GLOBAL ROUTINE ACT$VRB_CLEXEC  =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This is an action routine which closes the link to the current
+!	executor and opens a link to NML on the local node.
+!	The local node is known as '::' so we use the obj spec only
+!	to open a link to NML.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NCP$GT_EXECLCB		LCB to be used for the executor
+!	NCP$GL_OLDLCB		Pointer to lcb for tell exec
+!	NCP$GL_EXELCB		Pointer to lcb for exec
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Success or error signaled
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	LCB : REF BBLOCK [LCB$C_SIZE],	! Address of the lcb to be used
+	PTR				! General pointer
+	;
+
+    NCP$GL_OLDLCB = 0;			! No tell is active
+
+    LCB = NCP$GT_EXECLCB;		! The lcb of interest
+    NCP$GL_EXELCB = .LCB;		! The widely used pointer to it
+    NCP$CLOSELINK (.LCB);		! Close it if its active
+
+
+!
+!	Set a pointer to the NCB and put the obj spec on.  The local node
+!	will be used since we are using no node name and :: only is always
+!	the local node.
+!	Note we are using no access control, so the default access will be
+!	used for the object
+!
+
+    LCB [LCB$L_NCBPTR] = LCB [LCB$T_NCB];
+
+    PTR = .LCB [LCB$L_NCBPTR];
+
+    PTR = CH$MOVE
+	(
+	.BBLOCK [NCP$Q_OBJSPEC, DSC$W_LENGTH],
+	.BBLOCK [NCP$Q_OBJSPEC, DSC$A_POINTER],
+	.PTR
+	);
+
+    LCB [LCB$L_NCBCNT] = .PTR - LCB [LCB$T_NCB];
+    LCB [LCB$B_STS] = 0;
+
+				! Link will be opened on first write
+    RETURN SUCCESS
+
+    END;
+
+%SBTTL	'NCP$BLDLCB  Build an Link Control Block'
+ROUTINE NCP$BLDLCB (LCB) :NOVALUE =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine builds the contents of an LCB (link control block)
+!	from information in left around by the parse.
+!	The nodename which may be a logical name, is translated 10 times or
+!	until it does not translate further, which ever is first.
+!	If access control is provided with the node spec, it is appended to
+!	the translation after any access control is stripped from the
+!	translation.  If no access control is provided in the node spec,
+!	it may be specified in the logical. The logical name cannot contain
+!	::.  The translation may or may not contain ::.
+!
+! FORMAL PARAMETERS:
+!
+!	LCB		 Address of the link control block
+!
+! IMPLICIT INPUTS:
+!
+!	PDB$G_VRB_XID		Node spec string
+!	ACT$GQ_ACCACC_DSC	Descriptors of access control
+!	ACT$GQ_ACCPSW_DSC
+!	ACT$GQ_ACCUSR_DSC
+!	ACT$GL_XIDACC_Q		True for access control in node spec
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    MAP
+	LCB : REF BBLOCK		! Pointer to an link control block
+	;
+
+    LITERAL
+	RSLSIZ = 64			! Size for tranlation buffer
+	;
+
+    LOCAL
+	RSLBUF : VECTOR [RSLSIZ, BYTE],	! Translation buffer
+	RSLDSC : VECTOR [2],		! Descriptor of buffer
+	RSBDSC : VECTOR [2],		! Descriptor of whole buffer
+	STATUS,				! Return status of translation
+	ACCPTR,				! Pointer to original access control
+	ACCCNT,				! Size of access control
+	PTR,
+	CTR
+	;
+
+    EXTERNAL LITERAL
+	NCP$_INVACC			! Invalid access control signal
+	;
+
+    EXTERNAL
+	ACT$GQ_ACCACC_DSC,		! Descriptors for access control
+	ACT$GQ_ACCPSW_DSC,
+	ACT$GQ_ACCUSR_DSC,
+	ACT$GL_XIDACC_Q,		! Access control present in nodespec
+	PDB$G_VRB_XID			! Nodespec counted string here
+	;
+
+
+!
+!	Obtain the node spec and strip trailing colons
+!
+
+    PTR = BBLOCK [PDB$G_VRB_XID, PDB$T_DATA];	! Obtain node spec string
+    CTR = CH$RCHAR_A (PTR);			! And its size
+
+    DECRA IDX FROM .PTR + .CTR - 1		! Strip off trailing :: to
+    		TO .PTR				! Begin translation
+    DO
+	IF CH$RCHAR (.IDX) EQL ':'
+	THEN CTR = .CTR - 1
+	ELSE EXITLOOP
+    ;
+
+    CH$MOVE (.CTR, .PTR, RSLBUF);		! Copy to result buffer
+    RSLDSC [0] = .CTR;				! Build descriptor
+    RSLDSC [1] = RSLBUF;
+    RSBDSC [1] = RSLBUF;			! Describe whole buffer too
+    RSBDSC [0] = RSLSIZ;
+
+    IF .ACT$GL_XIDACC_Q				! If Access control specified
+    THEN					! Strip it off before trans
+	BEGIN
+	ACCPTR = CH$FIND_CH (.CTR, .PTR, '"'); ! Find it
+	RSLDSC [0] = .ACCPTR - .PTR;		! Shorten descriptor
+	ACCCNT = .CTR - .RSLDSC [0]		! Size of our access control
+	END
+    ;
+
+    DECRU IDX FROM 10 TO 1			! Translate logical 10 deep
+    DO
+	BEGIN
+	STATUS = $TRNLOG			! Obtain one translation
+	    (
+	    LOGNAM = RSLDSC,			! Here is the name to trans
+	    RSLLEN = RSLDSC [0],		! Return the length here
+	    RSLBUF = RSBDSC			! Return the string here
+	    )
+	;
+	IF  NOT .STATUS				! If any error
+	    OR
+	    .STATUS EQL SS$_NOTRAN		! or no translation
+	THEN EXITLOOP				! we are done
+	END
+    ;
+
+    IF .ACT$GL_XIDACC_Q				! If node spec had acc control
+    THEN					! Use as override
+	BEGIN
+	PTR = CH$FIND_CH (.RSLDSC [0], .RSLDSC [1], '"');
+	IF CH$FAIL (.PTR)			! If no acc in logical
+	THEN
+	    PTR = .RSLDSC [1] + .RSLDSC [0]	! Add ours at end
+	;
+	PTR = CH$MOVE (.ACCCNT, .ACCPTR, .PTR);	! Add our acc ctl at end of
+	RSLDSC [0] = .PTR - .RSLDSC [1]		! translation
+	END
+    ;
+
+    PTR = LCB [LCB$T_NCB];			! Set pointer to start
+    CH$MOVE					! Copy node spec to lcb
+	(
+	.RSLDSC [0],
+	.RSLDSC [1],
+	.PTR
+	);
+    CTR = .RSLDSC [0];				! Set the counter for it
+
+    DECRA IDX FROM .PTR + .CTR - 1		! Strip the colons again
+    		TO .PTR				! just to be sure
+    DO
+	IF CH$RCHAR (.IDX) EQL ':'
+	THEN CTR = .CTR - 1
+	ELSE EXITLOOP
+    ;
+
+!
+!	Obtain the access control if its needed
+!
+
+    PTR = LCB [LCB$T_NCB] + .CTR;		! Point to the copied string
+
+    IF .ACT$GL_XIDACC_Q				! Is there access control in
+    THEN					! The node spec?
+	BEGIN
+	IF	.ACT$GQ_ACCACC_DSC NEQ 0	! If so, there must not be
+		OR				! Access control elsewhere
+		.ACT$GQ_ACCPSW_DSC NEQ 0
+		OR
+		.ACT$GQ_ACCUSR_DSC NEQ 0
+	THEN
+	    SIGNAL_STOP (NCP$_INVACC)		! Signal too much access ctl
+	END
+    ELSE
+	BEGIN
+	IF .ACT$GQ_ACCUSR_DSC NEQ 0		! If not, use other access ctl
+	THEN
+	    BEGIN				! Look through the name we
+	    ACCPTR = CH$FIND_CH (.CTR, LCB [LCB$T_NCB], '"'); ! for acc ctl
+	    IF NOT CH$FAIL (.ACCPTR)
+	    THEN
+		PTR = .ACCPTR
+	    ;
+	    CH$WCHAR_A ('"', PTR);		! Put it in standard form
+	    PTR = CH$MOVE
+		(
+		.BBLOCK [ACT$GQ_ACCUSR_DSC, DSC$W_LENGTH],
+		.BBLOCK [ACT$GQ_ACCUSR_DSC, DSC$A_POINTER],
+		.PTR
+		);
+
+	    IF .ACT$GQ_ACCPSW_DSC NEQ 0		! A password??
+	    THEN
+		BEGIN
+		CH$WCHAR_A (' ', PTR);
+		PTR = CH$MOVE
+		    (
+		    .BBLOCK [ACT$GQ_ACCPSW_DSC, DSC$W_LENGTH],
+		    .BBLOCK [ACT$GQ_ACCPSW_DSC, DSC$A_POINTER],
+		    .PTR
+		    )
+		END
+	    ELSE
+		SIGNAL_STOP (NCP$_INVACC)	! If no password, not complete
+	    ;
+
+	    IF .ACT$GQ_ACCACC_DSC NEQ 0		! An account??
+	    THEN
+		BEGIN
+		CH$WCHAR_A (' ', PTR);
+		PTR = CH$MOVE
+		    (
+		    .BBLOCK [ACT$GQ_ACCACC_DSC, DSC$W_LENGTH],
+		    .BBLOCK [ACT$GQ_ACCACC_DSC, DSC$A_POINTER],
+		    .PTR
+		    )
+		END
+	    ;
+
+	    CH$WCHAR_A ('"', PTR);		! End the access control spec
+
+	    END
+	END
+    ;
+
+!
+!	Copy the object connect specification to the end
+!
+
+    PTR = CH$MOVE
+	(
+	.BBLOCK [NCP$Q_OBJSPEC, DSC$W_LENGTH],
+	.BBLOCK [NCP$Q_OBJSPEC, DSC$A_POINTER],
+	.PTR
+	);
+
+!
+!   Fill up the LCB pointers and status
+!
+
+    LCB [LCB$L_NCBCNT] = .PTR - LCB [LCB$T_NCB];
+    LCB [LCB$L_NCBPTR] = LCB [LCB$T_NCB];
+    LCB [LCB$B_STS] = 0;
+
+    RETURN
+
+    END;
+
+%SBTTL	'NCP$OPENLINK  Open a link to NML'
+GLOBAL ROUTINE NCP$OPENLINK (LCB) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine opens a link to NML given an LCB address and
+!	verifies the connect data to determine if NML is phase II or
+!	phase III.  The lcb already contains the NCB built in a previous
+!	step.
+!
+! FORMAL PARAMETERS:
+!
+!	LCB		Address of the LCB to use
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE  errors signaled
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LITERAL
+	MBXSIZ = 10			! Max size of mailbox name
+	;
+
+    MAP
+	LCB : REF BBLOCK		! The link control block
+	;
+
+    LOCAL
+	MBXBUF : VECTOR [MBXSIZ, BYTE],	! Buffer to build mailbox name
+	MBXLST : VECTOR [2],		! FAO list for mailbox name
+	MBXDSC : VECTOR [2],		! Descriptor of mailbox name buffer
+	IOSB : BBLOCK [8],		! IO status block
+	STATUS,				! Return status
+	PTR,				! General pointer
+	CTR				! General counter
+	;
+
+    OWN
+	CHNCHAR : BBLOCK [DIB$K_LENGTH]	! Channel characteristics
+	;
+
+    EXTERNAL LITERAL
+	NCP$_CONNEC,			! Connect errors
+	NCP$_UNSVRS			! Unsupported version of nml
+	;
+
+    LCB [LCB$W_MBXCHN] = 0;		! Make the channels zero
+    LCB [LCB$W_CHAN] = 0;		! to indicate they are not here
+
+    LCB [LCB$B_STS] = TRUE;		! This lcb is now open
+
+    LCB [LCB$B_PH2] = FALSE;		! Assume Phase III
+
+    CH$FILL(0, 3, LCB [LCB$B_NMLVERS]);	! Preset NML version to null
+
+!
+!	If we are going to communicate with the NML on the local node,
+!	and there is no access control string, then establish communications
+!	with the sharable version of NML linked with this program, rather
+!	than starting up another NML process on this node.
+!
+
+    IF CH$RCHAR(.LCB [LCB$L_NCBPTR]) EQL ':'
+    THEN
+	BEGIN
+	NML$INITIALIZE();		! Initialize NICE processor
+	CH$MOVE(3, UPLIT BYTE(NCP$C_VRS, NCP$C_ECO, NCP$C_UECO),
+		LCB [LCB$B_NMLVERS]);	! Assume NMLSHR is same as our version
+	RETURN;				! Return successfully
+	END;
+!
+!	We are about to do a non-transparent connect, so first
+!	we must create a mailbox.
+!
+
+    STATUS = $CREMBX
+	    (
+	    CHAN = LCB [LCB$W_MBXCHN],
+	    MAXMSG = 64,
+	    BUFQUO = 256,
+	    PROMSK = %X'FF00'		! own-sys=rwed
+	    );
+    NCP$SIGNETERR (NCP$_CONNEC, .STATUS, 0);	! Signal the error
+
+    STATUS = $GETCHN			! Obtain the mailbox name
+	    (
+	    CHAN = .LCB [LCB$W_MBXCHN],
+	    PRIBUF = UPLIT (DIB$K_LENGTH, CHNCHAR)
+	    );
+    NCP$SIGNETERR (NCP$_CONNEC, .STATUS, 0);	! Report an error
+
+    PTR = .CHNCHAR [DIB$W_DEVNAMOFF];	! Offset to the name
+    IF .PTR EQL 0			! Zero means missing
+    THEN 				! No name, so we die here
+	NCP$SIGNETERR (NCP$_CONNEC, SS$_IVCHAN, 0)
+    ;
+
+    MBXLST [0] = CHNCHAR + .PTR;	! Data list has pointer to the name
+    MBXLST [1] = .CHNCHAR [DIB$W_UNIT];	! The unit number to convert
+    MBXDSC [0] = MBXSIZ;		! Build descriptor of buffer, size and
+    MBXDSC [1] = MBXBUF;		! Address of the buffer
+
+    $FAOL				! Build the whole mailbox name
+	(
+	CTRSTR = ASCID ('_!AC!UW:'),	! The name and unit _MBAnnn:
+	OUTLEN = MBXDSC [0],		! Length goes back in descriptor
+	OUTBUF = MBXDSC,		! Descriptor is here
+	PRMLST = MBXLST			! Data list is here
+	);
+
+    STATUS = $ASSIGN			! Assign a channel to the network
+	    (
+	    DEVNAM = ASCID ('_NET:'),	! General device for network
+	    CHAN = LCB [LCB$W_CHAN],	! Place to put channel number
+	    MBXNAM = MBXDSC		! Name we built with FAO
+	    );
+    NCP$SIGNETERR (NCP$_CONNEC, .STATUS, 0); ! Report an error
+
+    STATUS = $QIOW			! Create a logical link to NML
+	    (
+	    CHAN = .LCB [LCB$W_CHAN],	! Use network channel
+	    FUNC = IO$_ACCESS,		! ACP function
+	    IOSB = IOSB,		! Status here
+	    P2 = LCB [LCB$L_NCBCNT]	! This is the NCB descriptor
+	    );
+    NCP$SIGNETERR (NCP$_CONNEC, .STATUS, IOSB); ! An error
+
+    STATUS = $QIOW			! Read the connect data
+	    (
+	    CHAN = .LCB [LCB$W_MBXCHN],	! Channel for mailbox
+	    FUNC = IO$_READVBLK,
+	    IOSB = IOSB,
+	    P1 = NCP$GT_MBXBFR,		! Read data into mailbox buffer
+	    P2 = NCP$C_MBXSIZ
+	    );
+    NCP$SIGNETERR (NCP$_CONNEC, .STATUS, IOSB);
+
+!
+!	Validate the message and its returned optional data
+!
+
+    STATUS = .BBLOCK [NCP$GT_MBXBFR, 0,0,16,0];
+    PTR = NCP$GT_MBXBFR + 4;
+
+    IF .STATUS NEQ MSG$_CONFIRM		! It must be a connect confirm
+    THEN SIGNAL_STOP (NCP$_CONNEC)	! Otherwise blow away
+    ;
+
+    CTR = .IOSB [2, 0, 16, 0] - 4;	! Play games to look at the data
+    CTR = .CTR - CH$RCHAR (.PTR) - 1;	! Skip over the device name
+    PTR = .PTR + CH$RCHAR (.PTR) + 1;
+
+    IF CH$RCHAR (.PTR) LEQ 0		! Any data returned?
+    THEN  LCB [LCB$B_PH2] = TRUE	! No, its phase II
+    ELSE				! Yes, check the data
+	BEGIN
+	IF
+	    (CH$RCHAR (.PTR) EQL 3)	! And its size
+	    AND
+	    (CH$GEQ			! Check that version is current or later
+		(
+		3, .PTR + 1,
+		3, UPLIT (BYTE (NCP$C_VRS, NCP$C_ECO, NCP$C_UECO) ),
+		0
+		)
+	     OR
+	     CH$EQL			! or the version is V2.0
+		(
+		3, .PTR + 1,
+		3, UPLIT (BYTE (2, 0, 0) ),
+		0
+		))
+	THEN
+	    BEGIN
+	    CH$MOVE(3, .PTR+1, LCB [LCB$B_NMLVERS]); ! Save NML version #
+	    LCB [LCB$B_PH2] = FALSE;	! Its not phase II but phase III
+	    END
+	ELSE
+	    BEGIN			! Close the link and blow away
+	    NCP$CLOSELINK (.LCB);
+	    SIGNAL_STOP (NCP$_UNSVRS)	! Back with not a supported version
+	    END				! of nml
+	END
+    ;
+
+    RETURN
+
+    END;
+
+%SBTTL	'NCP$SIGNETERR  Signal a Network Communication Error'
+GLOBAL ROUTINE NCP$SIGNETERR (CODE, STATUS, IOSB) :NOVALUE =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine checks the results from a system service or QIO
+!	and signals an error with a subcode.  Both the service status
+!	and the status block status is checked.
+!
+!	If there is an error on the link, it is closed if it is open.
+!	This will cause the link to be reopened automatically if another
+!	command is done.
+!
+! FORMAL PARAMETERS:
+!
+!	CODE		Value of the NCP code to signal
+!	STATUS		Value of the system service status
+!	IOSB		Address of the IOSB to check for error status
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE  error signaled with additional status
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    MAP
+	IOSB : REF BBLOCK
+	;
+
+    LOCAL
+	REPORT
+	;
+
+    IF  NOT (REPORT = .STATUS)			! Look at the primary status
+	OR
+	NOT
+	(
+	    IF .IOSB EQL 0			! If there is no iosb
+	    THEN TRUE				! Always succeed
+	    ELSE (REPORT = .IOSB [0, 0, 16, 0] ) ! Or report the iosb error
+	)
+    THEN
+	BEGIN
+	NCP$CLOSELINK (.NCP$GL_EXELCB);		! Close link to mark to reopen
+	SIGNAL_STOP (.CODE, 0, .REPORT)		! Signal the error
+	END
+
+    END;
+
+%SBTTL	'NCP$CLOSELINK  Close a Link Open in an LCB'
+GLOBAL ROUTINE NCP$CLOSELINK (LCB) :NOVALUE =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine closes a logical link open in an LCB.
+!	The LCB$B_STS byte is true for the link is open.
+!
+! FORMAL PARAMETERS:
+!
+!	LCB		Address of the lcb describing the link
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE  return always occurs, error signaled non-fatal
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    MAP
+	LCB : REF BBLOCK		! Link control block
+	;
+
+    LOCAL
+	STATUS				! Service status
+	;
+
+    EXTERNAL LITERAL
+	NCP$_DISCON			! Disconnect error status
+	;
+
+    IF NOT .LCB [LCB$B_STS]		! If link not open, return
+    THEN RETURN
+    ;
+
+    LCB [LCB$B_STS] = FALSE;		! Mark its not open
+
+    IF CH$RCHAR(.LCB [LCB$L_NCBPTR]) EQL ':'	! If talking to sharable NML,
+    THEN
+	BEGIN
+	BUILTIN REMQUE;
+	LOCAL
+	    length,
+	    entry: REF VECTOR;
+	NML$TERMINATE();		! Perform sharable NML cleanups
+	WHILE NOT REMQUE(.nml_resp_queue [0], entry) ! For each response in queue,
+	DO
+	    BEGIN
+	    length = .entry [2] + 12;	! Length of entry
+	    LIB$FREE_VM(length, entry);	! Deallocate the entry
+	    END;
+	RETURN;
+	END;
+
+    IF .LCB [LCB$W_CHAN] NEQ 0
+    THEN
+	BEGIN
+	STATUS = $DASSGN 		! Deassign the channel to net
+	    (CHAN = .LCB [LCB$W_CHAN]); 
+	IF NOT .STATUS			! and report an error if so
+	THEN SIGNAL (NCP$_DISCON, 0, .STATUS)
+	END
+    ;
+
+    IF .LCB [LCB$W_MBXCHN] NEQ 0
+    THEN
+	BEGIN
+	STATUS = $DASSGN		! Deassign mailbox channel, deleting it
+	    (CHAN = .LCB [LCB$W_MBXCHN]); 
+	IF NOT .STATUS			! and report the error
+	THEN SIGNAL (NCP$_DISCON, 0, .STATUS)
+	END
+    ;
+
+    RETURN    
+
+    END;
+
+%SBTTL	'NCP$SENDMSG  Send a Message to NML'
+GLOBAL ROUTINE NCP$SENDMSG (LCB, LEN, BFR) :NOVALUE =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine sends a message to the NML object over the link
+!	described by the LCB argument.  The buffer is described by the
+!	remaining arguments.  System service and IO errors are signalled.
+!
+! FORMAL PARAMETERS:
+!
+!	LCB		Address of the link control block
+!	LEN		Value of the length of the message
+!	BFR		Address of the message buffer
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    MAP
+	LCB : REF BBLOCK		! Link control block
+	;
+
+    LOCAL
+	STATUS,				! Service status
+	IOSB : BBLOCK [8]		! IO status block
+	;
+
+    EXTERNAL LITERAL
+	NCP$_NETIO			! Network comm error
+	;
+
+    IF NOT .LCB [LCB$B_STS]		! If link is not open
+    THEN
+	NCP$OPENLINK (.LCB);		! Open the link to executor
+
+    IF CH$RCHAR(.LCB [LCB$L_NCBPTR]) EQL ':'	! If talking to sharable NML,
+    THEN
+	BEGIN
+	BUILTIN REMQUE;
+	LOCAL
+	    length,
+	    entry:	REF VECTOR,
+	    msgdesc:	VECTOR [2];
+
+	WHILE NOT REMQUE(.nml_resp_queue [0], entry) ! For each response in queue,
+	DO
+	    BEGIN
+	    length = .entry [2] + 12;	! Length of entry
+	    LIB$FREE_VM(length, entry);	! Deallocate the entry
+	    END;
+
+	msgdesc [0] = .len;			! Make descriptor of message
+	msgdesc [1] = .bfr;
+	NML$PROCESS_NICE(msgdesc,		! Call sharable NML with message
+			store_response);	! and store all the responses
+	RETURN;
+	END;
+
+    STATUS = $QIOW			! Write the message
+	    (
+	    CHAN = .LCB [LCB$W_CHAN],
+	    FUNC = IO$_WRITEVBLK,
+	    IOSB = IOSB,
+	    P1 = .BFR,
+	    P2 = .LEN
+	    );
+    NCP$SIGNETERR (NCP$_NETIO, .STATUS, IOSB); ! Check and signal an error
+
+    RETURN
+
+    END;
+
+%SBTTL  'STORE_RESPONSE  Store a response from sharable NML'
+ROUTINE store_response (resp_desc): NOVALUE =
+
+!++
+!
+!	This routine is called by NML$PROCESS_NICE for each response
+!	that it generates as a result of processing a single NICE message.
+!	All we do is store the response messages away in a queue in the
+!	order in which they were generated, and de-queue them later when
+!	we wish to "read" a response.
+!
+! Inputs:
+!
+!	resp_desc = Address of descriptor of NICE response message
+!
+! Outputs:
+!
+!	None
+!--
+
+BEGIN
+
+BUILTIN INSQUE;
+
+MAP
+    resp_desc:	REF BBLOCK;		! Address of response descriptor
+
+LOCAL
+    status,
+    length,				! Length of block containing response
+    entry:	REF VECTOR;		! Address of block to contain response
+
+length = .resp_desc [dsc$w_length] + 12; ! Add response length + overhead
+
+status = LIB$GET_VM(length, entry);	! Allocate dynamic memory
+
+IF NOT .status				! If error detected,
+THEN
+    SIGNAL_STOP(.status);		! then signal fatal error
+
+entry [2] = .resp_desc [dsc$w_length];	! Store length of response message
+CH$MOVE(.resp_desc [dsc$w_length],	! Copy message to new block
+	.resp_desc [dsc$a_pointer],
+	entry [3]);
+
+INSQUE(.entry, .nml_resp_queue [1]);	! Insert at end of queue
+
+END;
+
+%SBTTL	'NCP$READRSP  Read and Decode an NML Response'
+GLOBAL ROUTINE NCP$READRSP (LCB, LEN, BFR, SHO) =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads a message from NML and decodes it.
+!	If the message is an error response, the error is signaled and
+!	control does not return to the caller.
+!	If the message is a data return or a done status, the message is
+!	returned via LEN, BFR and the first byte is returned as the value of
+!	the routine. LEN and BFR form a descriptor of the data beyond the
+!	error status byte, detail and error message.  If the error status
+!	is SUC, DON or MOR, and there is a detail or error message, an
+!	error is signaled to print these but control returns normally to
+!	the caller.
+!
+!	If an error contains data, it is assumed to be an entity for the
+!	error and the entity code is formatted and included in the error
+!	message.  Entity codes may also occur with success codes and in
+!	this case the data is printed as an entity if the message is not
+!	a show or list command, indicated by the SHO parameter.
+!
+! FORMAL PARAMETERS:
+!
+!	LCB		Address of link control block
+!	LEN		Address for return of length of buffer
+!	BFR		Address for return of address of buffer
+!	SHO		True if the command is show or list
+!
+! IMPLICIT INPUTS:
+!
+!	NCP$GL_ENTITY	Entity number sent in original message
+!			(If negative, then system-specific entity)
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Value of first byte of message, or error signalled
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    MAP
+	LCB : REF BBLOCK		! Link control block
+	;
+
+    LITERAL
+	RSPSIZ = 32,			! Size of response buffer required
+	DTLSIZ = 32,			! Size of detail buffer required
+	ENTSIZ = 32			! Size of entity code buffer
+	;
+
+    LOCAL
+	STATUS,				! Service status return
+	OUTLEN,				! Length in a buffer
+	IOSB : BBLOCK [8],		! QIO status
+	CTR,				! General temps
+	PTR,
+	CODE,
+	ENTITY,				! Entity number (negative if sys-specific)
+	RSP,				! Pointer for response text
+	COMMA,				! Pointer to separator before detail
+	DTL,				! Pointer for detail text
+	ERR,				! Pointer for error text
+	ENT,				! Pointer for entity code text
+	IDX,				! Index into tables
+	JUNK,				! Throw away temporary
+	DETAIL,				! Value of detail word
+	DTLTBL				! Address of detail table
+	;
+
+    OWN
+	DTLBUF : VECTOR [DTLSIZ, BYTE],	! Detail buffer
+	RSPBUF : VECTOR [RSPSIZ, BYTE],	! Response buffer
+	ENTDSC : VECTOR [2],		! Descriptor for string
+	ENTBUF : VECTOR [ENTSIZ, BYTE]	! Entity string buffer
+	;
+
+
+    EXTERNAL LITERAL
+	NCP$_NMLRSP,			! NML response message
+	NCP$_NETIO			! Network communication error
+	;
+
+    EXTERNAL
+	NCP$GA_TBL_NMLSTS,		! NML status return codes
+	NCP$GA_TBL_FOPDTL,		! File operations detail codes
+	NCP$GA_TBL_NCEDTL,		! Network communications detail codes
+	NCP$GA_TBL_VMSENTDTL,		! Detail table of VMS specific entities
+	NCP$GA_TBL_ENTDTL;		! Detail table of entities
+
+    EXTERNAL ROUTINE
+	NCP$FAOSET	: NOVALUE,	! Setup to convert entity
+	NCP$SHOENTITY	: NOVALUE,	! Convert entity
+	NCP$FAOL	: NOVALUE	! Convert fao string for entity
+	;
+
+    .LEN = 0;				! Set callers data
+    .BFR = NCP$GT_RSPBFR;
+
+    IF CH$RCHAR(.LCB [LCB$L_NCBPTR]) EQL ':'	! If talking to sharable NML,
+    THEN
+	BEGIN
+	BUILTIN REMQUE;
+	LOCAL
+	    length,
+	    entry:	REF VECTOR;
+	IF REMQUE(.nml_resp_queue [0], entry)	! De-queue next one.  If none,
+	THEN
+	    SIGNAL_STOP(NCP$_NETIO, SS$_ABORT);	! signal fatal error
+	ctr = .entry [2];		! Copy length of response
+	ptr = ncp$gt_rspbfr;		! Set address of buffer
+	CH$MOVE(.ctr, entry [3], .ptr);	! Copy response into buffer
+	length = .ctr + 12;		! Set length of container block
+	LIB$FREE_VM(length, entry);	! Deallocate container block
+	END
+    ELSE				! Else, read response from logical link
+	BEGIN
+	STATUS = $QIOW			! Read the message from NML
+		    (
+		    CHAN = .LCB [LCB$W_CHAN],
+		    FUNC = IO$_READVBLK,
+		    IOSB = IOSB,
+		    P1 = NCP$GT_RSPBFR,
+		    P2 = NCP$C_RSPSIZ
+		    );
+	NCP$SIGNETERR (NCP$_NETIO, .STATUS, IOSB);
+
+	CTR = .IOSB [0, 16, 16, 0];		! Point and count into message
+	PTR = NCP$GT_RSPBFR;
+	END;
+
+!
+!	We need to set some defaults in case the message is bad
+!
+
+    RSP = UPLIT (%ASCIC 'unrecognized'); ! Some default text for message
+    COMMA = UPLIT (%ASCIC '');
+    DTL = UPLIT (%ASCIC '');
+    ENT = UPLIT (%ASCIC '');
+    ERR = UPLIT (%ASCIC '');
+
+    IF .CTR EQL 0			! If message is short, signal now
+    THEN
+	SIGNAL_STOP (NCP$_NMLRSP, 5, .RSP, .COMMA, .DTL, .ENT, .ERR)
+    ;
+
+    CODE = .(.PTR) <0, 8, 1>;		! First byte is a code
+
+    IF NOT NCP$TABLESEARCH		! Find the code text if possible
+	    (
+	    .CODE <0, 8, 0>,		! Code byte
+	    NCP$GA_TBL_NMLSTS,		! Table
+	    RSP				! Return address of counted string
+	    )
+
+    THEN
+	BEGIN
+	$FAO				! If not found, make some text
+	    (
+	    ASCID ('management return # !SB'),
+	    OUTLEN,
+	    UPLIT (RSPSIZ-1, RSPBUF+1),
+	    .CODE
+	    );
+	RSPBUF [0] = .OUTLEN;		! As a counted string
+	RSP = RSPBUF			! Point to it
+	END
+    ;
+
+    DETAIL = -1;			! No detail yet
+
+    IF .CTR GEQ 3			! Is there a detail word
+    THEN
+	BEGIN
+	DETAIL = .(.PTR+1) <0, 16, 1>;	! Obtain the word
+	IF .DETAIL NEQ -1		! Ignore value?
+	THEN
+	    BEGIN			! Nope
+	    DTLTBL =			! Find a table to use
+		BEGIN
+		SELECTONE .CODE OF
+		SET
+		[NMA$C_STS_FOP, NMA$C_STS_FIO, NMA$C_STS_FCO] :
+			NCP$GA_TBL_FOPDTL	! File io errors
+			;
+		[NMA$C_STS_MLD, NMA$C_STS_MCF] :
+			NCP$GA_TBL_NCEDTL	! Network io errors
+			;
+		[NMA$C_STS_CMP, NMA$C_STS_IDE, NMA$C_STS_STA] :
+						! Errors with entities
+			IF .NCP$GL_ENTITY LSS 0	! If system-specific entity
+			THEN
+				NCP$GA_TBL_VMSENTDTL	! VMS entities
+			ELSE
+				NCP$GA_TBL_ENTDTL;	! DNA entities
+		[OTHERWISE] :			! Details not valid
+			BEGIN
+			IF .DETAIL EQL 0	! Zero is null detail here
+			THEN 1			! Null detail if not valid
+			ELSE 0			! But report non zero detail
+			END
+			;
+		TES
+		END
+	    ;
+
+	    IF  .CODE EQL NMA$C_STS_PVA		! Special details for these
+		OR				! Errors, its the parameter
+		.CODE EQL NMA$C_STS_PLO		! name
+		OR
+		.CODE EQL NMA$C_STS_PNA
+		OR
+		.CODE EQL NMA$C_STS_PTY
+		OR
+		.CODE EQL NMA$C_STS_PGP
+		OR
+		.CODE EQL NMA$C_STS_PMS
+	    THEN
+		BEGIN
+		NCP$FORMATPARM			! Format the parameter name
+		    (
+		    .NCP$GL_ENTITY,		! Entity is here
+		    DETAIL,			! Parameter code is here
+		    TRUE,			! Give the name
+		    FALSE,			! Not the data
+		    UPLIT (DTLSIZ - 1, DTLBUF + 1), ! Describe the buffer
+		    OUTLEN,			! Length of text here
+		    JUNK			! Return pointer to throw away
+		    );
+		DTLBUF [0] = .OUTLEN;		! Set length of counted string
+		DTL = DTLBUF;			! Point to buffer
+		DTLTBL = 1			! Kill following check
+		END
+	    ;
+
+	    IF	.DTLTBL NEQ 1		! Unless we formatted it above
+		AND
+		(
+		.DTLTBL EQL 0		! If there is no detail table
+		OR
+		(
+		IF  .DTLTBL NEQ 0	! Interlock for not in table check
+		THEN
+		NOT NCP$TABLESEARCH (.DETAIL, .DTLTBL, DTL)
+		ELSE
+		TRUE			! Force conversion if not in table
+		)
+		)
+	    THEN
+		BEGIN			! Put out in some standard way
+		$FAO
+		    (
+		    ASCID ('detail # !UW'),
+		    OUTLEN,
+		    UPLIT (DTLSIZ-1, DTLBUF+1),
+		    .DETAIL
+		    );
+		DTLBUF [0] = .OUTLEN;	! As counted string
+		DTL = DTLBUF
+		END
+	    END
+	END
+    ;
+
+    IF .CTR GEQU 4			! If there is enough for system
+    THEN				! Specific error text
+	BEGIN
+	IF .CTR GEQU (4 + .(.PTR+3) <0, 8, 0> )
+	THEN				! And the text is valid
+	    BEGIN
+	    ERR = .PTR + 3;		! Point to the counted string
+	    .LEN = .CTR - (.(.PTR+3) <0, 8, 0>) - 4; ! Adjust returned length
+	    .BFR = ..BFR + 4 + (.(.PTR+3) <0, 8, 0>) ! And buffer beyond it
+	    END
+	ELSE				! Tell the world its not clean
+	    ERR = UPLIT (%ASCIC '%NCP-W-ERRRSP, invalid error text in listener response')
+	END
+    ;
+	
+
+!
+!	Signal the error to print it
+!
+
+    IF ..LEN NEQ 0			! Is there an entity for the message
+	AND
+	NOT .SHO			! and this is not a show or list
+    THEN
+	BEGIN
+	.LEN = 0;			! Return no data to caller
+	ENTDSC [0] = ENTSIZ - 1;	! Descriptor for output is buffer
+	ENTDSC [1] = ENTBUF + 1;	! Less one byte for count
+	ENT = ENTBUF;			! Set counted string address
+	IF .NCP$GL_FNC_CODE NEQ NMA$C_FNC_TES ! Loop return with test data
+	THEN
+	    BEGIN
+	    PTR = ..BFR;		! Set pointer to entity code
+	    NCP$FAOSET ();		! Setup conversion routines
+	    NCP$SHOENTITY (PTR);	! Convert to fao parameters
+	    NCP$FAOL (ENTDSC);		! Convert to text
+	    ENTBUF [0] = .ENTDSC [0];	! Make counted string
+	    END
+	ELSE
+	    BEGIN
+	    $FAO			! Convert test data if loop return
+		(
+		(
+		IF .CODE EQL NMA$C_STS_PVA ! Special case the text for
+		THEN ASCID ('Maximum data length = !UW') ! a loop message
+		ELSE ASCID ('Messages not looped = !UW')
+		),
+		OUTLEN,
+		ENTDSC,			! Descriptor of buffer
+		...BFR			! Stack the data (word of loop count)
+		);
+	    ENTBUF [0] = .OUTLEN	! Set counter for this message
+	    END
+	END
+    ;
+
+    IF CH$RCHAR(.DTL) NEQ 0		! If text following message,
+    THEN
+	COMMA = UPLIT(%ASCIC ',');	! then delimit with a comma
+
+    IF
+	(
+	(
+	.CODE NEQ NMA$C_STS_MOR		! If a not a success code
+	AND
+	.CODE NEQ NMA$C_STS_SUC
+	AND
+	.CODE NEQ NMA$C_STS_DON
+	AND
+	.CODE NEQ NMA$C_STS_PAR
+	)
+	AND
+	CH$RCHAR (.RSP) NEQ 0		! and the response message is here
+	)
+	OR
+	CH$RCHAR (.DTL) NEQ 0		! or any of the text strings are here
+	OR
+	CH$RCHAR (.ERR) NEQ 0		! then print the error
+    THEN
+	SIGNAL (NCP$_NMLRSP, 5, .RSP, .COMMA, .DTL, .ENT, .ERR)
+    ;
+
+    RETURN .CODE			! Return data to caller
+
+    END;
+
+%SBTTL	'NCP$TABLESEARCH  Find an Entry in a Text Table'
+GLOBAL ROUTINE NCP$TABLESEARCH (CODE, TBL, RTXTC) =	!
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine searches a table for a word code and returns an
+!	address of a counted string of an associated text string.
+!
+! FORMAL PARAMETERS:
+!
+!	CODE		Value of the code word
+!	TBL		Address of the table
+!	RTXTC		Address to return the address of the counted string
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Success or failure  RTXTC set to 'unrecognized' if failure
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL				! Pointer to the table
+	TPTR : REF BBLOCKVECTOR [1, 4]
+	;		!
+
+    .RTXTC = UPLIT (%ASCIC 'unrecognized');
+    TPTR = .TBL;
+
+    INCRU IDX FROM 0			! Scan the table
+    DO
+	BEGIN
+	IF .TPTR [.IDX, 0, 0, 16, 1]	! Look for the end first
+		EQL			! Use a signed reference for this
+		-1
+	THEN
+	    RETURN FAILURE		! Not found, return failure
+	;
+
+	IF .TPTR [.IDX, 0, 0, 16, 0]	! Look for the code (unsigned)
+		EQL
+	    .CODE <0, 16, 0>		! Code as a word
+	THEN
+	    BEGIN			! Return the real address
+	    .RTXTC = .TPTR [.IDX, 2, 0, 16, 1] ! Make address from the offset
+	    	+ TPTR [.IDX, 2, 0, 16, 1];
+	    RETURN SUCCESS		! We found it
+	    END
+	END
+    ;
+    RETURN FAILURE			! Better never fail this way
+
+    END;
+
+END				!End of module
+ELUDOM

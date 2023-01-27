@@ -1,0 +1,877 @@
+	.TITLE	SHOW$SYSTEM
+	.IDENT	'V03-001'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY:	DCL SHOW command
+;
+; ABSTRACT:
+;
+;	This module implements the SHOW SYSTEM command option
+;
+; ENVIRONMENT:
+;
+;	Runs in user mode but requires privilege to change mode to kernel
+;
+; AUTHOR : BEATRICE U. WALTHER,  CREATION DATE: 10-OCT-1977
+;
+; MODIFIED BY:
+;
+;	V03-001	GAS0067		Gerry Smith		30-Mar-1982
+;		If an error occurs during $EXPREG, propagate it to
+;		the user.
+;
+;	V02-009	SGD2004		Scott G. Davis		25-Jan-1982
+;		Fix address references that had to be <8000.
+;
+;	V02-008	LJK0111		Lawrence J. Kenah	7-Jan-1982
+;		Fix several broken word displacements.
+;
+;	V02-007	MIR0023		Michael I. Rosenblum	24-Aug-1981
+;		Fixed bug with processes being deleted out from
+;		under the program.  Added consistency check.
+;
+;	V02-006	DJD0001		Darrell Duffy		24-August-1981
+;		Display process name with nonprintables correctly.
+;
+;	V02-005	LMK0001		Len Kawell		7-Mar-1981
+;		Add version number to title line.
+;
+;	V02-004	RIH32713	Richard I. Hustvedt	23-Sep-1980
+;		Increase buffer to provide for 8192 processes.
+;
+;
+;--
+
+
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include files:
+;
+
+	$PCBDEF				; process control block defintions
+	$PHDDEF				; process header definitions
+	$STATEDEF			; define process states
+	$IPLDEF				; define IPL values
+	$PRDEF				; processor register definitions
+	$SHRDEF				;  define shared messages
+	$STSDEF				; define status codes
+
+;
+; Macros:
+;
+
+;+
+; The $SHR_MESSAGES macro defines facility-specific message codes
+;	which are based on the system-wide shared message codes.
+;
+;	$SHR_MESSAGES	name, code, <<msg,severity>, ... >
+;
+;	where:
+;	    "name" is the name of the facility (e.g., COPY)
+;	    "code" is the corresponding facility code (e.g., 103)
+;	    "msg" is the name of the shared message (e.g., BEGIN)
+;	    "severity" is the desired message severity (e.g., 1, 0, 2, 4)
+;
+;-
+	.MACRO	$SHR_MESSAGES	NAME,CODE,MSGCODES
+;
+	.IF	NDF,SHR$K_SHRDEF  ; issue $SHRDEF if not done yet
+		SHR$K_SHRDEF = 1 ; define symbol to indic $SHRDEF done
+		$SHRDEF		 ; define shared message codes
+	.ENDC
+	.IRP	MSGPAIR, <'MSGCODES>
+		$SHRMSG_COD 'NAME', 'CODE', MSGPAIR
+	.ENDR
+	.ENDM
+	.MACRO	$SHRMSG_COD NAME, CODE, MSG, SEVERITY
+;
+	.IF	IDN,SEVERITY,WARNING    ; if WARNING, set 0 sev
+	  'NAME'$_'MSG' = 0	        ; set 0 sev (WARNING)
+	.IFF
+	  .IF	IDN,SEVERITY,SUCCESS    ; if SUCCESS, set 1 sev
+	    'NAME'$_'MSG' = 1	        ; set 1 sev (SUCCESS)
+	  .IFF
+	    .IF	IDN,SEVERITY,ERROR      ; if ERROR, set 2 sev
+	      'NAME'$_'MSG' = 2	        ; set 2 sev (ERROR)
+	    .IFF
+	      .IF IDN,SEVERITY,INFO     ; if INFO, set 3 sev
+	        'NAME'$_'MSG' = 3       ; set 3 sev (INFO)
+	      .IFF
+	        .IF IDN,SEVERITY,SEVERE ; if SEVERE, set 4 sev
+	          'NAME'$_'MSG' = 4     ; set 4 sev (SEVERE)
+	        .IFF
+	          'NAME'$_'MSG' = 'SEVERITY ; set specified sev
+	        .ENDC
+	      .ENDC
+	    .ENDC
+	  .ENDC
+	.ENDC
+	 'NAME'$_'MSG' = 'NAME'$_'MSG'+SHR$_'MSG'+<'CODE'@16>
+	.ENDM
+
+
+;
+; Equated symbols:
+;
+
+	_VIELD	SYS,0,<-		; define bit masks
+		<PROC,,M>,-		; /PROCESS
+		<BATCH,,M>,-		; /BATCH
+		<SUBP,,M>,-		; /SUBPROCESS
+		<NETW,,M>,-		; /NETWORK
+		>
+
+	$SHR_MESSAGES	SHOW,120,<-	; define shared messages
+		<BADLOGIC,ERROR>,-
+			>
+
+
+SCRATCH_PAGES=1152			; scratch pages needed
+USER_MODE=3
+PROGRAM_REGION=0
+PCB$S_LNAME=16				; maximum length of a process name
+
+;
+; FORM
+;
+; This structure is used to hold information about one process.
+; It is subsequently used as an FAO parameter list by the formatting
+; routine
+;
+	$DEFINI	FORM
+$DEF	FORM_PROCINFO
+$DEF	FORM_L_PID
+	.BLKL	1			; process id
+$DEF	FORM_L_LENNAM			; Length of process name
+	.BLKL	1
+$DEF	FORM_L_LNAME
+	.BLKL	1			; pointer to process name
+$DEF	FORM_L_GRP
+	.BLKL	1			; group number of UIC
+$DEF	FORM_L_MEM
+	.BLKL	1			; member field of UIC
+$DEF	FORM_L_STATE
+	.BLKL	1			; process state
+$DEF	FORM_L_PRI
+	.BLKL	1			; current priority
+$DEF	FORM_L_DIOCNT
+	.BLKL	1			; accumulated direct I/O count
+$DEF	FORM_L_CPUTIM
+	.BLKL	1			; Elapsed CPU time
+$DEF	FORM_L_PFLTS
+	.BLKL	1			; page faults
+$DEF	FORM_Q_PHYS
+	.BLKQ	1			; Process private page count
+					; Global page count
+$DEF	FORM_L_STS
+	.BLKL	1			; process status
+					; (later pointer to string)
+$DEF	FORM_L_OWNER
+	.BLKL	1			; owner of process if any
+					; (later pointer to string)
+$DEF	FORM_L_NETWRK
+	.BLKL	1			; pointer to network indicator (if any)
+$DEF	FORM_T_LNAME
+	.BLKB	PCB$S_LNAME		; space for process name
+$DEF	FORM_K_LENGTH			; define length of structure
+	$DEFEND	FORM			; end of structure
+
+;
+; Own storage
+;
+
+	.PSECT	SHOW$RWDATA	LONG,RD,WRT,NOEXE
+;
+; define CLI call back structures
+;
+
+SYS_A_GETQUAL:
+	$CLIREQDESC	-
+		RQTYPE=CLI$K_GETQUAL,-	; get qualifiers request
+		QUALST=SYS_A_QUALST	; pointer to qualifier list
+SYS_A_QUALST:
+	$CLIQUALDEF	-
+		QDCODE=CLI$K_SHSS_PROC,-; /PROCESS
+		SETLST=SYS_V_PROC,-	;
+		TRUACT=SYS_PROC_PRES	;
+	$CLIQUALDEF	-
+		QDCODE=CLI$K_SHSS_BATC,-; /BATCH
+		SETLST=SYS_V_BATCH,-
+		CLRLST=SYS_V_PROC
+	$CLIQUALDEF	-
+		QDCODE=CLI$K_SHSS_SUBP,-; /SUBPROCESS
+		SETLST=SYS_V_SUBP,-
+		CLRLST=SYS_V_PROC
+	$CLIQUALDEF	-
+		QDCODE=CLI$K_SHSS_NETW,-; /NETWORK
+		SETLST=SYS_V_NETW,-
+		CLRLST=SYS_V_PROC
+	$CLIQUALDEF	END_LIST
+
+
+SYS_L_BITLIS:
+	.BLKL	1			; bit list
+SYS_Q_SCRATCH:
+	.BLKQ	1			; descriptor of scratch area
+					; (pointers to start and end)
+SYS_Q_CPUTIM:
+	.BLKQ	1			; space for expanded CPU time
+PCB_ARGLIS:
+	.LONG	1			; construct argument list for call
+	.BLKL	1			; to GET_PHD
+
+TITLE_ARGS:				; argument list for title line
+	.LONG	4			; version number length
+	.LONG	SYS$GQ_VERSION		; version number address
+	.LONG	0			; for date and time
+	.LONG	DESC_UPTIM		; for CPU uptime
+
+TEST_MASK:				; eligible for printing mask
+	.LONG	0
+
+DESC_UPTIM:				; descriptor for uptime
+	.LONG	13			; size of string returned
+BUF_AD:	.LONG	UP_BUFF			; addr. of string
+UP_BUFF:
+	.BLKB	13			; buffer for string
+
+;
+; text
+;
+
+	.PSECT	SHOW$STATE_TBL1	LONG,RD,NOWRT,NOEXE
+
+SYS_STATE:
+	.PSECT	SHOW$STATE_TBL2	LONG,RD,NOWRT,NOEXE
+
+SYS_STATE_TEXT:
+	.IRP	XXX,<-
+		COLPG,-			; collided page wait
+		MWAIT,-			; mutex and miscellaneous resource wait
+		CEF,-			; common event flag wait
+		PFW,-			; page fault wait
+		LEF,-			; local event flag wait
+		LEFO,-			; local event flag out of balance set
+		HIB,-			; hibernate wait
+		HIBO,-			; hibernate wait out of balance set
+		SUSP,-			; suspended
+		SUSPO,-			; suspended out of balance set
+		FPG,-			; free page wait
+		COM,-			; compute, in balance set
+		COMO,-			; compute, out of balance set
+		CUR,-			; current process
+		>
+	.PSECT	SHOW$STATE_TBL1	LONG,RD,NOWRT,NOEXE
+
+	.WORD SCH$C_'XXX		; code
+
+MAX_STATES =<.-SYS_STATE>/2		; no. of entries in state table
+	.PSECT	SHOW$STATE_TBL2	LONG,RD,NOWRT,NOEXE
+
+	.ADDRESS	SYS_T_'XXX	; pointer to text
+	.SAVE
+	.PSECT	SHOW$MSG_TXT	LONG,RD,NOWRT,NOEXE
+SYS_T_'XXX:
+	.ASCIC	/'XXX'/
+	.RESTORE
+	.ENDR
+SYS_T_BATCH:
+	.ASCIC	/B/			; batch indicator
+SYS_T_SUBPROC:
+	.ASCIC	/S/			; subprocess indicator
+SYS_T_NETWRK:
+	.ASCIC	/N/			; network indicator
+NULL_T_STRING:
+	.LONG	0			; null string is always needed
+
+;
+; define PSECTS to be locked
+;
+
+	.PSECT	SHOW$AAAADATA	PAGE,RD,WRT,NOEXE
+LOCK_DATA_START:
+TMP_L_DIOCNT:
+	.BLKL	1			; direct i/o count
+TMP_L_PAGEFLTS:
+	.BLKL	1			; page faults
+TMP_L_CPUTIM:
+	.BLKL	1			; CPU time
+TMP_L_STS:
+	.BLKL	1			; process status
+LOCK_DATA_END:
+
+;
+; build descriptors to locked areas
+;
+
+	.PSECT	SHOW$MSG_TXT BYTE,RD,NOWRT,NOEXE
+
+LOCK_Q_DATA:
+	.LONG	LOCK_DATA_START
+	.LONG	LOCK_DATA_END
+
+	.SBTTL	SHOW$SYSTEM	- main loop
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine represents the main control loop of the
+;	SHOW SYSTEM Command
+;
+;
+; CALLING SEQUENCE:
+;
+;	CALLS
+;
+; INPUT PARAMETERS:
+;
+;	4(AP) = address of CLI utility service routine
+;
+; IMPLICIT INPUTS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	R0 =	SS$_NORMAL
+;		Status code as returned by action routines 
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+	.PSECT	SHOW$CODE	BYTE,RD,NOWRT,EXE
+
+	.ENTRY	SHOW$SYSTEM,0
+
+;
+; get scratch space
+;
+
+	$EXPREG_S	-
+		PAGCNT=#SCRATCH_PAGES,-
+		RETADR=W^SYS_Q_SCRATCH,-
+		ACMODE=#USER_MODE,-
+		REGION=#PROGRAM_REGION
+	BLBS	R0,10$			; branch if no error
+
+	MOVL	R0,SHOW$L_STATUS	; if error from EXPREG, pass it on
+	BRB	90$			; and exit
+
+
+;
+; parse qualifiers
+;
+10$:
+	MOVL	#SS$_NORMAL,W^SHOW$L_STATUS
+
+					; assume success
+	PUSHAL	W^SYS_L_BITLIS		; bit list
+	PUSHAL	W^SHOW$A_CLIWORK	; CLI work area
+	PUSHAL	W^SYS_A_GETQUAL		; request qualifiers
+	CALLS	#3,@CLI$A_UTILSERV(AP)	; call CLI
+	MOVL	W^SHOW$L_STATUS,R0	; load status code of action routine
+
+;
+; exits
+;
+
+90$:
+	RET
+
+	.SBTTL	SYS_PROC_PRES	- display processes
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called by the CLI as a true action routine
+;	for qualifier /PROCESS
+;
+;
+; CALLING SEQUENCE:
+;
+;	CALLS
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT INPUTS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	R0 =	SS$_NORMAL
+;		Status code as returned by COPY_PROC
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+	.PSECT	SHOW$CODE	BYTE,RD,NOWRT,EXE
+
+SYS_PROC_PRES:
+	.WORD	0
+
+;
+; copy process information into scratch space
+;
+
+	$CMKRNL_S	<W^COPY_PROC>
+	BLBC	R0,90$			; exit on error
+
+;
+; format and print information
+;
+
+	CALLS	#0,W^SYS_FORMAT
+
+;
+; exit
+;
+
+90$:
+	MOVL	R0,W^SHOW$L_STATUS	; save status through CLI  return
+	RET
+
+	.SBTTL	COPY_PROC	- copy process information
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine scans all PCB's and copies information about each
+; 	process in the system into a scratch area
+;
+;
+; CALLING SEQUENCE:
+;
+;	CALLS
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT INPUTS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;
+;	Raw information about all processes is copied into a scratch area
+;
+; COMPLETION CODES:
+;
+;	R0 =	SS$_NORMAL
+;		SHOW$_BADLOGIC = scratch area overflow
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+; REGISTER USAGE
+;
+;	R6 = 	PCB address of null process
+;	R7 =	pointer to scratch area
+;	R8 = 	limit of scratch area
+;	R9 = 	current pix
+;	R10 =	address of current PCB beeing processes
+;	R11 =	pid for consistancy check
+;--
+
+	.PSECT	SHOW$CODE	BYTE,RD,NOWRT,EXE
+
+COPY_PROC:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+;
+; Initialize
+;
+
+	MOVL	W^SYS_Q_SCRATCH,R7	; start of scratch area
+	MOVL	W^SYS_Q_SCRATCH+4,R8	; limit of scratch area
+	CLRL	R9			; current pix
+	MOVL 	@SCH$GL_PCBVEC[R9],R10	; get start address of PCB pointer table
+	MOVL	PCB$L_PID(R10),R11	; get the pid for the consistancy check
+	MOVL	R10,R6			; remember PCB of null process
+;%%%
+	$LKWSET_S	-		; lock data in working set
+		INADR=LOCK_Q_DATA	; (code is accessed when called)
+	BLBC	R0,99$			; exit on error
+
+;
+; scan all PCB's
+;
+
+	BRB	12$			; don't skip null process the 1st time
+10$:
+	SETIPL	#IPL$_SYNCH		;SET IPL
+	MOVL	@SCH$GL_PCBVEC[R9],R10	; get address of PCB pointer table
+	MOVL	PCB$L_PID(R10),R11	; get the pid for the consistancy check
+	SETIPL	#0			;reset ipl
+	CMPL	R10,R6			; is it the NULL process ?
+	BEQLU	20$			; skip null process
+12$:
+	MOVL	#SYS_M_PROC,W^TEST_MASK	; init test mask
+	MOVL	R7,R5			; save pointer to scratch area
+	ADDL	#FORM_K_LENGTH,R5	; test for overflow
+	CMPL	R5,R8			;
+	BGEQU	80$			; branch on scratch area overflow
+	BSBW	W^COPY_PCB		; copy PCB information into scratch
+	PUSHL	R11			; pass the PID
+	PUSHL	R10			; address of PCB
+	CALLS	#2,W^GET_PHD		; get PHD information
+	BLBC	R0,20$			; if the process left us
+	BSBW	W^COPY_PHD		; copy PHD information from locked data
+					; into scratch
+	BITL	W^SYS_L_BITLIS,W^TEST_MASK	; show this one ?
+	BEQLU	20$			; br if qualifications not met
+	ADDL	#FORM_K_LENGTH,R7	; update pointer to scratch area
+20$:
+	AOBLEQ	SCH$GL_MAXPIX,R9,10$	; repeat for all PCB's
+	CMPL	R7,R8			; check for overflow
+	BGEQU	80$			; branch if overflow
+	MNEGL	#1,FORM_L_PID(R7)	; mark end of copied area
+	BRB	90$			; all done
+
+;
+; exits
+;
+
+80$:
+	MOVL	#SHOW$_BADLOGIC,R0	; scratch area overflow
+	RET
+90$:
+	MOVZWL	#SS$_NORMAL,R0		; signal success
+99$:
+	RET
+
+
+;
+; subroutine to copy PCB information into a scratch area
+;
+
+COPY_PCB:
+	MOVL	PCB$L_PID(R10),FORM_L_PID(R7)
+					; process id
+	MOVC3	#PCB$S_LNAME,PCB$T_LNAME(R10),FORM_T_LNAME(R7)
+					; process name
+	MOVZWL	PCB$W_GRP(R10),FORM_L_GRP(R7)
+					; group number of uic
+	MOVZWL	PCB$W_MEM(R10),FORM_L_MEM(R7)
+					; member number of UIC
+	MOVZWL	PCB$W_STATE(R10),FORM_L_STATE(R7)
+					; scheduling state
+	MOVZBL	PCB$B_PRI(R10),FORM_L_PRI(R7)
+					; current priority
+	MOVZWL	PCB$W_PPGCNT(R10),FORM_Q_PHYS(R7)
+					; process private page count
+	MOVZWL	PCB$W_GPGCNT(R10),FORM_Q_PHYS+4(R7)
+					; global page count
+	MOVL	PCB$L_OWNER(R10),FORM_L_OWNER(R7)
+					; owner pid, if any
+	BEQLU	10$			; br if not a subprocess
+	BISL2	#SYS_M_SUBP,W^TEST_MASK	; set bit for subprocess
+10$:	RSB
+
+;
+; subroutine to copy PHD information from locked data area into scratch area
+;
+
+COPY_PHD:
+	MOVL	W^TMP_L_DIOCNT,FORM_L_DIOCNT(R7)
+					; direct i/o count
+	MOVL	W^TMP_L_CPUTIM,FORM_L_CPUTIM(R7)
+					; elapsed CPU time
+	MOVL	W^TMP_L_PAGEFLTS,FORM_L_PFLTS(R7)
+					; page faults
+	MOVL	W^TMP_L_STS,R0		; process status
+	MOVL	R0,FORM_L_STS(R7)
+	BBC	#PCB$V_BATCH,R0,10$	; test if batch
+	BISL2	#SYS_M_BATCH,W^TEST_MASK; set bit for batch
+10$:	BBC	#PCB$V_NETWRK,R0,20$	; test if network proc.
+	BISL2	#SYS_M_NETW,W^TEST_MASK	; set bit for network proc.
+20$:	RSB
+
+	.SBTTL	SYS_FORMAT	- format and print information
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine scans the previously copied process information,
+;	formats it and prints it on SYS$OUTPUT:
+;
+;
+; CALLING SEQUENCE:
+;
+;	CALLS
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT INPUTS:
+;
+;	Process information previously copied into the scratch area
+;	EXE$GL_ABSTIM  -  System uptime in seconds
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	R0 =	SS$_NORMAL
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+; REGISTER USAGE:
+;
+;	R1,R2,R5 =	scratch
+;	R7 =		current pointer to scratch area
+;	R9 =		process status
+;
+;--
+
+	.PSECT	SHOW$CODE	BYTE,RD,NOWRT,EXE
+
+SYS_FORMAT:
+	.WORD	^M<R2,R5,R9>
+
+;
+; initialize
+;
+
+	MOVL	W^SYS_Q_SCRATCH,R7	; start of scratch area
+	TSTL	FORM_L_PID(R7)		; anything to show ?
+	BLSS	90$			; br if not
+	EMUL	#-10*1000*1000,EXE$GL_ABSTIM,-
+	#0,W^SYS_Q_CPUTIM		; compute delta uptime
+	$ASCTIM_S	-		; convert uptime to ASCII
+		TIMBUF=W^DESC_UPTIM,-	; descriptor addr.
+		TIMADR=W^SYS_Q_CPUTIM,-	; addr. of delta time
+		CVTFLG=#0		; return DDDD HH:MM:SS
+	SUBL2	#2,DESC_UPTIM		; skip past 2 digits of days
+	ADDL2	#2,BUF_AD		; 99 days should be enough
+	PUSHL	#SHOW$_SYSTTL		; message id for title
+	PUSHAL	W^TITLE_ARGS		; argument list for title line
+	CALLS	#2,W^SHOW$PRINT_MSG	; print the title
+
+;
+; scan copied information
+;
+10$:
+	TSTL	FORM_L_PID(R7)		; last entry ?
+	BLSS	90$			; branch if no more
+	BSBW	W^PRINT_PROC		; format and print information
+	ADDL2	#FORM_K_LENGTH,R7	; skip to next entry
+	BRB	10$			;
+
+;
+; exit
+;
+
+90$:
+	MOVZWL	#SS$_NORMAL,R0		; signal success
+	RET
+
+;
+; subroutine to format and print information
+;
+
+PRINT_PROC:
+
+;
+; rearrange data and perform some arithmetic
+;
+
+	MOVAL	FORM_T_LNAME(R7), R0	; Address of the name as counted str
+	MOVZBL	(R0)+, FORM_L_LENNAM(R7); Store the name
+	MOVL	R0,FORM_L_LNAME(R7)	; insert pointer to character string
+	EMUL	#100000,FORM_L_CPUTIM(R7),#0,W^SYS_Q_CPUTIM
+					; compute CPU time in system time format
+	MOVAL	W^SYS_Q_CPUTIM,FORM_L_CPUTIM(R7)
+					; insert pointer to counted scring
+	SUBL3	FORM_L_PRI(R7),#31,FORM_L_PRI(R7)
+					; complement priority
+	ADDL2	FORM_Q_PHYS+4(R7),FORM_Q_PHYS(R7)
+					; compute physical memory occupied
+	MOVL	FORM_L_STS(R7),R9	; save status
+	MOVAL	NULL_T_STRING,FORM_L_STS(R7)
+					; assume not batch
+	BBC	#PCB$V_BATCH,R9,20$	; is it a batch job ?
+	MOVAL	SYS_T_BATCH,FORM_L_STS(R7)
+					; insert pointer to string
+20$:
+	TSTL	FORM_L_OWNER(R7)	; test owner pid
+	BEQLU	30$			; branch if owner non zero
+	MOVAL	SYS_T_SUBPROC,FORM_L_OWNER(R7)
+					; it is a subprocess
+	BRB	40$
+30$:
+	MOVAL	NULL_T_STRING,FORM_L_OWNER(R7)
+40$:
+	MOVAL	NULL_T_STRING,FORM_L_NETWRK(R7)
+					; assume not a network process
+	BBC	#PCB$V_NETWRK,R9,45$	; branch if not a network process
+	MOVAL	SYS_T_NETWRK,FORM_L_NETWRK(R7)
+					; else insert pointer to network indicator
+45$:
+	MOVL	FORM_L_STATE(R7),R5	; get process state
+	CLRL	R1			; index into state table
+	MOVAL	NULL_T_STRING,FORM_L_STATE(R7)
+					; in case unknow state
+50$:
+	CMPW	SYS_STATE[R1],R5	; get state table entry
+	BNEQU	60$			; not the one
+	MOVL	SYS_STATE_TEXT[R1],-	; store address of text string
+		FORM_L_STATE(R7)
+	BRB	65$			; done
+60$:
+	AOBLEQ	#MAX_STATES,R1,50$	;
+65$:
+;
+; print information
+;
+
+	BLBC	R9,70$			; test for residency
+	PUSHL	#SHOW$_SYSPRES		; process was resident
+	BRB	80$
+70$:
+	PUSHL	#SHOW$_SYSPNRS		; process was non resident
+80$:
+	PUSHAL	FORM_PROCINFO(R7)	; parameter list
+	CALLS	#2,W^SHOW$PRINT_MSG	; print line
+	RSB
+
+	.SBTTL	GET_PHD		- copy PHD information
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	copies PHD information into temporary storage
+;
+;
+; CALLING SEQUENCE:
+;
+;	CALLS
+;
+; INPUT PARAMETERS:
+;
+;	4(AP)	= address of PCB
+;	8(AP)	= the PID for a consistancy check
+;
+; IMPLICIT INPUTS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;
+;	PHD information about the given process is copied into a temporary
+;	area.
+;
+; COMPLETION CODES:
+;
+;	R0 =	SS$_NORMAL
+;
+; SIDE EFFECTS:
+;
+;	This routine temporarily raises IPL to SYNCH.
+;	Therefore, its code as well as the data area it is copying to
+;	have to be locked in the working set before being called
+;	THIS CODE HAS TO FIT ON ONE PAGE !!
+;
+;--
+
+	.PSECT	SHOW$AAAACODE	PAGE,RD,NOWRT,EXE
+
+GET_PHD:
+	.WORD	^M<R2,R3>
+
+	MOVL	#1,R0			;SETUP SS$NORMAL
+	MOVL	4(AP),R1		; get PCB address
+	BLBC	PCB$L_STS(R1),20$	; process not resident anyway
+
+LOCK_BEGIN=.
+	SETIPL	LOCK_IPL		; disable interrupts
+	MOVZWL	8(AP),R3
+	MOVL	@SCH$GL_PCBVEC[R3],R3	; get address of PCB pointer table
+	CMPL	PCB$L_PID(R3),8(AP)	; compare this pid with the one we are
+	BEQLU	10$			; are they the same
+	CLRL	R0			; Signal an error
+	BRB	30$			; AND RETURN
+10$:	BLBC	PCB$L_STS(R1),20$	; check again for residency	
+	MOVL	PCB$L_PHD(R1),R2	; get pointer to PHD
+	MOVL	PHD$L_DIOCNT(R2),W^TMP_L_DIOCNT
+					; direct i/o count
+	MOVL	PHD$L_PAGEFLTS(R2),W^TMP_L_PAGEFLTS
+					; page faults
+	MOVL	PHD$L_CPUTIM(R2),W^TMP_L_CPUTIM
+					; elapsed CPU time
+20$:
+	MOVL	PCB$L_STS(R1),W^TMP_L_STS; copy status while in SYNCH
+;%%%
+30$:	SETIPL	#0			; drop IPL
+	RET
+LOCK_IPL:
+	.LONG	IPL$_SYNCH
+LOCK_END:
+	ASSUME	<LOCK_END-LOCK_BEGIN> LE 512
+	.END

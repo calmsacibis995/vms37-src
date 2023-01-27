@@ -1,0 +1,320 @@
+	.TITLE	BTMEM7VV - Configure and Test 11/7VV Memory
+	.IDENT	'V03-001'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; FACILITY:
+;
+;	Linked with VMB.EXE - part of the
+;	bootstrap module for VAX 11/7VV hardware.
+;
+; ENVIRONMENT:
+;
+;	Runs at IPL 31, kernel mode, memory management is OFF, IS=1
+;	(running on interrupt stack), and code must be PIC.
+;
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is 11/7VV specific and
+;	determines how much memory is on the system, which pages
+;	of that memory are present (and good). Then the routines
+;	set bits in the PFN bitmap to represent each present (and
+;	good) page of memory.  Only internal (main) memory and
+;	expander memory is configured.  No attempt is made to
+;	look for external (Abus, SBIA) memory such as MA780 or
+;	MS780.
+;
+; INPUTS:
+;
+;	R0-R4	- scratch
+;	R5	- address of 1st RPB configuration code field
+;	R6	- address of the PFN bitmap
+;	R7	- address of the SCB
+;	R8	- address of the CPU-specific table
+;	R9	- address of the RPB quadword descriptor to the bitmap
+;	R10	- address of the 1st unused byte of good memory
+;	R11	- address of the RPB
+;	FP	- original top of stack
+;	SP	- current top of stack
+;
+; IMPLICIT INPUTS:
+;
+;	The configuration of memory on a 11/7VV is determined by the system
+;	console during system initialization.  The memory is identified
+;	and its system physical address is determined by initilizing
+;	a hardware structure called the PAMM (Physical Address Memory
+;	Map).  This routine accesses the PAMM to determine how much
+;	memory has been identified by the console.
+;
+; OUTPUTS:
+;
+;	R6-R11 and SP must be preserved.
+;
+; IMPLICIT OUTPUTS:
+;
+;	The PFN bitmap is modified to describe all physical memory
+;	described by the PAMM and found to be good (RDS free) by the
+;	testing loop in this module.
+;
+;	RPB$L_PFNCNT stores the number of good pages of physical memory.
+;
+;	All single bit parity errors in memory are cleared.
+;
+; AUTHOR:
+;
+;	C. A. Samuelson, creation date 24-April-1981
+;
+; REVISION HISTORY:
+;
+;	V03-001	KDM0078		Kathleen D. Morse	15-Mar-1982
+;		Clear all MA780-specific boot flags.
+;
+;	V02-002	PRD0002		Paul R. DeStefano	27-Oct-1981
+;		Change notoation for 7VV support.
+;
+;	V02-001	PHL0012		Peter H. Lipman		04-Aug-1981
+;		Change PSECT to put this code into an area that VMB
+;		can overlay when it reads in the secondary boot.
+;
+;--
+
+	.SBTTL	Declarations
+
+	.DEFAULT DISPLACEMENT, WORD
+
+;
+; Macros to describe VMS data structures
+;
+
+	$DMPDEF				; System dump file header definitions
+	$IO7VVDEF			; 11/7VV definitions
+	$PAMMDEF			; Physical Address Memory Map defs
+	$PRDEF				; Processor registers
+	$RPBDEF				; Restart parameter block
+	$SBIADEF			; SBI Adapter definitions
+
+;
+; Macros
+;
+
+	.MACRO	ERROR,STR		; Outputs an error string to the
+	BSBW	ERROUT			; console terminal.
+	.ASCIZ	STR
+	.ENDM	ERROR
+
+	.PSECT	YBTMEM,LONG
+
+	.SHOW	EXPANSIONS
+
+	.SBTTL	CHECKMEM_7VV, Identify 11/7VV memory
+
+;++
+;
+; CHECKMEM_7VV, Locate and test memory for 117VV
+;
+;--
+
+CHECKMEM_7VV::
+
+; Start searching the PAMM for internal memory types.  The PAMM has 1024
+; locations.  Each location contains a code identifying whether there
+; is internal memory, expander memory, an Abus adapter, or nothing.  If
+; internal memory is indicated, the starting physical address is also in
+; the PAMM location.  Internal memory is always aligned on 1Mb boundaries
+; and comes in integral size multiples of 1 Mb.  Each PAMM location
+; maps 1 Mb of physical address space.  If expander memory is indicated,
+; the expander memory control contains a separate PAMM for describing
+; its contents.
+;
+; This routine starts by reading the memory separator register in the
+; bootstrap Abus adapter.  This location contains the highest physical
+; address possible for internal memory.  The search loop is terminated
+; when either all locations of the PAMM and expander memory PAMM have
+; been processed or when the calculated physical address of memory is
+; greater than the physical address in the memory separator register.
+;
+; The physical address space of internal memory can be sparse.  That is
+; the PAMM can map 1 Mb chunks of memory into discontiguous physical
+; addresses.  This module recognizes and this eventuality and configures
+; memory correctly.  However, it is not recommended that systems be
+; configured in this manner since  PFN database is used to describe the
+; holes as well as the valid memory.  Only 8 discontiguous regions of memory
+; are allowed.
+; 
+; During this memory locate and test loop, the following registers are
+; used.
+;
+;	R0	- Used to hold repeater memory block number
+;
+;	R1	- Contains the current physical address bits <29:20> of
+;		  the start of the memory segment to test.  Used to
+;		  access the PAMM location describing the memory.
+;
+;	R2	- Contents of PAMM location for current physical address
+;
+;	R3	- contains the highest possible internal and expander
+;		  memory physical address as determined by the memory
+;		  separator register in the bootstrap Abus adapter.
+;
+	BICL	#<RPB$M_MPM ! RPB$M_USEMPM ! RPB$M_FINDMEM>, -
+		RPB$L_BOOTR5(R11)	; Clear all MA780-specific boot flags
+	BISL3	IO7VV$AL_SBIACR,RPB$L_ADPPHY(R11),R3 ; Address of SBIA CR
+					; Config Reg contains Memory Separator
+	BICL3	#^C<SBIA$M_MEMSEP>,(R3),R3 ; Read CR, clear all but Mem Sep value
+
+	CLRL	R1			; Points to current PAMM location and
+					; physical address bits <29:20>
+	MOVAL	PAGE_MCHECK_7VV+1,4(R7)	; Special mcheck handler for RDS errors
+
+TRY_NEXT_7VV:				; Find and test next 1Mb of memory
+
+	MTPR	R1,#PR$_PAMLOC		; Address the next PAMM location
+	MFPR	#PR$_PAMACC,R2		; Get contents of the PAMM for this address
+
+; The low order 5 bits of the PAMM indicate what (if any) is present in the
+; associated 1 Mb of physical address.  These bits are encoded as follows:
+;
+;	Code	Meaning
+;	 00	 Internal Memory Array Card 0
+;	  .
+;	  .
+;	  .
+;	 07	 Internal Memory Array Card 7
+;	 08	 Bus repeater present
+;	 19	 I/O adapter 0
+;	  .
+;	  .
+;	  .
+;	 1C	 I/O adapter 3
+;	 1D	 unused
+;	 1E	 unused
+;	 1F	 Non-existant memory
+
+	EXTZV	#PAMM$V_CONF,#PAMM$S_CONF,R2,R2
+					; Isolate PAMM location type code
+	BBC	#4,R2,TEST_7VV		; Either memory or expander memory if set
+	BRW	DO_NEXT_7VV		; Not interested in I/O or NEXM
+
+; We have found either an internal array or an expander memory bus repeater.
+; If this is an internal array, then (conditionally) test each page and
+; configure good pages in the PFN bitmap.  If this is a memory repeater,
+; then access the repeater's PAMM to find out about the memory.
+
+TEST_7VV:
+	CMPB	#PAMM$C_RPTR,R2			; Repeater if code 8
+	BNEQ	INTERNAL_MEM		; Not a repeater, test internal memory
+
+; This is a repeater memory.  Access the Repeater memory PAMM to discover what
+; memory is present.  Configure all repeater memory before we continue to
+; examine the internal memory PAMM.
+
+	MOVZBL	#1,R0			; Search for repeater memory with an array
+	MOVL	R1,R4			; Copy Physical Address
+RPTR_LOOP:
+	INSV	R0,#PAMM$V_BLOCK,#PAMM$S_BLOCK,R4 ; Address Repeater Memory Block
+	MTPR	R4,#PR$_PAMLOC		; Address Repeater PAMM location
+	MFPR	#PR$_PAMACC,R2		; Read Repeater PAMM
+	EXTZV	#PAMM$V_CONF,#PAMM$S_CONF,R2,R2 ; Isolate configuration type field
+	CMPB	#PAMM$C_RPTR,R2		; Array card if code between 0 and 7
+	BGTR	INTERNAL_MEM		; If an array card, test and configure memory
+	INCL	R0			; Move to next repeater block
+	CMPB	R0,#2			; Only two repeater blocks
+	BLEQ	RPTR_LOOP		; Check them both
+	BRB	DO_NEXT_7VV		; End of repeater memory, back to main loop
+
+INTERNAL_MEM:				; Internal memory
+	BSBW	TEST_MEMORY_7VV		; Call subroutine to test 1Mb of memory
+	
+; End of test loop for this PAMM location.  Increment to the next megabyte
+; address, test to see if either all PAMM locations have been examined or
+; if we have reached the memory separator boundary.  If either is true, then
+; we're done, else continue looking.
+
+DO_NEXT_7VV:
+	ADDL	#^X100000,R1		; Increment to next 1 Mb boundary
+	BBS	#30,R1,10$		; End of PAMM if overflow to bit 30
+	CMPL	R1,R3			; Past memory separator?
+	BGTRU	10$			;
+	BRW	TRY_NEXT_7VV		; No look at next PAMM location
+10$:	MOVAL	UNEXP_MCHK+1,4(R7)	; Restore SCB vector
+	CLRL	(R10)+			; Indicate end of RPB memory descr list
+	RSB				; Done, return
+
+	.SBTTL	TEST_MEMORY_7VV - Test and configure 1 Mb of 11/7VV memory
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is used to test and configure 1 Mb of 11/7VV memory
+;	after its starting physical address has been determined by accessing
+;	the PAMM.  This routine sets a bit in the PFN bitmap for each good
+;	page found and updates the RPB memory descriptor array indicating
+;	the presence of the memory.
+;
+; INPUTS:
+;
+;	R1	- Contains the physical address of the start of the 1 Mb
+;		  chunk of memory to test.
+;
+;	R4	- Scratch
+;
+;	R6	- Address of the PFN bitmap
+;
+;	R11	- Address of the RPB
+;
+;		All other registers used (except R4) must be preserved.
+;
+; OUTPUTS:
+;
+;	All registers except R4 must be preserved.
+;
+; IMPLICIT OUTPUTS:
+;
+;	Each byte of memory is written to initialize the memory arrays.
+;
+;	A bit is set in the PFN bitmap is set for each good page of memory
+;	in the 1 Mb segment.
+;
+;	The RPB memory descriptor field is updated to represent the memory
+;	found.  If this segment of memory is discontiguous with the previous,
+;	then a new memory descriptor is started.
+;
+;--
+
+TEST_MEMORY_7VV:
+;********************************************************************
+	RSB
+
+	.SBTTL	PAGE_MCHECK_7VV - RDS Machine Check Handler for Memory Test
+;++
+; PAGE_MCHECK_7VV - RDS Machine Check Handler for 11/7VV Memory Test
+;--
+
+PAGE_MCHECK_7VV:
+	REI
+	.END

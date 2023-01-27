@@ -1,0 +1,2078 @@
+	.TITLE	DDDRIVER - TU58 DC100 TAPE CARTRIDGE DRIVER
+	.IDENT	'V03-001'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;
+;++
+;
+; FACILITY:
+;
+;	VAX/VMS	 TU58 DATA CARTRIDGE DRIVER
+;
+;
+; ABSTRACT:
+;
+;	This module contains the tables and routines necessary to
+;	perfrom all device-dependent processing of an I/O request
+;	for the TU58 on a VAX/VMS operating system.  This device
+;	operates using a RADIAL SERIAL PROTOCOL.  For a spec of the
+;	TU58 and its RSP, see the "TU58 DECtape II USER'S GUIDE",
+;	document # EK-0TU58-UG-001.
+;
+;	This driver is desinged to work with a DL-11 serial interface
+;	via the UBA registers, or as a console device via the internal
+;	processor registers.
+;
+; AUTHOR:
+;
+;	S. T. Jeffreys		31-OCT-1979	(with thanks to Mark Grossman)
+;
+; MODIFIED BY:
+;
+;	V03-001	STJ0260		Steven T. Jeffreys	15-Apr-1982
+;		- A slight change for 11/730 initialization code.
+;		  Relax some of the sanity checking to allow for
+;		  variations between processors.
+;
+;	V02-008	STJ0232		Steven T. Jeffreys	02-Mar-1982
+;		- Set the number of retries per request down to 4 (from 8).
+;		- Modify the reset_controller routine to always dump the
+;		  reciever buffer immediately after clearing the BREAK.
+;		- Modify dump_recvr_buf to return an error status if
+;		  the DONE bit never gets set.
+;		- Modify snd_pkt_noint to return an error status if
+;		  the READY bit never gets set.
+;
+;	V02-007	STJ0107		Steven T. Jeffreys	19-Aug-1981
+;		- Modified SND_PKT_NOINT to spin on the tranmitter ready bit.
+;		  This is necessary for 11/750 console TU58s to init properly.
+;		- Always return SS$_DATAOVERUN from GET_PACKET_C and GET_PACKET_U
+;		  so that in the event of an error, R0 will contain the correct
+;		  status code.  For non-error conditions, R0 is ingored.
+;
+;	V02-006	TCM0001		Trudy C. Matthews	29-Jul-1981
+;		Changed all "7ZZ"s to "730"s.
+;
+;	V02-005	JLV0025		Jake VanNoy		11-Jun-1981
+;		Added DEFUNITS to DPT.
+;
+;	V02-004	STJ0027		Steven  T. Jeffreys,	24-Mar-1981
+;		- Modify the driver so that the device dependent status info
+;		  is not returned in R1 (second longord of the IOSB).
+;		  Register R1 will be zeroed before completing the I/O.
+;		- Return SS$_DATAOVERUN for data over run errors.
+;		- Return SS$_PARITY for checksum errors.
+;		- Alter errorlogging scheme to log all device errors.
+;		  Old scheme was to only log errors that aborted the request.
+;		- Modify the controller error/reset routine so that it will
+;		  return the original reason for the controller reset.
+;		- Added support for multiple console TU58s. (eg. CSA1, CSA2)
+;		- Added support for MRSP.
+;		- Optimized interrupt service routines to minimize interrupt
+;		  latentcy and processor usage.
+;
+;	V02-003	ACG0179		Andrew C. Goldstein,	23-Jul-1980  18:17
+;		Fix ACP class code in DPT
+;
+;	V02-002	STJ0001		Steve Jeffreys,		15-July-1980
+;		Fix access violation on IO$_SEARCH requests.
+;
+;--
+
+	.PAGE
+	.SBTTL	EXTERNAL DEFINITIONS
+;
+; EXTERNAL SYMBOLS
+;
+	$ADPDEF				;Define adapter control block
+	$CRBDEF				;Define channel request block
+	$DCDEF				;Define device class
+	$DDBDEF				;Define device data block
+	$DEVDEF				;Define device characteristics
+	$DPTDEF				;Define driver prologue table
+	$DYNDEF				;Define data structure types
+	$EMBDEF				;Define error message buffer
+	$IDBDEF				;Define interrupt data block
+	$IODEF				;Define I/O function codes
+	$IRPDEF				;Define I/O request packet
+	$PRDEF				;Define processor registers
+	$PTEDEF				;Page table entry definitions
+	$SSDEF				;Define system status codes
+	$UBADEF				;Define unibus adapter
+	$UCBDEF				;Define unit control block
+	$VECDEF				;Define interrupt vector block
+	.PAGE
+	.SBTTL  LOCAL DEFINITONS
+;
+; Local symbols
+;
+
+;
+; TU58 register definitions
+;
+
+	$DEFINI	DD			;Start of register definitions
+
+$DEF	DD_RCSR		.BLKW	1	;Receiver status register
+	_VIELD	DD_RCSR,0,<-		;Start of bit definitions
+		<,6>,-			;Unused bits
+		<RIE,,M>,-		;Receiver interrupt enable
+		<RDONE,,M>,-		;Receiver done
+		>			;
+$DEF	DD_RBUF		.BLKW	1	;Receiver data buffer register
+	_VIELD	DD_RBUF,0,<-		;Start of bit definitions
+		<,15>,-			;0-7 data , 8-14 unused
+		<ERROR,,M>,-		;Composite error bit
+		>
+$DEF	DD_XCSR		.BLKW	1	;Transmitter status register
+	_VIELD	DD_XCSR,0,<-		;Start of bit definitions
+		<BREAK,,M>,-		;Causes a framing error-break
+		<,5>,-			;Unused
+		<TIE,,M>,-		;Transmitter interrupt enable
+		<TRDY,,M>,-		;Transmitter ready
+		>			;
+$DEF	DD_XBUF		.BLKW	1	;TRANSMITTER DATA BUFFER REGISTER
+
+	$DEFEND	DD
+
+;
+;	Device function codes.
+;
+DD_CODE_DATACHECK = 1			;Datacheck READ/WRITE modifier
+DD_CODE_READ      = 2			;Read request
+DD_CODE_WRITE     = 3			;Write request
+DD_CODE_SEARCH    = 5			;Search Request
+DD_CODE_DIAG      = 7			;Diagnostic request
+DD_CODE_DETECT	  = 10			;Detect TU58 type
+;
+;	Radial serial protocol flags
+;
+DD_FLAG_DATA	= 1			;Data packet flag
+DD_FLAG_CNTL	= 2			;Command packet flag
+DD_FLAG_INIT	= 4			;Initialize controller flag
+DD_FLAG_CONT	= 16			;Continue flag
+DD_FLAG_XOFF	= 19			;Suspend device action flag
+ACK_CHAR	= DD_FLAG_CONT		;ACK character for MRSP
+MRSP_V_SWITCH	= 3			;Switch vield for MRSP
+MRSP_M_SWITCH	= 8			;Switch mask for MRSP
+CMD_PKT_HDR	= ^X0A02		;Command packet header switch
+DTECT_PKT_HDR	= ^X000A0A02		;Special command packet header
+DTECT_PKT_CHKSM	= ^X0A0C		;Special command packet checksum
+TWO_INITS	= ^X0404		;Two INIT characters
+	.PAGE
+;
+;	Device dependent status codes returned in the END PACKET.
+;
+DD_STS_NORMAL  = 0			;Normal success
+DD_STS_RETRY   = 1			;Success but with retries
+DD_STS_BADDIAG = -1			;Failed self test (diagnostics)
+DD_STS_PARTOP  = -2			;Partial operation (end of tape)
+DD_STS_BADUNIT = -8			;Bad unit #
+DD_STS_NOCART  = -9			;No cartridge
+DD_STS_WRTLCK  = -11			;Write locked
+DD_STS_DATACHK = -17			;Data check error
+DD_STS_BLKNF   = -32			;Seek error (block not found)
+DD_STS_MTRSTOP = -33			;Motor stopped
+DD_STS_BADOPCD = -48			;Bad op code
+DD_STS_BADRCD  = -55			;Bad record #
+;
+;	The remainder of the status codes are internal
+;	to this driver, and are used only for debugging.
+;
+DD_STS_BADINIT = -57			;Failed init sequence 
+DD_STS_BADCKSM = -58			;Failed checksum comparison
+DD_STS_DATAOVR = -59			;Data over-run
+;
+;	Define various and sundry symbols.
+;
+DD_CP_LEN	= 14			;Command packet buffer length in bytes
+DD_EP_LEN	= 14			;End packet buffer length in bytes
+DD_NUM_REGS	= 4;			;Number of device registers
+DD_ERRBUF_LEN	= <<DD_NUM_REGS * 4> + DD_CP_LEN + DD_EP_LEN>
+DD_ERRBUF_LEN_L	= 11			;Length of error buffer in longwords
+DD_CP_BCNT	= 10			;Command packet byte count
+DD_CHKSM_LEN	= 2			;Packet checksum length in bytes
+DD_MAX_PKT_BCNT = 128			;Maximum data packet byte count
+DD_DPBCNT	= 1			;Offset to data packet byte count
+DD_DATA		= 2			;Offset to data w/i data packet
+DD_DPBUF_LEN	= <DD_MAX_PKT_BCNT + 4>	;Data packet buffer length
+LONG_WAIT	= 52			;# of seconds before read timeout
+SHORT_WAIT	= 2			;# of seconds to wait after first byte read
+WRITE_WAIT	= 2			;# of seconds before write timeout
+HIGH_DIPL	= 23			;Special DIPL for COMET
+MAXCHRTIM	= 20000			;Maximum character time, in 10 u-sec
+					;units, assuming a 50 baud line.
+;
+;	Define the bits for device dependent status word in the UCB.
+;	The field that contains these bits is UCB$W_TU58STS.
+;
+	_VIELD	DD,0,<-			;Start of bit definitions
+		<CONSOLE,,M>,-		;Console device
+		<PASS1,,M>,-		;Determines where to call buffer routines
+		<MRSP,,M>,-		;This TU58 speaks MRSP
+		<USEMRSP,,M>,-		;Use MRSP for this operation
+		>			;End of bit definitions
+	.PAGE
+;
+;	Define extensions to UCB
+;
+	$DEFINI	UCB			;Start of UCB extensions
+
+.=UCB$W_BCR+2				;Begin definitions at end of UCB
+$DEF	UCB$L_DD_BUFWIN	.BLKL	1	;Window to user's buffer
+$DEF	UCB$L_DD_DPTR	.BLKL	1	;Pointer to data packet buffer
+$DEF	UCB$L_DD_MSGPKT	.BLKL	1	;Current message packet address
+$DEF	UCB$W_DD_MSGLEN	.BLKW	1	;Current message packet length
+;
+; Define buffer for device registers.
+;
+$DEF	UCB$K_DD_REGBUF			;Register buffer address
+$DEF	UCB$W_DD_XCSR	.BLKW	1	;Transmitter CSR
+$DEF	UCB$W_DD_XBUF	.BLKW	1	;Transmitter buffer
+$DEF	UCB$W_DD_RCSR	.BLKW	1	;Receiver CSR
+$DEF	UCB$W_DD_RBUF	.BLKW	1	;Receiver buffer
+;
+; Define the Command Packet buffer.
+;
+$DEF	UCB$K_DD_CPADDR			;Command packet buffer address
+$DEF	UCB$B_DD_CPFLAG	.BLKB	1	;Command packet flag byte
+$DEF	UCB$B_DD_CPBCNT	.BLKB	1	;Command packet byte count
+$DEF	UCB$B_DD_OPCODE	.BLKB	1	;Op code
+$DEF	UCB$B_DD_OPMOD	.BLKB	1	;Op code modifier
+$DEF	UCB$B_DD_UNIT	.BLKB	1	;Unit number
+$DEF	UCB$B_DD_SWITCH	.BLKB	1	;Switches
+$DEF	UCB$B_DD_SEQL	.BLKB	1	;Sequence number - low byte
+$DEF	UCB$B_DD_SEQH	.BLKB	1	;Sequence number - high byte
+$DEF	UCB$B_DD_BCNTL	.BLKB	1	;Byte count - low byte
+$DEF	UCB$B_DD_BCNTH	.BLKB	1	;Byte count - high byte
+$DEF	UCB$B_DD_BLKL	.BLKB	1	;Block number - low byte
+$DEF	UCB$B_DD_BLKH	.BLKB	1	;Block number - high byte
+$DEF	UCB$W_DD_CPCKSM	.BLKW	1	;Command packet checksum
+;
+;	Define the End Packet buffer
+;
+$DEF	UCB$K_DD_EPADDR			;End packet buffer address
+$DEF	UCB$B_DD_EPFLAG	.BLKB	1	;End packet flag
+$DEF	UCB$B_DD_EPBCNT	.BLKB	1	;Packet byte count
+$DEF	UCB$B_DD_EPCODE	.BLKB	1	;Op code
+$DEF	UCB$B_DD_EPSTS	.BLKB	1	;Success code
+$DEF	UCB$B_DD_EPUNIT	.BLKB	4	;Unit # (next 3 bytes not used)
+$DEF	UCB$W_DD_ABCNT	.BLKW	1	;Actual byte count (bytes transfered)
+$DEF	UCB$W_DD_SMSTS	.BLKW	1	;Summary status (more status info)
+$DEF	UCB$W_DD_EPCKSM	.BLKW	1	;Packet checksum
+
+$DEF	UCB$K_DD_UCBLEN			;Last loc. in UCB
+	$DEFEND	UCB
+
+;
+; The following are psuedonyms for existing but unused fields in the UCB.
+;
+UCB$W_TU58STS	= UCB$B_OFFNDX		;Device specific status
+					;This field also uses UCB$B_OFFRTC
+;
+; Note that the following fields in the UCB are currently not
+; used by the TU58 driver, and may be used as the need arises.
+;
+; UCB$B_FEX
+; UCB$B_CEX
+; UCB$x_xxx		(unused, WORD sized field contiguous with UCB$B_CEX)
+; UCB$W_EC1
+; UCB$W_EC2
+	.PAGE
+	.SBTTL  LOCAL MACRO DEFINITIONS
+;
+;	LOCAL MACRO DEFINITIONS
+;
+
+;
+; GET_PACKET	- Get a packet of data from the TU58
+;
+.MACRO	GET_PACKET	?L1,?L2
+	BBC	#DD_V_CONSOLE,-		;Branch if not a console device
+		UCB$W_TU58STS(R5),L1	;
+	BSBW	GET_PACKET_C		;Get packet (console)
+	BRB	L2			;Rejoin common code
+L1:	BSBW	GET_PACKET_U		;Get packet (unibus)
+L2:
+.ENDM	GET_PACKET
+
+;
+; SEND_PACKET	- Send a packet of data to the TU58
+;
+.MACRO	SEND_PACKET	?L1,?L2
+	BBC	#DD_V_CONSOLE,-		;Branch if not a console device
+		UCB$W_TU58STS(R5),L1	;
+	BSBW	SEND_PACKET_C		;Send packet (console)
+	BRB	L2			;Rejoin common code
+L1:	BSBW	SEND_PACKET_U		;Send packet (unibus)
+L2:
+.ENDM	SEND_PACKET
+
+
+;
+; GET_BYTE	- Get a byte of data from the device.
+;
+.MACRO	GET_BYTE
+	MOVAB	UCB$B_SPR(R5),-		;Get buffer address
+		UCB$L_DD_MSGPKT(R5)	;
+	MOVW	#1,UCB$W_DD_MSGLEN(R5)	;Get buffer length
+	GET_PACKET			;Get the data
+.ENDM	GET_BYTE
+
+;
+; SEND_BYTE	- Send a byte of data to the device.
+;
+.MACRO	SEND_BYTE
+	MOVAB	UCB$B_SPR(R5),-		;Get buffer address
+		UCB$L_DD_MSGPKT(R5)	;
+	MOVW	#1,UCB$W_DD_MSGLEN(R5)	;Get buffer length
+	SEND_PACKET			;Send data
+.ENDM	SEND_BYTE
+	
+
+;
+; MOVTOUSER
+;
+; Move a string of data to the user's buffer.
+; Assume all inputs have been set up.
+; The different entry points are needed to avoid problems
+; with page  aligned user buffers.
+;
+.MACRO	MOVTOUSER ?L1,?L2
+	BBSC	#DD_V_PASS1,-		;Is this the first data transfer?
+		UCB$W_TU58STS(R5),L1	;Branch if yes
+	MOVL	UCB$L_DD_BUFWIN(R5),R0	;Get window into user's buffer
+	JSB	G^IOC$MOVTOUSER2	;Move data
+	BRB	L2			;Rejoin common code
+L1:	JSB	G^IOC$MOVTOUSER		;Move data
+L2:	MOVL	R0,UCB$L_DD_BUFWIN(R5)	;Save new window
+.ENDM	MOVTOUSER
+
+
+;
+; MOVFROMUSER
+;
+; Move a string of data from the user's buffer.
+; Assume all inputs have been set up.
+; The different entry points are needed to avoid problems
+; with page  aligned user buffers.
+;
+.MACRO	MOVFROMUSER ?L1,?L2
+	BBSC	#DD_V_PASS1,-		;Is this the first data transfer?
+		UCB$W_TU58STS(R5),L1	;Branch if yes
+	MOVL	UCB$L_DD_BUFWIN(R5),R0	;Get window into user's buffer
+	JSB	G^IOC$MOVFRUSER2	;Move data
+	BRB	L2			;Rejoin common code
+L1:	JSB	G^IOC$MOVFRUSER		;Move data
+L2:	MOVL	R0,UCB$L_DD_BUFWIN(R5)	;Save new window
+.ENDM	MOVFROMUSER
+	.PAGE
+	.SBTTL  DRIVER PROLOGUE TABLE
+;
+; DRIVER PROLOGUE TABLE
+;
+;	The DPT describes driver parameters and I/O databse fields
+;	that are initialized during driver LOADing and RELOADing.
+;
+DPTAB	-				;DPT creation macro
+	END=DD_END,-			;End of driver
+	ADAPTER=UBA,-			;Adapter type = UNIBUS
+	FLAGS=DPT$M_SVP,-		;System page table entry required
+	UCBSIZE=<UCB$K_DD_UCBLEN>,-	;Length of UCB
+	NAME=DDDRIVER,-			;Driver name
+	DEFUNITS=2			;Number of units to autoconfigure.
+
+DPT_STORE INIT				;START CONTROL BLOCK INIT VALUES
+DPT_STORE DDB,DDB$L_ACPD,L,<^A\F11\>	;Default ACP name
+DPT_STORE DDB,DDB$L_ACPD+3,B,DDB$K_TAPE	;ACP class
+DPT_STORE UCB,UCB$B_FIPL,B,8		;Fork IPL
+
+DPT_STORE UCB,UCB$L_DEVCHAR,L,-		;DEVICE CHARACTERISTICS
+		<DEV$M_FOD-		;- File oriented
+		!DEV$M_DIR-		;- Directory structured
+		!DEV$M_AVL-		;- Available
+		!DEV$M_ELG-		;- Error logging
+		!DEV$M_SHR-		;- Shareable
+		!DEV$M_IDV-		;- Input device
+		!DEV$M_ODV-		;- Output device
+		!DEV$M_RND>		;- Random access
+
+DPT_STORE UCB,UCB$B_DEVCLASS,B,DC$_DISK	;Device class
+DPT_STORE UCB,UCB$B_DEVTYPE,B,DT$_TU58	;Device type
+DPT_STORE UCB,UCB$W_DEVBUFSIZ,W,512	;Default buffer size
+DPT_STORE UCB,UCB$B_SECTORS,B,128	;Number of sectors/track
+DPT_STORE UCB,UCB$B_TRACKS,B,4		;Number of tracks/cylinder
+DPT_STORE UCB,UCB$W_CYLINDERS,W,1	;Number of cylinders
+DPT_STORE UCB,UCB$B_DIPL,B,20		;Device IPL
+DPT_STORE UCB,UCB$B_ERTMAX,B,4		;Maximum error retry count
+DPT_STORE UCB,UCB$L_MAXBLOCK,L,512	;Maximum # of blocks
+DPT_STORE REINIT			;START CONTROL BLOCK RE-INIT VALUES
+DPT_STORE CRB,CRB$L_INTD+4,D,DD_INT	;Interrupt service routine address
+DPT_STORE CRB,CRB$L_INTD2+4,D,DD_INT	;Interrupt service routine address
+DPT_STORE CRB,-				;Unit init
+	  CRB$L_INTD+VEC$L_UNITINIT,D,-	;
+	  DD_UNIT_INIT			;
+DPT_STORE DDB,DDB$L_DDT,D,DD$DDT	;DDT address
+
+DPT_STORE END				;End of prologue table
+
+	.PAGE
+	.SBTTL  DRIVER DISPATCH TABLE
+;
+;DRIVER DISPATCH TABLE
+;
+;	The DDT list entry points for the driver subroutines which are
+;	called by the operating system.
+;
+
+	DDTAB	-			;DDT creation macro
+		DEVNAM=DD,-		;Generic device name
+		START=DD_STARTIO,-	;STARTIO routine address
+		UNSOLIC=0,-		;Unsolicited interrupt handler
+		FUNCTB=DD_FUNCTABLE,-	;FDT address
+		CANCEL=0,-		;CANCEL I/O handler
+		REGDMP=DD_REGDUMP,-	;Register dump routine address
+		DIAGBF=<DD_ERRBUF_LEN+<<1+3+5>*4>>,- ;Byte size of diab buffer
+		ERLGBF=<DD_ERRBUF_LEN+<1*4>+<EMB$L_DV_REGSAV>>	;Byte size of
+							 	;errorlog buffer
+		
+	.PAGE
+	.SBTTL	FUNCTION DECISION TABLE
+;
+; FUNCTION DECISION TABLE
+;
+;	The FDT lists valid function codes, specifies which codes
+;	are buffered, and designates subroutines to perform I/O
+;	preprocessing for particular functions.
+;
+
+DD_FUNCTABLE:
+
+	FUNCTAB,-			;LIST LEGAL FUNCTIONS
+		<DIAGNOSE,-		;RUN INTERNAL DIAGNOSTICS 
+		SEARCH,-		;SEARCH FOR BLOCK
+		SENSECHAR,-		;SENSE CHARACTERISTICS
+		SETCHAR,-		;SET CHARACTERISTICS
+		SENSEMODE,-		;SENSE MODE
+		SETMODE,-		;SET MODE
+		READLBLK,-		;READ LOGICAL BLOCK
+		WRITELBLK,-		;WRITE LOGICAL BLOCK
+		READPBLK,-		;READ PHYSICAL BLOCK
+		WRITEPBLK,-		;WRITE PHYSICAL BLOCK
+		READVBLK,-		;READ VIRTUAL BLOCK
+		WRITEVBLK,-		;WRITE VIRTUAL BLOCK
+		ACCESS,-		;ACCESS FILE / FIND DIRECTORY ENTRY
+		ACPCONTROL,-		;ACP CONTROL FUNCTION
+		CREATE,-		;CREATE FILE AND /OR DIRECTORY ENTRY
+		DEACCESS,-		;DEACCESS FILE
+		DELETE,-		;DELETE FILE AND / OR DIRECTORY ENTRY
+		MODIFY,-		;MODIFY FILE ATTRIBUTES
+		MOUNT-			;MOUNT VOLUME
+		>
+
+	FUNCTAB,-			;BUFFERED FUNCTIONS
+		<SENSECHAR,-		;SENSE CHARACTERISTICS
+		SETCHAR,-		;SET CHARACTERISTICS
+		SENSEMODE,-		;SENSE MODE
+		SETMODE,-		;SET MODE
+		ACCESS,-		;ACCESS FILE / FIND DIRECTORY ENTRY
+		ACPCONTROL,-		;ACP CONTROL FUNCTION
+		CREATE,-		;CREATE FILE AND /OR DIRECTORY ENTRY
+		DEACCESS,-		;DEACCESS FILE
+		DELETE,-		;DELETE FILE AND / OR DIRECTORY ENTRY
+		MODIFY,-		;MODIFY FILE ATTRIBUTES
+		MOUNT-			;MOUNT VOLUME
+		>
+	FUNCTAB +ACP$READBLK,-		;READ FUNCTIONS
+		<READLBLK,-
+		READPBLK,-
+		READVBLK,-
+		>
+	FUNCTAB +ACP$WRITEBLK,-		;WRITE FUNCTIONS
+		<WRITELBLK,-
+		WRITEPBLK,-
+		WRITEVBLK,-
+		>
+	FUNCTAB +EXE$ONEPARM,-		;ONE PARAMETER FUNCTIONS
+		<SEARCH,-
+		>
+	FUNCTAB	+EXE$ZEROPARM,-		;ZERO PARAMETER FUNCTIONS
+		<DIAGNOSE,-
+		>
+	FUNCTAB +ACP$ACCESS,-
+		<ACCESS,-
+		CREATE-
+		>
+	FUNCTAB +ACP$DEACCESS,-
+		<DEACCESS-
+		>
+	FUNCTAB +ACP$MODIFY,-
+		<ACPCONTROL,-
+		DELETE,-
+		MODIFY-
+		>
+	FUNCTAB +ACP$MOUNT,-
+		<MOUNT-
+		>
+	FUNCTAB +EXE$SENSEMODE,-
+		<SENSECHAR,-
+		SENSEMODE-
+		>
+	FUNCTAB	+EXE$SETCHAR,-
+		<SETCHAR,-
+		SETMODE-
+		>
+
+	.PAGE
+	.SBTTL	TU58 UNIT INITIALIZATION
+;++
+; DD_UNIT_INIT - TU58 TAPE CARTRIDGE UNIT INITIALIZATION
+;
+; The operating system calls this routine at system startup,
+; during driver loading and during recovery from power failure.
+;
+; INPUTS:
+;
+;		R4 = ADDRESS OF CSR
+;		R5 = ADDRESS OF UNIT CONTROL BLOCK
+;
+;	All interrupts are locked out.
+;
+; OUTPUTS:
+;
+;	Allocate a data packet buffer out of nonpaged pool, if the buffer
+;	has not already been allocated.  This is done to reduce the size
+;	of the UCB.  If the buffer cannot be allocated, exit immediately.
+;	In addition to the buffer itself, a 12 byte header must be allocated,
+;	and certain fields be initilaized so that the buffer can be self-
+;	identifying.
+;
+;	The unit status is set to online and a determination is made
+;	as to whether the unit interfaces via unibus adapter registers(UBA)
+;	or internal processor registers(IPR). If the unit uses IPR's, then
+;	it is a console device.  The device is a console device if
+;	the CSR address is not a system address.  All system addresses
+;	have bit 31 = 1, which makes them appear negative.
+;
+; Side Effects:
+;
+;	If the processor type is unknown, or the sector buffer could not
+;	be allocated, mark the device (UCB) offline to prevent it use.
+;--
+DD_UNIT_INIT:				;TU58 controller intialization
+;
+;	Allocate the buffer if it has not been allocated yet.
+;
+	CLRW	UCB$W_TU58STS(R5)	;Reset device status flags
+	BBCS	#UCB$V_ONLINE,-		;Set device online
+		UCB$W_STS(R5),10$	;
+10$:	TSTL	UCB$L_DD_DPTR(R5)	;Is pointer to buffer nonzero?
+	BNEQ	20$			;Branch if yes
+	PUSHL	R4			;Save R4
+	MOVAL	G^EXE$GL_NONPAGED,R4	;Put address of nonpaged pool
+					;list head in R4
+	PUSHL	(R4)			;Save IPL in pool list head
+	MFPR	#PR$_IPL,(R4)		;Save IPL in pool list head
+	MOVZBL	#<DD_DPBUF_LEN+12>,R1	;Set buffer length in R1
+	JSB	G^EXE$ALONONPAGED	;Allocate data packet buffer
+	POPL	(R4)			;Restore IPL in list head
+	POPL	R4			;Restore R4
+	BLBC	R0,13$			;Branch if error
+	MOVW	R1,8(R2)		;Put size into buffer header
+	MOVB	#DYN$C_BUFIO,10(R2)	;Put type into buffer header
+	ADDL3	#12,R2,-		;Save pointer to start of actual
+		UCB$L_DD_DPTR(R5)	;data packet buffer.
+;
+;	Check the CSR address to determine if this is a console or unibus
+;	TU58.  Unibus TU58s will have a CSR address that is a system
+;	address, and the number will appear negative.  Console TU58s will
+;	have a CSR address that is actually a processor internal register
+;	number, and will appear to be a positive number.
+;
+20$:	TSTL	R4			;Test CSR address
+	BEQL	13$			;Sanity check
+	BLSS	50$			;Branch if unibus TU58
+;
+;	The device is a console TU58.  Mark it as such.
+;	Determine the CPU type and set the device IPL field
+;	in the UCB accordingly.
+;
+	MOVB	G^EXE$GB_CPUTYPE,R0	;Get CPU type code
+	BLEQ	13$			;Sanity check
+	CMPB	#PR$_SID_TYP730,R0	;Is this a 730 cpu?
+	BEQL	40$			;Branch if yes
+	CMPB	#PR$_SID_TYP750,R0	;Is this a 750 cpu?
+	BEQL	30$			;Branch if yes
+13$:	BBSC	#UCB$V_ONLINE,-		;Set device offline
+		UCB$W_STS(R5),14$	;
+14$:	RSB				;Just in case
+30$:	MOVB	#HIGH_DIPL,-		;Set high device IPL for 750 cpu
+		UCB$B_DIPL(R5)		;
+40$:	BBSS	#DD_V_CONSOLE,-		; Mark this unit as a console device
+		UCB$W_TU58STS(R5),50$	;
+50$:	BSBB	INIT_UNIT		;Do second half of unit initialization
+;	BLBC	R0,13$			;Branch if error
+	RSB				;Return
+	.PAGE
+	.SBTTL	INIT_UNIT
+;++
+; INIT_UNIT
+;
+; This routine is the second half of the TU58 unit initialization
+; routine.  This routine will initialize the controller and determine
+; if the controller speaks MRSP.  The algorithm for determining the
+; TU58 controller type is given below.
+;
+; Determining the TU58 controller type:
+;
+;	Initialize the controller, and then send it a command packet with
+;	the flow control bit set (MRSP_M_SWITCH in the SWITCH field of the
+;	command packet), and get the first byte of the controller's response.
+;	If the controller speaks MRSP, the response will be 02 (which is the
+;	first byte of an end packet).  If the controller does not speak MRSP,
+;	then the first byte will be 01 (first byte of a data packet).  Note
+;	that a data overrun condition will also indicate that the controller
+;	does not speak MRSP.  If an overrun condition did not occur, and the
+;	response was not 01 or 02, then assume that there is a hard controller
+;	error, and exit with the appropriate error status.  After getting the
+;	response, ignore the rest of the data sent by the TU58 and reinitialize
+;	the controller.
+;
+; Input:
+;	IPL	 = IPL$_POWER
+;	R0 .. R3 = scratch
+;	R4	 = CSR address
+;	R5	 = UCB address
+;
+; Output:
+;	R0 is even if error, odd if success
+;--
+
+INIT_UNIT:				;Second half of unit initialization
+	BSBW	RESET_CONTROLLER	;Initialize the controller
+	BLBC	R0,13$			;Branch if error
+;
+;	Build the special command packet used to detect the controller type.
+;	Note that since the only variables in the command packet will be the
+;	device unit number (which will also cause the checksum to vary) the
+;	command packet can be built quickly, and the checksum computed easily.
+;
+	MOVAL	UCB$K_DD_CPADDR(R5),R2	;Get address of command packet buffer
+	MOVL	#DTECT_PKT_HDR,(R2)+	;Set FLAG, PKT_BCNT, OPCODE, and OPMOD
+	MOVZWL	UCB$W_UNIT(R5),R0	;Get device unit #
+	BBSS	#<MRSP_V_SWITCH+8>,R0,10$;Set MRSP switch bit to prevent data
+					;overruns on 730 processors.
+10$:	BBC	#DD_V_CONSOLE,-		;Branch if not console device
+		UCB$W_TU58STS(R5),20$	;
+	DECW	R0			;Decrement the unit #
+20$:	MOVL	R0,(R2)+		;Set the UNIT, SWITCH, and SEQUENCE #
+	CLRL	(R2)+			;Clear TRANSFER COUNT and BLOCK #
+	ADDW3	#DTECT_PKT_CHKSM,R0,(R2);Compute and set the CHECKSUM
+;
+;	Send the command packet to the controller.
+;
+	MOVAB	UCB$L_DD_MSGPKT(R5),R2	;Get address of packet pointer
+	MOVAL	UCB$K_DD_CPADDR(R5),(R2)+;Get command packet address
+	MOVW	#DD_CP_LEN,(R2)		;Get command packet length
+	BSBB	SND_PKT_NOINT		;Send command packet
+	BLBC	R0,13$			;Branch if error
+;
+;	Get the controller's response.  The response
+;	(in R1) will determine the controller type.
+;
+	
+	BSBW	DUMP_RECVR_BUF		;Get controller response
+	BLBC	R0,13$			;Branch if error
+	BBS	#DD_RBUF_V_ERROR,R1,30$	;Branch if data overrun
+	CMPB	#DD_FLAG_DATA,R1	;Was it a data packet flag?
+	BEQL	30$			;Branch if equal
+	CMPB	#DD_FLAG_CNTL,R1	;Was it a command packet flag?
+	BNEQ	13$			;Branch if not
+	BBSS	#DD_V_MRSP,-		;Set MRSP bit
+		UCB$W_TU58STS(R5),30$	;
+30$:	BSBW	RESET_CONTROLLER	;Ignore the rest of the response
+	BLBS	R0,40$			;Branch if success
+;
+;	Something went wrong.
+;
+13$:	CLRL	R1			;
+	BSBW	RCSR			;Clear receiver CSR
+	BSBW	SCSR			;Clear transmitter CSR
+	MOVW	#SS$_CTRLERR,R0		;Set error status
+40$:	RSB				;Return
+	.PAGE
+	.SBTTL	SND_PKT_NOINT
+;++
+; SND_PKT_NOINT
+;
+; This routine will send a packet of bytes to the TU58 controller.
+; This routine is special in that it does not use interrupts, and
+; expects IPL to be at IPL_POWER.
+;
+; Input:  R4 = CSR address
+;	  R5 = UCB address
+;
+; Output: R0 .. R3 are destroyed
+;	  Note that if R0 is nonzero, then not all the bytes were sent.
+;--
+
+SND_PKT_NOINT:				;Send packet w/o interrupts
+	MOVZWL	UCB$W_DD_MSGLEN(R5),R0	;Get # of bytes to send
+	MOVL	UCB$L_DD_MSGPKT(R5),R2	;Get address of message packet
+;
+; Wait for one character time until the TU58 is ready for another character.
+;
+10$:	MULL3	#MAXCHRTIM,G^EXE$GL_TENUSEC,R3;Calculate wait loop count
+	BBC	#DD_V_CONSOLE,-		;Branch if not a console device
+		UCB$W_TU58STS(R5),20$	;
+	CMPB	G^EXE$GB_CPUTYPE,-	;Is this a 730 cpu?
+		#PR$_SID_TYP730		;
+	BNEQ	20$			;Branch if not
+	DIVL2	#40,R3			;Reduce wait time for 730 consoles
+20$:	BBC	#DD_V_CONSOLE,-		;Branch if not a console device
+		UCB$W_TU58STS(R5),40$	;
+	MFPR	#PR$_CSTS,R1		;Get console device CSR
+30$:	BBS	#DD_XCSR_V_TRDY,R1,50$	;Branch if transmitter ready
+	.BYTE	1[8]			;NOPs to slow loop to allow DMA
+	SOBGTR	R3,20$			;Loop
+	MOVZWL	#SS$_CTRLERR,R0		;ERROR -- transmitter never ready
+	RSB
+40$:	MOVZWL	DD_XCSR(R4),R1		;Get UNIBUS device CSR
+	BRB	30$			;Rejoin common code
+;
+; Send a byte the TU58.
+;
+50$:	MOVZBL	(R2)+,R1		;Get byte to send
+	BBC	#DD_V_CONSOLE,-		;Branch if not console device
+		UCB$W_TU58STS(R5),70$	;
+	MTPR	R1,#PR$_CSTD		;Send byte (console)
+60$:	SOBGTR	R0,10$			;Branch if more bytes to send
+	INCL	R0			;Set success status 
+	RSB				;Return
+70$:	MOVW	R1,DD_XBUF(R4)		;Send byte (unibus)
+	BRB	60$			;Rejoin common code
+	.PAGE
+	.SBTTL	DUMP_RECVR_BUF
+;++
+; DUMP_RECVR_BUF
+;
+; Dump the contents of the receiver buffer to R1.
+; This routine will wait (via a delay loop) for
+; approximately 1 character time before giving up.
+; Note that the receiver buffer is dumped no matter what.
+; This routine executes at IPL equal to IPL$_POWER.
+;
+; Input:   R4 = CSR address
+;	   R5 = UCB address
+;
+; Output:  R1 = contents of receiver buffer
+;	   R0 is destroyed.
+;--
+
+DUMP_RECVR_BUF:				;Dump receiver buffer
+	MULL3	#MAXCHRTIM,G^EXE$GL_TENUSEC,R0;Calc wait interval
+	BBC	#DD_V_CONSOLE,-		;Branch if not a console device
+		UCB$W_TU58STS(R5),10$	;
+	CMPB	G^EXE$GB_CPUTYPE,-	;Is this a 730 cpu?
+		#PR$_SID_TYP730		;
+	BNEQ	10$			;Branch if not
+	DIVL2	#40,R0			;Reduce wait time for 730 consoles
+10$:	BBC	#DD_V_CONSOLE,-		;Branch if not console device
+		UCB$W_TU58STS(R5),50$	;
+	MFPR	#PR$_CSRS,R1		;Get CSR (console)
+20$:	BITW	#DD_RCSR_M_RDONE,R1	;Test DONE bit
+	BNEQ	30$			;Branch if transfer done
+	.BYTE	1[8]			;NOP's to slow loop to allow DMA I/O
+	SOBGTR	R0,10$			;Branch if time not up
+	MOVZWL	#SS$_CTRLERR,R0		;ERROR -- done bit never set
+	BRB	35$			;Read receiver buffer anyway
+30$:	MOVZWL	#SS$_NORMAL,R0		;Set success status
+35$:	BBC	#DD_V_CONSOLE,-		;Branch if not a console device
+		UCB$W_TU58STS(R5),40$	;
+	MFPR	#PR$_CSRD,R1		;Dump receiver buffer (console)
+	RSB				;Return
+40$:	MOVZWL	DD_RBUF(R4),R1		;Dump receiver buffer (unibus)
+	RSB				;Return
+50$:	MOVW	DD_RCSR(R4),R1		;Get receiver CSR (unibus)
+	BRB	20$			;Rejoin common code
+	.PAGE
+	.SBTTL  STARTIO ROUTINE
+;++
+; DD_STARTIO - START I/O OPERATION ON TU58
+;
+; This routine is entered when the associated unit is idle and a packet is
+; available for processing.
+;
+; INPUTS:
+;
+;	R3 = ADDRESS OF I/O REQUEST PACKET.
+;	R5 = ADDRESS OF DEVICE UNIT UCB.
+;
+; OUTPUTS:
+;
+;	The I/O request will be completed, barring errors, and the driver
+;	returns with some extra information in the IOSB.  The format of the
+;	IOSB is:
+;			   IOSB
+;	 31		   16 15		 0
+;	+--------------------+--------------------+
+;	|   TRANSFER COUNT   |        STATUS      |
+;	+--------------------+--------------------+
+;	|		 <unused>		  |
+;	+--------------------+--------------------+
+;
+;	Where TRANSFER COUNT is the number of bytes transfered,
+;	STATUS is the I/O status code.  The second longword is
+;	unused, and is zero.
+;
+; ERROR LOGGING:
+;
+;	The information copied to the error logger buffer includes the 4
+;	device registers as well as the COMMAND and END packet buffers.
+;	The register dump routine assumes the information is in the UCB,
+;	and that the register and packet buffers are contiguous.
+; NOTE:
+;	Data is sent/received to/from the TU58 one byte at a time.
+;
+;	All exchanges of data between the TU58 and this driver are done by
+;	"message packets" that have a special format that is recognized by
+;	the TU58 controller.  Each message packet has a checksum associated
+;	with it.  The checksum is (for lack of a better word) checked upon
+;	receipt of the message packet.  If the checksum that was sent with
+;	the packet does not agree with checksum calculated by the receiver,
+;	this is considered a controller error, and the driver attempts to
+;	retry the entire I/O request.
+;
+;	To complete a given I/O request, several message packets may be sent
+;	back and forth between the driver and the device.  For a full spec of
+;	driver - device interaction and message packet design, see the
+;	"TU58 DECtape II USER'S GUIDE", document # EK-0TU58-UG-001.
+;
+;
+;--
+DD_STARTIO:				;Start I/O operation
+;
+	REQPCHAN			;Request channel-prevent access to
+					;controller by two units at same time
+
+DD_RESTARTIO:				;Restart the I/O operation after
+					;a powerfail recovery.  We start
+					;here to aviod having to release
+					;and then request a new channel.
+
+	MOVB	UCB$B_ERTMAX(R5),-	;Set error retry count
+		UCB$B_ERTCNT(R5)	;
+	BICW	#UCB$M_DIAGBUF,-	;Clear diag. status bit
+		UCB$W_DEVSTS(R5)	;
+	BBC	#IRP$V_DIAGBUF,-	;Branch if not diag. request
+		IRP$W_STS(R3),10$	;
+	BISW	#UCB$M_DIAGBUF,-	;Set diag. status bit
+		UCB$W_DEVSTS(R5)	;
+10$:	MOVL	UCB$L_CRB(R5),R4	;Get CRB address
+	ASSUME	IDB$L_CSR EQ 0		;The following assumes this
+	MOVL	@CRB$L_INTD+VEC$L_IDB(R4),R4  ;Get CSR address
+;
+;	Buffer up the command packet.
+;
+	MOVAB	UCB$K_DD_CPADDR(R5),R2	;Get buffer address
+	MOVW	#CMD_PKT_HDR,(R2)+	;Set packet flag byte and byte count
+	BSBW	SET_FUNCTION		;Determine device function
+	MOVB	R0,(R2)+		;Put opcode into buffer
+	MOVB	R1,(R2)+		;Put opcode modifier into buffer
+;
+;	For console TU58s, the physical device unit number is one
+;	less than the unit number stored in the UCB.  This is a
+;	necessary to be compatible with existing software.
+;
+	MOVZWL	UCB$W_UNIT(R5),R0	;Get device unit #
+	BBC	#DD_V_CONSOLE,-		;Branch if not a console device
+		UCB$W_TU58STS(R5),20$	;
+	DECB	R0			;Decrement device unit
+20$:	MOVB	R0,(R2)+		;Put unit number into command packet
+	CLRL	R0			;Assume not using MSRP
+	BBC	#DD_V_USEMRSP,-		;Branch if not using MRSP
+		UCB$W_TU58STS(R5),30$	;
+	MOVB	#MRSP_M_SWITCH,R0	;Set switch to use MRSP
+30$:	MOVB	R0,(R2)+		;Set command switch
+	CLRW	(R2)+			;Set sequence # (unused)
+	MOVW	UCB$W_BCNT(R5),(R2)	;Put byte count into buffer
+	MOVW	(R2)+,UCB$W_BCR(R5)	;Save # bytes to transfer
+;
+;	Convert the physical media address in IRP$L_MEDIA to an LBN.
+;	This is necessary because the TU58 controller expects an LBN,
+;	not a physical media address.  The LBN is given by the formula:
+;
+;	LBN = (CYLINDER*(TRACKS/CYLINDER)+TRACK)*(SECTORS/TRACK))+SECTOR
+;
+	MOVL	IRP$L_MEDIA(R3),-	;Copy media address to UCB
+		UCB$L_MEDIA(R5)		;
+	MOVAL	UCB$L_MEDIA(R5),R3	;Get address of media address
+	MOVZBL	(R3)+,R0		;Get SECTOR
+	MOVZBL	(R3)+,R1		;Get TRACK
+	MOVZWL	(R3)+,-(SP)		;Get CYLINDER
+	MOVZBL	UCB$B_TRACKS(R5),R3	;Get TRACKS/CYLINDER
+	MULL2	(SP)+,R3		;R3 = C*(T/C)
+	ADDL2	R3,R1			;R1 = C*(T/C)+T
+	MOVZBL	UCB$B_SECTORS(R5),R3	;Get SECTORS/TRACK
+	MULL2	R3,R1			;R1 = (C*(T/C)+T)*(S/T)
+	ADDW3	R1,R0,(R2)+		;Put LBN into command packet buffer
+;
+;	Compute the checksum for the command packet, and then
+;	insert it at the end of the packet.
+;
+	MOVAB	UCB$K_DD_CPADDR(R5),R1	;Get command packet address
+	MOVZWL	#<DD_CP_LEN - DD_CHKSM_LEN>,R2	;Get command packet length
+	BSBW	CHECKSUM		;Compute the checksum
+	MOVW	R0,UCB$W_DD_CPCKSM(R5)	;Insert the checksum into packet
+;
+DD_TRYAGN:
+;
+;	Clear the End Packet buffer
+;
+	PUSHR	#^M<R4,R5>		;Save R4 and R5
+	MOVC5	#0,-			;Source length
+		0,-			;Source address
+		#0,-			;Fill character
+		#DD_EP_LEN,-		;Destination length
+		UCB$K_DD_EPADDR(R5)	;Destination address
+	POPR	#^M<R4,R5>		;Restore R4 and R5
+;
+;	In case the I/O request has been restarted, some of the 
+;	fields in the UCB must be reset to their initial values.
+;
+	MOVL	UCB$L_IRP(R5),R3	;Get IRP address
+	MOVQ	IRP$L_SVAPTE(R3),-	;Restore UCB$L_SVAPTE, 
+		UCB$L_SVAPTE(R5)	;UCB$W_BCNT and UCB$W_BOFF
+	MOVW	UCB$W_BCNT(R5),-	;Restore UCB$W_BCR
+		UCB$W_BCR(R5)		;
+	BISW	#DD_M_PASS1,-		;Reset bit in TU58STS
+		UCB$W_TU58STS(R5)	;
+;
+;	Send the command packet to the device.
+;
+	MOVAB	UCB$K_DD_CPADDR(R5),-	;Get command packet address
+		UCB$L_DD_MSGPKT(R5)	;
+	MOVW	#DD_CP_LEN,-		;Get command packet length.
+		UCB$W_DD_MSGLEN(R5)	;
+	SEND_PACKET			;Send the command packet
+;
+;	Drop thru to GET_RESPONSE
+;
+	.PAGE
+;
+; This sequence of code is executed after each successful
+; transmission/reception of a message packet.  GET_RESPONSE
+; merely gets the next byte sent from the device, and uses
+; that byte to decide what to do next.
+;
+GET_RESPONSE:				;Get the TU58's resonse
+	GET_BYTE			;Get a byte
+	MOVB	UCB$B_SPR(R5),R1	;Move to R1 for convenience
+	CMPB	#DD_FLAG_DATA,R1	;Data flag?
+	BEQL	READ_DATA		;Branch if data flag
+	CMPB	#DD_FLAG_CONT,R1	;Continue flag?
+	BEQL	10$			;Branch if continue flag
+	CMPB	#DD_FLAG_CNTL,R1	;Control flag?
+	BEQL	20$			;If control flag then branch
+	MOVZWL	#SS$_CTRLERR,R0		;Assume controller error
+	BRW	CONT_ERROR		;Controller protocol error
+10$:	BRW	WRITE_DATA		;Write to the device
+20$:	BRW	END_PACKET		;Get the end packet
+	.PAGE
+;
+; The following code sequence services READ requests by
+; transferring a data packet from the device to the user's buffer.
+;
+READ_DATA:				;Service READ reauest
+	MOVB	R1,@UCB$L_DD_DPTR(R5)	;Buffer data flag
+	GET_BYTE			;Get the packet byte count
+	MOVZBL	#DD_DPBCNT,R0		;Put offset in R0
+	MOVB	UCB$B_SPR(R5),-		;Buffer the byte count
+		@UCB$L_DD_DPTR(R5)[R0]	;
+;
+;	Get the rest of the data packet, including the checksum.
+;
+	INCB	R0			;Set offset to point to next byte
+	MOVAB	@UCB$L_DD_DPTR(R5)[R0],-;Get pointer into packet buffer
+		UCB$L_DD_MSGPKT(R5)	;
+	MOVZBW	UCB$B_SPR(R5),R0	;Get packet byte count
+	ADDW3	#DD_CHKSM_LEN,R0,-	;Allow room for the packet checksum
+		UCB$W_DD_MSGLEN(R5)	;
+	GET_PACKET			;Get the data packet
+;
+;	Now transfer the data in the data packet buffer to
+;	the users buffer, and then await the TU58's next byte.
+;	On return from MOVTOUSER, R1 points to the end of the packet buffer.
+;
+	MOVZBL	#DD_DATA,R0		;Put offset into R0
+	MOVAB	@UCB$L_DD_DPTR(R5)[R0],R1 ;Get address of data
+	MOVZBL	UCB$B_SPR(R5),R2	;Get # of data bytes
+	MOVTOUSER			;Move data
+;
+;	Calculate the packet checksum and compare it with the checksum
+;	received from the device.  If no match then the data was garbled
+;	during transmission and the I/O operation must be retried.
+;	On return from CHECKSUM, R1 points to the packet buffer checksum.
+;
+	MOVL	R1,R0			;Save pointer into buffer
+	MOVL	UCB$L_DD_DPTR(R5),R1	;Get buffer address
+	SUBL3	R1,R0,R2		;Calculate the buffer length
+	BSBW	CHECKSUM		;Calculate the checksum
+	CMPW	R0,(R1)			;Compare checksums
+	BEQL	10$			;Branch if no errors
+	MOVW	#SS$_PARITY,R0		;Put error code in R0
+	BRW	CONT_ERROR		;Attempt to retry operation
+;
+;	Subtract the packet byte count from the total byte count and continue.
+;
+10$:	MOVZBW	UCB$B_SPR(R5),R0	;Get data packet byte count
+	SUBW	R0,UCB$W_BCR(R5)	;Update byte transfer count
+	BRW	GET_RESPONSE		;Await next byte from device
+	.PAGE
+;
+; The following code services a WRITE request by transfering data
+; from the user's buffer to the TU58.  The transfer is made by
+; sending data packets of <= 128 bytes.  When sending data we do
+; not have to worry about data over-run.
+;
+WRITE_DATA:				;Send data to the device
+	MOVB	#DD_FLAG_DATA,-		;Buffer data flag
+		@UCB$L_DD_DPTR(R5)	;
+;
+;	Calculate the packet byte count.
+;
+	CMPW	UCB$W_BCR(R5),-		;Can we send a full packet?
+		#DD_MAX_PKT_BCNT	;
+	BGTRU	10$			;Branch if yes
+	MOVZBW	UCB$W_BCR(R5),R1	;Set byte count <= 128
+	BRB	20$			;Rejoin common code
+10$:	MOVZBW	#DD_MAX_PKT_BCNT,R1	;Set byte count = 128
+20$:	MOVZBL	#DD_DPBCNT,R0		;Put offset into R0
+	MOVB	R1,@UCB$L_DD_DPTR(R5)[R0] ;Put byte count into data packet
+	SUBW	R1,UCB$W_BCR(R5)	;Calc new UCB$W_BCR
+;
+;	Transfer the data from the user's buffer to the packet buffer.
+;	On return from IOC$MOVFRUSER, R1 = pointer into packet buffer.
+;
+	MOVZBL	R1,R2			;Get byte count
+	MOVZBL	#DD_DATA,R0		;Put offset into R0
+	MOVAB	@UCB$L_DD_DPTR(R5)[R0],R1 ;Get address of data w/i data packet
+	MOVFROMUSER			;Move data
+;
+;	Create the data packet checksum.  On return from CHECKSUM,
+;	R1 points to the end of the data buffer.
+;
+	MOVL	R1,R0			;Save pointer into buffer
+	MOVL	UCB$L_DD_DPTR(R5),R1	;Get buffer address
+	SUBL3	R1,R0,R2		;Calculate buffer length
+	BSBW	CHECKSUM		;Calculate checksum	
+	MOVW	R0,(R1)+		;Put checksum into buffer
+;
+;	Send the data packet to the device.
+;
+	MOVL	UCB$L_DD_DPTR(R5),-	;Get buffer address
+		UCB$L_DD_MSGPKT(R5)	;
+	SUBL3	UCB$L_DD_MSGPKT(R5),R1,R0 ;Calculate buffer length
+	MOVW	R0,UCB$W_DD_MSGLEN(R5)	;Move to input cell
+	SEND_PACKET			;Send data packet
+	BRW	GET_RESPONSE		;Await next byte from device
+	.PAGE
+;
+; This code will get the end packet and interpret the device
+; status code.
+;
+END_PACKET:				;Intrepret the end packet
+	MOVB	R1,UCB$B_DD_EPFLAG(R5)	;Buffer flag byte
+;
+;	Read in the rest of the end packet, including the checksum.
+;
+	MOVAB	UCB$B_DD_EPBCNT(R5),-	;Get buffer address
+		UCB$L_DD_MSGPKT(R5)	;
+	MOVW	#<DD_EP_LEN-1>,-	;Get buffer length
+		UCB$W_DD_MSGLEN(R5)	;
+	GET_PACKET			;Get end packet
+;
+;	Calculate the packet checksum and compare it to the checksum sent
+;	by the device.  If no match, then the data was garbled during 
+;	transmission, and the I/O request must be retried.
+; 
+	MOVAB	UCB$K_DD_EPADDR(R5),R1	;Get Command packet buffer address
+	MOVZWL	#<DD_CP_LEN - DD_CHKSM_LEN>,R2	;Get buffer length
+	BSBW	CHECKSUM		;Calculate checksum
+	CMPW	R0,UCB$W_DD_EPCKSM(R5)	;Compare checksums
+	BEQL	10$			;Branch if match
+	MOVW	#SS$_PARITY,R0		;Put error code in R0
+	BRB	CONT_ERROR		;Attempt to retry request
+;
+;	Get the device status and see how things went.
+;
+10$:	MOVZBL	UCB$B_DD_EPSTS(R5),R1	;Get device status code
+	MOVW	#SS$_NORMAL,R0		;Assume success 
+	CMPB	R1,#DD_STS_NORMAL	;Test status
+	BGEQ	DD_EXIT			;Branch if success or success w/ retries
+					;- assumes value of 0 and 1 respectively
+;
+;	If we get this far, something went wrong.
+;	Log a device error, and see if the device-specific
+;	error code can be mapped directly to a VMS error code.
+;	If not, then map the error into SS$_CTRLERR.  Note that
+;	the operation will not be retried for this type of error.
+;
+	JSB	G^ERL$DEVICERR		;Log the error
+	MOVW	#SS$_NONEXDRV,R0	;Assume bad unit #
+	CMPB	#DD_STS_BADUNIT,R1	;
+	BEQL	DD_EXIT			;
+	MOVW	#SS$_MEDOFL,R0		;Assume no cartridge
+	CMPB	#DD_STS_NOCART,R1	;
+	BEQL	DD_EXIT			;
+	MOVW	#SS$_WRITLCK,R0		;Assume writelock error
+	CMPB	#DD_STS_WRTLCK,R1	;
+	BEQL	DD_EXIT			;
+	MOVW	#SS$_DATACHECK,R0	;Assume datacheck error
+	CMPB	#DD_STS_DATACHK,R1	;
+	BEQL	DD_EXIT			;
+;
+;	Map all other errors into CONTROLLER ERRORS, but
+;	return device status code in device dependent 
+;	field of the IOSB.
+;
+	MOVW	#SS$_CTRLERR,R0		;Assume controller error
+;
+;	Fall through to DD_EXIT
+;
+	.PAGE
+	.SBTTL  COMMON EXIT ROUTINE
+;
+;	Common exit routine.  Exit status is in the low word of R0.
+;
+DD_EXIT:				;Common exit routine
+	MOVZWL	R0,-(SP)		;Save I/O status
+	JSB	G^IOC$DIAGBUFILL	;Fill diagnostic buffer if present.
+	RELCHAN				;Release channel
+;
+;	Put the IOSB info into R0 and R1 and exit the driver.
+;
+	POPL	R0			;Restore I/O status
+	SUBW3	UCB$W_BCR(R5),-		;Calc bytes transferred
+		UCB$W_BCNT(R5),R2	;
+	ASHL	#16,R2,R2		;Shift count to high word
+	BISL	R2,R0			;Merge count into status longword
+	CLRL	R1			;Clear second status longword
+	REQCOM				;That's all folks!
+	.PAGE
+	.SBTTL  Controller error handler
+;
+; This code attempts to recover from errors encountered during
+; a data transfer.  Control is transferred to DD_RETRY only on
+; device timeout recovery.  All other errors trap to CONT_ERROR.
+;
+; The only way to recover from an error is to set the controller to
+; a known state, via the TU58 INIT sequence, and retry the entire I/O
+; operation.  If the INIT sequence fails, then exit with a controller
+; error.
+;
+CONT_ERROR:				;Recover from controller error
+	MOVZWL	R0,UCB$L_DD_BUFWIN(R5)	;Save the error status code
+	BSBW	DD_SAVEREG		;Save device registers
+	JSB	G^ERL$DEVICERR		;Log the error
+;
+; This entry point is used by the timeout routine.  It is 
+; necessary to enter here to avoid overwriting the register
+; save area in the UCB that was written by the timeout routine.
+;
+DD_RETRY:
+	BSBB	RESET_CONTROLLER	;Reset the device controller
+	BLBC	R0,10$			;Branch if controller init failure
+	DECB	UCB$B_ERTCNT(R5)	;Decrement error retry count
+	BLEQ	10$			;Branch if no retries left
+	BBS	#IO$V_INHRETRY,-	;Branch if no retry requested
+		UCB$W_FUNC(R5),10$	;
+	BRW	DD_TRYAGN		;Retry I/O function
+10$:	MOVW	UCB$L_DD_BUFWIN(R5),R0	;Restore the error status code
+	BRB	DD_EXIT			;Exit the driver
+
+	.PAGE
+	.SBTTL TIMEOUT and POWERFAIL recovery
+;++
+; This routine is called in the event of a device timeout.
+; The timeout could be caused by a failure of the TU58 hardware
+; or the hardware connecting the TU58 to the host machine, or
+; the host machine could have undergone powerfail recovery.
+;
+; Input:
+;
+;	IPL	= Device IPL
+;	(SP)	= Return address
+;	R0-R3	= Scratch
+;	R4	= CSR address
+;	R5	= UCB address
+;--
+
+DD_TIME_OUT:
+	BSBW	DD_SAVEREG		;Move registers into UCB
+	CLRL	R1			;Prepare to disable interrupts
+	BSBW	RCSR			;Disable receive interrupts
+	BSBW	SCSR			;Disable transmit interrupts
+	SETIPL	UCB$B_FIPL(R5)		;Lower IPL to FIPL
+	BBSC	#UCB$V_POWER,-		;Power failure?
+		UCB$W_STS(R5),DD_PWF	;Branch if yes
+	JSB	G^ERL$DEVICTMO		;Log timeout error
+	BBCC	#UCB$V_TIMOUT,-		;Reset status
+		UCB$W_STS(R5),10$	;
+10$:	MOVZWL	#SS$_TIMEOUT,-		;Save the timeout status
+		UCB$L_DD_BUFWIN(R5)	;
+	BRB	DD_RETRY		;Init the controller and retry the I/O
+
+
+
+;
+; DD_PWF 
+;
+; This routine is branched after the device timeout caused by 
+; a powerfail.  The I/O operation is retried.  Note that the
+; controller has already been reset by the unit initialization
+; routines, which are called by the operating system as part
+; of its normal powerfail recovery.
+;
+DD_PWF:
+	BRW	DD_RESTARTIO		;Start function over again
+	.PAGE
+	.SBTTL	RESET_CONTROLLER	
+;++
+; RESET_CONTROLLER
+;
+;	This routine will set the device controller to a known state.
+;	To initialize the TU58 controller, it is necessary to perform
+;	the following steps:
+;
+;		- Set the BREAK bit in the transmitter CSR and hold
+;		  it for at least two character times.
+;		- Clear the Break bit.
+;		- Dump the receiver buffer.  The contents are unimportant.
+;		- Send two INIT characters.
+;		- Dump the reciever buffer.  The response must be equal to
+;		  DD_FLAG_CONT.  If not, the initialization sequence failed.
+;
+;	The initialization sequence must be done with IPL equal to IPL_POWER
+;	to lock out all interrupts.  
+;
+; Input:
+;
+;	R0-R3	= Scratch
+;	R4	= CSR address
+;	R5	= UCB addres
+;
+; Output:
+;
+;	R0 = SS$_NORMAL if the reset worked, SS$_CTRLERR if not.
+;--
+
+RESET_CONTROLLER:
+	;
+	; Set the BREAK condition.  Clear it after a short wait.
+	;
+	MOVZWL	#DD_XCSR_M_BREAK,R1	;Put BREAK into R1
+	DSBINT				;Disable interrupts
+	BSBW	SCSR			;Set BREAK condition
+	TIMEWAIT #<2*MAXCHRTIM>,#1,#0,W	;Loop for 2 character times
+	CLRL	R1			;Clear R1
+	BSBW	SCSR			;Clear break condition
+	;
+	; Dump the receiver buffer.
+	;
+	BSBW	DUMP_RECVR_BUF		;Dump buffer and discard contents
+	;
+	; Send two INIT characters.
+	;
+	MOVAL	UCB$L_DD_MSGPKT(R5),R0	;Get address of buffer pointer
+	MOVAW	2+UCB$L_DD_BUFWIN(R5),(R0);Get address of message buffer
+	MOVW	#TWO_INITS,@(R0)	;Put INIT characters into buffer
+	MOVW	#2,4(R0)		;Save # of bytes to send
+	BSBW	SND_PKT_NOINT		;Send the packet
+	BLBC	R0,20$			;Branch if error
+	;
+	; The controller should respond with a DD_FLAG_CONT.
+	; If it does not, then exit with a controller error.
+	; R0 will contain a meaningful status code on return
+	; from dump_recvr_buf.
+	;
+	BSBW	DUMP_RECVR_BUF		;Get controller response
+	MOVZWL	#SS$_NORMAL,R0		;Assume success status
+	CMPB	#DD_FLAG_CONT,R1	;Is it the correct response?
+	BEQL	20$			;Branch if true
+	MOVZWL	#SS$_CTRLERR,R0		;Set error status
+20$:	ENBINT				;Enable interrupts
+	RSB				;Return
+	.PAGE
+	.SBTTL  REGISTER DUMP ROUTINE
+;++
+; DD_REGDUMP - REGISTER DUMP ROUTINE
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is called to save the device registers in a specified 
+; buffer. It is called from the device error logging routine and from
+; the diagnostic buffer fill routine.
+;
+; INPUTS:
+;	R0 = ADDRESS OF REGISTER SAVE BUFFER
+;	R4 = ADDRESS OF DEVICE CONTROL STATUS REGISTER
+;	R5= ADDRESS OF UNIT CONTROL BLOCK
+; OUTPUTS:
+;	DEVICE REGISTERS ARE MOVED INTO THE SPECIFIED BUFFER.
+;	R0 CONTAINS THE ADDRESS OF THE NEXT EMPTY LONGWORD IN THE BUFFER.
+;	ALL REGISTERS EXCEPT R1 AND R2 ARE PRESERVED.
+;
+;--
+DD_REGDUMP:
+	MOVL	#DD_ERRBUF_LEN_L,(R0)+	;Insert # of longwords dumped
+	MOVL	#DD_NUM_REGS,R2		;Store number of registers
+	MOVAW	UCB$W_DD_XCSR(R5),R1	;Get address of first reg.
+10$:	MOVZWL	(R1)+,(R0)+		;Dump registers into buffer
+	SOBGTR	R2,10$			;If GTR - more to go
+;
+;	Now dump the Command and End packets to the error buffer.
+;
+	MOVL	#7,R2			;Get length of combined packets
+20$:	MOVL	(R1)+,(R0)+		;Dump longword to buffer
+	SOBGTR	R2,20$			;If GTR - more to go
+	RSB				;Return
+	.PAGE
+	.SBTTL	INTERRUPT SERVICE ROUTINE
+;
+;++
+; DD$INT - TU58 INTERRUPT ROUTINE
+;
+; This routine is entered via a JSB instruction when an
+; interrupt occurs.  The state of the stack on entry is:
+;
+;	00(SP) = ADDRESS OF IDB ADDRESS.
+;	04(SP) = SAVED R0.
+;	08(SP) = SAVED R1.
+;	12(SP) = SAVED R2.
+;	16(SP) = SAVED R3.
+;	20(SP) = SAVED R4.
+;	24(SP) = SAVED R5.
+;	28(SP) = SAVED INTERRUPT PC
+;	32(SP) = INTERRUPT PSL.
+;
+; Interrupt dispatching occurs as follows:
+;--
+DD_INT::
+	MOVL	@(SP)+,R3		;Get IDB address
+	MOVQ	(R3),R4			;Get CSR and UCB address
+	MOVQ	UCB$L_FR3(R5),R3	;Restore R3 and R4
+	BBC	#UCB$V_INT,-		;If clr -interrupt not expected
+		UCB$W_STS(R5),DD_UNSOLNT
+	JMP	@UCB$L_FPC(R5)		;Jump to interrupt ret. address
+DD_UNSOLNT:
+;
+;	In order to dismiss the interrupt, the receiver buffer must be read.
+;
+	BBC	#DD_V_CONSOLE,-		;Branch if not console device
+		UCB$W_TU58STS(R5),20$	;
+	MFPR	#PR$_CSRD,R1		;Read buffer for CONSOLE TU58
+10$:	POPR	#^M<R0,R1,R2,R3,R4,R5>	;Restore R0-R5
+	REI				;Dismiss the interrupt
+20$:	MOVW	DD_RBUF(R4),R1		;Read buffer for UNIBUS TU58
+	BRB	10$			;Dismiss the interrupt
+
+	.PAGE
+	.SBTTL	LOCAL SUBROUTINES
+
+;++
+;
+; DD_SAVEREG
+;
+; ABSTRACT:	Store the device registers in the UCB, so they may
+;		later be passed to the error logger.
+;
+; INPUT:	R4 = CSR Address
+;		R5 = UCB address
+;
+; OUTPUT:	Registers saved in UCB.
+;
+; SIDE EFFECTS:	R0,R2 are over-written.
+;
+;		Note that for CONSOLE devices, the xmitter buffer is
+;		a write-only register.  Code around this by saving the
+;		image of the buffer as it is loaded in the routine
+;		SEND_PACKET.  Also note that the MFPR instruction has
+;		a longword context, so the CONSOLE devices registers
+;		must be saved carefully, so other locations in the UCB
+;		are not overwritten.
+;
+;--
+DD_SAVEREG:				;Save device registers.
+	MOVAW	UCB$K_DD_REGBUF(R5),R2	;Get address of buffer
+	BBC	#DD_V_CONSOLE,-		;Branch if not console device
+		UCB$W_TU58STS(R5),10$	;
+	MFPR	#PR$_CSTS,R0		;Get xmitter CSR
+	MOVW	R0,(R2)+		;Save xmitter CSR
+	MFPR	#PR$_CSRS,2(R2)		;Save receiver CSR
+	MFPR	#PR$_CSRD,R0		;Get receiver buffer
+	MOVW	R0,4(R2)		;Save receiver buffer
+	RSB				;Return
+10$:	MOVW	DD_XCSR(R4),(R2)+	;Save xmitter CSR
+	MOVW	DD_XBUF(R4),(R2)+	;Save xmitter buffer
+	MOVW	DD_RCSR(R4),(R2)+	;Save receiver CSR
+	MOVW	DD_RBUF(R4),(R2)+	;Save receiver buffer
+	RSB				;Return
+	.PAGE
+	.SBTTL	GET_PACKET_C
+;++
+;
+; GET_PACKET_C
+;
+; ABSTRACT:	Get a message packet from a console TU58.  Because of
+;		the unique nature of the TU58, this routine is optimized
+;		for speed.  The TU58 generates an inordinate number of
+;		interrupts, and can use a large fraction of the processor
+;		during normal operation.  In order to reduce overhead, some
+;		extreme measures have been taken in the coding of this routine.
+;
+; INPUT:	R4 = CSR address
+;		R5 = UCB address
+;		UCB$L_DD_MSGPKT(R5) = Message packet buffer address
+;		UCB$W_DD_MSGLEN(R5) = Message packet buffer length
+;
+; OUTPUT:	None.
+;
+;
+; NOTES:	1) This routine enables the device interrupts at the
+;		   beginning of the message packet and does not 
+;		   disable them until the entire message packet has
+;		   been transferred.
+;
+;		2) The WFIKPCH macro is not used.  Instead, the code
+;		   is placed inline to avoid the cost in time inherent
+;		   in the macro.
+;
+;		3) To save the overhead of IOFORKing after each byte 
+;		   transferred, the routine will not IOFORK until
+;		   the entire message packet has been transferred.
+;
+;		4) The large time (40 seconds) spent waiting for a device timeout
+;		   is necessary because of the slowness of the TU58.  It takes on 
+;		   the order of 30 - 40 seconds for the device to position the 
+;		   tape from one end of the cartridge to another.
+;
+;--
+
+GET_PACKET_C:				;Get a message packet 
+;
+;	The following code is done only once, to set up
+;	for the optimized interrupt service loop.
+;
+	MOVL	(SP)+,UCB$L_DPC(R5)	;Store return address
+	BICW	#UCB$M_TIMOUT,-		;Clear timeout occurred bit
+		UCB$W_STS(R5)		;
+;
+; If this is an MRSP TU58 then set the interrupt dispatch address to
+; point to the code that will handle the MRSP protocol.  Otherwise,
+; set the dipatch address to a routine to handle the normal RSP TU58.
+;	
+	MOVAL	L^300$,UCB$L_FPC(R5)	;Assume this is an MRSP TU58.
+	BBS	#DD_V_MRSP,-		;Branch if this is an MRSP TU58.
+		UCB$W_TU58STS(R5),10$	;
+	MOVAL	L^600$,UCB$L_FPC(R5)	;Set address for RSP TU58
+10$:	MOVL	UCB$L_DD_MSGPKT(R5),-	;Get address of message packet
+		UCB$L_FR3(R5)		;
+	MOVZWL	UCB$W_DD_MSGLEN(R5),-	;Get length of message
+		UCB$L_FR4(R5)		;
+	DSBINT	UCB$B_DIPL(R5)		;Lock out device interrupts
+	MTPR	#DD_RCSR_M_RIE,#PR$_CSRS;Enable interrupts
+	BISW	#UCB$M_TIM!UCB$M_INT,-	;Set INTERRUPT and TIMEOUT enabled
+		UCB$W_STS(R5)		;
+	ADDL3	#LONG_WAIT,-		;Compute timeout time for entire transfer.
+		G^EXE$GL_ABSTIM,-	;This will save recomputing it for each
+		UCB$L_DUETIM(R5)	;byte transferred.
+;
+;	This code is executed for the first byte received from the device.
+;	All succeeding interrupts for bytes bytes received will go through
+; 	another path, which is faster.  This is done to save several
+;	instructions that need not be executed again.  Note for this path
+;	the IPL must be restored before returning to the caller's caller.
+;	Failure to do so will cause a BUGCHECK in the fork process dispatcher.
+;	Note that R3 and R4 have already been saved, so it is not necessary
+;	to do so again.  Also note that since interrupts and timeouts are not
+;	disabled until all the data has been transfered, it is not necessary
+;	to set the INTERRUPT and TIMEOUT enable bits for each byte transferred.
+;	For that reason, the timeout time is computed only once, and is large
+;	enough to allow time to transfer the maximum number of bytes possible,
+;	which is 128 bytes of data plus some RSP protocol overhead.
+;
+100$:	ENBINT				;Allow device interrupts
+	RSB				;Return
+	.WORD	DD_TIME_OUT-.		;Offset to timeout routine
+;
+;	This is the fast interrupt servic loop for MRSP protocol
+;	data transfers.  This path exists to save testing the MRSP
+;	bit in the UCB for each byte transferred.  Note that the interrupt
+;	is dispatched here to avoid the cost of an RSB back to the device's
+;	interrupt dispatcher.  Of course the interrupt dispatcher JMPs here.
+;
+200$:	MOVQ	R3,UCB$L_FR3(R5)	;Save R3 and R4
+250$:	POPR	#^M<R0,R1,R2,R3,R4,R5>	;Restore registers from the interrupt
+	REI				;Dismiss the interrupt
+	.WORD	DD_TIME_OUT-.		;Offset to timeout routine
+;
+;	Dump the receiver buffer (word sized) into R1.
+;	After saving the data, acknowledge the receipt of the data.
+;	This will cause the TU58 to send the next byte, if any.
+;
+300$:	MFPR	#PR$_CSRD,R1		;Dump receiver buffer to R1
+	MTPR	#ACK_CHAR,#PR$_CSTD	;Send ack. character
+400$:	MOVB	R1,(R3)+		;Put byte in message buffer
+	SOBGTR	R4,200$			;Branch if more to go
+;
+;	The data has been transferred.  Disable device interrupts
+;	and create a fork process to continue on with the I/O operation.
+;
+500$:	MTPR	#0,#PR$_CSRS		;Disable device interrupts
+	BICW	#UCB$M_TIM!UCB$M_INT,-	;Clear INTERRUPT and TIMEOUT enabled
+		UCB$W_STS(R5)		;
+	PUSHAB	L^250$			;Set return address of "caller's caller"
+	IOFORK				;Get back to fork context
+	MOVZWL	#SS$_DATAOVERUN,R0	;Always return overrun status
+	JMP	@UCB$L_DPC(R5)		;Return
+;
+;	Check for data overrun.  If an overrun occurred, disable
+;	device interrupts and get back to fork context.  Then
+;	reset the controller.  Note that no overruns will (should)
+;	occur when using MRSP, so this test does not have to be made
+;	for MRSP TU58s.
+;
+	.WORD	DD_TIME_OUT-.		;Offset to timeout routine
+600$:	MFPR	#PR$_CSRD,R1		;Dump receiver buffer to R1
+	BBC	#DD_RBUF_V_ERROR,R1,400$;Branch if no overrun
+	MOVAL	L^CONT_ERROR,UCB$L_DPC(R5);Return to controller reset routine
+	BRB	500$			;Branch to common exit code
+	.PAGE
+	.SBTTL	SEND_PACKET_C
+;++
+;
+; SEND_PACKET_C
+;
+; ABSTRACT:	Send a message packet to a console TU58.  Because of
+;		the unique nature of the TU58, this routine is optimized
+;		for speed.  The TU58 generates an inordinate number of
+;		interrupts, and can use a large fraction of the processor
+;		during normal operation.  In order to reduce overhead, some
+;		extreme measures have been taken in the coding of this routine.
+;
+; INPUT:	R4 = CSR address
+;		R5 = UCB address
+;		UCB$L_DD_MSGPKT(R5) = Message packet buffer address
+;		UCB$W_DD_MSGLEN(R5) = Message packet buffer length
+;
+; OUTPUT:	None.
+;
+; NOTES:
+;
+;		1) This routine enables the device interrupts at the
+;		   beginning of the message packet and does not 
+;		   disable them until the entire message packet has
+;		   been transferred.
+;
+;		2) The WFIKPCH macro is not used.  Instead, the code
+;		   is placed inline to avoid the cost in time inherent
+;		   in the macro.
+;
+;		3) To save the overhead of IOFORKing after each byte 
+;		   transferred, the routine will not IOFORK until
+;		   the entire message packet has been transferred.
+;
+;
+;--
+SEND_PACKET_C:				;Send a message packet (console)
+;
+;	The following code needs to be done only once, to
+;	set things up for the interrupt service loop.
+;
+	MOVL	(SP)+,UCB$L_DPC(R5)	;Store return address
+	BICW	#UCB$M_TIMOUT,-		;Clear timeout occurred bit
+		UCB$W_STS(R5)		;
+	MOVAL	L^300$,UCB$L_FPC(R5)	;Save interrupt dispatch address
+	MOVL	UCB$L_DD_MSGPKT(R5),-	;Get address of message packet
+		UCB$L_FR3(R5)		;
+	MOVZWL	UCB$W_DD_MSGLEN(R5),-	;Get length of message
+		UCB$L_FR4(R5)		;
+	DSBINT	UCB$B_DIPL(R5)		;Lock out device interrupts
+	MTPR	#DD_XCSR_M_TIE,#PR$_CSTS;Enable transmitter interrupts
+	BISW	#UCB$M_TIM!UCB$M_INT,-	;Set INTERRUPT and TIMEOUT enabled
+		UCB$W_STS(R5)		;
+	ADDL3	#LONG_WAIT,-		;Compute timeout time for entire transfer.
+		G^EXE$GL_ABSTIM,-	;This will save recomputing it for each
+		UCB$L_DUETIM(R5)	;byte transferred.
+;
+;	This code is executed for the first byte received from the device.
+;	All succeeding interrupts for bytes bytes received will go through
+; 	another path, which is faster.  This is done to save several
+;	instructions that need not be executed again.  Note for this path
+;	the IPL must be restored before returning to the caller's caller.
+;	Failure to do so will cause a BUGCHECK in the fork process dispatcher.
+;	Note that R3 and R4 have already been saved, so it is not necessary
+;	to do so again.  Also note that since interrupts and timeouts are not
+;	disabled until all the data has been transfered, it is not necessary
+;	to set the INTERRUPT and TIMEOUT enable bits for each byte transferred.
+;	For that reason, the timeout time is computed only once, and is large
+;	enough to allow time to transfer the maximum number of bytes possible,
+;	which is 128 bytes of data plus some RSP protocol overhead.
+;
+100$:	ENBINT				;Allow device interrupts
+	RSB				;Return
+	.WORD	DD_TIME_OUT-.		;Offset to timeout routine
+;
+;	This is the second and faster path through the wait-for-
+;	interrupt-and-keep-channel logic.  It is reasonable to have
+;	two paths, as the first path is only needed for the first
+;	byte sent, and there will always be at least 14 bytes (the
+;	length of a command packet) sent.  This path saves two instructions,
+;	as it would be necessary to save and restore the IPL in the
+;	other path.  Note that the interrupt is dismissed here.  This
+;	is to save the necessary RSB to return to the interrupt dispatcher.
+;	Of course the driver's interrupt dispatch JMPs to the location
+;	stored in UCB$L_FPC within the device UCB.
+;
+200$:	MOVQ	R3,UCB$L_FR3(R5)	;Save R3 and R4
+250$:	POPR	#^M<R0,R1,R2,R3,R4,R5>	;Restore registers from the interrupt
+	REI				;Dismiss the interrupt
+	.WORD	DD_TIME_OUT-.		;Offset to timeout routine
+;
+;	Get the data byte from the packet buffer and send it
+;	to the device.  If there is more data to send, go through
+;	the second wait-for-interrupt-keep-channel path.
+;
+300$:	MOVZBL	(R3)+,R1		;Get data byte and point to next byte
+	MTPR	R1,#PR$_CSTD		;Send data byte
+	MOVW	R1,UCB$W_DD_XBUF(R5)	;Save data byte (register is write-only)
+	SOBGTR	R4,200$			;Loop if more data
+;
+;	The data has been transferred.  Disable device interrupts
+;	and create a fork process to continue on with the I/O operation.
+;
+	BICW	#UCB$M_TIM!UCB$M_INT,-	;Clear INTERRUPT and TIMEOUT enabled
+		UCB$W_STS(R5)		;
+	MTPR	#0,#PR$_CSTS		;Disable device interrupts
+	PUSHAB	L^250$			;Set return address of "caller's caller"
+	IOFORK				;Get back to fork context
+	JMP	@UCB$L_DPC(R5)		;Return
+	.PAGE
+	.SBTTL	GET_PACKET_U
+;++
+;
+; GET_PACKET_U
+;
+; ABSTRACT:	Get a message packet from a unibus TU58.  Because of
+;		the unique nature of the TU58, this routine is optimized
+;		for speed.  The TU58 generates an inordinate number of
+;		interrupts, and can use a large fraction of the processor
+;		during normal operation.  In order to reduce overhead, some
+;		extreme measures have been taken in the coding of this routine.
+;
+; INPUT:	R4 = CSR address
+;		R5 = UCB address
+;		UCB$L_DD_MSGPKT(R5) = Message packet buffer address
+;		UCB$W_DD_MSGLEN(R5) = Message packet buffer length
+;
+; OUTPUT:	None.
+;
+;
+; NOTES:	1) This routine enables the device interrupts at the
+;		   beginning of the message packet and does not 
+;		   disable them until the entire message packet has
+;		   been transferred.
+;
+;		2) The WFIKPCH macro is not used.  Instead, the code
+;		   is placed inline to avoid the cost in time inherent
+;		   in the macro.
+;
+;		3) To save the overhead of IOFORKing after each byte 
+;		   transferred, the routine will not IOFORK until
+;		   the entire message packet has been transferred.
+;
+;		4) The large time (40 seconds) spent waiting for a device timeout
+;		   is necessary because of the slowness of the TU58.  It takes on 
+;		   the order of 30 - 40 seconds for the device to position the 
+;		   tape from one end of the cartridge to another.
+;
+;--
+
+GET_PACKET_U:				;Get a message packet 
+;
+;	The following code is done only once, to set up
+;	for the optimized interrupt service loop.
+;
+	MOVL	(SP)+,UCB$L_DPC(R5)	;Store return address
+	BICW	#UCB$M_TIMOUT,-		;Clear timeout occurred bit
+		UCB$W_STS(R5)		;
+;
+; If this is an MRSP TU58 then set the interrupt dispatch address to
+; point to the code that will handle the MRSP protocol.  Otherwise,
+; set the dipatch address to a routine to handle the normal RSP TU58.
+;	
+	MOVAL	L^300$,UCB$L_FPC(R5)	;Assume this is an MRSP TU58.
+	BBS	#DD_V_MRSP,-		;Branch if this is an MRSP TU58.
+		UCB$W_TU58STS(R5),10$	;
+	MOVAL	L^600$,UCB$L_FPC(R5)	;Set address for RSP TU58
+10$:	MOVL	UCB$L_DD_MSGPKT(R5),-	;Get address of message packet
+		UCB$L_FR3(R5)		;
+	MOVL	R4,UCB$L_FR4(R5)	;Save CSR address
+	DSBINT	UCB$B_DIPL(R5)		;Lock out device interrupts
+	MOVW	#DD_RCSR_M_RIE,DD_RCSR(R4);Enable receiver interrupts
+	BISW	#UCB$M_TIM!UCB$M_INT,-	;Set INTERRUPT and TIMEOUT enabled
+		UCB$W_STS(R5)		;
+	ADDL3	#LONG_WAIT,-		;Compute timeout time for entire transfer.
+		G^EXE$GL_ABSTIM,-	;This will save recomputing it for each
+		UCB$L_DUETIM(R5)	;byte transferred.
+;
+;	This code is executed for the first byte received from the device.
+;	All succeeding interrupts for bytes bytes received will go through
+; 	another path, which is faster.  This is done to save several
+;	instructions that need not be executed again.  Note for this path
+;	the IPL must be restored before returning to the caller's caller.
+;	Failure to do so will cause a BUGCHECK in the fork process dispatcher.
+;	Note that R3 and R4 have already been saved, so it is not necessary
+;	to do so again.  Also note that since interrupts and timeouts are not
+;	disabled until all the data has been transfered, it is not necessary
+;	to set the INTERRUPT and TIMEOUT enable bits for each byte transferred.
+;	For that reason, the timeout time is computed only once, and is large
+;	enough to allow time to transfer the maximum number of bytes possible,
+;	which is 128 bytes of data plus some RSP protocol overhead.
+;
+100$:	ENBINT				;Allow device interrupts
+	RSB				;Return
+	.WORD	DD_TIME_OUT-.		;Offset to timeout routine
+;
+;	This is the fast interrupt servic loop for MRSP protocol
+;	data transfers.  This path exists to save testing the MRSP
+;	bit in the UCB for each byte transferred.  Note that the interrupt
+;	is dispatched here to avoid the cost of an RSB back to the device's
+;	interrupt dispatcher.  Of course the interrupt dispatcher JMPs here.
+;
+200$:	MOVQ	R3,UCB$L_FR3(R5)	;Save R3 and R4
+250$:	POPR	#^M<R0,R1,R2,R3,R4,R5>	;Restore registers from the interrupt
+	REI				;Dismiss the interrupt
+	.WORD	DD_TIME_OUT-.		;Offset to timeout routine
+;
+;	Dump the receiver buffer (word sized) into R1.
+;	After saving the data, acknowledge the receipt of the data.
+;	This will cause the TU58 to send the next byte, if any.
+;
+300$:	MOVZWL	DD_RBUF(R4),R1		;Dump receiver buffer to R1
+	MOVW	#ACK_CHAR,DD_XBUF(R4)	;Send ack. character
+400$:	MOVB	R1,(R3)+		;Put byte in message buffer
+	DECW	UCB$W_DD_MSGLEN(R5)	;Decrement byte count
+	BGTR	200$			;Branch if more to go
+;
+;	The data has been transferred.  Disable device interrupts
+;	and create a fork process to continue on with the I/O operation.
+;
+500$:	MOVW	#0,DD_RCSR(R4)		;Disable receiver interrupts
+	BICW	#UCB$M_TIM!UCB$M_INT,-	;Clear INTERRUPT and TIMEOUT enabled
+		UCB$W_STS(R5)		;
+	PUSHAB	L^250$			;Set return address of "caller's caller"
+	IOFORK				;Get back to fork context
+	MOVZWL	#SS$_DATAOVERUN,R0	;Always return overrun status
+	JMP	@UCB$L_DPC(R5)		;Return
+;
+;	Check for data overrun.  If an overrun occurred, disable
+;	device interrupts and get back to fork context.  Then
+;	reset the controller.  Note that no overruns will (should)
+;	occur when using MRSP, so this test does not have to be made
+;	for MRSP TU58s.
+;
+	.WORD	DD_TIME_OUT-.		;Offset to timeout routine
+600$:	MOVZWL	DD_RBUF(R4),R1		;Dump receiver buffer to R1
+	BBC	#DD_RBUF_V_ERROR,R1,400$;Branch if no overrun
+	MOVAL	L^CONT_ERROR,UCB$L_DPC(R5);Return to controller reset routine
+	BRB	500$			;Branch to common exit code
+	.PAGE
+	.SBTTL	SEND_PACKET_U
+;++
+;
+; SEND_PACKET_U
+;
+; ABSTRACT:	Send a message packet to a unibus TU58.  Because of
+;		the unique nature of the TU58, this routine is optimized
+;		for speed.  The TU58 generates an inordinate number of
+;		interrupts, and can use a large fraction of the processor
+;		during normal operation.  In order to reduce overhead, some
+;		extreme measures have been taken in the coding of this routine.
+;
+; INPUT:	R4 = CSR address
+;		R5 = UCB address
+;		UCB$L_DD_MSGPKT(R5) = Message packet buffer address
+;		UCB$W_DD_MSGLEN(R5) = Message packet buffer length
+;
+; OUTPUT:	None.
+;
+; NOTES:
+;
+;		1) This routine enables the device interrupts at the
+;		   beginning of the message packet and does not 
+;		   disable them until the entire message packet has
+;		   been transferred.
+;
+;		2) The WFIKPCH macro is not used.  Instead, the code
+;		   is placed inline to avoid the cost in time inherent
+;		   in the macro.
+;
+;		3) To save the overhead of IOFORKing after each byte 
+;		   transferred, the routine will not IOFORK until
+;		   the entire message packet has been transferred.
+;
+;--
+SEND_PACKET_U:				;Send a message packet (unibus)
+;
+;	The following code needs to be done only once, to
+;	set things up for the interrupt service loop.
+;
+	MOVL	(SP)+,UCB$L_DPC(R5)	;Store return address
+	BICW	#UCB$M_TIMOUT,-		;Clear timeout occurred bit
+		UCB$W_STS(R5)		;
+	MOVAL	L^300$,UCB$L_FPC(R5)	;Save interrupt dispatch address
+	MOVL	UCB$L_DD_MSGPKT(R5),-	;Get address of message packet
+		UCB$L_FR3(R5)		;
+	MOVL	R4,UCB$L_FR4(R5)	;Save CSR address
+	DSBINT	UCB$B_DIPL(R5)		;Lock out device interrupts
+	MOVW	#DD_XCSR_M_TIE,DD_XCSR(R4);Enable transmitter interrupts
+	BISW	#UCB$M_TIM!UCB$M_INT,-	;Set INTERRUPT and TIMEOUT enabled
+		UCB$W_STS(R5)		;
+	ADDL3	#LONG_WAIT,-		;Compute timeout time for entire transfer.
+		G^EXE$GL_ABSTIM,-	;This will save recomputing it for each
+		UCB$L_DUETIM(R5)	;byte transferred.
+;
+;	This code is executed for the first byte received from the device.
+;	All succeeding interrupts for bytes bytes received will go through
+; 	another path, which is faster.  This is done to save several
+;	instructions that need not be executed again.  Note for this path
+;	the IPL must be restored before returning to the caller's caller.
+;	Failure to do so will cause a BUGCHECK in the fork process dispatcher.
+;	Note that R3 and R4 have already been saved, so it is not necessary
+;	to do so again.  Also note that since interrupts and timeouts are not
+;	disabled until all the data has been transfered, it is not necessary
+;	to set the INTERRUPT and TIMEOUT enable bits for each byte transferred.
+;	For that reason, the timeout time is computed only once, and is large
+;	enough to allow time to transfer the maximum number of bytes possible,
+;	which is 128 bytes of data plus some RSP protocol overhead.
+;
+100$:	ENBINT				;Allow device interrupts
+	RSB				;Return
+	.WORD	DD_TIME_OUT-.		;Offset to timeout routine
+;
+;	This is the second and faster path through the wait-for-
+;	interrupt-and-keep-channel logic.  It is reasonable to have
+;	two paths, as the first path is only needed for the first
+;	byte sent, and there will always be at least 14 bytes (the
+;	length of a command packet) sent.  This path saves two instructions,
+;	as it would be necessary to save and restore the IPL in the
+;	other path.  Note that the interrupt is dismissed here.  This
+;	is to save the necessary RSB to return to the interrupt dispatcher.
+;	Of course the driver's interrupt dispatch JMPs to the location
+;	stored in UCB$L_FPC within the device UCB.
+;
+200$:	MOVQ	R3,UCB$L_FR3(R5)	;Save R3 and R4
+250$:	POPR	#^M<R0,R1,R2,R3,R4,R5>	;Restore registers from the interrupt
+	REI				;Dismiss the interrupt
+	.WORD	DD_TIME_OUT-.		;Offset to timeout routine
+;
+;	Get the data byte from the packet buffer and send it
+;	to the device.  If there is more data to send, go through
+;	the second wait-for-interrupt-keep-channel path.
+;
+300$:	MOVZBW	(R3)+,DD_XBUF(R4)	;Send the data to the TU58
+	DECW	UCB$W_DD_MSGLEN(R5)	;Decrement byte count
+	BGTR	200$			;Branch if more to send
+;
+;	The data has been transferred.  Disable device interrupts
+;	and create a fork process to continue on with the I/O operation.
+;
+	BICW	#UCB$M_TIM!UCB$M_INT,-	;Clear INTERRUPT and TIMEOUT enabled
+		UCB$W_STS(R5)		;
+	MOVW	#0,DD_XCSR(R4)		;Disable transmitter interrupts
+	PUSHAB	L^250$			;Set return address of "caller's caller"
+	IOFORK				;Get back to fork context
+	JMP	@UCB$L_DPC(R5)		;Return
+	.PAGE
+;++
+;
+; SCSR
+;
+; ABSTRACT:	Update the transmitter CSR with the data in R1.
+;
+; INPUT:	R1 = CSR image
+;		R4 = CSR address
+;
+; OUTPUT:	CSR updated
+;
+; SIDE EFFECTS:	None
+;
+;--
+SCSR:
+	BBC	#DD_V_CONSOLE,-		;Branch if not console device
+		UCB$W_TU58STS(R5),10$	;
+	MTPR	R1,#PR$_CSTS		;Update CSR
+	RSB				;Return
+10$:	MOVW	R1,DD_XCSR(R4)		;Update CSR
+	RSB				;Return
+	.PAGE
+;++
+;
+; RCSR
+;
+; ABSTRACT:	Update the receiver CSR with the data in R1.
+;
+; INPUT:	R1 = CSR image
+;		R4 = CSR address
+;
+; OUTPUT:	CSR updated
+;
+; SIDE EFFECTS:	None
+;
+;--
+RCSR:
+	BBC	#DD_V_CONSOLE,-		;Branch if not console device
+		UCB$W_TU58STS(R5),10$	;
+	MTPR	R1,#PR$_CSRS		;Update CSR
+	RSB				;Return
+10$:	MOVW	R1,DD_RCSR(R4)		;Update CSR
+	RSB				;Return
+	.PAGE
+;++
+;
+; CHECKSUM
+;
+; ABSTRACT:	Given a message packet buffer address and length,
+;		compute the checksum of the buffer.  The checksum
+;		is formed by adding adjacent words in the buffer and
+;		adding in the carry (if any).
+;
+; INPUT:	R1 = Message packet buffer address.
+;		R2 = Message packet buffer length. 
+;		R5 = UCB address.
+;
+; OUTPUT:	R0 = Checksum (low word)
+;
+;
+; SIDE EFFECTS: R1,R2 are overwritten.
+;
+;--
+CHECKSUM:				;Create massage packet checksum
+	PUSHL	R2			;Save byte count on stack
+	CLRL	R0			;Clear output cell
+	ASHL	#-1,R2,R2		;Convert byte count to word count
+10$:	ADDW	(R1)+,R0		;Add word to current checksum
+	ADWC	#0,R0			;Add in carry, if any
+	SOBGTR	R2,10$			;Branch if not done
+;
+;	In order to make CHECKSUM work for odd byte counts, we 
+;	have add the last byte on after calculating the checksum
+;	for the rest of the buffer.
+;
+	BLBS	(SP)+,20$		;Branch if odd  byte count
+	RSB				;Return
+20$:	MOVZBL	(R1)+,R2		;Get the last byte in the buffer
+	ADDW	R2,R0			;Add it to the checksum
+	ADWC	#0,R0			;Add in carry, if any
+	RSB				;Return
+	.PAGE
+;++
+;
+; SET_FUNCTION
+;
+; ABSTRACT:	Use the function code in the IRP to determine which TU58
+;		function to perform.  In effect, map the system function
+;		code into a TU58 function code.  The results are returned
+;		in the low bytes of R0 and R1.
+;
+; INPUT:	R5 = UCB ADDRESS
+;
+; OUTPUT:	R0 = TU58 FUNCTION CODE
+;		R1 = TU58 FUNCTION CODE MODIFIER
+;		Mapping bit in UCB$W_TU58STS is set or cleared, depending
+;		on the function requested.
+;
+; SIDE EFFECTS:	R3 = IRP ADDRESS
+;
+; NOTE:		Some functions listed as legal in the FDT are not yet
+;		implemented in the TU58 firmware. These functions will
+;		be trapped here and flagged as illegal function codes.
+;		If an illegal function is requested, exit the driver
+;		without sending a command packet.
+;		
+;--
+SET_FUNCTION:				;Determine TU58 function
+;
+;	If this TU58 speaks MRSP, assume that the function will
+;	use MRSP unless the user explicitly requests otherwise.
+;
+	MOVW	IRP$W_FUNC(R3),-	;Copy function code to UCB
+		UCB$W_FUNC(R5)		;
+	BBC	#DD_V_MRSP,-		;Branch if not an MRSP TU58
+		UCB$W_TU58STS(R5),20$	;
+	BBCS	#DD_V_USEMRSP,-		;Set to use MRSP
+		UCB$W_TU58STS(R5),10$	;
+10$:	BBC	#IO$V_NOMRSP,-		;Branch if user wants to use MRSP
+		IRP$W_FUNC(R3),20$	;
+	BBCC	#DD_V_USEMRSP,-		;Do not use MRSP for this operation
+		UCB$W_TU58STS(R5),20$	;
+20$:	CLRL	R1			;Assume no function modifier
+	MOVL	UCB$L_IRP(R5),R3	;Get IRP address
+	EXTZV	#IRP$V_FCODE,-		;Extract the function code
+		#IRP$S_FCODE,-		;
+		IRP$W_FUNC(R3),R0	;Put function code in R0
+	CMPB	#IO$_READPBLK,R0	;READ physical block?
+	BEQL	30$			;
+	CMPB	#IO$_WRITEPBLK,R0	;WRITE physical block?
+	BEQL	40$			;
+	CMPB	#IO$_SEARCH,R0		;SEARCH/POSITION request?
+	BEQL	50$			;
+	CMPB	#IO$_DIAGNOSE,R0	;DIAGNOSE function?
+	BNEQ	200$			;Branch if not
+	MOVB	#DD_CODE_DIAG,R0	;Set diagnose function
+	RSB				;Return
+30$:	MOVB	#DD_CODE_READ,R0	;Set READ function
+	BRB	45$			;Check for function modifier
+40$:	MOVB	#DD_CODE_WRITE,R0	;Set WRITE function
+45$:	BBS	#IO$V_DATACHECK,-	;Branch if DATACHECK requested
+		IRP$W_FUNC(R3),46$	;
+	RSB				;Return
+46$:	MOVB	#DD_CODE_DATACHECK,R1	;Set DATACHECK op code modifier
+	RSB				;Return
+50$:	MOVB	#DD_CODE_SEARCH,R0	;Set SEARCH function
+	RSB				;Return
+;
+;	If we fall through all the tests, it is an illegal function.
+;
+200$:	TSTL	(SP)+			;Discard return address
+	MOVW	#SS$_ILLIOFUNC,R0	;Put error status in R0
+	BRW	DD_EXIT			;Exit the driver NOW
+
+DD_END:					;ADDRESS OF LAST LOCATION IN DRIVER
+
+	.END

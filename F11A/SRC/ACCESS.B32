@@ -1,0 +1,463 @@
+MODULE ACCESS (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-002'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This is the main processing routine for the ACCESS function.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  20-Dec-1976  15:43
+!
+! MODIFIED BY:
+!
+!	V03-002	LMP0023		L. Mark Pilant,		 8-Apr-1982  10:40
+!		If there is only one FCB, don't call REMAP_FILE but still
+!		set COMPLETE in the window.
+!
+!	V03-001	LMP0018		L. Mark Pilant,		31-Mar-1982  12:00
+!		Modify to use a local copy of the window complete flag.
+!
+!	V02-005	LMP0005		L. Mark Pilant,		29-Dec-1981  12:35
+!		Added byte limit quota check on window creationi and
+!		Cathedral window support.
+!
+!	V02-004	ACG0225		Andrew C. Goldstein,	24-Nov-1981  17:39
+!		Add NOLOCK support
+!
+!	V02-003	ACG0167		Andrew C. Goldstein,	7-May-1980  18:47
+!		Previous revision history moved to F11A.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	ACCESS,				! main access function processing
+	CHECK_FIND,			! conditional directory search
+	HANDLER;			! conditional handler to catch error exit
+
+GLOBAL ROUTINE ACCESS =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This is the main processing routine for the ACCESS function.
+!
+! CALLING SEQUENCE:
+!	ACCESS ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!	IO_PACKET: address of I/O request packet
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	PRIMARY_FCB: FCB of file
+!	CURRENT_WINDOW: address of file window
+!	USER_STATUS: I/O status block to return to user
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	FCB & window created
+!
+!--
+
+BEGIN
+
+LOCAL
+	FCB_CREATED,				! flag indicating new FCB created
+	PACKET		: REF BBLOCK,		! address of I/O packet
+	ABD		: REF BBLOCKVECTOR [,ABD$C_LENGTH],
+						! buffer descriptors
+	FIB		: REF BBLOCK,		! file identification block
+	FCB		: REF BBLOCK,		! FCB address
+	HEADER		: REF BBLOCK,		! address of file header
+	NEW_HEADER	: REF BBLOCK,		! address of extension header
+	FUNCTION	: BLOCK [1];		! function code qualifiers
+
+EXTERNAL
+	USER_STATUS	: VECTOR,		! I/O status block for user
+	CURRENT_VCB	: REF BBLOCK,		! VCB of volume
+	PRIMARY_FCB	: REF BBLOCK,		! FCB of file
+	CURRENT_WINDOW	: REF BBLOCK,		! window for file
+	IO_PACKET	: REF BBLOCK,		! I/O request packet
+	CLEANUP_FLAGS	: BITVECTOR;		! cleanup action flags
+
+EXTERNAL ROUTINE
+	GET_FIB,				! get FIB for operation
+	FIND,					! find file in directory
+	CREATE,					! create file
+	SEARCH_FCB,				! search FCB list
+	READ_HEADER,				! read file header
+	NEXT_HEADER,				! read extension file header
+	CREATE_FCB,				! create an FCB
+	CHECK_PROTECT,				! check file protection
+	CREATE_WINDOW,				! create a window
+	MAKE_ACCESS,				! complete the access
+	MAKE_EXTFCB,				! create and link extension FCB
+	FLUSH_FID,				! flush a file from the buffer pool
+	UPDATE_FCB,				! update attributes in FCB
+	READ_ATTRIB,				! read file attributes
+	REMAP_FILE,				! remap the file completely
+	MARK_COMPLETE;				! mark file complete
+
+
+! Enable the deaccess cleanup if an access is taking place.
+!
+
+PACKET = .IO_PACKET;
+FUNCTION = .PACKET[IRP$W_FUNC];
+IF .FUNCTION[IO$V_ACCESS]
+THEN
+    BEGIN
+    CLEANUP_FLAGS[CLF_ZCHANNEL] = 1;
+    CLEANUP_FLAGS[CLF_DELWINDOW] = 1;
+    END;
+
+! Set up pointers to interesting control blocks.
+!
+
+					! pointer to buffer descriptors
+ABD = .BBLOCK [.PACKET[IRP$L_SVAPTE], AIB$L_DESCRIPT];
+FIB = GET_FIB (.ABD);				! pointer to FIB
+
+! Do directory processing, if any. For a normal access, do the directory
+! lookup if a directory ID is present. If this is a conditional create, do
+! the lookup and turn the function into a create if the lookup fails
+! with a file not found. Conditional create on spool devices always become
+! creates.
+!
+
+IF .FUNCTION[IO$V_CREATE]
+THEN
+    BEGIN
+    IF .CLEANUP_FLAGS[CLF_SPOOLFILE]
+    OR (
+	IF .FIB[FIB$W_DID_NUM] NEQ 0
+	THEN NOT CHECK_FIND (.ABD, .FIB)
+	ELSE 1
+	)
+    THEN
+	BEGIN
+	USER_STATUS[0] = SS$_CREATED;
+	RETURN CREATE ();
+	END;
+    END
+
+ELSE
+    IF .FIB[FIB$W_DID_NUM] NEQ 0
+    THEN FIND (.ABD, .FIB, 0);
+
+! If there is a file open on the channel, check the file ID returned by the
+! FIND against the file ID that is open. If they are different, drop the FCB
+! and window addresses on the floor.
+!
+
+IF .PRIMARY_FCB NEQ 0
+THEN
+    IF .PRIMARY_FCB[FCB$W_FID_NUM] NEQ .FIB[FIB$W_FID_NUM]
+    OR .PRIMARY_FCB[FCB$W_FID_RVN] NEQ .FIB[FIB$W_FID_RVN]
+    THEN
+	BEGIN
+	PRIMARY_FCB = 0;
+	CURRENT_WINDOW = 0;
+	END;
+
+! If this is a find only, exit now to avoid an extraneous read of the
+! file header.
+!
+
+IF NOT .FUNCTION[IO$V_ACCESS]		! if no access
+AND .PACKET[IRP$W_BCNT] LEQ ABD$C_ATTRIB ! and no attribute list
+THEN RETURN 1;				! all done
+
+! Find the FCB of the file, if one exists. then read the file
+! header. If there is no FCB, create one.
+!
+
+FCB = SEARCH_FCB (FIB[FIB$W_FID]);
+HEADER = READ_HEADER (FIB[FIB$W_FID], .FCB);
+
+! If the file is marked for delete and is not accessed by this user, and
+! the accessor is not the system, deny its existence.
+!
+
+IF .CURRENT_WINDOW EQL 0 AND .HEADER[FH1$V_MARKDEL]
+AND NOT .BBLOCK [BBLOCK [.PACKET[IRP$L_ARB], ARB$Q_PRIV], PRV$V_BYPASS]
+THEN ERR_EXIT (SS$_NOSUCHFILE);
+
+FCB_CREATED = 0;
+IF .FCB EQL 0
+THEN
+    BEGIN
+    FCB_CREATED = 1;
+    FCB = KERNEL_CALL (CREATE_FCB, .HEADER);
+    END;
+PRIMARY_FCB = .FCB;			! record FCB for external use
+
+! If access is requested, check for conflicts and file protection.
+! then create a window and link everything up.
+!
+
+IF .FUNCTION[IO$V_ACCESS]
+THEN
+    BEGIN
+    CHECK_PROTECT (.FIB[FIB$V_WRITE] OR .FIB[FIB$V_NOREAD], .HEADER, .FCB);
+
+    IF (.HEADER[FH1$V_LOCKED])
+    AND NOT .BBLOCK [BBLOCK [.PACKET[IRP$L_ARB], ARB$Q_PRIV], PRV$V_BYPASS]
+    THEN ERR_EXIT (SS$_FILELOCKED);		! file is deaccess locked
+
+    IF (.FCB[FCB$V_EXCL]
+	AND NOT (.FIB[FIB$V_NOLOCK] AND .CLEANUP_FLAGS[CLF_SYSPRV]))
+    OR (.FIB[FIB$V_NOREAD] AND .FCB[FCB$W_ACNT] NEQ 0)
+    OR (.FIB[FIB$V_NOWRITE] AND .FCB[FCB$W_WCNT] NEQ 0)
+    OR (.FIB[FIB$V_WRITE] AND .FCB[FCB$W_LCNT] NEQ 0)
+    OR (.FCB[FCB$W_SEGN] NEQ 0 AND .FCB[FCB$W_ACNT] NEQ 0)
+    THEN ERR_EXIT (SS$_ACCONFLICT);		! one of above access conflicts
+
+
+    CURRENT_WINDOW = KERNEL_CALL (CREATE_WINDOW, .FIB[FIB$L_ACCTL],
+	.FIB[FIB$B_WSIZE], .HEADER, .PACKET[IRP$L_PID], .FCB);
+    IF .CURRENT_WINDOW EQL 0 THEN ERR_EXIT (SS$_EXBYTLM);
+    KERNEL_CALL (MAKE_ACCESS, .FCB, .CURRENT_WINDOW, .ABD);
+
+! If the file looks like a directory file and it is being write accessed,
+! flush it from the buffer pool to avoid retaining stale directory data.
+!
+
+    IF .FIB[FIB$V_WRITE]
+    AND .BBLOCK [HEADER[FH1$W_RECATTR], FAT$B_RTYPE] EQL FAT$C_FIXED
+    AND .BBLOCK [HEADER[FH1$W_RECATTR], FAT$W_RSIZE] EQL NMB$C_DIRENTRY
+    THEN FLUSH_FID (FIB[FIB$W_FID]);
+
+    END;					! end of access processing
+
+! If the file is multi-header, read the extension headers and create
+! extension FCB's as necessary. Finally read back the primary header.
+!
+
+IF .FCB_CREATED
+THEN
+    BEGIN
+    WHILE 1 DO
+	BEGIN
+	NEW_HEADER = NEXT_HEADER (.HEADER, .FCB);
+	IF .NEW_HEADER EQL 0 THEN EXITLOOP;
+	HEADER = .NEW_HEADER;
+	IF .FUNCTION[IO$V_ACCESS]
+	AND SEARCH_FCB (HEADER[FH1$W_FID]) NEQ 0
+	THEN ERR_EXIT (SS$_ACCONFLICT);
+	FCB = KERNEL_CALL (MAKE_EXTFCB, .HEADER, .FCB, .FUNCTION[IO$V_ACCESS]);
+	END;
+
+    IF .FCB NEQ .PRIMARY_FCB
+    THEN
+	BEGIN
+	FCB = .PRIMARY_FCB;
+	HEADER = READ_HEADER (0, .FCB);
+	KERNEL_CALL (UPDATE_FCB, .HEADER);
+	END;
+    END;
+
+! Do read attributes if requested.
+!
+
+IF .PACKET[IRP$W_BCNT] GTR ABD$C_ATTRIB
+THEN
+    BEGIN
+    IF .CURRENT_WINDOW EQL 0
+    THEN CHECK_PROTECT (RDATT_ACCESS, .HEADER, .FCB);
+    IF NOT KERNEL_CALL (READ_ATTRIB, .HEADER, .ABD) THEN ERR_EXIT ();
+    END;
+
+! If necessary map the file completely.
+
+IF .FUNCTION[IO$V_ACCESS]
+THEN
+    IF .CURRENT_WINDOW[WCB$V_CATHEDRAL]
+    THEN
+	IF .PRIMARY_FCB[FCB$L_EXFCB] NEQ 0
+	THEN REMAP_FILE()
+	ELSE KERNEL_CALL (MARK_COMPLETE, .CURRENT_WINDOW);
+
+RETURN 1;
+
+END;						! end of routine ACCESS
+
+ROUTINE CHECK_FIND (ABD, FIB) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine calls the directory search and intercepts any error
+!	exits to handle the create if non-existent function. If the search
+!	is successful, the routine returns success; if the search fails with
+!	no such file and the create subfunction bit is set, it returns failure;
+!	all other errors are resignaled.
+!
+!
+! CALLING SEQUENCE:
+!	CHECK_FIND (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of buffer descriptor packet
+!	ARG2: address of FIB
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1 if find is successful
+!	0 if file is to be created
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+MAP
+	ABD		: REF BBLOCKVECTOR [,ABD$C_LENGTH],
+	FIB		: REF BBLOCK;
+
+BUILTIN
+	FP;
+
+EXTERNAL ROUTINE
+	FIND;				! find file in directory
+
+
+! Establish the condition handler and call FIND. If we hear from it we
+! return true. Any signals cause either unwind or resignal.
+!
+
+.FP = HANDLER;
+
+FIND (.ABD, .FIB, 0);
+RETURN 1;
+
+END;					! end of routine CHECK_FIND
+
+ROUTINE HANDLER (SIGNAL, MECHANISM) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is the condition handler for the conditional find call.
+!	It intercepts the error exit from FIND and unwinds to CHECK_FIND's
+!	caller when appropriate.
+!
+!
+! CALLING SEQUENCE:
+!	HANDLER (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of signal array
+!	ARG2: address of mechanism array
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	SS$_RESIGNAL or none if unwind
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+
+BEGIN
+
+MAP
+	SIGNAL		: REF BBLOCK,	! signal arg array
+	MECHANISM	: REF BBLOCK;	! mechanism arg array
+
+EXTERNAL ROUTINE
+	SYS$UNWIND	: ADDRESSING_MODE (ABSOLUTE);
+					! system unwind service
+
+
+! If the condition is change mode to user (error exit) and the status is
+! no such file, cause an unwind to return 0 to the access main line.
+! Otherwise, just resignal the condition.
+!
+
+IF .SIGNAL[CHF$L_SIG_NAME] EQL SS$_CMODUSER
+AND .SIGNAL[CHF$L_SIG_ARG1] EQL SS$_NOSUCHFILE
+THEN
+    BEGIN
+    MECHANISM[CHF$L_MCH_SAVR0] = 0;
+    SYS$UNWIND (0, 0);
+    END;
+
+RETURN SS$_RESIGNAL;			! status is irrelevant if unwinding
+
+END;					! end of routine HANDLER
+
+END
+ELUDOM

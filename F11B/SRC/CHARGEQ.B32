@@ -1,0 +1,785 @@
+MODULE CHARGEQ (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This module contains the routines for charging disk blocks
+!	against a particular quota file entry.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  22-May-1979  20:51
+!
+! MODIFIED BY:
+!
+!	V02-006	ACG0229		Andrew C. Goldstein,	23-Dec-1981  21:45
+!		Add counters for quota cache hits and misses
+!
+!	V02-005	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:25
+!		Previous revision history moved to F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+FORWARD ROUTINE
+	CHARGE_QUOTA	: NOVALUE,	! check and/or charge disk blocks
+	SEARCH_QUOTA,			! search for a quota file record
+	WRITE_QUOTA	: NOVALUE,	! write back a quota record
+	SCAN_QUO_CACHE,			! search the quota cache
+	CLEAN_QUO_CACHE,		! write modified cache entry
+	ENTER_QUO_CACHE,		! make a new cache entry
+	SET_OVERDRAFT;			! mark file overdrawn
+
+GLOBAL ROUTINE CHARGE_QUOTA (UIC, BLOCK_COUNT, FLAGS) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine locates the quota file entry identified by the UIC
+!	given and checks and/or charges the indicated number of blocks,
+!	as specified by the flags.
+!
+! CALLING SEQUENCE:
+!	CHARGE_QUOTA (ARG1, ARG2, ARG3)
+!
+! INPUT PARAMETERS:
+!	ARG1: UIC of entry to charge
+!	ARG2: number of blocks to charge (negative to credit)
+!	ARG3: bit encoded flags
+!	      bit 0 set to check if quota will be exceeded
+!	      bit 1 set to actually charge blocks to the quota entry
+!
+! IMPLICIT INPUTS:
+!	IO_PACKET: user's I/O packet
+!	CURRENT_RVN: RVN of volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	quota file modified
+!
+!--
+
+
+BEGIN
+
+MAP
+	FLAGS		: BITVECTOR;	! flags argument
+
+LABEL
+	CHECK_QUOTA;			! block of code to check quota
+
+LOCAL
+	SAVE_RVN,			! place to save current RVN
+	Q_RECORD	: REF BBLOCK;	! address of quota file record
+
+EXTERNAL
+	IO_PACKET	: REF BBLOCK,	! user's I/O packet
+	CURRENT_WINDOW	: REF BBLOCK,	! window of user's file, if any
+	CURRENT_RVN;			! RVN of current volume
+
+EXTERNAL ROUTINE
+	SWITCH_VOLUME;			! switch to desired RVN
+
+
+! Save the current RVN and then switch context to the root RVN.
+! First locate the quota file record. If there is no quota file enabled, this
+! routine is a NOP.
+!
+
+SAVE_RVN = .CURRENT_RVN;
+SWITCH_VOLUME (1);
+
+CHECK_QUOTA: BEGIN
+
+Q_RECORD = SEARCH_QUOTA (.UIC, 0, 0, 1);
+IF .Q_RECORD EQL -1 THEN LEAVE CHECK_QUOTA;
+
+! Check for quota exceeded if requested and the user does not have EXQUOTA
+! privilege. If we are to check, lack of a quota record is an error; if
+! we do not check, this routine is a NOP.
+!
+
+IF .FLAGS[QUOTA_CHECK]
+AND NOT .BBLOCK [BBLOCK [.IO_PACKET[IRP$L_ARB], ARB$Q_PRIV], PRV$V_EXQUOTA]
+THEN
+    BEGIN
+    IF .Q_RECORD EQL 0
+    THEN ERR_EXIT (SS$_EXDISKQUOTA);
+    IF .Q_RECORD[DQF$L_USAGE] + .BLOCK_COUNT GTRU .Q_RECORD[DQF$L_PERMQUOTA]
+    THEN
+	BEGIN
+	IF .CURRENT_WINDOW NEQ 0
+	THEN
+	    BEGIN
+	    IF .CURRENT_WINDOW[WCB$V_OVERDRAWN]
+	    THEN
+		BEGIN
+		IF .Q_RECORD[DQF$L_USAGE] + .BLOCK_COUNT GTRU
+		   .Q_RECORD[DQF$L_PERMQUOTA] + .Q_RECORD[DQF$L_OVERDRAFT]
+		THEN ERR_EXIT (SS$_EXDISKQUOTA)
+		ELSE ERR_STATUS (SS$_OVRDSKQUOTA);
+		END
+	    ELSE
+		BEGIN
+		KERNEL_CALL (SET_OVERDRAFT);
+		ERR_EXIT (SS$_EXDISKQUOTA);
+		END;
+	    END
+	ELSE
+	    ERR_EXIT (SS$_EXDISKQUOTA);
+	END;
+    END
+
+ELSE
+    IF .Q_RECORD EQL 0 THEN LEAVE CHECK_QUOTA;
+
+! If the record is to be charged, do so. Check the result to see if it
+! is negative; if so, zero it to prevent absurd results.
+!
+
+IF .FLAGS[QUOTA_CHARGE]
+THEN
+    BEGIN
+    Q_RECORD[DQF$L_USAGE] = .Q_RECORD[DQF$L_USAGE] + .BLOCK_COUNT;
+    IF .Q_RECORD[DQF$L_USAGE] LSS 0
+    THEN Q_RECORD[DQF$L_USAGE] = 0;
+    WRITE_QUOTA (.Q_RECORD);
+    END;
+
+END;					! end of block CHECK_QUOTA
+
+SWITCH_VOLUME (.SAVE_RVN);
+
+END;					! end of routine CHARGE_QUOTA
+
+GLOBAL ROUTINE SEARCH_QUOTA (UIC, FLAGS, START_REC, USE_CACHE) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine searches the quota file for the specified UIC under
+!	control of the match flags.
+!
+! CALLING SEQUENCE:
+!	SEARCH_QUOTA (ARG1, ARG2, ARG3, ARG4)
+!
+! INPUT PARAMETERS:
+!	ARG1: UIC to search for
+!	ARG2: match control flags from FIB
+!	ARG3: record number at which to start
+!	ARG4: 1 to find record in the cache
+!	      0 to unconditionally go to the quota file
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: address of volume's VCB
+!	context set to RVN 1 of volume set
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	QUOTA_RECORD: record number of found record
+!	FREE_QUOTA: record number of first free quota file entry
+!	QUOTA_INDEX: cache index of cache entry if found
+!	DUMMY_REC: filled in with cache contents if found
+!
+! ROUTINE VALUE:
+!	address of quota file record found, 0 if none, -1 if not quota file
+!
+! SIDE EFFECTS:
+!	quota file read, contents of buffer cache altered
+!
+!--
+
+BEGIN
+
+MAP
+	FLAGS		: BITVECTOR;	! match control flags
+
+LITERAL
+	ALL_GROUP	= $BITPOSITION (FIB$V_ALL_GRP),
+	ALL_MEMBER	= $BITPOSITION (FIB$V_ALL_MEM),
+	RECS_PER_BLOCK	= 512 / DQF$C_LENGTH;
+
+LABEL
+	QUOTA_SCAN;			! search quota file
+
+LOCAL
+	FCB		: REF BBLOCK,	! address of quota file FCB
+	QUOTA_CACHE	: REF BBLOCK,	! address of quota cache
+	QUOTA_LIST	: REF BBLOCKVECTOR [,VCA$C_QUOLENGTH],
+					! address of quota cache entries
+	J,				! index into quota cache
+	REC_NUM,			! quota file record to read
+	FIRST_REC,			! first record in block to use
+	VBN,				! block number of quota file
+	Q_RECORD	: REF BBLOCK,	! address of quota file record
+	LOWEST_LRU,			! oldest quota LRU index
+	LOWEST_J,			! oldest quota cache entry index
+	LRU_DELTA,			! LRU index of current entry
+	OLD_RECORD	: REF BBLOCK;	! address of old quota record
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK,	! address of VCB of volume
+	QUOTA_RECORD,			! record number found
+	FREE_QUOTA,			! record number of free quota file entry
+	QUOTA_INDEX,			! index of applicable cache entry
+	REAL_Q_REC	: REF BBLOCK,	! address of quota record read
+	DUMMY_REC	: BBLOCK,	! dummy quota record from cache
+	PMS$GL_QUOHIT	: ADDRESSING_MODE (GENERAL),
+					! count of quota cache hits
+	PMS$GL_QUOMISS	: ADDRESSING_MODE (GENERAL);
+					! count of quota cache misses
+
+EXTERNAL ROUTINE
+	READ_BLOCK;			! read a disk block
+
+
+! Get the FCB address for the quota file. If none, take an error exit.
+!
+
+FCB = .CURRENT_VCB[VCB$L_QUOTAFCB];
+IF .FCB EQL 0 THEN RETURN -1;
+
+! If there are no wild cards in the search, scan the quota cache first.
+! If it is OK to use the cache, then return the cache entry, if found. If
+! the real record must be read, use the record pointer in the cache to read it.
+! As long as the record is read, also update it if the cache entry is dirty.
+!
+
+REAL_Q_REC = 0;
+QUOTA_CACHE = .CURRENT_VCB[VCB$L_QUOCACHE];
+QUOTA_LIST = QUOTA_CACHE[VCA$L_QUOLIST];
+IF NOT .FLAGS[ALL_MEMBER] AND NOT .FLAGS[ALL_GROUP]
+THEN
+    BEGIN
+    J = KERNEL_CALL (SCAN_QUO_CACHE, .UIC, .USE_CACHE);
+    IF .J NEQ 0
+    THEN
+	BEGIN
+	PMS$GL_QUOHIT - .PMS$GL_QUOHIT + 1;
+	IF NOT .USE_CACHE
+	OR .QUOTA_CACHE[VCA$W_QUOSIZE] LEQU 1
+	THEN
+	    BEGIN
+	    QUOTA_RECORD = .QUOTA_LIST[.J-1, VCA$L_QUORECNUM];
+	    REC_NUM = .QUOTA_LIST[.J-1, VCA$L_QUORECNUM] - 1;
+	    REAL_Q_REC = READ_BLOCK (.REC_NUM / RECS_PER_BLOCK
+				     + .FCB[FCB$L_STLBN], 1, QUOTA_TYPE)
+			 + (.REC_NUM MOD RECS_PER_BLOCK) * DQF$C_LENGTH;
+	    KERNEL_CALL (CLEAN_QUO_CACHE, .J, .REAL_Q_REC);
+	    END;
+	RETURN DUMMY_REC;
+	END;
+    END;
+
+! We failed to find a match in the quota cache, or we couldn't. If we want to
+! use the cache, find a free entry. This is done by searching the LRU indices
+! for the oldest entry (or by finding an empty entry).
+!
+
+IF .USE_CACHE
+THEN
+    BEGIN
+    PMS$GL_QUOMISS - .PMS$GL_QUOMISS + 1;
+    LOWEST_LRU = 0;
+    INCR J FROM 1 TO .QUOTA_CACHE[VCA$W_QUOSIZE]
+    DO
+	BEGIN
+	IF .QUOTA_LIST[.J-1, VCA$L_QUORECNUM] EQL 0
+	THEN
+	    BEGIN
+	    LOWEST_J = .J;
+	    EXITLOOP;
+	    END;
+	LRU_DELTA = .QUOTA_CACHE[VCA$W_QUOLRU] - .QUOTA_LIST[.J-1, VCA$W_QUOLRUX];
+	IF .LRU_DELTA GTRU .LOWEST_LRU
+	THEN
+	    BEGIN
+	    LOWEST_LRU = .LRU_DELTA;
+	    LOWEST_J = .J;
+	    END;
+	END;
+
+! If the cache entry we are about to use contains a modified entry, we must
+! read the corresponding record, update it, and write it.
+!
+
+    IF  .QUOTA_LIST[.LOWEST_J-1, VCA$V_QUODIRTY]
+    AND .QUOTA_LIST[.LOWEST_J-1, VCA$L_QUORECNUM] NEQ 0
+    THEN
+	BEGIN
+	REC_NUM = .QUOTA_LIST[.LOWEST_J-1, VCA$L_QUORECNUM] - 1;
+	OLD_RECORD = READ_BLOCK (.REC_NUM / RECS_PER_BLOCK
+				 + .FCB[FCB$L_STLBN], 1, QUOTA_TYPE)
+		     + (.REC_NUM MOD RECS_PER_BLOCK) * DQF$C_LENGTH;
+	KERNEL_CALL (CLEAN_QUO_CACHE, .LOWEST_J, .OLD_RECORD);
+	END;
+
+    END;
+
+! Now scan the blocks of the quota file, looking for a matching record.
+!
+
+QUOTA_SCAN: BEGIN
+
+FIRST_REC = .START_REC MOD RECS_PER_BLOCK;
+INCR VBN FROM .START_REC/RECS_PER_BLOCK TO .FCB[FCB$L_EFBLK] - 1
+DO
+    BEGIN
+    Q_RECORD = READ_BLOCK (.VBN + .FCB[FCB$L_STLBN],
+			   .FCB[FCB$L_EFBLK] - .VBN,
+			   QUOTA_TYPE)
+	     + .FIRST_REC * DQF$C_LENGTH;
+
+    INCR J FROM .FIRST_REC TO RECS_PER_BLOCK - 1
+    DO
+	BEGIN
+	QUOTA_RECORD = .VBN * RECS_PER_BLOCK + .J + 1;
+
+	IF .Q_RECORD[DQF$V_ACTIVE]
+	THEN
+	    BEGIN
+	    IF  (.FLAGS[ALL_MEMBER] OR .UIC<00,16> EQL .(Q_RECORD[DQF$L_UIC])<00,16>)
+	    AND (.FLAGS[ALL_GROUP]  OR .UIC<16,16> EQL .(Q_RECORD[DQF$L_UIC])<16,16>)
+	    THEN LEAVE QUOTA_SCAN;
+	    END
+
+	ELSE
+	    BEGIN
+	    IF .FREE_QUOTA EQL 0
+	    THEN FREE_QUOTA = .QUOTA_RECORD;
+	    END;
+
+	Q_RECORD = .Q_RECORD + DQF$C_LENGTH;
+	END;				! end of inner loop
+
+    FIRST_REC = 0;
+    END;				! end of block scan loop
+
+RETURN 0;				! return 0 if not found
+END;					! end of block QUOTA_SCAN
+
+! We have found a record in the quota file. If there were wild cards, now
+! scan the quota cache to see if an entry is present. With wild cards, the
+! file must be scanned first to be able to return the entries in a coherent
+! order; yet we must look at the cache in case a modified entry is present.
+!
+
+IF .FLAGS[ALL_MEMBER] OR .FLAGS[ALL_GROUP]
+THEN
+    BEGIN
+    J = KERNEL_CALL (SCAN_QUO_CACHE, .Q_RECORD[DQF$L_UIC], 0);
+    IF .J EQL 0 THEN RETURN .Q_RECORD;
+    KERNEL_CALL (CLEAN_QUO_CACHE, .J, .Q_RECORD);
+    REAL_Q_REC = .Q_RECORD;
+    RETURN DUMMY_REC;
+    END;
+
+! Finally enter the new record into the quota cache.
+!
+
+IF NOT .USE_CACHE THEN RETURN .Q_RECORD;
+
+KERNEL_CALL (ENTER_QUO_CACHE, .LOWEST_J, .Q_RECORD, 0);
+CH$MOVE (DQF$C_LENGTH, .Q_RECORD, DUMMY_REC);
+QUOTA_INDEX = .LOWEST_J;
+RETURN DUMMY_REC;
+
+END;					! end of routine SEARCH_QUOTA
+
+GLOBAL ROUTINE WRITE_QUOTA (Q_RECORD) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine writes the indicated quota record. If a cache entry
+!	exists for the record being processed (indicated by the record
+!	being the dummy record), we update the cache entry. If we also
+!	have the real quota record in memory, then mark it for write-back.
+!
+!
+! CALLING SEQUENCE:
+!	WRITE_QUOTA (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of quota record
+!
+! IMPLICIT INPUTS:
+!	REAL_Q_REC: buffer of real quota record if exists
+!	QUOTA_INDEX: cache index of cache entry
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	quota cache modified, quota record marked for write-back
+!
+!--
+
+BEGIN
+
+MAP
+	Q_RECORD	: REF BBLOCK;	! address of quota record
+
+EXTERNAL
+	DUMMY_REC	: BBLOCK,	! dummy record for cache entry
+	REAL_Q_REC	: REF BBLOCK,	! address of quota record read
+	QUOTA_INDEX;			! cache index of current cache entry
+
+EXTERNAL ROUTINE
+	MARK_DIRTY;			! mark buffer for write back
+
+
+! If the record is the dummy record, update the cache. Also update the
+! associated real record if there is one.
+!
+
+IF .Q_RECORD EQL DUMMY_REC
+THEN
+    BEGIN
+    KERNEL_CALL (ENTER_QUO_CACHE, .QUOTA_INDEX, .Q_RECORD, .REAL_Q_REC EQL 0);
+    IF .REAL_Q_REC NEQ 0
+    THEN
+	BEGIN
+	CH$MOVE (DQF$C_LENGTH, .Q_RECORD, .REAL_Q_REC);
+	MARK_DIRTY (.REAL_Q_REC);
+	END;
+    END
+
+! Else all we have is the address of the real quota record with no associated
+! cache entry.
+!
+
+ELSE
+    MARK_DIRTY (.Q_RECORD);
+
+END;					! end of routine WRITE_QUOTA
+
+ROUTINE SCAN_QUO_CACHE (UIC, MARK_USE) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine scans the quota cache for the indicated UIC. If found,
+!	it returns the contents, and marks the entry used if requested.
+!
+!
+! CALLING SEQUENCE:
+!	SCAN_QUO_CACHE (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: UIC to search for
+!	ARG2: 1 to record new use
+!	      0 to not
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	DUMMY_REC: receives contents of cache entry if found
+!	QUOTA_INDEX: receives index of cache entry found
+!	QUOTA_RECORD: quota file record number of found entry
+!
+! ROUTINE VALUE:
+!	index of entry found or 0 if none
+!
+! SIDE EFFECTS:
+!	quota cache entry modified
+!
+!--
+
+BEGIN
+
+LOCAL
+	QUOTA_CACHE	: REF BBLOCK,	! address of quota cache
+	QUOTA_LIST	: REF BBLOCKVECTOR [,VCA$C_QUOLENGTH];
+					! address of quota cache entries
+
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK,	! address of VCB of volume
+	DUMMY_REC	: BBLOCK,	! dummy quota record for cache entry
+	QUOTA_INDEX,			! quota cache index
+	QUOTA_RECORD;			! quota file record number
+
+! Search the quota cache for an active entry with a matching UIC.
+!
+
+QUOTA_CACHE = .CURRENT_VCB[VCB$L_QUOCACHE];
+QUOTA_LIST = QUOTA_CACHE[VCA$L_QUOLIST];
+
+INCR J FROM 1 TO .QUOTA_CACHE[VCA$W_QUOSIZE]
+DO
+    BEGIN
+    IF  .QUOTA_LIST[.J-1, VCA$L_QUORECNUM] NEQ 0
+    AND .QUOTA_LIST[.J-1, VCA$L_QUOUIC] EQL .UIC
+    THEN
+	BEGIN
+	IF .MARK_USE
+	THEN
+	    BEGIN
+	    QUOTA_LIST[.J-1, VCA$W_QUOLRUX] = .QUOTA_CACHE[VCA$W_QUOLRU];
+	    QUOTA_CACHE[VCA$W_QUOLRU] = .QUOTA_CACHE[VCA$W_QUOLRU] + 1;
+	    END;
+	DUMMY_REC[DQF$L_FLAGS] = DQF$M_ACTIVE;
+	QUOTA_RECORD = .QUOTA_LIST[.J-1, VCA$L_QUORECNUM];
+	CH$MOVE (16, QUOTA_LIST[.J-1, VCA$L_QUOUIC], DUMMY_REC[DQF$L_UIC]);
+	QUOTA_INDEX = .J;
+	RETURN .J;
+	END;
+    END;
+
+RETURN 0;				! nothing found
+
+END;					! end of routine SCAN_QUO_CACHE
+
+GLOBAL ROUTINE CLEAN_QUO_CACHE (J, Q_RECORD) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine updates the indicated quota record buffer from the
+!	indicated cache entry, and marks the record dirty and marks the
+!	cache entry clean if necessary.
+!
+!
+! CALLING SEQUENCE:
+!	CLEAN_QUO_CACHE (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: index in quota cache
+!	      0 to not
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!
+! OUTPUT PARAMETERS:
+!	ARG2: address of record buffer
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1
+!
+! SIDE EFFECTS:
+!	quota cache entry modified, buffer marked dirty
+!
+!--
+
+BEGIN
+
+MAP
+	Q_RECORD	: REF BBLOCK;	! address of quota record
+
+LOCAL
+	QUOTA_CACHE	: REF BBLOCK,	! address of quota cache
+	QUOTA_LIST	: REF BBLOCKVECTOR [,VCA$C_QUOLENGTH];
+					! address of quota cache entries
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK;	! address of VCB of volume
+
+EXTERNAL ROUTINE
+	MARK_DIRTY;			! mark buffer for write back
+
+
+! Copy the cache entry to the record buffer. If the cache entry is marked
+! dirty, mark it clean and mark the record dirty.
+!
+
+QUOTA_CACHE = .CURRENT_VCB[VCB$L_QUOCACHE];
+QUOTA_LIST = QUOTA_CACHE[VCA$L_QUOLIST];
+
+CH$MOVE (16, QUOTA_LIST[.J-1, VCA$L_QUOUIC], Q_RECORD[DQF$L_UIC]);
+IF .QUOTA_LIST[.J-1, VCA$V_QUODIRTY]
+THEN
+    BEGIN
+    QUOTA_LIST[.J-1, VCA$V_QUODIRTY] = 0;
+    MARK_DIRTY (.Q_RECORD);
+    END;
+
+1
+END;					! end of routine CLEAN_QUO_CACHE
+
+ROUTINE ENTER_QUO_CACHE (J, Q_RECORD, MARK_DIRTY) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine enters the given quota record into the cache at the
+!	indicated cache index. If requested, the cache entry is marked dirty.
+!
+!
+! CALLING SEQUENCE:
+!	ENTER_QUO_CACHE (ARG1, ARG2, ARG3)
+!
+! INPUT PARAMETERS:
+!	ARG1: index in quota cache
+!	ARG2: address of record buffer
+!	ARG3: 1 to mark record dirty
+!	      0 to not
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!	QUOTA_RECORD: record number of quota record
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1
+!
+! SIDE EFFECTS:
+!	quota cache entry modified
+!
+!--
+
+BEGIN
+
+MAP
+	Q_RECORD	: REF BBLOCK;	! address of quota record
+
+LOCAL
+	QUOTA_CACHE	: REF BBLOCK,	! address of quota cache
+	QUOTA_LIST	: REF BBLOCKVECTOR [,VCA$C_QUOLENGTH];
+					! address of quota cache entries
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK,	! address of VCB of volume
+	QUOTA_RECORD;			! record number of quota recoed read
+
+
+! Copy the record data to the cache entry. If requested, mark the cache
+! entry dirty.
+!
+
+QUOTA_CACHE = .CURRENT_VCB[VCB$L_QUOCACHE];
+QUOTA_LIST = QUOTA_CACHE[VCA$L_QUOLIST];
+
+CH$MOVE (16, Q_RECORD[DQF$L_UIC], QUOTA_LIST[.J-1, VCA$L_QUOUIC]);
+QUOTA_LIST[.J-1, VCA$W_QUOFLAGS] = 0;
+QUOTA_LIST[.J-1, VCA$L_QUORECNUM] = (IF .Q_RECORD[DQF$V_ACTIVE]
+				     THEN .QUOTA_RECORD
+				     ELSE 0);
+QUOTA_LIST[.J-1, VCA$W_QUOLRUX] = .QUOTA_CACHE[VCA$W_QUOLRU];
+QUOTA_CACHE[VCA$W_QUOLRU] = .QUOTA_CACHE[VCA$W_QUOLRU] + 1;
+
+IF .MARK_DIRTY
+THEN QUOTA_LIST[.J-1, VCA$V_QUODIRTY] = 1;
+
+1
+END;					! end of routine ENTER_QUO_CACHE
+
+ROUTINE SET_OVERDRAFT =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine sets the overfrawn bit in the file window, to allow
+!	the user to go into overdraft on his file the next time.
+!
+!
+! CALLING SEQUENCE:
+!	SET_OVERDRAFT ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CURRENT_WINDOW: address of user's file window
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1
+!
+! SIDE EFFECTS:
+!	overdrawn bit set in file window
+!
+!--
+
+BEGIN
+
+EXTERNAL
+	CURRENT_WINDOW	: REF BBLOCK;	! user's file window
+
+
+CURRENT_WINDOW[WCB$V_OVERDRAWN] = 1;
+
+1
+END;					! end of routine SET_OVERDRAFT
+
+END
+ELUDOM

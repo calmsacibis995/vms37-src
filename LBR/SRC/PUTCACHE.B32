@@ -1,0 +1,573 @@
+MODULE LBR_PUTCACHE (			! General library procedure routines
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  Library access procedures
+!
+! ABSTRACT:
+!
+!	The VAX/VMS librarian procedures implement a standard access method
+!	to libraries through a shared, common procedure set.
+!
+! ENVIRONMENT:
+!
+!	VAX native, user mode.
+!
+!--
+!
+!
+! AUTHOR:  Bob Grosso			23-Jan-1981
+!
+! MODIFIED BY:
+!
+!	V02-005		RPG0045		Bob Grosso	02-Dec-1981
+!		Support allocation of cache header blocks from common blocks.
+!
+!	V02-004		RPG0044		Bob Grosso	24-Jul-1981
+!		Convert messages and zero context cache pointer after dealloc.
+!
+!	V02-003		RPG0041		Bob Grosso	15-Jul-1981
+!		Pre-set corrupted header before updating library file.
+!
+!	V02-002		RPG0040		Bob Grosso	8-May-1981
+!		Check that last block is not null for Test_write.
+!
+!	V02-001		RPG0022		Bob Grosso	20-Mar-1981
+!		Correct routine Test_write.
+!
+!--
+
+LIBRARY
+	'SYS$LIBRARY:STARLET.L32';	! System macros
+REQUIRE
+	'PREFIX';		! Librarian general definitions
+REQUIRE
+	'LBRDEF';		! Librarian structure definitions
+
+EXTERNAL LITERAL
+    lbr$_badparam,
+    lbr$_writeerr,
+    lbr$_normal;
+
+EXTERNAL
+    lbr$gl_rmsstv,		! Returns STV on RMS errors
+    lbr$gl_control: REF BBLOCK; ! Pointer to current control block
+
+EXTERNAL ROUTINE
+    check_lock : JSB_0,		! Check if index is locked.
+    dealloc_mem : JSB_2,	! To return cache.
+    get_mem : JSB_2,		! To allocate empty_cache_buffer
+    empty_cache,		! To empty cache when library read only
+    write_block : JSB_2,	! To write out block of highest VBN
+    lookup_cache : JSB_2,	! To find block of highest VBN
+    validate_ctl : JSB_1;	! To validate the control index for lbr$flush
+
+FORWARD ROUTINE
+    write_n_blocks,		! Write empty cache buffer
+    flush_cache,		! Write out and deallocate cache
+    dealloc_cache,		! Deallocate hash table and cache
+    test_write;			! Write out highest VBN in cache to ensure
+				!   sufficient disk space.
+
+
+ROUTINE  flush_cache ( flush_data, writestatus, continue_on_err ) =
+!+++
+!
+!	This routine writes out to the library either all the data blocks 
+!	or all the index blocks.  The emptying of the cache starts with 
+!	the first bucket and proceeds by emptying a bucket at a time.  If
+!	a block has been modified then those VBN's in the cache which are
+!	sequentially adjacent to it are also copied to the empty_cache_buffer.
+!	The next VBN in sequential order will be found in the next bucket, so
+!	the search will continue along the buckets until the buffer fills or
+!	the next VBN is not found in the next bucket, at which point the 
+!	buffer will be written out to the library.
+!	Before any blocks are written, the block with the largest VBN is 
+!	written out to ensure that there is room on the storage device to 
+!	update the library.
+!
+! Inputs
+!
+!	flush_data = 	lbr$c_flushdata if data blocks are to be flushed,
+!		     	lbr$c_flushall if index blocks are to be flushed.
+!
+!	writestatus = 	If writestatus indicates an error then no more
+!		      	blocks will be written.  If writestatus = true,
+!		      	then the cache will continue to be deallocated.
+!
+!	continue_on_err =
+!			If true, then continue to deallocate cache after
+!		      	a buffer write error has occurred, else exit.
+!
+! Routine value
+!
+!	success or status from write.
+!---
+BEGIN
+
+!+++
+! body of ROUTINE flush_cache
+!---      
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK,
+    cache = .context [ctx$l_cache] : VECTOR;
+
+LITERAL
+    first_bucket = 0,			!Offset of first entry in hash table
+    last_bucket = lbr$c_hashsize/4 - 1;	!Offset of last entry in hash table
+
+LOCAL
+    flushbuf : BBLOCK [lbr$c_flshbfsiz * lbr$c_pagesize], 
+					! buffer when called by lbr$flush
+    putcachebuf : REF BBLOCK,		! point to either flushbuf which is on stack
+					!  or buffer allocated from virtual memory.
+    putbufsiz,				! Size of the buffer being used
+    bufstatus,				! allocation status for vm buffer
+    status;
+
+
+!+++
+! Descend through hash table a bucket at a time.
+! For each entry in a bucket, check it's vbn and then search the next bucket
+! for the next vbn in sequence. 
+! If found, store in buffer so all consecutive vbn's can be written with one QIO.
+! Keep getting consecutive vbn's until buffer full or next in sequence not found.
+! A count is kept of the number of virtual blocks copied to the buffer, and
+! the location in the buffer of the last vb that was modified is recorded so
+! that trailing unmodified blocks are not written out.
+!---
+!
+!    If a buffer cannot be allocated from virtual memory then use the buffer
+!    on the stack.
+!
+putbufsiz = lbr$c_putbufsiz;
+IF NOT (bufstatus = get_mem (lbr$c_putbufsiz * lbr$c_pagesize, putcachebuf))
+THEN
+    BEGIN
+    putbufsiz = lbr$c_flshbfsiz;
+    putcachebuf = flushbuf;
+    END;
+INCR bucket FROM first_bucket TO last_bucket DO	! for every bucket in hash table
+    BEGIN
+    LOCAL
+        entry : REF BBLOCK,	! Each bucket contains the head of a linked 
+				!   list of cache entries.
+	last_entry : REF BBLOCK,! Backward link in bucket's linked list
+        nxtcache_entry,		! Next cache entry in the linked list.
+	targvbn,		! The virtual block number of the first block 
+				!   in the empty_cache_buffer.
+        bufblkcnt,		! Count of the blocks written into the 
+				!   putcachebuf buffer.
+        lstmodblkloc,		! The count of the last vbn in the putcachebuf 
+				!   which had the modified bit set. The buffer
+				!   contents will be written out up to the 
+				!   last modified block.
+        next_vbn,		! The next vbn in sequence after the one just
+				!   copied to the putcachebuf.
+	next_bucket;		! Record location of the hash table bucket 
+				!   being searched.
+
+    last_entry = cache[.bucket] ;	! back link in hash bucket linked list
+    entry = .cache [.bucket];		! first hash list entry
+    !
+    !    Loop for each entry in the bucket unless there has been a write error
+    !    and continue_on_err is false
+    !
+    WHILE ((.entry NEQ 0) AND (.writestatus OR .continue_on_err) )DO
+	BEGIN
+	nxtcache_entry = .entry [cache$l_link];	! remember the next entry in bucket
+	IF .entry [cache$v_data] EQL .flush_data
+	THEN
+	    BEGIN
+	    IF .entry [cache$v_dirty] 	! if the page has been modified
+            THEN
+                BEGIN
+                IF .writestatus
+	        THEN
+		    !
+		    ! As long as there haven't been any write errors then keep
+		    ! copying blocks to buffer and writing buffer to library.
+		    !
+	            BEGIN
+	            targvbn	= .entry [cache$l_vbn]; ! vbn of first block in empty cache buffer.
+	            CH$MOVE (lbr$c_pagesize, CH$PTR(.entry[cache$l_address]), 
+		        CH$PTR( .putcachebuf ));
+	            bufblkcnt = 1;		! record the number of pages and modified
+	            lstmodblkloc = 1;		!    pages copied to the buffer
+	            next_vbn = .entry[cache$l_vbn] + 1;	! the virtual block number of the page
+						!     following the last copied to buffer
+	            !
+	            !    if the next vbn is in the cache it will be in one of 
+		    !    the entries in the next bucket. Check for end of hash 
+		    !    table and loop around.
+	            !
+	            IF .bucket LSS last_bucket 
+	            THEN next_bucket = .bucket + 1
+	            ELSE next_bucket = 0;
+
+	            !
+	            !    Keep looping until the buffer is filled or the
+		    !    consecutive VBN is not found.
+	            !
+	            WHILE ( (.bufblkcnt LSS .putbufsiz) AND (.next_vbn NEQ 0) ) DO
+                        BEGIN
+	                LOCAL
+                            nxtbucket_entry : REF BBLOCK,		! forward link in chain of cache entries.
+			    last_bucket_entry : REF BBLOCK,		! rear link
+			    nxtvbn_entry : REF BBLOCK;		! the cache entry of the vbn being sought.
+		        nxtbucket_entry = .cache[.next_bucket];	! retain forward link.
+		        last_bucket_entry = cache[.next_bucket];	! retain backward link.
+		        nxtvbn_entry = 0;			! mark the next sequential
+								! vbn as unfound.
+		        !
+		        !    While there are entries in the bucket and the VBN being sought
+		        !    has not been found and the search has not gone beyond where the vbn
+		        !    would be, keep looping through the entries in the bucket.
+		        !    Also give up search if block was found but is of wrong type; data/index.
+		        !
+		        WHILE ((.nxtbucket_entry NEQ 0) AND (.nxtvbn_entry EQL 0)) DO
+		            BEGIN
+		            IF .nxtbucket_entry[cache$l_vbn] GTR .next_vbn
+		            THEN
+			        BEGIN
+			        last_bucket_entry = .nxtbucket_entry;
+			        nxtbucket_entry = .nxtbucket_entry[cache$l_link];
+			        END
+		            ELSE
+			        BEGIN
+			        IF .nxtbucket_entry[cache$l_vbn] EQL .next_vbn
+			        THEN
+			            BEGIN
+				    IF .nxtbucket_entry[cache$v_data] EQL .flush_data
+				    THEN
+				        BEGIN
+			    	        !
+			    	        !    Next VBN found so unlink and mark it found
+				        last_bucket_entry[cache$l_link] = .nxtbucket_entry[cache$l_link];
+				        nxtvbn_entry = .nxtbucket_entry; ! record the unlinked cache entry 
+									 ! which contains the VBN searched for.
+				        END
+				    ELSE nxtbucket_entry = 0 ! Was found but was wrong type.
+				    END
+			        ELSE			! the next VBN is not in cache
+				    nxtbucket_entry = 0;	! End search
+			        END;
+		            END;	! WHILE searching for next vbn
+
+		        IF .nxtvbn_entry EQL 0 	! the next VBN was not found
+		        THEN next_vbn = 0
+		        ELSE
+			    !
+			    !   The next VBN was found, copy it into buffer if it was
+			    !   modified.  If not modified, copy it in unless it would 
+			    !   be the last in the buffer.
+			    !
+			    BEGIN
+			    IF ( (.nxtvbn_entry[cache$v_dirty]) OR
+			         (.bufblkcnt + 1  NEQ .putbufsiz) )
+			    THEN
+			        BEGIN
+			        CH$MOVE (lbr$c_pagesize,
+				    CH$PTR (.nxtvbn_entry[cache$l_address]),
+				    CH$PTR ( .putcachebuf + .bufblkcnt*lbr$c_pagesize ) );
+			        bufblkcnt = .bufblkcnt + 1;
+			        IF .nxtvbn_entry[cache$v_dirty] THEN lstmodblkloc = .bufblkcnt;
+			        !
+			        !    When setting next bucket for continued search of sequential
+				!    vbn's check to see if it should loop around end of hash table.
+			        !
+			        IF .next_bucket LSS last_bucket 
+			        THEN next_bucket = .next_bucket + 1
+			        ELSE next_bucket = 0;
+
+			        next_vbn = .next_vbn + 1;
+			        END
+
+			    ELSE
+			        !
+			        !   page was not modified and would be last in buffer so don't 
+			        !   bother with it.
+			        !
+			        next_vbn = 0;
+			    !
+			    !    deallocate block and then the hash bucket entry
+			    !
+			    dealloc_mem (lbr$c_pagesize, .nxtvbn_entry[cache$l_address]);
+		            dealloc_mem (cache$c_length, .nxtvbn_entry);
+		            END;	! else the vbn was found
+		        END;	! WHILE still filling buffer and finding the next VBN to go in it.
+	            writestatus = write_n_blocks ( .putcachebuf, .targvbn, .lstmodblkloc );
+		    !
+		    !    If there has been a write error then exit if flush_cache
+		    !    was called to flush the cache, else it was called to deallocate
+		    !    the cache, so keep on deallocating without writing.
+		    !
+		    IF NOT .writestatus AND NOT .continue_on_err
+		    THEN 
+		        BEGIN
+			! ** Note **  those blocks in buffer are lost
+		        IF .bufstatus 
+			THEN dealloc_mem (.putbufsiz * lbr$c_pagesize, .putcachebuf);
+		        RETURN .writestatus;
+		        END;
+                    END;		! IF writestatus (if only deallocating and not writing)
+	        END;		! If the first was modified
+	    last_entry[cache$l_link] = .entry[cache$l_link]; ! unlink
+	    !
+	    !    deallocate block and then the hash bucket entry
+	    !
+	    dealloc_mem (lbr$c_pagesize, .entry[cache$l_address]);
+            dealloc_mem (cache$c_length, .entry);
+	    END		! If the block type was correct
+        ELSE	! the block type was incorrect so hop over it.
+	    last_entry = .entry;
+
+        entry = .nxtcache_entry;
+	END	! WHILE covering all entries in the bucket
+    END;	! DO the whole hash table
+
+IF .bufstatus THEN dealloc_mem (.putbufsiz * lbr$c_pagesize, .putcachebuf);
+RETURN .writestatus;
+END;	! flush_cache
+
+
+ROUTINE test_write =
+!+++
+!
+!	Write out the largest VBN in the cache to ensure that there will 
+!	be sufficient space to write the library.
+!	Return the status of the write.
+!
+!---
+BEGIN
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK,
+    largest_vbn = context [ctx$l_hivbn];
+LOCAL
+    cache_entry : REF BBLOCK,
+    status;
+
+IF .context[ctx$v_ronly]
+THEN RETURN lbr$_normal
+ELSE
+    BEGIN
+    !
+    !  If largest_vbn is 0 then no blocks were modified
+    !
+    IF .largest_vbn EQL 0 THEN RETURN lbr$_normal;
+    perform ( lookup_cache (.largest_vbn, cache_entry) );
+    status = write_block (.cache_entry[cache$l_address], .largest_vbn);
+    IF .status
+    THEN RETURN write_block (.lbr$gl_control [lbr$l_oldhdrptr], 1)
+    ELSE RETURN lbr$_writeerr;
+    END;
+END;	! ROUTINE test_write
+
+
+ROUTINE write_n_blocks ( addr, targetvbn, nblocks ) =
+BEGIN
+
+!---
+!
+!	This routine writes out #[nblocks] blocks from the flush_cache_buffer 
+!	in memory to the library file at the specified	block number.
+!
+! Inputs:
+!
+!	addr = address of buffer to write from
+!	targetvbn = first disk block number in library file to write to
+!	nblocks = number of blocks in buffer to write out
+!
+! Outputs:
+!
+!	Return write status.
+!---
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr]: BBLOCK,
+    rab   = .context [ctx$l_recrab]: BBLOCK;
+
+LOCAL
+    status;
+
+rab [rab$l_bkt] = .targetvbn;		! Set block number to write
+rab [rab$l_rbf] = .addr;	!Set address of buffer for write
+rab [rab$w_rsz] = lbr$c_pagesize * .nblocks;	!And its length
+status = $WRITE (RAB=rab);	!Write the record
+IF NOT .status
+THEN 
+    BEGIN
+    lbr$gl_rmsstv = .rab [rab$l_stv]; ! Record error code.
+    RETURN lbr$_writeerr;
+    END
+ELSE RETURN lbr$_normal;
+
+END;
+
+
+GLOBAL ROUTINE dealloc_cache =
+BEGIN
+
+!+++
+!
+! Flush out the cache, writing blocks to library file and
+! returning virtual memory.  Then deallocate the hash table.
+! First write out the block of the highest VBN to ensure sufficient disk 
+! space.  Then write out data blocks then index blocks.  If a write error
+! occurs, continue deallocating the cache but quit writing the blocks out
+! to the library file.
+!
+!---
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK;
+
+LOCAL
+    status;
+
+LITERAL
+    continue  = true;  	! if flush_cache encounters a write error
+			! quit writing but continue to deallocate cache.
+!
+!    If the library has been opened read only then just empty the
+!    cache, otherwise use flush_cache which does more error checking
+!    and writes out data blocks before the index blocks.
+!
+IF .context[ctx$v_ronly]
+THEN
+    status = empty_cache ()
+ELSE
+    BEGIN
+    !
+    !    Write out the block in the cache with the largest VBN to 
+    !    ensure sufficient disk space before flushing the cache.
+    !
+    status = test_write ();
+
+    status = flush_cache( lbr$c_flushdata, .status, continue);
+    status = flush_cache( lbr$c_flushall, .status, continue);
+    dealloc_mem ( lbr$c_hashsize, .context [ctx$l_cache] );
+    context [ctx$l_cache] = 0;
+    END;
+
+!
+!   If an error hasn't occurred, and cache header entry common allocation
+!   block is not empty then deallocate it.
+!
+IF (NOT .status) AND (.context [ctx$l_chdallsiz] NEQ 0)
+THEN
+    BEGIN
+    dealloc_mem ( .context [ctx$l_chdallsiz], .context [ctx$l_chdalladr] );
+    END;
+
+RETURN .status;
+END;
+
+
+GLOBAL ROUTINE lbr$flush ( ctl_index, blktyp_to_flush ) =
+BEGIN
+
+!+++
+!
+! FUNCTIONAL DESCRIPTION
+!
+!	This routine empties the cache of all data blocks or of all
+!	data and index blocks, and deallocates the virtual memory.
+!	If a write error is encountered then it quits both writing
+!	the cache to the library, and deallocating the cache.
+!
+! CALLING SEQUENCE
+!
+!	status = lbr$flush ( ctl_index, blktyp_to_flush )
+!
+! INPUT PARAMETERS
+!
+!	ctl_index:
+!		address of control table index.
+!
+!	blktyp_to_flush:
+!		If blktyp_to_flush  = lbr$c_flushdata then write out
+!		data blocks from cache and return virtual memory.
+!		If blktyp_to_flush  = lbr$c_flushall then write out
+!		data blocks and index blocks to library file and
+!		deallocate the virtual memory.
+!
+! IMPLICIT OUTPUTS
+!
+!	All the blocks of the type specified are emptied from the
+!	virtual memory cache and written to the library.
+!
+! RETURN VALUE
+!
+!	lbr$_normal	Success code
+!	lbr$_badparam	Block type other than lbr$c_flushall or lbr$c_flushdata
+!			requested.
+!	lbr$_writeerr	Write error during writing out of cache
+!---
+
+LOCAL
+    blocktype,		! flag to signal whether data blocks or both
+			!   data and index blocks should be flushed.
+    status;
+
+LITERAL
+    continue = false;
+
+BUILTIN
+    NULLPARAMETER;
+
+perform (validate_ctl (..ctl_index));
+perform( check_lock() );	! check that index is not locked
+
+IF NULLPARAMETER(1)
+    THEN blocktype = lbr$c_flushall
+    ELSE blocktype = .blktyp_to_flush;
+IF ( (.blocktype NEQ lbr$c_flushdata) AND (.blocktype NEQ lbr$c_flushall) ) 
+THEN RETURN lbr$_badparam; 
+
+!
+!    Write out the block in the cache with the largest VBN to 
+!    ensure sufficient disk space before flushing the cache.
+!
+status = test_write ();
+
+IF .status 
+THEN status = flush_cache( lbr$c_flushdata, .status, continue);
+IF .blocktype EQL lbr$c_flushall 
+THEN
+    IF .status
+    THEN status = flush_cache( lbr$c_flushall, .status, continue);
+RETURN .status;
+END;
+
+END ! module PUTCACHE
+ELUDOM

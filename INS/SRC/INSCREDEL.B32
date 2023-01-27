@@ -1,0 +1,1082 @@
+MODULE INS_CREDEL (			! Create, Replace and Delete KFI entry
+			IDENT = 'V03-001',
+			ADDRESSING_MODE(EXTERNAL = GENERAL)
+		 ) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  Install
+!
+! ABSTRACT:
+!
+!	This module executes the REPLACE and DELETE options on INSTALL
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system.
+!
+! AUTHOR:  Bob Grosso, October 1981
+!
+! Modified by:
+!
+!	V03-005	RPG0005		Bob Grosso		16-Mar-1982
+!		Add null translation table mask parameter to 
+!		RM$KFI_PRS_DEV call.
+!
+!	V03-004	RPG0004		Bob Grosso		30-Dec-1981
+!		Build listheads in ins$credel.
+!
+!	V03-003	RPG0003		Bob Grosso		23-Dec-1981
+!		Cleanup code and add some support for P1 kfi.
+!
+!	V03-002	RPG0002		Bob Grosso		20-Nov-1981
+!		Use correct number of list heads.
+!
+!	V03-001	RPG0001		Bob Grosso		18-Nov-1981
+!		Correct error which prevented installing an image
+!		with privileges on a non-system volume.
+!
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:LIB';		! VAX/VMS system definitions
+
+REQUIRE
+	'SRC$:INSPREFIX.REQ';
+REQUIRE
+	'LIB$:INSDEF.B32';
+
+
+%SBTTL  'Declarations';
+
+LINKAGE
+    CALL_S_4 = CALL (STANDARD, REGISTER=4),				! for calling routines to execute in kernel mode,
+									! the change mode dispatcher passes PCB address in R4.
+
+    CALL_S_S_S_S_S_S_S_4 =						! for calling INS$CREDEL
+	CALL (STANDARD, STANDARD, STANDARD, STANDARD, STANDARD, STANDARD, STANDARD, REGISTER=4),
+
+    JSB_0_4 = JSB (REGISTER =0, REGISTER = 4) : NOPRESERVE (1,2,3),	! for calling SCH$LOCKW and SCH$UNLOCK
+
+    JSB_0_G1 = JSB (REGISTER = 0) 					! for IOC$VERIFYCHAN
+		: GLOBAL (ccb = 1) NOPRESERVE (2,3), 
+
+    JSB_G1_G2 = JSB : 							! Allocate pool
+		GLOBAL (length = 1, entry_block = 2) NOPRESERVE (3),
+
+    JSB_G1_G2_3 = JSB (REGISTER = 3)					! Allocate memory in P1 space
+		: GLOBAL (length = 1, entry_block = 2),
+
+    JSB_G7_8_G10 = JSB (REGISTER = 8) 					! for RM$KFISCN
+		: GLOBAL (kfiadr = 7, listhead = 10) NOPRESERVE (1,2,3,4,5,6,9),
+
+    CALL_G7_G10_S_S_S_S_S_S_S = CALL (STANDARD, STANDARD, 		! for make_kfi_entry
+		STANDARD, STANDARD, STANDARD, STANDARD) : GLOBAL (kfiadr = 7, listhead = 10);
+
+
+!
+! Table of contents
+!
+FORWARD ROUTINE
+    ins$credel : CALL_S_S_S_S_S_S_S_4,		! execute in kernel mode to perform the actual changes to the KFI
+    make_kfi_entry : CALL_G7_G10_S_S_S_S_S_S_S,	! create a new KFI entry
+    make_listhead,				! create a known file list header block
+    verify_kfi;					! verify that the $IMGACT call succeeded when doing a create or replace operation
+
+EXTERNAL ROUTINE
+    exe$allocate : JSB_G1_G2_3,			! Allocate in process space
+    exe$alononpaged : JSB_G1_G2,		! Allocate non-paged pool
+    exe$alopaged : JSB_G1_G2,			! Allocate from paged pool
+    ioc$verifychan : JSB_0_G1,			! verify device channel
+    rm$kfiscn : JSB_G7_8_G10,			! scan KFI for entry address
+    rm$kfi_prs_dev,				! Translate hidden root directory
+    sch$lockw : JSB_0_4,			! Lock and
+    sch$unlock : JSB_0_4,			! unlock mutex.
+    SYS$FAO;					! format ASCII data
+
+EXTERNAL
+    ctl$gq_allocreg,				! Memory allocation listhead
+    ctl$gl_knownfil,				! Process known file listhead queues
+    exe$gl_kfimtx,				! known file list mutex
+    exe$gl_knownfil : REF BBLOCK,		! Pointer to knownfil list queues
+    exe$gl_sysucb,				! Address of system disk unit control block
+    sgn$gb_kfilstct;				! Number of kfi list queues to put in header block
+
+GLOBAL
+    ins$gl_ctlmsk : BLOCK [1],			! Control flags
+    ins$gl_imgactflg,				! IMGACT control flags
+    ins$gl_kfiadr,				! Return the KFI address when it has been created or replaced
+    ins$gl_kfichan,				! Channel known image file is open on.
+    ins$gl_kfiflgs : BLOCK [1],			! the flags which will be put in the kfi$_wflags field of the KFI
+    ins$gq_kfiprivs : BBLOCK [8],		! quadword privilege mask
+    ins$gl_kfinam : $NAM_DECL,			! NAM block for the filename of the known image
+    ins$gl_kfirns : BBLOCK [dsc$c_s_bln];	! resultant name string descriptor
+
+EXTERNAL LITERAL
+    ins$_exist,			! name already in use
+    ins$_gblsecfail,		! failed to create global section
+    ins$_hdrnotres,		! unable to make image header resident
+    ins$_kfifull,		! 
+    ins$_nokfifnd;		! no known file entry found
+
+LITERAL
+    devnamsiz = 24,		! device name size, 16 bytes of name, 5 bytes of unit (round up)
+    ins$c_tbl_beg = 0,		! Index of beginning of table
+    ins$c_dev = 0,		! index to device info
+    ins$c_dir = 1,
+    ins$c_nam = 2,
+    ins$c_typ = 3,
+    ins$c_tbl_end = 4,		! index of zeroed longword for table stopper
+
+    num_alloc = 8,		! number of blank KFI entries to allocate at a time 
+				! from paged pool
+    num_str_flds = 4;		! Number of Counted ASCII fields in KFI
+				! device, directory, file-name, file-type
+
+MACRO				! indicies into string_sizes []
+    ins$b_devsiz = 0,0,8,0%,
+    ins$b_dirsiz = 1,0,8,0%,
+    ins$b_namsiz = 2,0,8,0%,
+    ins$b_typsiz = 3,0,8,0%;
+
+OWN
+    string_sizes : BBLOCK [num_str_flds]	! ** Accessed as VECTOR [num_str_flds, BYTE] **
+		PRESET (
+			[ins$b_devsiz] = 5,	! max device name length plus count byte
+			[ins$b_dirsiz] = 0,	! directory size to be filled in later
+			[ins$b_namsiz] = 10,	! max filenamelength plus count byte
+		   	[ins$b_typsiz] = 4	! max filetype length plus count byte
+			),
+
+    string_store : BBLOCK [nam$c_maxrss];	! buffer to build counted ASCII strings 
+
+MACRO
+    ins$b_cntbyte = 0,0,8,0%,			! first byte is for string length
+    ins$t_strngloc = 1,0,0,0%;			! skip over count byte
+
+BIND
+    faoctl_cvtdev = $descriptor ('!AC!UW');	! convert device type and unit number to ASCII string
+
+
+%SBTTL 'PROC_CREATE_DELETE';
+
+GLOBAL ROUTINE  proc_create_delete =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	Prepare arguement list for a call to INS$CREDEL which will
+!	create, replace, or delete a Known File entry.
+!	If there is no listhead for the entry being created, then create one.
+!
+!  EXPLICIT INPUT:
+!
+!	none
+!
+!  IMPLICIT INPUT:
+!
+!	ins$gl_ctlmsk	=	INSTALL's control flags dictating which operation to perform
+!	ins$gl_imgactflg =	Flags to be passed to $IMGACT
+!				IAC$V_NOACT set reqeusts that image activator complete the KFI creation or replacement.
+!				IAC$V_WRITABLE set if /WRITE qualifier was on command line
+!	ins$gl_kfichan	=	Channel on which the known file image is open
+!	ins$gl_kfiflgs	=	Flags to be placed into KFI entry
+!	ins$gq_kfiprivs	=	Address of quadword contianing privilege mask for KFI
+!	ins$gl_kfinam	=	Name Block to get the dir, nam and typ strings for the KFI
+!	ins$gl_kfirns	=	Address of buffer containing the resultant name string which is input to $IMGACT
+!
+!  IMPLICIT OUTPUT:
+!
+!	ins$gl_kfiadr	=	Address of KFI, may also have low bit set
+!
+!  ROUTINE VALUE:
+!
+!    R0 = return status, low bit set for success, else error status
+!
+!---
+
+LOCAL
+    cmk_arglst : VECTOR [8],	! input argument array for kernel mode routines
+    cmk_retval,			! either an error status or kfi address returned from kernel mode routine
+    dirstr_loc,			! pointer to directory name string for removal of []
+    dirstr_len,			! length of directory name string
+    status,
+    store_strings : REF BBLOCK,	! moveable pointer into string_store buffer
+    typstr_loc;			! locate start otype string, skipping past '.'
+
+
+
+
+!+++
+!
+!   Build pointers to counted ASCII strings for file spec
+!
+!---
+
+
+store_strings = string_store;		! init pointer to start of buffer
+
+!
+!   Copy the directory string from file NAM block.
+!   Strip off [] and <> from directory name
+!
+cmk_arglst [5] = .store_strings;	! start of directory string
+
+dirstr_loc = .ins$gl_kfinam [nam$l_dir];
+dirstr_len = .ins$gl_kfinam [nam$b_dir];
+!
+!   Strip off the "[]" or "<>" from the directory strings.
+!
+IF (NOT CH$FAIL(CH$FIND_CH( .dirstr_len, .dirstr_loc, %C'['))) OR 
+   (NOT CH$FAIL(CH$FIND_CH( .dirstr_len, .dirstr_loc, %C'<')))
+THEN
+    BEGIN
+    dirstr_loc = .dirstr_loc + 1;					! skip past '['
+    dirstr_len = .dirstr_len - 2;					! skip past '[' and stop before ']'
+    END;
+
+!
+!   Check if there is a hidden root directory which must be translated and
+!   prefixed to the directory string
+!
+IF .ins$gl_kfinam [nam$v_root_dir]
+THEN
+    BEGIN
+    LITERAL
+	mask = 0;				! Translation table mask
+    LOCAL
+	devbuf : BBLOCK [devnamsiz],		! device will be returned but ignored
+	dirbuf : BBLOCK [nam$c_maxrss],		! directory is passed to parse routine
+	srcdev_desc : BBLOCK [dsc$c_s_bln],	! descriptor of device logical name to be translated
+	dev_desc : BBLOCK [dsc$c_s_bln],	! descriptor of the buffer in which the unused device string will be returned
+	dev_len : WORD,				! length of the device string returned in devbuf
+	dir_desc : BBLOCK [dsc$c_s_bln],	! directory of buffer in which the translated directory string will be returned
+	dir_len : WORD;				! length of the directory string returned in dirbuf
+
+    srcdev_desc = 0;				! clean descriptor
+    srcdev_desc [dsc$b_class] = dsc$k_class_s;
+    srcdev_desc [dsc$w_length] = .ins$gl_kfinam [nam$b_dev] - 1;	! Drop off trailing ':'
+    srcdev_desc [dsc$a_pointer] = .ins$gl_kfinam [nam$l_dev];
+
+    dev_desc = 0;				! clean descriptor
+    dev_desc [dsc$w_length] = devnamsiz;
+    dev_desc [dsc$a_pointer] = devbuf;
+
+    dir_desc = 0;				! clean descriptor
+    dir_desc [dsc$w_length] = nam$c_maxrss;
+    dir_desc [dsc$a_pointer] = dirbuf;
+
+    !
+    !   Parse the device name to translate for the root directory
+    !
+    status = rm$kfi_prs_dev ( srcdev_desc, dev_desc, dev_len, dir_desc, dir_len, mask );
+    IF .status
+    THEN
+	BEGIN
+	store_strings [ins$b_cntbyte] = .dir_len + 1 + .dirstr_len;	! Length is root directory len, plus dot, plus directory
+	store_strings = CH$MOVE ( .dir_len, .dir_desc [dsc$a_pointer],	! Move root directory string
+	    store_strings [ins$t_strngloc] );
+	.store_strings = %C'.';						! Store the dot between strings
+	END
+    ELSE RETURN .status;
+    END
+
+ELSE
+    !
+    ! No hidden root directory, length is just length of directory string minus the brackets
+    !
+    store_strings [ins$b_cntbyte] = .dirstr_len;			! copy count byte for directory string
+
+store_strings = CH$MOVE (.dirstr_len,  .dirstr_loc,
+		store_strings [ins$t_strngloc] );			! copy directory string
+
+cmk_arglst [6] = .store_strings;					! start of filename string
+store_strings [ins$b_cntbyte] = .ins$gl_kfinam [nam$b_name];		! copy count byte for name string
+store_strings = CH$MOVE (.ins$gl_kfinam [nam$b_name], .ins$gl_kfinam [nam$l_name], 
+		store_strings [ins$t_strngloc] );			! copy name string
+
+cmk_arglst [7] = .store_strings;					! start of type string
+store_strings [ins$b_cntbyte] = .ins$gl_kfinam [nam$b_type] - 1;	! copy count byte for type string, skip '.'
+typstr_loc = .ins$gl_kfinam [nam$l_type] + 1;				! skip past '.' in file type string
+store_strings = CH$MOVE (.ins$gl_kfinam [nam$b_type], .typstr_loc,
+		store_strings [ins$t_strngloc] );			! copy type string
+
+
+
+!+++
+!
+!   Build an argument list and call the kernel mode routine
+!   which will modify the KFI list
+!
+!---
+
+IF ((.ins$gl_kfiflgs AND kfi$m_kp_shared) NEQ 0)	! /share or /head implies /open
+   OR ((.ins$gl_kfiflgs AND kfi$m_kp_reshdr) NEQ 0)
+THEN
+    ins$gl_kfiflgs = (.ins$gl_kfiflgs OR kfi$m_kp_open);
+
+cmk_arglst [0] = 7;				! number of parameters
+cmk_arglst [1] = .ins$gl_kfichan;			! load device channel for verfication
+cmk_arglst [2] = ins$gl_ctlmsk;			! address of control flags
+cmk_arglst [3] = ins$gl_kfiflgs;		! address of KFI flags
+cmk_arglst [4] = ins$gq_kfiprivs;		! address of privilege mask
+
+cmk_retval = $CMKRNL (ROUTIN = ins$credel, ARGLST = cmk_arglst);
+IF .cmk_retval 
+THEN ins$gl_kfiadr = .cmk_retval		! if sucessful, then KFI address is returned in status
+ELSE RETURN .cmk_retval;			! Otherwise return the error code
+
+
+IF .ins$gl_ctlmsk [ins$v_process]
+THEN
+    BEGIN
+    status = ins$_kfifull;			! replace with call to ins$p1permanent ();
+    END
+
+ELSE
+    BEGIN		! Not /PROCESS
+
+    !+++
+    !
+    !   Call the image activator with the NOACT flag 
+    !   bit set to complete the change to the KFI
+    !
+    !---
+
+    status = $IMGACT ( NAME = ins$gl_kfirns, IMGCTL=.ins$gl_imgactflg );
+    IF .ins$gl_ctlmsk [ins$v_delete] 	! Ignore error message from image activator if deleting
+    THEN RETURN true;
+    IF NOT .status THEN RETURN .status;	! Error creating global sections
+
+
+    !+++
+    !
+    !   Find the new KFI address after the replace.
+    !
+    !---
+
+    IF .ins$gl_ctlmsk [ins$v_replace] 
+    THEN
+        BEGIN
+        ins$gl_ctlmsk [ins$v_findkfi] = true;	! specify to ins$credel that we only want the 
+						! KFI address returned
+        cmk_retval = $CMKRNL (ROUTIN = ins$credel, ARGLST = cmk_arglst);
+	IF .cmk_retval				! If successful
+	THEN ins$gl_kfiadr = .cmk_retval	! then KFI address returned OR'd with success status
+	ELSE RETURN .cmk_retval;
+	END;
+
+
+    !+++
+    !
+    !   After a CREATE or REPLACE verify that $IMGACT was successful
+    !
+    !---
+
+    cmk_arglst [0] = 1;
+    cmk_arglst [1] = .ins$gl_kfiadr;		! load kfi address
+    cmk_retval = $CMKRNL (ROUTIN = verify_kfi, ARGLST = cmk_arglst);
+    IF NOT .cmk_retval THEN RETURN .cmk_retval;
+
+    END;	! Not /PROCESS
+
+RETURN .status;
+END;		! Global routine proc_create_delete
+
+
+%SBTTL  'INS$CREDEL';
+
+GLOBAL ROUTINE ins$credel ( chan, insctl_adr, kfiflg_adr, priv_adr, 
+	dir_ascic, nam_ascic,  typ_ascic, pcb_adr ) : CALL_S_S_S_S_S_S_S_4 =
+BEGIN
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!	If insctl_adr [ins$v_findkfi] is set then return the KFI address.
+!	If insctl_adr [ins$v_create] is set then create a KFI entry.
+!	If insctl_adr [ins$v_delete] then set the delete pending, and no-replace
+!	bits so that the call to $IMGACT will result in it's deletion.
+!	If insctl_adr [ins$v_replace] then set delete pending bit so $IMGACT
+!	will replace the KFI entry.
+!
+!  CALLING SEQUENCE:
+!
+!  INPUTS:
+!
+!	chan =		Channel on which the known file image is open
+!	insctl_adr =	Address of longword containing the control flags which
+!			tell whether KFI is to be created, replaced or deleted.
+!			Default is CREATE, for interfae with SYSINIT.
+!	kfiflg_adr =	Address of longword, the low word of which contains 
+!			flags which will be copied into KFI.
+!	priv_adr =	Address of a quadword which contains the privilege mask
+!			which will be copied into the KFI.
+!	dir_ascic =	Address of ASCIC directory string with "[]" or "<>" 
+!			removed.
+!	nam_ascic =	Address of ASCIC file name string.
+!	typ_ascic =	Address of ASCIC file type string.
+!	PCB_adr =	Address of Process Control Block, courtesy of change
+!			mode dispatcher.
+!
+!  IMPLICIT INPUTS:
+!
+!	none
+!
+!  OUTPUTS:
+!
+!	none
+!
+!  IMPLICIT OUTPUTS:
+!
+!	A kfi entry or header entry is allocated and initialized
+!
+!  ROUTINE VALUE:
+!
+!	ins$_nokfifnd :		No known file entry found for file 
+!				to be deleted or replaced.
+!	ins$_exist :		Known file to be created already exists
+!	ins$_kfifull :		Known file header pointer is full. Can not 
+!				create any new lists.
+!---
+
+GLOBAL REGISTER
+    ccb = 1,		! Channel control block
+    kfiadr = 7,		! Address of Known File Entry
+    listhead = 10;	! Head of KFI list
+
+MAP
+    ccb : REF BBLOCK,
+    insctl_adr : REF BBLOCK,
+    kfiadr : REF BBLOCK,
+    string_sizes : VECTOR [num_str_flds,BYTE];
+
+LITERAL
+    hdrlen_3quehdrs = kfi$c_kfihdlen + (3*8),	! size of kfi header block is fixed
+						! part plus 3 quadwords for queue headers.
+    !
+    !   Masks to code which fields in kfi are filled in.
+    !	From higher bits to lowest bit;
+    !				typ,nam,dir,dev
+    msk$c_nam = 4,		! 0100 binary
+    msk$c_devdirtyp = 11;	! 1011 binary
+
+LOCAL
+    stringtable : VECTOR [5,LONG],		! table of addresses locating the ASCIC strings in string_store.
+			! Used as input parameter to RM$KFISCN.
+			!  string_table [0] : address of device name string
+			! 		[1] : address of directory name string
+			! 		[2] : address of file name string
+			! 		[3] : address of file type string
+			! 		[4] : 0 for table stopper.
+
+    ctl_knownfil,			! store contents of ctl$gl_knownfil
+    ddb,				! device data block
+    devnamstr : BBLOCK [devnamsiz],	! Store device name string
+    faobufdsc : BBLOCK [dsc$c_s_bln],	! buffer to build device name string
+    kfi_flags,				! Flags to copy into kfi$w_flags
+    knownfil_hdr : REF BBLOCK,		! record list head for system or process kfi's
+    outlen,				! Outlen from FAO
+    ret_status,
+    status,
+    ucb : REF BBLOCK;			! unit control block
+
+LABEL
+    CREATE,				! block for creating KFI entry
+    FIND_LSTHD,				! Block to create a listhead entry
+    REPDEL;				! block to mark KFI entry for replace and delete
+
+
+!+++
+!
+!   Verify the channel and obtain the CCB from which the UCB
+!   is obtained to see if the image is on the system device.
+!
+!---
+
+status = ioc$verifychan (.chan);	! Verify channel and get CCB
+IF NOT .status THEN RETURN .status;
+
+kfi_flags = ..kfiflg_adr;		! copy flags to local store
+
+ucb = .ccb [ccb$l_ucb];			! Get Unit control block address from channel control block
+IF .ucb NEQ .exe$gl_sysucb		! If this is not the system device
+THEN					! then privileged images must remain open
+    BEGIN				! to keep a transaction against the volume.
+    IF (kfi$m_procpriv AND .kfi_flags) NEQ 0		! Is it privileged?
+    THEN
+	kfi_flags = (.kfi_flags OR kfi$m_kp_open);	! Keep file open
+    END;
+
+
+!+++
+!
+!   Build the device name string and the
+!   table of pointers to ASCII strings
+!
+!---
+
+ddb = .ucb [ucb$l_ddb];			! address of device data block
+!
+!   Use FAO to build the device name string from device type string and unit number
+!
+faobufdsc [dsc$w_length] = devnamsiz - 1;
+faobufdsc [dsc$a_pointer] = devnamstr + 1;
+SYS$FAO (faoctl_cvtdev, outlen, faobufdsc,
+	.ddb + $BYTEOFFSET(ddb$t_name), .ucb [ucb$w_unit]);
+devnamstr [ins$b_cntbyte] = .outlen;	! store string length
+stringtable [ins$c_dev] = devnamstr;		! store location of counted ASCII devicename
+stringtable [ins$c_dir] = .dir_ascic;
+stringtable [ins$c_nam] = .nam_ascic;
+stringtable [ins$c_typ] = .typ_ascic;
+stringtable [ins$c_tbl_end] = 0;
+
+
+!+++
+!
+!   Lock the KFI mutex
+!
+!---
+
+IF NOT .insctl_adr [ins$v_process]
+THEN
+    BEGIN
+    knownfil_hdr = .exe$gl_knownfil;
+    SCH$LOCKW (exe$gl_kfimtx, .pcb_adr);	! Lock KFI mutex for writing
+    ctl_knownfil = ctl$gl_knownfil;		! save P1 kfi list head
+    ctl$gl_knownfil = 0;			! zero P1 listhead so rm$kfiscn will not search it
+    END
+ELSE
+    knownfil_hdr = .ctl$gl_knownfil;
+
+!+++
+!
+!   Search the KFI for the entry 
+!   described by the table of strings
+!
+!---
+
+rm$kfiscn ( stringtable [ins$c_tbl_beg] );	! Scan KFI for file described by the ASCII strings in stringtable
+
+ret_status = true;	! Preset success status.  Before return, if return 
+			! status is still success, then address of KFI will be
+			! OR'd in.
+IF .insctl_adr [ins$v_delete] OR .insctl_adr [ins$v_replace]
+THEN
+REPDEL:
+
+
+    !+++
+    !
+    !	/DELETE or /REPLACE
+    !
+    !---
+
+    BEGIN
+    IF .kfiadr EQL 0 		! kfi must be present to replace or delete
+    THEN LEAVE REPDEL WITH (ret_status = ins$_nokfifnd);
+
+    IF .insctl_adr [ins$v_findkfi]
+    THEN LEAVE REPDEL;			! We found it and merely are confirming it's presence
+					! KFI address will be OR'd with return status
+
+    kfiadr [kfi$v_markdel] = true;	! Set mark for delete bit.
+    IF .insctl_adr [ins$v_delete]
+    THEN				! Indicate this is a delete, not a replace
+	kfiadr [kfi$v_noreplace] = true;
+
+    END
+
+!
+!   Create a KFI entry
+!
+ELSE
+CREATE:
+
+
+    !+++
+    !
+    !	/CREATE 
+    !
+    !---
+
+    BEGIN
+    BIND
+	dirnamstr = .stringtable [ins$c_dir] : BBLOCK;
+
+    IF .kfiadr NEQ 0 
+    THEN 					! The entry to be created already exists
+	LEAVE CREATE WITH (ret_status = ins$_exist);
+
+    !
+    ! set size of directory name string and add a count byte
+    !
+    string_sizes [ins$c_dir] = .dirnamstr [ins$b_cntbyte] + 1;
+
+    IF .listhead EQL 0				! Then this is a new list
+    THEN
+ 	FIND_LSTHD:
+
+	!+++
+	!
+	!   This is a new list, build a listhead
+	!
+	!---
+
+	BEGIN
+	LOCAL
+	    kf_ptrblk_siz,
+	    num_listhead_ptrs;
+
+	!
+	!   Must make a new known file list for this entry
+	!
+	ret_status = ins$_kfifull;			! In case there is no room for new lists
+	IF .knownfil_hdr EQL 0 
+	THEN 
+	    BEGIN
+	    status = make_listhead (.insctl_adr, knownfil_hdr,
+				(IF .insctl_adr [ins$v_process]
+					THEN ctl$gl_knownfil
+					ELSE exe$gl_knownfil) );
+
+	    IF NOT .status THEN LEAVE CREATE;		! Return an error, no room for new list
+	    END;
+
+	kf_ptrblk_siz = .knownfil_hdr [$BYTEOFFSET (kfp$w_size) -
+					  $BYTEOFFSET (kfp$l_que0),0,8,0];
+	!
+	!   Kfp$l_que0 is the offset to the first listhead pointer.
+	!   Number of list head pointers is the number of longwords left
+	!   in the pointer block following the fixed part.
+	!
+	num_listhead_ptrs = (.kf_ptrblk_siz - $BYTEOFFSET (kfp$l_que0)) /4;
+	!
+	!   Check each list head pointer slot to see if it's free.
+	!   When an empty slot is found, go build the header entry.
+	!
+	INCR quenum FROM 0 TO .num_listhead_ptrs - 1 DO
+	    BEGIN
+	    BIND
+		ptr_blk = .knownfil_hdr : VECTOR;
+
+	    IF .ptr_blk [.quenum] EQL 0			! An empty slot was found
+	    THEN
+		BEGIN					! go build the header entry
+		ret_status = make_kfi_entry ( .insctl_adr, .quenum,
+			hdrlen_3quehdrs, .kfi_flags, .priv_adr,
+			msk$c_devdirtyp, stringtable [ins$c_tbl_beg]);
+		LEAVE FIND_LSTHD;
+		END;
+	    END;
+	LEAVE CREATE;		! with ret_status = ins$_kfifull
+	END;			! create a listhead entry
+
+
+    !+++
+    !
+    !   Build the entry
+    !
+    !---
+
+    ret_status = make_kfi_entry (.insctl_adr, -1, kfi$c_length, .kfi_flags,
+			.priv_adr, msk$c_nam, stringtable [ins$c_tbl_beg]);
+
+
+    END;	! CREATE: block
+
+!+++
+!
+!   Unlock the KFI mutex and return KFI address
+!   or an error status.
+!
+!---
+
+IF NOT .insctl_adr [ins$v_process]
+THEN
+    BEGIN
+    ctl$gl_knownfil = ctl_knownfil;		! restore P1 kfi list head
+    SCH$UNLOCK (exe$gl_kfimtx, .pcb_adr);	! Unlock KFI mutex
+    END;
+
+IF .ret_status
+THEN
+    RETURN (.kfiadr OR true)			! Return the new KFI address OR'd with success code
+ELSE
+    RETURN .ret_status;				! Return error status
+END;		! routine  ins$credel
+
+
+%SBTTL  'make_kfi_entry';
+
+ROUTINE make_kfi_entry ( insctl_adr, quenum, fixed_len, flgs, privs, strng_msk,
+			string_table
+			) : CALL_G7_G10_S_S_S_S_S_S_S =
+!+++
+!
+!  FUNCTIONAL DESCRIPTION:
+!
+!  CALLING SEQUENCE:
+!
+!  INPUTS:
+!
+!	insctl_adr =	Address of longword containing the control flags which
+!			will determine if KFI in system or Process P1 space.
+!	quenum =	Is negative if KFI being built or equals offset from exe$gl_knownfil for a listhead being built
+!	fixed_len =	Fixed size of structure being built
+!	flgs =		Flags to go into kfi$w_flags
+!	privs =		Address of quadword containing privilege mask for images installed /PRIV
+!	strng_msk =	Mask specifying which strings are entered in entry 
+!				0010	requests file name
+!				1101	request device, directory and file type strings
+!	string_table =	Pointer to Table of addresses of counted ASCII
+!			strings.
+!     In Global register 7:
+!	kfiadr =	KFI address will be passed back in R7
+!     In Global register 10:
+!	listhead =	If listhead=0 then a listhead needs to be built, otherwise, kfi is entered at this listhead
+!
+!  IMPLICIT INPUTS:
+!	none
+!
+!  OUTPUTS:
+!	none
+!
+!  IMPLICIT OUTPUTS:
+!	Build a header entry or KFI entry
+!
+!  ROUTINE VALUE:
+!
+!---
+BEGIN
+
+!
+!   Queue manipulation instructions
+!
+BUILTIN
+    insque,
+    remque;
+
+GLOBAL REGISTER
+    length = 1,				! size of block to allocate
+    entry_block = 2;			! address of allocated block 
+
+EXTERNAL REGISTER
+    kfiadr = 7,
+    listhead = 10;
+
+MAP
+    insctl_adr : REF BBLOCK,		! control mask
+    string_sizes : VECTOR [num_str_flds,BYTE];
+
+LOCAL
+    entry : REF BBLOCK,			! Point to memory allocated for new entry
+    knownfil_hdr,			! Pointer to kfi header block
+    len,				! Fixed Length plus string storage
+    string_mask,			! Which strings to store
+    status;
+
+BIND
+    string_tab = .string_table : VECTOR [num_str_flds,LONG];
+
+
+knownfil_hdr = (IF .insctl_adr [ins$v_process]
+		THEN .ctl$gl_knownfil
+		ELSE .exe$gl_knownfil );
+
+!+++
+!
+!   Compute how much room the string storage will
+!   take to get allocation size for entry
+!
+!---
+
+len = .fixed_len;
+string_mask = .strng_msk;
+INCR str_fld FROM 0 TO num_str_flds-1 DO
+    BEGIN
+    IF .string_mask		! If this field is to be filled in
+    THEN len = .len + .string_sizes [.str_fld];	! then add in it's size.
+    string_mask = .string_mask ^ -1;		! Shift mask to see next bit
+    END;
+length = .len;					! size requested
+
+IF .quenum GEQ 0
+THEN
+    !+++
+    !
+    !	Create a list header
+    !
+    !---
+    BEGIN
+    BIND
+	kf_ptr_blk = .knownfil_hdr - $BYTEOFFSET (kfp$l_que0) : BBLOCK,	! point to start of pointer block 
+	kf_ptr_blk_ques = kf_ptr_blk [kfp$l_que0] : VECTOR;			! point to start of queues in pointer block
+
+    IF NOT (status = 
+	(IF .insctl_adr [ins$v_process]
+	 THEN exe$allocate (ctl$gq_allocreg)	! allocate from P1 space
+	 ELSE exe$alononpaged ())		! allocate header entry from nonpaged pool
+	)
+    THEN RETURN .status;
+
+    entry = .entry_block;
+    entry [kfi$w_size] = .length;		! size actually allocated
+    entry [kfi$b_type] = dyn$c_kfi;		! Mark as a known file entry
+    entry [kfi$b_kfictl] = kfi$m_kfihd;		! Mark as a kfi header
+    entry [kfi$w_refcnt] = 1;			! Bias the count, locking the entry
+    entry [kfi$b_kfiqnum] = .quenum;		! Indicate which list this is.
+    entry [kfi$b_kfiseq] = 0;			! zero sequence number
+
+    IF .quenum GEQU .kf_ptr_blk [kfp$b_quecount]	! Is the new slot beyond the current head?
+    THEN kf_ptr_blk [kfp$b_quecount] = .quenum + 1;	! Then the new count is the index plus one
+
+    !
+    !   init three empty queues;
+    !	    active
+    !	    delete pending
+    !	    free list
+    listhead = .entry + kfi$c_kfihdlen;	! return listhead to caller in R10
+    kf_ptr_blk_ques [.quenum] = .listhead;	! Set address of known file list head
+    INCR offset FROM 0 TO 16 BY 8 DO
+	BEGIN
+	BIND
+	   flink = .listhead + .offset,
+	   blink = .listhead + .offset + 4;
+
+	flink = flink;			! forward link points to itself
+	blink = flink;			! backward link points to forward link
+	END;
+    END		! create header entry
+
+
+ELSE
+
+    !+++
+    !
+    !	create known file entry
+    !
+    !---
+
+    BEGIN
+    BIND
+	free_list = .listhead + 16,	! forward link listhead of freelist
+	end_free_list = .listhead + 20; ! backward link listhead
+
+    !
+    !	Get an entry from the free list.  If the list was empty or there
+    !	was only one left, make more entries.
+    !
+    WHILE 
+	BEGIN
+	status = REMQUE (.free_list, entry);
+	(.status EQL 2) OR (.status EQL 3)
+	END
+    DO
+	!
+	!   List was either empty or we grabbed last one
+	!
+	BEGIN
+
+	IF .status EQL 2
+	    THEN
+	    !
+	    !   Got one but it was the last so put it back and allocate some more.
+	    !   Must keep at least one entry on the free list for the Image
+	    !   activator known file entry replacement logic to work.
+	    !
+	    BEGIN
+	    length = .entry [kfi$w_size];	! allocate new entries with same size as old
+	    status = INSQUE (.entry, free_list);
+	    END;
+
+	!
+	!   Allocate new entries.  Length of block to allocate is passed
+	!   in R1 (length) which was either computed from the fixed length plus
+	!   the size of the strings to be stored, or if there were already
+	!   entries on the list, then allocate same size as those.
+	!
+	INCR i FROM 1 TO num_alloc DO
+	    BEGIN
+
+	    IF NOT (status = 
+		(IF .insctl_adr [ins$v_process]
+		 THEN exe$allocate (ctl$gq_allocreg)	! allocate from P1 space
+		 ELSE exe$alopaged ())			! allocate header entry from nonpaged pool
+		)
+	    THEN RETURN .status;
+
+	    entry = .entry_block;
+	    entry [kfi$w_size] = .length;
+	    entry [kfi$b_kfiseq] = 0;
+	    status = INSQUE (.entry, .end_free_list);
+	    END;
+	END;		! While REMQUE status indicated none or 1 left on list
+
+    entry [kfi$b_type] = dyn$c_kfi;		! mark as known file entry
+    entry [kfi$b_kfictl] = 0;			! zero control flags
+    entry [kfi$w_refcnt] = 1;			! bias the ref count
+   	BEGIN
+	BIND
+	    header_entry = ..listhead : BBLOCK;
+
+	entry [kfi$b_kfiqnum] = .header_entry [kfi$b_kfiqnum];
+	END;
+    CH$FILL (0, (kfi$c_length + 7 - kfi$c_kfihdlen), .entry + kfi$c_kfihdlen);  ! Zero the end of the entry
+    entry [kfi$w_flags] = .flgs;		! fill in the flags
+    IF .entry [kfi$v_procpriv]			! If installed /PRIV 
+    THEN CH$MOVE (8, .privs, entry [kfi$q_procpriv]);	! copy in the privilege mask
+
+    kfiadr = .entry;			! return entry address to caller routine in R7
+    END;	! create known file entry
+
+
+!+++
+!
+!   Put name strings into entry
+!
+!---
+
+    BEGIN
+    LOCAL
+	offsets : REF BBLOCK,
+	string_base;
+
+    offsets = .entry + $BYTEOFFSET (kfi$b_devnam);	! Start of offset bytes in KFI entry
+    string_base = .entry + .fixed_len;			! Start of string store at end of KFI
+    string_mask = .strng_msk;
+    INCR str_fld FROM 0 TO num_str_flds-1 DO		! For as many strings as are stored
+	BEGIN
+	IF .string_mask					! Does this string get stored for this type of entry
+	THEN
+	    BEGIN
+	    BIND
+		string = .string_tab [.str_fld] : BBLOCK;
+
+	    offsets [ins$b_cntbyte] = .string_base - .entry;		! Record the offset to the string
+	    string_base = CH$MOVE (.string [ins$b_cntbyte] + 1, string,	! store the string
+				.string_base);
+	    END
+	ELSE
+	    offsets [ins$b_cntbyte] = 0;		! Otherwise this string not stored
+
+	offsets = .offsets + 1;				! Advance to next string type
+	string_mask = .string_mask ^ -1;		! shift the mask
+	END;
+    END;	! store strings
+
+INSQUE (.entry, ..listhead);		! queue at front of active list
+					! but after header entry for that list
+RETURN ss$_normal;			! successful completion
+END;	! routine make_kfi_entry
+
+
+%SBTTL 'make_listhead';
+
+ROUTINE make_listhead (insctl_adr, knownfil_ptr, knownfil_adr) =
+!+++
+!
+!   Create a knownfil list header block for either
+!   exe$gl_knownfil or ctl$gl_knownfil.
+!
+!---
+BEGIN
+GLOBAL REGISTER
+    length = 1,
+    entry_block = 2;
+
+MAP
+    insctl_adr : REF BBLOCK;
+
+LOCAL
+    alloc_len,
+    entry : REF BBLOCK,
+    status;
+
+LITERAL
+    longwords = 4;
+
+alloc_len = (longwords * .sgn$gb_kfilstct) + $BYTEOFFSET (kfp$l_que0);	! Number of bytes to allocate
+length = .alloc_len;
+IF .insctl_adr [ins$v_process]
+THEN
+    status = exe$allocate (ctl$gq_allocreg)
+ELSE
+    status = exe$alononpaged ();
+IF NOT .status THEN RETURN .status;
+
+entry = .entry_block;
+ch$fill (0, .length, .entry);		! zero the allocated header block
+entry [kfp$w_size] = .alloc_len;	! set length
+entry [kfp$b_type] = dyn$c_ptr;		! mark it as a pointer block
+entry [kfp$b_type1] = dyn$c_kfi;	! pointing to kfi's
+
+.knownfil_adr = entry [kfp$l_que0];	! point knownfil list head to start of queue lists
+.knownfil_ptr = ..knownfil_adr;		! reset caller's pointer
+
+RETURN true;
+END;		! routine make_listhead
+
+
+%SBTTL  'verify_kfi';
+
+ROUTINE verify_kfi ( kfiadr ) =
+!+++
+!
+!   Check whether the image activator was successful 
+!
+!---
+BEGIN
+LOCAL
+    kfi_adr : REF BBLOCK;
+
+kfi_adr = (.kfiadr AND (NOT kfi$m_kfiseq));  ! Clear the low bits which may contain success status
+!
+!   If file was to be shared make sure it is.
+!
+IF .kfi_adr [kfi$v_kp_shared] 
+THEN 
+    IF NOT .kfi_adr [kfi$v_is_shared]
+    THEN RETURN ins$_gblsecfail;
+
+!
+!   If file was to have the header resident make sure it is.
+!
+IF .kfi_adr [kfi$v_kp_reshdr]
+THEN
+    IF NOT .kfi_adr [kfi$v_is_reshdr]
+    THEN RETURN ins$_hdrnotres;
+
+RETURN true;	! Everything in place
+END;		! routine  verify_kfi
+
+END		! Module ins_repdel
+ELUDOM

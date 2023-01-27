@@ -1,0 +1,431 @@
+	.TITLE	REMXPORT - PROVIDE THE ACP TRANSPORT MECHANISM
+	.IDENT	'V03-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY:	REMOTE I/O ACP
+;
+; ABSTRACT:
+;	This module handles the mechanism for transporting
+;	ACP messages.
+;
+;	This version of the module uses:
+;	***************************
+;		DECnet
+;	***************************
+;	as its transport mechanism.
+;
+; ENVIRONMENT:
+;	MODE = KERNEL
+;--
+
+
+; AUTHOR:	SCOTT G. DAVIS, CREATION DATE: 11-JUL-79
+;
+; MODIFIED BY:
+;
+;	V02-005	SPF0050	Steve Forgey	31-Dec-1981
+;		Store logical link number in RT UCB.
+;
+;	V02-004 DJD2002 Darrell Duffy	2-May-1981
+;		Fix to ignore link error mailbox messages.
+;
+;	V02-003 DJD2001 Darrell Duffy	27-Feb-1981
+;		Allow for max links at init time.
+;
+;	V02-002	SGD2001	Scott G. Davis	23-Sep-1980
+;		Remove multiple devices, ignore unknown messages
+
+
+; INCLUDE FILES:
+;
+	$AQBDEF
+	$DIBDEF
+	$MSGDEF
+	$NFBDEF
+	$REMDEF
+	$UCBDEF
+	$RTTUCBEXT
+
+;
+; MACROS:
+;
+
+;
+; EQUATED SYMBOLS:
+;
+MBX_MSG_LTH = 150			; Size of a mailbox message
+RT_OBJ	=	23			; Object number for network cmd term
+
+;
+; OWN STORAGE:
+;
+	.PSECT	REM_XP_PURE,NOWRT,NOEXE
+  
+MBXDESC:	.ASCID	/REMACP_MBX/	; Logical name of mailbox
+NETDESC:	.ASCID	/_NET:/		; Device name for channel assignment
+NFBDESC:	.LONG	5		; NFB (FIB) descriptor
+		.ADDRESS	NFB
+DIBDESC:	.LONG	DIB$K_LENGTH	; Descriptor for device info bfr
+		.ADDRESS	DIBBUF
+
+
+	.PSECT	REM_XP_IMPURE	NOSHR,NOEXE,RD,WRT
+
+NFB:	.BYTE	NFB$C_DECLOBJ		; Function code (DECLARE OBJ)
+NFB_OBJ:	.LONG	RT_OBJ		; Object number
+MBX_Q_IOSB:				; I/O status block
+NCBDESC:				; Multiplex with MBX IOSB
+		.BLKQ	1		; Status of I/O completion
+MBX_T_BUFFER:				; Buffer for mailbox message
+	.BLKW	1			; Message identification
+		.BLKW	1		; Not used
+MBX_T_DATA:				; On connect initiates, et cetera
+		.BLKB	MBX_MSG_LTH	; Leave room for message
+DIBBUF:	.BLKB	DIB$K_LENGTH		; Device information buffer
+
+
+	.PSECT	REM_XP_CODE,NOWRT
+;++
+;
+; REM$XPORT_START - Initialize the transport mechanism
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine gets a channel for rejecting connection requests and
+;	for declaring object types, to receive inbound connections.
+;
+; OUTPUTS:
+;
+;	R0 - LBC=>NG, LBS=>OK
+;
+;--
+
+REM$XPORT_START::
+;
+; Create a mailbox for inbound connects, etc.
+;
+	$CREMBX_S-
+		CHAN=	W^REM$GW_MBX_CHAN- ;
+		MAXMSG=	#MBX_MSG_LTH-	;
+		BUFQUO=	#<MBX_MSG_LTH*16>- ;
+		LOGNAM=	W^MBXDESC -	; Mailbox's logical name
+		PROMSK=	#0		;
+	BLBC	R0,10$			; If LBC error
+;
+; Get a channel for rejects and mailbox info
+;
+	BSBW	REM$XPORT_CHAN		; Get a channel to the network
+	BLBC	R0,10$			; If LBC  couldn't find one slot!
+;
+; Declare object for multiple inbound connects
+;
+	$QIOW_S	CHAN=	@W^REM$GL_CHANVEC[R11],-
+		FUNC=	S^#IO$_ACPCONTROL,-
+		IOSB=	W^MBX_Q_IOSB,-
+		P1=	W^NFBDESC
+	BLBC	R0,10$			; If LBC NG
+	MOVZWL	W^MBX_Q_IOSB,R0		; Get the I/O completion code
+	BLBS	R0,20$			; If LBS ok
+10$:
+	RSB				; Done
+20$:
+	MOVL	#1,@W^REM$GL_UCBVEC[R11] ; Stuff dummy value to show busy
+30$:
+	MOVB	#REM$C_MBX_READ,R10	; Set up for a mailbox read
+	BRW	REM$ENQUEUE		; Queue the request and return
+
+
+
+;+
+; REM$MBX_READ - This routine puts a read out on the mailbox for
+;		process termination and inbound connect notifications
+;-
+REM$MBX_READ::				; Post read to mailbox
+	$QIO_S  CHAN	= W^REM$GW_MBX_CHAN,-
+		FUNC	= S^#IO$_READVBLK,-
+		ASTADR	= B^MBX_AST,-
+		IOSB	= W^MBX_Q_IOSB,-
+		P1	= W^MBX_T_BUFFER,-
+		P2	= #MBX_MSG_LTH
+	BLBC	R0,MBX_FAILURE		; If LBC error
+	RSB				; return
+;++
+;
+; MBX_AST - This routine services process terminations
+;		and inbound connect notifications.
+;
+;-
+MBX_AST:	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	CMPW	W^MBX_Q_IOSB,S^#SS$_ABORT ; Was the I/O cancelled?
+	BEQL	50$			; If EQL yes
+ 	CMPW	W^MBX_Q_IOSB,#SS$_CANCEL ; Try this code, too
+	BEQL	50$			; If EQL yes
+	MOVAB	W^MBX_T_BUFFER,R9	; Point to message buffer
+	MOVZWL	(R9)+,R6		; Save mailbox message code
+	MOVW	(R9)+,R7		; Get device dev_unit number
+	MOVZBL	(R9),R0			; Get length of device name
+					; Counted ASCII string
+	INCL	R0			;
+	ADDL	R0,R9			; Pass device name string
+;
+; Determine device index
+;
+	MOVZBL	W^REM$GB_MAXLINKS,R11	; Init count
+10$:
+	CMPW	R7,@W^REM$GL_MBX_UNITS[R11]	; Match?
+	BEQL	20$			; If EQL yes
+	SOBGTR	R11,10$			; Loop
+;*****
+; FATAL - unit number not found
+;*****
+
+20$:
+;
+; Dispatch
+;
+	BSBB	100$			; Allow for easy return
+					; by action routines
+	MOVB	#REM$C_MBX_READ,R10	; Set up for a mailbox read
+	BSBW	REM$ENQUEUE		; Queue the request
+50$:	RET				; Done
+;
+; Dispatch to action routine matching logical link event
+;
+; R9 points to mailbox data
+; R11 contains device index
+;
+100$:					; Entry point
+	$DISPATCH	R6,-		; Case on event code
+
+	<-;	event		action
+
+	    <MSG$_CONNECT,	CONN_REQ>,	-; Connect request received
+	    <MSG$_ABORT,	LINK_BROKEN>, -; Link broken
+	    <MSG$_DISCON,	LINK_BROKEN>, -; Link broken
+	    <MSG$_EXIT,		LINK_BROKEN>, -; Link broken
+	    <MSG$_PATHLOST,	LINK_BROKEN>, -; Link broken
+	    <MSG$_PROTOCOL,	LINK_BROKEN>, -; Link broken
+	    <MSG$_THIRDPARTY,	LINK_BROKEN>, -; Link broken
+	    <MSG$_NETSHUT,	NET_SHUTDOWN>, -; Network shutting down
+>
+	RSB					; Ignore other messages
+MBX_FAILURE:
+	BUG_CHECK	ACPMBFAIL,FATAL
+
+
+;++
+;
+; CONFIRM_AST - This is the AST routine for connect accepts.
+;		Issue a read over the link.
+
+;
+;--
+
+CONFIRM_AST:	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	MOVL	4(AP),R11		; Get the device index
+	MOVQ	@W^REM$GL_RIOSBVEC[R11],R0 ; Get the IOSB
+	BLBS	R0,5$			; If LBS I/O was OK
+;
+; I/O failed
+;
+	BSBW	REM$KILL_UCB		; Clean up the channel
+	RET				; Done
+5$:
+	MOVL	@W^REM$GL_UCBVEC[R11],R5 ; Get the UCB address
+	BICB	#UCB$M_ONLINE,UCB$W_STS(R5) ; Waiting for CONFIGURE
+	BSBW	REM$SEND_CONFIG		; Send one, too
+	MOVB	#REM$C_LNK_READ,R10	; Set up for a link read
+	BSBW	REM$ENQUEUE		; Queue the work element
+	RET				; Dismiss the AST
+
+
+
+;++
+;
+; CONN_REQ - Connection request received - figure out who and why.
+;		Allocate a channel and a UCB, set up the data bases,
+;		and confirm the link, if everything is copasetic,
+;		else reject the logical link.
+;
+; INPUTS:
+;
+;	R9 - points at counted NCB
+;
+;--
+
+CONN_REQ:
+	MOVAB	W^NCBDESC,R10		; Point to descriptor
+	MOVZBL	(R9)+,(R10)+		; Store length
+	MOVL	R9,(R10)		; Pointer to data
+	SUBL2	#4,R10			; Point to descriptor
+	MOVL	S^#IO$_ACCESS,R9	; Set the initial function code
+	MOVAB	B^CONFIRM_AST,R8		; For confirm, take an AST
+;
+; Try to set up a database for this channel
+;
+	BSBW	REM$SET_UP_IN		; Do it
+	BLBS	R0,200$			; If LBS OK
+;
+; Can't take this link - reject it
+;
+100$:
+	MOVZBL	W^REM$GB_MAXLINKS,R11	; Set up index of reject "device"
+	MOVW	@W^REM$GL_REJ_CHAN,R7	; Get reject channel
+	BISW	#IO$M_ABORT,R9		; Fix up the function code
+	CLRL	R8			; No AST
+	BRB	225$
+200$:
+	MOVL	@W^REM$GL_UCBVEC[R11],R5; Get UCB address
+	CLRW	UCB$W_RTT_LINK(R5)	; Initialize cell
+	LOCC	#^A'/',(R10),@4(R10)	; Find seperator in NCB
+	BEQL	225$			; If EQL, seperator not found
+	MOVW	1(R1),UCB$W_RTT_LINK(R5); Store logical link number in RT UCB
+225$:	
+	MOVAQ	@W^REM$GL_RIOSBVEC[R11],R5 ; Get the IOSB address
+	CLRL	R6			; No P1
+	BSBW	REM$DO_QIO		; Perform the requisite I/O
+	BLBS	R0,250$			; If LBS OK
+	BSBW	REM$KILL_UCB		; The I/O failed - clean up
+250$:
+	RSB				; Done
+
+
+
+;++
+;
+; REM$XPORT_CHAN - Get a channel to the network and set up various vectors
+;
+; INPUTS:
+;
+;	None
+;
+; OUTPUTS:
+;
+;	R0 - lbs => things are OK; lbc => NG
+;	R11 - device index
+;	Channel no. and unit stored
+;
+;--
+
+REM$XPORT_CHAN::
+	MOVZBL	W^REM$GB_MAXLINKS,R11	; Init index
+10$:
+	TSTL	@W^REM$GL_UCBVEC[R11]	; Free slot?
+	BEQL	20$			; If EQL yes
+	SOBGTR	R11,10$			; Loop
+	CLRL	R0			; Return error
+	RSB				; Done
+20$:
+	$ASSIGN_S DEVNAM= W^NETDESC-	; "_NET:" refers to NETACP
+		CHAN= @W^REM$GL_CHANVEC[R11]- ; Store channel #
+		MBXNAM= W^MBXDESC	; Specify associated mailbox
+	BLBC	R0,100$			; If LBC assignment failed
+	$GETCHN_S	CHAN= @W^REM$GL_CHANVEC[R11],- ; Discover the unit no. of net:
+			PRIBUF= W^DIBDESC ; Address of char buf descriptor
+	MOVW	W^DIBBUF+DIB$W_UNIT,-; Store associated unit
+		@W^REM$GL_MBX_UNITS[R11] 
+100$:
+	RSB				; That is all
+
+
+;++
+;
+; LINK_BROKEN - The logical link was broken
+;
+; INPUTS:
+;
+;	R11 - device index
+;
+;--
+
+LINK_BROKEN:
+;
+; We ignore mailbox error codes which signal links are breaking because
+; it is not feasible or necessary to synchronize actions taken here with those
+; taken in rttdriver and elsewhere.  There is always io outstanding to the
+; link, either here during protocol init or in rttdriver.  This io will
+; complete with errors when the link breaks and appropriate action will be
+; taken.
+;
+	RSB
+
+;++
+;
+; NET_SHUTDOWN - Network is shutting down.  Go away, since there is no
+;		way to keep "declared name" or "declared obj" info around.
+;
+; Side effects:
+;
+;	Mount count is cleared - equivalent to running STOPREM
+;
+;--
+
+NET_SHUTDOWN:
+	MOVL	W^REM$GL_Q_HEAD,R2	; Get the AQB address
+	CLRB	AQB$B_MNTCNT(R2)	; Mark for dismount
+	RSB				; Done
+
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+; BIN_TO_ASC - THIS ROUTINE CONVERTS A BINARY NUMBER TO AN
+;	ASCII STRING WITH ZERO SUPPESSION.
+;	CODE IS DUE TO BILL BROWN (JBC_BIN2ASC).
+;
+; CALLING SEQUENCE:
+;
+;	BSB	BIN_TO_ASC
+;
+; INPUT PARAMETERS:
+;
+;	R0 = NUMBER TO CONVERT
+;	R1 = SCRATCH
+;	R3 = ADDRESS OF PLACE TO STORE FIRST BYTE
+;
+; OUTPUT PARAMETERS:
+;
+;	NUMBER IS CONVERTED AND STORED
+;	R3 IS INCREMENTED PAST LAST BYTE STORED
+;
+; IMPLICIT OUTPUTS:
+;
+;	R0 AND R1 ARE RETURNED ZERO
+;
+;--
+
+BIN_TO_ASC:				; ENTER WITH JSB/BSB
+	CLRL	R1			; ZERO HI 1/2 OF QUAD WORD
+20$:	EDIV	#10,R0,R0,-(SP)		; DIVIDE BY DECIMAL RADIX
+	ADDL	#^A/0/,(SP)		; CONVERT TO ASCII
+	TSTL	R0			; ANYTHING LEFT TO CONVERT
+	BEQL	30$			; BR IF NO MORE SIGNIFICANT DIGITS
+	BSBB	20$			; RECURSE THRU ASCII CONVERT
+30$:	CVTLB	(SP)+,(R3)+		; INSERT ASCII UNIT NUMBER
+	RSB				; UNWIND RECURSIVE LOOP
+
+	.END

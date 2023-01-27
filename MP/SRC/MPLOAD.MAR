@@ -1,0 +1,804 @@
+	.TITLE	MPLOAD - LOAD AND CONNECT CODE FOR MULTIPROCESSING
+	.IDENT	'V03-006'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; Facility:  Executive , Hardware fault handling
+;
+; Abstract: 
+;
+;	MPLOAD is the main control module for the installation of
+;	the code required for multiprocessing.  It changes mode to kernel,
+;	acquires sufficient pool space and moves the code into it.
+;	With all interrupts disabled, the necessary hooks are inserted
+;	into the exec to connect several replacement routines.
+;
+; Environment: MODE=Kernel 
+;
+; Author:  RICHARD I. HUSTVEDT, Creation date:  15-MAY-1979
+;
+; Modified by:
+;
+;	V03-006	KDM0090		Kathleen D. Morse	5-Apr-1982
+;		Implement STOP/CPU logic that halts the secondary
+;		processor and unloads the multi-processing code.
+;
+;	V03-005	KDM0087		Kathleen D. Morse	5-Apr-1982
+;		Fix error exits, return pool and reset pointer to
+;		multi-processing code.
+;
+;	V03-004	KDM0083		Kathleen D. Morse	31-Mar-1982
+;		Change names of scheduling routines and hooks to match
+;		multi-processing naming conventions.
+;
+;	V03-003	KDM0082		Kathleen D. Morse	31-Mar-1982
+;		Add quadword to hold time/date that multi-processing
+;		code was loaded so that MONITOR can recognize that a
+;		STOP/CPU has been issued since its last sampling.
+;
+;	V03-002	KDM0081		Kathleen D. Morse	31-Mar-1982
+;		Change reference to MMG$INVALIDATE to MPH$INVALIDHK,
+;		to follow hook label naming conventions.
+;
+;	V03-001	KDM0080		Kathleen D. Morse	31-Mar-1982
+;		Assembly switch the debug and performance measurement
+;		code.  Also, reset protection on executive pages.
+;
+;	V02-017	KDM0039		Kathleen D. Morse	26-Jan-1982
+;		Implement the DCL command:  STOP/CPU.
+;
+;	V02-016	KDM0038		Kathleen D. Morse	26-Jan-1982
+;		Implement the DCL commands:  SHOW/CPU and START/CPU.
+;
+;	V02-015	KDM0037		Kathleen D. Morse	26-Jan-1982
+;		Return extra piece of non-paged pool, that comes
+;		from aligning to a page boundary.
+;
+;	V02-014	KDM0028		Kathleen D. Morse	31-Jul-1981
+;		Add standard structure type of loadable code, and sub-type
+;		of multi-processing.
+;
+;	V02-013	KDM0026		Kathleen D. Morse	23-Jul-1981
+;		Initialize the all the MA780 interrupt vectors for
+;		secondary processor, even those not used.
+;
+;	V02-012	KDM0023		Kathleen D. Morse	21-Jul-1981
+;		Place data that must be locked in working set next to
+;		the code that must be locked in the working set.
+;
+;	V02-011	KDM0017		Kathleen D. Morse	08-Jul-1981
+;		Rename MPS$GL_MPMBASE to MPS$AL_MPMBASE.
+;
+;	V02-010	KDM0015		Kathleen D. Morse	29-Jun-1981
+;		Increase MPS$GL_MPMBASE to a vector of addresses for
+;		all MA780s, so that error bit clearing can be done in
+;		the MA780 interrupt routines.
+;
+;	V02-009	KDM0014		Kathleen D. Morse	11-Jun-1981
+;		Fix number of bytes of loadable code to move to pool.
+;
+;	V02-008	KDM0011		Kathleen D. Morse	13-May-1981
+;		Replace MMG$AL_SBICONF with new symbol, MMG$GL_SBICONF.
+;		Change hooks to use new symbolic name convention.
+;
+;	V02-007	KDM0009		Kathleen D. Morse	28-Mar-1981
+;		Add hook into AST delivery to check if process should
+;		be rescheduled to run on secondary.
+;
+;	V02-006	KDM0007		Kathleen D. Morse	27-Mar-1981
+;		Initialize exec pointer to pool used for MP code.
+;		Add structure descriptor to beginning of MP code.
+;
+;	V02-005	KDM0005		Kathleen D. Morse	11-Mar-1981
+;		Add new macro for JSB address hooks instead of JMP address
+;		hooks.
+;
+;	V02-004	KDM0004		Kathleen D. Morse	26-Feb-1981
+;		Add code for bugcheck logic.
+;
+;	V02-003	KDM0003		Kathleen D. Morse	09-Sep-1980
+;		Change reference to absolute offset within MMG$FREWSLE
+;		to symbolic name, MMG$INVALIDATE.
+;
+;	V02-002	KDM0001		Kathleen D. Morse	04-Sep-1980
+;		Replace copyright.
+;
+; 01	- 
+;--
+
+;
+; INCLUDE FILES:
+;
+
+;
+; MACROS:
+;
+
+	.MACRO	HOOK,LOC,TARGET		;
+	.LONG	LOC			;
+	JMP	@#TARGET		;
+	.BLKB	6			 ; Normal VMS contents of hook location
+	.ENDM	HOOK			;
+
+	.MACRO	HOOKJSB,LOC,TARGET
+	.LONG	LOC
+	JSB	@#TARGET
+	.BLKB	6			 ; Normal VMS contents of hook location
+	.ENDM	HOOKJSB
+
+;
+; EQUATED SYMBOLS:
+;
+ 
+	$CLIMSGDEF			; Define CLI error messages
+	$DSCDEF				; Define string descriptor fields
+	$DYNDEF				; Define dynamic structure types
+	$IPLDEF				; Define interrupt priority levels
+	$IRPDEF				; Define structure header fields
+	$LCKDEF				; Lock bit definitions
+	$MPMDEF				; Define MA780 registers
+	$MPSDEF				; Define secondary processor states
+	$NDTDEF				; Define nexus type codes
+	$PCBDEF				; Process control block definitions
+	$PHDDEF				; Process header definitions
+	$PRDEF				; Define processor register numbers
+	$PTEDEF				; Define page table entry format
+	$RPBDEF				; Define restart param block offsets
+	$SSDEF				; Define system error messages
+	$STATEDEF			; State definitions
+	$VADEF				; Define virtual address fields
+
+
+;
+; OWN STORAGE:
+;
+	.PSECT	$$$$$$BEGIN,PAGE	; Base PSECT
+MPS$BEGIN::				;
+MPS$GL_POOLDSC::			; Structure descriptor for MP code
+	.LONG	0			; Adr of non-paged pool alloc for MP
+	.LONG	<<<<MPS$END-MPS$BEGIN>+511>@-4>@4> ; Size of pool used
+	.WORD	<<<<MPS$END-MPS$BEGIN>+511>@-4>@4> ; Structure size
+	.BYTE	DYN$C_LOADCODE		; Structure type of loadable code
+	.BYTE	DYN$C_LC_MP		; Structure sub-type of multi-processing
+MPS$HOOKTBL::				; Addresses to be locked in WS
+	.LONG	HOOKBASE,HOOKEND	; 
+;
+;	The convention for the following logical names is:
+;
+;		1) All hooks in the exec are prefixed by MPH$
+;		2) If the entire routine is replaced, then the
+;		   rest of the hook name is the same as the normal
+;		   routine name
+;		3) If there are only a few lines of new MP code to
+;		   be inserted, the hook name ends with HK and the
+;		   continuation point (if any) hook name ends with CONT
+;		4) All MP routines are prefixed with MPS$
+;		5) If the MP routine entirely replaces an exec routine,
+;		   then the rest of the MP routine name is the same as
+;		   the normal routine name
+;		6) If there are only a few lines of new MP code, then
+;		   the rest of the MP routine name is a new name
+;
+HOOKBASE:					; Base of hook table
+	HOOK	MPH$SCHED,MPS$SCHED		;
+	HOOK	MPH$RESCHED,MPS$RESCHED		; Reschedule interrupt
+	HOOK	MPH$QAST,MPS$QAST		; Queue AST
+	HOOK	MPH$INVALIDHK,MPS$INVALID	; Invalidate TB
+	HOOKJSB	MPH$BUGCHKHK,MPS$BUGCHECK	; Check for 2ndary during bugchk
+	HOOK	MPH$ASTDELHK,MPS$ASTSCHEDCHK	; Resched process to 2ndary chk
+	HOOK	MPH$NEWLVLHK,MPS$ASTNEWLVL	; Set new PR ASTLVL
+	.LONG	0				; End of JMP/JSB type hooks
+SCB_IPL14:					; Hook for SCB IPL=14 vector
+	.LONG	0				;  Adr of longword
+	.LONG	0				;  Old contents of longword
+SCB_IPL16:					; Hook for SCB IPL=16 vector
+	.LONG	0				;  Adr of longword
+	.LONG	0				;  Old contents of longword
+SCB_VEC94:					; Hook for XDELTA (SOFTINT 5)
+	.LONG	0				;  Adr of longword
+	.LONG	0				;  Old contents of longword
+SCB_VECBC:					; Hook for SOFTINT F
+	.LONG	0				;  Adr of longword
+	.LONG	0				;  Old contents of longword
+	.LONG	0				; Empty hook at ends table
+HOOKEND:
+	.PSECT	_END,PAGE		; End PSECT
+MPS$END::				;
+
+	.PSECT	__MPLOAD,LONG		;
+
+LOCKRANGE:				; Addresses to be locked in WS
+	.LONG	LOCKSTART,LOCKEND	;
+
+STOPRANGE:				; Addresses to be locked in WS
+	.LONG	STOPSTART,STOPEND	;
+
+;
+; Output buffer for SHOW CPU displays.
+;
+OUTPUT_LENGTH:	.LONG	0
+
+OUTPUT_BUFFER:
+	.BLKB	70
+
+OUTPUT_BUF_DSC:
+	.LONG	70
+	.ADDRESS	OUTPUT_BUFFER
+
+DCL_LINE_DSC:
+	.LONG	0
+	.LONG	0
+
+STATE_VALUE:
+	.LONG	0
+
+
+;
+; Array of ascid descriptor addresses for secondary
+; processor states.  Ordered from minimum to maximum
+; value of the state.  Indexed via numeric state value - 1.
+;
+STATES:
+	.ADDRESS IDLE_STATE_DSC
+	.ADDRESS DROP_STATE_DSC
+	.ADDRESS BUSY_STATE_DSC
+	.ADDRESS EXEC_STATE_DSC
+	.ADDRESS INIT_STATE_DSC
+	.ADDRESS STOP_STATE_DSC
+
+INIT_STATE_DSC:
+	.ASCID	/INITIALIZE/
+STOP_STATE_DSC:
+	.ASCID	/STOP/
+BUSY_STATE_DSC:
+	.ASCID	/BUSY/
+EXEC_STATE_DSC:
+	.ASCID	/EXECUTE/
+DROP_STATE_DSC:
+	.ASCID	/DROP/
+IDLE_STATE_DSC:
+	.ASCID	/IDLE/
+GET_VERB_DSC:
+	.ASCID	/$VERB/
+GET_LINE_DSC:
+	.ASCID	/$LINE/
+
+STATE_CTL_DSC:
+	.ASCID	\!/!_Attached processor is in the !AS state.\
+
+ILSTATE_CTL_DSC:
+	.ASCID	\!/!_Attached processor is in an illegal state of !XL\
+
+
+	.LIST	MEB			; Show macro expansions
+	.PAGE
+	.SBTTL	MPDCL - Multi-processing DCL command line handling
+;++
+; Functional Description:
+;
+; This routine contains the entry point for MP.EXE, MP$DCL.  This code
+; determines which command verb was requested (START, STOP, or SHOW)
+; and branches to the appropriate code.  It reports an error if the
+; invocation was not via one of these three verbs.
+;
+; Calling Sequence:
+;
+;	CALLx	MPS$DCL
+;
+; Input Parameters:
+;
+;	None
+;
+; Environment:
+;
+;	Executed by the primary processor.
+;
+; Return Status:
+;
+;	SS$_NORMAL - normal completion
+;	SS$_DEVOFFLINE - device is not in configuration (returned if not
+;		on an 11/780, or secondary is not started)
+;	SS$_SHMNOTCNCT - shared memory not connected (returned if no MA780
+;		is found for START/CPU)
+;	CLI$_ABVERB - unrecognized command (returned if MP.EXE is not invoked
+;		via START, STOP, or SHOW DCL commands)
+;
+;--
+ERRORX2:
+	MOVZBL	#SS$_DEVOFFLINE,R0	; Report device not in configuration
+ERRORX5:
+	RET				; Exit with error status
+MPS$DCL::
+	.WORD	0			; Entry mask
+	.ENABL	LSB
+	CMPB	#1,G^EXE$GB_CPUTYPE	; Is this an 11/780?
+	BNEQ	ERRORX2			; Br if not, error exit
+	MOVB	#DSC$K_CLASS_D,DSC$B_CLASS+DCL_LINE_DSC ; Initialize descriptor
+	PUSHAB	DCL_LINE_DSC		; Buffer dsc adr for command line
+	PUSHAB	GET_LINE_DSC		; Dsc adr of callback item requested
+	CALLS	#2,G^CLI$GET_VALUE	; Request command line
+	BLBC	R0,ERRORX5		; Br if error
+;
+; Determine which DCL command was issued:  SHOW/CPU, START/CPU, or SHOW/CPU.
+; If none of these was issued, then exit with an error status.
+;
+	MOVL	DCL_LINE_DSC+DSC$A_POINTER,R2 ; Get address of DCL command line
+	CMPB	(R2)+,#^A\S\		; First character must be an S
+	BNEQ	ERRORX3			; Br if unrecognized verb
+	CMPB	(R2),#^A\H\		; Check for SHOW verb
+	BEQL	SHOW_CPU		; Br to execute SHOW/CPU command
+	CMPB	(R2)+,#^A\T\		; Check for STOP or START verbs
+	BNEQ	ERRORX3			; Br if unrecognized verb
+	CMPB	(R2),#^A\A\		; Check for START verb
+	BEQL	START_CPU		; Br to execute START/CPU command
+	CMPB	(R2),#^A\O\		; Check for STOP verb
+	BEQL	STOP_CPU		; Br to execute STOP/CPU command
+ERRORX3:
+	MOVL	#CLI$_IVVERB,R0		; Report unrecognized command
+ERRORX4:
+	RET				; Exit with error status
+START_CPU:				; START/CPU DCL command execution
+	BRW	MPS$LOAD		; Continue loading MP code
+
+STOP_CPU:				; STOP/CPU DCL command execution
+	BRW	MPS$UNLOAD		; STOP/CPU DCL command execution
+
+;
+; GETDATA - This routine goes into kernel mode and copies
+; needed data into a local buffer.
+;
+GETDATA:
+	.WORD	0			; Entry mask
+	MOVZBL	#SS$_NORMAL,R0		; Assume success
+	MOVL	G^EXE$GL_MP,R1		; Get adr of loaded MP code
+	BEQL	ERRORX2			; Br if MP not loaded
+	MOVL	MPS$GL_STATE(R1),STATE_VALUE ; Copy state variable
+	RET				; Exit from kernel mode routine
+;
+; The command was SHOW CPU.  Change into kernel mode to
+; access the state variable for the secondary processor.
+;
+SHOW_CPU:
+	$CMKRNL_S GETDATA		; Acquire secondary state
+	BLBC	R0,ERRORX4		; Exit with error status
+;
+; Now format and output data.
+;
+10$:
+	MOVAB	ILSTATE_CTL_DSC,R2	; Assume illegal state
+	MOVL	STATE_VALUE,R0		; Get state value
+	CMPL	R0,#MPS$K_IDLESTATE	; Is this at least minimum value?
+	BLSS	20$			; Br if bad value
+	CMPL	R0,#MPS$K_STOPSTATE	; Is this at least maximum value?
+	BGTR	20$			; Br if bad value
+	DECL	R0			; Convert value to an index
+	MOVL	STATES[R0],R0		; Get address of ascii state text
+	MOVAB	STATE_CTL_DSC,R2	; Output ascii state name
+20$:	$FAO_S	CTRSTR=(R2),-
+		OUTLEN=OUTPUT_LENGTH,-
+		OUTBUF=OUTPUT_BUF_DSC,-
+		P1=R0			; Format output line
+	BLBC	R0,ERRORX4		; Exit with error status
+	MOVL	OUTPUT_LENGTH,OUTPUT_BUF_DSC ; Initialize output buffer dsc
+	PUSHAQ	OUTPUT_BUF_DSC	; Dsc adr for output buffer
+	CALLS	#1,G^LIB$PUT_OUTPUT	; Output secondary processor state
+	BLBC	R0,ERRORX4		; Exit with error status
+
+EXIT:
+	MOVZBL	#SS$_NORMAL,R0		; Exit with success code
+	RET				; Exit
+	.DSABL	LSB
+	.PAGE				;
+	.SBTTL	
+;++
+; Functional Description:
+;
+;	MPS$LOAD is linked together with all of the code required for multi-
+;	processing. The necessary amount of non-paged pool is allocated
+;	and rounded up to page boundary.  Code is then moved into this
+;	block of pool.  All of this code must be PIC although a limited
+;	amount of relocation will be done on data cells and the SCB for
+;	the secondary processor.
+;
+; Calling Sequence:
+;
+;	BRW	MPS$LOAD
+;
+; Input Parameters:
+;
+;	None
+;
+; Environment:
+;
+;	Executed by the primary processor.
+;
+;
+;--
+
+MPS$LOAD::				; Load multi-processing code for START
+	$LKWSET_S	INADR=LOCKRANGE	; Lock critical code into WS
+	BLBC	R0,ERRORX1		; Exit if unable to lock pages
+	$LKWSET_S	INADR=MPS$HOOKTBL ; Lock critical data into WS
+	BLBC	R0,ERRORX1		; Br if error
+	$CMKRNL_S W^MPS$LOADK		; Execute kernel routine
+ERRORX1:
+	RET				; Return
+
+
+LOCAL_MEM_ERR:
+	MOVL	#ERR$_LCLMEMUSED,R0	; Local memory cannot be used for MP
+	RET
+
+MA780_NOT_USED:
+	MOVL	#ERR$_MA780_REQ,R0	; MA780 memory required for MP
+	RET	
+
+MA780_CNCT_ERR:
+	MOVL	#ERR$_SHMDBLUSE,R0	; MA780 memory used for MP and MA780
+	RET				;  system interconnect at same time
+
+
+
+MPS$LOADK::	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+	.ENABL	LSB
+	TSTL	G^EXE$GL_MP		; Is secondary already started?
+	BNEQ	EXIT			; Br on yes, don't do anything
+	TSTL	G^EXE$GL_SHBLIST	; Is MA780 in use as sys intercnct?
+	BNEQ	MA780_CNCT_ERR		; Br if MA780 already in use
+	MOVL	G^EXE$GL_RPB,R0		; Get address of RPB
+	BBS	#RPB$V_USEMPM,RPB$L_BOOTR5(R0),LOCAL_MEM_ERR ; Br if booted with
+	BBC	#RPB$V_MPM,RPB$L_BOOTR5(R0),MA780_NOT_USED   ;  wrong memory
+	MOVZWL	W^MPS$GL_POOLDSC+IRP$W_SIZE,R1 ; Size of loadable code
+	JSB	G^EXE$ALONONPAGED	; Allocate necessary block
+
+	.IF	DF,MPDBGSWT
+	SETIPL	#0			;***** Drop IPL for debugging
+	.ENDC
+
+	BLBC	R0,ERRORX1		; Exit if none available
+	MOVL	R2,R0			; Remember starting address of pool
+	MOVL	R2,W^MPS$GL_POOLDSC	; Assume nothing to return to pool
+	MOVAB	511(R2),R2		; Round up to page boundary
+	BICL	#^X1FF,R2		; Set to page boundary
+	MOVL	R2,R10			; Save address of block
+	MOVL	R2,G^EXE$GL_MP		; Set exec pointer to MP code
+	SUBL3	R0,R2,R1		; Compute size of unused piece of pool
+	BEQL	10$			; Br if piece of pool was page-aligned
+	MOVW	R1,IRP$W_SIZE(R0)	; Set size of unused piece
+	MOVW	#<DYN$C_LC_MP@8+DYN$C_LOADCODE>,IRP$B_TYPE(R0) ; Set type
+	CMPL	R1,#32			; Is piece too small to bother returning
+	BLEQ	10$			; Br if too small
+	MOVL	R2,W^MPS$GL_POOLDSC	; Set page-aligned pool adr
+	SUBL2	R1,W^MPS$GL_POOLDSC+4	; Set page-aligned pool size
+	SUBL2	R1,W^MPS$GL_POOLDSC+IRP$W_SIZE ; Set page-aligned size
+	ASSUME	IRP$W_SIZE LE 10
+	MOVL	W^MPS$GL_POOLDSC,(R2)	; Initialize enough of pool block
+	MOVL	W^MPS$GL_POOLDSC+4,4(R2) ;  to allow its deallocate if an
+	MOVL	W^MPS$GL_POOLDSC+8,8(R2) ;  error exit is required
+	JSB	G^EXE$DEANONPAGED	; Return unused piece of pool
+	BLBS	R0,10$			; Br if successful
+DEA_ERR_EXIT:
+	PUSHL	R0			; Save error exit status
+	MOVL	W^MPS$GL_POOLDSC,R0	; Get address of pool allocated
+	JSB	G^EXE$DEANONPAGED	; Release block of pool
+	POPL	R0			; Restore exit status
+	CLRL	G^EXE$GL_MP		; Indicate no MP code loaded
+	RET				; Exit with error status
+
+10$:
+	MOVAB	W^MPS$BEGIN,R0		; Address of start of code segment
+	SUBL3	R0,R10,R9		; Relocation offset is difference
+;
+; The addresses in the SCB for the secondary processor are now relocated
+; by adding the relocation value.  Any SCB pointer already a system space
+; address is correct and need not be relocated.
+;
+	MOVAB	W^SCB$AL_BASE+512,R1	; Get base of SCB
+	MOVZBL	#128,R0			; Do all 128 vectors
+	.DSABL	LSB
+SCB_LOOP:				;
+	TSTL	-(R1)			; Is vector in system space?
+	BLSS	10$			; Yes, skip it
+	ADDL	R9,(R1)			; Other wise relocate pointer to point
+10$:	SOBGTR	R0,SCB_LOOP		; to code segment. Do all 128 vectors
+;
+; Locate all the multiport memory controllers and initialize the SCB
+; vectors for the inter-processor interrupts.  The first MA780 is used for
+; the multi-processing scheduling interrupt while the other MA780s are
+; vectored to an unexpected interrupt logging routine.  The error interrupt
+; vectors for the MA780s are initialized for the secondary also, while
+; those for the primary were initialized in the normal VMS boot procedures.
+;
+LOC_MPM:				; Initialize vectors for MA780 memories
+	CLRL	R0			; Initialize index
+	MOVAB	W^MPS$INT58,R2		; Get adr of error interrupt logger
+	ADDL	R9,R2			; Relocate for eventual location
+	BISL	#1,R2			; Set interrupt stack bit in vector
+	MOVL	G^MMG$GL_SBICONF,R3	; Get address of SBI config array
+	MOVAB	W^MPS$AL_MPMBASE,R4	; Get address of first MA780 base
+	MOVL	G^EXE$GL_SCB,R5		; Base address for primary SCB
+	MOVL	G^EXE$GL_RPB,R6		; Get base of RPB
+	MOVAL	W^SCB$AL_BASE,R7	; Base address for secondary SCB
+
+10$:	BICB3	#3,RPB$B_CONFREG(R6)[R0],R1 ; Get a type byte
+	CMPB	#NDT$_MPM0,R1		; Is it a multiport memory?
+	BNEQ	15$			; Br if not an MA780
+
+	MOVAL	256(R7)[R0],R8		; Compute address of first vector
+	MOVL	R2,64(R8)		; Set IPL=X15 vector (error interrrupt)
+	MOVL	R2,192(R8)		; Set IPL=X17 vector (error interrupt)
+
+	TSTL	W^MPS$AL_MPMBASE	; Is this the first MA780?
+	BNEQ	12$			; Br if not
+
+	MOVAB	W^MPS$SINTSR,R1		; Get adr of secondary interrupt rtn
+	ADDL	R9,R1			; Relocate for eventual location
+	BISL	#1,R1			; Set interrupt stack bit in vector
+	MOVL	R1,(R8)			; Set IPL=X14 vector (inter-proc intrpt)
+	MOVL	R1,128(R8)		; Set IPL=X16 vector (inter-proc intrpt)
+
+	MOVAB	W^MPS$PINTSR,R1		; Get adr of primary interrupt routine
+	ADDL	R9,R1			; Relocate for eventual location.
+	BISL	#1,R1			; Set interrupt stack bit in vector
+	MOVAL	256(R5)[R0],R8		; Compute address of first vector
+	MOVL	R8,SCB_IPL14		; Remember adr for unload logic
+	MOVL	(R8),SCB_IPL14+4	; Remember contents for unload
+	MOVL	R1,(R8)			; Set IPL=X14 vector (inter-proc intrpt)
+	MOVAB	128(R8),SCB_IPL16	; Remember adr for unload logic
+	MOVL	128(R8),SCB_IPL16+4	; Remember contents for unload
+	MOVL	R1,128(R8)		; Set IPL=X16 vector (inter-proc intrpt)
+	BRB	14$			; Continue with common code
+
+11$:	BRW	10$			; Branch assist
+
+12$:	MOVAB	W^MPS$UNEXPINT,R1	; Get adr of unexpected interrupt rtn
+	ADDL	R9,R1			; Relocate for eventual location
+	BISL	#1,R1			; Set interrupt stack bit in vector
+	MOVL	R1,(R8)			; Set IPL=X14 vector (inter-proc intrpt)
+	MOVL	R1,128(R8)		; Set IPL=X16 vector (inter-proc intrpt)
+
+14$:	MOVL	(R3)[R0],(R4)+		; Remember adr for this MA780s registers
+
+15$:	AOBLSS	#16,R0,11$		; Try all 16
+
+ 	MOVL	W^MPS$AL_MPMBASE,R0	; Get base of MA780 registers
+	BNEQ	FOUND_MPM		; Found at least one MA780
+	MOVZWL	#SS$_SHMNOTCNCT,R0	; Indicate failure to find an MA780
+	BRW	DEA_ERR_EXIT		; Error exit with pool deall
+FOUND_MPM:				;
+	MOVAB	W^MPS$RESCHEDIPL5,R1	; Get address of primary fork rtn
+	BISL	#1,R1			; Set interrupt stack bit in vector
+	MOVAB	^X94(R5),SCB_VEC94	; Remember adr for unload logic
+	MOVL	^X94(R5),SCB_VEC94+4	; Remember contents for unload
+	MOVAB	^XBC(R5),SCB_VECBC	; Remember adr for unload logic
+	MOVL	^XBC(R5),SCB_VECBC+4	; Remember contents for unload
+	MOVL	^X94(R5),^XBC(R5)	; Make XDELTA respond to softint ^XF
+	ADDL3	R9,R1,^X94(R5)		; Relocate for eventual location & store
+ 	ADDL3	#MPM$L_IIR,W^MPS$AL_MPMBASE,- ; Compute address of
+		W^MPS$GL_MPMIIR		; interrupt request register
+					; Interrupt routines
+	MOVL	MPM$L_CSR(R0),R2	; Read configuration register
+	EXTZV	#MPM$V_CSR_PORT,-	; Get port number
+		#MPM$S_CSR_PORT,R2,R2	; 
+
+	ADDL3	#MPM$V_IIR_CTL,R2,R3	; Set to control field
+	ASHL	R3,#^X1111,W^MPS$GL_PRIMSKT ; Generate interrupt trigger mask
+	MULL	#4,R2			; Compute bit position for trigger
+	ASHL	R2,#^XF,W^MPS$GL_PRIMSKC; Align and store mask for clear
+;
+; Compute the physical addresses for the secondary SCB and the Secondary
+; initialization routine starting address.
+;
+SET_PHYS:				;
+	MOVL	G^MMG$GL_SPTBASE,R5	; Get base of SPT
+	MOVAB	W^SCB$AL_BASE,R1	; VA of Secondary processor SCB
+	ADDL	R9,R1			; Relocate to eventual location
+	EXTZV	#VA$V_VPN,#VA$S_VPN,R1,R1 ; Get virtual page number
+	MOVL	(R5)[R1],R0		; Fetch PTE for it
+	EXTZV	#PTE$V_PFN,#PTE$S_PFN,R0,R0 ; Isolate page number
+	ASHL	#9,R0,W^MPS$GL_SCBB	; Save physical SCB address
+	MOVAB	W^EXE$MPSTART,R1	; VA of initialization routine
+	ADDL	R9,R1			; Relocate to eventual location
+	EXTZV	#VA$V_VPN,#VA$S_VPN,R1,R1 ; Get virtual page number
+	MOVL	(R5)[R1],R0		; Fetch PTE for it
+	EXTZV	#PTE$V_PFN,#PTE$S_PFN,R0,R0 ; Isolate page number
+	ASHL	#9,R0,RPB$L_HALTPC(R6)	; Save starting physical address
+;
+; Relocate some stray locations
+;
+MISC_RELOC:				;
+	ADDL	R9,XDELIBRK		; Address for initial breakpoint
+	ADDL	R9,MPS$GL_STRTVA	; Address for jump into S0 space
+	ADDL	R9,MPS$GL_ISP		; Interrupt stack for secondary
+;
+; Remember the time and date that this code was loaded.  This field
+; is used by the MONITOR utility to determine if the multi-processing
+; code has been reloaded during its last sampling interval (and therefore,
+; the cpu time accumulation cells have been re-initialized).
+;
+	MOVQ	G^EXE$GQ_SYSTIME,W^MPS$GQ_MPSTRTIM ; Get time in 64 bits
+;
+; Now move the code into the pool segment after all relocation is done.
+;
+MOVE_CODE:				;
+	MOVZWL	#<MPS$END-MPS$BEGIN>,R11 ; Size of MP code in bytes
+	MOVC3	R11,W^MPS$BEGIN,(R10)	; Move code to allocated pool space
+
+	.IF	DF,MPDBGSWT
+	NOP				;***** Instruction for debug breakpoint
+	.ENDC
+
+;
+; Begin locked down code that will execute at IPL=31 to actually
+; install needed hooks into the running system.
+;
+LOCKSTART:				;
+	SETIPL	#31			;
+	JSB	G^INI$WRITABLE		; Set writable for installing hooks
+	MOVAB	HOOKBASE,R5		; Get base of hook table
+	ADDL3	R9,R5,R1		; Get address of loaded mp code
+10$:	MOVL	(R5)+,R0		; Fetch address to install hook
+	BEQL	20$			; Done if address is zero
+	MOVW	(R0),10(R1)		; Save normal VMS contents for STOP/CPU
+	MOVW	(R5)+,(R0)+		; Move JMP opcode + operand specifier
+	MOVL	(R0),12(R1)		; Save normal VMS contents for STOP/CPU
+	ADDL3	R9,(R5)+,(R0)+		; Set address
+	ADDL2	#6,R5			; Point to next hook
+	ADDL2	#16,R1			; Point to next hook
+	BRB	10$			; Continue installing hooks
+20$:	BRW	HOOKS_DONE		; Branch assist for hooks completed
+;
+; This code is loaded into the RPB.  It is used as a safe place for
+; the secondary to wait while the primary does a bugcheck.  The first
+; longword is modified by the primary after it reboots.
+;
+	.ALIGN	LONG
+RPB_BUGCHK=.-4				; Address of longword that is modified
+					; by primary and secondary
+MPS$RPB_WAIT::				;
+	JMP	@RPB_BUGCHK		; RPB loop for secondary to execute
+
+RPB_LOOPSIZ = .-MPS$RPB_WAIT		; Number of bytes for code for RPB loop
+
+;
+; Now load loop code into the RPB for bugcheck.  This must be loaded
+; in two steps.  First, the loop code is loaded and then the loop address.
+;
+HOOKS_DONE:				;
+	MOVC	#RPB_LOOPSIZ,W^MPS$RPB_WAIT,RPB$B_WAIT(R6) ; Load JMP loop
+	MOVL	RPB$L_HALTPC(R6),RPB$L_BUGCHK(R6) ; Now start the secondary
+					; executing at EXE$MPSTART (phys. adr)
+;
+LOCKEND:				; End of locked code
+;
+; Installation of the multi-processing code is now complete
+;
+INSTALL_DONE:
+	JSB	G^INI$RDONLY		; Reset protection on system pages
+	SETIPL	#0			; Drop IPL
+	BSBW	MPS$MAINIT		; Initialize MA780 for interrupts
+	MOVL	#1,R0			; Set status to success
+	RET				; and return
+	.PAGE				;
+	.SBTTL	MPS$UNLOAD - STOP/CPU DCL command
+	
+;++
+; Functional Description:
+;
+;	MPS$UNLOAD is linked together with all of the code required for
+;	multi-processing.  This routine causes the secondary processor
+;	to halt and then unloads the multi-processing code (i.e., restores
+;	all the executive hook locations to their original values and
+;	restores the SCB to its single processor VMS values.
+;
+; Calling Sequence:
+;
+;	BRW	MPS$UNLOAD
+;
+; Input Parameters:
+;
+;	EXE$GL_MP - Points to multi-processing code loaded in pool
+;	EXE$GL_RPB - Points to RPB
+;
+; Environment:
+;
+;	Executed by the primary processor.
+;
+;
+;--
+
+MPS$UNLOAD::				; Unload multi-processing code for STOP
+	$LKWSET_S	INADR=STOPRANGE	; Lock critical code into WS
+	BLBC	R0,EXIT2		; Exit if unable to lock pages
+	$CMKRNL_S W^MPS$UNLOADK		; Execute kernel routine
+EXIT2:
+	RET				; Return
+
+
+STOPSTART:
+
+MPS$UNLOADK::	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+	SETIPL	#IPL$_SYNCH		; Synchronize on primary
+	MOVZBL	#SS$_NORMAL,R0		; Assume success
+	MOVL	G^EXE$GL_MP,R10		; Is multi-proc code loaded?
+	BNEQ	5$			; Br on yes, continue unloading
+4$:	BRW	100$			; Branch assist
+5$:	BBSSI	#MPS$V_STOPREQ,MPS$GL_STOPFLAG(R10),4$ ; Set STOP request flg
+10$:	BBSSI	#LCK$V_INTERLOCK,MPS$GL_INTERLOCK(R10),15$ ; Flush cache
+15$:	CMPL	MPS$GL_STATE(R10),#MPS$K_INITSTATE ; Is secondary active?
+	BGEQ	50$			; Br if not active, no process to return
+	JSB	MPS$INTSCND(R10)	; Interrupt secondary with STOP request
+20$:	BBCCI	#MPS$V_STOPACK1,MPS$GL_STOPFLAG(R10),20$ ; Wait for secondary
+	BBSSI	#LCK$V_INTERLOCK,MPS$GL_INTERLOCK(R10),30$ ; Flush cache
+30$:	CMPL	MPS$GL_STATE(R10),#MPS$K_IDLESTATE ; Is secondary active?
+	BEQL	50$			; Br if not active, no process to return
+;
+; Return process executing on the secondary to the scheduling queues.
+;
+	MOVL	MPS$GL_CURPCB(R10),R1	; Get PCB address for process
+	MOVZBL	PCB$B_PRI(R1),R2	; Get current priority of process
+	BBSS	R2,G^SCH$GL_COMQS,40$	; Indicate something in sched queue
+40$:	MOVW	#SCH$C_COM,PCB$W_STATE(R1) ; Indicate process is computable
+	MOVAQ	G^SCH$AQ_COMT[R2],R3	; Get tail of queue
+	INSQUE	(R1),@(R3)+		; Place process in scheduling queue
+	MOVL	#MPS$K_STOPSTATE,MPS$GL_STATE(R10) ; Set secondary stopped
+	SOFTINT	#IPL$_SCHED		; Request primary reschedule
+;
+; Now unload the multi-processing code.
+;
+50$:	MOVL	#MPS$K_STOPSTATE,MPS$GL_STATE(R10) ; Change INIT state to STOP
+	SETIPL	#31			; Prevent all system events
+	MOVAB	G^SCH$GL_NULLPCB,R0 ; Get address of null process PCB
+	MOVL	PCB$L_PHD(R0),R0	; Get address of null process PHD
+	SUBL	MPS$GL_NULLCPU(R10),PHD$L_CPUTIM(R0) ; Del secondary null time
+	JSB	G^INI$WRITABLE		; Make executive writable
+	MOVAB	HOOKBASE(R10),R5	; Get address of exec hook table
+60$:	MOVL	(R5),R0			; Get address of a hook
+	BEQL	70$			; 0 ends the JMP/JSB type hooks
+	MOVW	10(R5),(R0)+		; Replace the JMP/JSB opcode
+	MOVL	12(R5),(R0)+		; Replace the longword destination
+	ADDL2	#16,R5			; Point to next hook in table
+	BRB	60$			; Repeat for each hook
+70$:	ADDL	#4,R5			; Skip the end indicator
+80$:	MOVL	(R5)+,R0		; Get address of SCB vector changed
+	BEQL	90$			; 0 ends the SCB vector changes
+	MOVL	(R5)+,(R0)		; Replace SCB vector
+	BRB	80$			; Repeat for each SCB change
+90$:	CLRL	G^EXE$GL_MP		; Reset pointer to multi-proc code
+	JSB	G^INI$RDONLY		; Restore protection on executive pages
+	SETIPL	#IPL$_ASTDEL		; Lower IPL for deallocate of pool
+	MOVL	R10,R0			; Set address of block to return
+	JSB	G^EXE$DEANONPAGED	; Return block of nonpaged pool
+	BLBC	R0,100$			; Branch if error
+	MOVZBL	#SS$_NORMAL,R0		; Return success code
+100$:	SETIPL	#0			; Restore IPL
+	RET				;
+
+STOPEND:
+
+
+	.END	MPS$DCL

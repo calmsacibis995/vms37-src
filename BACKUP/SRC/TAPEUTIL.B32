@@ -1,0 +1,1661 @@
+MODULE TAPEUTIL (%TITLE	'Magtape Utility Routines'
+		IDENT = 'V03-001'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	Backup/Restore
+!
+! ABSTRACT:
+!
+!	This module contains routines to do the I/O involved in writing
+!	save sets.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS user mode
+!
+!--
+!
+! AUTHOR:  Andrew C. Goldstein, CREATION DATE:  17-Sep-1980  21:41
+!
+! MODIFIED BY:
+!
+!	V03-001	ACG0284		Andrew C. Goldstein,	9-Apr-1982  13:46
+!		Complete filtering of EOT status returns
+!
+!	V02-011	ACG0257		Andrew C. Goldstein,	21-Jan-1982  18:38
+!		Support lists of labels
+!
+!	V02-010	ACG0256		Andrew C. Goldstein,	19-Jan-1982  21:19
+!		Add /PROTECTION and /OWNER qualifiers to save sets
+!
+!	V02-009	MLJ0063		Martin L. Jack,	22-Dec-1981  3:01
+!		Use new $PUTMSG action routine parameter.
+!
+!	V02-008	MLJ0054		Martin L. Jack,	30-Nov-1981  14:03
+!		Prompt to OPCOM if and only if SYS$COMMAND is not a terminal.
+!
+!	V02-007	MLJ0043		Martin L. Jack,	8-Sep-1981  16:47
+!		Account for RMS logical device change.
+!
+!	V02-006	ACG0216		Andrew C. Goldstein,	4-Sep-1981  17:28
+!		Make SKIP_RECORD read if only one block
+!
+!	V02-005	MLJ0036		Martin L. Jack,	29-Aug-1981  16:19
+!		Implement operator assisted reel restart.
+!
+!	V02-004	ACG0209		Andrew C. Goldstein,	10-Jul-1981  13:33
+!		Make some errors continuable, fix error messages
+!
+!	V02-003	MLJ0025		Martin L. Jack,	8-May-1981  14:45
+!		Reorganize qualifier database.
+!		Make routines non-global if possible.
+!
+!	V02-002	MLJ0010		Martin L. Jack,	25-Mar-1981  15:30
+!		Reorganize global storage.
+!
+!	V02-001	MLJ0004		Martin L. Jack,	20-Feb-1981  2:10
+!		Implement operator assisted tape handling
+!
+!**
+
+
+LIBRARY	'SYS$LIBRARY:LIB';
+REQUIRE	'SRC$:COMMON';
+
+FORWARD ROUTINE
+	OPCOM:		NOVALUE,	! Communicate with operator
+	PUTMSG_ACTRTN_B,		! $PUTMSG action routine (GET_RESTART)
+	GET_RESTART:	NOVALUE,	! Get restart option
+	SENSE_CHAR,			! Read tape characteristics
+	WRITE_MESSAGE,			! Communicate with SYS$COMMAND
+	MOUNT_MESSAGE	: NOVALUE,	! issue mount request message
+	READY_TAPE,			!
+	SET_CHAR:	NOVALUE,	! Set tape characteristics
+	REWIND:		NOVALUE,	! Rewind tape
+	UNLOAD:		NOVALUE,	! Unload tape
+	SKIP_TM,			! Skip files on tape
+	SKIP_RECORD,			! Skip records on tape
+	READ_LABEL,			! Read label from tape
+	WRITE_TM:	NOVALUE,	! Write tape mark on tape
+	WRITE_LABEL:	NOVALUE,	! Write label on tape
+	JULIAN_DATE:	NOVALUE,	! Julian date conversion
+	FORMAT_VOLOWNER:NOVALUE,	! Owner UIC and protection format
+	MAKE_VOL1:	NOVALUE,	! Construct VOL1 label
+	MAKE_HDR1:	NOVALUE,	! Construct HDR1 label
+	MAKE_HDR2:	NOVALUE;	! Construct HDR2 label
+
+
+EXTERNAL LITERAL
+	BACKUP$_READYREAD,
+	BACKUP$_READYWRITE,
+	BACKUP$_WRITENABLE,
+	BACKUP$_SPECIFY,
+	BACKUP$_OPERFAIL,
+	BACKUP$_ABORT,
+	BACKUP$_NOTANSI,
+	BACKUP$_LABELERR,
+	BACKUP$_POSITERR;
+
+
+G$DEFINE();			! Define global common area
+
+
+BUILTIN
+	CALLG;
+
+ROUTINE OPCOM(REPLY,MSGID,PARAM): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine communicates with OPCOM to request tape handling if
+!	BACKUP is executing in a batch job.
+!
+! INPUT PARAMETERS:
+!	REPLY		- Pointer to descriptor to receive reply, or 0
+!	MSGID		- Message identification
+!	PARAM...	- FAO parameters required by the message
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	REPLY:		REF BBLOCK;		! Pointer to reply descriptor
+LOCAL
+	CHANNEL,				! Channel assigned to mailbox
+	STATUS,					! Status return
+	IOSB:		VECTOR[4,WORD],		! I/O status block
+	BUFFER_1:	BBLOCK[256],		! Message buffer
+	BUFFER_2:	BBLOCK[256],		! Message buffer
+	DESC:		VECTOR[2],		! Descriptor
+	DESC_2:		VECTOR[2],		! Descriptor
+	P;					! Temporary
+
+
+! Create a mailbox to receive the reply.  The protection on the mailbox is
+! set to system RW, owner RWED for maximum safety.
+!
+STATUS = $CREMBX(CHAN=CHANNEL, PROMSK=%B'1111111100001100');
+IF NOT .STATUS THEN SIGNAL(BACKUP$_OPERFAIL, 0, .STATUS);
+
+
+! Get the message text.  The BUFFEROVF or MSGNOTFND status return is
+! considered fatal, since it should not occur.
+!
+DESC[0] = 256;
+DESC[1] = BUFFER_1;
+STATUS = $GETMSG(
+    MSGID=.MSGID,
+    MSGLEN=DESC,
+    BUFADR=DESC);
+IF .STATUS NEQ SS$_NORMAL
+THEN
+    SIGNAL(BACKUP$_OPERFAIL, 0, .STATUS);
+
+
+! Use FAO to edit the message text.  The gotten message is the control string,
+! and the formatted message is placed in BUFFER_2.
+!
+DESC_2[0] = 256 - $BYTEOFFSET(OPC$L_MS_TEXT);
+DESC_2[1] = BUFFER_2 + $BYTEOFFSET(OPC$L_MS_TEXT);
+$FAOL(
+    CTRSTR=DESC,
+    OUTLEN=DESC_2,
+    OUTBUF=DESC_2,
+    PRMLST=PARAM);
+
+
+! Special case test to remove information following a CRLF from the
+! formatted string.  This allows the same message to be used in interactive
+! and batch processing, but to have the prompt stripped away for batch.
+!
+P = CH$FIND_CH(.DESC_2[0], .DESC_2[1], %O'015');
+IF .P NEQ 0 THEN DESC_2[0] = .P - .DESC_2[1];
+
+
+! Initialize OPCOM information at head of buffer.
+!
+CH$FILL(0, $BYTEOFFSET(OPC$L_MS_TEXT), BUFFER_2);
+BUFFER_2[OPC$B_MS_TYPE] = OPC$_RQ_RQST;
+BUFFER_2[OPC$B_MS_TARGET] = OPC$M_NM_CENTRL + OPC$M_NM_DEVICE +
+    (IF .BBLOCK[RWSV_SAVE_FAB[FAB$L_DEV], DEV$V_SQD]
+	THEN OPC$M_NM_TAPES
+	ELSE OPC$M_NM_DISKS);
+
+
+! Send the message to OPCOM.
+!
+DESC_2[0] = .DESC_2[0] + $BYTEOFFSET(OPC$L_MS_TEXT);
+DESC_2[1] = BUFFER_2;
+STATUS = $SNDOPR(
+    MSGBUF=DESC_2,
+    CHAN=.CHANNEL);
+IF NOT .STATUS OR .STATUS EQL OPC$_NOPERATOR
+THEN
+    SIGNAL(BACKUP$_OPERFAIL, 0, .STATUS);
+
+
+WHILE TRUE DO
+    BEGIN
+
+    ! Read the mailbox to get OPCOM's reply.
+    !
+    STATUS = $QIOW(
+	FUNC=IO$_READVBLK,
+	CHAN=.CHANNEL,
+	IOSB=IOSB,
+	P1=BUFFER_1,
+	P2=136);
+    IF .STATUS THEN STATUS = .IOSB[0];
+    IF NOT .STATUS THEN SIGNAL(BACKUP$_OPERFAIL, 0, .STATUS);
+
+
+    ! Sanity check the reply buffer.
+    !
+    IF
+	.BUFFER_1[OPC$B_MS_TYPE] NEQ MSG$_OPREPLY OR
+	.BUFFER_1[OPC$L_MS_RPLYID] NEQ 0
+    THEN
+	SIGNAL(BACKUP$_OPERFAIL);
+
+
+    ! Dispatch on the reply type.
+    !		Request complete:		exit the loop
+    !		Request pending:		reissue the mailbox read
+    !		No operator, aborted, etc.:	signal fatal error
+    !
+    SELECTONE .BUFFER_1[OPC$W_MS_STATUS] OF
+	SET
+
+	[OPC$_RQSTCMPLTE AND %X'FFFF']:
+	    EXITLOOP;
+
+	[OPC$_RQSTPEND AND %X'FFFF']:
+	    0;
+
+	[OTHERWISE]:
+	    SIGNAL(
+		BACKUP$_OPERFAIL,
+		0,
+		(OPC$_RQSTABORT AND %X'FFFF0000') +
+		    .BUFFER_1[OPC$W_MS_STATUS]);
+
+	TES;
+    END;
+
+
+! Return the reply text if requested.
+!
+IF .REPLY NEQ 0
+THEN
+    BEGIN
+
+    ! Remove information following a CRLF from the reply buffer.  This
+    ! is additional information returned by OPCOM.
+    !
+    P = CH$FIND_CH(128, BUFFER_1[OPC$L_MS_TEXT], %O'015');
+    IF .P EQL 0 THEN P = BUFFER_1[OPC$L_MS_TEXT] + 128;
+    CH$COPY(
+	.P - BUFFER_1[OPC$L_MS_TEXT], BUFFER_1[OPC$L_MS_TEXT],
+	%C' ',
+	.REPLY[DSC$W_LENGTH], .REPLY[DSC$A_POINTER]);
+    END;
+
+
+! Delete the mailbox.
+!
+STATUS = $DASSGN(CHAN=.CHANNEL);
+IF NOT .STATUS THEN SIGNAL(BACKUP$_OPERFAIL, 0, .STATUS);
+END;
+
+ROUTINE PUTMSG_ACTRTN_B(DESC)=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine is an action routine for the $PUTMSG call in routine
+!	GET_RESTART.  It takes care of sending the message text to OPCOM
+!	if BACKUP is executing in a batch job.  Otherwise, it calls the
+!	standard action routine (PUTMSG_ACTRTN), if defined, to put the
+!	message out in the standalone environment.  Otherwise, it lets
+!	$PUTMSG put the message out.
+!
+! INPUT PARAMETERS:
+!	DESC		- Descriptor for message.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	True if $PUTMSG should put the message out, otherwise false.
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	DESC:		REF BBLOCK;	! Pointer to descriptor
+EXTERNAL ROUTINE
+	PUTMSG_ACTRTN:	WEAK;		! $PUTMSG action routine for standalone
+BUILTIN
+	AP;
+
+
+IF NOT .COM_FLAGS[COM_INTERACT]
+THEN
+    BEGIN
+    LOCAL
+	BUFFER_2:	BBLOCK[256],		! OPCOM message buffer
+	DESC_2:		VECTOR[2],		! Descriptor for BUFFER_2
+	STATUS;					! Status variable
+
+
+    ! Initialize OPCOM information at head of buffer and move message text
+    ! to buffer.
+    !
+    CH$FILL(0, $BYTEOFFSET(OPC$L_MS_TEXT), BUFFER_2);
+    BUFFER_2[OPC$B_MS_TYPE] = OPC$_RQ_RQST;
+    BUFFER_2[OPC$B_MS_TARGET] = OPC$M_NM_CENTRL + OPC$M_NM_DEVICE +
+	(IF .BBLOCK[RWSV_SAVE_FAB[FAB$L_DEV], DEV$V_SQD]
+	    THEN OPC$M_NM_TAPES
+	    ELSE OPC$M_NM_DISKS);
+    CH$MOVE(.DESC[DSC$W_LENGTH], .DESC[DSC$A_POINTER], BUFFER_2[OPC$L_MS_TEXT]);
+
+    ! Send the message to OPCOM.  There is no reply.
+    !
+    DESC_2[0] = .DESC[DSC$W_LENGTH] + $BYTEOFFSET(OPC$L_MS_TEXT);
+    DESC_2[1] = BUFFER_2;
+    STATUS = $SNDOPR(MSGBUF=DESC_2);
+    IF NOT .STATUS OR .STATUS EQL OPC$_NOPERATOR
+    THEN
+	SIGNAL(BACKUP$_OPERFAIL, 0, .STATUS);
+
+
+    ! Return false to inhibit $PUTMSG output.
+    !
+    FALSE
+    END
+ELSE
+    BEGIN
+    IF PUTMSG_ACTRTN NEQ 0
+    THEN
+	CALLG(.AP, PUTMSG_ACTRTN)
+    ELSE
+	TRUE
+    END
+END;
+
+GLOBAL ROUTINE GET_RESTART(SIG,MASK): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine requests a restart option from the interactive user or
+!	from the system operator if BACKUP is executing in a batch job.
+!
+! INPUT PARAMETERS:
+!	SIG		- Signal parameter array
+!	MASK		- Bit mask of valid options
+!			  %B'01': RESTART is valid
+!			  %B'10': CONTINUE is valid
+!				  (QUIT is always valid)
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	If the reply is QUIT:		Signal the fatal BACKUP$_ABORT
+!	If the reply is RESTART:	Call REEL_RESTART
+!	If the reply is CONTINUE:	Return
+!
+!--
+
+BEGIN
+MAP
+	SIG:		REF BBLOCK;	! Signal parameters
+LOCAL
+	OPTIONS,			! Pointer to ASCIC options list
+	ANS_BUFFER:	VECTOR[8,BYTE]	! Buffer for user's response
+			VOLATILE;
+EXTERNAL ROUTINE
+	REEL_RESTART:	NOVALUE;	! Restart from checkpoint
+
+
+! Issue the original fatal message.
+!
+BBLOCK[SIG[CHF$L_SIG_NAME], STS$V_SEVERITY] = STS$K_ERROR;
+SIG[CHF$L_SIG_ARGS] = .SIG[CHF$L_SIG_ARGS] - 2;
+$PUTMSG(MSGVEC=.SIG, ACTRTN=PUTMSG_ACTRTN_B);
+
+
+! Loop until a valid response is received.
+!
+WHILE TRUE DO
+    BEGIN
+    LOCAL
+	REPLY_DESC:	VECTOR[2];	! Descriptor for reply
+
+
+    ! Initialize descriptor for answer.
+    !
+    REPLY_DESC[0] = 8;
+    REPLY_DESC[1] = ANS_BUFFER;
+
+
+    CASE .MASK FROM %B'01' TO %B'11' OF
+	SET
+	[%B'01']:	OPTIONS = UPLIT BYTE (%ASCIC ' or RESTART');
+	[%B'10']:	OPTIONS = UPLIT BYTE (%ASCIC ' or CONTINUE');
+	[%B'11']:	OPTIONS = UPLIT BYTE (%ASCIC ', CONTINUE or RESTART');
+	TES;
+
+
+    ! Issue prompt and receive reply.
+    !
+    IF NOT .COM_FLAGS[COM_INTERACT]
+    THEN
+	OPCOM(REPLY_DESC,
+	    BACKUP$_SPECIFY,
+	    .OPTIONS)
+    ELSE
+	BEGIN
+	LOCAL
+	    MSG_VECTOR:	VECTOR[4];
+
+	MSG_VECTOR[0] = 3;
+	MSG_VECTOR[1] = BACKUP$_SPECIFY;
+	MSG_VECTOR[2] = 1;
+	MSG_VECTOR[3] = .OPTIONS;
+	$PUTMSG(MSGVEC=MSG_VECTOR, ACTRTN=WRITE_MESSAGE, ACTPRM=REPLY_DESC);
+	END;
+
+
+    ! Analyze reply, after upcasing it.
+    !
+    ANS_BUFFER[0] = .ANS_BUFFER[0] AND NOT %O'040';
+    IF .ANS_BUFFER[0] EQL %C'C' AND .MASK<1,1> THEN RETURN;
+    IF .ANS_BUFFER[0] EQL %C'Q' THEN SIGNAL(BACKUP$_ABORT);
+    IF .ANS_BUFFER[0] EQL %C'R' AND .MASK<0,1> THEN REEL_RESTART();
+    END;
+END;
+
+GLOBAL ROUTINE SENSE_CHAR =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads the tape characteristics.
+!
+! CALLING SEQUENCE:
+!	SENSE_CHAR ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	tape device characteristics longword
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	TAPE_CHAR	: BBLOCK [$BYTEOFFSET (DIB$L_DEVDEPEND)+4],
+	DESC		: VECTOR[2];
+
+DESC[0] = %ALLOCATION(TAPE_CHAR);
+DESC[1] = TAPE_CHAR;
+$GETCHN (CHAN = .RWSV_CHAN,
+	 PRIBUF = DESC);
+
+.TAPE_CHAR[DIB$L_DEVDEPEND]
+END;					! End of routine SENSE_CHAR
+
+ROUTINE WRITE_MESSAGE (MESSAGE,REPLY_DESC) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine outputs the specified prompt message to SYS$COMMAND
+!	and waits for a response.
+!
+! CALLING SEQUENCE:
+!	WRITE_MESSAGE (MESSAGE,REPLY_DESC)
+!
+! INPUT PARAMETERS:
+!	MESSAGE: string descriptor of message to use
+!	REPLY_DESC: descriptor for reply buffer
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	FALSE (to inhibit $PUTMSG output)
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+EXTERNAL ROUTINE
+	LIB$GET_COMMAND	: ADDRESSING_MODE (GENERAL);
+
+
+! Use the message as the prompt to read an input line.
+!
+LIB$GET_COMMAND(.REPLY_DESC, .MESSAGE);
+FALSE
+END;					! End of routine WRITE_MESSAGE
+
+GLOBAL ROUTINE MOUNT_MESSAGE (MESSAGE) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine issues an operator message to mount the next
+!	volume and waits for the reply.
+!
+! CALLING SEQUENCE:
+!	MOUNT_MESSAGE (MESSAGE)
+!
+! INPUT PARAMETERS:
+!	MESSAGE: code of message to issue
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+	MSG_VECTOR	: VECTOR [6],	! message arg vector for $PUTMSG
+	REPLY_DESC	: VECTOR [2];	! descriptor for reply
+
+
+! Set up the message vector and issue the message to the terminal,
+! or to OPCOM if running under batch.
+!
+
+MSG_VECTOR[0] = 5;
+MSG_VECTOR[1] = .MESSAGE;
+MSG_VECTOR[2] = 3;
+MSG_VECTOR[3] = .RWSV_VOL_NUMBER;
+MSG_VECTOR[4] = .BBLOCK[RWSV_SAVE_QUAL[QUAL_DVI_DESC], DSC$W_LENGTH];
+MSG_VECTOR[5] = .BBLOCK[RWSV_SAVE_QUAL[QUAL_DVI_DESC], DSC$A_POINTER];
+REPLY_DESC[0] = REPLY_DESC[1] = 0;
+IF NOT .COM_FLAGS[COM_INTERACT]
+THEN
+    OPCOM(0,
+	.MSG_VECTOR[1],
+	.MSG_VECTOR[3], .MSG_VECTOR[4], .MSG_VECTOR[5])
+ELSE
+    $PUTMSG (MSGVEC = MSG_VECTOR, ACTRTN = WRITE_MESSAGE, ACTPRM = REPLY_DESC);
+
+END;					! End of routine MOUNT_MESSAGE
+
+GLOBAL ROUTINE READY_TAPE (WRITE) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine gets the tape ready as specified and returns the
+!	tape device characteristics.
+!
+! CALLING SEQUENCE:
+!	READY_TAPE (WRITE)
+!
+! INPUT PARAMETERS:
+!	WRITE: FALSE if tape is to be read
+!	       TRUE if tape is to be written
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	tape device characteristics longword
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+	STATUS,				! system service status
+	MSG_VECTOR	: VECTOR [6],	! message arg vector for $PUTMSG
+	IO_STATUS	: VECTOR [4,WORD]; ! I/O status block
+
+EXTERNAL ROUTINE
+	FILE_ERROR;			! signal file related error
+
+
+! Loop, checking for tape on line and write enabled if necessary,
+! prompting to the user until satisfied.
+!
+
+WHILE TRUE
+DO
+    BEGIN
+    STATUS = $QIOW (CHAN = .RWSV_CHAN,
+		    FUNC = IO$_SENSEMODE,
+		    IOSB = IO_STATUS
+		    );
+    IF .STATUS THEN STATUS = .IO_STATUS[0];
+
+    IF .STATUS EQL SS$_ENDOFTAPE
+    THEN STATUS = TRUE;
+
+    IF .STATUS EQL SS$_MEDOFL
+    OR .STATUS EQL SS$_VOLINV	! **** Temp until TMDRIVER is fixed
+    THEN
+	BEGIN
+	IF .WRITE
+	THEN MOUNT_MESSAGE (BACKUP$_READYWRITE)
+	ELSE MOUNT_MESSAGE (BACKUP$_READYREAD);
+	END
+
+    ELSE IF NOT .STATUS
+    THEN FILE_ERROR (BACKUP$_LABELERR, .RWSV_SAVE_FAB, .STATUS)
+
+    ELSE IF .WRITE AND .BBLOCK [IO_STATUS[2], MT$V_HWL]
+    THEN MOUNT_MESSAGE (BACKUP$_WRITENABLE)
+
+    ELSE EXITLOOP;
+    END;
+
+SENSE_CHAR ()
+END;					! End of routine READY_TAPE
+
+GLOBAL ROUTINE SET_CHAR (CHAR) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine sets the tape characteristics.
+!
+! CALLING SEQUENCE:
+!	SET_CHAR (CHAR)
+!
+! INPUT PARAMETERS:
+!	CHAR: tape characteristics word to set
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	tape device characteristics longword
+!	NONE
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+	TAPE_CHAR	: BBLOCK [$BYTEOFFSET (DIB$L_DEVDEPEND)+4],
+	DESC		: VECTOR[2],
+	STATUS,				! system service status
+	IO_STATUS	: VECTOR [4,WORD]; ! I/O status block
+
+EXTERNAL ROUTINE
+	FILE_ERROR;			! signal file related error
+
+WHILE TRUE
+DO
+    BEGIN
+    DESC[0] = %ALLOCATION(TAPE_CHAR);
+    DESC[1] = TAPE_CHAR;
+    $GETCHN (CHAN = .RWSV_CHAN,
+	     PRIBUF = DESC);
+
+    TAPE_CHAR[DIB$L_DEVDEPEND] = .CHAR;
+    STATUS = $QIOW (CHAN = .RWSV_CHAN,
+		    FUNC = IO$_SETMODE,
+		    IOSB = IO_STATUS,
+		    P1   = TAPE_CHAR[DIB$B_DEVCLASS]
+		    );
+    IF .STATUS THEN STATUS = .IO_STATUS[0];
+    IF .STATUS EQL SS$_ENDOFTAPE THEN STATUS = TRUE;
+    IF .STATUS THEN EXITLOOP;
+    FILE_ERROR (BACKUP$_POSITERR, .RWSV_SAVE_FAB, .STATUS);
+    END;
+
+END;					! End of routine SET_CHAR
+
+GLOBAL ROUTINE REWIND : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine rewinds the save set tape.
+!
+! CALLING SEQUENCE:
+!	REWIND ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+	STATUS,				! general status value
+	IO_STATUS	: VECTOR [4, WORD]; ! I/O status block
+
+EXTERNAL ROUTINE
+	FILE_ERROR;			! signal file related error
+
+WHILE TRUE
+DO
+    BEGIN
+    STATUS = $QIOW (CHAN = .RWSV_CHAN,
+		    FUNC = IO$_REWIND,
+		    IOSB = IO_STATUS
+		    );
+    IF .STATUS THEN STATUS = .IO_STATUS[0];
+    IF .STATUS EQL SS$_ENDOFTAPE THEN STATUS = TRUE;
+    IF .STATUS THEN EXITLOOP;
+    FILE_ERROR (BACKUP$_POSITERR, .RWSV_SAVE_FAB, .STATUS);
+    END;
+
+END;					! End of routine REWIND
+
+GLOBAL ROUTINE UNLOAD : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine unloads the save set tape.
+!
+! CALLING SEQUENCE:
+!	UNLOAD ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+	STATUS,				! general status value
+	IO_STATUS	: VECTOR [4, WORD]; ! I/O status block
+
+EXTERNAL ROUTINE
+	FILE_ERROR;			! signal file related error
+
+WHILE TRUE
+DO
+    BEGIN
+    STATUS = $QIOW (CHAN = .RWSV_CHAN,
+		    FUNC = IO$_UNLOAD,
+		    IOSB = IO_STATUS
+		    );
+    IF .STATUS THEN STATUS = .IO_STATUS[0];
+    IF NOT .STATUS
+    THEN
+	BEGIN
+	IF .STATUS EQL SS$_NOPRIV
+	THEN
+	    BEGIN
+	    STATUS = $QIOW (CHAN = .RWSV_CHAN,
+			    FUNC = IO$_REWINDOFF,
+			    IOSB = IO_STATUS
+			    );
+	    IF .STATUS THEN STATUS = .IO_STATUS[0];
+	    END;
+	END;
+    IF .STATUS EQL SS$_ENDOFTAPE THEN STATUS = TRUE;
+    IF .STATUS THEN EXITLOOP;
+    FILE_ERROR (BACKUP$_POSITERR, .RWSV_SAVE_FAB, .STATUS);
+    END;
+
+END;					! End of routine UNLOAD
+
+GLOBAL ROUTINE SKIP_TM (COUNT) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine skips the specified number of tape marks
+!	forward or backward on the tape.
+!
+! CALLING SEQUENCE:
+!	SKIP_TM (COUNT)
+!
+! INPUT PARAMETERS:
+!	COUNT: number of tape marks to skip, + for forward, - for reverse
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	TRUE if success
+!	SS$_ENDOFVOLUME if 2 successive tape marks encountered
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+	STATUS,				! general status value
+	IO_STATUS	: VECTOR [4, WORD]; ! I/O status block
+
+EXTERNAL ROUTINE
+	FILE_ERROR;			! signal file related error
+
+STATUS = $QIOW (CHAN = .RWSV_CHAN,
+		FUNC = IO$_SKIPFILE,
+		IOSB = IO_STATUS,
+		P1   = .COUNT
+		);
+IF .STATUS THEN STATUS = .IO_STATUS[0];
+IF .STATUS EQL SS$_ENDOFTAPE
+THEN STATUS = TRUE;
+IF NOT .STATUS
+AND .STATUS NEQ SS$_ENDOFVOLUME
+THEN FILE_ERROR (BACKUP$_POSITERR, .RWSV_SAVE_FAB, .STATUS);
+
+.STATUS
+END;					! End of routine SKIP_TM
+
+GLOBAL ROUTINE SKIP_RECORD (COUNT) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine skips the specified number of records
+!	forward or backward on the tape.
+!
+! CALLING SEQUENCE:
+!	SKIP_RECORD (COUNT)
+!
+! INPUT PARAMETERS:
+!	COUNT: number of records to skip, + for forward, - for reverse
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	TRUE if success
+!	SS$_ENDOFFILE if a tape mark is encountered
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+	DUMMY		: BBLOCK [16],	! dummy I/O buffer for read
+	STATUS,				! general status value
+	IO_STATUS	: VECTOR [4, WORD]; ! I/O status block
+
+EXTERNAL ROUTINE
+	FILE_ERROR;			! signal file related error
+
+! To avoid some crocks in the various magtape drivers' EOV handling,
+! if the record count is 1, read it rather than skipping.
+!
+
+IF .COUNT EQL 1
+THEN
+    STATUS = $QIOW (CHAN = .RWSV_CHAN,
+		    FUNC = IO$_READLBLK,
+		    IOSB = IO_STATUS,
+		    P1   = DUMMY,
+		    P2   = 16
+		    )
+ELSE
+    STATUS = $QIOW (CHAN = .RWSV_CHAN,
+		    FUNC = IO$_SKIPRECORD,
+		    IOSB = IO_STATUS,
+		    P1   = .COUNT
+		    );
+IF .STATUS THEN STATUS = .IO_STATUS[0];
+IF .STATUS EQL SS$_ENDOFTAPE
+OR .STATUS EQL SS$_DATAOVERUN
+THEN STATUS = TRUE;
+IF NOT .STATUS
+AND .STATUS NEQ SS$_ENDOFFILE
+THEN FILE_ERROR (BACKUP$_POSITERR, .RWSV_SAVE_FAB, .STATUS);
+
+.STATUS
+END;					! End of routine SKIP_RECORD
+
+GLOBAL ROUTINE READ_LABEL (BUFFER, LABEL_TYPE) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads and verifies a magtape label record.
+!
+! CALLING SEQUENCE:
+!	READ_LABEL (BUFFER, LABEL_TYPE)
+!
+! INPUT PARAMETERS:
+!	BUFFER: address of buffer to read label
+!	LABEL_TYPE: optional label type to check for
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	TRUE if label is valid
+!	BACKUP$_NOTANSI if any checks fail
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+BUILTIN
+	ACTUALCOUNT;
+
+MAP
+	BUFFER		: REF BBLOCK;	! label buffer arg
+
+LOCAL
+	STATUS,				! system service status
+	IO_STATUS	: VECTOR [4, WORD]; ! I/O status block
+
+EXTERNAL ROUTINE
+	FILE_ERROR;			! signal file related error
+
+! Read a record from the input channel and make the approriate checks.
+!
+
+STATUS = $QIOW (CHAN = .RWSV_CHAN,
+		FUNC = IO$_READLBLK,
+		IOSB = IO_STATUS,
+		P1   = .BUFFER,
+		P2   = 80
+		);
+IF .STATUS THEN STATUS = .IO_STATUS[0];
+IF .STATUS EQL SS$_ENDOFTAPE
+THEN STATUS = TRUE;
+IF NOT .STATUS
+THEN
+    BEGIN
+    IF .STATUS EQL SS$_DATAOVERUN
+    THEN RETURN BACKUP$_NOTANSI
+    ELSE IF .STATUS EQL SS$_ENDOFFILE
+    THEN RETURN SS$_ENDOFVOLUME
+    ELSE FILE_ERROR (BACKUP$_LABELERR, .RWSV_SAVE_FAB, .STATUS);
+    END;
+
+IF .IO_STATUS[1] NEQ 80
+THEN RETURN BACKUP$_NOTANSI;
+
+IF ACTUALCOUNT () GEQU 2
+THEN
+    BEGIN
+    IF .BUFFER[HD1$L_HD1LID] NEQ .LABEL_TYPE
+    THEN RETURN BACKUP$_NOTANSI;
+    END;
+
+TRUE
+END;					! End of routine READ_LABEL
+
+GLOBAL ROUTINE WRITE_TM : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine writes a tape mark onto the current output tape.
+!
+! CALLING SEQUENCE:
+!	WRITE_TM ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+	STATUS,				! general status value
+	IO_STATUS	: VECTOR [4, WORD]; ! I/O status block
+
+EXTERNAL ROUTINE
+	FILE_ERROR;			! signal file related error
+
+STATUS = $QIOW (CHAN = .RWSV_CHAN,
+		FUNC = IO$_WRITEOF,
+		IOSB = IO_STATUS
+		);
+IF .STATUS THEN STATUS = .IO_STATUS[0];
+IF .STATUS EQL SS$_ENDOFTAPE
+THEN STATUS = TRUE;
+IF NOT .STATUS
+THEN FILE_ERROR (BACKUP$_LABELERR, .RWSV_SAVE_FAB, .STATUS);
+
+END;					! End of routine WRITE_TM
+
+GLOBAL ROUTINE WRITE_LABEL (BUFFER) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine writes a label onto the current output tape.
+!
+! CALLING SEQUENCE:
+!	WRITE_LABEL (BUFFER)
+!
+! INPUT PARAMETERS:
+!	BUFFER: address of buffer containing label to be written
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LOCAL
+	STATUS,				! general status value
+	IO_STATUS	: VECTOR [4, WORD]; ! I/O status block
+
+EXTERNAL ROUTINE
+	FILE_ERROR;			! signal file related error
+
+STATUS = $QIOW (CHAN = .RWSV_CHAN,
+		FUNC = IO$_WRITELBLK,
+		IOSB = IO_STATUS,
+		P1   = .BUFFER,
+		P2   = 80
+		);
+IF .STATUS THEN STATUS = .IO_STATUS[0];
+IF .STATUS EQL SS$_ENDOFTAPE
+THEN STATUS = TRUE;
+IF NOT .STATUS
+THEN FILE_ERROR (BACKUP$_LABELERR, .RWSV_SAVE_FAB, .STATUS);
+
+END;					! End of routine WRITE_LABEL
+
+ROUTINE JULIAN_DATE (BUFFER) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine places todays date into the specified 6 byte
+!	buffer in ANSI Julian date format.
+!
+! CALLING SEQUENCE:
+!	JULIAN_DATE (BUFFER)
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	BUFFER: buffer into which to place date
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+MAP
+	BUFFER		: REF VECTOR [,BYTE];
+
+BIND
+	DAYTBL = UPLIT WORD(0,31,59,90,120,151,181,212,243,273,304,334,365)
+					: VECTOR [, WORD];
+
+LITERAL
+	N_YEAR		= 0,		! year in time buffer
+	N_MONTH		= 1,		! month in buffer
+	N_DAY		= 2;		! day in buffer
+
+LOCAL
+	TIME_BUFFER	: VECTOR [7, WORD], ! buffer to receive system time
+	DAY,				! day of year
+	STRING_BUFFER	: VECTOR [7, BYTE], ! FAO output string
+	STRING_DESC	: VECTOR [2];	! descriptor for above
+
+! Get the system time in numerical format. Then run the month through
+! the table to compute day in year, adjusting for leap year. (Note
+! we handle only the 4 year leap year cycle. The Julian date format
+! will have long crumbled to ashes by the time we see the next 100
+! year cycle.)
+!
+
+$NUMTIM (TIMBUF = TIME_BUFFER);
+DAY = .TIME_BUFFER[N_DAY] + .DAYTBL[.TIME_BUFFER[N_MONTH]-1];
+IF .(TIME_BUFFER[N_YEAR])<0,2> EQL 0
+AND .TIME_BUFFER[N_MONTH] GTRU 2
+THEN DAY = .DAY + 1;
+
+! Convert to string and put it in the buffer.
+!
+
+STRING_DESC[0] = 7;
+STRING_DESC[1] = STRING_BUFFER;
+$FAO   ($DESCRIPTOR ('!4ZL!3ZL'),
+	0,
+	STRING_DESC[0],
+	.TIME_BUFFER[N_YEAR],
+	.DAY
+	);
+BUFFER[0] = ' ';
+CH$MOVE (5, STRING_BUFFER[2], BUFFER[1]);
+
+END;					! End of routine JULIAN_DATE
+
+ROUTINE FORMAT_VOLOWNER (VOL_LABEL, OWNER, PROTECTION) : NOVALUE  =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine formats the volume owner filed in VOL1
+!
+! CALLING SEQUENCE:
+!	FORMAT_VOLOWNER (VOL_LABEL, OWNER, PROTECTION)
+!
+! INPUT PARAMETERS:
+!	VOL_LABEL - address of VOL1 label
+!	OWNER - owner of tape
+!	PROTECTION - tape protection
+!
+! IMPLICIT INPUTS:
+!	D%C preinitialized
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+! USER ERRORS:
+!	NONE
+!
+!--
+
+BEGIN
+
+MAP
+	VOL_LABEL	: REF BBLOCK,	! address of VOL1 label
+	PROTECTION	: BITVECTOR;	! protection to be encoded on tape
+
+LOCAL
+	DESCR		: VECTOR [2],	! descriptor
+	P;				! pointer
+
+LITERAL
+	WORLD_WRITE = 13,
+	WORLD_READ = 12,
+	GROUP_WRITE = 9,
+	GROUP_READ = 8;
+
+
+! First convert binary owner to ASCII
+!
+
+DESCR[0] = 10;
+DESCR[1] = VOL_LABEL[VL1$T_VOLOWNER] + 3;
+$FAO (
+	$DESCRIPTOR('!5OW!5OW'),
+	0,
+	DESCR[0],
+	.OWNER<16,16>,.OWNER<0,16>);
+
+! Now format protection
+!
+
+IF NOT .PROTECTION[GROUP_READ] OR NOT .PROTECTION[WORLD_READ]
+THEN
+    BEGIN
+    P = VOL_LABEL[VL1$T_VOLOWNER] + 8;
+    (.P)<0,8> = .(.P)<0,8> + ('A' - '0');
+    END;
+
+! Now if group can also write, blank fill member field
+!
+
+IF NOT .PROTECTION[GROUP_WRITE]
+THEN CH$FILL(' ',5,VOL_LABEL[VL1$T_VOLOWNER] + 8);
+
+IF NOT .PROTECTION[WORLD_READ]
+THEN
+    BEGIN
+    P = VOL_LABEL[VL1$T_VOLOWNER] + 3;
+    (.P)<0,8> = .(.P)<0,8> + ('A' - '0');
+    END;
+ 
+IF NOT .PROTECTION[WORLD_WRITE]
+THEN CH$FILL(' ',10,VOL_LABEL[VL1$T_VOLOWNER] + 3);
+
+END;					! end of routine FORMAT_VOLOWNER
+
+GLOBAL ROUTINE MAKE_VOL1 (BUFFER) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine formats a tape volume header label in the
+!	indicated buffer.
+!
+! CALLING SEQUENCE:
+!	MAKE_VOL1 (BUFFER)
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	BUFFER: buffer to write label into
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+MAP
+	BUFFER		: REF BBLOCK;	! label buffer arg
+
+LOCAL
+	P		: REF BBLOCK,	! structure pointer
+	DESCRIPTOR	: VECTOR [2];	! string descriptor for FAO
+
+! Initialize the label buffer and set up the basic volume label.
+!
+
+CH$FILL (' ', 80, .BUFFER);
+BUFFER[VL1$L_VL1LID] = 'VOL1';
+CH$COPY(
+    .BBLOCK[RWSV_SAVE_FAB[FC_NAM], NAM$B_NAME],
+    .BBLOCK[RWSV_SAVE_FAB[FC_NAM], NAM$L_NAME],
+    %C' ',
+    VL1$S_VOLLBL, BUFFER[VL1$T_VOLLBL]);
+
+! If an explicit label was specified, get it. Use the segment number
+! to pick the right entry from the label list. If we are out of list,
+! use the first entry and append the reel number.
+!
+
+P = 0;
+IF .QUAL[QUAL_LABE]
+THEN
+    BEGIN
+    P = .QUAL[QUAL_LABE_LIST];
+    DECR J FROM .RWSV_VOL_NUMBER-1 TO 1
+    DO
+	BEGIN
+	P = .P[QUAL_NEXT];
+	IF .P EQL 0 THEN EXITLOOP;
+	END;
+    IF .P NEQ 0
+    THEN CH$MOVE (VL1$S_VOLLBL, P[QUAL_LABE_VALUE], BUFFER[VL1$T_VOLLBL])
+    ELSE CH$MOVE (VL1$S_VOLLBL, BBLOCK [.QUAL[QUAL_LABE_LIST], QUAL_LABE_VALUE], BUFFER[VL1$T_VOLLBL]);
+    END;
+
+! Append the save set volume number to the volume label if this is a
+! continuation volume and an explicit label was not available.
+!
+
+IF .RWSV_VOL_NUMBER GTRU 1
+AND .P EQL 0
+THEN
+    BEGIN
+    INCR J FROM 0 TO VL1$S_VOLLBL-2-1
+    DO
+	BEGIN
+	IF .VECTOR [BUFFER[VL1$T_VOLLBL], .J; VL1$S_VOLLBL, BYTE] EQL ' '
+	THEN VECTOR [BUFFER[VL1$T_VOLLBL], .J; VL1$S_VOLLBL, BYTE] = '_';
+	END;
+    DESCRIPTOR[0] = 2;
+    DESCRIPTOR[1] = BUFFER[VL1$T_VOLLBL] + VL1$S_VOLLBL - 2;
+    $FAO ($DESCRIPTOR ('!2ZL'),
+	  0,
+	  DESCRIPTOR[0],
+	  .RWSV_VOL_NUMBER
+	  );
+    END;
+
+! For the first volume, save the volume label as the file set ID.
+!
+
+IF .RWSV_VOL_NUMBER LEQU 1
+THEN CH$MOVE (HD1$S_FILESETID, BUFFER[VL1$T_VOLLBL], RWSV_FILESET_ID);
+
+! Fill in the remaining fixed fields.
+!
+
+(BUFFER[VL1$T_VOLOWNER])<0,24> = 'D%C';
+BUFFER[VL1$B_DECSTDVER] = '1';
+BUFFER[VL1$B_LBLSTDVER] = '3';
+
+! If ownership and protection are specified, fill in the fields in
+! the label.
+!
+
+IF .QUAL[QUAL_PROT]
+THEN FORMAT_VOLOWNER (.BUFFER,
+		      IF .QUAL[QUAL_O_OWN_UIC] THEN .QUAL[QUAL_O_OWN_VALU] ELSE .JPI_UIC,
+		      .QUAL[QUAL_PROT_VALUE]);
+
+END;					! End of routine MAKE_VOL1
+
+GLOBAL ROUTINE MAKE_HDR1 (BUFFER) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine formats a tape file header label 1 in the
+!	indicated buffer.
+!
+! CALLING SEQUENCE:
+!	MAKE_HDR1 (BUFFER)
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	BUFFER: buffer to write label into
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+MAP
+	BUFFER		: REF BBLOCK;	! label buffer arg
+
+BIND
+	PROTO_HDR1	= UPLIT BYTE ('000100 00000 00000 000000DECVMSBACKUP        ');
+
+LOCAL
+	DESCRIPTOR	: VECTOR [2];	! string descriptor for FAO
+
+BUFFER[HD1$L_HD1LID] = 'HDR1';
+CH$COPY (.COM_SSNAME[DSC$W_LENGTH],
+	.COM_SSNAME[DSC$A_POINTER],
+	' ',
+	HD1$S_FILEID,
+	BUFFER[HD1$T_FILEID]);
+CH$MOVE (HD1$S_FILESETID, RWSV_FILESET_ID, BUFFER[HD1$T_FILESETID]);
+CH$MOVE (80-$BYTEOFFSET (HD1$T_GENNO), PROTO_HDR1, BUFFER[HD1$T_GENNO]);
+
+! Generate file section number, sequence number, and creation date.
+!
+
+DESCRIPTOR[0] = 4;
+DESCRIPTOR[1] = BUFFER[HD1$T_FILESECNO];
+$FAO   ($DESCRIPTOR ('!4ZL'),
+	0,
+	DESCRIPTOR[0],
+	.RWSV_VOL_NUMBER
+	);
+DESCRIPTOR[1] = BUFFER[HD1$T_FILESEQNO];
+$FAO   ($DESCRIPTOR ('!4ZL'),
+	0,
+	DESCRIPTOR[0],
+	.RWSV_FILE_NUMBER
+	);
+JULIAN_DATE (BUFFER[HD1$T_CREATEDT]);
+
+END;					! End of routine MAKE_HDR1
+
+GLOBAL ROUTINE MAKE_HDR2 (BUFFER) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine formats a tape file header label 2 in the
+!	indicated buffer.
+!
+! CALLING SEQUENCE:
+!	MAKE_HDR2 (BUFFER)
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	BUFFER: buffer to write label into
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+MAP
+	BUFFER		: REF BBLOCK;	! label buffer arg
+
+LOCAL
+	DESCRIPTOR	: VECTOR [2];	! FAO string descriptor
+
+
+CH$FILL (' ', 80, .BUFFER);
+BUFFER[HD2$L_HD2LID] = 'HDR2';
+BUFFER[HD2$B_RECFORMAT] = 'F';
+DESCRIPTOR[0] = HD2$S_BLOCKLEN + HD2$S_RECLEN;
+DESCRIPTOR[1] = BUFFER[HD2$T_BLOCKLEN];
+$FAO	($DESCRIPTOR ('!2(5ZL)'),
+	0,
+	DESCRIPTOR[0],
+	.QUAL[QUAL_BLOC_VALUE],
+	.QUAL[QUAL_BLOC_VALUE]
+	);
+
+BUFFER[HD2$B_FORMCNTRL] = 'M';
+BUFFER[HD2$T_BUFOFF] = '00';
+
+END;					! End of routine MAKE_HDR2
+
+END
+ELUDOM

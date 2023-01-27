@@ -1,0 +1,1133 @@
+	.TITLE	SYSFAO - FORMATTED ASCII OUTPUT SYSTEM SERVICE
+	.IDENT	'V03-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY: SYSTEM SERVICE
+;
+; ABSTRACT:
+;
+;	This module provides general formatting services.  It converts
+;	binary values to octal, hexadecimal, and decimal ASCII
+;	representations, and also inserts ASCII strings and converts
+;	date and time to ASCII.
+;
+; ENVIRONMENT:
+;
+;	FAO runs in the mode of the caller.
+;
+; AUTHOR: Henry M. Levy	, CREATION DATE: 29-JAN-1977
+;
+; MODIFIED BY:
+;
+;	V03-005	MSH0001		Maryann S. Hinden	20-NOV-1981
+;		Use longword displacement to reference EXE$SIGTORET.
+;
+;	V03-004 DWT0001		David W. Thiel		06-Nov-1981
+;		Fixed condition handler.  Check argument to $ASCTIM to
+;		prevent exception in $ASCTIM.
+;
+;	V03-003 PCA0001		Paul C. Anagnostopoulos		22-Jul-1981
+;		Fixed a bug wherein !AF did not replace unprintable
+;		characters if it encountered result string overflow.
+;		Now it replaces those characters that it does copy.
+;
+;	V03-002	TCM0001		Trudy C. Matthews	10-Mar-1981
+;		Change CALLS with word displacement to CALLS with longword
+;		displacement.
+;
+;	V03-001	TMH0001		Tim Halvorsen	24-Feb-1981
+;		Add condition handler to catch access violations
+;		and the like, so that services like $PUTMSG do
+;		not cause an access violation in programs like DCL
+;		simply because not enough arguments were supplied.
+;--
+
+	.SBTTL	DECLARATIONS
+
+;
+; MACROS:
+;
+
+	$SSDEF				; define system status codes
+	$CHFDEF				; Condition handling facility
+	$SFDEF				; Call frame definitions
+
+;
+; EQUATED SYMBOLS:
+;
+
+	ARGCOUNT = 0			; offset to argument count
+	INDSC	= 4			; offset to input string descriptor
+	OUTLEN	= 8			; offset to output length
+	OUTDSC	= 12			; offset to output buffer descriptor
+	FIRSTARG = 16			; offset to first conversion param
+
+	INLEN	= -16			; local offset to input length remaining
+	INPTR	= -12			; local offset to input string pointer
+	LASTVAL = -8			; local offset to last value converted
+	FIELDEND = -4			; local offset to end of defined field
+
+	CR	= 13			; carriage return
+	LF	= 10			; line feed
+	EXCL	= 33			; exclamation ('!')
+	TAB	= 9			; horizontal tab
+	FF	= 12			; form feed
+
+;
+; OWN STORAGE:
+;
+
+	.PSECT	Y$EXEPAGED
+
+ASC_NAMES:
+	.ASCII	/0123456789ABCDEF/	; ASCII digits
+
+;
+;	The following table contains the first character for all 
+;	FAO conversion directives.  The first part of the table
+;	contains the first character for two-character directives,
+;	while the second half of the table contains the one-character
+;	directives.
+;
+;	NOTE -- The ordering of this table must be preserved.  The index
+;		of the directives found in this table is used to dispatch
+;		via a CASE statement in the main program (FAO).  
+;		Routine CVTNUM also uses the index to dispatch and to
+;		compute the proper radix for the conversion.
+;
+
+CNTRL_TABLE:
+TWO_CHAR_CNTRLS:
+	.ASCII	/O/			; octal conversions
+	.ASCII	/X/			; hex conversions
+	.ASCII	/U/			; unsigned decimal
+	.ASCII	/S/			; signed decimal
+	.ASCII	/Z/			; unsigned decimal zero filled
+	.ASCII	/A/			; ascii insertion directives
+	.ASCII	/%/			; time conversion, or plural indication
+	.ASCII	/*/			; character repeater
+ONE_CHAR_CNTRLS:
+	.ASCII	/+/			; skip argument
+	.ASCII	/-/			; backup argument
+	.ASCII	/</			; begin field definition
+	.ASCII  />/			; end of field definition
+REPLACE_CHRS:				; these are one or two char replacements
+	.ASCII	./.			; newline 
+	.ASCII	/_/			; tab
+	.ASCII	/^/			; form feed
+	.ASCII	/!/			; insert exclamation
+CNTRL_LENGTH = .-CNTRL_TABLE		; length of table
+
+ONECHAR_INDEX = CNTRL_LENGTH - <ONE_CHAR_CNTRLS - CNTRL_TABLE>
+
+REPL_OFFSET = REPLACE_CHRS - CNTRL_TABLE ; offset of replacement chars
+
+STRING_TYPES:
+	.ASCII	/CSDF/			; ascii string types
+DATA_TYPES:
+	.ASCII	/BWL/			; byte, word , or long
+PERCENT_STR:
+	.ASCII	/SDT/			; subtypes for % directive
+FIELDS:
+	.BYTE	8,16,32			; field size for B,W,and L
+REPLACEMENT:
+	.BYTE	LF,TAB,FF,EXCL		; simple replacement table
+
+;
+; The following array contains the number of Octal and Hex digits in
+; byte , word, and longword fields.  The byte digits are first, the
+; hex digits starting at the 4'th entry so that the array may be
+; context indexed.
+;
+
+OCT_HEX_DIGITS:
+	.BYTE	3,6,11,0
+	.BYTE	2,4,8
+
+RADIX:
+	.BYTE	8,16,10,10,10		; radix for numeric conversisons
+
+
+
+	.SBTTL	FAO - MAIN PROGRAM
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is the entry point for the FAO and FAOL system
+;	services.   The caller's control string is scanned for control
+;	characters ('!').  All other information is simply passed to
+;	the output buffer.  If a control directive is found, it is parsed
+;	and an action routine is dispatched.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS or CALLG	to SYS$FAO or SYS$FAOL
+;
+; INPUT PARAMETERS:
+;
+;	INDSC	- The address of a string descriptor for the input
+;		  control string.
+;	OUTLEN	- The address of a word to receive the length of
+;		  the output string
+;	OUTDSC	- The address of a string descriptor for the output
+;		  buffer.
+;	FIRSTARG - For FAOL , this is the address of a list of longword
+;		  parameters.  For FAO , this is the first of a 
+;		  variable number of parameters which
+;		  may have been passed on the call argument list.
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUT PARAMETERS:
+;
+;	OUTLEN	- Word pointed to will receive length of output buffer.
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL	- success code, normal return
+;	SS$_BUFFEROVF	- output buffer overflow, attempt to write past end of output buffer
+;	SS$_BADPARAM	- invalid directive specified
+;	SS$_ACCVIO	- unable to read argument list or address arguments
+;
+; SIDE EFFECTS:
+;
+;	none
+;
+;--
+
+;
+; Global register usage:
+;
+;	R7,R8 - scratch registers
+;	R9  - number of characters remaining in output buffer
+;	R10 - current position in output buffer
+;	R11 - pointer to next conversion parameter 
+;
+; Locals
+;
+;	INLEN(FP) - (word) length of input control string
+;	INPTR(FP) - address of position in input control string
+;
+
+;
+; Entry point for call with multiple arguments on stack
+;
+
+EXE$FAO::
+
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>	; save all registers
+	MOVAB	W^HANDLER,(FP)		; Establish condition handler
+	MOVAL	FIRSTARG(AP),R11	; get address of first argument
+	BRB	FAO			; go to main routine
+
+;
+; Entry point for FAOL call.
+;
+
+EXE$FAOL::
+
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	MOVAB	W^HANDLER,(FP)		; Establish condition handler
+	MOVL	FIRSTARG(AP),R11	; address of first argument
+FAO:
+	CLRQ	-(SP)			; save space for LASTVAL and FIELDEND
+	MOVQ	@INDSC(AP),-(SP)	; save locals on stack
+	MOVQ	@OUTDSC(AP),R9		; load output descriptor into R9,R10
+	MOVZWL	R9,R9			; ensure word length
+
+;
+; Look for a control character in the input string.  Copy text
+; up to the control, if any , to the output buffer.
+;
+
+MAIN_SCAN:
+	CLRL	-(SP)			; indicate control not found
+	LOCC	#EXCL,INLEN(FP),@INPTR(FP) ; search for control char
+	BEQL	10$			; branch if not found
+	INCL	(SP)			; set indicator to show char. found
+10$:
+	SUBW3	R0,INLEN(FP),R6		; calculate bytes to move
+	MOVL	R0,INLEN(FP)		; update input length remaining
+	SUBW	R6,R9			; update and test output length
+	BLSS	OVERFLOW		; not enough room, error exit
+	MOVC3	R6,@INPTR(FP),(R10)	; move text part of input string
+	BLBC	(SP)+,DONE		; leave if no controls left
+	MOVL	R1,INPTR(FP)		; update input address pointer
+	MOVL	R3,R10			; update output address pointer
+	BSBB	GETCHAR			; skip control char
+
+;
+; Parse the directive which has been found in the input string.  Set
+; up: R0 = remaining count in CNTRL_TABLE
+;     R4 = second char if two-char directive
+;     R5 = repeat count
+;     R6 = field width
+;
+
+PARSE_DIRECTIVE:
+
+	MOVL	#1,R5			; default repeat count is 1
+	CLRL	R2			; paren indicator ( not found yet )
+	BSBW	GETCOUNT		; pull off count, if any
+	BSBB	GETCHAR			; get next char from input string
+	CMPB	#^A/(/,R3		; was next char a paren?
+	BNEQ	20$			; branch if not
+	INCL	R2			; set paren found indicator
+	TSTL	R6			; was there a repeat count?
+	BLSS	10$			; no..use default
+	MOVL	R6,R5			; else get repeat count
+10$:
+	BSBB	GETCOUNT		; look for field width
+	BSBB	GETCHAR			; get next char
+20$:
+	LOCC	R3,#CNTRL_LENGTH,CNTRL_TABLE ; check character in table
+	BEQL	ILLEGAL			; illegal directive exit
+	CMPL	R0,#ONECHAR_INDEX	; is this a one char directive?
+	BLEQ	30$			; yes, don't need any more
+	BSBB	GETCHAR			; get second control char
+	MOVL	R3,R4			; move to R4 for return
+30$:
+	BLBC	R2,40$			; skip if no paren found
+	BSBB	GETCHAR			; else skip paren char
+40$:
+
+	SUBL3	R0,#CNTRL_LENGTH,R3	; compute offset for case table
+
+;
+; The following  does a BSBB to the case dispatch
+; table.  The service routines do an RSB and return into CASE_LOOP.
+;
+
+	BRB	CASE_LOOP		; start processing loop
+CASE_BSB:
+	BSBB	FAO_CASE		; dispatch next directive
+CASE_LOOP:
+	SOBGEQ	R5,CASE_BSB		; repeat as specified
+	BRB	MAIN_SCAN		; else continue string processing
+
+;
+; Here is the main dispatch table for dispatching FAO service 
+; routines.  The case is entered via BSBB from CASE_BSB. The routines
+; RSB to CASE_LOOP.  Since the 5 numeric conversion directives all 
+; dispatch to the same routine, the case has a base of 5 and the
+; numeric directives fall through to the statement following the CASE.
+;
+; Registers R0, R1, and R2 may be scratched by service routines.
+;
+
+FAO_CASE:
+	CASE	R3,<-			; dispatch to service routine
+		CVTASC,-		; ascii string insertion
+		PERCENT,-		; insert ascii time or plural 'S'
+		REPEATIT,-		; repeat character 'n' times
+		INCR_ARGPTR,-		; skip next parameter
+		DECR_ARGPTR,-		; backup to previous parameter
+		STARTFIELD,-		; define fixed length field
+		ENDFIELD,-		; terminate fixed length field
+		NEWLINE,-		; insert CR/LF
+		INSERT_CHAR,-		; insert TAB
+		INSERT_CHAR,-		; insert form feed
+		INSERT_CHAR,-		; insert '!'
+	>,B,#5				; offset start by 5
+
+	BRW	CVTNUM			; dispatch to numeric conversion
+
+
+ILLEGAL: 
+	MOVZWL	#SS$_BADPARAM,R0	; error return code
+	BRB	FAO_EXIT
+OVERFLOW:
+	MOVZWL	#SS$_BUFFEROVF,R0	; error return code
+	CLRL	R9			; ensure correct return length
+	BRB	FAO_EXIT
+DONE:	
+	MOVZWL	#SS$_NORMAL,R0		; no errors
+FAO_EXIT:
+	TSTL	OUTLEN(AP)		; was a return length required?
+	BEQL	10$			; branch if not
+	SUBW3	R9,@OUTDSC(AP),@OUTLEN(AP) ; compute and return output buffer length
+10$:	RET
+
+	.SBTTL	GETCHAR - Routine to get next char from input string
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine gets the next character from the input control
+;	string, updating the length and address pointers.  If the length
+;	goes negative, an error exit is called.
+;
+; CALLING SEQUENCE:
+;
+;	JSB (R8)
+;
+; INPUT PARAMETERS:
+;
+;	none
+;
+; IMPLICIT INPUTS:
+;
+;	INLEN(FP) -  lower word has remaining length of input string
+;	INPTR(FP) -  is pointer to current string position
+;
+; OUTPUTS:
+;
+;	R3 - next character in input string
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; COMPLETION CODES:
+;
+;	none
+;
+; SIDE EFFECTS:
+;
+;	input pointers on stack are updated
+;	error may cause jump to ILLEGAL
+;--
+
+GETCHAR:
+	DECW	INLEN(FP)		; decr input length remaining
+	BLSS	ILLEGAL			; error if no more left
+	MOVZBL	@INPTR(FP),R3		; get next character
+	INCL	INPTR(FP)		; update pointer
+	RSB				; return
+
+	.SBTTL	GETCOUNT - Routine to get repeat-count or field-width
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This subroutine to PARSE_DIRECTIVE scans for a repeat-count or
+;	field-width in the directive in the input stream.  If a numeric
+;	count is found, it is converted to binary.  If a '#' character
+;	is found, the count is taken from the next parameter
+;	in the parameter list.
+;
+; CALLING SEQUENCE:
+;
+;	JSB or BSB
+;
+; INPUTS:
+;
+;	R11	- parameter pointer
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUTS:
+;
+;	R6	- value of count, if # or number found, else -1
+;
+; IMPLICIT OUTPUTS:
+;
+;	R11 may be modified if a parameter is taken from the stack
+;
+; COMPLETION CODES:
+;
+;	none
+;
+; SIDE EFFECTS:
+;
+;	R1, R3, and R4 are destroyed
+;--
+
+
+
+GETCOUNT:
+	MNEGL	#1,R6			; not found indicator
+	CMPB	#^A/#/,@INPTR(FP)	; is this a param. count?
+	BEQL	40$			; yes .. pull next param
+	CLRQ	R3			; zero buffer for digit (R3)
+					; ... and accumulator for sum (R4)
+	MOVL	INPTR(FP),R1		; remember where we were
+10$:
+	SUBB3	#^A/0/,@INPTR(FP),R3	; subtract ascii 0 from char
+	BLSS	20$			; branch if not numeric
+	CMPB	#^A/9/-^A/0/,R3		; still numeric?
+	BLSS	20$			; no, branch
+	MULL2	#10,R4			; shift for next digit
+	ADDL	R3,R4			; add in next digit
+	BSBB	GETCHAR			; skip digit we took
+	BRB	10$			; continue while numeric
+20$:
+	CMPL	R1,INPTR(FP)		; did we get any chars?
+	BEQL	30$			; no, leave
+	MOVL	R4,R6			; yes, return value 
+30$:
+	RSB				; return
+
+40$:
+	MOVL	(R11)+,R6		; get value from next parameter
+	BSBB	GETCHAR			; skip '#'
+	RSB				; return
+
+	.SBTTL	CVTASC	- Insert ASCII string
+	.LIST MEB
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Service routine to handle ASCII string insertions.
+;	Strings are specified by several different methods.  For
+;	filled strings (AF) , non-printing characters are output
+;	as dots ('.').  
+;
+; CALLING SEQUENCE:
+;
+;	JSB or BSB
+;
+; INPUTS:
+;
+;	R3	- index of first control char in CNTRL_TABLE
+;	R4	- second control character
+;	R6	- output field width
+;	R9	- output buffer length remaining
+;	R10	- output buffer pointer
+;	R11	- parameter pointer
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	R9 and R10 are update to point to current position in output buffer
+;	R11 is updated as parameters are taken from the stack
+;
+; ROUTINE VALUE:
+;
+;	none
+;
+; SIDE EFFECTS:
+;
+;	R7 and R8 are destroyed
+;--
+
+
+CVTASC:
+
+	PUSHR	#^M<R3,R4,R5,R6>	; save registers
+	CLRL	R7			; set filled indicator to not filled
+	LOCC	R4,#4,STRING_TYPES	; search for string subtype
+	BEQL	110$			; error if not found
+
+;
+;	R0 = 1 - filled , 2 - 2 arg desc. , 3 - str. desc. , 4 - cstring
+;
+	CASE	R0,<10$,20$,30$>,B,#2	; case on descriptor type, base = 2
+
+;
+; Case falls through here for filled ascii strings. Two argument
+; descriptor is used.
+;
+
+	INCL	R7			; set filled indicator for filled ascii
+10$:
+	MOVQ	(R11)+,R1		; get length and address
+	BRB	40$			; continue
+
+;
+; Standard system string descriptor
+;
+
+20$:
+	MOVQ	@(R11)+,R1		; move descriptor to R1,R2
+	MOVZWL	R1,R1			; make sure length is word
+	BRB	40$			; continue
+
+;
+; Ascii counted string, first byte contains length
+;
+
+30$:
+	MOVL	(R11)+,R2		; address of counted string
+	MOVZBL	(R2)+,R1		; get length and skip byte count
+
+40$:
+
+;
+; Here, R1 has string length, R2 has string address. Check length against
+; specified field width to decide how much string to move.
+;
+
+	MOVL	R6,R8			; was a width specified?
+	BGEQ	50$			; branch if so
+	MOVL	R1,R8			; if not, use string length instead
+50$:
+	
+;
+; The string is moved to the output buffer with blank fill at the
+; end.  The output pointers are then updated by the field width, so
+; that the string will be truncated if it was longer than the field
+; width.  If the string is filled, a second pass is made to change
+; non-printing characters to dots.
+;
+
+	MOVL	R9,R6			; copy remaining char count
+					; NOTE we have to use R6 here.
+	SUBL	R8,R9			; update length remaining
+	BLSS	55$			; Overflow, use remaining length.
+	MOVL	R8,R6			; else move only required length
+55$:	MOVC5	R1,(R2),#^A/ /,R6,(R10) ; move string, fill at end
+
+	MOVL	R10,R2			; save output address
+	ADDL	R6,R10			; update output pointer
+	BLBC	R7,90$			; all done if not filled ASCII
+60$:					; R7 will now become loop counter.
+	CMPB	(R2),#^O40		; printing character?
+	BLSS	70$			; no, fill with dot
+	CMPB	(R2),#^O176		; still printing?
+	BLEQ	80$			; yes, skip this one
+70$:
+	MOVB	#^A/./,(R2)		; insert dot in place of char
+80$:
+	INCL	R2			; point to next character
+	AOBLEQ	R6,R7,60$		; continue until done
+
+90$:
+	TSTL	R9			; Did we get result overflow above?
+	BLSS	100$			; Yes, branch to tell user.
+	POPR	#^M<R3,R4,R5,R6>
+	RSB				; return
+
+100$:
+	BRW	OVERFLOW
+110$:
+	BRW	ILLEGAL
+
+	.SBTTL	CVTNUM - Convert numeric parameter to ASCII
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine handles the various HEX, OCTAL, and DECIMAL
+;	conversions. The proper field is extracted from the
+;	parameter (byte, word , or long) and the needed output
+;	width is determined.  This is compared with the user
+;	specified field width to determine if padding of filling
+;	is needed.  The entire field with fill is built on the
+;	stack and then moved so that the result will be correct
+;	on buffer overflow.
+;
+; CALLING SEQUENCE:
+;
+;	JSB or BSB
+;
+; INPUTS:
+;
+;	R3	- index of directive in CNTRL_TABLE.
+;			0 = Octal
+;			1 = heX
+;			2 = Unsigned decimal
+;			3 = Signed decimal
+;			4 = Zero filled unsigned decimal
+;	R4	- second char of directive (B,W, or L)
+;	R6	- field width, or -1 if none
+;	R9	- output length remaining
+;	R10	- output position pointer
+;	R11	- next parameter pointer
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; ROUTINE VALUE:
+;
+;	none
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+;
+; The registers will be set up as follows
+;
+;	R0  - max digits to be output
+;	R1  - 0 -> byte, 1 -> word , 2 -> long
+;	R2  - value to be converted
+;	R4  - conversion radix
+;	R5  - sign indicator, 1 -> sign to be output, 0 otherwise
+;	R7  - fill character, (blank, zero for !Z, or * on width too small
+;		for decimal conversions)
+;	R8  - total width of field to be output
+;
+
+CVTNUM:
+
+	PUSHR	#^M<R3,R4,R5>
+
+	LOCC	R4,#3,DATA_TYPES	; determine data type
+	BNEQ	10$			; continue if legal directive
+	BRW	ILLEGAL			; else take error condition
+10$:
+	SUBL3	R0,#3,R1		; convert to index
+	MOVL	(R11)+,R2		; get next longword parameter
+	EXTZV	#0,FIELDS[R1],R2,R2	; select proper field
+	CLRL	R5			; note unsigned
+	MOVB	#^A/ /,R7		; default fill char is blank
+	MOVZBL	RADIX[R3],R4		; get conversion radix
+
+;
+; Case on the type of conversion.  Note that base is set
+; so that octal and hex conversions fall through case table.
+;
+ 
+	CASE	R3,<40$,30$,20$>,,#2	; base index of 2
+
+;
+; Octal and Hex fall through here
+;
+
+	MOVAL	(R1)[R3],R0		; compute index in OCT_HEX_DIGITS
+	MOVZBL	OCT_HEX_DIGITS[R0],R0	; get number of digits to output
+	MOVL	R6,R8			; user specified width?
+	BGEQ	15$			; yes, use it as width
+	MOVL	R0,R8			; else take needed space
+15$:
+	CMPL	R8,R0			; width lss default digits?
+	BGEQ	60$			; no, fill to user specified width
+	MOVL	R8,R0			; else output only specified width
+	BRB	60$
+
+;
+; Unsigned decimal with zero fill
+;
+
+20$:
+	MOVB	#^A/0/,R7		; insert new fill char
+	BRB	40$			; continue with normal dec. code
+
+;
+; Signed decimal conversion
+;
+
+30$:
+	EXTV	#0,FIELDS[R1],R2,R2	; sign extend the field
+	BBC	#31,R2,40$		; not negative, continue
+	INCL	R5			; else note that value negative
+	MNEGL	R2,R2			; and make it positive
+
+40$:					; common decimal processing
+
+;
+; Determine the number of digits needed to print number in ASCII
+; decimal representation.
+;
+
+	MOVL	#1,R0			; init digit counter
+	MOVL	R4,R3			; copy first power of 10
+44$:
+	CMPL	R2,R3			; does it fit?
+	BLSSU	48$			; yes, R0 has count if so
+	MULL	R4,R3			; else compute next power of ten
+	AOBLSS	R4,R0,44$		; continue (10 digits is largest possible)
+48$:
+	ADDL3	R0,R5,R3		; add in sign, if one exists
+	MOVL	R6,R8			; did user specify width?
+	BGEQ	50$			; yes, use it for field width
+	MOVL	R3,R8			; else use amount needed
+	BRB	60$			; continue
+50$:
+	CMPL	R3,R8			; is there space within specified width?
+	BLEQ	60$			; yes, go on
+	MOVB	#^A/*/,R7		; no room, fill with stars
+	CLRL	R0			; output no digits
+
+60$:
+	MOVL	R2,LASTVAL(FP)		; remember value to be converted
+
+;
+; Insert the ASCII representation for the value in R2 into the
+; output buffer. 
+;
+
+CVT_BIN_TO_ASC:
+
+	PUSHR	#^M<R6,R11>		; save work registers
+	PUSHAB	4(R8)			; compute stack space needed for buffer
+	BICL	#3,(SP)			; round stack to longword
+	MOVL	SP,R11			; save stack pointer
+	SUBL	(R11),SP		; leave buffer space on stack
+
+	CLRL	R3			; clear upper half of quad quotient
+	MNEGL	#1,R1			; init digit counter for loop
+	BRB	15$			; start loop
+10$:
+	EDIV	R4,R2,R2,R6		; R2 <- quotient, R6 <- remainder
+	MOVB	ASC_NAMES[R6],-(R11)	; output ascii digit
+15$:
+	AOBLSS	R0,R1,10$		; one more digit, done yet?
+	BLBC	R5,20$			; branch if no sign to output
+	MOVB	#^A/-/,-(R11)		; output sign
+	INCL	R1			;
+20$:
+	
+;	
+; If field (R8) is not full, then fill remainder with the fill character
+;
+
+	BRB	40$			; start the loop
+30$:
+	MOVB	R7,-(R11)		; insert fill character
+40$:
+	AOBLEQ	R8,R1,30$		; fill until full
+
+;
+; Now copy stack back to buffer, checking for overflow
+;
+
+	BRB	70$			; start loop
+50$:
+	SOBGEQ	R9,60$			; update length, check for overflow
+	BRB	INSERT_OVF		; handle overflow
+60$:	MOVB	(R11)+,(R10)+		; move char to output buffer
+70$:	SOBGEQ	R8,50$			; move entire string
+
+;
+; Now clean up mess on stack
+;
+
+	MOVL	R11,SP			; restore stack 
+	POPR	#^M<R0,R6,R11>		; remove top of stack and restore regs
+
+;
+; Restore registers and return from service routine.
+;
+
+	POPR	#^M<R3,R4,R5>
+	RSB
+
+	.SBTTL	QUICKSERVE - Small service routines
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Following are a collection of short service routines for
+;	FAO directives.  
+;
+; CALLING SEQUENCE:
+;
+;	JSB or BSB
+;
+; INPUTS:
+;
+;	R3  - index in CNTRL_TABLE of the directive
+;	R4  - second character of two-char directive, if any
+;	R6  - user specified field width, if any (ignored for singal char
+;	      and argument directives)
+;	R9  - output length remaining
+;	R10 - output position pointer
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	R9 and R10 are modified 
+;
+; COMPLETION CODES:
+;
+;	none
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+
+INCR_ARGPTR:
+
+;
+; Directive to skip next parameter in parameter list
+;
+
+	TSTL	(R11)+			; skip next parameter
+	RSB				; exit
+
+DECR_ARGPTR:
+
+;
+; Directive to back up and reuse last parameter in parameter list
+;
+
+	TSTL	-(R11)			; back up argument pointer
+	RSB				; exit
+
+NEWLINE:
+
+;
+; Insert carriage return, line feed into output buffer
+;
+
+	SOBGEQ	R9,10$			; room for CR?, branch if so
+	BRB	INSERT_OVF		; no room in output buffer
+10$:
+	MOVB	#CR,(R10)+		; insert CR in output buffer
+					; continue for LF insertion
+
+INSERT_CHAR:
+
+;
+; Make simple one character insertion in the output buffer.
+;
+
+	SOBGEQ	R9,INSERT_IT		; check length, branch if ok
+INSERT_OVF:
+	BRW	OVERFLOW		; error , no room in output buffer
+INSERT_IT:
+
+;
+; Insert the character by computing the index into the replacement table
+;
+
+	MOVB	REPLACEMENT-REPL_OFFSET[R3],(R10)+ ; insert the char
+	RSB
+
+;
+; Directive to repeat a particular character 'n' times, where 'n' is
+; specified by the field width in the directive.
+;
+
+REPEATIT:
+	PUSHR	#^M<R3,R4,R5>	 	; save regs for MOVC5 clobber
+	TSTL	R6			; check if width was specified
+	BLSS	ILLFIELD		; illegal if none specified
+	SUBL	R6,R9			; compute remaining output length
+	BLSS	INSERT_OVF		; not enough room, error
+	MOVC5	#0,(SP),R4,R6,(R10) 	; fill with specified character
+	ADDL	R6,R10			; update output pointer
+	POPR	#^M<R3,R4,R5>	 	; restore regs
+	RSB
+
+;
+; The following are the directives which define a fixed length field.
+; The field width is specified with the define field directive.  At the
+; end field directive, any of the field remaining is blank filled, else
+; the field is truncated to the specified length.
+;
+
+STARTFIELD:
+	TSTL	R6			; did user specify field (must be specified)
+	BGEQ	STARTOK			; yes, continue
+ILLFIELD:
+	BRW	ILLEGAL			; illegal directive
+STARTOK:ADDL3	R6,R10,FIELDEND(FP) 	; compute and save ending address
+	CMPL	R6,R9			; was that much space remaining?
+	BGTR	INSERT_OVF		; no, take error here
+	RSB				; return
+
+;
+; Set up registers so that if fill is needed, a phony call is made
+; to REPEATIT with the length in R6 and the 'blank' character in R4
+;
+
+ENDFIELD:
+	MOVZBL	#^A/ /,R4		; generate blank fill character
+	SUBL3	R10,FIELDEND(FP),R6 	; compute remaining field length
+	BGTR	REPEATIT		; if any left, go fill with blanks
+	MOVL	FIELDEND(FP),R10 	; else truncate by setting back pointer
+	SUBL	R6,R9			; subtract negative difference from counter
+	RSB				; return
+
+	.SBTTL	PERCENT - Time directives and plural 'S'
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	These directives are for date and time conversion, and for
+;	conditionally inserting a plural 'S' into messages.
+;	The time directives insert an ASCII time string into the output buffer.
+;	The user may supply a quadword binary time to be converted, 
+;	or have the current date or time inserted.
+;
+; CALLING SEQUENCE:
+;
+;	JSB/BSB
+;
+; INPUTS:
+;
+;	R4  - second character of directive.  D -> convert
+;		date and time, T -> convert time only
+;		S -> plural indicator
+;	R9  - remaining length of output buffer
+;	R10 - current output buffer position
+;	R11 - next parameter address
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; ROUTINE VALUE:
+;
+;	none
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+PERCENT:
+	LOCC	R4,#3,PERCENT_STR	; find directive type
+	BEQL	ILLFIELD		; illegal directive if not found
+	CLRL	R7			; assume date and time
+	CASE	R0,<10$,30$>,B,#2	; branch on directive type
+
+;
+; Time only directive falls through here
+;
+
+	INCL	R7			; indicate time only
+10$:					; time and date enters here
+	PUSHR	#^M<R3,R4,R5>		; save registers
+	MOVC5	#0,(R10),#^A/ /,R9,(R10) ; blank fill rest of output buffer
+	MOVAL	-(SP),R8		; space for return length
+	MOVQ	R9,-(SP)		; form descriptor for output buffer
+	MOVAL	(SP),R2			; get address of buffer descriptor
+	MOVL	(R11)+,R1		; get binary time address
+	BEQL	12$			; branch if no address
+	CMPL	(R1),4(R1)		; let potential access violation
+					; ...happen in this frame rather than
+					; ...within $ASCTIM to help condition
+					; ...handler
+12$:	$ASCTIM_S (R8),(R2),(R1),R7	; convert time to ascii
+	MOVL	R6,R2			; did user specify width?
+	BGEQ	20$			; yes, use it
+	MOVZWL	(R8),R2			; else use returned length
+20$:
+	SUBL	R2,R9			; update output length
+	BLSS	40$			; error, not enough room
+	ADDL	R2,R10			; update output buffer
+	ADDL	#12,SP			; pop locals from stack
+	POPR	#^M<R3,R4,R5>		; restore registers
+	RSB				;
+30$:
+
+;
+; Check if the last value converted was equal to one.  If so, then do
+; nothing, else output an 'S' into the output buffer.
+;
+
+	CMPL	#1,LASTVAL(FP)		; was last value a one
+	BEQL	60$			; yes, simply return
+	SOBGEQ	R9,50$			; check if room in buffer
+40$:	BRW	OVERFLOW		; no room , error
+50$:	MOVB	#^A/S/,(R10)+		; plural, insert 'S'
+	BBC	#5,-2(R10),60$		; continue if previous character was
+					; ...upper case
+	BISB	#^X20,-1(R10)		; else convert upper 'S' to lower 's'
+60$:	RSB				; return
+
+	.SBTTL	HANDLER - Condition handler
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This condition handler is used to catch any errors which
+;	ocurred while processing the arguments, such as access
+;	violation.  This is because we don't want exceptions
+;	occurring within the system service.
+;	Care must be taken in this handler to deal with a second access
+;	violation while storing the return value for $FAO.
+;
+; INPUTS:
+;
+;	CHF$L_SIGARGLST(AP) = Address of signal vector
+;	CHF$L_MCHARGLST(AP) = Address of mechanism vector
+;
+; OUTPUTS:
+;
+;	The final R0 is set to the status code and the service
+;	is exited via $UNWIND.
+;--
+
+HANDLER:
+	.WORD	0
+
+	MOVAB	L^EXE$SIGTORET,(FP)	;Simple handler for errors here
+
+	ASSUME	CHF$L_MCHARGLST,EQ,CHF$L_SIGARGLST+4
+	MOVQ	CHF$L_SIGARGLST(AP),R0	; Get address of signal argument list
+	CMPL	#SS$_UNWIND,CHF$L_SIG_NAME(R0) ;Unwinding?
+	BEQL	90$			;Exit if yes
+	TSTL	CHF$L_MCH_DEPTH(R1)	;Exception within FAO?
+	BNEQ	80$			;Resignal if no
+	MOVL	CHF$L_SIG_NAME(R0),CHF$L_MCH_SAVR0(R1) ;Set final return status
+	CLRQ	-(SP)			;Clear depth and new PC arguments
+	CALLS	#2,G^SYS$UNWIND		;Unwind to establisher's caller
+					;***** The next instruction my ACCVIO
+	MOVL	SF$L_SAVE_AP(FP),R0	;Get address of FAO's argument list
+	MOVL	OUTLEN(R0),R0		;Output length requested?
+	BEQL	10$			;Branch if not
+	CLRW	(R0)			;Indicate nothing returned in buffer
+10$:					;***** End of potential ACCVIO
+80$:	MOVZWL	#SS$_RESIGNAL,R0	;Resignal (ignore after UNWIND)
+90$:	RET				;
+
+
+	.END

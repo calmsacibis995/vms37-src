@@ -1,0 +1,1111 @@
+	$BEGIN	NT0DAPIO,034,NF$NETWORK,<DAP MESSAGE I/O>
+
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: RMS
+;
+; Abstract:
+;
+;	This module contains routines that transmit and receive DAP messages
+;	to and from the File Access Listener (FAL) at the remote node.
+;
+; Environment: VAX/VMS, executive mode
+;
+; Author: James A. Krycka,	Creation Date:	09-DEC-1977
+;
+; Modified By:
+;
+;	V02-034	TMK0002		Todd M. Katz	21-FEB-1982
+;		Whenever we are waiting in RM$STALL, we are waiting on the
+;		event flag associated with the transfer operation. This will
+;		be regardless of whether we are waiting for the transfer or the
+;		special receive operation to complete. If we are waiting for
+;		both operations to complete, and one of them does, then when
+;		we dismiss the AST we stall again waiting (on the transfer
+;		operation's event flag) for the second operation to complete.
+;		This will be regardless of whether the receive or the transfer
+;		operation completes first. In file transfer mode it will be
+;		possible that the receive associated with the first $PUT is
+;		associated with one event flag, while the transfer associated
+;		with an explicit $DISCONNECT is associated with another. This
+;		quite likely be the case when the RMS record operations are 
+;		performed asynchronously. To prevent the process hang which
+;		will occur when the transfer operation completes before the
+;		receive and the receive AST is delivered while we are again 
+;		waiting for the event flag associated with the transfer 
+;		operation to be set, I have made two changes to the special
+;		receive AST synchronization code. First, when the special
+;		AST is posted, the event flag used will always the throw
+;		event flag (event flag# 31). Second, when the special receive
+;		AST is delivered, and it is determined within NT$STALLAST
+;		that a stall was explicitely requested, the event flag 
+;		associated with the transfer operation will be specifically
+;		set preventing any possible hangs do to the receive and
+;		the transfer QIOs specifying different event flags.
+;
+;	V02-033	TMK0001		Todd M. Katz	19-FEB-1982
+;		In NT$STALLAST, if this AST is for a special receive we have 
+;		not stalled for, and RMS rundown is in progress, then before
+;		dismissing the AST, set the IOREFN event flag. RMS rundown
+;		has done a $CANCEL on this channel with ASTs disabled, cleared
+;		this event flag, and is waiting for it to be set (indicating 
+;		that all QIOs canceled have completed) before it can continue
+;		on and eventually close the file.
+;
+;	V02-032	JAK0071		J A Krycka	07-FEB-1982
+;		In NT$TRANSMIT_PKT avoid issuing a special receive QIO request
+;		(that will overwrite the receive buffer) if the receive buffer
+;		still contains messages to parse.
+;
+;	V02-031	JAK0070		J A Krycka	31-JAN-1982
+;		Fix bug that returns incorrect secondary status code in the
+;		STV field of the FAB or RAB where the remote node is not a VMS
+;		system.
+;
+;	V02-030	JAK0069		J A Krycka	23-JAN-1981
+;		Return RMS$_NETFAIL and RMS$_SUPPORT if possible instead of
+;		RMS$_NET and RMS$_SUP.
+;
+;	V02-029	JAK0068		J A Krycka	04-JAN-1982
+;		V02-030 supersedes this change.
+;
+;	V02-028	TMK0030		Todd M. Katz	21-DEC-1981
+;		Fix three broken branches. Change ALL BSBWs to RM$STALL to JSBs
+;		and one BRW to RM$THREADGO to a JMP. Also, while I am at it, I
+;		will change all W^RM$STALLASTs to L^RM$STALLASTs in all QIO_S.
+;		One is already a broken branch, and I expect the others will 
+;		be soon.
+;
+;	V02-027	TMK0028		Todd M. Katz	20-DEC-1981
+;		Fix a broken branch by changing a BSBW to RM$STALL to a JSB.
+;
+;	V02-026	JAK0063		J A Krycka	26-AUG-1981
+;		Add NT$INTERRUPT routine to send an interrupt message to FAL.
+;
+;	V02-025	JAK0063		J A Krycka	25-AUG-1981
+;		Update symbols to correspond to revised DAPDEF.MDL file.
+;
+;	V02-024	JAK0049		J A Krycka	17-OCT-1980
+;		Continuation of V02-023. Remove NWA$V_LAST_MSG check from
+;		NT$TRANSMIT_PKT, introduce SETUP_QIO_PARAM subroutine,
+;		consolodate entry points, and perform miscellaneous clean-up.
+;
+;	V02-023	JAK0045		J A Krycka	08-MAY-1980
+;		Keep a receive posted when appropriate to accept a possible
+;		error reply (DAP Status message) from the remote FAL to prevent
+;		a deadlock condition.
+;
+;	V02-022	REFORMAT	J A Krycka	26-JUL-1980
+;
+;--
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+
+	$DAPPLGDEF			; Define DAP prologue symbols
+	$DAPHDRDEF			; Define DAP message header
+	$DAPCNFDEF			; Define DAP Configuration message
+	$DAPSTSDEF			; Define DAP Status message
+	$DAPFIDDEF			; Define DAP field ID symbols
+	$FABDEF				; Define File Access Block symbols
+	$IFBDEF				; Define IFAB symbols
+	$IMPDEF				; Define impure area definitions
+	$IODEF				; Define I/O function codes
+	$IRBDEF				; Define IRAB symbols
+	$NWADEF				; Define Network Work Area symbols
+	$PIODEF				; Define Process I/O Page symbols
+	$RMSDEF				; Define RMS completion codes
+	$RMSFALMSG			; Define FAL status codes
+
+;
+; Macros:
+;
+;	None
+;
+; Equated Symbols:
+;
+
+RMS__FACILITY=1				; RMS facility code
+
+	ASSUME	DAP$Q_DCODE_FLG EQ 0
+	ASSUME	NWA$Q_FLG EQ 0
+
+;
+; Own Storage:
+;
+;	None
+;
+
+	.SBTTL	NT$TRANSMIT - SEND DAP MESSAGE
+
+;++
+; NT$TRANSMIT - sends the specified DAP message to the remote FAL.
+;	DAP outbound message blocking is supported. Consequently, the new
+;	message wil be buffered (blocked with others) and delivered later
+;	unless the NWA$V_LAST_MSG bit is set or DAP messsage blocking is
+;	disabled.
+;
+; Calling Sequence:
+;
+;	BSBW	NT$TRANSMIT
+;
+; Input Parameters:
+;
+;	R7	NWA (=DAP) address
+;	R8	FAB/RAB address
+;	R9	IFAB/IRAB address
+;	R10	FWA/IFAB address
+;	R11	Impure Area address
+;
+; Implicit Inputs:
+;
+;	DAP$V_MSGBLK
+;	NWA$L_AUXPTR
+;	NWA$Q_AUX
+;	NWA$W_DAPBUFSIZ
+;	NWA$V_FLUSH_BUF
+;	NWA$V_LAST_MSG
+;	NWA$V_RCVAST
+;	NWA$Q_XMT
+;
+; Output Parameters:
+;
+;	R0	Status code (RMS)
+;	R1-R3	Destroyed
+;	AP	Destroyed
+;
+; Implicit Outputs:
+;
+;	DAP$L_DCODE_STS (on error)
+;	IFB$L_IOS/IRB$L_IOS
+;	NWA$Q_AUX
+;	NWA$V_FLUSH_BUF cleared
+;	NWA$V_LAST_MSG cleared
+;
+; Completion Codes:
+;
+;	Standard RMS completion codes
+;
+; Side Effects:
+;
+;	None
+;
+;--
+
+NT$TRANSMIT::				; Entry point
+	PUSHR	#^M<R4,R5>		; Save registers
+
+;
+; Check for possible Status message returned by FAL in response to a previous
+; DAP message sent.
+;
+
+	BBC	#NWA$V_RCVAST,(R7),5$	; Branch if no DAP message received
+	BSBW	NT$RECEIVE		; Process the (Status) message
+	BLBS	R0,5$			; Continue only if it was a warning or
+	BRB	EXIT			;  success Status message (which should
+					;  not occur), else exit
+
+;
+; Process flush-blocked-messages-only option.
+;
+
+5$:	BBCC	#NWA$V_FLUSH_BUF,(R7),-	; Branch if flush option is disabled
+		10$			;  (and initialize for next time thru)
+	TSTL	NWA$Q_AUX(R7)		; Branch if no blocked DAP messages
+	BEQL	SUC			;  in buffer
+	BRB	40$			; Else, send them (explicit flush)
+
+;
+; Does partner support message blocking?
+;
+
+;	$TSTPT	NTDAP_ENC		; ***** add this testpoint *****
+10$:	BBC	#DAP$V_MSGBLK,-		; Branch if message blocking is
+		DAP$Q_SYSCAP(R7),50$	;  disabled
+
+;
+; Are there any messages in AUX buffer waiting to go?
+;
+
+	TSTL	NWA$Q_AUX(R7)		; Branch if no blocked DAP messages
+	BEQL	20$			;  in buffer
+
+;
+; Will new message fit in AUX buffer with other messages?
+;
+
+	ADDL3	NWA$Q_XMT(R7),-		; Compute total # bytes
+		NWA$Q_AUX(R7),R0	;
+	CMPW	R0,NWA$W_DAPBUFSIZ(R7)	; Branch if new message can be blocked
+	BLEQ	30$			;  with the others
+
+;
+; Flush AUX buffer to make room for new message.
+;
+
+	BSBB	FLUSH_AUX_BUF		; Send blocked DAP messages
+	BLBC	R0,EXIT			; Branch on failure
+
+;
+; Does new message support message blocking?
+;
+
+20$:	BBC	#<DAP$V_LENGTH+8>,-	; Branch if not (implicit flush)
+		@NWA$Q_XMT+4(R7),50$	;
+
+;
+; Is this last message of sequence?
+;
+
+	BBS	#NWA$V_LAST_MSG,(R7),50$; Branch if yes (implicit flush)
+
+;
+; Move new message to AUX buffer.
+;
+
+	MOVL	NWA$Q_XMT(R7),-		; Update byte count in descriptor
+		NWA$Q_AUX(R7)		;
+	MOVC3	NWA$Q_XMT(R7),-		; Copy the message
+		@NWA$Q_XMT+4(R7),-	;
+		@NWA$Q_AUX+4(R7)	;
+	MOVL	R3,NWA$L_AUX_PTR(R7)	; Update next byte pointer
+	BRB	SUC			;
+;
+; Append new message to AUX buffer.
+;
+
+30$:	MOVL	R0,NWA$Q_AUX(R7)	; Update byte count in descriptor
+	MOVC3	NWA$Q_XMT(R7),-		; Append the message
+		@NWA$Q_XMT+4(R7),-	;
+		@NWA$L_AUX_PTR(R7)	;
+	MOVL	R3,NWA$L_AUX_PTR(R7)	; Update next byte pointer
+
+;
+; Does new message support message blocking?
+;
+
+	BBC	#<DAP$V_LENGTH+8>,-	; Branch if not (implicit flush)
+		@NWA$Q_XMT+4(R7),40$	;
+
+;
+; Is this last message of sequence?
+;
+
+	BBC	#NWA$V_LAST_MSG,(R7),SUC; Branch if not
+
+;
+; Send blocked messages in AUX buffer.
+;
+
+40$:	BSBB	FLUSH_AUX_BUF		; Send blocked DAP messages
+	BRB	EXIT			;
+
+;
+; Send new message from XMT buffer.
+;
+
+50$:	MOVQ	NWA$Q_XMT(R7),R4	; Put buffer descriptor in <R4,R5>
+	BSBB	NT$TRANSMIT_PKT		; Send the message
+	BRB	EXIT			;
+
+;
+; Return to caller.
+;
+
+SUC:	RMSSUC				; Return success
+EXIT:	$CLRBIT	#NWA$V_LAST_MSG,(R7)	; Clear last-message-to-block flag
+	POPR	#^M<R4,R5>		; Restore registers
+	RSB				; Exit with RMS code in R0
+
+;+
+; This routine transmits blocked DAP messages in AUX buffer to partner.
+;-
+
+FLUSH_AUX_BUF:				; Entry point
+	MOVQ	NWA$Q_AUX(R7),R4	; Put buffer descriptor in <R4,R5>
+	BSBB	NT$TRANSMIT_PKT		; Send the blocked messages
+	CLRL	NWA$Q_AUX(R7)		; Initialize byte count descriptor
+	MOVL	NWA$Q_AUX+4(R7),-	; Initialize next byte pointer
+		NWA$L_AUX_PTR(R7)	;
+	RSB				; Exit
+
+	.SBTTL	NT$TRANSMIT_PKT - SEND DAP MESSAGE PACKET
+
+;++
+; NT$TRANSMIT_PKT - sends the specified packet of DAP messages to the remote
+;	FAL.
+;
+; Calling Sequence:
+;
+;	BSBW	NT$TRANSMIT_PKT
+;
+; Input Parameters:
+;
+;	R4	Buffer size
+;	R5	Buffer address
+;	R7	NWA (=DAP) address
+;	R8	FAB/RAB address
+;	R9	IFAB/IRAB address
+;	R10	FWA/IFAB address
+;	R11	Impure Area address
+;
+; Implicit Inputs:
+;
+;	NWA$W_DAPBUFSIZ
+;	NWA$Q_RCV
+;	NWA$V_RCVQIO
+;
+; Output Parameters:
+;
+;	R0	Status code (RMS)
+;	R1-R3	Destroyed
+;	AP	Destroyed
+;
+; Implicit Outputs:
+;
+;	DAP$L_DCODE_STS (on error)
+;	DAP$Q_MSG_BUF1
+;	IFB$L_IOS/IRB$L_IOS
+;	NWA$V_RCVQIO
+;
+; Completion Codes:
+;
+;	Standard RMS completion codes
+;
+; Side Effects:
+;
+;	None
+;
+;--
+
+	ASSUME	IFB$L_IOS  EQ IRB$L_IOS
+
+NT$TRANSMIT_PKT::			; Entry point
+	$TSTPT	NTDAP_XMT		;
+
+;+
+; Issue special receive QIO with AST if none has been posted, to guarantee that
+; there is always a receive posted to accept a possible error response (DAP
+; Status message) from FAL. If all goes well, then this receive will be used
+; to accept the normal DAP message response from FAL after the transmit message
+; sequence is complete.
+;
+; Note:	This is termed a special receive QIO because (1) the NWA is used to
+;	store the I/O status block instead of the IFAB, and (2) NT$STALLAST is
+;	used to process the AST instead of RM$STALLAST. These changes were
+;	necessary to allow both a transmit and a receive QIO request to be
+;	outstanding on the same channel in RMS.
+;
+; Note:	Always use the IFAB address as the AST parameter because the the IFAB is
+;	guaranteed to be around for both IFAB and IRAB based operations, as this
+;	receive may be posted in an IRAB context ($PUT) and completed in an IFAB
+;	context ($CLOSE).
+;-
+
+	BBS	#NWA$V_RCVQIO,(R7),10$	; Branch if special receive is posted
+	TSTL	DAP$Q_MSG_BUF1(R7)	; Branch if receive buffer is in use
+	BNEQ	10$			;  indicating that a receive message
+					;  sequence is in progress
+	BSBB	SETUP_QIO_PARAM		; Return with IFAB address, EFN #, and
+					;  channel # in R1-R3, respectively
+	$QIO_S-				; Issue receive QIO request
+		EFN=#IMP$C_ASYQIOEFN-	;  Use throw away event flag
+		CHAN=R3-		;  Channel #
+		FUNC=#IO$_READVBLK-	;  Function code
+		IOSB=NWA$Q_IOSB(R7)-	;  Receive I/O status block address
+		ASTADR=W^NT$STALLAST-	;  AST routine address
+		ASTPRM=R1-		;  Always use IFAB address
+		P1=@NWA$Q_RCV+4(R7)-	;  Buffer address
+		P2=NWA$W_DAPBUFSIZ(R7)	;  Buffer size
+	BLBC	R0,ERRSYS		; Branch on failure
+	$SETBIT	#NWA$V_RCVQIO,(R7)	; Set special receive QIO posted flag
+
+;+
+; Issue transmit QIO with AST.
+; If outbound DAP message blocking is in effect, then more than one DAP message
+; may be transmitted via this QIO.
+;-
+
+10$:	BSBB	SETUP_QIO_PARAM		; Return with IFAB address, EFN #, and
+					;  channel # in R1-R3, respectively
+	$QIO_S-				; Issue transmit QIO request
+		EFN=R2-			;  Event flag #
+		CHAN=R3-		;  Channel #
+		FUNC=#IO$_WRITEVBLK-	;  Function code
+		IOSB=IFB$L_IOS(R9)-	;  IFAB/IRAB IOSB address
+		ASTADR=L^RM$STALLAST-	;  AST routine address
+		ASTPRM=R9-		;  IFAB/IRAB address
+		P1=(R5)-		;  Buffer address
+		P2=R4			;  Buffer size
+	BLBC	R0,ERRSYS		; Branch on failure
+	JSB	RM$STALL		; Await completion
+	BLBC	R0,ERRSYS		; Branch on failure
+	RMSSUC				; Return success
+	RSB				; Return with RMS code in R0
+
+;+
+; Common code for transmit, interrupt, and receive routines to process a QIO
+; failure.
+;-
+
+ERRSYS:	RMSERR	SYS,R1			; Set default RMS code
+	BSBW	RM$MAPERR		; Map SS code into RMS code and
+					;  put SS code in STV field
+	CLRL	DAP$L_DCODE_STS(R7)	; Zero message parse status code to
+					;  indicate that this error was not
+					;  generated from a Status message
+	RSB				; Return with RMS code in R0
+
+;++
+; This is a QIO support routine that obtains the IFAB address, event flag
+; number, and channel number to use. This routine uses the fact that an IRAB
+; block ID is even and an IFAB block ID is odd.
+;
+; Input Parameters:
+;
+;	R9	IFAB/IRAB address
+;
+; Output Parameters:
+;
+;	R1	IFAB address
+;	R2	Event flag #
+;	R3	Channel #
+;--
+
+SETUP_QIO_PARAM:			; Control point
+	JSB	RM$SETEFN		; Request event flag # to use
+	MOVL	(SP)+,R2		;  and store it
+
+	ASSUME	IFB$B_BID EQ IRB$B_BID
+	ASSUME	<IFB$C_BID&1> EQ 1
+	ASSUME	<IRB$C_BID&1> EQ 0
+
+	MOVL	R9,R1			; Get IFAB/IRAB address
+	BLBS	IFB$B_BID(R9),10$	; Branch if this is an IFAB
+	MOVL	IRB$L_IFAB_LNK(R9),R1	; Get IFAB address from IRAB
+10$:	MOVZWL	IFB$W_CHNL(R1),R3	; Get channel #
+	RSB				; Exit
+
+	.SBTTL	NT$INTERRUPT - SEND INTERRUPT MESSAGE
+
+;++
+; NT$INTERRUPT - sends the specified DAP message to the remote FAL as an
+;	interrupt message.
+;
+; Calling Sequence:
+;
+;	BSBW	NT$INTERRUPT
+;
+; Input Parameters:
+;
+;	R7	NWA (=DAP) address
+;	R8	FAB/RAB address
+;	R9	IFAB/IRAB address
+;	R10	IFAB address
+;	R11	Impure Area address
+;
+; Implicit Inputs:
+;
+;	NWA$Q_XMT
+;
+; Output Parameters:
+;
+;	R0	Status code (RMS)
+;	R1-R3	Destroyed
+;	AP	Destroyed
+;
+; Implicit Outputs:
+;
+;	DAP$L_DCODE_STS (on error)
+;	IFB$L_IOS/IRB$L_IOS
+;
+; Completion Codes:
+;
+;	Standard RMS completion codes
+;
+; Side Effects:
+;
+;	None
+;
+;--
+
+	ASSUME	IFB$L_IOS  EQ IRB$L_IOS
+
+NT$INTERRUPT::				; Entry point
+	$TSTPT	NTDAP_XMT		;
+
+;+
+; Issue interrupt QIO with AST.
+;
+; Note:	It is not necessary to issue a special receive QIO (like NT$TRANSMIT_PKT
+;	does) because FAL is not in a state where it is trying to send RMS a
+;	message. Rather, FAL is waiting for this interrupt message to tell it
+;	what to do next.
+;-
+
+	BSBB	SETUP_QIO_PARAM		; Return with IFAB address, EFN #, and
+					;  channel # in R1-R3, respectively
+	$QIO_S-				; Issue interrupt QIO request
+		EFN=R2-			;  Event flag #
+		CHAN=R3-		;  Channel #
+		FUNC=#IO$_WRITEVBLK!IO$M_INTERRUPT- ; Function code
+		IOSB=IFB$L_IOS(R9)-	;  IFAB/IRAB IOSB address
+		ASTADR=L^RM$STALLAST-	;  AST routine address
+		ASTPRM=R9-		;  IFAB/IRAB address
+		P1=@NWA$Q_XMT+4(R7)-	;  Buffer address
+		P2=NWA$Q_XMT(R7)	;  Buffer size
+	BLBC	R0,ERRSYS1		; Branch on failure
+	JSB	RM$STALL		; Await completion
+	BLBC	R0,ERRSYS1		; Branch on failure
+	RMSSUC				; Return success
+	RSB				; Return with RMS code in R0
+ERRSYS1:BRW	ERRSYS			; Branch aid
+
+	.SBTTL	NT$RECEIVE - RECEIVE DAP MESSAGE
+
+;++
+; NT$RECEIVE - accepts the next DAP message packet from the remote FAL.
+;	DAP inbound message blocking is supported. Consequently, the next
+;	message processed may already be in the receive buffer (blocked with
+;	others) unless DAP message blocking is disabled.
+;
+; Calling Sequence:
+;
+;	BSBW	NT$RECEIVE
+;
+; Input Parameters:
+;
+;	R7	NWA (=DAP) address
+;	R8	FAB/RAB address
+;	R9	IFAB/IRAB address
+;	R10	FWA/IFAB address
+;	R11	Impure Area address
+;
+; Implicit Inputs:
+;
+;	DAP fields
+;	DAP$V_VAXVMS
+;	NWA$Q_IOSB
+;	NWA$Q_RCV
+;	NWA$V_NODECODE
+;	NWA$V_RCVAST
+;	NWA$V_RCVQIO
+;
+; Output Parameters:
+;
+;	R0	Status code (RMS)
+;	R1-R3	Destroyed
+;	AP	Destroyed
+;
+; Implicit Outputs:
+;
+;	DAP$L_DCODE_STS (on error)
+;	DAP fields
+;	IFB$L_IOS/IRB$L_IOS
+;	NWA$L_THREAD
+;	NWA$W_DAPBUFSIZ
+;	NWA$V_NODECODE cleared
+;	NWA$V_RCVAST
+;	NWA$V_RCVQIO
+;	NWA$V_RCVSTALL
+;
+; Completion Codes:
+;
+;	Standard RMS completion codes
+;
+; Side Effects:
+;
+;	None
+;
+;--
+
+	ASSUME	IFB$L_IOS  EQ IRB$L_IOS
+
+NT$RECEIVE::				; Entry point
+	$TSTPT	NTDAP_RCV		;
+	TSTL	DAP$Q_MSG_BUF1(R7)	; Branch if there is a blocked DAP
+	BNEQ	DECODE_DAP_MSG		;  message in receive buffer to process
+
+;+
+; Check for special receive QIO posted (by NT$TRANSMIT_PKT).
+; If DAP inbound message blocking is in effect, then more than one DAP message
+; may be received via this QIO.
+;-
+
+	BBC	#NWA$V_RCVQIO,(R7),20$	; Branch if special receive not posted
+	BBS	#NWA$V_RCVAST,(R7),10$	; Branch if special received completed
+	$SETBIT	#NWA$V_RCVSTALL,(R7)	; Set flag to resume thread after stall
+	MOVL	R9,NWA$L_THREAD(R7)	; Save IFAB/IRAB address that we are
+					;  stalling on for use by NT$STALLAST
+					;  before it branches to RM$THREADGO
+	JSB	RM$STALL		; Await completion of special receive
+					; Note: R0 contains garbage on return
+10$:	$CLRBIT	#NWA$V_RCVQIO,(R7)	; Clear receive posted flag
+	$CLRBIT	#NWA$V_RCVAST,(R7)	; Clear receive AST delivered flag
+	MOVZWL	NWA$Q_IOSB(R7),R0	; Get status code
+	BLBC	R0,ERRSYS2		; Branch on failure
+	MOVZWL	NWA$Q_IOSB+2(R7),-	; Store # bytes received in
+		NWA$Q_RCV(R7)		;  descriptor
+	BRB	30$			; Join common code
+
+;+
+; Issue receive QIO with AST unless there is a blocked message to process.
+; If DAP inbound message blocking is in effect, then more than one DAP message
+; may be received via this QIO.
+;-
+
+20$:	BSBW	SETUP_QIO_PARAM		; Return with IFAB address, EFN #, and
+					;  channel # in R1-R3, respectively
+	$QIO_S-				; Receive DAP messages(s) from FAL
+		EFN=R2-			;  Event flag #
+		CHAN=R3-		;  Channel #
+		FUNC=#IO$_READVBLK-	;  Function code
+		IOSB=IFB$L_IOS(R9)-	;  IFAB/IRAB IOSB address
+		ASTADR=L^RM$STALLAST-	;  AST routine address
+		ASTPRM=R9-		;  NWA address plus flag
+		P1=@NWA$Q_RCV+4(R7)-	;  Buffer address
+		P2=NWA$W_DAPBUFSIZ(R7)	;  Buffer size
+	BLBC	R0,ERRSYS2		; Branch on failure
+	JSB	RM$STALL		; Await completion
+	BLBC	R0,ERRSYS2		; Branch on failure
+	MOVZWL	IFB$L_IOS+2(R9),-	; Store # bytes received in
+		NWA$Q_RCV(R7)		;  descriptor
+30$:	MOVQ	NWA$Q_RCV(R7),-		; Copy descriptor to DAP control
+		DAP$Q_MSG_BUF1(R7)	;  block
+
+;+
+; Decode next DAP message received and process any message parsing failure or
+; receipt of a DAP Status message.
+;-
+
+DECODE_DAP_MSG:				;
+;	$TSTPT	NTDAP_DEC		; ***** add this testpoint *****
+	BBSC	#NWA$V_NODECODE,(R7),10$; Branch if message is not to be parsed
+					;  (and initialize for next time thru)
+	$SETBIT	#DAP$K_STS_MSG,-	; Flag Status message as valid
+		DAP$L_MSG_MASK(R7)	;  to receive from FAL
+	PUSHL	R7			; Push address of DAP control block
+	CALLS	#1,W^NT$DECODE_MSG	; Decode message into DAP control block
+	CLRL	DAP$L_MSG_MASK(R7)	; Clear valid message flags
+					;  (initialize for next time thru)
+	BLBC	R0,PARSE_FAILURE	; Branch if message parse failed
+	CMPB	DAP$B_DCODE_MSG(R7),-	; Branch if DAP Status message was
+		#DAP$K_STS_MSG		;  received
+	BNEQ	10$
+	BRW	STATUS_RETURN		;
+10$:	RMSSUC				; Return success
+	RSB				; Return with RMS code in R0
+ERRSYS2:BRW	ERRSYS			; Branch aid
+
+	.SBTTL	NT$STALLAST - RECEIVE AST ROUTINE
+
+;++
+; NT$STALLAST - is the receive AST routine for a (special) receive posted
+;	early by NT$TRANSMIT_PKT.
+;
+;	Note carefully the following:
+;	The call to RM$CHKAST must be a BSBW and immediatedly follow the entry
+;	mask. Furthermore, if ASTS are inhibited (as is the case after RMS is
+;	entered but before the first call to RM$STALL), then this AST will be
+;	requeued instead of returning control to the instruction following the
+;	'BSBW RM$CHKAST' instruction. Then after RM$STALL is called, the AST
+;	will be delivered and control will return after the 'BSBW RM$CHKAST'
+;	instruction.
+;
+; Calling Sequence:
+;
+;	CALLS	#5,NT$STALLAST	(invoked by VAX/VMS as an AST routine)
+;
+; Input Parameters:
+;
+;	4(AP)	IFAB address
+;
+; Implicit Inputs:
+;
+;	Contents of IFAB
+;	IFB$L_NWA_PTR
+;	NWA$L_THREAD
+;	NWA$V_RCVSTALL
+;	impure area
+;
+; Output Parameters:
+;
+;	R0	Set to contents of 1st word of I/O status block
+;	R1-R3	Destroyed
+;	R4-R11	Contents before stall
+;	AP	Destroyed
+;	SP	Address of stack having same contents as before stall
+;	PC	Restored to return in line after call to RM$STALL
+;
+; Implicit Outputs:
+;
+;	IMP$L_SAVED_SP set appropriately for new stack
+;	IMP$V_AST set
+;	NWA$V_RCVAST set
+;	NWA$V_RCVSTALL cleared
+;
+; Completion Codes:
+;
+;	System service status code from first word of I/O status block
+;
+; Side Effects:
+;
+;	The AST may be requeued (by RM$CHKAST).
+;	RMS will be running at AST level on exit.
+;	Secondary user structures require reprobing before use.
+;	Absolute stack addresses will be different on exit.
+;	If RMS rundown is in progress, the I/O rundown event flag will be set.
+;
+;--
+
+	.ENTRY	NT$STALLAST,^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	BSBW	RM$CHKAST		; Check for ASTS inhibited
+	MOVL	IFB$L_NWA_PTR(R9),R7	; Get address of NWA
+					; Note: R9 always contains IFAB address
+	$SETBIT	#NWA$V_RCVAST,(R7)	; Set receive AST delivered flag
+	BBSC	#NWA$V_RCVSTALL,(R7),10$; Branch if waiting in RM$STALL
+					;  and reset flag
+
+	BBC	#IMP$V_IORUNDOWN,-	; if RMS rundown is in progress
+		@#PIO$GW_IIOIMPA,5$	; then set the I/O rundown event flag
+	$SETEF_S	#IMP$C_IOREFN	; to allow rundown to complete
+5$:	RET				; Dismiss AST
+
+10$:	MOVL	NWA$L_THREAD(R7),R9	; Pick up the IFAB/IRAB address
+					;  that was used to stall on
+	JSB	RM$SETEFN		; retrieve the event flag for
+	POPL	R2			;  the transfer operation we are
+	$SETEF_S	R2		;  waiting on in stall and set it
+	JMP	RM$THREADGO		; Cause return from RM$STALL
+
+	.SBTTL	PROCESS DAP MESSAGE PARSE FAILURE
+
+;++
+; CASE 1 -- NT$DECODE_MSG failed to parse the received DAP message.
+;
+; Possible MACCODE values returned by NT$DECODE_MSG are DAP$_UNSUPPORT,
+; DAP$_FORMAT, DAP$_INVALID, and DAP$_MSG_SYNC. The first is mapped to
+; RMS$_SUP and the latter three are mapped into RMS$_BUG_DAP. Therefore:
+;   (1)	STS of FAB/RAB = RMS$_SUP or RMS$_BUG_DAP
+;   (2) STV of FAB/RAB = DAP status code (prefixed by RMS facility code)
+;
+; Note: The STS value is returned in R0 less the RMS facility code.
+;--
+
+PARSE_FAILURE:				; Code segment of NT$RECEIVE
+	CMPB	DAP$B_DCODE_MAC(R7),-	; Branch if error is not
+		#DAP$_MSG_SYNC		;  'message-out-of-sequence'
+	BNEQ	10$			;
+	MOVZBL	DAP$B_DCODE_MSG(R7),R1	; Get message type number
+	BRB	20$			; Join common code
+10$:	MOVZBL	DAP$B_DCODE_FID(R7),R1	; Get ID of field in error
+	INSV	DAP$B_DCODE_MSG(R7),-	; Insert message type number
+		#6,#6,R1		;
+20$:	INSV	DAP$B_DCODE_MAC(R7),-	; Insert MACCODE error code
+		#12,#4,R1		;
+	MOVW	R1,FAB$L_STV(R8)	; Update STV field of FAB/RAB
+	MOVW	#RMS__FACILITY,-	; Add RMS facility code to value
+		FAB$L_STV+2(R8)		;  in STV field of FAB/RAB
+	CMPB	DAP$B_DCODE_MAC(R7),-	; Did parse fail because a field/option
+		#DAP$_UNSUPPORT		;  received is not supported by RMS?
+	BEQL	30$			; Branch if yes
+	RMSERR	BUG_DAP			; Declare Data Access Protocol error
+	RSB				; Exit with RMS code in R0
+30$:	RMSERR	SUP			; Declare message unsupported
+	RSB				; Exit with RMS code in R0
+
+;++
+; This routine is called to report a Data Access Protocol error detected by
+; NT$SEARCH in processing the NAMETYPE field that was not detected by
+; NT$DECODE_MSG when the Name message was parsed.
+;--
+
+NT$BUG_NAMETYPE::			; Entry point
+	MOVB	#DAP$_INVALID,-		; Field value is invalid
+		DAP$B_DCODE_MAC(R7)	;
+	MOVB	#DAP$_NAMETYPE,-	; Identify field
+		DAP$B_DCODE_FID(R7)	;
+	BRB	PARSE_FAILURE		; Join common code
+
+	.SBTTL	PROCESS DAP STATUS MESSAGE FROM FAL
+
+;++
+; CASE 2 -- RMS received a DAP Status message from partner.
+;
+; The DAP status code may indicate:
+;   (1)	success or failure of file operation attempted by the remote file system
+;   (2)	the requested file operation is not supported by the remote system
+;   (3)	a Data Access Protocol error detected at the remote system
+; In all cases, RMS will translate the DAP status code into an RMS completion
+; code that may also have an associated secondary status code.
+;
+; If the DAP status code maps directly into an RMS completion code, then:
+;   (1)	STS of FAB/RAB = corresponding RMS status code
+;   (2) STV of FAB/RAB = 0 or supplementary information if any received from FAL
+; Or
+;   (1)	STS of FAB/RAB = corresponding RMS status code
+;   (2) STV of FAB/RAB = secondary status code received if partner is VMS or
+;			 FAL$_DAPFAIL if partner is non-VMS
+;
+; If not, then one of the following indirect mappings will be made:
+;   (1)	STS of FAB/RAB = RMS$_SUPPORT or RMS$_NETFAIL
+;   (2) STV of FAB/RAB = FAL status code mapped from DAP status code
+; Or
+;   (1) STS of FAB/RAB = RMS$_SUP, RMS$_NET, or RMS$_BUG_DAP
+;   (2) STV of FAB/RAB = DAP status code (prefixed by FAL facility code)
+;
+; Note: The STS value is returned in R0 less the RMS facility code.
+;--
+
+STATUS_RETURN:				; Code segment of NT$RECEIVE
+
+	ASSUME	DAP$_PENDING EQ 0
+	ASSUME	DAP$_SUCCESS EQ 1
+	ASSUME	DAP$_UNSUPPORT EQ 2
+	ASSUME	DAP$_FILE_OPEN EQ 4
+	ASSUME	DAP$_FILE_XFER EQ 5
+	ASSUME	DAP$_WARNING EQ 6
+	ASSUME	DAP$_FILE_CLOS EQ 7
+	ASSUME	DAP$_FORMAT EQ 8
+	ASSUME	DAP$_INVALID EQ 9
+	ASSUME	DAP$_MSG_SYNC EQ 10
+
+	EXTZV	#0,#12,DAP$W_STSCODE(R7),R2 ; Get MICCODE field
+	EXTZV	#12,#4,DAP$W_STSCODE(R7),R3 ; Get MACCODE field
+	$CASEB	SELECTOR=R3-		; Status returned by partner:
+		DISPL=<-		;
+		    FILE_ACCESS-	;  File operation pending
+		    FILE_ACCESS-	;  File operation successful
+		    UNSUPPORT-		;  Request not supported
+		    PROTOCOL-		;  Undefined value
+		    FILE_ACCESS-	;  Error related to opening a file
+		    FILE_ACCESS-	;  Error related to file transfer
+		    PROTOCOL-		;  Undefined value
+		    FILE_ACCESS-	;  Error related to closing a file
+;		    PROTOCOL-		;  Incorrect message format
+;		    PROTOCOL-		;  Invalid field value
+;		    PROTOCOL-		;  Unexpected message for state
+		>			;
+
+;+
+; Process Data Access Protocol error; RMS$_BUG_DAP will be returned.
+;-
+
+PROTOCOL:				; Dispatched here from CASE statement
+	RMSERR	BUG_DAP			; Declare Data Access Protocol error
+	CMPW	DAP$W_STSCODE(R7),-	; Check for invalid file name string
+		#<<DAP$_INVALID@12>!-	;  as this is not really a protocol
+		  <DAP$K_ACC_MSG@6>!-	;  error, just a difference in file
+		  <DAP$_FILESPEC>!-	;  specification formats between
+		0>			;  systems
+	BNEQ	DAPCODE_TO_STV		; Branch if any other error
+	RMSERR	SYN			; Convert response to general
+	BRB	DAPSTV_TO_STV		;  file name string syntax error
+					; Note that this prevents return of
+					;  RMS$_BUG_DAP in response to a
+					;  bad (invalid) file specification
+
+;+
+; Process operation not supported error condition; RMS$_SUPPORT (with a
+; secondary FAL status code from the NT$UNSUPPORTED conversion table) or
+; RMS$_SUP (with an associated DAP status code) will be returned.
+;-
+
+UNSUPPORT:				; Dispatched here from CASE statement
+	ADDL2	#FAL$_OFFSET_B,R2	; Convert DAP MICCODE value to a FAL
+					;  message number (see RMSFALMSG.MSG)
+	MOVAB	W^NT$UNSUPPORTED,R0	; Get address of conversion table
+10$:	MOVZWL	(R0)+,R1		; Get next FAL message code
+	BEQL	20$			; Branch if end of table
+	EXTZV	#3,#12,R1,R3		; Obtain FAL message number (bits 3-14)
+	CMPW	R2,R3			; Does DAP status code correspond to
+					;  this FAL message?
+	BNEQ	10$			; Branch if not--continue search
+	RMSERR	SUPPORT			; Generate primary error code
+	BRB	FALCODE_TO_STV		; Join common code
+20$:	RMSERR	SUP			; Generate catch-all primary error code
+	BRB	DAPCODE_TO_STV		; Join common code
+
+;+
+; Process status information (success or failure) of file operation attempted
+; by the remote file system. The NT$DAP_TO_RMS conversion table will be used
+; to map the DAP status code into a standard RMS completion code. RMS$_NETFAIL
+; (with a secondary FAL status code) or RMS$_NET (with an associated DAP status
+; code) will be returned if a direct mapping cannot be made.
+;-
+
+FILE_ACCESS:				; Dispatched here from CASE statement
+	RMSERR	NET			; Start with general file access error
+	CMPW	R2,#NT$DAPRMSEND	; Branch if MICCODE value is too
+	BGTRU	DAPCODE_TO_STV		;  large for conversion table
+	MOVZWL	W^NT$DAP_TO_RMS[R2],R0	; Use MICCODE value as index into
+					;  DAP-to-RMS conversion table
+	BBC	#13,R0,DAPSTV_TO_STV	; Branch if this is an RMS completion
+					;  code; not a FAL status code
+	MOVL	R0,R1			; Copy FAL status code to R1
+	RMSERR	NETFAIL			; Generate primary error code
+					; Fall thru to common code ...
+
+;+
+; An RMS$_SUPPORT or RMS$_NETFAIL code has been generated and put in R0 with
+; an associated FAL status code put in R1.
+;-
+
+FALCODE_TO_STV:				;
+	MOVW	R1,FAB$L_STV(R8)	; Put FAL status code from table in low
+	MOVW	#FAL$_FACILITY,-	;  word of STV field of FAB/RAB
+		FAB$L_STV+2(R8)		;  and FAL facility code in high word
+	RSB				; Exit with RMS code in R0
+
+;+
+; An RMS$_SUP, RMS$_NET, or RMS$_BUG_DAP code has been generated an put in R0.
+; Each of these codes requires an associated DAP error code to be returned
+; in the STV field of the FAB/RAB. This secondary code consists of the FAL
+; facility code in the upper word and the DAP STSCODE value in the lower word.
+;-
+
+DAPCODE_TO_STV:				;
+	MOVW	DAP$W_STSCODE(R7),-	; Put DAP status code received in low
+		FAB$L_STV(R8)		;  word of STV field of FAB/RAB
+	MOVW	#FAL$_FACILITY,-	;  and FAL facility code in high word
+		FAB$L_STV+2(R8)		;
+	RSB				; Exit with RMS code in R0
+
+;+
+; The DAP Status message was mapped into an RMS completion code and put in R0.
+; Update the STV field of the FAB/RAB as appropriate--some RMS codes require
+; a secondary status code, some require a value, and others do not refer to it.
+;-
+
+DAPSTV_TO_STV:				;
+	MOVL	DAP$L_STV(R7),-		; Put STV value received (if any)
+		FAB$L_STV(R8)		;  in STV field of FAB/RAB
+	BBC	#RMS$V_STVSTATUS,R0,20$	; Branch if RMS code does not require
+					;  an associated status code in STV
+					;  (used by $GETMSG and $PUTMSG)
+	BBC	#DAP$V_VAXVMS,(R7),10$	; Use STV value from FAL only if
+	TSTL	FAB$L_STV(R8)		;  remote node is VMS and the value
+	BNEQ	20$			;  is non-zero
+10$:	MOVL	#FAL$_DAPFAIL,-		; Otherwise, stuff a general FAL status
+		FAB$L_STV(R8)		;  code in STV
+20$:	RSB				; Exit with RMS code in R0
+
+	.SBTTL	NT$RMT_xxx ERROR REPORTING ROUTINES
+
+;++
+; CASE 3 -- RMS generates an RMS$_SUPPORT error for a request not supported by
+; the remote system based on the capabilities stated by FAL in its DAP
+; Configuration message. The following status information is returned:
+;   (1)	STS of FAB/RAB = RMS$_SUPPORT
+;   (2) STV of FAB/RAB = FAL status code
+;
+; Note:	R8 contains the address of FAB/RAB on input.
+;--
+
+NT$RMT_ORG::				; Unsupported value in ORG field
+	MOVZWL	#<FAL$_ORG&^XFFFF>,R1	; Generate secondary error code
+	BRB	RMT_COMMON		;
+NT$RMT_RFM::				; Unsupported value in RFM field
+	MOVZWL	#<FAL$_RFM&^XFFFF>,R1	; Generate secondary error code
+	BRB	RMT_COMMON		;
+NT$RMT_RAT::				; Unsupported value in RAT field
+	MOVZWL	#<FAL$_RAT&^XFFFF>,R1	; Generate secondary error code
+	BRB	RMT_COMMON		;
+NT$SUP_FOP::				; Temporary
+NT$RMT_FOP1::				; Unsupported value in FOP field
+	MOVZWL	#<FAL$_FOP1&^XFFFF>,R1	; Generate secondary error code
+	BRB	RMT_COMMON		;
+NT$RMT_FOP2::				; Unsupported value in FOP field
+	MOVZWL	#<FAL$_FOP2&^XFFFF>,R1	; Generate secondary error code
+	BRB	RMT_COMMON		;
+NT$RMT_RAC::				; Unsupported value in RAC field
+	MOVZWL	#<FAL$_RAC&^XFFFF>,R1	; Generate secondary error code
+	BRB	RMT_COMMON		;
+NT$RMT_ROP::				; Unsupported value in ROP field
+	MOVZWL	#<FAL$_ROP&^XFFFF>,R1	; Generate secondary error code
+	BRB	RMT_COMMON		;
+NT$RMT_ACCFUNC::			; Unsupported RMS service call
+	MOVZWL	#<FAL$_ACCFUNC&^XFFFF>,R1;Generate secondary error code
+	BRB	RMT_COMMON		;
+NT$SUP_CTLFUNC::			; Temporary
+NT$RMT_CTLFUNC::			; Unsupported RMS service call
+	MOVZWL	#<FAL$_CTLFUNC&^XFFFF>,R1;Generate secondary error code
+RMT_COMMON:				; Common code
+	MOVW	R1,FAB$L_STV(R8)	; Put associated FAL code in STV
+	MOVW	#FAL$_FACILITY,-	;  of FAB/RAB
+		FAB$L_STV+2(R8)		;
+	RMSERR	SUPPORT			; Declare primary error
+	RSB				; Exit with RMS code in R0
+
+	.SBTTL	NT$LCL_xxx ERROR REPORTING ROUTINES
+
+;++
+; CASE 4 -- RMS generates an RMS$_SUPPORT error for a request that it cannot
+; support in a network context. The following status information is returned:
+;   (1)	STS of FAB/RAB = RMS$_SUPPORT
+;   (2) STV of FAB/RAB = another RMS completion code
+;
+; Note:	The secondary RMS error code cannot have an associated secondary code
+;	of its own.
+;
+; Note:	R8 contains the address of FAB/RAB on input.
+;--
+
+NT$LCL_RFM::				; Unsuspported value in RFM field
+	RMSERR	RFM,R1			; Generate secondary error code
+	BRB	LCL_COMMON		;
+NT$LCL_FOP::				; Unsupported value in FOP field
+	RMSERR	FOP,R1			; Generate secondary error code
+	BRB	LCL_COMMON		;
+NT$LCL_ROP::				; Unsupported value in ROP field
+	RMSERR	ROP,R1			; Generate secondary error code
+	BRB	LCL_COMMON		;
+NT$LCL_ENV::				; Unsupported RMS service call
+	RMSERR	ENV,R1			; Generate secondary error code
+LCL_COMMON:				; Common code
+	MOVW	R1,FAB$L_STV(R8)	; Put associated RMS code in STV
+	MOVW	#RMS__FACILITY,-	;  of FAB/RAB
+		FAB$L_STV+2(R8)		;
+	RMSERR	SUPPORT			; Declare primary error
+	RSB				; Exit with RMS code in R0
+
+;++
+; Branch aids for exiting RMS.
+;--
+
+NT$EXRMS::				; Exit RMS with failure code in R0
+	JMP	RM$EXRMS		; Branch aid
+NT$EXSUC::				; Exit RMS with success code in R0
+	JMP	RM$EXSUC		; Branch aid
+
+
+	.END				; End of module

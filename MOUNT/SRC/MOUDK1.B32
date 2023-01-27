@@ -1,0 +1,902 @@
+MODULE MOUDK1 (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-001'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  MOUNT Utility Structure Level 1
+!
+! ABSTRACT:
+!
+!	This routine performs all of the mechanics of mounting a disk,
+!	given as input the parsed and partially validated command line.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  17-Oct-1977  17:41
+!
+! MODIFIED BY:
+!
+!	V03-001	STJ0242		Steven T. Jeffreys,	30-Mar-1982
+!		- Remove code that sets the device allocation access mode.
+!		  The device will be manually deallocated in VMOUNT.
+!		- Read the first block of the storage map and write it
+!		  back to the disk to determine if the volume is hardware
+!		  write-locked.
+!
+!	V02-009	STJ0192		Steven T. Jeffreys,	02-Feb-1982
+!		Use global buffers defined in MOUDK2.
+!
+!	V02-008	ACG0246		Andrew C. Goldstein,	4-Jan-1982  14:48
+!		Add /OVER:LOCK, add NOCACHE bit in VCB;
+!		remove primary exception vector logic.
+!
+!	V02-007	LMP0001		L. Mark Pilant		9-Nov-1981
+!		Map the entire index file if it contains extension
+!		file headers.
+!
+!	V02-006	STJ0041		Steven T. Jeffreys,	21-May-1980
+!		Copy volume serial number from home block to VCB.
+!
+!	V02-005	ACG0169		Andrew C. Goldstein,	18-Apr-1980  13:56
+!		Bug check on internal errors
+!
+!	V02-004	ACG0167		Andrew C. Goldstein,	18-Apr-1980  13:38
+!		Previous revision history moved to MOUNT.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:MOUDEF.B32';
+REQUIRE 'LIBD$:[VMSLIB.OBJ]MOUNTMSG.B32';
+
+
+FORWARD ROUTINE
+	MOUNT_DISK1	: NOVALUE,	! main disk mounting routine
+	MAKE_DISK_MOUNT,		! kernel mode mount routine
+	KERNEL_HANDLER	: NOVALUE;	! kernel mode condition handler
+
+!+
+!
+! Own storage for this module.
+!
+!-
+
+LITERAL
+	WINDOW_SIZE	= 30*6;		! maximum index file window size
+
+OWN
+	PROTO_FCBE1	: BBLOCK [FCB$C_LENGTH], ! prototype index file extent 1
+	PROTO_FCBE2	: BBLOCK [FCB$C_LENGTH]; ! prototype index file extent 2
+
+EXTERNAL
+	!
+	! These buffers are shared with MOUDK2.
+	!
+	BUFFER		: BBLOCK,		! buffer for disk blocks
+	PROTO_VCB	: BBLOCK,		! prototype VCB
+	PROTO_FCB	: BBLOCK,		! prototype index file FCB
+	PROTO_WCB	: BBLOCK,		! prototype index file window
+	VOLUME_UIC	: LONG;			! owner UIC of volume
+
+
+GLOBAL ROUTINE MOUNT_DISK1 : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs all of the mechanics of mounting a structure
+!	level 1 disk, given as input the parsed and partially validated
+!	command line.
+!
+!
+! CALLING SEQUENCE:
+!	MOUNT_DISK ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	MOUNT parser data base
+!	CHANNEL: channel number for I/O
+!	HOME_BLOCK: buffer containing volume home block
+!	HOMEBLOCK_LBN: LBN of home block
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	volume mounted: VCB, etc., created, ACP started
+!
+!--
+
+BEGIN
+
+BUILTIN
+	ROT,
+	FFS,
+	FFC;
+
+LOCAL
+	PROCESS_UIC,			! UIC of this process
+	PRIVILEGE_MASK	: REF BBLOCK,	! address of process privilege mask
+	P,				! random pointer
+	C,				! string count
+	STATUS,				! utility status word
+	MAP_AREA	: REF BBLOCK,	! pointer to file header map area
+	MAP_POINTER	: REF BBLOCK,	! pointer to scan map pointers
+	WCB_POINTER	: REF BBLOCK,	! pointer to scan WCB pointers
+	INDEX_LBN,			! LBN of current index file map pointer
+	INDEX_CNT,			! count for above LBN
+	EXTENT_LBN,			! LBN of the extension header
+	EXTENT_VBN,			! VBN of the extension header
+	EXTENT_FID,			! FID of the next extent
+	BIAS,				! offset for storage map location
+	COUNT,				! number of blocks in storage map
+	LBN,				! current LBN in use
+	FREE,				! number of free blocks on volume
+	X,				! longword of bitmap
+	B1,				! start point of bit scan
+	B2;				! end point of bit scan
+
+EXTERNAL
+	MOUNT_OPTIONS	: BITVECTOR,	! command option flags
+	DEVICE_CHAR	: BBLOCK,	! device characteristics
+	LABEL_STRING	: VECTOR,	! volume label string in command
+	PHYS_NAME	: VECTOR,	! descriptor of physical device name
+	DEVICE_COUNT,			! number of device specified
+	DRIVE_COUNT	: VECTOR,	! number of drives per device
+	WINDOW,				! command specified window size
+	ACCESSED,			! command specified LRU limit
+	EXTENSION,			! command specified default file extend
+	HOME_BLOCK	: BBLOCK,	! buffer containing volume home block
+	HOMEBLOCK_LBN,			! LBN of home block
+	HEADER_LBN,			! LBN of current file header
+	CTL$GL_PHD	: REF BBLOCK ADDRESSING_MODE (ABSOLUTE),
+					! vector page pointer to process header
+	ACP$GB_WINDOW	: BYTE ADDRESSING_MODE (ABSOLUTE),
+					! default window size for /SYSTEM
+	ACP$GW_SYSACC	: WORD	ADDRESSING_MODE (ABSOLUTE);
+					! default LRU limit for /SYSTEM
+
+EXTERNAL ROUTINE
+	GET_UIC,			! get UIC of process
+	CHECK_HEADER,			! verify file header
+	WRITE_BLOCK,			! write a block to the disk
+	READ_BLOCK,			! read a block from the disk
+	INIT_FCB,			! initialize FCB
+	TURN_WINDOW1;			! initialize window
+
+
+! For maximum safety, we do as much setup work in user mode as possible. We
+! read all of the disk blocks (index file and storage map headers and the
+! storage map) in user mode so that the program is abortable in case something
+! hangs. Prototype control blocks are built in local storage and are copied
+! into the system pool by the kernel mode routine.
+!
+! Get the process UIC and the volume owner UIC. Make the privilege checks
+! for overriding volume protection and options requiring operator privilege.
+!
+
+IF .DEVICE_COUNT NEQ 1 OR .DRIVE_COUNT[0] GTR 1
+THEN ERR_EXIT (MOUN$_DEVICES);
+
+PROCESS_UIC = KERNEL_CALL (GET_UIC);
+PRIVILEGE_MASK = CTL$GL_PHD[PHD$Q_PRIVMSK];
+VOLUME_UIC = 0;
+IF .MOUNT_OPTIONS[OPT_IS_FILES11]
+THEN
+    BEGIN
+    VOLUME_UIC = .(HOME_BLOCK[HM1$W_VOLOWNER])<0,8>;
+    VOLUME_UIC<16,8> = .(HOME_BLOCK[HM1$W_VOLOWNER])<8,8>;
+    END;
+
+IF  (
+    .MOUNT_OPTIONS[OPT_OVR_PRO]
+    AND NOT (.PRIVILEGE_MASK[PRV$V_VOLPRO]
+		OR .VOLUME_UIC EQL 0
+		OR .VOLUME_UIC EQL .PROCESS_UIC)
+    )
+
+OR  (
+    (  .MOUNT_OPTIONS[OPT_WINDOW]
+    OR .MOUNT_OPTIONS[OPT_ACCESSED]
+    OR .MOUNT_OPTIONS[OPT_UNIQUEACP]
+    OR .MOUNT_OPTIONS[OPT_SAMEACP]
+    OR .MOUNT_OPTIONS[OPT_FILEACP]
+    )
+    AND NOT .PRIVILEGE_MASK[PRV$V_OPER]
+    )
+
+OR  (
+    .MOUNT_OPTIONS[OPT_GROUP]
+    AND NOT .PRIVILEGE_MASK [PRV$V_GRPNAM]
+    )
+
+OR  (
+    .MOUNT_OPTIONS[OPT_SYSTEM]
+    AND NOT .PRIVILEGE_MASK [PRV$V_SYSNAM]
+    )
+
+THEN ERR_EXIT (SS$_NOPRIV);
+
+IF .MOUNT_OPTIONS[OPT_FOREIGN]
+THEN VOLUME_UIC = .PROCESS_UIC;
+
+! First fill in the prototype VCB from the data in the home block.
+!
+
+CH$FILL (0, VCB$C_LENGTH, PROTO_VCB);	! init to zero
+PROTO_VCB[VCB$W_TRANS] = 1;		! transaction count
+PROTO_VCB[VCB$W_MCOUNT] = 1;		! mount count
+
+IF .MOUNT_OPTIONS[OPT_GROUP]
+THEN PROTO_VCB[VCB$V_GROUP] = 1;
+IF .MOUNT_OPTIONS[OPT_SYSTEM]
+THEN PROTO_VCB[VCB$V_SYSTEM] = 1;
+
+!
+! Copy volume serial number from homeblock to VCB.
+!
+PROTO_VCB [VCB$L_SERIALNUM] = .HOME_BLOCK [HM1$L_SERIALNUM];
+
+IF .MOUNT_OPTIONS[OPT_IS_FILES11]
+AND NOT (.MOUNT_OPTIONS[OPT_FOREIGN] AND .MOUNT_OPTIONS[OPT_LABEL])
+THEN
+    BEGIN
+					! volume label, blank filled
+					! find trailing zero, if any
+    P = CH$FIND_CH (HM1$S_VOLNAME, HOME_BLOCK[HM1$T_VOLNAME], 0);
+    C = 12;				! compute string length
+    IF NOT CH$FAIL (.P)
+    THEN C = .P - HOME_BLOCK[HM1$T_VOLNAME];
+    CH$COPY (.C, HOME_BLOCK[HM1$T_VOLNAME], ' ',
+	     VCB$S_VOLNAME, PROTO_VCB[VCB$T_VOLNAME]);
+    END
+ELSE
+    CH$COPY (.LABEL_STRING[0], .LABEL_STRING[1], ' ',
+	     VCB$S_VOLNAME, PROTO_VCB[VCB$T_VOLNAME]);
+
+IF NOT .MOUNT_OPTIONS[OPT_FOREIGN]
+THEN
+    BEGIN
+    PROTO_VCB[VCB$V_MOUNTVER] = .MOUNT_OPTIONS [OPT_MOUNTVER];
+    PROTO_VCB[VCB$L_HOMELBN] = .HOMEBLOCK_LBN; ! home block LBN
+					! index file bitmap LBN
+    PROTO_VCB[VCB$L_IBMAPLBN] = ROT (.HOME_BLOCK[HM1$L_IBMAPLBN], 16);
+    PROTO_VCB[VCB$W_CLUSTER] = 1;		! volume cluster factor
+					! default window size
+    PROTO_VCB[VCB$B_WINDOW] = .HOME_BLOCK[HM1$B_WINDOW];
+    IF .PROTO_VCB[VCB$B_WINDOW] EQL 0
+    THEN PROTO_VCB[VCB$B_WINDOW] = 7;
+    IF .MOUNT_OPTIONS[OPT_SYSTEM]
+    THEN PROTO_VCB[VCB$B_WINDOW] = .ACP$GB_WINDOW;
+    IF .MOUNT_OPTIONS[OPT_WINDOW]
+    THEN PROTO_VCB[VCB$B_WINDOW] = .WINDOW;
+					! directory LRU limit
+    PROTO_VCB[VCB$B_LRU_LIM] = .HOME_BLOCK[HM1$B_LRU_LIM];
+    IF .MOUNT_OPTIONS[OPT_SYSTEM]
+    THEN PROTO_VCB[VCB$B_LRU_LIM] = .ACP$GW_SYSACC;
+    IF .MOUNT_OPTIONS[OPT_ACCESSED]
+    THEN PROTO_VCB[VCB$B_LRU_LIM] = .ACCESSED;
+    IF .MOUNT_OPTIONS[OPT_NOCACHE]
+    THEN PROTO_VCB[VCB$B_LRU_LIM] = 0;
+					! default file extend
+    PROTO_VCB[VCB$W_EXTEND] = .HOME_BLOCK[HM1$B_EXTEND];
+    IF .PROTO_VCB[VCB$W_EXTEND] EQL 0
+    THEN PROTO_VCB[VCB$W_EXTEND] = 5;
+    IF .MOUNT_OPTIONS[OPT_EXTENSION]
+    THEN PROTO_VCB[VCB$W_EXTEND] = .EXTENSION;
+					! index file bitmap size
+    PROTO_VCB[VCB$B_IBMAPSIZE] = .HOME_BLOCK[HM1$W_IBMAPSIZE];
+					! maximum number of files
+    PROTO_VCB[VCB$L_MAXFILES] = .HOME_BLOCK[HM1$W_MAXFILES];
+
+    IF .MOUNT_OPTIONS[OPT_NOCACHE]
+    THEN PROTO_VCB[VCB$V_NOCACHE] = 1;
+
+! Now read the index file header, verify it, and initialize the prototype
+! index file FCB.
+!
+
+    HEADER_LBN = .PROTO_VCB[VCB$L_IBMAPLBN] + .PROTO_VCB[VCB$B_IBMAPSIZE];
+    STATUS = READ_BLOCK (.HEADER_LBN, BUFFER);
+    IF NOT .STATUS THEN ERR_EXIT (.STATUS);
+    IF NOT CHECK_HEADER (BUFFER, UPLIT WORD (1, 1, 0)) THEN ERR_EXIT ();
+
+    CH$FILL (0, FCB$C_LENGTH, PROTO_FCB);
+
+! Clear out the extension header FCB's so they are in a known state
+!
+
+    CH$FILL (0, FCB$C_LENGTH, PROTO_FCBE1);
+    CH$FILL (0, FCB$C_LENGTH, PROTO_FCBE2);
+
+    PROTO_FCB[FCB$L_STVBN] = 1;
+    INIT_FCB (PROTO_FCB, BUFFER);
+    PROTO_FCB[FCB$W_ACNT] = 1;
+
+! Build the prototype index file window.
+!
+
+    CH$FILL (0, WCB$C_LENGTH, PROTO_WCB);
+    PROTO_WCB[WCB$W_SIZE] = WCB$C_LENGTH + WINDOW_SIZE;
+    PROTO_WCB[WCB$V_READ] = 1;
+    TURN_WINDOW1 (PROTO_WCB, BUFFER, 3, 1);
+
+! Read any extents that exist, verify them, and initialize the appropriate
+! FCB for them. In addition, update the WCB to reflect the entire file.
+!
+
+MAP_AREA = BUFFER + .BUFFER[FH1$B_MPOFFSET] * 2;
+IF .MAP_AREA[FM1$W_EX_FILNUM] NEQ 0 AND .MAP_AREA[FM1$W_EX_FILSEQ] NEQ 0
+THEN
+    BEGIN
+    MAP_POINTER = .MAP_AREA + FM1$C_POINTERS;
+    DECR J FROM .MAP_AREA[FM1$B_INUSE] TO 1 DO
+	BEGIN
+	INDEX_LBN = .MAP_POINTER[FM1$W_LOWLBN];
+	INDEX_LBN<16,8> = .MAP_POINTER[FM1$B_HIGHLBN];
+	INDEX_CNT = .MAP_POINTER[FM1$B_COUNT] + 1;
+	IF .HEADER_LBN GEQU .INDEX_LBN
+	AND .HEADER_LBN LSSU .INDEX_LBN + .INDEX_CNT THEN EXITLOOP;
+	MAP_POINTER = .MAP_POINTER + 4;
+	END;
+
+! Verify that the extension file header falls within the contiguous porition
+!
+
+    EXTENT_LBN = .HEADER_LBN + .MAP_AREA[FM1$W_EX_FILNUM] - 1;
+    IF .INDEX_LBN + .INDEX_CNT LSSU .EXTENT_LBN THEN ERR_EXIT (SS$_FILESTRUCT);
+    EXTENT_FID = .MAP_AREA[FM1$W_EX_FILNUM];
+    EXTENT_FID<16,16> = .MAP_AREA[FM1$W_EX_FILSEQ];
+
+! Read in the extent and add to the list.
+!
+
+    STATUS = READ_BLOCK (.EXTENT_LBN, BUFFER);
+    IF NOT .STATUS THEN ERR_EXIT (.STATUS);
+    IF NOT CHECK_HEADER (BUFFER, EXTENT_FID) THEN ERR_EXIT ();
+    PROTO_FCBE1[FCB$L_STVBN] = .PROTO_FCB[FCB$L_FILESIZE] + .PROTO_FCB[FCB$L_STVBN];
+    INIT_FCB (PROTO_FCBE1, BUFFER);
+    PROTO_FCB[FCB$L_FILESIZE] = .PROTO_FCB[FCB$L_FILESIZE] + .PROTO_FCBE1[FCB$L_FILESIZE];
+    PROTO_FCBE1[FCB$W_ACNT] = 1;
+    PROTO_FCBE1[FCB$L_HDLBN] = .EXTENT_LBN;
+
+! Update the prototype index file window.
+!
+
+    WCB_POINTER = PROTO_WCB + WCB$C_MAP;
+    EXTENT_VBN = 1;
+    INCR J FROM 1 TO .PROTO_WCB[WCB$W_NMAP] DO
+	BEGIN
+	EXTENT_VBN = .EXTENT_VBN + .WCB_POINTER[WCB$W_COUNT];
+	WCB_POINTER = .WCB_POINTER + 6;
+	END;
+    TURN_WINDOW1 (PROTO_WCB, BUFFER, 3, .EXTENT_VBN);
+
+    MAP_AREA = BUFFER + .BUFFER[FH1$B_MPOFFSET] * 2;
+    IF .MAP_AREA[FM1$W_EX_FILNUM] NEQ 0 AND .MAP_AREA[FM1$W_EX_FILSEQ] NEQ 0
+    THEN
+	BEGIN
+
+! Verify that the extent falls within the contiguous portion.
+!
+
+	EXTENT_LBN = .HEADER_LBN + .MAP_AREA[FM1$W_EX_FILNUM] - 1;
+	IF .INDEX_LBN + .INDEX_CNT LSSU .EXTENT_LBN THEN ERR_EXIT (SS$_FILESTRUCT);
+	EXTENT_FID = .MAP_AREA[FM1$W_EX_FILNUM];
+	EXTENT_FID<16,16> = .MAP_AREA[FM1$W_EX_FILSEQ];
+
+! Read in the extent and add it to the list
+!
+
+	STATUS = READ_BLOCK (.EXTENT_LBN, BUFFER);
+	IF NOT .STATUS THEN ERR_EXIT (.STATUS);
+	IF NOT CHECK_HEADER (BUFFER, EXTENT_FID) THEN ERR_EXIT ();
+	PROTO_FCBE2[FCB$L_STVBN] = .PROTO_FCBE1[FCB$L_FILESIZE] + .PROTO_FCBE1[FCB$L_STVBN];
+	INIT_FCB (PROTO_FCBE2, BUFFER);
+	PROTO_FCB[FCB$L_FILESIZE] = .PROTO_FCB[FCB$L_FILESIZE] + .PROTO_FCBE2[FCB$L_FILESIZE];
+	PROTO_FCBE2[FCB$W_ACNT] = 1;
+	PROTO_FCBE2[FCB$L_HDLBN] = .EXTENT_LBN;
+
+! Update the prototype index file window.
+!
+
+	WCB_POINTER = PROTO_WCB + WCB$C_MAP;
+	EXTENT_VBN = 1;
+	INCR J FROM 1 TO .PROTO_WCB[WCB$W_NMAP] DO
+	    BEGIN
+	    EXTENT_VBN = .EXTENT_VBN + .WCB_POINTER[WCB$W_COUNT];
+	    WCB_POINTER = .WCB_POINTER + 6;
+	    END;
+	TURN_WINDOW1 (PROTO_WCB, BUFFER, 3, .EXTENT_VBN);
+
+	END;
+    END;
+
+! Now read the storage map file header and find the starting LBN of the
+! storage map. Note that we skip the "storage control block", which may or
+! may not be represented by a separate retrieval pointer.
+!
+
+    STATUS = READ_BLOCK (.PROTO_VCB[VCB$L_IBMAPLBN] + .PROTO_VCB[VCB$B_IBMAPSIZE] + 1, BUFFER);
+    IF NOT .STATUS OR NOT CHECK_HEADER (BUFFER, UPLIT WORD (2, 2, 0))
+    THEN
+	BEGIN
+	ERR_MESSAGE (MOUN$_MAPHDRBAD);
+	PROTO_VCB[VCB$V_NOALLOC] = 1;
+	END
+
+    ELSE
+	BEGIN
+	MAP_AREA = BUFFER + .BUFFER[FH1$B_MPOFFSET]*2;
+	MAP_POINTER = .MAP_AREA + FM1$C_POINTERS;
+
+	BIAS = 1;				! assume one retrieval pointer
+	IF .MAP_AREA[FM1$B_INUSE] GTR 4
+	OR .MAP_AREA[FM1$B_INUSE] LSS 2
+	THEN ERR_EXIT (SS$_FILESTRUCT);	! more than 2 or no pointers
+	IF .MAP_AREA[FM1$B_INUSE] EQL 4
+	THEN
+	    BEGIN
+	    BIAS = 0;			! 2 pointers - use the second
+	    MAP_POINTER = .MAP_POINTER + 4;
+	    END;
+
+	COUNT = .(.MAP_POINTER)<8,8> + 1 - .BIAS;
+	LBN = .(.MAP_POINTER)<16,16>;
+	LBN<16,8> = .(.MAP_POINTER)<0,8>;
+	LBN = .LBN + .BIAS;
+
+	PROTO_VCB[VCB$L_SBMAPLBN] = .LBN;
+	PROTO_VCB[VCB$B_SBMAPSIZE] = .COUNT;
+
+! Read the first block of the storage map and write it back.  If the
+! write fails because the device is hardware write-locked, mark the
+! volume software write-locked and inform the user of the situation.
+! For the moment, ignore read errors, as they will be handled later.
+!
+
+	IF .MOUNT_OPTIONS [OPT_WRITE]
+	THEN
+	    IF READ_BLOCK (.LBN, BUFFER)
+	    THEN
+		IF NOT (STATUS = WRITE_BLOCK (.LBN, BUFFER))
+		THEN
+		    BEGIN
+		    IF .STATUS EQL SS$_WRITLCK
+		    THEN ERR_MESSAGE (MOUN$_WRITELOCK)
+		    ELSE ERR_MESSAGE (MOUN$_WRITESCB, 0, .STATUS);
+		    MOUNT_OPTIONS[OPT_WRITE] = 0;
+		    END;
+
+! Scan the storage map to compute the number of free blocks on the volume.
+!
+
+	FREE = 0;
+	DECR J FROM .COUNT TO 1 DO
+	    BEGIN
+	    MAP BUFFER : VECTOR;
+
+	    STATUS = READ_BLOCK (.LBN, BUFFER);
+	    IF NOT .STATUS
+	    THEN
+		BEGIN
+		ERR_MESSAGE (MOUN$_BITMAPERR, 0, .STATUS);
+		PROTO_VCB[VCB$V_NOALLOC] = 1;
+		END;
+
+	    INCR I FROM 0 TO 127 DO
+		BEGIN
+		X = .BUFFER[.I];
+		IF .X NEQ 0
+		THEN
+		    BEGIN
+		    B2 = 0;
+		    WHILE 1 DO
+			BEGIN
+			IF FFS (B2, %REF (32-.B2), X, B1)
+			THEN EXITLOOP;
+			FFC (B1, %REF (32-.B1), X, B2);
+			FREE = .FREE + .B2 - .B1;
+			IF .B2 GEQ 32 THEN EXITLOOP;
+			END;
+		    END;
+		END;
+	    LBN = .LBN + 1;
+	    END;
+
+	PROTO_VCB[VCB$L_FREE] = .FREE;
+	END;
+
+    END;				! end of Files-11 specific mount processing
+
+! Finally call the kernel mode routine to make it all real. Note that all the
+! hookups, including generating the mounted volume list entry, are done
+! within one kernel mode call so that they are uninterruptible by the user.
+!
+
+IF .MOUNT_OPTIONS[OPT_OVR_LOCK]
+THEN PROTO_VCB[VCB$V_NOALLOC] = 0;
+
+STATUS = KERNEL_CALL (MAKE_DISK_MOUNT);
+IF NOT .STATUS THEN ERR_EXIT (.STATUS);
+
+! Announce that the volume is mounted.
+!
+
+ERR_MESSAGE (MOUN$_MOUNTED, 3, VCB$S_VOLNAME, PROTO_VCB[VCB$T_VOLNAME], PHYS_NAME[0]);
+
+END;					! end of routine MOUNT_DISK
+
+ROUTINE MAKE_DISK_MOUNT =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine does all of the data base manipulation needed to get
+!	a volume actually mounted. It allocates the real VCB, FCB, and
+!	window, and hooks then all together. It also starts up the ACP
+!	gets the mounted volume list entry made.
+!
+!
+! CALLING SEQUENCE:
+!	MAKE_DISK_MOUNT ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	MOUNT parser data base
+!	own storage of this module
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1 if successful
+!	status values if not
+!
+! SIDE EFFECTS:
+!	volume mounted
+!
+!--
+
+BEGIN
+
+BUILTIN
+	INSQUE;
+
+LOCAL
+	WINDOW_SIZE,			! size in bytes needed for window
+	UCB		: REF BBLOCK,	! pointer to volume UCB
+	EXTENT1_FCB	: REF BBLOCK,	! pointer to first extent FCB
+	EXTENT2_FCB	: REF BBLOCK;	! pointer to second extent FCB
+
+EXTERNAL
+	MOUNT_OPTIONS	: BITVECTOR,	! command parser options
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	CHANNEL,			! channel assigned to device
+	HOME_BLOCK	: BBLOCK,	! buffer containing home block
+	OWNER_UIC,			! owner UIC from command
+	PROTECTION,			! volume protection from command
+	REAL_VCB	: REF BBLOCK,	! address of VCB allocated
+	REAL_FCB	: REF BBLOCK,	! address of FCB allocated
+	REAL_WCB	: REF BBLOCK,	! address of window allocated
+	CTL$GL_VOLUMES	: ADDRESSING_MODE (ABSOLUTE);
+					! count of volumes mounted by process
+
+EXTERNAL ROUTINE
+	GET_CHANNELUCB,			! get UCB assigned to channel
+	ALLOCATE_MEM,			! allocate system dynamic memory
+	START_ACP,			! start and connect ACP to device
+	SET_DATACHECK,			! set volume data check attributes
+	LOCK_IODB,			! lock I/O database mutex
+	UNLOCK_IODB,			! unlock I/O database mutex
+	ALLOC_LOGNAME,			! create logical name and MTL blocks
+	ENTER_LOGNAME,			! enter logical name and MTL in lists
+	SEND_ERRLOG;			! send message to error logger
+
+
+! Allocate all of the required control blocks. We allocate them in
+! advance to avoid having to back out of some awkward situations later on.
+! The one exception is the AQB, which is either found or allocated by
+! START_ACP.
+!
+
+ENABLE KERNEL_HANDLER;
+
+REAL_VCB = ALLOCATE_MEM (VCB$C_LENGTH, 0);
+REAL_VCB[VCB$B_TYPE] = DYN$C_VCB;
+CH$MOVE (VCB$C_LENGTH-11, PROTO_VCB+11, .REAL_VCB+11);
+
+IF NOT .MOUNT_OPTIONS[OPT_FOREIGN]
+THEN
+    BEGIN
+    REAL_VCB[VCB$L_FCBFL] = REAL_VCB[VCB$L_FCBFL];
+    REAL_VCB[VCB$L_FCBBL] = REAL_VCB[VCB$L_FCBFL];
+
+    REAL_FCB = ALLOCATE_MEM (FCB$C_LENGTH, 0);
+    REAL_FCB[FCB$B_TYPE] = DYN$C_FCB;
+    CH$MOVE (FCB$C_LENGTH-11, PROTO_FCB+11, .REAL_FCB+11);
+    REAL_FCB[FCB$L_WLFL] = REAL_FCB[FCB$L_WLFL];
+    REAL_FCB[FCB$L_WLBL] = REAL_FCB[FCB$L_WLFL];
+    INSQUE (.REAL_FCB, REAL_VCB[VCB$L_FCBFL]);
+
+! If extension headers exist, allocate room for them and link them into the list
+!
+
+    IF .PROTO_FCBE1[FCB$L_FILESIZE] NEQ 0
+    THEN
+	BEGIN
+	EXTENT1_FCB = ALLOCATE_MEM (FCB$C_LENGTH, 0);
+	EXTENT1_FCB[FCB$B_TYPE] = DYN$C_FCB;
+	CH$MOVE (FCB$C_LENGTH-11, PROTO_FCBE1+11, .EXTENT1_FCB+11);
+	REAL_FCB[FCB$L_EXFCB] = .EXTENT1_FCB;
+	EXTENT1_FCB[FCB$L_WLFL] = EXTENT1_FCB[FCB$L_WLFL];
+	EXTENT1_FCB[FCB$L_WLBL] = EXTENT1_FCB[FCB$L_WLFL];
+	INSQUE (.EXTENT1_FCB, REAL_FCB[FCB$L_FCBFL]);
+	IF .PROTO_FCBE2[FCB$L_FILESIZE] NEQ 0
+	THEN
+	    BEGIN
+	    EXTENT2_FCB = ALLOCATE_MEM (FCB$C_LENGTH, 0);
+	    EXTENT2_FCB[FCB$B_TYPE] = DYN$C_FCB;
+	    CH$MOVE (FCB$C_LENGTH-11, PROTO_FCBE2+11, .EXTENT2_FCB+11);
+	    EXTENT1_FCB[FCB$L_EXFCB] = .EXTENT2_FCB;
+	    EXTENT2_FCB[FCB$L_WLFL] = EXTENT2_FCB[FCB$L_WLFL];
+	    EXTENT2_FCB[FCB$L_WLBL] = EXTENT2_FCB[FCB$L_WLFL];
+	    INSQUE (.EXTENT2_FCB, EXTENT1_FCB[FCB$L_FCBFL]);
+	    END;
+	END;
+
+    WINDOW_SIZE = WCB$C_LENGTH + MAXU (.PROTO_WCB[WCB$W_NMAP] + 2, 6) * 6;
+    REAL_WCB = ALLOCATE_MEM (.WINDOW_SIZE, 0);
+    REAL_WCB[WCB$B_TYPE] = DYN$C_WCB;
+    CH$MOVE (.WINDOW_SIZE-11, PROTO_WCB+11, .REAL_WCB+11);
+    REAL_WCB[WCB$L_FCB] = .REAL_FCB;
+    INSQUE (.REAL_WCB, REAL_FCB[FCB$L_WLFL]);
+    END;
+
+ALLOC_LOGNAME (0);
+
+! All data blocks except the AQB are now allocated. First set up the
+! volume ownership and protection in the VCB. Now hook up the blocks
+! to the device data base and start the ACP.
+!
+
+UCB = GET_CHANNELUCB (.CHANNEL);
+REAL_VCB[VCB$L_RVT] = .UCB;
+
+UCB[UCB$V_UNLOAD] = 1;
+UCB[UCB$L_OWNUIC] = .VOLUME_UIC;
+IF .MOUNT_OPTIONS[OPT_OWNER_UIC]
+THEN UCB[UCB$L_OWNUIC] = .OWNER_UIC;
+
+IF .MOUNT_OPTIONS[OPT_FOREIGN]
+THEN UCB[UCB$W_VPROT] = %X'FF00'
+ELSE UCB[UCB$W_VPROT] = .HOME_BLOCK[HM1$W_PROTECT];
+IF .MOUNT_OPTIONS[OPT_PROTECTION]
+THEN UCB[UCB$W_VPROT] = .PROTECTION;
+
+IF NOT .MOUNT_OPTIONS[OPT_FOREIGN]
+THEN
+    BEGIN
+    REAL_WCB[WCB$L_ORGUCB] = .UCB;
+    START_ACP (.UCB, .REAL_VCB, AQB$K_F11V1);
+    END
+ELSE
+    BEGIN
+    LOCK_IODB ();
+    UCB[UCB$L_VCB] = .REAL_VCB;
+    UCB[UCB$L_DEVCHAR] = .UCB[UCB$L_DEVCHAR]
+			OR (DEV$M_MNT OR DEV$M_DIR OR DEV$M_FOR);
+    SET_DATACHECK (.UCB, 0);
+    UNLOCK_IODB ();
+    END;
+
+IF .MOUNT_OPTIONS[OPT_NOSHARE] AND .CLEANUP_FLAGS[CLF_DEALLOCATE]
+THEN UCB[UCB$V_DEADMO] = 1;
+
+IF NOT .MOUNT_OPTIONS[OPT_WRITE]
+THEN BBLOCK [UCB[UCB$L_DEVCHAR], DEV$V_SWL] = 1;
+
+! Enter the logical name for the volume; bump the user's volume mount count,
+! and make the error log entry for the mount.
+!
+
+ENTER_LOGNAME (.UCB, .REAL_VCB);
+CTL$GL_VOLUMES = .CTL$GL_VOLUMES + 1;
+SEND_ERRLOG (1, .UCB);
+
+RETURN 1;
+
+END;					! end of routine MAKE_DISK_MOUNT
+
+ROUTINE KERNEL_HANDLER (SIGNAL, MECHANISM) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is the condition handler for all of the kernel mode
+!	code. It undoes any damage done so far and returns the error
+!	status to the user mode caller.
+!
+!
+! CALLING SEQUENCE:
+!	KERNEL_HANDLER (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of signal vector
+!	ARG2: address of mechanism vector
+!
+! IMPLICIT INPUTS:
+!	global pointers to blocks allocated
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	stack unwound, allocations undone
+!
+!--
+
+BEGIN
+
+MAP
+	SIGNAL		: REF BBLOCK,	! signal vector
+	MECHANISM	: REF BBLOCK;	! mechanism vector
+
+LOCAL
+	P		: REF BBLOCK,	! pointer to scan system lists
+	UCB		: REF BBLOCK,	! UCB being mounted
+	AREA;				! allocation area code
+
+EXTERNAL
+	MOUNT_OPTIONS	: BITVECTOR,	! command parser options
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	CHANNEL,			! channel assigned to device
+	MAILBOX_CHANNEL,		! channel number of ACP mailbox
+	REAL_VCB	: REF BBLOCK,	! address of VCB allocated
+	REAL_FCB	: REF BBLOCK,	! address of FCB allocated
+	REAL_WCB	: REF BBLOCK,	! address of window allocated
+	REAL_AQB	: REF BBLOCK,	! address of AQB allocated
+	LOG_ENTRY	: REF BBLOCK,	! address of logical name allocated
+	MTL_ENTRY	: REF BBLOCK,	! address of mounted volume list entry
+	IOC$GL_AQBLIST	: REF BBLOCK ADDRESSING_MODE (ABSOLUTE);
+					! system AQB list
+
+EXTERNAL ROUTINE
+	GET_CHANNELUCB,			! get UCB address of channel
+	LOCK_IODB,			! interlock system I/O database
+	UNLOCK_IODB,			! unlock system I/O database
+	DEALLOCATE_MEM;			! deallocate system dynamic memory
+
+
+! Deallocate whatever control blocks exist to wherever they came from.
+!
+
+IF .SIGNAL[CHF$L_SIG_NAME] NEQ SS$_UNWIND
+THEN
+    BEGIN
+
+    IF .SIGNAL[CHF$L_SIG_ARGS] NEQ 3
+    THEN BUG_CHECK (UNXSIGNAL, FATAL, 'Unexpected signal in MOUNT');
+
+! If there is a mailbox in existence, deassign its channel, thereby
+! deleting the mailbox.
+!
+
+    IF .CLEANUP_FLAGS[CLF_DEASSMBX]
+    THEN
+	$DASSGN (CHAN = .MAILBOX_CHANNEL);
+
+! Clean up the UCB.
+!
+
+    UCB = GET_CHANNELUCB (.CHANNEL);
+    UCB[UCB$L_VCB] = 0;
+
+! If we have created an AQB but no ACP, we must remove the AQB from the
+! system list.
+!
+
+    IF .CLEANUP_FLAGS[CLF_DELAQB]
+    THEN
+	BEGIN
+	LOCK_IODB ();
+	P = .IOC$GL_AQBLIST;
+	IF .P EQL .REAL_AQB
+	THEN
+	    IOC$GL_AQBLIST = .REAL_AQB[AQB$L_LINK]
+	ELSE
+	    BEGIN
+	    UNTIL .P[AQB$L_LINK] EQL .REAL_AQB
+	    DO P = .P[AQB$L_LINK];
+	    P[AQB$L_LINK] = .REAL_AQB[AQB$L_LINK];
+	    END;
+	DEALLOCATE_MEM (.REAL_AQB, 0);
+	UNLOCK_IODB ();
+	END;
+
+    AREA = 2;				! assume process allocation area
+    IF .MOUNT_OPTIONS[OPT_GROUP]
+    OR .MOUNT_OPTIONS[OPT_SYSTEM]
+    THEN AREA = 1;			! system paged pool if system or group
+
+    IF .REAL_VCB NEQ 0
+    THEN DEALLOCATE_MEM (.REAL_VCB, 0);
+
+    IF .REAL_FCB NEQ 0
+    THEN DEALLOCATE_MEM (.REAL_FCB, 0);
+
+    IF .REAL_WCB NEQ 0
+    THEN DEALLOCATE_MEM (.REAL_WCB, 0);
+
+    IF .LOG_ENTRY NEQ 0
+    THEN DEALLOCATE_MEM (.LOG_ENTRY, .AREA);
+
+    IF .MTL_ENTRY NEQ 0
+    THEN DEALLOCATE_MEM (.MTL_ENTRY, .AREA);
+
+! Return the condition code in R0.
+!
+
+    MECHANISM[CHF$L_MCH_SAVR0] = .SIGNAL[CHF$L_SIG_NAME];
+    $UNWIND ();
+
+    END;
+END;					! end of routine KERNEL_HANDLER
+
+END
+ELUDOM

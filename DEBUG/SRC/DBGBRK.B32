@@ -1,0 +1,1654 @@
+MODULE DBGBRK ( IDENT = 'V03-000') =
+BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+! FACILITY:	DEBUG
+!
+!++
+! FUNCTIONAL DESCRIPTION:
+!	BREAK ACTION ROUTINES FOR VAX DEBUG FACILITY
+!
+! Version:	3.01
+!
+! History:
+!	Author:
+!		Carol Peters, 26 Jul 1976: Version 01
+!
+!	Modified by:
+!		Dale Roedger, 16 November 1978
+!		David Plummer, 3 Jul 80, DLP
+!		John Francis, 12 February 1982
+! Revision history:
+! 1.01	22-SEP-78	DAR	Deleted require files: VXPALT, DLLNAM.
+! 1.02	25-SEP-78	MCC	Deleted require file SYSLIT
+! 1.03	10-NOV-78	DAR	Added threaded breakpoints to the breakpoint table.
+! 1.04	16-NOV-78	DAR	Show watchpoints now loads dbg$gl_asci_len so
+!				watchpoints on string data are resymbolized 
+!				correctly.
+! 1.05  18-apr-80	ala	Added extra parameter to dbg$fao_put routine
+!				to indicate output buffer.
+! 1.06   3-Jul-80	DLP	Added primary descriptor pointer field, and entry
+!				point indication field to xpoint table. Added
+!				primary descriptor parameter to save_bpt. Added
+!				error return capability (instead of signals).
+! 3.01 12-Feb-82	JF	Fixed bug in FIND_WATCH for VAX-11/730
+!--
+
+! TABLE OF CONTENTS
+!--
+FORWARD ROUTINE
+	dbg$find_bpt,				! ROUTINE TO FIND A BREAKPOINT IN TABLES
+	dbg$find_watch,				! routine to identify a watchpoint
+	dbg$init_break : NOVALUE,		! ROUTINE TO INITIALIZE BREAKPOINT AREA
+	dbg$ins_opcodes : NOVALUE,		! INSERTS AN OPCODE FOR A BPT
+	dbg$rem_opcodes : NOVALUE,		! REMOVES ALL BREAKPOINTED OPCODES FOR BREAKPOINTS
+	dbg$save_bpt,				! ROUTINE TO SET A BREAKPOINT location
+	dbg$show_bpts,				! ROUTINE TO SHOW BREAKPOINTS
+	dbg$cancel_bpt;				! Routine to cancel breakpoints,
+						! watchpoints, and tracepoints.
+
+!
+! Require files:
+
+
+REQUIRE 'src$:dbgprolog.req';
+REQUIRE 'SRC$:DBGGEN.REQ';
+REQUIRE 'SRC$:BSTRUC.REQ';
+REQUIRE 'SRC$:SYSSER.REQ';
+REQUIRE 'SRC$:DBGMES.REQ';
+
+OWN
+	bpt_thread : LONG,			! Holds the address DBG$THREAD_BPT
+	bpt_instr  : INITIAL (bpt_instruction);	! Holds the breakpoint opcode
+
+
+EXTERNAL ROUTINE
+	dbg$map_to_reg_addr,			! Maps context reg addr to user_reg addr
+	dbg$nget_symid,				! Obtains symid list from prim. desc.
+	dbg$sta_lock_symid : NOVALUE,		! Saves an RST symid list
+	dbg$sta_unlock_symid : NOVALUE,		! Unlocks an RST symid list
+	dbg$ncopy_desc,				! Makes non-listed prim. desc. copy
+	dbg$nfree_desc,				! Releases a non_listed prim. desc.
+	dbg$nsymbolize,				! Produces symbolic info from prim. desc.
+	dbg$sho_optrace,			! Report on opcode tracing
+	dbg$fao_put : NOVALUE,			! Standard DEBUG I/O formatter.
+	dbg$ncopy,				! Copies dynamic storage
+	dbg$freerelease,			! ROUTINE TO RELEASE STORAGE 
+	dbg$freez,				! ROUTINE TO GET AND ZERO A BLOCK OF STORAGE
+	dbg$is_it_entry,			! sees whether an address is bound to
+						! a routine or entry point.
+	dbg$out_put : NOVALUE,			! Standard DEBUG I/O flush.
+	dbg$out_sym_val : NOVALUE,		! output values (symbolically)
+	dbg$read_access,			! checks read access protection
+	dbg$thread_bpt,				! Entry to DEBUG for threaded BPT
+	dbg$write_mem;				! ROUTINE TO WRITE TO USER'S MEMORY
+
+EXTERNAL
+	dbg$cp_out_str : VECTOR[,BYTE],		! Pointer to DEBUG output buffer
+	dbg$gl_runframe : ref block[,byte],	! Current saved set of regs, etc
+	dbg$gb_mod_ptr	: REF VECTOR [, BYTE],	! pointer to current mode settings
+	dbg$gl_asci_len,			! Length for string data.
+	dbg$gl_bpthead,				! HEAD OF BREAKPOINT CHAIN
+	dbg$gl_buf_siz,				! size of DEBUG output buffer.
+	dbg$gl_context: BITVECTOR,		! CONTEXT DESCRIPTOR WORD
+	dbg$gl_last_loc,			! last location referenced by user
+	dbg$gl_list: VECTOR;			! LINKED LIST FOR EXPRESSIONS
+
+BUILTIN
+	INSQUE,
+	REMQUE;
+
+LITERAL
+	bytes_per_page	= %X'200';
+
+LITERAL
+    	dbg_write	= 0,
+	dbg_brk		= 0,			! for debugging
+	dbg_brk1	= 0,			! ditto
+	dbg_brk2	= 0;			! for debugging watch
+
+MACRO
+	!++
+	! free_a_breakpt releases the storage for one breakpoint or
+	! tracepoint.
+	!--
+	free_a_breakpt (pointer) =
+		BEGIN
+
+		!++
+		! IF THE BREAKPOINT HAS AN ACTION BUFFER, THEN FREE THE
+		! STORAGE FOR THAT BUFFER BEFORE REMOVING THE LINK IN THE
+		! BREAKPOINT CHAIN. THE bpt_acnt HOLDS THE LENGTH OF THE ACTION
+		! BUFFER IN BYTES NOT INCLUDING THE COUNT BYTE.
+		!--
+		LOCAL
+			dummy_loc;
+
+		IF .bpt_aptr (pointer) NEQ 0
+		THEN dbg$freerelease (.bpt_aptr (pointer), (.bpt_acnt (pointer) + 1) / %UPVAL + 1);
+
+		! Release the storage for the primary descriptor if one is present
+
+		IF .bpt_prim (pointer) NEQA 0
+		THEN
+		    BEGIN
+		    LOCAL
+			dummy,
+			symid_list;
+
+		    ! Notify the RST to release symid's
+
+		    IF dbg$nget_symid (.bpt_prim (pointer), symid_list, dummy)
+		    THEN
+			dbg$sta_unlock_symid (.symid_list);
+
+		    ! Release the primary descriptor
+
+		    dbg$nfree_desc (.bpt_prim (pointer), dummy);
+
+		    END;
+
+		IF NOT REMQUE (pointer, dummy_loc)
+		THEN dbg$freerelease (pointer, overhead_bpt);
+		END%;
+
+! The following diagram is of a breakpoint, tracepoint, or watchpoint
+! entry. The picture is 32-bits wide and 32 bytes long.
+!
+!	!---------------------------------------!
+!	!		right link		!
+!	!---------------------------------------!
+!	!		left link		!
+!	!---------------------------------------!
+!	!	address of ?????-point		!
+!	!---------------------------------------!
+!	!  action buffer len. !   after count	!
+!	!---------------------------------------!
+!	! opcode ! accs ! type ! thpt ! length	!
+!	!---------------------------------------!
+!	!	action buffer address		!
+!	!---------------------------------------!
+!	!    original thread (if "thpt" TRUE)	!
+!	!---------------------------------------!
+!	!	primary descriptor pointer	!
+!	!---------------------------------------!
+!	! entry! xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx!
+!	!---------------------------------------!
+!	
+!
+! action buffer len.	- is 16 bits long and is the number of characters
+!			  in the "do" action buffer.
+! after count		- is 16 bits long and is the number of times the
+!			  breakpoint is to be encountered before it is reported
+!
+! opcode		- is 8 bits long and contains the original opcode for
+!			  breakpoints or tracepoints.
+!			- For watchpoints this is 2 4-bit fields that hold the
+!			  original protections for the page(s).
+! accs			- is a 2 bit field that indicates the access:
+!			  execute or write.
+! type			- is a 2 bit field that indicates the type of entry:
+!			  breakpoint, tracepoint, or watchpoint.
+! thpt			- is a 1 bit field that indicates if this entry is at
+!			  a thread.
+! length		- is a 16 bit field that holds the length of the
+!			  watchpoint.
+! action buffer addr.	- is 32 bits long and is the address of the "do" action
+!			  buffer, if there is none it is ZERO.
+! original thread	- is 32 bits long and is the address that was in the
+!			  position where the breakpoint or tracepoint was set.
+! primary desc. ptr.	- is 32 bits long and is the address of a primary descriptor
+!			  if one was supplied.
+! entry			- is 1 bit long. If true, then xpoint is on an entry point
+!
+!--
+
+GLOBAL ROUTINE dbg$find_bpt (address) =
+!++
+! Functional description:
+!	SEARCHES THE ENTIRE BREAKPOINT TABLE FOR A BREAKPOINT.
+!	RETURNS A pointer TO THE BREAKPOINT, ZERO IF NONE FOUND.
+!
+! Input parameters:
+!	address		- address OF BREAKPOINT TO FIND
+!
+! Implicit inputs:
+!	dbg$gl_bpthead, THE HEADER LINK IN THE BREAKPOINT CHAIN
+!
+! Output parameters:
+!	address OF BREAKPOINT entry FOR THIS BREAKPOINT, OR ZERO
+!	IF BREAKPOINT IS NOT FOUND.
+!
+! Implicit outputs:
+!	NONE
+!
+! Routine value:
+!	address OF BREAKPOINT entry OR ZERO
+!
+! Side effects:
+!	NONE
+!--
+
+	BEGIN
+
+	LOCAL
+		entry;
+
+	entry = .dll_rlink (.dbg$gl_bpthead);
+
+	!+
+	! Look at each entry in the breakpoint chain except the header link
+	! to see whether the address of the breakpoint matches the address
+	! passed to this routine. If it does, then return the pointer
+	! to the breakpoint entry. Otherwise, exit
+	! the loop when the address of an entry is the address of the
+	! header link.
+	!-
+	WHILE .entry NEQA .dbg$gl_bpthead
+	DO
+		BEGIN
+		IF .address EQLA .bpt_addr (.entry)
+		THEN RETURN .entry
+		ELSE entry = .dll_rlink (.entry);
+		END;
+
+	!+
+	! NO MATCH. RETURN ZERO
+	!-
+	RETURN 0
+	END;
+
+GLOBAL ROUTINE dbg$find_watch (address, table_entry_ptr) =
+!++
+! Functional description:
+!	Searches the break/trace/watchpoint table for an entry on the
+!	same page as this address or exactly the same as this address.
+!	If an exact match is found, then the address of the entry is
+!	returned to the caller in an output parameter. If a same
+!	page match is found, then the value TRUE is returned,
+!	but the output parameter contains an address of zero.
+!
+! Input parameters:
+!	address		- address to be compared against the table entries.
+!
+! Implicit inputs:
+!	dbg$gl_bpthead, the head of the break/trace/watchpoint table.
+!	We know that the number of bytes in a single VAX page is 200
+!	hexadecimal, represented by the literal bytes_per_page.
+!
+! Output parameters:
+!	table_entry_ptr	- place in which to return table entry address
+!
+! Implicit outputs:
+!	none
+!
+! Routine value:
+!	true if the address is on the same page as some watchpoint.
+!	Otherwise, false.
+!
+! Side effects:
+!	none
+!
+!--
+
+	BEGIN
+
+	MAP
+		table_entry_ptr	: REF VECTOR;
+
+	LOCAL
+		entry,			! address of current table entry
+		page_number,		! page on which a watchpoint exists
+		page_match;		! boolean variable, says whether
+					! a matching page has been found.
+
+	!+
+	! Initialize variables. The page number variable holds the 
+	! page containing the address passed as an input variable.
+	!-
+	page_number = .address / bytes_per_page;
+
+%IF dbg_brk2
+%THEN
+	$fao_tt_out ('address in find_watch is !XL, page is !SL', .address, .page_number);
+%FI
+
+	page_match = FALSE;
+	table_entry_ptr [0] = 0;
+	entry = .dll_rlink (.dbg$gl_bpthead);
+
+	!+
+	! Look at each entry in the table. If an entry is a watchpoint,
+	! see whether the address passed is exactly the watchpoint
+	! found, or simply an address that shares the page of the watchpoint.
+	! If any match or shared page is found, store the table entry address in
+	! the output parameter and set page_match to true.
+	!-
+	WHILE .entry NEQA .dbg$gl_bpthead
+	DO
+		BEGIN
+		IF .bpt_type (.entry) EQL watch_point
+		THEN
+			BEGIN
+
+%IF dbg_brk2
+%THEN
+			$fao_tt_out ('found a watchpoint at !XL, page !UL',
+				 .bpt_addr (.entry), .bpt_addr (.entry) / bytes_per_page);
+%FI
+			IF (.bpt_addr(.entry) LEQA .address)
+			AND (.address LEQA (.bpt_addr(.entry) + .bpt_leng(.entry)))
+			THEN
+				BEGIN
+
+%IF dbg_brk2
+%THEN
+				$fao_tt_out ('exact match with a watchpoint !XL',
+						.table_entry_ptr[0]);
+%FI
+
+				table_entry_ptr [0] = .entry;
+				RETURN TRUE
+				END;
+
+	IF ((.bpt_addr(.entry)/bytes_per_page) LEQA .page_number)
+	AND (.page_number LEQA ((.bpt_addr(.entry) + .bpt_leng(.entry))/bytes_per_page))
+			THEN
+				BEGIN
+				page_match = TRUE;
+				table_entry_ptr [0] = .entry;
+				END;
+			END;
+		entry = .dll_rlink (.entry);
+		END;
+
+	!+
+	! If any entry caused the page_match flag to be set, return
+	! true, otherwise return false.
+	!-
+
+	RETURN .page_match
+
+	END;
+
+GLOBAL ROUTINE dbg$init_break : NOVALUE =
+!++
+! Functional description:
+!	ALLOCATES AND SETS UP THE pointerS IN THE HEADER LINK OF THE
+!	BREAKPOINT CHAIN.
+!
+! Input parameters:
+!	none
+!
+! Implicit inputs:
+!	dbg$gl_bpthead, THE pointer TO THE HEAD OF THE BREAKPOINT CHAIN
+!
+! Output parameters:
+!	none
+!
+! Implicit outputs:
+!	dbg$gl_bpthead NOW HOLDS AN address
+!
+! Routine value:
+!	novalue
+!
+! Side effects:
+!	THE BREAKPOINT CHAIN HEADER LINK IS INITIALIZED
+!--
+
+	BEGIN
+
+	!+
+	! ALLOCATE A BREAKPOINT entry FOR THE HEADER LINK OF THE BREAKPOINT
+	! CHAIN.
+	!-
+	dbg$gl_bpthead = dbg$freez (2);
+
+	!+
+	! NOW WRITE THE TWO LINKS, EACH POINTING TO THE address OF THE
+	! FIRST LONGWORD OF THIS entry.
+	!-
+	dll_rlink (.dbg$gl_bpthead) = .dbg$gl_bpthead;
+	dll_llink (.dbg$gl_bpthead) = .dbg$gl_bpthead;
+	bpt_thread = dbg$thread_bpt;		! Initialize the OWN storage for
+						! threaded breakpoints.
+
+	END;
+
+GLOBAL ROUTINE dbg$ins_opcodes (user_pc_value) : NOVALUE =
+!++
+! Functional description:
+!	LOOKS FOR A BREAKPOINT IDENTIFIED BY ITS PC VALUE IN
+!	THE BREAKPOINT TABLE. IF IT EXISTS, THE OPCODE FOUND
+!	FOR THAT BREAKPOINT IS SUBSTITUTED FOR THE BPT INSTRUCTION
+!	AT THAT PC.
+!
+!	IF THE address PASSED TO THIS ROUTINE IS EQUIVALENT TO
+!	THE LITERAL all_bpts, THEN ALL OPCODES FOR ALL BREAKPOINTS
+!	ARE REINSERTED.
+!
+!	If the PC value matches a watchpoint (or all_bpts is specified),
+!	then the original protections of the watchpoints are
+!	reinstated.
+!
+! Input parameters:
+!	user_pc_value	- VALUE OF USER PC AT TIME OF BPT
+!
+! Implicit inputs:
+!	dbg$gl_bpthead, HEADER LINK IN BREAKPOINT CHAIN.
+!
+! Output parameters:
+!	none
+!
+! Implicit outputs:
+!	none
+!
+! Routine value:
+!	novalue
+!
+! Side effects:
+!	BPT INSTRUCTION REPLACED WITH PC'S ORIGINAL OPCODE
+!	Watchpoints set with original protection.
+!--
+
+	BEGIN
+
+	LOCAL
+		addr_range	: VECTOR [2],
+		entry;
+
+	IF .user_pc_value EQL all_bpts
+	THEN
+		BEGIN
+
+%IF dbg_brk1
+%THEN
+		$fao_tt_out ('inserting opcodes for all breakpoints');
+%FI
+
+ 		entry = .dll_rlink (.dbg$gl_bpthead);
+
+		!++
+		! FOR EACH ENTRY IN THE BREAKPOINT CHAIN EXCEPT THE
+		! HEADER LINK, ATTEMPT TO INSERT THE OPCODE. IF ANY
+		! INSERTION FAILS, QUIT. AFTER DOING AN INSERTION,
+		! MOVE TO THE NEXT ENTRY IN THE LINKED CHAIN, AND
+		! ONLY QUIT WHEN THE NEXT ENTRY IS THE HEADER LINK.
+		!--
+		WHILE .entry NEQA .dbg$gl_bpthead
+		DO
+			BEGIN
+
+			!++
+			! INSERT THE OPCODE FOR EACH BREAKPOINT, GOING
+			! ON TO THE NEXT AFTER THE OPCODE IS INSERTED.
+			! IF THE BREAKPOINT CAN NOT BE REPLACED, signal
+			! an error.
+			!--
+			IF .bpt_accs (.entry) EQL execute_watch
+			THEN
+			    BEGIN
+			    LOCAL
+				status;
+			    IF .bpt_thpt (.entry)	! Is this a "thread_point"
+			    THEN
+				status = dbg$write_mem (.bpt_addr(.entry), bpt_thrd(.entry), 4)
+			    ELSE
+			    	status = dbg$write_mem (.bpt_addr(.entry), bpt_opco(.entry), 1);
+			    IF NOT .status
+			    THEN
+				BEGIN
+				!++
+				! THE BREAKPOINT REMOVAL AND OPCODE INSERTION
+				! HAS FAILED. PUNT.
+				!--
+				SIGNAL (dbg$_nowopco);
+				RETURN
+				END;
+			    END;
+
+			IF .bpt_type (.entry) EQL watch_point
+			THEN
+				BEGIN
+				!++
+				! Set the protection of the
+				! watchpoint to its original state. If
+				! the set protection system service fails,
+				! signal fatal error.
+				!--
+				addr_range [0] = .bpt_addr (.entry);
+				addr_range [1] = .bpt_addr (.entry);
+
+%IF dbg_brk2
+%THEN
+				$fao_tt_out ('setting !XL to protection !SL', 
+					.bpt_addr (.entry), .bpt_pro1 (.entry));
+%FI
+
+				IF NOT $SETPRT (inadr = addr_range, prot = .bpt_pro1 (.entry))
+				THEN
+					BEGIN
+
+%IF dbg_brk2
+%THEN
+					$fao_tt_out ('failed to set protection on !XL',
+						.bpt_addr (.entry));
+%FI
+
+					SIGNAL (dbg$_nowprot);
+					RETURN
+					END;
+				IF (.bpt_addr(.entry) / bytes_per_page) NEQ
+					((.bpt_addr(.entry) + .bpt_leng(.entry)) / bytes_per_page)
+				THEN
+					BEGIN
+					!++
+					! End of variable being watched is
+					! on another page. Set that protection
+					! also.
+					!--
+					addr_range [0] = .bpt_addr(.entry) + .bpt_leng(.entry);
+					addr_range [1] = .bpt_addr(.entry) + .bpt_leng(.entry);
+
+%IF dbg_brk2
+%THEN
+					$fao_tt_out ('setting !XL to protection !SL',
+						.addr_range [0], .bpt_pro2 (.entry));
+%FI
+
+					IF NOT $SETPRT (inadr = addr_range, prot = .bpt_pro2 (.entry))
+					THEN
+						BEGIN
+
+%IF dbg_brk2
+%THEN
+						$fao_tt_out ('failed to set protection on !XL',
+							.addr_range [0]);
+%FI
+
+						SIGNAL (dbg$_nowprot);
+						RETURN
+						END;
+					END;
+				END;
+			entry = .dll_rlink (.entry);
+			END;
+
+		IF .dbg$gl_runframe[dbg$l_bpt_pc] NEQ 0
+		THEN
+		    IF NOT dbg$write_mem (.dbg$gl_runframe[dbg$l_bpt_pc],
+					  dbg$gl_runframe[dbg$b_bpt_ins], 1)
+		    THEN
+			BEGIN
+			SIGNAL (dbg$_nowopco);
+			RETURN
+			END;
+
+		!++
+		! ALL OPCODES ARE INSERTED.
+		!--
+		RETURN
+		END;
+
+
+	IF dbg$find_watch (.user_pc_value, entry)
+	THEN
+	BEGIN
+	!++
+	! This is a watchpoint or a location on the same
+	! page as a watchpoint. Restore its original
+	! protection. If this fails, signal fatal error.
+	!--
+	addr_range [0] = .bpt_addr (.entry);
+	addr_range [1] = .bpt_addr (.entry);
+
+%IF dbg_brk2
+%THEN
+	$fao_tt_out ('setting !XL to protection !SL', .bpt_addr (.entry), .bpt_pro1 (.entry));
+%FI
+
+	IF NOT $SETPRT (inadr = addr_range, prot = .bpt_pro1 (.entry))
+	THEN
+		BEGIN
+
+%IF dbg_brk2
+%THEN
+		$fao_tt_out ('failed to set protection on !XL', .bpt_addr (.entry));
+%FI
+
+		SIGNAL (dbg$_nowprot);
+		RETURN
+		END;
+	IF (.bpt_addr(.entry) / bytes_per_page) NEQ
+		((.bpt_addr(.entry) + .bpt_leng(.entry)) / bytes_per_page)
+	THEN
+		BEGIN
+		addr_range [0] =  .bpt_addr(.entry) + .bpt_leng(.entry);
+		addr_range [1] =  .bpt_addr(.entry) + .bpt_leng(.entry);
+%IF dbg_brk2
+%THEN
+		$fao_tt_out ('setting !XL to protection !SL', .addr_range [0], .bpt_pro2 (.entry));
+%FI
+
+		IF NOT $SETPRT (inadr = addr_range, prot = .bpt_pro2 (.entry))
+		THEN
+			BEGIN
+
+%IF dbg_brk2
+%THEN
+			$fao_tt_out ('failed to set protection on !XL', .addr_range [0]);
+%FI
+
+			SIGNAL (dbg$_nowprot);
+			RETURN
+			END;
+		END;
+	END;
+
+	END;
+
+GLOBAL ROUTINE dbg$rem_opcodes (addr_of_no_bpt) : NOVALUE =
+!++
+! Functional description:
+!	For each break/tracepoint in the breakpoint table, remove the
+!	opcode at that address and replace it with a breakpoint
+!	instruction. For each watchpoint, protec the page as
+!	requested in the SET WATCH commands.
+!
+! Input parameters:
+!	addr_of_no_bpt	- The PC location where we do not want a BPT stored
+!			  if there happens to be a break set.  A value of zero
+!			  indicates replace all breakpointed instructions.
+!
+! Implicit inputs:
+!	dbg$gl_bpthead, header link in breakpoint chain
+!
+! Output parameters:
+!	none
+!
+! Implicit outputs:
+!	none
+!
+! Routine value:
+!	novalue
+!
+! Side effects:
+!	The program is modified as instructed by the user so that DEBUG
+!	can gain control when desired.
+!--
+
+	BEGIN
+
+	LOCAL
+		entry;
+
+
+%IF dbg_brk1
+%THEN
+	$fao_tt_out ('removing all breakpointed opcodes');
+%FI
+
+	IF .dbg$gl_runframe[dbg$l_bpt_pc] NEQ 0
+	THEN
+	    IF NOT dbg$write_mem (.dbg$gl_runframe[dbg$l_bpt_pc], bpt_instr, 1)
+	    THEN
+		BEGIN
+		SIGNAL (dbg$_nowbpt);
+		RETURN
+		END;
+
+	entry = .dll_rlink (.dbg$gl_bpthead);
+	WHILE .entry NEQA .dbg$gl_bpthead
+	DO
+		BEGIN
+		!++
+		! For each breakpoint and tracepoint, insert a breakpoint
+		! instruction for each opcode. If the opcode at the 
+		! break/tracepoint address is different from the opcode
+		! stored in the table, rewrite the new opcode into the
+		! table. If the opcode cannot be written signal a fatal
+		! error.
+		!--
+		IF .bpt_accs(.entry) EQL execute_watch
+		THEN
+		    BEGIN
+		    LOCAL
+			bpt_address: REF VECTOR [, BYTE];
+
+		    bpt_address = .bpt_addr(.entry);	! Get address of breakpoint.
+		    IF .bpt_thpt(.entry)		! Is this a "thread_point" ?
+		    THEN
+			bpt_thrd(.entry) = ..bpt_address	! Get current thread
+		    ELSE
+			bpt_opco(.entry) = .bpt_address [0];	! Get the current opcode
+
+%IF dbg_brk1
+%THEN
+			$fao_tt_out ('removing opcode !XB at !XL',
+				.bpt_opco (.entry), .bpt_addr (.entry));
+%FI
+
+		    IF .addr_of_no_bpt NEQ .bpt_address
+		    THEN
+			BEGIN
+			LOCAL
+			    status;
+
+			IF .bpt_thpt(.entry)	! Is this a "thread_point" ?
+			THEN
+			    status = dbg$write_mem (.bpt_addr(.entry), bpt_thread, 4)
+			ELSE
+			    status = dbg$write_mem (.bpt_addr(.entry), bpt_instr, 1);
+			IF NOT .status
+			THEN
+			    BEGIN
+			    !++
+			    ! THE OPCODE REMOVAL AND BREAKPOINT INSERTION
+			    ! HAS FAILED. TELL THE USER.
+			    !--
+			    SIGNAL (dbg$_nowbpt);
+			    RETURN
+			    END;
+			END
+		    END
+		ELSE
+		    IF .bpt_type (.entry) EQL watch_point
+		    THEN
+			BEGIN
+			!++
+			! This is a watchpoint. Set its protection to
+			! disallow read or write (or both) access. If
+			! the protection cannot be set, signal fatal
+			! error.
+			!--
+			LOCAL
+				addr_range	: VECTOR [2];
+
+			addr_range [0] = .bpt_addr (.entry);
+			addr_range [1] = .bpt_addr (.entry);
+
+%IF dbg_brk2
+%THEN
+			$fao_tt_out ('setting !XL to protection !SL', .bpt_addr (.entry), prt$c_ur);
+%FI
+
+			IF NOT $SETPRT (inadr = addr_range, prot = prt$c_ur)
+			THEN
+				BEGIN
+				!++
+				! The protection could not be set. Signal
+				! fatal error.
+				!--
+
+%IF dbg_brk2
+%THEN
+				$fao_tt_out ('failed to set protection on !XL', .addr_range [0]);
+%FI
+
+				SIGNAL (dbg$_nowprot);
+				RETURN
+				END;
+
+			!++
+			! Now calculate whether the end of the range
+			! being watched is on the same or a different page.
+			! If different, set that page's protection too.
+			!--
+			IF (.bpt_addr(.entry) / bytes_per_page) NEQ
+				((.bpt_addr(.entry) + .bpt_leng(.entry)) / bytes_per_page)
+			THEN
+				BEGIN
+				addr_range [0] = .bpt_addr(.entry) + .bpt_leng(.entry);
+				addr_range [1] = .bpt_addr(.entry) + .bpt_leng(.entry);
+
+%IF dbg_brk2
+%THEN
+				$fao_tt_out ('setting !XL to protection !SL',
+					.addr_range [0],
+					prt$c_ur);
+%FI
+
+				IF NOT $SETPRT (inadr = addr_range, prot = prt$c_ur)
+				THEN
+					BEGIN
+					!++
+					! Protection setting failed.
+					! Signal fatal error.
+					!--
+
+%If dbg_brk2
+%THEN
+					$fao_tt_out ('failed to set protection on !XL',
+						.addr_range [0]);
+%FI
+
+					SIGNAL (dbg$_nowprot);
+					RETURN
+					END;
+				END;
+			END;
+		entry = .dll_rlink (.entry);
+		END;
+
+	!++
+	! ALL BREAKPOINT INSTRUCTIONS ARE INSERTED.
+	!--
+	END;
+
+GLOBAL ROUTINE dbg$save_bpt (location, action_addr, after_count, prim_desc) =
+		
+!++
+! Functional description:
+!	STORES THE BREAKPOINT OR TRACEPOINT address, opcode, AND OTHER INFORMATION
+!	IN THE BREAKPOINT TABLE.  The routine also checks
+!	that the insertion of BPTs, which we don't actually
+!	do till much later, will go OK, so that we can complain
+!	about the error to the user now instead of when
+!	he tries to start up this program.
+!
+!	This routine gets called from perform_cmd when the context bit
+!	[dbg$k_set_break] was set by the action routine, DBG$break_setup,
+!	which gets called when someone says "SET B addr".
+!
+!	Note that this routine has been modified to conform to version 3 error
+!	handling.
+!
+! Input parameters:
+!	location	- THE address AT WHICH THE BREAK IS TO OCCUR
+!	action_addr	- THE address OF THE ACTION BUFFER (for BREAKs)
+!	after_count	- The /AFTER count (for BREAKs)
+!			- The size of the watchpoint for "typed" variables.
+!	prim_desc	- The address of a primary descriptor
+!	[message_vect]	- Optional. Address of a longword to contain address of
+!			  a message argument vector.
+!
+! Implicit inputs:
+!	-dbg$gl_bpthead IS THE address OF THE HEADER LINK IN THE
+!	BREAKPOINT LINKED LIST.
+!	-A context bit must be set to say which kind of
+!	 break/trace/watch point we are to SAVE.
+!
+! Output parameters:
+!	NONE
+!
+! Implicit outputs:
+!	NONE
+!
+! Routine value:
+!	Unsigned integer longword completion code
+!
+! Completion code:
+!	sts$k_success (1)	- Success. Xpoint set.
+!
+!	sts$k_severe  (4)	- Failure. Xpoint not set. 
+!
+! Side effects:
+!	-INSERTS A NEW entry IN THE BREAKPOINT TABLE. 
+!	-Replaces the opcode INSTRUCTION WITH A BPT INSTRUCTION.
+!	-Causes an error message to be produced if either of the
+!	 above cannot be done OK.  In this case everything, including
+!	 protection codes, etc, remains as it was before the
+!	 call to this routine.
+!	-Except for the temporary breakpoint (from EXC - see above),
+!	DEBUG's '.' (dbg$gl_last_loc) gets set to the address on which
+!	the break/trace/watch point was set.
+!--
+
+	BEGIN
+
+	BUILTIN
+		ACTUALCOUNT,
+		ACTUALPARAMETER;
+
+	MAP
+		location : REF VECTOR [, BYTE],
+		action_addr : REF VECTOR [, BYTE];
+
+	LOCAL
+		dummy,					! Dummy parameter
+		symid_list,				! Pointer to RST symid list
+		prim_desc_copy,				! address of primary desc copy
+		adjus_location	: REF VECTOR [, BYTE],	! holds breakpoint's actual location
+		opcode		: BYTE,			! actual opcode at breakpoint
+		entry,					! address of table entry
+		prev_prot_one : BYTE,			! protection of starting byte
+		prev_prot_two : BYTE,			! protection of ending byte
+		length,					! length of watchpoint in bytes
+		entry_flag;				! If true, then entry pt.
+
+
+	! Set up version 3 error handling
+
+	set_flag(4);
+
+%IF dbg_brk
+%THEN
+	$fao_tt_out ('setting break or trace at !XL', .location);
+%FI
+
+	! Make a copy of the primary descriptor out of non-volatile storage
+	! if one was supplied.
+
+	IF .prim_desc NEQA 0
+	THEN
+	    BEGIN
+
+	    ! Obtain symid list
+
+	    IF dbg$nget_symid (.prim_desc, symid_list, dummy)
+	    THEN
+		BEGIN
+		
+		! Copy the primary descriptor
+
+		IF dbg$ncopy_desc (.prim_desc, prim_desc_copy, dummy)
+		THEN
+		    dbg$sta_lock_symid (.symid_list);	! Lock symids
+
+	        END
+	    ELSE
+		BEGIN
+		prim_desc_copy = 0;
+		END;
+	    END
+	ELSE
+	    prim_desc_copy = 0;
+
+	adjus_location = .location;
+
+	!+
+	! If the location of the break/tracepoint corresponds exactly to
+	! the name of a routine, then set the actual breakpoint
+	! at the routine's address plus the entry mask offset.
+	!-
+
+	entry_flag = false;
+
+	IF .dbg$gl_context [dbg$k_trace] OR .dbg$gl_context [dbg$k_break]
+	THEN IF dbg$is_it_entry (.adjus_location)
+	THEN 
+	    BEGIN
+	    adjus_location = .adjus_location + 2;
+	    entry_flag = true;
+	    END;
+
+	!+
+	! See whether the location is readable. If not, a SIGNAL will
+	! be generated and DEBUG unwound.
+	!-
+	IF if_flag
+	THEN
+	    IF NOT dbg$read_access (.adjus_location, 1, if_param)
+	    THEN
+		BEGIN
+		RETURN sts$k_severe;
+		END
+	    ELSE
+		BEGIN
+		0;
+		END
+	ELSE
+	    dbg$read_access (.adjus_location, 1);
+
+	!+
+	! In the case of break/tracepoint, besides being readable now,
+	! the location must also be writable later when we really want
+	! to insert the BPT.  Check this by
+	! writing what we know is there into there.  
+	! (Since write_mem does all the changing and restoring
+	!  of protection, etc).
+	!-
+	IF .dbg$gl_context [dbg$k_break] OR .dbg$gl_context [dbg$k_trace]
+	THEN
+		BEGIN
+		opcode = .adjus_location[0];
+
+%IF dbg_brk
+%THEN
+		$fao_tt_out('save_bpt: writing !XB into location !XL',
+			.opcode,.adjus_location);
+%FI
+
+		IF NOT dbg$write_mem (.adjus_location, opcode, 1)
+		THEN
+			BEGIN
+			IF_SIGNAL (DBG$_NOACCESSW, 1, .adjus_location);
+			RETURN sts$k_severe;
+			END;
+		END
+	ELSE
+		BEGIN
+
+		!+
+		! Try to set the protection of the watchpoint to
+		! no write. If this fails, punt the
+		! command. In the course of protection setting, calculate
+		! the length of the watchpoint by calling a symbol table
+		! routine. If a symbol name cannot be found, just use the
+		! default length for the number of bytes.
+		!-
+		LOCAL
+			reg_addr,
+			addr_range	: VECTOR [2];		! holds addresses for $SETPRT
+%IF dbg_brk2
+%THEN
+		$fao_tt_out ('setting watchpoint at !XL for !XL',
+			.adjus_location, .after_count);
+%FI
+		!+
+		! The user is not permitted to set a watchpoint in P1 space
+		!-
+		IF (.adjus_location GEQA P1_SPACE) AND (.adjus_location LSSA SYSTEM_SPACE)
+		THEN
+			BEGIN
+			IF_SIGNAL (DBG$_BADWATCH, 1, .adjus_location);
+			RETURN sts$k_severe;
+			END;
+
+		!+
+		! The user is not permitted to set a watchpoint on a variable
+		! bound to either the context regs or the user runframe regs
+		!-
+
+		IF dbg$map_to_reg_addr (.adjus_location, reg_addr)
+		THEN
+			BEGIN
+			IF_SIGNAL (DBG$_NOWATTAR);
+			RETURN sts$k_severe;
+			END;
+
+		IF .adjus_location GEQA dbg$gl_runframe [dbg$l_user_regs]
+					AND
+		   .adjus_location LSSA dbg$gl_runframe [dbg$l_user_regs] + 68
+		THEN
+			BEGIN
+			IF_SIGNAL (DBG$_BADWATCH, 1, .adjus_location);
+			RETURN sts$k_severe;
+			END;
+
+		IF .after_count NEQ 0
+		THEN
+		    BEGIN
+		    length = .after_count - 1;
+		    END
+		ELSE
+		    length = 3;
+
+%IF dbg_brk2
+%THEN
+		$fao_tt_out ('length is !SL bytes, setting !XL to user read-only',
+				.length+1, .adjus_location);
+%FI
+
+		!+
+		! Now set the protection on the starting byte. Save the
+		! old protection in a local variable.
+		!-
+		addr_range [0] = .adjus_location;
+		addr_range [1] = .adjus_location;
+		IF NOT $SETPRT (inadr = addr_range,
+				prot = prt$c_ur,
+				prvprt = prev_prot_one)
+		THEN
+			BEGIN
+			IF_SIGNAL (DBG$_BADWATCH, 1, .adjus_location);
+			RETURN sts$k_severe;
+			END;
+		
+%IF dbg_brk2
+%THEN
+		$fao_tt_out ('old protection of start was !SL', .prev_prot_one);
+%FI
+
+		!+
+		! Now set the protection back to its original state. It
+		! will be protected as requested just before the user
+		! program starts.
+		!-
+		IF NOT $SETPRT (inadr = addr_range, prot = .prev_prot_one)
+		THEN
+			BEGIN
+			IF_SIGNAL (dbg$_nowprot);
+			RETURN sts$k_severe;
+			END;
+
+		!+
+		! If the final byte is on a different page, set the
+		! protection of that page also. Save the old protection
+		! in another local variable.
+		!-
+		IF (.adjus_location / bytes_per_page) NEQ
+			((.adjus_location + .length) / bytes_per_page)
+		THEN
+			BEGIN
+			addr_range [0] = .adjus_location + .length;
+			addr_range [1] = .adjus_location + .length;
+			IF NOT $SETPRT (inadr = addr_range,
+					prot = prt$c_ur,
+					prvprt = prev_prot_two)
+			THEN
+				BEGIN
+				IF_SIGNAL (DBG$_BADWATCH, 1, .adjus_location+.length-1);
+				RETURN sts$k_severe;
+				END;
+	
+			!+
+			! Now reset protection to its original state.
+			!-
+			IF NOT $SETPRT (inadr = addr_range, prot = .prev_prot_two)
+			THEN
+				BEGIN
+				IF_SIGNAL (dbg$_nowprot);
+				RETURN sts$k_severe;
+				END;
+			END
+		ELSE prev_prot_two = .prev_prot_one;
+
+%IF dbg_brk2
+%THEN
+		$fao_tt_out ('old protection of end was !SL', .prev_prot_two);
+%FI
+
+		END;
+
+	!+
+	! See if the break/trace/watchpoint is already set.
+	!-
+	entry = dbg$find_bpt (.adjus_location);
+
+	IF .entry EQL 0
+	THEN
+		BEGIN
+		entry = dbg$freez (overhead_bpt);
+		INSQUE (.entry, .dbg$gl_bpthead);
+		END;
+
+	!+
+	! THE NEW LINK IS MADE. NOW STORE THE APPROPRIATE INFORMATION.
+	! THE opcode IS SAVED, THE address OF THE BREAKPOINT OR TRACEPOINT
+	! IS SAVED, AND THE address OF THE ACTION BUFFER IS saved.
+	!-
+	IF .dbg$gl_context [dbg$k_trace]
+	THEN
+	    BEGIN
+	    bpt_type (.entry) = trace_point;
+	    bpt_aftc(.entry) = 1;
+	    END
+	ELSE
+	    IF .dbg$gl_context [dbg$k_break]
+	    THEN
+		BEGIN
+		bpt_type (.entry) = break_point;
+%if dbg_brk
+%then
+		$fao_tt_out('after_count = !SL',.after_count);
+%FI
+		! Fill in the after count field.  We note that
+		! this field is only 1 word long, and that
+		! it must be positive and signed.  After writing
+		! this field in, we extract it again so that we
+		! can inform the user of a possible number truncation.
+
+		bpt_aftc(.entry) = .after_count<0,15,0>;
+		
+		IF .bpt_aftc(.entry) NEQ .after_count
+		THEN
+		    SIGNAL (DBG$_NUMTRUNC);
+		END
+	    ELSE			! This must be a watchpoint !!
+		BEGIN
+		bpt_type (.entry) = watch_point;
+		bpt_accs (.entry) = write_watch;
+		bpt_leng (.entry) = .length;
+		bpt_pro1 (.entry) = .prev_prot_one;
+		bpt_pro2 (.entry) = .prev_prot_two;
+		END;
+
+	IF .bpt_type (.entry) NEQ watch_point
+	THEN
+	    BEGIN
+	    bpt_accs (.entry) = execute_watch;
+	    IF .dbg$gl_context[dbg$k_thread]
+	    THEN
+		BEGIN
+		bpt_thpt(.entry) = TRUE;
+		bpt_thrd(.entry) = ..adjus_location;	! Save Original thread.
+		END
+	    ELSE
+		bpt_opco (.entry) = .adjus_location [opcode_byte];
+	    END;
+
+	bpt_addr (.entry) = .adjus_location;
+	bpt_aptr (.entry) = .action_addr;
+	IF .action_addr NEQA 0
+	THEN
+	    bpt_acnt (.entry) = .action_addr [0]
+	ELSE
+	    bpt_acnt (.entry) = 0;
+
+
+	! Fill in the primary descriptor and entry point fields
+
+	bpt_prim (.entry) = .prim_desc_copy;
+	bpt_enty (.entry) = .entry_flag;
+
+	!+
+	! The DEBUG symbol '.', which corresponds to DBG$GL_LAST_LOC,
+	! is supposed to get set to where a break/trace/watch point
+	! has just been set.
+	!-
+	dbg$gl_last_loc = .adjus_location;
+
+	RETURN sts$k_success;
+
+END;
+
+GLOBAL ROUTINE dbg$show_bpts =
+!++
+! Functional description:
+!	Displays all user-set BREAK/TRACE/WATCH points, and their
+!	status, and for SHOW TRACE, reports on any opcode
+!	tracing which may be in effect.
+!
+!	NOTE: This routine has been modified to conform to the message argument
+!	vector method of reporting errors.
+!
+! Input parameters:
+!	
+!	Accepts an optional parameter which, if supplied, should be the address
+!	of a longword to contain the address of a message argument vector for errors.
+!
+! Implicit inputs:
+!	dbg$gl_bpthead, THE HEADER LINK IN THE BREAKPOINT CHAIN.
+!
+! Output parameters:
+!	NONE
+!
+! Implicit outputs:
+!	NONE
+!
+! Routine value:
+!	NOVALUE
+!
+! Side effects:
+!	Either the report or an error message is issued.
+!--
+
+	BEGIN
+
+	BUILTIN
+		ACTUALCOUNT,
+		ACTUALPARAMETER;
+
+	LOCAL
+		dummy,
+		string_desc : BLOCK [8,BYTE],
+		output_buffer : VECTOR[ TTY_OUT_WIDTH, BYTE],
+		found_one,
+		entry;
+
+	! Set up the optional message argument vector flag
+
+	set_flag (0);
+
+	! Initialize the string descriptor
+
+	string_desc [dsc$b_dtype] = dsc$k_dtype_t;
+	string_desc [dsc$b_class] = dsc$k_class_s;
+	string_desc [dsc$a_pointer] = 0;
+	string_desc [dsc$w_length] = 0;
+
+%IF dbg_brk1
+%THEN
+	$fao_tt_out ('showing breakpoints');
+%FI
+
+	found_one = FALSE;
+	entry = .dll_rlink (.dbg$gl_bpthead);
+
+	WHILE .entry NEQA .dbg$gl_bpthead
+	DO
+		BEGIN
+		LOCAL
+			at_pc,
+			ENTRY_CS : CS_POINTER;
+
+		! Set up to do standard DEBUG I/O
+
+		dbg$cp_out_str = output_buffer +1;
+		dbg$gl_buf_siz = 0;
+		!+
+		! See if the break or trace point is
+		! on a routine entry point.  If this is true, 
+		! then we must have set the BPT on 2 bytes past
+		! where the routine begins.  In this case
+		! we perpend the message with 'routine ', 
+		! and announce (symbolically or otherwise)
+		! the break_at address 2 less than what it
+		! really is.  This is done so that
+		! what we announce is the same thing you gave to
+		! set the break, and is the same as what you give
+		! to cancel the break.
+		!-
+		entry_cs = uplit(%ascic '');  ! empty string
+		at_pc = .bpt_addr(.entry);
+
+		IF .dbg$gl_context [dbg$k_break]
+			        OR
+		   .dbg$gl_context [dbg$k_trace]
+		THEN
+		    IF ( dbg$is_it_entry( .bpt_addr(.entry) -2 ) )
+		    THEN
+			BEGIN
+			at_pc = .at_pc -2;
+			entry_cs = uplit(%ascic 'routine ');
+			END;
+
+		SELECTONE TRUE OF
+		    SET
+
+		    [.dbg$gl_context[dbg$k_break]]:
+			IF (.bpt_type (.entry) EQL break_point)
+			THEN
+				BEGIN
+				dbg$fao_put( output_buffer, 
+    					 UPLIT( %ASCIC '!ACbreakpoint ' ),
+    						.entry_cs);
+
+				! Report unusual /AFTER counts.
+
+				IF( .BPT_AFTC(.ENTRY) NEQ 1 )
+				THEN
+					dbg$fao_put( output_buffer, 
+    						uplit( %ascic '/after:!SW '),
+    						.bpt_aftc(.entry));
+				dbg$fao_put( output_buffer, 
+    					uplit( %ascic 'at '));
+
+				! If a primary descriptor is available, use it
+				! to symbolize
+
+				IF .bpt_prim (.entry) NEQA 0
+				THEN
+				    BEGIN
+				    IF NOT dbg$nsymbolize (.bpt_prim (.entry),
+							   string_desc, dummy)
+				    THEN
+					dbg$out_sym_val (.at_pc, long_length,
+							 no_override, output_buffer)
+				    ELSE
+					dbg$fao_put (output_buffer,
+						     UPLIT BYTE (%ASCIC '!AS'),
+						     string_desc);
+				    END
+				ELSE
+				    dbg$out_sym_val( .at_pc, long_length, 
+    					             no_override, output_buffer);
+
+				! See if there is an action buffer
+
+				IF( .BPT_ACNT( .entry ) NEQ 0 )
+				THEN
+					dbg$fao_put( output_buffer, 
+    						UPLIT( %ASCIC ' do (!AC)'),
+						.BPT_APTR(.entry));
+				found_one = TRUE;
+%IF dbg_write
+%THEN
+    $fao_tt_out('OUTPUT SHOULD BE DONE IN dbg$show_bpts NOW:');
+%FI
+
+				dbg$out_put (output_buffer);
+				END;
+
+		    [.dbg$gl_context[dbg$k_trace]]:
+			IF (.bpt_type (.entry) EQL trace_point)
+			THEN
+				BEGIN
+				    dbg$fao_put( output_buffer, 
+    					UPLIT( %ASCIC '!ACtracepoint at ' ),
+    				    .entry_cs);
+
+				    ! If a primary descriptor is available, use it
+				    ! to symbolize
+
+				    IF .bpt_prim (.entry) NEQA 0
+				    THEN
+				        BEGIN
+				        IF NOT dbg$nsymbolize (.bpt_prim (.entry),
+							   string_desc, dummy)
+				        THEN
+					    dbg$out_sym_val (.at_pc, long_length,
+							 no_override, output_buffer)
+				        ELSE
+					    dbg$fao_put (output_buffer,
+						     UPLIT BYTE (%ASCIC '!AS'),
+						     string_desc);
+				        END
+				    ELSE
+				        dbg$out_sym_val( .at_pc, long_length, 
+    					             no_override, output_buffer);
+				    found_one = TRUE;
+
+%IF dbg_write
+%THEN
+    $fao_tt_out('OUTPUT SHOULD BE DONE IN dbg$show_bpts NOW:');
+%FI
+				    dbg$out_put (output_buffer);
+				END;
+
+		    [.dbg$gl_context[dbg$k_watch]]:
+			IF (.bpt_type (.entry) EQL watch_point)
+			THEN
+				BEGIN
+				dbg$gl_asci_len = .bpt_leng(.entry) + 1;
+				dbg$fao_put (output_buffer, 
+    					UPLIT (%ASCIC 'watchpoint at '));
+
+				! If a primary descriptor is available, use it
+				! to symbolize
+
+				IF .bpt_prim (.entry) NEQA 0
+				THEN
+				    BEGIN
+				    IF NOT dbg$nsymbolize (.bpt_prim (.entry),
+							   string_desc, dummy)
+				    THEN
+					dbg$out_sym_val (.at_pc, long_length,
+							 no_override, output_buffer)
+				    ELSE
+					dbg$fao_put (output_buffer,
+						     UPLIT BYTE (%ASCIC '!AS'),
+						     string_desc);
+				    END
+				ELSE
+				    dbg$out_sym_val( .at_pc, long_length, 
+    					             no_override, output_buffer);
+				dbg$fao_put (output_buffer, 
+    					UPLIT (%ASCIC ' for !UW. bytes.'),
+    					.dbg$gl_asci_len);
+				found_one = TRUE;
+
+%IF dbg_write
+%THEN
+    $fao_tt_out('OUTPUT SHOULD BE DONE IN dbg$show_bpts NOW:');
+%FI
+				dbg$out_put (output_buffer);
+				END;
+		    TES;
+
+		entry = .dll_rlink (.entry);
+		END;
+	SELECTONE TRUE OF
+	    SET
+
+	    [.dbg$gl_context[dbg$k_break]]:
+		BEGIN
+		IF NOT .found_one
+		THEN IF_SIGNAL (dbg$_nobreaks);
+		END;
+
+	    [.dbg$gl_context[dbg$k_watch]]:
+		BEGIN
+		IF NOT .found_one
+		THEN IF_SIGNAL (dbg$_nowatches);
+		END;
+
+	    [.dbg$gl_context[dbg$k_trace]]:
+		BEGIN
+		IF .found_one
+		THEN	dbg$sho_optrace()
+		ELSE
+			IF ( NOT dbg$sho_optrace() )
+			THEN	IF_SIGNAL (dbg$_notraces);
+		END;
+	    TES;
+	RETURN sts$k_success;
+	END;
+
+GLOBAL ROUTINE dbg$cancel_bpt (break_address)  =
+!++
+! Functional description:
+!	This routine will cancel the break, trace, or watchpoint at the user
+!	specified address.  It also has the capability of canceling all the
+!	break, trace, and watchpoints or any one group of them.
+!
+!	NOTE: This routine has been modified to optionally use the message
+!	argument vector of reporting errors.
+!
+!
+! Input parameters:
+!	break_address	- The address of the break, trace, or watchpoint to
+!			  be canceled.
+!			- This input may be one of four literal values, indicating
+!			  special operation.
+!	"all_bpts" (-1)	- cancel all breakpoints, tracepoints, and watchpoints.
+!	"all_break"(-2)	- cancel all breakpoints.
+!	"all_trace"(-3)	- cancel all tracepoints.
+!	"all_watch"(-4)	- cancel all watchpoints.
+!
+!	This routine accepts an optional second parameter which, if supplied,
+!	should be the address of a longword to containt the address of a message
+!	argument vector. If this parameter is supplied, this routine returns the
+!	message that it would have otherwise signaled.
+!
+! Implicit inputs:
+!	THE LINKED LIST that IS THE BREAKPOINT TABLE, WHICH IS
+!	POINTED TO BY dbg$gl_bpthead.
+!
+! Implicit outputs:
+!	LINKS IN THE BREAKPOINT CHAIN ARE READJUSTED.
+!
+! Routine value:
+!	NOVALUE
+!
+! Side effects:
+!	ONE OR ALL BREAKPOINTS ARE SWITCHED
+!--
+
+	BEGIN
+
+	BUILTIN
+		ACTUALCOUNT,
+		ACTUALPARAMETER;
+
+	LOCAL
+		error_code,	! Holds the potential siganl code.
+		entry,		! HOLDS CURRENT entry
+		next_entry;	! HOLDS STORAGE address OF NEXT entry
+
+	! set up the message argument vector
+
+	set_flag (1);
+%IF dbg_brk
+%THEN
+	$fao_tt_out ('canceling breakpoints');
+%FI
+	! Calculate the error code we will SIGNAL.
+
+	error_code = 	(IF .dbg$gl_context [dbg$k_break]
+			THEN dbg$_nosuchbpt
+			ELSE IF .dbg$gl_context [dbg$k_watch]
+			     THEN dbg$_nosuchwpt
+			     ELSE dbg$_nosuchtpt);
+
+	entry = .dll_rlink (.dbg$gl_bpthead);	! Pick up the first element
+
+	!++
+	! Examine each breakpoint in the breakpoint chain. If it matches
+	! the breakpoint (s) specified to be canceled, then cancel it.
+	! Otherwise go on to the next. If the end of the chain is reached,
+	! return. Also return after canceling a single breakpoint if only
+	! that was specified.
+	!--
+	WHILE .entry NEQ .dbg$gl_bpthead
+	DO
+		BEGIN
+		next_entry = .dll_rlink (.entry);
+		IF .break_address EQL .bpt_addr (.entry)
+		THEN
+			BEGIN
+			IF (.dbg$gl_context [dbg$k_break] AND (.bpt_type (.entry) EQL break_point))
+			OR (.dbg$gl_context [dbg$k_trace] AND (.bpt_type (.entry) EQL trace_point))
+			OR (.dbg$gl_context [dbg$k_watch] AND (.bpt_type (.entry) EQL watch_point))
+			THEN
+				BEGIN
+				free_a_breakpt (.entry);
+				RETURN sts$k_success;
+				END
+			ELSE
+				BEGIN
+				IF_SIGNAL(.error_code);
+				! no return
+				END;
+			END
+		ELSE
+			BEGIN
+			SELECTONE .break_address OF
+			SET
+			[all_bpts]:	free_a_breakpt (.entry);
+
+			[-2]:		IF (.bpt_type (.entry) EQL break_point)
+					THEN free_a_breakpt (.entry);
+
+			[-3]:		IF (.bpt_type (.entry) EQL trace_point)
+					THEN free_a_breakpt (.entry);
+
+			[-4]:		IF (.bpt_type (.entry) EQL watch_point)
+					THEN free_a_breakpt (.entry);
+			TES;
+			END;
+		entry = .next_entry;
+		END;
+
+	IF .break_address LSSU -4
+	THEN  IF_SIGNAL (.error_code);
+
+	RETURN sts$k_success;
+
+	END;
+
+END
+ELUDOM

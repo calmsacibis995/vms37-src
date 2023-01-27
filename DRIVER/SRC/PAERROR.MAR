@@ -1,0 +1,1020 @@
+	.TITLE	PAERROR
+	.IDENT	'V03-004'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1981, 1982                                                *
+;*  BY DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASS.			    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND  COPIED  *
+;*  ONLY  IN  ACCORDANCE  WITH  THE  TERMS  OF  SUCH  LICENSE AND WITH THE  *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE.  THIS SOFTWARE OR  ANY  OTHER  *
+;*  COPIES  THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY  *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE  IS  HEREBY  *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS SUBJECT TO CHANGE  WITHOUT  NOTICE  *
+;*  AND  SHOULD  NOT  BE  CONSTRUED  AS  A COMMITMENT BY DIGITAL EQUIPMENT  *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE OR  RELIABILITY  OF  ITS  *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;*									    *
+;****************************************************************************
+;
+;++
+;
+; FACILITY:
+;
+;	VAX/VMS EXECUTIVE, I/O DRIVERS
+;
+; ABSTRACT:  ROUTINES TO HANDLE CI VIRTUAL CIRCUIT RECOVERY
+;
+; AUTHOR:  N. KRONENBERG,  DECEMBER 1981
+;
+; MODIFIED BY:
+;
+;	V03-004	NPK2019		N. Kronenberg		6-Apr-1982
+;		Changed DISP_ENTRY to global ERR$DISP_ENTRY.
+;		Add routine ERR$CRASH_PORT.
+;		Fix illegal CDT state in NOTIFY_SYSAP to be nonfatal
+;		bugcheck with recovery rather than fatal bugcheck.
+;		Fix PB lookup failure in ERR$VCCLOSED_MSG to crash VC.
+;		Change queue interlock failure in FLUSH_Q to be non
+;		fatal bugcheck.
+;		Fix CHK_NO_CDTS to get remote port from PB and use
+;		$TURNMSG.
+;		Fix CLEANUP_PKTS to reset logout area longwd immediately
+;		after processing entry.
+;
+;	V03-003	NPK2018		N. Kronenberg		29-Mar-1982
+;		Modified ERR$CRASHVC_PB to use dg buffer in PB for
+;		SETCKT instead of allocating buffer.
+;		Broke ERR$DISC_VCFAIL into main routine and new
+;		subroutine, CHK_NO_CDTS.
+;		Made disconnect on power failure synchronous --
+;		it suspends till CDT is actually removed.
+;		Modified CONNECT_ABO and DCONNECT_OK in NOTIFY_SYSAP
+;		to call CHK_NO_CDTS.
+;
+;	V03-002	NPK2018		N. Kronenberg		25-Mar-1982
+;		Fix ERR$DISC_PWFAIL to purge out command queues again.
+;
+;	V03-001	NPK2016		N. Kronenberg		18-Mar-1982
+;		Fixed .TITLE
+;
+;
+;--
+
+	.SBTTL	DEFINITIONS
+
+;
+; Set PSECT to driver code:
+;
+
+	.PSECT	$$$115_DRIVER, LONG
+
+;
+; System definitions (LIB.MLB)
+;
+
+
+	$CDTDEF				; Connection Descriptor offsets
+	$IPLDEF				; Define priority levels
+	$PBDEF				; Path Blk offsets
+	$PDTDEF				; Port Descriptor offsets
+	$SCSDEF				; SCS message formats
+	$UCBDEF				; UCB definitions
+
+;
+; PADRIVER definitions (PALIB.MLB):
+;
+
+	$PAPBDEF			; PA-specific extension to PB
+	$PAPDTDEF			; PA-specific extension to PDT
+	$PAREGDEF			; CI port device register defns
+	$PAUCBDEF			; PA extension to UCB
+	$PPDDEF				; PPD layer of msg/dg header
+
+
+	.SBTTL	ERR$CRASHVC_MSG,	CRASH THE VC SPECIFIED
+	.SBTTL	-			BY A RESPONSE PKT
+	.SBTTL	ERR$CRASHVC_PB,		CRASH VC ON SPECIFIED
+	.SBTTL	-			PATH BLOCK
+
+;+
+; These routines are called to crash an open virtual circuit on
+; a specific path.  ERR$CRASHVC_MSG looks up the PB corresponding to
+; the remote port number in a given message/datagram.  It then
+; calls ERR$CRASHVC_PB.  ERR$CRASHVC_PB sets VC failure in progress
+; status in the PB and does a SETCKT closed to the remote port.  Return
+; is then taken since the SETCKT response will continue the process of
+; cleaning up the broken VC.
+;
+; In case the response pkt is a REQID or other datagram type pkt,
+; there may be no path block.  In this case, return is taken without
+; doing anything.
+;
+; Inputs:
+;
+;	IPL			-Fork IPL
+;	R2			-Addr of msg/dg response (ERR$CRASHVC_MSG)
+;	R3			-Addr of PB (ERR$CRASHVC_PB)
+;	R4			-PDT addr
+;
+;	VC state		-open
+;
+;	(SP)			-Return from ERR$CRASHVC_MSG/PB
+;
+; Outputs:
+;
+;	R0-R1			-Destroyed
+;	Other registers		-Preserved;  in particular, the msg/dg
+;				 pointed to by R2 is not disposed of --
+;				 that is the caller's responsibility
+;-
+
+	.ENABL	LSB
+
+ERR$CRASHVC_MSG::
+
+	PUSHL	R3			; Save caller's R3
+	BSBW	CNF$LKP_PB_MSG		; Get path block addr in R3
+	BLBC	R0,5$			; Branch if no PB found
+	MOVL	R1,R3			; Copy PB addr to useful register
+	BSBB	ERR$CRASHVC_PB		; Close VC on this path
+
+5$:	POPL	R3			; Restore caller's R3
+	RSB				; Return
+
+ERR$CRASHVC_PB::
+
+	PUSHL	R2			; Save caller's R2
+	CMPW	PB$W_STATE(R3),-	; Is virtual circuit failure
+		#PB$C_VC_FAIL		;  already in progress?
+	BEQL	10$			; Branch if so
+	MOVW	#PB$C_VC_FAIL,-		; Set VC failure in progress
+		PB$W_STATE(R3)		;  on this PB
+	MOVL	PB$L_CLSCKT_DG(R3),R2	; Get addr of SETCKT dg in PB
+	$SETCKT	-			; Tell port to mark VC closed
+		PORT=PB$B_RSTATION(R3),-;  to this remote station
+		PRIORITY=HIGH,-		; Do SETCKT at top priority
+		MASK=#PPD$M_CST,-	;  to close VC
+		MVAL=#0,-		;
+		RETFLAG=TRUE,-		; Get response to reclaim buffer
+		NOTIFY=TRUE		; Ask interrupt serv to notify us
+10$:	POPL	R2			; Restore caller's R2
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	ERR$VC_CLOSED_MSG,	HANDLE VC CLOSED ON
+	.SBTTL	-			PATH SPECIFIED BY
+	.SBTTL	-			MSG/DG
+	.SBTTL	ERR$VC_CLOSED_PB,	HANDLE VC CLOSED ON
+	.SBTTL	-			SPECIFIED PATH BLOCK
+
+;+
+; ERR$VCCLOSED_MSG looks up the path block corresponding to 
+; the specified message.  It then calls ERR$VCCLOSED_PB.
+; ERR$VCCLOSED_PB sets virtual circuit failure in progress in
+; the path block and scans the CDT list for that path.  For
+; each open CDT found, the SYSAP's error entry is called to notify the
+; SYSAP of the virtual circuit failure.  The SYSAP may, in the course
+; of reclaiming threads (CDRP's) in progress, cause new traffic to be
+; sent to the port.  This happens with apparent success, e.g., new
+; SEND_MSG_BUF's do not yield errors.  The SYSAP may issue a DISCONNECT
+; as part of its error routine, or may defer the DISCONNECT till later.
+;
+; When all SYSAP's owning open CDT's have had their error entries called,
+; then ERR$VCCLOSED_PB calls CDF$REMOVE_PB to claen up the configuration 
+; database if there were no CDT's on this path block.
+;
+; CDT's in non-open states are handled in various ways:
+;
+;	State			Action
+;
+;	CLOSED			Nonfatal bugcheck since a closed CDT
+;				should never be linked to a PB.
+;
+;	CON_ACK			Terminate the connect call with
+;				VCBROKEN status
+;
+;	DISC_ACK		Terminate disconnect with success status
+;
+;	CON_REC			Call the SYSAP's error routine.
+;
+;	DISC_REC		Ignore this CDT since the SYSAP will
+;				eventually DISCONNECT anyway.
+;
+;	CON_SENT		Terminate connect call with VCBROKEN
+;				status
+;
+;	DISC_SENT		Terminate disconnect with success status
+;
+;	REJ_SENT		Terminate disconnect with success status
+;
+;	ACCP_SENT		Terminate accept call with VCBROKEN status
+;
+;	LISTEN			Nonfatal bugcheck since a listen CDT
+;				should never be linked to the PB
+;
+;	DISC_MTCH		Terminate disconnect with success status
+;
+; Inputs:
+;
+;	IPL			-Fork IPL
+;
+;	R1			-Failure reason (VMS status code)
+;	R2			-Addr of RSP (ERR$VCCLOSED_MSG)
+;	R3			-Addr of failing PB (ERR$VCCLOSED_PB)
+;	R4			-PDT addr
+;
+;	VC state		-Closed by port
+;
+;	(SP)			-Return from ERR$VCCLOSED_MSG/PB
+;
+; Outputs:
+;
+;	R0,R1			-Destroyed
+;	Other registers		-Preserved;  in particular, the msg/dg
+;				 pointed to in ERR$VCCLOSED_MSG
+;				 call is not disposed of.  That is
+;				 the caller's responsibility.
+;-
+
+	.ENABL	LSB
+
+ERR$VCCLOSED_MSG::
+
+	PUSHR	#^M<R1,R2,R3>		; Save caller's registers 
+	BSBW	CNF$LKP_PB_MSG		; Get PB associated with msg
+	BLBC	R0,CONFIG_ERR		; Branch if no PB
+	MOVL	R1,R3			; Copy PB addr to useful register
+	POPL	R1			; Retreive the aux status
+	BSBB	ERR$VCCLOSED_PB		; Handle PB gone down
+	MOVQ	(SP)+,R2		; Restore caller's R2, R3
+	RSB				; Return
+
+ERR$VCCLOSED_PB::
+
+	MOVW	#PB$C_VC_FAIL,-		; Set path blk to VC failure
+		PB$W_STATE(R3)		;  in progress state
+	TSTL	PB$L_CDTLST(R3)		; Any CDT's on this PB?
+	BNEQ	10$			; Branch if so
+	BSBW	CNF$REMOVE_PB		; Else remove PB/SB
+	RSB				; Return
+
+10$:	MOVZWL	#SS$_VCBROKEN,R0	; Set status for SYSAP error routine
+	BSBW	NOTIFY_SYSAP		; Handle all CDT's in list
+	RSB				; Return
+
+CONFIG_ERR:
+
+					;***Log event
+	BSBW	ERR$CRASH_PORT		; Init port crash
+	POPR	#^M<R1,R2,R3>		; Restore caller's registers
+	RSB				; Return to caller to drain
+					;  response
+
+	.DSABL	LSB
+
+	.SBTTL	ERR$CRASH_PORT,		INIT PORT CRASH
+
+;+
+; ERR$CRASH_PORT is called by interrupt service detecting a hardware
+; error or by the driver at fork IPL detecting an error which might
+; be either a software error or a port hardware or firmware error.
+;
+; Action is to maintenance init the port to prevent further activity,
+; and, if there are any error retries left, to call ERR$PWF_RECOV
+; in simulation of a power fail recovery.  If no retries are left,
+; then PUP is cleared in PDT$W_LPORT_STS to prevent the port from being
+; reinitialized.  ERR$PWF_RECOV initiates a fork process on the UCB
+; which takes care of notifying SYSAPs and cleaning up the configuration
+; database eventually.  The main difference between deliberately crashing
+; the port and a real power failure is that in the crash case, cached
+; packets are not written to the logout area by the port and hence may not
+; be reclaimed.
+;
+; Inputs:
+;
+;	R4			-PDT addr
+;
+;	(SP)			-Caller's PC
+;
+; Outputs:
+;
+;	R0,R1			-Destroyed
+;
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+ERR$CRASH_PORT::
+
+	BBSS	#PDT$V_PWF_CLNUP,-	; Set PWF cleanup in progress
+		PDT$W_LPORT_STS(R4),20$	;  Branch if set already
+	PUSHR	#^M<R2,R3,R4,R5>	; Save registers
+	MOVL	#PA_PMC_M_MIN,-		; Maintenance init the port
+		@PDT$L_PMC(R4)		;
+	MOVL	PDT$L_UCB0(R4),R5	; Get UCB addr
+	BICW	#UCB$M_ONLINE,-		; Set unit offline to show init
+		UCB$W_STS(R5)		;  in progress
+	MOVZWL	#SS$_ABORT,R1		; Assume we have more retries,
+					;  but let SYSAP know not to
+					;  expect cached entries back
+	DECB	UCB$B_ERTCNT(R5)	; Decr retry count
+	BGEQ	10$			; Branch if not out of retries
+	MOVZWL	#SS$_CTRLERR,R1		; Else set aux status to tell
+					;  SYSAP's port won't return
+	BICW	#PDT$M_PUP,-		; Also fake power off to prevent
+		PDT$W_LPORT_STS(R4)	;  reinit when all SYSAP's notified
+
+10$:	BSBW	ERR$PWF_RECOV		; Treat like power failure from here on
+	POPR	#^M<R2,R3,R4,R5>	; Restore registers
+
+20$:	RSB				; Return to caller
+
+	.DSABL	LSB
+
+	.SBTTL	ERR$PWF_RECOV,		NOTIFY SYSAPS WITH 
+	.SBTTL	-			CONNECTIONS ON POWER
+	.SBTTL	-			FAILED PORT
+
+;+
+; ERR$PWF_RECOV is called by unit initialization on power fail
+; recovery or by port interrupt service on power down.
+; ERR$PWF_RECOV forks to lower IPL to the SCS syncronization
+; level.  Next, all formative path blocks on this PDT (i.e., START
+; handshakes in progress) are looked up and formative PB's and SB's are
+; deallocated to pool.
+;
+; ERR$PWF_RECOV then calls CNF$LKP_PB_PDT to look up PB's associated with 
+; the failed PDT.  CNF$LKP_PB_PDT calls us back as a coroutine for each
+; PB found.  For each PB, the CDT list is searched and, for each open CDT,
+; the SYSAP error address is called with appropriate status.  SYSAP 
+; DISCONNECTs issued as a result of error routines being called continue 
+; the failure process.  (See routine ERR$DISC_PWFAIL for more info.)
+;
+; CDT's in non-open states are handled the same as described in ERR$VCCLOSED_MSG.
+;
+; Inputs:
+;
+;	IPL			-IPL$_POWER or device IPL
+;	
+;	R1			-Aux status to report to SYSAP
+;	R5			-UCB 0 addr
+;
+;	Port state		-Uninitialized/maint;  PDT/PQB 
+;				 logout area contains a list of
+;				 port cached entries.
+;
+;	PDT$W_LPORT_STS		-PWF_CLNUP set to show powerfail
+;				 cleanup in progress.
+;				 PUP set if called from system 
+;				 powerfail recovery to show power up.
+;				 PUP clear if called from port interrupt
+;				 on power down to show power not
+;				 recovered yet.
+;
+;	(SP)			-Return to caller in unit initialization
+;				 or interrupt service.
+;
+; Outputs:
+;
+;	IPL			-IPL --> IPL$_SCS and return taken to
+;				 unit init;  The unit is set offline
+;				 and registers preserved on return to
+;				 unit init.
+;-
+
+	.ENABL	LSB
+
+ERR$PWF_RECOV::
+
+	BICW	#UCB$M_ONLINE,-		; Set unit offline to show
+		UCB$W_STS(R5)		;  that it's uninitialized
+	MOVL	R1,R3			; Copy aux status to register
+					;  that will be preserved over fork
+	BBCC	#UCB_V_FKLOCK,-		; Is UCB fork blk in use?
+		UCB$W_DEVSTS(R5),10$	; If so, clear use bit and
+	REMQUE	(R5),R5			;  and remove from fork list
+
+10$:	IOFORK				; Fork with new PC to lower
+					;  IPL (returns to unit init)
+	MOVL	UCB$L_PDT(R5),R4	; Get PDT addr
+
+;
+; Clean up formative path and system blocks on this PDT:
+;
+
+	MOVAQ	PDT$Q_FORMPB(R4),R2	; Get addr of formative PB 
+					;  listhead
+	MOVL	(R2),R3			; Get next formative PB
+	
+20$:	CMPL	R3,R2			; Back at listhead?
+	BEQL	50$			; Branch if so
+	MOVL	PB$L_SB(R3),R0		; Else get formative SB
+	BEQL	30$			; Branch if no SB
+	JSB	G^COM$DRVDEALMEM	; Else deallocate SB to pool
+
+30$:	BBCC	PB$B_RSTATION(R3),-	; Turn off known port bit in
+		PDT$B_PORTMAP(R4),40$	;  bitmap
+40$:	MOVL	R3,R0			; Copy PB addr for deallocator
+	MOVL	(R3),R3			; Get addr of next formative PB
+	JSB	G^COM$DRVDEALMEM	; Deallocate PB to pool
+	BRB	20$			; Go for next formative PB
+
+50$:	MOVL	R2,(R2)			; Set formative pathblock
+	MOVL	R2,4(R2)		;  to empty
+
+;
+; Remove all packets from port command queues, response queue,
+; free queues, and the logout area.  All packets are returned to
+; pool except send datagrams which are flagged 'return to sysap.'
+; These are returned to the SYSAP just as if they had gone out 
+; normally.
+;
+
+	BSBW	CLEANUP_PKTS		; Call packet cleanup routine
+
+;
+; Clean up fully open paths and system blocks on this PDT:
+;
+
+	BSBW	CNF$LKP_PB_PDT		; Look up 1st/next PB
+					; Start of coroutine if PB found:
+	BLBC	R0,55$			; Branch if no more PB's
+	MOVW	#PB$C_PWR_FAIL,-	; Set PB state to pwr fail
+		PB$W_STATE(R3)		;  in progress
+	TSTL	PB$L_CDTLST(R3)		; Does this PB have any connections?
+	BNEQ	60$			; Branch if so
+	BSBW	CNF$REMOVE_PB		; Else kill of this PB
+	TSTW	PDT$W_PBCOUNT(R4)	; Any PB's left on this PDT?
+	BNEQ	90$			; Branch if so, can't clean up port
+
+55$:	BSBW	CALL_INIT_PORT		; Try port hardware init
+	RSB				; Continue PB search
+
+60$:	MOVZWL	#SS$_VCBROKEN,R0	; Set status info for
+	MOVZWL	UCB$L_FR3(R5),R1	;  for SYSAP error routine
+	BSBW	NOTIFY_SYSAP		; Handle all CDT's in list
+
+90$:	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	ERR$DISC_VCFAIL,	PROCESS DISCONNECT CALL
+	.SBTTL	-			FOR CDT ON FAILING PB
+
+;+
+; ERR$DISC_VCFAIL is called by FPC$DCONNECT when the SYSAP issues a 
+; DISCONNECT for a connection associated with a path block that has
+; a virtual circuite failure in progress.  The CDT is placed in a
+; virtual circuit fail state.  If this is the last CDT on the path
+; block to be DISCONNECTed, then a marker message is sent to the
+; port.  Receipt of the error response for the marker (handled in
+; ERR$CACHECLR) tells us that the port cache is completely purged
+; of all command queue entries for this virtual circuit.
+;
+; Inputs:
+;
+;	IPL			-Fork IPL
+;
+;	R1			-Addr of PB
+;	R3			-Addr of CDT being DISCONNECTed
+;	R4			-Addr of PDT
+;
+;	CDT$W_STATE(R3)		-Any except CLOSED
+;
+;	(SP)			-Addr of return to SYSAP
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+ERR$DISC_VCFAIL::
+
+	$DISPATCH	-		; Dispathc on CDT state:
+		CDT$W_STATE(R3),-	;
+		<-			;
+		<CDT$C_CON_REC,	20$>,-	;  Connect received on LISTEN,
+		<CDT$C_VC_FAIL,	30$>,-	;  DISCONNECT already isssued,
+		>			;  All other states:
+
+	MOVW	#CDT$C_VC_FAIL,-	; Set state to VC failure
+		CDT$W_STATE(R3)		;
+
+10$:	BSBW	CHK_NO_CDTS		; Send cache clear if all
+					;  CDTs have been disconnected
+	MOVL	R5,CDT$L_FR5(R3)	; Suspend this DISCONNECT
+	POPL	CDT$L_FPC(R3)		;  until cache is clear
+	RSB				; Return to caller's caller
+
+20$:	BSBW	SCS$FREE_LISTEN		; Put CDT back in LISTEN state
+	BRB	10$			; Join common check for no CDT's
+
+30$:	MOVZWL	#SS$_NORMAL,R0		; Return success to SYSAP
+	RSB				; 
+
+	.DSABL	LSB
+
+	.SBTTL	ERR$DISC_PWFAIL,	PROCESS DISCONNECT CALL
+	.SBTTL	-			FOR CDT ON POWER 
+	.SBTTL	-			FAILED PORT
+
+;+
+; ERR$DISC_PWFAIL is called by FPC$DCONNECT when the SYSAP issues
+; a DISCONNECT for a connection associated with a power failed port.
+; (Path block state = PB$C_PWR_FAIL.)  In this case the local
+; port is nonfunctional and action is to deallocate CDTs as they
+; are DISCONNECTed after purging out the command queues of any SEND's
+; the SYSAP may have done since being notified at its error entry.
+;
+; If this is the last CDT on this path block, the path block (and
+; system block) is removed and an attempt made to reinit the
+; port hardware.
+;
+; Inputs:
+;
+;	IPL			-Fork IPL
+;	
+;	R1			-Addr of PB
+;	R3			-Addr of CDT being DISCONNECTed
+;	R4			-Addr of PDT
+;
+;	CDT$W_STATE		-Any except CLOSED or VC_FAIL
+;
+;	(SP)			-Addr of return to FPC$DCONNECT
+;
+; Outputs:
+;
+;	R0-R3			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+ERR$DISC_PWFAIL::
+
+	PUSHL	R1			; Save PB addr
+	CMPW	CDT$W_STATE(R3),-	; Is this a listener with a
+		#CDT$C_CON_REC		;  connect in hand?
+	BNEQ	10$			; Branch if not
+	BSBW	SCS$FREE_LISTEN		; Else just put it back to listening
+	BRB	20$			; Join common check for no more CDT's
+
+10$:	PUSHL	R3			; Save CDT addr
+	BSBW	CLEANUP_PKTS		; Purge out the command queues
+					;  again in case SYSAP error routine
+					;  did any more SENDs
+	POPL	R3			; Restore CDT addr
+	BSBW	SCS$DEAL_SCSREC		; Deallocate CDT's SCS recv buffer
+	JSB	G^SCS$DEALL_CDT		; Deallocate CDT
+
+20$:	POPL	R3			; Retreive PB addr in R3
+	TSTL	PB$L_CDTLST(R3)		; Any CDT's left on PB?
+	BNEQ	30$			; Branch if so
+	BSBW	CNF$REMOVE_PB		; Else deallocate PB/SB
+	TSTW	PDT$W_PBCOUNT(R4)	; Any PB's left on this PDT?
+	BNEQ	30$			; Branch if some left
+	BSBW	CALL_INIT_PORT		; Try to init port hardware now
+
+30$:	MOVZWL	#SS$_NORMAL,R0		; Set to return success to SYSAP
+	RSB				;
+
+	.DSABL	LSB
+
+	.SBTTL	CLEANUP_PKTS		CLEAN UP PACKETS QUEUED TO
+	.SBTTL	-			PORT AND IN LOGOUT AREA
+
+;+
+; CLEANUP_PKTS calls FLUSH_Q to remove and dispose of packets currently
+; on each of the port queues.  It hen extracts each packet address
+; recorded in the logout area and calls ERR$DISP_ENTRY to dispose of the
+; entry.  The rule for disposing of packets is to return all packets
+; to pool except send datagrams flagged as 'return to sysap.'  These
+; are returned to the SYSAP.
+;
+; Inputs:
+;
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R0-R3			-Destroyed
+;-
+
+ASSUME	PDT$Q_COMQBASE	EQ  PDT$Q_COMQL
+ASSUME	PDT$Q_COMQL+8	EQ  PDT$Q_COMQH
+ASSUME	PDT$Q_COMQH+8 	EQ  PDT$Q_COMQ2
+ASSUME	PDT$Q_COMQ2+8	EQ  PDT$Q_COMQ3
+ASSUME	PDT$Q_COMQ3+8	EQ  PDT$Q_RSPQ
+
+	.ENABL	LSB
+
+CLEANUP_PKTS:
+
+	MOVAL	PDT$Q_COMQBASE(R4),R1	; Get adr of 1st command queue
+	MOVL	#<<PDT$Q_RSPQ - PDT$Q_COMQBASE>/8 + 1>,R3
+					; Get count of command/rsp queues
+
+10$:	BSBB	FLUSH_Q			; Purge next queue of all entries
+	ADDL	#8,R1			; Step to next queue to flush
+	SOBGTR	R3,10$			; Branch if more queues
+	MOVL	PDT$L_MFQHDR(R4),R1	; Get addr of msg free queue header
+	BSBB	FLUSH_Q			; Purge all entries
+	MOVL	PDT$L_DFQHDR(R4),R1	; Get addr of dg free queue header
+	BSBB	FLUSH_Q			; Purge all entries
+	MOVAL	PDT$L_DQELOGOUT(R4),R3	; Get base of logout area
+	MOVL	#<<PDT$C_PALENGTH - PDT$L_DQELOGOUT>/4>,R1
+					; Get count of elmts in logout area
+
+20$:	MOVL	(R3)+,R2		; Get addr of next entry
+	CMPL	R2,#-1			; Port record anything here?
+	BEQL	30$			; Branch if not
+	BSBW	ERR$DISP_ENTRY		; Else dispose of entry
+	MCOML	#0,-4(R3)		; Reset entry just processed
+
+30$:	SOBGTR	R1,20$			; Branch if more entries in logout area
+	RSB				; Return
+
+	.DSABL	LSB
+
+
+
+	.SBTTL	FLUSH_Q			REMOVE AND DISPOSE OF
+	.SBTTL	-			ALL QUEUED ENTRIES
+	.SBTTL	ERR$DISP_ENTRY		DISPOSE OF A SINGLE ENTRY
+
+;+
+; FLUSH_Q removes and processes all entries from a specified port queue.
+;
+; ERR$DISP_ENTRY processes a removed entry.  All packets are returned to
+; pool except send datagrams flagged 'return to sysap.'  These are 
+; handled exactly as if they had gone out successfully.
+;
+; Inputs:
+;
+;	IPL			-Fork IPL
+;	R1			-Addr of queue header (FLUSH_Q)
+;	R2			-Pkt addr (ERR$DISP_ENTRY)
+;
+; Outputs:
+;
+;	R0			-Destroyed
+;	R2			-Destroyed (FLUSH_Q)
+;	Other registers 	-Preserved
+;
+
+	.ENABL	LSB
+
+FLUSH_Q:
+
+	BBCC	#0,(R1),1$		; Unconditionally clear queue lock
+					;  in case port died holding it
+
+1$:	$QRETRY	 REMQHI (R1),R2,-	; Remove next entry from 
+		 ERROR=FATALQ		;  queue head
+	BVS	10$			; Branch if no more entries
+	BSBB	ERR$DISP_ENTRY		; Else dispose of entry
+	BRB	FLUSH_Q			; Go for another entry
+	
+10$:	RSB				; Return
+
+
+
+ERR$DISP_ENTRY::
+
+	BBC	#PPD$V_RSP,-		; Anybody expecting pkt?
+		PPD$B_FLAGS(R2),20$	;  Branch if not
+	CMPB	PPD$B_OPC(R2),-		; Was it a send datagram?
+		#PPD$C_SNDDG		;
+	BNEQ	20$			; Branch if not
+	PUSHR	#^M<R1,R2,R3,R5>	; Save registers 
+	BSBW	INT$DISP_SENDDG		; Else handle as interrupt
+	POPR	#^M<R1,R2,R3,R5>	; Restore destroyed registers
+	RSB				; Return
+
+20$:	MOVL	R2,R0			; Copy pkt address
+	BSBW	SCS$DEAL_PKT		; Return to pool
+	RSB				; Return
+
+FATALQ:					; Should never get here since
+					;  queue lock cleared manually
+	BUGCHECK  CIPORT,NONFATAL	; Nonfatal bugcheck
+
+	CLRQ	(R1)			; If survive bugcheck, clear queue 
+					;  header
+	TSTL	(SP)+			; Clear return from error call
+	RSB				; Return from FLUSH_Q
+
+	.DSABL	LSB
+
+	.SBTTL	CALL_INIT_PORT,		CALL PORT HARDWARE INIT
+
+;+
+; If port has power now, raise IPL to 31 and call port initialization
+; routine in PAINIT.
+;-
+
+	.DSABL	LSB
+
+CALL_INIT_PORT:
+
+	BICW	#PDT$M_PWF_CLNUP,-	; Show power fail cleanup
+		PDT$W_LPORT_STS(R4)	;  bookkeeping done
+	BBC	#PDT$V_PUP,-		; Has port got power now?
+		PDT$W_LPORT_STS(R4),20$	;  Branch if not
+	MOVQ	R4,-(SP)		; Save PDT addr and R5{
+	MOVL	PDT$L_UCB0(R4),R5	; Get UCB addr for init
+	BBS	#UCB$V_ONLINE,-		; If controller-unit already
+		UCB$W_STS(R5),10$	;  initialized, branch
+	MOVL	PDT$L_CNF(R4),R4	; Get config register addr
+	DSBINT				; Raise IPL
+	BSBW	INI$PORT		; Call port init
+	ENBINT				; Lower IPL
+
+10$:	MOVQ	(SP)+,R4		; Restore our registers
+	
+20$:	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	ERR$CACHECLR,		PROCESS REC'D MARKER
+	.SBTTL	-			MSG THAT SAYS THE PORT
+	.SBTTL	-			CACHE IS CLEAR OF TRAFFIC
+	.SBTTL	-			ON SPECIFIED VC
+
+;+
+; ERR$CACHECLR is called by PAINTR response error status handler upon
+; receipt of the PPD sequenced message with PPD$W_MTYPE containing
+; PPD$C_CACHECLR.  This is a  sequenced message sent out to a remote station
+; associated with a closed (crashed) virtual circuit.  It is sent after all
+; CDT's associated with the closed VC have been DISCONNECTed and therefore
+; signals that the port cache no longer holds any commands associated
+; with that VC.  The CACHECLR msg should always be received with fatal
+; error status since it is sent over a closed VC, but this is not
+; verified.
+;
+; Inputs:
+;
+;	IPL			-Fork IPL
+;
+;	R2			-Addr of CACHECLR marker msg
+;	R4			-Addr of PDT
+;
+; Outputs:
+;
+;	R0-R3			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+ERR$CACHECLR::
+
+	BSBW	CNF$LKP_PB_MSG		; Look up PB assoc with remote
+					;  port in CACHECLR msg
+	BLBS	R0,10$			; Branch if lookup successful
+	BRW	CONFIG_ERR		; Else, config database is
+					;  inconsistent
+
+10$:	PUSHL	R1			; Save PB addr
+	MOVL	(SP),R3			; Retreive PB addr
+	MOVL	PB$L_CDTLST(R3),R3	; Get addr of 1st CDT
+	BEQL	50$			; Branch if none
+	
+20$:	PUSHL	CDT$L_CDTLST(R3)	; Save addr of next CDT 
+	MOVZWL	#SS$_NORMAL,R0		; Return success to suspended
+	BSBW	SCS$CLOSE_CDT		;  SYSAP and delete CDT
+	POPL	R3			; Get next CDT addr
+	BNEQ	20$			; Branch if got one
+
+50$:	POPL	R3			; Retreive the PB addr
+	BSBW	CNF$REMOVE_PB		; Deallocate PB/SB
+	RSB				; Return
+
+	.DSABL	LSB
+
+	.SBTTL	ERR$BUGCHECK,		RECORD PORT LOCAL STORE 
+	.SBTTL	-			IN MEMORY
+	.SBTTL	ERR$BUGCHECKNF,		RECORD LOCAL STORE CONDITIONALLY
+	.SBTTL	-			IF NONFATAL BUGCHECKS ARE FATAL
+
+;+
+; This routine copies the port local store (device registers, VC
+; descriptor table, transalation cache, work space, etc.) over the
+; microcode in pool so that this info will be available in a dump.
+;
+; Inputs:
+;
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	All registers		-Preserved
+;-
+
+ASSUME	<^X1000>  LE  PA_C_WCSSIZ*6
+
+	.ENABL	LSB
+
+ERR$BUGCHECKNF::
+
+	BBS	#EXE$V_FATAL_BUG,-	; Branch if nonfatal bugchecks
+		G^EXE$GL_DEFFLAGS,-	;  are set to be fatal via
+		ERR$BUGCHECK		;  SYSGEN parameter
+	RSB				; Else return doing nothing
+
+ERR$BUGCHECK::
+
+	PUSHR	#^M<R0,R1,R2,R3>	; Save caller's registers
+	MOVL	PDT$L_CNF(R4),R2	; Get addr of base of device registers
+	
+10$:	MOVL	G^SCS$GL_MCADR,R3	; Get addr of ucode in pool
+	MOVZWL	#<^X1000/4>,R1		; Get size of device register space
+	
+20$:	MOVL	(R2)+,(R3)+		; Copy next long wd of local store
+	SOBGTR	R1,20$			; Branch if more to copy
+	POPR	#^M<R0,R1,R2,R3>
+
+	RSB
+
+	.DSABL	LSB
+
+	.SBTTL	CHK_NO_CDTS,		IF ALL CDTS ON PB DISCONNECTED,
+	.SBTTL	-			SEND CACHE CLEAR MSG
+
+;+
+; This routine is called by ERR$DISC_FAIL and NOTIFY_SYSAP as CDTs
+; are disconnected during a VC failure.  It checks whether any CDTs
+; remain which have not been DISCONNECTed.  If so, CHK_NO_CDTS returns.
+; If all have been disconnected, then a cache clear message is sent.
+;
+; Inputs:
+;
+;	R1			-Addr of PB
+;
+; Outputs:
+;
+;	R0-R2			-Destroyed
+;	Other registers		-Preserved
+;
+;-
+
+	.ENABL	LSB
+
+CHK_NO_CDTS:
+
+	MOVAL	PB$L_CDTLST-CDT$L_CDTLST(R1),R0
+					; Get addr of CDT list - offset
+					;  CDT$L_CDTLST
+	
+10$:	MOVL	CDT$L_CDTLST(R0),R0	; Get next CDT
+	BEQL	20$			; Branch if none
+	CMPW	CDT$W_STATE(R0),-	; Is CDT state other than
+		#CDT$C_VC_FAIL		;  VC fail?
+	BEQL	10$			; Branch if not
+	RSB				; Else return without doing anything
+					;  since not all CDTs disconnected yet
+
+20$:	MOVL	PB$L_CLSCKT_DG(R1),R2	; Get addr of preallocated dg
+	MOVW	#PPD$C_CACHE_LEN,-	; Set PPD length
+		PPD$W_LENGTH(R2)	;
+	MOVW	#PPD$C_CACHECLR,-	; Set PPD type code
+		PPD$W_MTYPE(R2)		;
+	MOVB	PB$B_RSTATION(R1),-	; Get remote port number from PB
+		PPD$B_PORT(R2)		;
+	$TURNMSG RETFLAG=TRUE,-		; Send msg, specifying response
+		PRIORITY=LOW,-		;  and low priority so it
+		PATH=AUTO		;  will go out after all else
+					; NOTE: This is the only place
+					;  where a sequenced msg goes out
+					;  in a CIDG structure type pkt.
+					;  This is so that this msg and 
+					;  the SETCKT closed that preceded
+					;  it can go out in the same buffer.
+	RSB				;
+
+	.DSABL	LSB
+
+	.SBTTL	NOTIFY_SYSAP,		SEARCH CDT LIST AND
+	.SBTTL	-			HANDLE CDT'S IN 
+	.SBTTL	-			VARIOUS STATES
+
+;+
+; NOTIFY_SYSAP is called by ERR$VCCLOSED_MSG/PB and ERR$PWF_RECOV to search
+; the CDT list associated with a path block and notify the SYSAP appropriately
+; depending upon the CDT state.  State dependent processing is summarized in 
+; ERR$CLOSED_MSG/PB.
+;
+; Inputs:
+;
+;	R1			-Aux status to pass to SYSAP
+;	R3			-PB addr
+;	R4			-PDT addr
+;
+; Outputs:
+;
+;	R0-R3			-Destroyed
+;	Other registers		-Preserved
+;-
+
+	.ENABL	LSB
+
+NOTIFY_SYSAP:
+
+	PUSHL	R5			; Save caller's R5
+	MOVZWL	#SS$_VCBROKEN,R0	; Set status to report to SYSAP
+	MOVL	R3,R5			; Save PB addr
+	MOVL	PB$L_CDTLST(R3),R3	; Get 1st CDT
+	BEQL	30$			; Branch if none
+
+NEXT_CDT:
+
+	PUSHL	CDT$L_CDTLST(R3)	; Save addr of next CDT in case
+					;  this one is deleted
+	$DISPATCH	-		; Dispatch on CDT state
+		CDT$W_STATE(R3),-	;
+		<-				;
+		<CDT$C_OPEN,	CALL_ERRADDR>,-	;  
+		<CDT$C_CON_ACK,	CONNECT_ABO>,-	;
+		<CDT$C_DISC_ACK,DCONNECT_OK>,-	;
+		<CDT$C_CON_REC,	CALL_ERRADDR>,-	;
+		<CDT$C_DISC_REC,IGNORE_CDT>,-	;
+		<CDT$C_CON_SENT,CONNECT_ABO>,-	;
+		<CDT$C_DISC_SENT,DCONNECT_OK>,-	;
+		<CDT$C_REJ_SENT,DCONNECT_OK>,-	;
+		<CDT$C_ACCP_SENT,CONNECT_ABO>,-	;
+		<CDT$C_DISC_MTCH,DCONNECT_OK>,-	;
+		<CDT$C_VC_FAIL,	IGNORE_CDT>,-	;
+		>
+
+	BUGCHECK	CIPORT,NONFATAL	; Illegal CDT state
+	
+	MOVAL	PB$L_CDTLST-CDT$L_CDTLST(R5),R0
+					; If nonfatal bugcheck, get PB
+					;  CDT listhead addr - CDT$L_CDTLST
+	
+FIND_PRV_CDT:
+
+	CMPL	CDT$L_CDTLST(R0),R3	; Got previous link?
+	BEQL	UNLNK_CDT		; Branch if so
+	MOVL	CDT$L_CDTLST(R0),R0	; Else get next CDT
+	BRB	FIND_PRV_CDT		; Go check it
+
+UNLNK_CDT:
+
+	MOVL	(SP),CDT$L_CDTLST(R0)	; Remove this CDT from list and
+					;  take no further action on it
+	MOVZWL	#SS$_VCBROKEN,R0	; Retreive status
+	BRB	GET_NEXT_CDT		; Go for next CDT
+
+CALL_ERRADDR:				; Notify SYSAP via error routine:
+
+	PUSHR	#^M<R0,R1,R4,R5>	; Save registers we need
+	JSB	@CDT$L_ERRADDR(R3)	; Call SYSAP error routine
+	POPR	#^M<R0,R1,R4,R5>	; Restore registers
+	BRB	GET_NEXT_CDT		; Join common code
+
+CONNECT_ABO:				; Terminate pending connect/accept
+					;  with error status
+
+	MOVQ	R0,-(SP)		; Save status values
+	BSBW	SCS$CLOSE_CDT		; Terminate connx mgmt call
+	BRB	10$			; Join common code
+
+DCONNECT_OK:				; Terminate pending connection mgmt
+					;  call with success status:
+	
+	MOVQ	R0,-(SP)		; Save standard status values
+	MOVZWL	#SS$_NORMAL,R0		; Set status to success
+	BSBW	SCS$CLOSE_CDT		; Complete pending disconnect call
+	
+10$:	MOVL	R5,R1			; Retreive PB addr
+	BSBW	CHK_NO_CDTS		; Check CDTs disconnected now
+					;  and send cache clear if all disconnected
+	MOVQ	(SP)+,R0		; Restore standard status values
+
+IGNORE_CDT:
+GET_NEXT_CDT:
+
+	POPL	R3			; Retreive addr of next CDT
+	BEQL	30$			; Branch if none
+	BRB	NEXT_CDT		; Else go process
+
+30$:	POPL	R5			; Restore caller's R5
+	RSB				; Return
+
+	.DSABL	LSB
+
+
+
+	.END

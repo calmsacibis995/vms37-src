@@ -1,0 +1,2206 @@
+
+!-*-BLISS-*-
+!<BLF/NOERROR>
+!<BLF/WIDTH:116>
+!<BLF/REMARK:8>
+!<BLF/NOPLIT>
+!<BLF/MACRO>
+!<BLF/LOWERCASE_KEY>
+!<BLF/UPPERCASE_USER>
+module SOR$SCRATCH_IO (language (bliss32) ,
+		list (assembly) ,
+		addressing_mode (external = long_relative) ,
+		ident = 'V03-000'
+		) =
+begin
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! Facility:
+!
+!	Sort
+!
+!
+! Abstract:
+!
+!	This module contains the routines that handle the scratch files
+!	I/O and the management of virtual memory and the use of the
+!	working set.
+!
+!
+! Environment:
+!
+!	Starlet Operating System, User mode utility
+!
+!
+! Author:
+!
+!	Ellen R Simich,		Creation Date:		1-Sep-77
+!
+!
+! Modified By :
+!
+!	V02.05		PDG0005		PDG		8-Feb-1982
+!		Clean up usage of SHR$ errors.
+!	V02.04		PDG0004		Peter D Gilbert	11-Dec-1981
+!		Fix returned address/status problem with
+!		    SOR$$RAB_INIT and MAP_INDEX.
+!	V02.03		JDN0003		Joe Neumeister	21-Sep-1981
+!		Change SOR$GV_FLAGS from a bitvector [16] to a 
+!    		    bitvector [32] to allow new switches, (/STATISTICS).
+!	V02.02		JDN0002		Joe Neumeister	19-Jun-1981
+!		Re-initialize variables at end of SORT to avoid
+!		    zeroing data if SORT is called a second time.
+!	V02.01		JDN0001		Joe Neumeister	12-Feb-1981
+!		Remove locking of working set if subroutine, calculate
+!		    minimum storage for sort tree and assure working set
+!		    able to hold sort tree, make two tries at acquiring 
+!		    virtual memory.
+!		Declare ERROR symbols as external literals to allow
+!		    new error messages to be outputted.
+!--
+
+!
+! Table of Contents:
+!
+
+macro
+    MAP_REGS =
+	START_ADR = 11 %;
+
+linkage
+    CALLR = call : global (MAP_REGS),
+    JSBR = jsb : global (MAP_REGS),
+    JSBL = jsb;
+
+forward routine
+    CALC_BUFFER : novalue JSBL ,
+    PARTITION_VM,
+    GCD_LCM : novalue ,
+    FLUSH_PAGES : JSBL,
+    MAP_INDEX ,
+    MAP_VM : JSBL,
+    GET_VM_PAGES,
+    EXTEND_FILE : JSBL,
+    CALC_MIN_STORAGE : novalue ;
+!
+! Include Files:
+!
+
+library 'SYS$LIBRARY:LIB.L32';					! System definitions
+
+
+!
+! Macros:
+!
+
+macro
+    START_BUF =
+	0, 0, 32, 0 %,
+    END_BUF =
+	4, 0, 32, 0 %,
+    CUR_BUF =
+	8, 0, 32, 0 %,
+    VBN_START =
+	12, 0, 32, 0 %,
+    VBN_LEFT =
+	16, 0, 32, 0 %,
+    FILE_IN =
+	20, 0, 8, 0 %;						! Merge buffers header
+
+!
+! Equated Symbols:
+!
+
+literal
+    ERROR = 0,
+    SUCCESS = 1,
+    SORT_ERROR = 28,
+    MAXRUNS = 127;						! Max number of runs per index block
+
+psect
+    global = SOR$SORTDATA ( addressing_mode (general)),
+    own = SOR$SORTDATA ( addressing_mode (general));
+
+!
+! Own Storage:
+!
+
+global
+    SOR$GL_IN_BUF,						! Address of input buffer
+    SOR$GL_TREE_SIZ,						! Size of tree in bytes
+    SOR$GL_BUF_END,						! Ending address of output buffer
+    SOR$GL_TREE,						! Address of sort tree
+    SOR$GL_OUT_BUF,						! Address of output buffer
+    SOR$GL_BUF_SIZE,						! Size of input/output buffers in blocks
+    SOR$GB_MERGE : byte,					! Order of merge
+    SOR$GB_WRK_FIL : byte initial (2);				! Number of work files
+
+global bind
+    SOR$AL_BUF_ADR = SOR$GL_TREE : ref blockvector [10, 21, byte];
+
+own
+    WS_SIZE,							! Current working set size
+    WS_LIMIT,							! New working set size
+    VM_LIMIT,							! Size of VM added to program
+    VBN_INDEX : vector [10],					! Address of VBN index
+    FILE_SIZE : vector [10],					! Save file size for extend
+    HIGH_VM,							! Highest address mapped
+    START_RUN : initial (0),					! Start address of run
+    VBNS : vector [10] initial (2, 2, 2, 2, 2, 2, 2, 2, 2, 2),	! First free VBN for output
+    								! or start vbn of run input
+    EVENT_FLAG : initial (0),					! Event flag number
+    WORK_IN : byte,						! Number of files in and out
+    OUT_RUN : byte initial (0),					! Current run output number
+    OUT_FILE : byte initial (0),				! Current output file number
+    IN_FILE : byte initial (0),					! Current input file
+    IN_RUN : byte initial (0),					! Current run input number
+    WORK_OUT : byte,
+    FILE_ID : vector [30, word],				! Save file ids for extends
+    SCR_CHANNELS : vector [10, word],				!Work file channel numbers
+    SECOND_TRY : byte initial (0),				! Indiactor that first try to get VM failed 
+    MIN_STORAGE ; 						! Minimum working set for min. tree size
+
+!
+! External References:
+!
+
+external literal
+    LIB$_INSEF,
+    SOR$GK_LEN_SIZE : unsigned (4),				! Size of record length field
+    SOR$GK_NODE_HED : unsigned (5),				! Length of tree node header
+    SOR$GK_INDEX : unsigned (3),
+    SOR$GK_RECORD : unsigned (2),				! Sort type
+    SOR$GK_TAG : unsigned (3),					! Sort type
+    SOR$GK_UTILITY : unsigned (4),				! Utility flag
+    SOR$GK_SORT6 : unsigned (4),
+    SOR$GK_MERGE2 : unsigned (4),
+    SOR$GK_FILE_IO : unsigned (2),				! User passed file name
+    SOR$GK_DDB_SIZE : unsigned (16),				! Size of input file DDB.
+    SOR$GK_NO_MERGE : unsigned (3),				! No merge pass indicated
+    SOR$_MISS_KEY,				! Declare ERROR symbols
+    SOR$_WORK_DEV,				!  as external literals
+    SOR$_NO_WRK,
+    SOR$_VM_FAIL,
+    SOR$_WS_FAIL,
+    SOR$_SORT_ON,
+    SOR$_BAD_KEY,
+    SOR$_NUM_KEY,
+    SOR$_BAD_LEN,
+    SOR$_ONE_IN,
+    SOR$_IND_OVR,
+    SOR$_INCONSIS,
+    SOR$_VAR_FIX,
+    SOR$_BAD_TYPE,
+    SOR$_LRL_MISS,
+    SOR$_BAD_SPEC,
+    SOR$_BAD_LRL,
+    SOR$_BAD_FILE,
+    SOR$_BAD_ADR,
+    SOR$_MAP,
+    SOR$_EXTEND,
+    SOR$_KEY_LEN,
+    SOR$_CLEAN_UP,
+    SOR$_BAD_MERGE,
+    SOR$_BAD_ROUTIN,
+    SOR$_INP_FILES,
+    SOR$_BAD_ORDER;
+MACRO
+    DEFSHR_[MSG,SEV] =
+	%NAME('SOR$_',MSG) =
+		%NAME('SHR$_',MSG) +
+		%NAME('STS$K_',SEV) + SORT_ERROR ^ 16 %;
+LITERAL
+    DEFSHR_(
+	OPENOUT,  SEVERE);
+
+
+compiletime
+    PERFORMANCE = 0;						! Performance measurement.
+
+
+external routine
+    %if PERFORMANCE %then
+    PME_EXIT,							! Performance measurement exit.
+    %fi
+    SOR$$OUT_RAB : weak,
+    SOR$$RAB_INIT : weak,
+    SOR$$CLOSE_FILE : weak,
+    SOR$$UNLOCK_GRP,
+    LIB$FREE_VM : addressing_mode (general),
+    SOR$$ERROR : novalue weak,
+    SOR$$END_MERGE : weak,
+    LIB$GET_EF : addressing_mode (general),
+    SOR$$CREATE_OUT : weak,
+    LIB$FREE_EF : addressing_mode (general),
+    LIB$GET_VM : addressing_mode (general);
+
+external
+    SOR$GB_NUM_KEYS : byte,					! Number of defined keys
+    SOR$GL_SAVE_SIZ,						! Size of LAST_KEY buffer
+    SOR$GL_SAVE_ADR,						! Address of LAST_KEY buffer.
+    SOR$AL_STATS : vector [16] weak,				! Statistics buffer
+    SOR$GB_KEY_SIZE : byte,					! Size of keys
+    SOR$GB_SOR_TYP : byte,					! Type of srot to perform
+    SOR$GL_IN_ALQ,						! File size
+    SOR$GL_REC_SIZE,						! Tree entry size
+    SOR$GW_MAX_LRL : word weak,				! Max LRL of all input files.
+    SOR$GW_MAX_MRS : word weak,					! Max MRS field.
+    SOR$GL_TOT_ALQ : weak,					! Total allocation.
+    SOR$GW_FIX_SIZE : word,					! Size of fixed area for VFC records.
+    SOR$GB_NUM_FILE : byte weak,				! Number of input files.
+    SOR$GV_DDB_TABL : weak vector [],				! Table of input file DDBs.
+    SOR$GL_DDB_PTR : weak,					! FAB/RAB DDB pointer.
+    SOR$GB_CUR_FILE : byte weak,				! Current input file.
+    SOR$GW_IN_LRL : word,					! Longest record length
+    SOR$GT_INP_NAME : vector [ch$allocation (NAM$C_MAXRSS)] weak,
+    SOR$GL_REC_CNT : weak,					! Record count
+    SOR$GB_REC_NUM : byte weak,					! Record number position
+    SOR$GB_NO_SCR : byte,					! TRUE if no scratch files were created.
+    SOR$GV_FLAGS : bitvector [32];				! Sorting option flags
+								!    Change to longword.  ---JDN
+psect
+    plit = SOR$SORTDATA ( addressing_mode (general)),
+    code = SOR$SORTINIT;
+
+
+%title 'SOR$$CREATE_SCR'
+
+global routine SOR$$CREATE_SCR  : =
+
+!++
+! Functional Description:
+!
+!	Create the scratch files on the specified devices.
+!
+!
+! Formal Parameters:
+!
+!	The number of work files.
+!
+!
+! Implicit Inputs:
+!
+!	The size in blocks to allocate for the file.
+!
+!
+! Implicit Outputs:
+!
+!	None.
+!
+!
+! Routine Value:
+!
+!	An error code on error.
+!
+!
+! Completion Codes:
+!
+!	1 for success.
+!
+!
+! Side Effects:
+!
+!	None.
+!
+!
+!--
+
+    begin
+
+    literal
+	BLK_BYTES = 512,					! Bytes in a page
+	DEFAULT_SIZE = 12,					! Default filename size
+	MAX_FILES = 10,						! Maximum number of work file
+	LOGICAL_SIZE = 9;					! Logical name size
+
+    bind
+	LOGICAL_NAME = uplit byte(%ascii'SORTWORK0'),
+	SCRATCH_NAME = uplit byte(%ascii'SORTWORK.TMP');	! Sort work file
+
+    local
+	PTR,
+	DEV_SIZ : byte,
+	COUNT : byte,
+	SCRATCH_CHAN : vector [MAX_FILES, word],
+	SCRATCH_NAM : $NAM_DECL,
+	SCRATCH_FAB : $FAB_DECL,
+	SCRATCH_RSA : vector [ch$allocation (NAM$C_MAXRSSLCL)];	! Scratch name area
+
+
+    ! If the user gave me too many, then just use the first 10.
+
+    if .SOR$GB_WRK_FIL gtru MAX_FILES then SOR$GB_WRK_FIL = 10;
+
+    ! 1 is too few, so change that to 2.
+
+    if .SOR$GB_WRK_FIL eql 1 then SOR$GB_WRK_FIL = 2;
+
+
+    !
+    !  Fill in the appropriate information in the FAB.
+    !
+    ! Initialize the fab.
+    !
+    $FAB_INIT (FAB = SCRATCH_FAB, DNA = ch$ptr (SCRATCH_NAME), DNS = DEFAULT_SIZE, FNS = LOGICAL_SIZE,
+	FNA = ch$ptr (LOGICAL_NAME), ORG = SEQ, SHR = NIL, RAT = CR, NAM = SCRATCH_NAM, RFM = VAR);
+
+    if .SOR$GB_SOR_TYP eql SOR$GK_RECORD
+    then
+	SCRATCH_FAB [FAB$L_ALQ] = maxu (((3*.SOR$GL_IN_ALQ)/.SOR$GB_WRK_FIL), .SOR$GL_BUF_SIZE)
+    else
+	SCRATCH_FAB [FAB$L_ALQ] = maxu ((((3*.SOR$GL_IN_ALQ)/2)/.SOR$GB_WRK_FIL), .SOR$GL_BUF_SIZE);
+
+    SCRATCH_FAB [FAB$L_ALQ] = (.SOR$GL_BUF_SIZE - (.SCRATCH_FAB [FAB$L_ALQ] mod .SOR$GL_BUF_SIZE)) + .SCRATCH_FAB [
+	FAB$L_ALQ];
+    SCRATCH_FAB [FAB$B_FAC] = FAB$M_GET or FAB$M_PUT or FAB$M_UPD or FAB$M_DEL;
+    SCRATCH_FAB [FAB$L_FOP] = FAB$M_SUP or FAB$M_UFO or FAB$M_TMD or FAB$M_CBT;
+    !
+    ! Initialize the name block.
+    !
+    $NAM_INIT (NAM = SCRATCH_NAM, ESS = NAM$C_MAXRSSLCL, ESA = ch$ptr (SCRATCH_RSA), RSA = ch$ptr (SCRATCH_RSA),
+	RSS = NAM$C_MAXRSSLCL);
+    !
+    ! If the user did not specify anything, create two files on the
+    ! default system device, otherwise, create the specified files.
+    !
+    ! Initialize block for channel numbers
+    COUNT = 0;
+
+    incr index from 0 to .SOR$GB_WRK_FIL - 1 do
+	begin
+	!
+	! Do the create and try for contiguous if possible, otherwise, try to
+	! allocate non-contiguous. The total number of blocks needed for work
+	! files is equal to twice the input file size plus one half the
+	! input file size.
+	!
+	ch$wchar (.index + 48, ch$ptr (LOGICAL_NAME + 8));
+	FILE_SIZE [.index] = .SCRATCH_FAB [FAB$L_ALQ];
+	! Create the file.
+
+	if not $RMS_CREATE (FAB = SCRATCH_FAB)
+	then
+	    begin
+
+	    if .SOR$GV_FLAGS [SOR$GK_UTILITY]
+	    then
+		SOR$$ERROR (SOR$_OPENOUT, .SCRATCH_NAM [NAM$B_ESL],
+		    .SCRATCH_NAM [NAM$L_ESA], .SCRATCH_FAB [FAB$L_STS], .SCRATCH_FAB [FAB$L_STV]);
+
+	    return SOR$_OPENOUT;
+	    end;
+
+	!
+	! Device must be local and random access.
+	!
+
+	if not .block [SCRATCH_FAB [FAB$L_DEV], DEV$V_RND;, byte] or .SCRATCH_NAM [NAM$V_NODE]
+	then
+	    begin
+
+	    if .SOR$GV_FLAGS [SOR$GK_UTILITY]
+	    then
+		SOR$$ERROR (SOR$_WORK_DEV, .SCRATCH_NAM [NAM$B_RSL],
+		    .SCRATCH_NAM [NAM$L_RSA]);
+
+	    return SOR$_WORK_DEV;
+	    end;
+
+	! Save the file ID.
+	FILE_ID [.index*3] = .SCRATCH_NAM [NAM$W_FID_NUM];
+	FILE_ID [.index*3 + 1] = .SCRATCH_NAM [NAM$W_FID_SEQ];
+	FILE_ID [.index*3 + 2] = .SCRATCH_NAM [NAM$W_FID_RVN];
+	SCRATCH_FAB [FAB$L_ALQ] = .FILE_SIZE [.index];
+	!
+	! Determine which files are not on the same device as the input
+	! file and use them first for processing.
+	!
+
+	if .SOR$GV_FLAGS [SOR$GK_FILE_IO]
+	then
+	    begin
+	    PTR = ch$find_ch (NAM$C_MAXRSSLCL, ch$ptr (SOR$GT_INP_NAME), %c':');
+	    DEV_SIZ = ch$diff (.PTR, ch$ptr (SOR$GT_INP_NAME));
+
+	    if ch$neq (.DEV_SIZ, ch$ptr (SOR$GT_INP_NAME), .DEV_SIZ, ch$ptr (SCRATCH_RSA))
+	    then
+		begin
+		SCR_CHANNELS [.COUNT] = .SCRATCH_FAB [FAB$L_STV];
+		COUNT = .COUNT + 1;
+		SCRATCH_CHAN [.index] = 65535;
+		end
+	    else
+		SCRATCH_CHAN [.index] = .SCRATCH_FAB [FAB$L_STV]
+
+	    end
+	else
+	    begin
+	    SCR_CHANNELS [.COUNT] = .SCRATCH_FAB [FAB$L_STV];
+	    COUNT = .COUNT + 1;
+	    SCRATCH_CHAN [.index] = 65535;
+	    end;
+
+	end;
+
+    !
+    ! Then locate all the files on the input device and
+    ! then compute the total number of sort work files out and
+    ! merge files out.
+    !
+
+    incr index from 0 to .SOR$GB_WRK_FIL - 1 do
+
+	if .SCRATCH_CHAN [.index] neq 65535
+	then
+	    begin
+	    SCR_CHANNELS [.COUNT] = .SCRATCH_CHAN [.index];
+	    COUNT = .COUNT + 1;
+	    end;
+
+    WORK_IN = .SOR$GB_WRK_FIL/2;
+    WORK_OUT = .SOR$GB_WRK_FIL mod 2 + .WORK_IN;
+    !
+    ! Now that the files are created, allocate and map 1 page of virtual
+    ! memory to the first VBN of each SORT output file.
+    !
+
+    if not LIB$GET_EF (EVENT_FLAG)
+    then
+
+	if .SOR$GV_FLAGS [SOR$GK_UTILITY] then SOR$$ERROR (SOR$_MAP, LIB$_INSEF) else return SOR$_WORK_DEV;
+
+    return MAP_INDEX (.WORK_OUT, .SOR$GL_OUT_BUF, 1,
+		(SEC$M_WRT or SEC$M_DZRO), 0, SOR$GL_OUT_BUF);
+
+    end;
+
+psect
+    code = SOR$SORTCOM;
+
+
+%title 'SOR$$MAP_VM'
+
+global routine SOR$$MAP_VM (NEW_RUN) : JSBR =
+
+!++
+! Functional Description:
+!
+!	This routine maps the output buffer that will contain the
+!	strings created from the initial dispersion or merge phases onto
+!	the VBNs of the work files.
+!
+!
+! Formal Parameters:
+!
+!	A flag indicating whether this is a new run,
+!	the same run or an end of run update.
+!
+!
+! Implicit Inputs:
+!
+!	A register containing the starting address of the
+!	buffer to map.
+!
+!
+! Implicit Outputs:
+!
+!	The starting and ending address of the output buffer.
+!
+!
+! Routine Value:
+!
+!
+! Completion Codes:
+!
+!	1 for success or an error code.
+!
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+
+    begin
+
+    external register
+	MAP_REGS;
+
+    local
+	PTR,							! Pointer to VBN index for current file
+	ERROR_CODE;
+
+    literal
+	BLK_BYTES = 512;					! Number of bytes in page
+
+    stacklocal
+	VIRTUAL_ADR : vector [2];				! Vector for address to map
+
+    !
+    ! If this is an in core sort do not map the output buffer, but
+    ! set up to do the output directly to the output file. Get the memory
+    ! for the output buffer and initialize the output RAB.
+    !
+
+    if .SOR$GV_FLAGS [SOR$GK_NO_MERGE]
+    then
+	begin
+
+	if .SOR$GV_FLAGS [SOR$GK_FILE_IO]
+	then
+
+	    if not SOR$$OUT_RAB () then return SOR$_OPENOUT;
+
+	return SUCCESS;
+	end;
+
+    !
+    ! If this is a new run, update the pointer for the last run to indicate
+    ! the number of VBNs in the run, and the offset into the last block. Then
+    ! map the next run into the next file, otherwise, continue mapping in
+    ! the current file.
+    !
+
+    if .START_RUN neq 0
+    then
+	begin
+	PTR = .VBN_INDEX [.OUT_FILE] + (.OUT_RUN*4);
+
+	if .NEW_RUN
+	then
+	    begin
+	    .PTR = ((.START_ADR - 1 - .START_RUN)/BLK_BYTES) + ..PTR + 1;
+	    VBNS [.OUT_FILE] = ((.START_ADR - 1 - .START_RUN)/BLK_BYTES) + .VBNS [.OUT_FILE] + 1;
+	    end
+	else
+	    begin
+	    .PTR = ((.SOR$GL_BUF_END + 1 - .START_RUN)/BLK_BYTES) + ..PTR;
+	    VBNS [.OUT_FILE] = ((.SOR$GL_BUF_END + 1 - .START_RUN)/BLK_BYTES) + .VBNS [.OUT_FILE];
+	    end;
+
+	if .NEW_RUN gtr 1 then return SUCCESS;
+
+	!
+	! Flush the current pages to disk to ensure no overmap occurs.
+	!
+
+	if .START_RUN geqa .SOR$GL_OUT_BUF
+	then
+
+	    if not FLUSH_PAGES (.START_RUN, .SOR$GL_BUF_END) then return SOR$_MAP;
+
+	START_ADR = .SOR$GL_OUT_BUF;
+	end;
+
+    if .NEW_RUN and .START_RUN neq 0
+    then
+
+	if .OUT_FILE + 1 neq .WORK_OUT and .OUT_FILE + 1 neq .SOR$GB_WRK_FIL
+	then
+	    OUT_FILE = .OUT_FILE + 1
+	else
+	    begin
+	    OUT_FILE = (.OUT_FILE - .WORK_OUT) + 1;
+	    OUT_RUN = .OUT_RUN + 1;
+	    end;
+
+    !
+    ! If there is no room in the current file for the run then extend the file.
+    !
+
+    if .FILE_SIZE [.OUT_FILE] - .VBNS [.OUT_FILE] lssu .SOR$GL_BUF_SIZE
+    then
+	begin
+	VIRTUAL_ADR [0] = EXTEND_FILE ();
+
+	if not .VIRTUAL_ADR [0] then return .VIRTUAL_ADR [0];
+
+	end;
+
+    !
+    ! If the index block of VBNs for the files are filled,
+    ! map a new one for each file.
+    !
+
+    if .OUT_RUN eql MAXRUNS
+    then
+	begin
+
+	incr index from 0 to .WORK_OUT - 1 do
+	    begin
+	    local
+		STATUS,
+		DUMMY;
+
+	    .VBN_INDEX [.index + .OUT_FILE] + (.OUT_RUN*4) = .VBNS [.index + .OUT_FILE];
+
+	    STATUS = MAP_INDEX (1, .VBN_INDEX[.OUT_FILE+.index],
+		.VBNS[.index+.OUT_FILE], SEC$M_WRT, .OUT_FILE+.index, DUMMY);
+	    if not .STATUS then return .STATUS;
+
+	    VBNS [.index + .OUT_FILE] = .VBNS [.index + .OUT_FILE] + 1;
+	    end;
+
+	OUT_RUN = 0;
+	PTR = .VBN_INDEX [.OUT_FILE];
+	ch$fill (%x'0', .WORK_OUT*BLK_BYTES, ch$ptr (.PTR));
+	end;
+
+    !
+    ! Map the output buffer.
+    !
+
+    if (.START_ADR and %x'1FF') neq 0 then START_ADR = (.START_ADR and %x'FFFFFE00') + BLK_BYTES;
+
+    if .START_ADR + (.SOR$GL_BUF_SIZE*BLK_BYTES) gtra .HIGH_VM then START_ADR = .SOR$GL_OUT_BUF;
+
+    VIRTUAL_ADR [0] = .START_ADR;
+    VIRTUAL_ADR [1] = .VIRTUAL_ADR [0] + (.SOR$GL_BUF_SIZE*BLK_BYTES);
+
+    if not MAP_VM (VIRTUAL_ADR, .VBNS [.OUT_FILE], SEC$M_WRT, .OUT_FILE) then return SOR$_MAP;
+
+    START_RUN = .VIRTUAL_ADR [0];
+    START_ADR = .VIRTUAL_ADR [0];
+    SOR$GL_BUF_END = .VIRTUAL_ADR [1];
+    return SUCCESS;
+    end;
+
+psect
+    code = SOR$SORTINIT;
+
+
+%title 'SOR$$GET_SPACE'
+
+global routine SOR$$GET_SPACE (LRL) : =
+
+!++
+! Functional Description:
+!
+!	This routine  adjusts the working set limit if needed, 
+!	and calls the routine that gets as much virtual 
+!	memory as is required to sort the file and partitions
+!	the VM for the sort tree and I/O buffers.
+!
+!
+! Formal Parameters:
+!
+!	The longest record length.
+!
+!
+! Implicit Inputs:
+!
+!	The file size and the sort type.
+!
+!
+! Implicit Outputs:
+!
+!	None.
+!
+! Routine Value:
+!
+!	An error code on error.
+!
+!
+! Completion Codes:
+!
+!	1 for success.
+!
+!
+! Side Effects:
+!
+!	The programs virtual memory is extended and the
+!	working set limit is adjusted.
+!
+!
+!--
+
+    begin
+
+    literal
+	TREE_SIZE = 2,
+	WORK_SET = 6,
+	VM_USED = 8,
+	BLK_BYTES = 512,					! Number of bytes in a block
+	OVERHEAD = 35,
+	MIN_SIZE = 75;						! Minimum working set size required
+
+
+    !
+    ! Get current working set size and adjust it to the
+    ! the working set limit.
+    !
+    $ADJWSL (PAGCNT = 0, WSETLM = WS_SIZE);
+    $ADJWSL (PAGCNT = %x'7FFFFFFF', WSETLM = WS_LIMIT);
+
+    if .WS_LIMIT lss MIN_SIZE and .SOR$GL_IN_ALQ gtr 10
+    then
+	begin
+
+	if .SOR$GV_FLAGS [SOR$GK_UTILITY] then SOR$$ERROR (SOR$_WS_FAIL, .WS_LIMIT);
+
+	return SOR$_WS_FAIL;					! Min size of 24k bytes
+	end;
+
+    CALC_MIN_STORAGE ();					! Calculate min. storage for sort tree, etc.
+
+    !
+    !	If subroutine SORT, (not the Utility), only use the greater of:
+    !		 [1/2*WS_LIMIT    or   MIN_SIZE(=75 pages)].
+    !
+    
+    if not .SOR$GV_FLAGS [SOR$GK_UTILITY] 			
+    then
+	WS_LIMIT = (maxu ((.WS_LIMIT/2), MIN_SIZE, .MIN_STORAGE));
+
+    SECOND_TRY = 0;						! Assure indicator set properly first time.
+
+    if not PARTITION_VM (.LRL) 					! If the first try to acquire and partition VM
+    then							! failed, try to acquire the min. VM for SORT.
+	begin
+	WS_LIMIT = (maxu (MIN_SIZE, .MIN_STORAGE));
+	SECOND_TRY = 1;						! Set the indicator that the first try failed.
+
+	if not PARTITION_VM (.LRL) 				! If the second try to acquire and partition VM
+	then							! failed, exit with a fatal error.
+	    begin
+	    if .SOR$GV_FLAGS [SOR$GK_UTILITY] then SOR$$ERROR (SOR$_VM_FAIL, .VM_LIMIT);
+	    return SOR$_VM_FAIL;
+	    end
+	end;
+
+    SECOND_TRY = 0;						! Assure indicator is reset properly.
+
+    HIGH_VM = .SOR$GL_IN_BUF + .VM_LIMIT;
+    !
+    ! Now that the sizes are set, calculate the actual addresses of
+    ! the input buffer, the tree and the output buffer.
+    !
+
+    if (.SOR$GL_IN_BUF and %x'1FF') neq 0 then SOR$GL_IN_BUF = (.SOR$GL_IN_BUF and %x'FFFFFE00') + BLK_BYTES;
+
+    SOR$GL_TREE = .SOR$GL_IN_BUF + .SOR$GW_IN_LRL + 10;
+    SOR$GL_OUT_BUF = ((.SOR$GL_TREE + .SOR$GL_TREE_SIZ) and %x'FFFFFE00') + BLK_BYTES;
+    SOR$GL_TREE_SIZ = .SOR$GL_OUT_BUF - .SOR$GL_TREE;
+
+
+    if .SOR$GV_FLAGS [SOR$GK_UTILITY]
+    then
+	begin
+    	$LKWSET (INADR = SOR$GL_TREE);					! If utility, lock sort tree into WS
+	SOR$AL_STATS [WORK_SET] = .WS_LIMIT;
+	SOR$AL_STATS [VM_USED] = .VM_LIMIT;
+	end;
+
+    return SUCCESS;
+    end;
+
+psect
+    code = SOR$SORTCOM;
+
+
+
+%title 'CALC_MIN_STORAGE'
+routine CALC_MIN_STORAGE : novalue =
+
+!++
+! Functional Description:
+!
+!	This routine calculates the minimum storage needed for (at least) 2 nodes in the sort tree.
+!
+!
+! Formal Parameters:
+!
+!	None.
+!
+!
+! Implicit Inputs:
+!
+!	The working set quota,
+!	the initial (default) working set value,
+!	the sort type, 
+!	the total key size and the length of the longest record.
+!
+!
+! Implicit Outputs:
+!
+!	The minimum storage needed for (at least) 2 nodes in the sort tree.
+!
+!
+! Routine Value:
+!
+!
+! Completion Codes:
+!
+!	None.
+!
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+
+    begin
+
+    literal
+	OVERHEAD = 35,						! Sort code overhead.
+	BLK_BYTES = 512,					! Bytes per block.
+	RFA_SIZE = 6;						! RMS RFA size
+
+    own
+	MIN_TREE_PAGES;
+
+    macro
+	KEY_START = SOR$GK_LEN_SIZE + SOR$GK_NODE_HED%;
+
+
+    if .SOR$GB_SOR_TYP eql SOR$GK_RECORD
+    then
+	SOR$GL_REC_SIZE = (KEY_START + .SOR$GB_KEY_SIZE + .SOR$GW_IN_LRL)		! Calculate node size.
+    else
+
+	if .SOR$GB_SOR_TYP eql SOR$GK_INDEX
+	then
+	    SOR$GL_REC_SIZE = (KEY_START + (2 * .SOR$GB_KEY_SIZE) + RFA_SIZE)		! Calculate node size.
+	else
+	    SOR$GL_REC_SIZE = (KEY_START + .SOR$GB_KEY_SIZE + RFA_SIZE);		! Calculate node size.
+
+!++
+!
+!	Calculate the minimum tree storage needed for 2 nodes.
+!
+!--
+
+    MIN_TREE_PAGES = ((( .SOR$GL_REC_SIZE * 2 ) + 511 ) / 512);		! Calc. pages.
+
+    if .SOR$GV_FLAGS [SOR$GK_FILE_IO]
+    then
+	MIN_STORAGE = ( .MIN_TREE_PAGES * 2 ) + OVERHEAD					! Calc. pages.
+    else
+	MIN_STORAGE = (( .MIN_TREE_PAGES * 4 )/ 3 ) + OVERHEAD;				! Calc. pages.
+end;
+
+
+
+
+%title 'PARTITION_VM'
+
+routine PARTITION_VM (LRL) : =
+
+!++
+! Functional Description:
+!
+!	This routine gets as much virtual memory as is 
+!	required to sort the file, and sets up the input, 
+!	output, and sort tree areas within the aquired 
+!	virtual memory.
+!
+!
+! Formal Parameters:
+!
+!	The longest record length.
+!
+!
+! Implicit Inputs:
+!
+!	The file size and the sort type.
+!
+!
+! Implicit Outputs:
+!
+!	None.
+!
+! Routine Value:
+!
+!	An error code on error.
+!
+!
+! Completion Codes:
+!
+!	1 for success.
+!
+!
+! Side Effects:
+!
+!	The programs virtual memory is extended.
+!
+!
+!--
+
+    begin
+
+    literal
+	TREE_SIZE = 2,
+	WORK_SET = 6,
+	VM_USED = 8,
+	BLK_BYTES = 512,					! Number of bytes in a block
+	OVERHEAD = 35,
+	MIN_SIZE = 75;						! Minimum working set size required
+
+    local
+	IN_BUF_SIZE;						! Actual buffer size
+
+    !
+    ! Set up input and output buffer addresses and sort tree.
+    ! Sort tree = 1/2 working set, buffers = 1/4 working set.
+    !
+    SOR$GL_BUF_SIZE = ((.WS_LIMIT - OVERHEAD)/4);
+    SOR$GL_TREE_SIZ = (.SOR$GL_BUF_SIZE*TREE_SIZE*BLK_BYTES);
+    !
+    ! If doing file I/O initialize the RAB and connect.  Then
+    ! take the returned buffer size and if less than the available
+    ! buffer size add the difference onto the tree space. Otherwise,
+    ! set the sort tree = 3/4 working set and the output buffer = 1/4
+    ! working set.
+    !
+
+    if .SOR$GV_FLAGS [SOR$GK_FILE_IO]
+    then
+	begin
+	if not .SECOND_TRY					! Avoid RAB initialization if this is the second try.
+	then
+	    begin
+	    local
+		STATUS;
+	    SOR$GB_CUR_FILE = 0;			! Current file = 0
+	    SOR$GL_DDB_PTR = .SOR$GV_DDB_TABL [0];	! Set up DDB pointer.
+	    STATUS = SOR$$RAB_INIT (.LRL, IN_BUF_SIZE);
+	    if not .STATUS then return .STATUS;
+	
+	    if .IN_BUF_SIZE lss .SOR$GL_BUF_SIZE*BLK_BYTES then
+		SOR$GL_TREE_SIZ = .SOR$GL_TREE_SIZ + (.SOR$GL_BUF_SIZE*BLK_BYTES - .IN_BUF_SIZE);
+	    end
+	end
+    else
+	SOR$GL_TREE_SIZ = .SOR$GL_TREE_SIZ + (.SOR$GL_BUF_SIZE*BLK_BYTES);
+
+    IN_BUF_SIZE = .SOR$GL_BUF_SIZE;		! Save current buffer size.
+
+    CALC_BUFFER ();
+
+
+    ! If CALC_BUFFER has shrunk SOR$GL_BUF_SIZE, then add the
+    ! difference back onto the tree.
+    !
+
+    if .IN_BUF_SIZE gtr .SOR$GL_BUF_SIZE then
+	SOR$GL_TREE_SIZ = .SOR$GL_TREE_SIZ + (.IN_BUF_SIZE - .SOR$GL_BUF_SIZE)*BLK_BYTES;
+
+    !
+    ! Determine the amount of virtual memory needed for the input buffers,
+    ! the VBN index and sort tree and get it. If possible the additional
+    ! virtual memory should equal 7 times the size of the working set size.
+    ! However if the buffer size is very large compared to the working set
+    ! due to rounding, use that size.  Allocate an extra, unused page to
+    ! make sure that any memory that is allocated later won't be in a
+    ! page that might be mapped to a work file.
+
+    !
+
+    if .SOR$GV_FLAGS [SOR$GK_NO_MERGE]
+    then
+	VM_LIMIT = .SOR$GL_TREE_SIZ + (.SOR$GL_TREE_SIZ/TREE_SIZE)
+    else
+	VM_LIMIT = (maxu (.SOR$GL_BUF_SIZE, .WS_LIMIT)*BLK_BYTES*7) + .SOR$GW_IN_LRL;
+
+    if not GET_VM_PAGES (.VM_LIMIT, SOR$GL_IN_BUF, VM_LIMIT)
+    then
+	return ERROR
+    else
+	return SUCCESS;
+
+    end;
+
+
+%title 'GET_VM_PAGES'
+
+routine GET_VM_PAGES (SIZE, START_ADDRESS, ACTUAL_SIZE) =
+
+
+!++
+!
+!
+!
+! Functional Description:
+!
+!	This routine calls LIB$GET_VM to allocate a block of memory.
+!	It guarantees that the starting address will at the beginning
+!	of a page and that the ending address at the end of a page.
+!	The actual amount allocated will always be greater than or
+!	equal to the amount requested.
+!
+!
+!
+! Formal Parameters:
+!
+!	SIZE.rl (val)	the number of bytes requested for allocation.
+!
+!	START_ADDRESS.wa.v	the address of the 1st byte allocated.
+!
+!	ACTUAL_SIZE.wl.v	the actual number of bytes allocated.
+!
+!
+!
+!
+! Routine Value:
+!
+!	SUCCESS or error code.
+!
+!
+!--
+
+
+
+    begin
+
+
+	local
+	    TEMP,
+	    LOCATION,			! Start location returned by LIB$GET_VM
+	    TRUE_ADDRESS,		! 1st byte that is on a page boundry.
+	    REQ_SIZE,			! Actual amount requested to LIB$GET_VM.
+	    CUR_TOP,			! Last address in block returned by LIB$GET_VM
+	    TOP;			! Last address in block to be returned to user.
+
+
+	literal
+	    BLK_BYTES = 512,		! Bytes per page.
+	    BYTE_MASK = %x'1FF',	! Mask for byte number within page.
+	    PAGE_MASK = %x'FFFFFE00';	! Mask for page number.
+
+
+	macro
+
+	    BYTE_NUMBER (A) = ((A) and BYTE_MASK) %,	! Extract byte number.
+
+	    PAGE_NUMBER (A) = ((A) and PAGE_MASK) %;	! Extract page number.
+
+
+
+	!
+	! First get the memory + 2 pages so that when we trim
+	! off the part that is over the page boundry, we will
+	! still have at least as much as requested.
+	!
+
+	REQ_SIZE = .SIZE + 2 * BLK_BYTES;	! Amount to request.
+
+	TEMP = LIB$GET_VM (REQ_SIZE, LOCATION);	! Get the memory.
+	if not .TEMP then return .TEMP;
+
+	if BYTE_NUMBER (.LOCATION) neq 0 then	! Adjust beginning to page boundry.
+
+	    begin
+		TRUE_ADDRESS = PAGE_NUMBER (.LOCATION) + BLK_BYTES;
+		LIB$FREE_VM (%ref (.TRUE_ADDRESS - .LOCATION), LOCATION);  ! Free up stuff before 1st page.
+		end
+
+	    else
+
+		TRUE_ADDRESS = .LOCATION;
+
+
+	!
+	! Now trim the top so that the memory block ends at
+	! a page boundry.
+	!
+
+	TOP = (.TRUE_ADDRESS + .SIZE - 1) or BYTE_MASK;  ! Get top of requested memory.
+
+	CUR_TOP = .LOCATION + .REQ_SIZE - 1;		 ! Get actual top of memory.
+
+	if .TOP gtru .CUR_TOP then return SOR$_VM_FAIL;	 ! Should never happen.
+
+	if .TOP lssu .CUR_TOP then
+	    LIB$FREE_VM (%ref (.CUR_TOP - .TOP), %ref (.TOP + 1));  ! Release memory beyond last page.
+
+	.ACTUAL_SIZE = .TOP - .TRUE_ADDRESS + 1;	 ! Tell user how much he got.
+	.START_ADDRESS = .TRUE_ADDRESS;			 ! And where it is.
+
+	SUCCESS
+	end;
+
+%title 'MAP_INDEX'
+routine MAP_INDEX (NUM_FILES, ADDRESS, START_VBN, FLAG_VALUE, START_FILE,
+			HIGH_ADR)  =
+
+!++
+! Functional Description:
+!
+!	This routine maps the VBN index blocks of the work files.
+!
+!
+! Formal Parameters:
+!
+!	The number of files to map index blocks for, the starting virtual
+!	address, the starting VBN and the desired flags word.
+!	START_FILES is the first file to map.
+!
+!	HIGH_ADR -	Address to store the highest address mapped + 1.
+!
+! Implicit Inputs:
+!
+!	None.
+!
+!
+! Implicit Outputs:
+!
+!	None.
+!
+!
+! Routine Value:
+! Completion Codes:
+!
+!	An error code if failed.
+!
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+
+    begin
+
+    literal
+	BLK_BYTES = 511;
+
+    stacklocal
+	VIRTUAL_ADR : vector [2];
+
+    !
+    ! These pages will contain an index of pointers which are the starting
+    ! VBNs of each of the strings created in the dispersion phase or the
+    ! intermediate merge phases.
+    !
+    VIRTUAL_ADR [0] = .ADDRESS;
+
+    incr index from .START_FILE to .START_FILE + .NUM_FILES - 1 do
+	begin
+	VIRTUAL_ADR [1] = .VIRTUAL_ADR [0] + BLK_BYTES;
+
+	if not FLUSH_PAGES (.VIRTUAL_ADR [0], .VIRTUAL_ADR [1]) then return SOR$_MAP;
+
+	if not MAP_VM (VIRTUAL_ADR, .START_VBN, .FLAG_VALUE, .index) then return SOR$_MAP;
+
+	if .NUM_FILES geq .WORK_OUT then VBN_INDEX [.index] = .VIRTUAL_ADR [0];
+
+	VIRTUAL_ADR [0] = .VIRTUAL_ADR [1] + 1;
+	end;
+
+    .HIGH_ADR = .VIRTUAL_ADR [0];		! Store high address
+    return SUCCESS;
+    end;
+
+psect
+    code = SOR$SORTCOM;
+
+
+%title 'EXTEND_FILE'
+routine EXTEND_FILE : JSBL =
+
+!++
+! Functional Description:
+!
+!	This routine extends the work files when necessary.
+!
+!
+! Formal Parameters:
+!
+!	None.
+!
+!
+! Implicit Inputs:
+!
+!	None.
+!
+!
+! Implicit Outputs:
+!
+!	None.
+!
+!
+! Routine Value:
+!
+!	1 for success.
+!
+!
+! Completion Codes:
+!
+!	An error code if failed.
+!
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+
+    begin
+
+    builtin
+	rot;
+
+    literal
+	FAT$C_LENGTH = 14;
+
+    local
+	ERROR_CODE;
+
+    stacklocal
+	SCRATCH_FIB : block [FIB$K_EXTDATA, byte],		! File ident block
+	FIB_DESC : vector [2],					! File ident block descriptor
+	VIRTUAL_ADR : vector [2],				! Virtual addresses
+	ATTR_LIST : block [12, byte],				! Attribute list for write
+	ATTR_AREA : block [FAT$C_LENGTH, byte];
+
+    bind
+	FILE = .OUT_FILE*3;
+
+    !
+    ! Set up the file identification block and its descriptor. Then issue
+    ! the QIOs which do the extend and write attributes to update the end of
+    ! file block.
+    !
+    ch$fill (0, FIB$K_EXTDATA, ch$ptr (SCRATCH_FIB));
+    FIB_DESC [0] = FIB$K_EXTDATA;
+    FIB_DESC [1] = SCRATCH_FIB;
+    SCRATCH_FIB [FIB$W_FID_NUM] = .FILE_ID [FILE];
+    SCRATCH_FIB [FIB$W_FID_SEQ] = .FILE_ID [FILE + 1];
+    SCRATCH_FIB [FIB$W_FID_RVN] = .FILE_ID [FILE + 2];
+    SCRATCH_FIB [FIB$W_EXCTL] = FIB$M_EXTEND or FIB$M_ALCONB;
+    SCRATCH_FIB [FIB$L_EXSZ] = 3*.SOR$GL_BUF_SIZE;
+    FILE_SIZE [.OUT_FILE] = .FILE_SIZE [.OUT_FILE] + .SCRATCH_FIB [FIB$L_EXSZ];
+    !
+    ! Set up the attribute list to write the attributes so that
+    ! EFBLK gets updated for the pager.
+    !
+    ATTR_LIST [ATR$W_SIZE] = FAT$C_LENGTH;
+    ATTR_LIST [ATR$W_TYPE] = ATR$C_RECATTR;
+    ATTR_LIST [ATR$L_ADDR] = ATTR_AREA;
+    ATTR_LIST + 8 = 0;
+    ATTR_AREA [FAT$B_RATTRIB] = FAB$M_CR;
+    ATTR_AREA [FAT$B_RTYPE] = FAB$C_VAR;
+    ATTR_AREA [FAT$W_RSIZE] = .SOR$GL_REC_SIZE;
+    ATTR_AREA [FAT$L_HIBLK] = rot (.FILE_SIZE [.OUT_FILE], 16);
+    ATTR_AREA [FAT$L_EFBLK] = rot ((.FILE_SIZE [.OUT_FILE] + 1), 16);
+    ATTR_AREA [FAT$W_FFBYTE] = 0;
+    $QIOW (EFN = .EVENT_FLAG, FUNC = IO$_MODIFY, IOSB = VIRTUAL_ADR, P1 = FIB_DESC, P5 = ATTR_LIST,
+	CHAN = .SCR_CHANNELS [.OUT_FILE]);
+
+    if not .VIRTUAL_ADR [0]
+    then
+
+	if .SOR$GV_FLAGS [SOR$GK_UTILITY] then SOR$$ERROR (SOR$_EXTEND, .VIRTUAL_ADR [0]) else return SOR$_EXTEND;
+
+    return SUCCESS;
+    end;
+
+psect
+    code = SOR$SORTINIT;
+
+
+%title 'CALC_BUFFER'
+routine CALC_BUFFER : novalue JSBL =
+
+!++
+! Functional Description:
+!
+!	This routine does the necessary calculations on the buffer size
+!	to insure the appropriate mapping of vbns to records.
+!
+!
+! Formal Parameters:
+!
+!	None.
+!
+!
+! Implicit Inputs:
+!
+!	The buffer size, the record size, and the key size.
+!
+!
+! Implicit Outputs:
+!
+!	None.
+!
+!
+! Routine Value:
+!
+!
+! Completion Codes:
+!
+!
+!--
+
+    begin
+
+    local
+	CUR_SIZE,				! Current guess for best buffer size.
+	USED,					! % of the buffer that will be used for records.
+	BEST_USED,				! The highest value of USED so far.
+	NUM_PAGES,				! Number of pages needed for the current buffer size.
+	REC_SIZE;				! Size of max record + overhead.
+
+    own
+	BUF_SIZE,				! Calculated buffer size.
+	GCD;					! Greatest common divisor of record size and 512.
+
+    literal
+	RFA_SIZE = 6,
+	MAX_BUF = 65536,			! Maximum I/O buffer size allowed.
+	BLK_BYTES = 512;
+
+!
+! Calculate the I/O buffer size to minimize the wasted space.  First,
+! find the least common multiple of the record size and 512.  If this
+! is reasonably small, then fixed length records can fit in a buffer
+! with no wasted space.  If the LCM is too large, then find the multiple
+! of the record size that minimizes wasted space but still produces a
+! small buffer.  Return the buffer size in SOR$GL_BUF_SIZ.
+
+! First, calculate the record size.
+
+    REC_SIZE = .SOR$GB_KEY_SIZE + SOR$GK_LEN_SIZE;
+
+    if .SOR$GB_SOR_TYP eql SOR$GK_RECORD
+    then
+	REC_SIZE = .REC_SIZE + .SOR$GW_IN_LRL
+    else
+	REC_SIZE = .REC_SIZE + RFA_SIZE;
+
+    if .SOR$GB_SOR_TYP eql SOR$GK_INDEX then REC_SIZE = .REC_SIZE + .SOR$GB_KEY_SIZE;
+
+    GCD_LCM (.REC_SIZE, BLK_BYTES, GCD, BUF_SIZE);
+
+! If the buffer size is too big, loop through all multiples of the
+! record size that produce a small enough buffer and choose the multiple
+! that minimizes the wasted space.  Since we know that REC_SIZE*BLK_BYTES gtr MAX_BUF,
+! we will go through the loop a maximum of 512 times.
+
+    if .BUF_SIZE gtru MAX_BUF
+    then
+	begin
+	BEST_USED = 0;				! Best % of buffer use seen so far.
+	CUR_SIZE = .REC_SIZE;			! Start with a buffer of 1 record.
+
+	while .CUR_SIZE lequ MAX_BUF do
+	    begin
+	    NUM_PAGES = (.CUR_SIZE + BLK_BYTES - 1)/BLK_BYTES;
+	    USED = (.CUR_SIZE*1000)/(.NUM_PAGES*BLK_BYTES);
+
+	    if .USED gtru .BEST_USED
+	    then
+		begin
+		BEST_USED = .USED;
+		BUF_SIZE = .CUR_SIZE;
+		end;
+
+	    CUR_SIZE = .CUR_SIZE + .REC_SIZE;	! Step to next multiple.
+	    end;
+
+	end;
+
+    NUM_PAGES = (.BUF_SIZE + BLK_BYTES - 1) / BLK_BYTES;
+    if .NUM_PAGES geq .SOR$GL_BUF_SIZE
+    then
+	SOR$GL_BUF_SIZE = .NUM_PAGES
+    else
+	SOR$GL_BUF_SIZE = .SOR$GL_BUF_SIZE - (.SOR$GL_BUF_SIZE mod .NUM_PAGES);
+
+    if .SOR$GL_BUF_SIZE gtr .REC_SIZE then
+	SOR$GL_BUF_SIZE = .REC_SIZE;		!Don't use buffers gtr .REC_SIZE * 512
+
+    end;
+
+%title 'GCD_LCM'
+routine GCD_LCM (NUM1, NUM2, GCD, LCM) : novalue =
+
+!++
+! Functional Description:
+!
+!	This routine finds the greatest common multiple and the least
+!	common divisor of two numbers.
+!
+!
+! Formal Parameters:
+!
+!	NUM1, NUM2
+!	    The two numbers whose gcd and lcm are to be found.
+!
+!	GCD
+!	    The greatest common divisor of NUM1 and NUM2.  (Returned)
+!
+!	LCM
+!	    The least common multiple of NUM1 and NUM2. (Returned)
+!
+!
+! Implicit Inputs:
+!
+!	None.
+!
+!
+! Routine Value:
+!
+!	None.
+!
+!
+! Side Effects:
+!
+!	None.
+    begin
+
+    local
+	REMAINDER;
+
+! Use Euclid's algorithm to find the greatest common multiple and the
+! least common divisor.
+    .GCD = .NUM1;
+    .LCM = .NUM2;
+
+    while ..LCM neq 0 do
+	begin
+	REMAINDER = ..GCD mod ..LCM;
+	.GCD = ..LCM;
+	.LCM = .REMAINDER;
+	end;
+
+    .LCM = (.NUM1/..GCD)*.NUM2;
+    end;
+
+psect
+    code = SOR$SORTMERGE;
+
+
+%title 'SOR$$MERGE_PASS'
+
+global routine SOR$$MERGE_PASS (NUMBER_OF_RUNS, NEW_PASS) : CALLR =
+
+!++
+! Functional Description:
+!
+!	This routine sets up for an intermediate merge merge phase. It
+!	calculates the order of merge cleans out the work space, and
+!	maps the input runs and the output buffer onto the correct files
+!	and VBNs.
+!
+!
+! Formal Parameters:
+!
+!	The number of runs of files to be merged, and a switch
+!	indicating whether this is a new pass or the same pass.
+!
+!
+! Implicit Inputs:
+!
+!	None.
+!
+!
+! Implicit Outputs:
+!
+!	None.
+!
+!
+! Routine Value:
+!
+!	1 for success.
+!
+!
+! Completion Codes:
+!
+!	An error code if failed.
+!
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+
+    begin
+
+    external register
+	MAP_REGS;
+
+    local
+	PTR,
+	ERROR_CODE;
+
+    stacklocal
+	VIRTUAL_ADR : vector [2];
+
+    literal
+	LIST_SIZE = 160,
+	INDEX_SIZE = 220,
+	BLK_BYTES = 512,
+	OVERHEAD = 35;
+
+    !
+    ! Now clean out the existing work space by writing all pages back
+    ! to the disk and reinitializing the virtual address space.
+    !
+
+    if .NEW_PASS then PTR = .VBN_INDEX [0] else PTR = .SOR$GL_OUT_BUF;
+
+    if not FLUSH_PAGES (.PTR, .HIGH_VM - 1) then return SOR$_MAP;
+
+    if .NEW_PASS
+    then
+	begin
+	!
+	! Now determine the order of the merge based on the number of runs
+	! and the available virtual memory.
+	!
+
+	if .NUMBER_OF_RUNS lssu 11
+	then
+	    SOR$GB_MERGE = .NUMBER_OF_RUNS
+	else
+
+	    if .NUMBER_OF_RUNS lssu 17
+	    then
+		SOR$GB_MERGE = 4
+	    else
+
+		if .NUMBER_OF_RUNS lssu 26
+		then
+		    SOR$GB_MERGE = 5
+		else
+
+		    if .NUMBER_OF_RUNS lssu 37
+		    then
+			SOR$GB_MERGE = 6
+		    else
+
+			if .NUMBER_OF_RUNS lssu 50
+			then
+			    SOR$GB_MERGE = 7
+			else
+
+			    if .NUMBER_OF_RUNS lssu 65
+			    then
+				SOR$GB_MERGE = 8
+			    else
+
+				if .NUMBER_OF_RUNS lssu 82 then SOR$GB_MERGE = 9 else SOR$GB_MERGE = 10;
+
+
+	!
+	! Map the index block of each file.  Leave room for an input record
+	! buffer.
+	!
+	begin
+	local
+	    STATUS;
+	VIRTUAL_ADR [0] = ((.SOR$GL_TREE + LIST_SIZE + INDEX_SIZE) and %x'FFFFFE00') + BLK_BYTES;
+	STATUS = MAP_INDEX (.SOR$GB_WRK_FIL, .VIRTUAL_ADR [0], 1, SEC$M_WRT,
+		0, VIRTUAL_ADR [0]); 
+	if not .STATUS then return .STATUS;
+	end;
+
+	decr TEMP from .SOR$GB_MERGE to 3 do
+
+	    if ((.SOR$GB_MERGE + 1)*.SOR$GL_BUF_SIZE*BLK_BYTES) + .VIRTUAL_ADR [0] leqa .HIGH_VM
+	    then
+		exitloop
+	    else
+		SOR$GB_MERGE = .SOR$GB_MERGE - 1;
+
+	!
+	! Determine which files have the input and the output.
+	!
+
+	if .OUT_FILE geq .WORK_OUT
+	then
+	    begin
+	    OUT_FILE = 0;
+	    IN_FILE = .WORK_IN;
+	    end
+	else
+	    begin
+	    OUT_FILE = .WORK_OUT;
+	    IN_FILE = 0;
+	    end;
+
+	PTR = .WORK_IN;
+	WORK_IN = .WORK_OUT;
+	WORK_OUT = .PTR;
+	IN_RUN = 0;						! Reset input file parameters
+	VBNS [0] = 2;
+	VBNS [1] = 2;
+	VBNS [2] = 2;
+	VBNS [3] = 2;
+	VBNS [4] = 2;
+	VBNS [5] = 2;						! Reset output file parameters
+	VBNS [6] = 2;
+	VBNS [7] = 2;
+	VBNS [8] = 2;
+	VBNS [9] = 2;
+	START_RUN = 0;
+	OUT_RUN = 0;
+	PTR = .VBN_INDEX [.OUT_FILE];				! Zero output file index
+	ch$fill (%x'0', (.WORK_OUT*BLK_BYTES), ch$ptr (.PTR));
+	end
+    else
+	VIRTUAL_ADR [0] = .SOR$AL_BUF_ADR [0, START_BUF];
+
+    !
+    ! If this is a new pass or the same pass but a new set of runs, map a
+    ! portion of each run left up to the merge order into the buffers.
+    ! Record the buffer size, starting and ending addresses, the number of
+    ! VBNs left in this run, the VBN to start with and the file number it
+    ! came from.
+    !
+
+    incr index from 0 to .SOR$GB_MERGE - 1 do
+	begin
+	PTR = .VBN_INDEX [.IN_FILE] + (.IN_RUN*4);
+	VIRTUAL_ADR [1] = .VIRTUAL_ADR [0] + (minu (..PTR, .SOR$GL_BUF_SIZE)*BLK_BYTES);
+
+	if not MAP_VM (VIRTUAL_ADR, .VBNS [.IN_FILE],0, .IN_FILE) then return SOR$_MAP;
+
+	SOR$AL_BUF_ADR [.index, START_BUF] = .VIRTUAL_ADR [0];
+	SOR$AL_BUF_ADR [.index, END_BUF] = .VIRTUAL_ADR [1];
+	SOR$AL_BUF_ADR [.index, CUR_BUF] = .VIRTUAL_ADR [0];
+	SOR$AL_BUF_ADR [.index, VBN_START] = .VBNS [.IN_FILE] + minu (..PTR, .SOR$GL_BUF_SIZE);
+	SOR$AL_BUF_ADR [.index, VBN_LEFT] = ..PTR - minu (..PTR, .SOR$GL_BUF_SIZE);
+	SOR$AL_BUF_ADR [.index, FILE_IN] = .IN_FILE;
+	VIRTUAL_ADR [0] = .VIRTUAL_ADR [1] + 1;
+	VBNS [.IN_FILE] = .VBNS [.IN_FILE] + ..PTR;
+	!
+	! Calculate the next file to get a run from. Then map a new index block
+	! for the input files if needed and map the output buffer.
+	!
+
+	if .IN_FILE + 1 neq .WORK_IN and .IN_FILE + 1 neq .SOR$GB_WRK_FIL
+	then
+	    IN_FILE = .IN_FILE + 1
+	else
+	    begin
+	    IN_FILE = (.IN_FILE - .WORK_IN) + 1;
+	    IN_RUN = .IN_RUN + 1;
+
+	    if .IN_RUN eql MAXRUNS
+	    then
+		begin
+
+		incr index from 0 to .WORK_IN - 1 do
+		    begin
+		    local
+			STATUS,
+			DUMMY;
+		    VBNS [.index + .IN_FILE] = .(.VBN_INDEX [.index + .IN_FILE] + (.IN_RUN*4));
+
+		    STATUS = MAP_INDEX (1, .VBN_INDEX[.index+.IN_FILE],
+			.VBNS[.index+.IN_FILE], SEC$M_WRT, .index+.IN_FILE,
+			DUMMY);
+		    if not .STATUS then return .STATUS;
+
+		    VBNS [.index + .IN_FILE] = .VBNS [.index + .IN_FILE] + 1;
+		    end;
+
+		IN_RUN = 0;
+		end;
+
+	    end;
+
+	end;
+
+    ! Reset the output buffer.
+    SOR$GL_OUT_BUF = .VIRTUAL_ADR [0];
+
+    if .NEW_PASS
+    then
+	begin
+
+	if .SOR$GB_MERGE geq .NUMBER_OF_RUNS then return SUCCESS;
+
+	START_ADR = .SOR$GL_OUT_BUF;
+	end;
+
+    return SOR$$MAP_VM (1);
+    end;
+
+psect
+    code = SOR$SORTMERGE;
+
+
+%title 'SOR$$MAP_RUN'
+
+global routine SOR$$MAP_RUN (BUFFER_NUM) : JSBL =
+
+!++
+! Functional Description:
+!
+!	This routine maps the remaining portion of the input runs into
+!	the buffers as needed during the merging.
+!
+!
+! Formal Parameters:
+!
+!	The number of the buffer or run to be mapped.
+!
+!
+! Implicit Inputs:
+!
+!	None.
+!
+!
+! Implicit Outputs:
+!
+!	None.
+!
+!
+! Routine Value:
+!
+!	1 for success.
+!
+!
+! Completion Codes:
+!
+!	An error code if failed.
+!
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+
+    begin
+
+    local
+	TEMP,
+	FILE_NUM;
+
+    stacklocal
+	VIRTUAL_ADR : vector [2];
+
+    literal
+	BLK_BYTES = 512;
+
+    !
+    ! Map the next portion of the run from the disk into the existing buffer.
+    !
+    FILE_NUM = .SOR$AL_BUF_ADR [.BUFFER_NUM, VBN_START];
+    VIRTUAL_ADR [0] = .SOR$AL_BUF_ADR [.BUFFER_NUM, START_BUF];
+    TEMP =(.SOR$AL_BUF_ADR [.BUFFER_NUM, VBN_LEFT]*BLK_BYTES) + .SOR$AL_BUF_ADR [.BUFFER_NUM, START_BUF] - 1;
+    VIRTUAL_ADR [1] = minu (.SOR$AL_BUF_ADR [.BUFFER_NUM, END_BUF], .TEMP);
+
+    !
+    ! If we are reducing the size of the section, then delete the
+    ! current section so that we won't have an unused section
+    ! laying around using process section table space.
+    !
+    if .VIRTUAL_ADR [1] lssu .SOR$AL_BUF_ADR [.BUFFER_NUM, END_BUF] then
+
+	$CRETVA (INADR = SOR$AL_BUF_ADR [.BUFFER_NUM, START_BUF]);
+
+
+    if not MAP_VM (VIRTUAL_ADR, .FILE_NUM,0, .SOR$AL_BUF_ADR [.BUFFER_NUM, FILE_IN]) then return SOR$_MAP;
+
+    SOR$AL_BUF_ADR [.BUFFER_NUM, CUR_BUF] = .VIRTUAL_ADR [0];
+    SOR$AL_BUF_ADR [.BUFFER_NUM, END_BUF] = .VIRTUAL_ADR [1];
+    SOR$AL_BUF_ADR [.BUFFER_NUM, VBN_LEFT] = .SOR$AL_BUF_ADR [.BUFFER_NUM, VBN_LEFT] - ((.VIRTUAL_ADR [1] -
+    .VIRTUAL_ADR [0])/BLK_BYTES) - 1;
+    SOR$AL_BUF_ADR [.BUFFER_NUM, VBN_START] = .SOR$AL_BUF_ADR [.BUFFER_NUM, VBN_START] + ((.VIRTUAL_ADR [1] -
+    .VIRTUAL_ADR [0])/BLK_BYTES) + 1;
+    return SUCCESS;
+    end;
+
+psect
+    code = SOR$SORTCOM;
+
+
+%title 'FLUSH_PAGES'
+routine FLUSH_PAGES (START_ADR, END_ADR) : JSBL =
+
+!++
+! Functional Description:
+!
+!	This routine writes out the pages that have been modified in the
+!	output buffer. This cleans out the buffer so that any remapping
+!	of the same address space or VBNs within the work file does not
+!	cause race conditions of pages going back to the same disk
+!	address.
+!
+!
+! Formal Parameters:
+!
+!	The starting and ending addresses to be written.
+!
+!
+! Implicit Inputs:
+!
+!	None.
+!
+!
+! Implicit Outputs:
+!
+!	None.
+!
+!
+! Routine Value:
+!
+!	1 for success.
+!
+!
+! Completion Codes:
+!
+!	An error code if failed.
+!
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+
+    begin
+
+    local
+	ERROR_CODE;
+
+    stacklocal
+	ADDRESS_STATUS : vector [2];
+
+    !
+    ! Set up the address vector and calls the update system service.
+    !
+    ADDRESS_STATUS [0] = .START_ADR;
+    ADDRESS_STATUS [1] = .END_ADR;
+    ERROR_CODE = $UPDSEC (INADR = ADDRESS_STATUS, EFN = .EVENT_FLAG, IOSB = ADDRESS_STATUS);
+
+    if .ERROR_CODE
+    then
+	begin
+	$WAITFR (EFN = .EVENT_FLAG);
+
+	if .ADDRESS_STATUS [0] then return SUCCESS else ERROR_CODE = .ADDRESS_STATUS [0];
+
+	end;
+
+    if .SOR$GV_FLAGS [SOR$GK_UTILITY] then SOR$$ERROR (SOR$_MAP, .ERROR_CODE);
+    return SOR$_MAP;
+
+    end;
+
+psect
+    code = SOR$SORTCOM;
+
+
+%title 'MAP_VM'
+routine MAP_VM (ADDRESS, START_VBN, FLAG, CHAN_INDEX) : JSBL =
+
+!++
+! Functional Description:
+!
+!	This routine does the actual mapping call to the system.
+!
+!
+! Formal Parameters:
+!
+!	The address of the virtual memory to be mapped the starting VBN
+!	to map it to, the mapping flags, and the index into the work
+!	file channels.
+!
+!
+! Implicit Inputs:
+!
+!	None.
+!
+!
+! Implicit Outputs:
+!
+!	None.
+!
+!
+! Routine Value:
+!
+!	1 for success.
+!
+!
+! Completion Codes:
+!
+!	An error code if failed.
+!
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+
+    begin
+
+    map
+	ADDRESS : ref vector [2];
+
+    literal
+	BLK_BYTES = 512;
+
+    local
+	TEMP;
+
+    !
+    ! Adjust the page fault count and call the system service.
+    !
+
+    if .ADDRESS [1] gtra .HIGH_VM
+    then
+
+	if .SOR$GV_FLAGS [SOR$GK_UTILITY] then SOR$$ERROR (SOR$_MAP) else return SOR$_MAP;
+
+    if (.SOR$GL_TREE_SIZ*2)/(.SOR$GB_MERGE + 1) gtr (.ADDRESS [1] - .ADDRESS [0])/BLK_BYTES
+    then
+	TEMP = ((.ADDRESS [1] - .ADDRESS [0])/BLK_BYTES)
+    else
+	TEMP = (.SOR$GL_TREE_SIZ*2)/(.SOR$GB_MERGE + 1);
+
+    if .TEMP gtr 127 then TEMP = 127;
+
+    ADDRESS [1] = .ADDRESS [1] - 1;
+    TEMP = $CRMPSC (INADR = .ADDRESS, RETADR = .ADDRESS, ACMODE = 0, GSDNAM = 0, ident = 0, FLAGS = .FLAG,
+	CHAN = .SCR_CHANNELS [.CHAN_INDEX], VBN = .START_VBN, PFC = .TEMP);
+
+    if not .TEMP
+    then
+
+	if .SOR$GV_FLAGS [SOR$GK_UTILITY] then SOR$$ERROR (SOR$_MAP, .TEMP) else return SOR$_MAP;
+
+    return SUCCESS;
+    end;
+
+psect
+    code = SOR$CONTROL;
+
+
+%title 'SOR$END_SORT'
+
+global routine SOR$END_SORT : =
+
+!++
+! Functional Description:
+!
+!	This routine cleans up the work space removing all mappings and
+!	returning the virtual memory aquired to the system. It readjusts
+!	the working set size to the original and deaasigns all channels.
+!	It then calls a routine which closes all RMS files.
+!
+!
+! Formal Parameters:
+!
+!	None.
+!
+!
+! Implicit Inputs:
+!
+!	None.
+!
+!
+! Implicit Outputs:
+!
+!	None.
+!
+!
+! Routine Value:
+!
+!
+! Completion Codes:
+!
+!	1 for success, or an error code.
+!
+!
+! Side Effects:
+!
+!	None.
+!
+!--
+
+    begin
+
+    literal
+	SORT_ON = 64,
+	SORT_OFF = 22,
+	SORT_FOF = 60;
+
+    map
+	SOR$GV_FLAGS : word;
+
+    local
+	VIRTUAL_ADR : vector [2],
+	NOT_END,				! Not called at end of sort.
+	ERROR_CODE;
+
+    !
+    ! First delete all mapped virtual address space by creating new address
+    ! space over it.  Then deassign the work files. Finally close the users
+    ! files if open.
+    !
+
+    %if PERFORMANCE %then
+	PME_EXIT();						! Turn off perfomance measurement.
+    %fi
+
+    if .SOR$GV_FLAGS [SOR$GK_MERGE2] then return SOR$$END_MERGE();
+
+    if (.SOR$GV_FLAGS and SORT_ON) neq 0 or ((.SOR$GV_FLAGS and SORT_OFF) neq SORT_OFF and (.SOR$GV_FLAGS and
+	SORT_FOF) neq SORT_FOF)
+    then
+	NOT_END = 1
+    else
+	NOT_END = 0;
+
+    ! Set sort 6th call on
+    SOR$GV_FLAGS [SOR$GK_SORT6] = 1;
+    ERROR_CODE = 0;
+
+    if .HIGH_VM neq 0
+    then
+	begin
+
+	if .VBN_INDEX [0] gtra .SOR$GL_IN_BUF or .VBN_INDEX [0] eql 0
+	then
+	    VIRTUAL_ADR [0] = .SOR$GL_IN_BUF
+	else
+	    VIRTUAL_ADR [0] = .VBN_INDEX [0];
+
+	VIRTUAL_ADR [1] = .HIGH_VM - 1;
+
+	if not $CRETVA (INADR = VIRTUAL_ADR) then ERROR_CODE = 1;
+
+	SOR$GL_IN_BUF = .HIGH_VM - .VM_LIMIT;
+	end;
+
+    if .SOR$GB_WRK_FIL neq 0 and not .SOR$GB_NO_SCR	! If scratch files exist
+    then
+	begin
+
+	incr index from 0 to .SOR$GB_WRK_FIL - 1 do
+
+	    if not $DASSGN (CHAN = .SCR_CHANNELS [.index]) then ERROR_CODE = 1;
+
+	if not LIB$FREE_EF (EVENT_FLAG) then ERROR_CODE = 1;
+
+	end;
+
+    if not LIB$FREE_VM (VM_LIMIT, SOR$GL_IN_BUF) then ERROR_CODE = 1;
+
+    if .SOR$GL_SAVE_SIZ gtru 0 then
+	if not LIB$FREE_VM (SOR$GL_SAVE_SIZ, SOR$GL_SAVE_ADR) then ERROR_CODE = 1;  ! Return LAST_KEY buffer.
+
+!    if not $ADJWSL (PAGCNT = .WS_SIZE - .WS_LIMIT) then ERROR_CODE = 1;
+
+    if .SOR$GV_FLAGS [SOR$GK_FILE_IO]
+    then
+
+	begin
+	    if .SOR$GV_FLAGS [SOR$GK_UTILITY] then	    
+		SOR$$UNLOCK_GRP (2);				! If utility is running, unlock merge phase pages.
+	    if not SOR$$CLOSE_FILE (1) then ERROR_CODE = 1;
+
+	    ! Return input file DDB's.
+
+	    incr INDEX from 0 to .SOR$GB_NUM_FILE - 1 do
+
+		begin
+    		    if not LIB$FREE_VM (%ref (SOR$GK_DDB_SIZE), SOR$GV_DDB_TABL [.INDEX]) then
+			ERROR_CODE = 1;
+		    SOR$GV_DDB_TABL [.INDEX] = 0;
+		    end;
+
+	    SOR$GB_NUM_FILE = 0;
+	    SOR$GW_MAX_LRL = 0;
+	    SOR$GW_MAX_MRS = 0;
+	    SOR$GL_IN_ALQ = 0;
+	    SOR$GL_DDB_PTR = 0;
+	    end;
+
+
+    !
+    ! Reinitialize all variables for possible recall of SORT.
+    !
+    SOR$GB_KEY_SIZE = 0;
+    SOR$GB_MERGE = 0;
+    SOR$GB_NUM_KEYS = 0;
+    SOR$GV_FLAGS = 0;
+    SOR$GB_SOR_TYP = 1;
+    SOR$GB_WRK_FIL = 2;
+    SOR$GL_IN_ALQ = 0;
+    SOR$GW_IN_LRL = 0;
+    SOR$GL_SAVE_SIZ = 0;
+    SOR$GL_SAVE_ADR = 0;
+    SOR$GL_REC_CNT = 0;					! Record count
+    SOR$GB_REC_NUM = 0;					! Position of record number. (Stable sort)
+    WS_SIZE = 0;
+    WS_LIMIT = 0;
+    SOR$GW_FIX_SIZE = %x'FFFF';			! Size of fixed area for VFC records.
+    OUT_RUN = 0;
+    OUT_FILE = 0;
+    IN_FILE = 0;
+    IN_RUN = 0;
+    VBNS [0] = 2;
+    VBNS [1] = 2;
+    VBNS [2] = 2;
+    VBNS [3] = 2;
+    VBNS [4] = 2;
+    VBNS [5] = 2;
+    VBNS [6] = 2;
+    VBNS [7] = 2;
+    VBNS [8] = 2;
+    VBNS [9] = 2;
+
+    ! Zero the rest of OWN storage just to be on the safe side...
+
+    VM_LIMIT	= 0;
+    HIGH_VM	= 0;
+    START_RUN	= 0;
+    EVENT_FLAG	= 0;
+    WORK_IN	= 0;
+    WORK_OUT	= 0;
+    SECOND_TRY	= 0;
+    MIN_STORAGE	= 0;
+
+    INCR I FROM 0 TO 29 DO FILE_ID [.I] = 0;
+    INCR I FROM 0 TO 9 DO
+	BEGIN
+	SCR_CHANNELS [.I] = 0;
+	VBN_INDEX [.I]	= 0;
+	FILE_SIZE [.I]	= 0;
+	END;
+
+    if not .ERROR_CODE or .NOT_END then return SUCCESS else return SOR$_CLEAN_UP;
+
+    end;
+
+end
+
+eludom
+
+
+
+

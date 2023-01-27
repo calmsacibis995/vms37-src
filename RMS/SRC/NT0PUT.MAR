@@ -1,0 +1,593 @@
+	$BEGIN	NT0PUT,035,NF$NETWORK,<NETWORK PUT/UPDATE/DELETE RECORD>
+
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; Facility: RMS
+;
+; Abstract:
+;
+;	This module communicates with the file access listener at the remote
+;	node to perform the put, udpate, and delete functions.
+;
+; Environment: VAX/VMS, executive mode
+;
+; Author: James A. Krycka,	Creation Date:	09-DEC-1977
+;
+; Modified By:
+;
+;	V02-035	JAK0068		J A Krycka	14-DEC-1981
+;		Replace NT$FE_TABLE stream terminator vector with NT$STM_MASK
+;		stream terminator bitmask.
+;
+;	V02-034	JAK0066		J A Krycka	01-OCT-1981
+;		Add support for stream file format.
+;
+;	V02-033	JAK0063		J A Krycka	25-AUG-1981
+;		If a $PUT operation fails at the remote node, send a DAP
+;		Continue Transfer message to direct FAL to restart the message
+;		stream.
+;
+;	V02-032	KRM0019		K R Malik	01-JUL-1981
+;		Return RFA value to user on $PUT and $UPDATE.
+;
+;	V02-031	JAK0047		J A Krycka	14-AUG-1980
+;		Declare RMS$_FTM error if the FOP SQO bit is set and the RAC
+;		value is not SEQ on a call to $PUT.
+;
+;	V02-030	REFORMAT	J A Krycka	26-JUL-1980
+;
+;--
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+
+	$BDBDEF				; Define BDB symbols
+	$DAPPLGDEF			; Define DAP prologue symbols
+	$DAPHDRDEF			; Define DAP message header
+	$DAPCNFDEF			; Define DAP Configuration message
+	$DAPCTLDEF			; Define DAP Control message
+	$DAPCONDEF			; Define DAP Continue Transfer message
+	$DAPDATDEF			; Define DAP Data message
+	$IFBDEF				; Define IFAB symbols
+	$IRBDEF				; Define IRAB symbols
+	$NWADEF				; Define Network Work Area symbols
+	$RABDEF				; Define Record Access Block symbols
+
+;
+; Macros:
+;
+;	None
+;
+; Equated Symbols:
+;
+
+LF=10					; Line feed
+VT=11					; Vertical tab
+FF=12					; Form feed
+DLE=16					; Data link error  (Control-P)
+DC1=17					; Device control 1 (Control-Q)
+DC2=18					; Device control 2 (Control-R)
+DC3=19					; Device control 3 (Control-S)
+DC4=20					; Device control 4 (Control-T)
+CTRLZ=26				; Control-Z
+ESC=27					; Escape
+
+CRLF=^X0A0D				; ASCII codes for CR and LF
+
+	ASSUME	DAP$Q_DCODE_FLG EQ 0
+	ASSUME	NWA$Q_FLG EQ 0
+
+;
+; Own Storage:
+;
+
+	.SAVE
+	.PSECT	ND$NETWORK,LONG,GBL,NOWRT
+
+;
+; The following bitmask represents the DAP terminator set for stream (STM)
+; format files where each bit position corresponds to an ASCII character code
+; for a single-character terminator. Note that the default terminator, CRLF,
+; is not expressed in this mask.
+;
+
+NT$STM_MASK::				; DAP stream terminator bitmask
+	.LONG	<<1@LF> + <1@FF> + <1@VT> + <1@CTRLZ> + <1@ESC> + -
+		<1@DLE> + <1@DC1> + <1@DC2> + <1@DC3> + <1@DC4>>
+
+	.RESTORE
+
+	.SBTTL	NT$PUT - PERFORM NETWORK PUT FUNCTION
+
+;++
+; NT$PUT - engages in a DAP dialogue with the remote FAL to put (store) the
+;	specified record of a sequential, relative, or indexed file. This
+;	routine supports both DAP file transfer and record transfer modes.
+;
+; Calling Sequence:
+;
+;	BSBW	NT$PUT
+;
+; Input Parameters:
+;
+;	R4	BDB address
+;	R8	RAB address
+;	R9	IRAB address
+;	R10	IFAB address
+;	R11	Impure Area address
+;
+; Implicit Inputs:
+;
+;	BDB buffer contents
+;	BDB$L_ADDR
+;	BDB$W_NUMB
+;	DAP$V_DAPCRC
+;	DAP$V_GEQ_V56
+;	DAP$L_CRC_RSLT
+;	IFB$L_NWA_PTR
+;	IFB$V_SQO
+;	IRB$B_MODE
+;	NWA$V_DAP_STM
+;	NWA$V_FTM_INIT
+;	NWA$V_FTM_RETRV
+;	NWA$W_DAPBUFSIZ
+;	NWA$B_ORG
+;	NWA$Q_XMT
+;	RAB$B_KSZ
+;	RAB$B_RAC
+;	RAB$L_ROP
+;	RAB$L_KBF
+;
+; Output Parameters:
+;
+;	R0	Status code (RMS)
+;	R1-R3	Destroyed
+;	AP	Destroyed
+;
+; Implicit Outputs:
+;
+;	BDB$B_FLGS
+;	DAP$L_CRC_RSLT
+;	IRB$L_IOS and IRB$L_IOS4 zeroed
+;	NWA$V_FTM_INIT cleared
+;	NWA$V_FTM_STORE
+;	RAB$W_RFA
+;
+; Completion Codes:
+;
+;	Standard RMS completion codes
+;
+; Side Effects:
+;
+;	None
+;
+;--
+
+NT$PUT::				; Entry point
+	$TSTPT	NTPUT			;
+	PUSHR	#^M<R4,R5,R6,R7>	; Save registers
+	MOVL	R4,R6			; Copy BDB address
+	MOVL	IFB$L_NWA_PTR(R10),R7	; Get address of NWA (and DAP)
+	BSBW	NT$CHK_RAC		; Validate record access mode
+	BLBC	R0,10$			; Branch on failure
+	BBS	#NWA$V_FTM_RETRV,(R7),20$; $PUT after $GET not allowed in FTM
+
+	ASSUME	RAB$C_SEQ EQ 0
+	ASSUME	RAB$C_KEY EQ 1
+	ASSUME	RAB$C_RFA EQ 2
+
+	$CASEB	SELECTOR=RAB$B_RAC(R8)-	; Dispatch on access mode:
+		DISPL=<-		;
+		    PUT_SEQ-		;  Sequential record access
+		    PUT_KEY-		;  Access by key value
+		>			;  Access by record file address
+	BRW	ERRRAC			; Branch aid
+10$:	BRW	EXIT			; Branch aid
+20$:	BRW	ERRFTM			; Branch aid
+
+;+
+; Sequential access has been requested.
+;
+; Note:	In record transfer mode a Control message must be sent for each record
+;	retrieved, whereas, in file transfer mode only an initial Control
+;	message is required.
+;-
+
+PUT_SEQ:				;
+	BBS	#IFB$V_SQO,(R10),10$	; Branch if in file transfer mode
+	MOVZBL	#DAP$K_SEQ_ACC,R1	; Set RAC for DAP message
+	BRB	PUT_SEND_CTL		; Join common code
+10$:	BBCC	#NWA$V_FTM_INIT,(R7),-	; Branch if no Control message required
+		PUT_SEND_DAT		;  and turn off single-shot flag
+	$SETBIT	#NWA$V_FTM_STORE,(R7)	; Set file transfer mode storage flag
+	MOVZBL	#DAP$K_SEQ_FILE,R1	; Set RAC for DAP message
+
+;+
+; Build and send DAP Control message to partner.
+;-
+
+PUT_SEND_CTL:				;
+	MOVL	#DAP$K_CTL_MSG,R0	; Get message type value
+	BSBW	NT$BUILD_HEAD		; Construct message header
+	MOVB	#DAP$K_PUT_WRITE,(R5)+	; Store CTLFUNC field
+	MOVB	#<<DAP$M_RAC>!-		; Store CTLMENU field
+		  <DAP$M_ROP>!-		;
+		0>,(R5)+		;
+	MOVB	R1,(R5)+		; Store RAC field
+PUT_SEND_CTL1:				; Common code for $PUT and $UPDATE
+	BSBW	NT$MAP_ROP		; Store ROP as an extensible field
+	BSBW	NT$BUILD_TAIL		; Finish building message
+	BSBW	NT$TRANSMIT		; Send Control message to FAL
+	BLBS	R0,PUT_SEND_DAT		; Branch on success
+	BRW	EXIT			; Branch aid
+
+;+
+; Build and send DAP Data message to partner containing user record.
+;-
+
+PUT_SEND_DAT:				;
+	BBS	#IFB$V_SQO,(R10),10$	; Branch if in file transfer mode
+	$SETBIT	#NWA$V_LAST_MSG,(R7)	; Declare this last message to block
+10$:	MOVL	#DAP$K_DAT_MSG,R0	; Get message type value
+	BSBW	NT$BUILD_HEAD		; Construct message header
+	MOVL	NWA$Q_XMT+4(R7),R4	; Get address of transmit buffer
+	CLRB	(R5)+			; Zero RECNUM field
+	MOVL	R5,R3			; Save next byte pointer
+	MOVZWL	BDB$W_NUMB(R6),R2	; Get record size
+	SUBL3	R4,R5,R1		; Compute # DAP overhead bytes in msg
+	ADDL3	R2,R1,R5		; Compute projected size of DAP message
+	CMPW	R5,NWA$W_DAPBUFSIZ(R7)	; Make sure message will fit in buffer
+	BGTRU	40$			; Branch if record is too big
+	MOVQ	R2,NWA$Q_SAVE_DESC(R7)	; Save descriptor of user record
+	PUSHR	#^M<R5>			; Save register
+	MOVC3	R2,@BDB$L_ADDR(R6),(R3)	; Move record into DAP message
+	POPR	#^M<R5>			; Restore register
+	BBC	#NWA$V_DAP_STM,(R7),50$	; Check if conversion is required
+
+;
+; The remote file is in stream format--add a CRLF to the user record if it
+; does not end in a stream form effector character.
+;
+
+	TSTW	BDB$W_NUMB(R6)		; Branch if this is a null record
+	BEQL	30$			;
+	MOVZBL	-1(R3),R0		; Get record terminator character
+	CMPB	R0,#31			; Branch if out-of-range for a stream
+	BGTRU	30$			;  terminator character
+	BBS	R0,W^NT$STM_MASK,50$	; Branch on stream terminator
+30$:	ADDL2	#2,R5			; Increase record length for CRLF
+	CMPW	R5,NWA$W_DAPBUFSIZ(R7)	; Make sure message will fit in buffer
+40$:	BGTRU	ERRRSZ			; Branch if record is too big
+	MOVW	#CRLF,(R3)+		; Add CRLF to terminate record
+	ADDL2	#2,NWA$Q_SAVE_DESC(R7)	; Update record length in descriptor
+
+;
+; End of record conversion.
+;
+
+50$:	MOVL	R3,R5			; Save next byte pointer
+	BSBW	NT$BUILD_TAIL		; Finish building message
+	BBC	#DAP$V_DAPCRC,-		; Branch if partner does not support
+		DAP$Q_SYSCAP(R7),60$	;  file level CRC checksum
+	MOVQ	NWA$Q_SAVE_DESC(R7),R2	; Put descriptor of record in <R2,R3>
+	CRC	W^NT$CRC_TABLE,-	; Compute CRC (destroying R0-R3)
+		DAP$L_CRC_RSLT(R7),-	;  using result of previous CRC
+		R2,(R3)			;  calculation as initial CRC value
+	MOVL	R0,DAP$L_CRC_RSLT(R7)	; Store CRC resultant value
+60$:	BSBW	NT$TRANSMIT		; Send record
+	BLBC	R0,CHKSTS		; Branch on failure
+	BICB2	#<1@BDB$V_DRT>,BDB$B_FLGS(R6) ; Say not dirty anymore
+
+;+
+; Receive DAP Status message from partner if we are in record transfer mode
+; and return record file address of the first block accessed.
+;-
+
+PUT_RECV_STS:				;
+	BBS	#IFB$V_SQO,(R10),EXIT	; Branch if in file transfer mode
+	BBC	#DAP$V_GEQ_V56,(R7),EXIT; Branch if partner uses DAP before V5.6
+; *****	$SETBIT	#DAP$K_STS_MSG,DAP$L_MSG_MASK(R7); Implied for receive
+	BSBW	NT$RECEIVE		; Obtain status of put/update request
+	BLBC	R0,CHKSTS		; Branch on failure
+	BSBW	NT$RET_RFA		; Return RFA value to user RAB
+	BRB	EXIT			; Branch aid
+
+;+
+; Access by relative record number or by key value has been requested.
+; This operation must be performed in DAP record transfer mode.
+;-
+
+PUT_KEY:				;
+	BBS	#IFB$V_SQO,(R10),ERRFTM	; Disallow file transfer mode
+	MOVL	#DAP$K_CTL_MSG,R0	; Get message type value
+	BSBW	NT$BUILD_HEAD		; Construct message header
+	MOVB	#DAP$K_PUT_WRITE,(R5)+	; Store CTLFUNC field
+	MOVB	#<<DAP$M_RAC>!-		; Store CTLMENU field
+		  <DAP$M_ROP>!-		;
+		0>,(R5)+		;
+	CMPB	NWA$B_ORG(R7),#NWA$K_IDX; Branch if IDX organization
+	BEQL	10$			;
+	BISB2	#DAP$M_KEY,-1(R5)	; Add KEY to CTLMENU if not IDX org
+10$:	MOVB	#DAP$K_KEY_ACC,(R5)+	; Store RAC field
+	CMPB	NWA$B_ORG(R7),#NWA$K_IDX; Branch if IDX organization
+	BEQL	20$			;
+	BSBW	NT$OBTAIN_KEY		; Store key value
+20$:	BRW	PUT_SEND_CTL1		; Join common code
+
+;+
+; Common exit code for $PUT and $UPDATE.
+;-
+
+CHKSTS:	BBS	#NWA$V_UPDATE,(R7),EXIT	; Branch if this is an update operation
+	BSBB	NT$RESUME_FAL		; Tell FAL what to do on put error
+	BRB	EXIT			; 
+ERRRSZ:	RMSERR	RSZ			; Invalid record size
+	BRB	EXIT			;	
+ERRRAC:	RMSERR	RAC			; Invalid record access value
+	BRB	EXIT			;
+ERRFTM:	RMSERR	FTM			; File transfer mode error
+EXIT:	$CLRBIT	#NWA$V_UPDATE,(R7)	; Initialize flag for next time thru
+	CLRQ	IRB$L_IOS(R9)		; Zero I/O status block
+					;  (pertinent status info is already
+					;  in R0 and RAB$L_STV)
+	POPR	#^M<R4,R5,R6,R7>	; Restore registers
+	RSB				; Exit with RMS code in R0
+
+	.SBTTL	NT$RESUME_FAL
+
+;++
+; This routine handles $PUT and $WRITE error recovery. The DAP specification
+; requires that a Continue Transfer message be sent to FAL as an interrupt
+; message to tell it what to do with the record (or block) that it failed to 
+; to $PUT (or $WRITE) to the file. After sending a Status message to indicate
+; the error condition, FAL waits for receipt of an interrupt message.
+;
+; Note:	The Continue Transfer message must not be sent on error from an $UPDATE
+;	operation; just on an error from a $PUT or $WRITE operation.
+;
+; Note:	If the error occurs in file transfer mode, the file transfer operation
+;	will be aborted. Consequently, the next RMS operation that the user
+;	requests must be a $DISCONNECT or $CLOSE. This restriction does not
+;	apply to record transfer mode.
+;
+; Inputs:
+;
+;	R0	Status code that caused this routine to be called
+;	R7	NWA (=DAP) address
+;
+; Output Parameters:
+;
+;	R0	Status code (RMS) to return to user
+;	R1-R5	Destroyed
+;	R6	Status code on entry
+;--
+
+NT$RESUME_FAL::				; Entry point
+	MOVL	R0,R6			; Save error code on entry
+	CMPB	DAP$B_DCODE_MSG(R7),-	; Verify that error occurred at remote
+		#DAP$K_STS_MSG		;  node (i.e., that FAL returned a
+	BNEQ	DONE			;  Status message and thus is waiting)
+
+;+
+; Build and send DAP Continue Transfer message to partner.
+;-
+
+SEND_CON:				; (required to continue after error)
+	MOVL	#DAP$K_CON_MSG,R0	; Get message type value
+	BSBW	NT$BUILD_HEAD		; Construct message header
+	MOVB	#DAP$K_SKIP_REC,(R5)+	; Store CONFUNC field assuming that
+					;  record transfer mode is in effect
+	BBC	#NWA$V_FTM_STORE,(R7),10$;Branch if we guessed right
+	MOVB	#DAP$K_ABORT,-1(R5)	; Store CONFUNC field appropriate for
+					;  file transfer mode
+10$:	BSBW	NT$BUILD_TAIL		; Finish building message
+	MOVL	R4,R1
+	MOVL	R5,R0
+	MOVQ	R0,R4
+	BSBW	NT$INTERRUPT		; Send Continue Transfer message to FAL
+					;  as an interrupt message
+	BLBC	R0,DONE1		; On failure return this error which
+					;  will override error code on entry
+DONE:	MOVL	R6,R0			; Restore error code on entry
+DONE1:	RSB				; Exit with RMS code in R0
+
+	.SBTTL	NT$UPDATE - PERFORM NETWORK UPDATE FUNCTION
+
+;++
+; NT$UPDATE - engages in a DAP dialogue with the remote FAL to update (modify)
+;	the specified record of a sequential, relative, or indexed file.
+;
+; Calling Sequence:
+;
+;	BSBW	NT$UPDATE
+;
+; Input Parameters:
+;
+;	R4	BDB address
+;	R8	RAB address
+;	R9	IRAB address
+;	R10	IFAB address
+;	R11	Impure Area address
+;
+; Implicit Inputs:
+;
+;	BDB buffer contents
+;	BDB$L_ADDR
+;	BDB$W_NUMB
+;	DAP$V_DAPCRC
+;	DAP$V_GEQ_V56
+;	DAP$L_CRC_RSLT
+;	IFB$L_NWA_PTR
+;	IFB$V_SQO
+;	NWA$V_DAP_STM
+;	NWA$W_DAPBUFSIZ
+;	NWA$Q_XMT
+;	RAB$B_RAC
+;	RAB$L_ROP
+;
+; Output Parameters:
+;
+;	R0	Status code (RMS)
+;	R1-R7	Destroyed
+;	AP	Destroyed
+;
+; Implicit Outputs:
+;
+;	BDB$B_FLGS
+;	DAP$L_CRC_RSLT
+;	IRB$L_IOS and IRB$L_IOS4 zeroed
+;	RAB$W_RFA
+;
+; Completion Codes:
+; Side Effects:
+;
+;	None
+;
+;--
+
+NT$UPDATE::				; Entry point
+	$TSTPT	NTUPDATE		;
+	PUSHR	#^M<R4,R5,R6,R7>	; Save registers
+	BBS	#IFB$V_SQO,(R10),ERRFTM	; Network update function not allowed
+					;  if file transfer mode selected
+	MOVL	R4,R6			; Copy BDB address
+	MOVL	IFB$L_NWA_PTR(R10),R7	; Get address of NWA (and DAP)
+	$SETBIT	#NWA$V_UPDATE,(R7)	; Denote this is an update operation
+
+;+
+; Build and send DAP Control message to partner.
+;-
+
+UPD_SEND_CTL:				;
+	$SETBIT	#NWA$V_LAST_MSG,(R7)	; Declare this last message to block
+	MOVL	#DAP$K_CTL_MSG,R0	; Get message type value
+	BSBW	NT$BUILD_HEAD		; Construct message header
+	MOVB	#DAP$K_UPDATE,(R5)+	; Store CTLFUNC field
+	MOVB	#<<DAP$M_RAC>!-		; Store CTLMENU field
+		  <DAP$M_ROP>!-		;
+		0>,(R5)+		;
+	MOVB	#DAP$K_SEQ_ACC,(R5)+	; Store RAC field--assume SEQ access
+	CMPB	RAB$B_RAC(R5),#RAB$C_KEY; Keyed access specified?
+	BNEQ	10$			; Branch if not
+	MOVB	#DAP$K_KEY_ACC,-1(R5)	; Change RAC field
+10$:	BRW	PUT_SEND_CTL1		; Join common code
+
+	.SBTTL	NT$DELETE - PERFORM NETWORK DELETE FUNCTION
+
+;++
+; NT$DELETE - engages in a DAP dialogue with the remote FAL to delete the
+;	specified record of a relative or indexed file.
+;
+; Calling Sequence:
+;
+;	BSBW	NT$DELETE
+;
+; Input Parameters:
+;
+;	R8	RAB address
+;	R9	IRAB address
+;	R10	IFAB address
+;	R11	Impure Area address
+;
+; Implicit Inputs:
+;
+;	DAP$V_GEQ_V56
+;	IFB$L_NWA_PTR
+;	IFB$V_SQO
+;	NWA$B_ORG
+;
+; Output Parameters:
+;
+;	R0	Status code (RMS)
+;	R1-R3	Destroyed
+;	AP	Destroyed
+;
+; Implicit Outputs:
+;
+;	None
+;
+; Completion Codes:
+;
+;	Standard RMS completion codes
+;
+; Side Effects:
+;
+;	None
+;
+;--
+
+NT$DELETE::				; Entry point
+	$TSTPT	NTDELETE		;
+	PUSHR	#^M<R4,R5,R6,R7>	; Save registers
+	BBS	#IFB$V_SQO,(R10),ERRFTM2; Network delete function not allowed
+					;  if file transfer mode selected
+	MOVL	R4,R6			; Copy BDB address
+	MOVL	IFB$L_NWA_PTR(R10),R7	; Get address of NWA (and DAP)
+	CMPB	NWA$B_ORG(R7),#NWA$K_SEQ; Screen out SEQ file organization
+	BEQL	ERRIOP			; Branch on error
+
+;+
+; Build and send DAP Control message to partner.
+;-
+
+DEL_SEND_CTL:				;
+	$SETBIT	#NWA$V_LAST_MSG,(R7)	; Declare this last message to block
+	MOVL	#DAP$K_CTL_MSG,R0	; Get message type value
+	BSBW	NT$BUILD_HEAD		; Construct message header
+	MOVB	#DAP$K_DELETE,(R5)+	; Store CTLFUNC field
+	MOVB	#DAP$M_RAC,(R5)+	; Store CTLMENU field
+	MOVB	#DAP$K_SEQ_ACC,(R5)+	; Store RAC field
+	BSBW	NT$BUILD_TAIL		; Finish building message
+	BSBW	NT$TRANSMIT		; Send Control message to FAL
+	BLBC	R0,EXIT2		; Branch on failure
+
+;+
+; Receive DAP Status message from partner.
+;-
+
+DEL_RECV_STS:				;
+	BBC	#DAP$V_GEQ_V56,(R7),EXIT2
+					; Branch if partner uses DAP before V5.6
+; *****	$SETBIT	#DAP$K_STS_MSG,DAP$L_MSG_MASK(R7); Implied for receive
+	BSBW	NT$RECEIVE		; Obtain status of delete request
+
+;+
+; Exit code for $DELETE.
+;-
+
+EXIT2:	POPR	#^M<R4,R5,R6,R7>	; Restore registers
+	BRW	NT$EXRMS		; Exit with RMS code in R0
+ERRFTM2:RMSERR	FTM			; File transfer mode error
+	BRB	EXIT2			;
+ERRIOP:	RMSERR	IOP			; Illegal I/O operation
+	BRB	EXIT2			;
+
+	.END				; End of module

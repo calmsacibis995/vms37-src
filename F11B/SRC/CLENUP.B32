@@ -1,0 +1,1143 @@
+MODULE CLENUP (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This module performs the necessary cleanup after an operation.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  6-Jan-1977  23:53
+!
+! MODIFIED BY:
+!
+!	V02-024	ACG0259		Andrew C. Goldstein,	26-Jan-1982  19:12
+!		Add mode arg to REMOVE
+!
+!	V02-023	ACG0247		Andrew C. Goldstein,	23-Dec-1981  20:26
+!		Make /NOCACHE flush all caches
+!
+!	V02-022	ACG0245		Andrew C. Goldstein,	23-Dec-1981  20:26
+!		Send spool file to print during cleanup
+!
+!	V02-021	ACG0244		Andrew C. Goldstein,	23-Dec-1981  20:14
+!		Do buffer flush before deallocating control blocks
+!
+!	V02-020	LMP0003		L. Mark Pilant,	30-Nov-1981  16:40
+!		Properly cleanup any cathedral windows.
+!
+!	V02-019	ACG0208		Andrew C. Goldstein,	11-Nov-1981  17:51
+!		Add segmented directory record support
+!
+!	V02-018	ACG0168		Andrew C. Goldstein,	7-May-1980  18:22
+!		Fix last block directory cleanup on delete failure
+!
+!	V02-017	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:25
+!		Previous revision history moved to F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	CLEANUP,			! normal cleanup
+	ZERO_WINDOWS,			! invalidate all windows of file
+	ZERO_IDX,			! initialize directory index
+	ERR_CLEANUP,			! cleanup after error
+	FLUSH_FIDCACHE,			! clean out file ID cache
+	MAKE_DEACCESS,			! deaccess the file
+	DEL_EXTFCB,			! deallocate extension FCB's
+	ZERO_CHANNEL;			! zero user channel pointer
+
+GLOBAL ROUTINE CLEANUP =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs the cleanup needed after a successfully
+!	completed file operation.
+!
+! CALLING SEQUENCE:
+!	CLEANUP ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CLEANUP_FLAGS: indicate specific actions to do
+!	PRIMARY_FCB: FCB of file
+!	CURRENT_WINDOW: window of file
+!	DIR_FCB: FCB of directory
+!	CURRENT_VCB: VCB of volume in process
+!	IO_PACKET: I/O packet of request
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	FCB's and windows deleted when appropriate
+!	header written
+!	FCB updated
+!
+!--
+
+BEGIN
+
+LOCAL
+	FCB		: REF BBLOCK,	! local FCB pointer
+	VCB		: REF BBLOCK,	! local VCB pointer
+	RVT		: REF BBLOCK,	! local RVT pointer
+	UCB		: REF BBLOCK,	! local UCB pointer
+	HEADER		: REF BBLOCK;	! file header
+
+EXTERNAL
+	CONTEXT_START,			! start of cleanup context area
+	CONTEXT_SAVE,			! start of context save area
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	FILE_HEADER	: REF BBLOCK,	! address of last file header read
+	CURRENT_FIB	: REF BBLOCK,	! address of current FIB in use
+	PRIMARY_FCB	: REF BBLOCK,	! FCB of file
+	CURRENT_WINDOW	: REF BBLOCK,	! window of file
+	DIR_FCB		: REF BBLOCK,	! FCB of directory
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume
+	CURRENT_UCB	: REF BBLOCK,	! UCB of volume
+	IO_PACKET	: REF BBLOCK;	! I/O packet in process
+
+EXTERNAL LITERAL
+	CONTEXT_SIZE;			! length of context area
+
+EXTERNAL ROUTINE
+	FLUSH_BUFFERS,			! write all dirty buffers
+	SWITCH_VOLUME,			! switch to desired volume
+	FLUSH_QUO_CACHE,		! flush the quota cache
+	FLUSH_FID,			! flush a file from buffer pool
+	DELETE_FID,			! delete file ID (and flush ID cache)
+	PURGE_EXTENT,			! purge extent cache
+	READ_HEADER,			! read file header
+	INIT_FCB2,			! initialize FCB
+	DEALLOCATE;			! deallocate dynamic memory
+
+
+! ***** Note: The primary header of the current file is not necessarily
+! resident at this point.
+!
+! Switch back to the primary context area if necessary (no normal cleanup
+! is ever necessary on secondary context).
+!
+
+IF .CONTEXT_SAVE NEQ 0
+THEN
+    BEGIN
+    CH$MOVE (CONTEXT_SIZE, CONTEXT_SAVE, CONTEXT_START);
+    CONTEXT_SAVE = 0;
+    END;
+
+! If the directory file is write accessed, flush the buffer pool of any
+! blocks that might be resident. Also flush the directory index.
+!
+
+IF .DIR_FCB NEQ 0
+THEN
+    BEGIN
+    IF .DIR_FCB[FCB$W_ACNT] EQL 0
+    THEN
+	BEGIN
+	IF NOT .DIR_FCB[FCB$V_DIR]
+	THEN
+	    BEGIN
+	    KERNEL_CALL (DEALLOCATE, .DIR_FCB);
+	    DIR_FCB = 0;
+	    END;
+	END
+
+    ELSE
+	BEGIN
+	IF .DIR_FCB[FCB$W_WCNT] NEQ 0
+	THEN
+	    BEGIN
+	    SWITCH_VOLUME (.DIR_FCB[FCB$W_FID_RVN]);
+	    FLUSH_FID (DIR_FCB[FCB$W_FID]);
+	    KERNEL_CALL (ZERO_IDX);
+	    END;
+	END;
+    END;
+
+! Check the entire volume set to see if the index file or storage map
+! on any volume is write accessed. If so, flush the buffer pool of any
+! of their blocks, and flush the file ID and extent caches as appropriate.
+! Also, if the volume is mounted /NOCACHE, flush the entire buffer cache.
+!
+
+RVT = .CURRENT_VCB[VCB$L_RVT];
+INCR J FROM 1 TO
+    BEGIN
+    IF .RVT EQL .CURRENT_UCB
+    THEN (UCB = .RVT; 1)
+    ELSE .RVT[RVT$B_NVOLS]
+    END
+DO
+    BEGIN
+    IF .RVT NEQ .CURRENT_UCB
+    THEN UCB = .VECTOR [RVT[RVT$L_UCBLST], .J-1];
+    IF .UCB NEQ 0
+    THEN
+	BEGIN
+	VCB = .UCB[UCB$L_VCB];
+	IF .VCB[VCB$V_NOCACHE]
+	THEN
+	    FLUSH_FID (0)
+	ELSE IF .VCB[VCB$V_WRITE_IF]
+	OR .VCB[VCB$V_WRITE_SM]
+	OR .BBLOCK [UCB[UCB$L_DEVCHAR], DEV$V_DMT]
+	THEN
+	    BEGIN
+	    SWITCH_VOLUME (.J);
+	    IF .VCB[VCB$V_WRITE_IF]
+	    THEN
+		BEGIN
+		DELETE_FID (0);
+		FLUSH_FID (UPLIT WORD (1, 1, 0));
+		END;
+	    IF .VCB[VCB$V_WRITE_SM]
+	    THEN
+		BEGIN
+		PURGE_EXTENT (0, 0);
+		FLUSH_FID (UPLIT WORD (2, 2, 0));
+		END;
+	    IF .BBLOCK [UCB[UCB$L_DEVCHAR], DEV$V_DMT]
+	    THEN
+		BEGIN
+		DELETE_FID (0);
+		PURGE_EXTENT (0, 0);
+		IF .J EQL 1
+		THEN FLUSH_QUO_CACHE ();
+		END;
+	    END;
+	END;
+    END;
+
+! If someone has the quota file write accessed (and it is active), flush it
+! from the buffer pool. (Note that the quota file is located on RVN 1.)
+!
+
+UCB = .CURRENT_VCB[VCB$L_RVT];
+IF .UCB NEQ .CURRENT_UCB
+THEN UCB = .UCB[RVT$L_UCBLST];
+IF .UCB NEQ 0
+THEN
+    BEGIN
+    VCB = .UCB[UCB$L_VCB];
+    FCB = .VCB[VCB$L_QUOTAFCB];
+    IF .FCB NEQ 0
+    THEN
+	IF .FCB[FCB$W_WCNT] GTRU 1
+	THEN
+	    BEGIN
+	    SWITCH_VOLUME (1);
+	    FLUSH_QUO_CACHE ();
+	    FLUSH_FID (FCB[FCB$W_FID]);
+	    END;
+    END;
+
+! Flush all dirty buffers.
+!
+
+FLUSH_BUFFERS ();
+
+! If an FCB is left about with no use, dispose of it.
+!
+
+IF .PRIMARY_FCB NEQ 0
+THEN
+    BEGIN
+    IF .PRIMARY_FCB[FCB$W_ACNT] EQL 0
+    AND NOT .PRIMARY_FCB[FCB$V_DIR]
+    THEN
+	BEGIN
+	KERNEL_CALL (DEALLOCATE, .PRIMARY_FCB);
+	PRIMARY_FCB = 0;
+	END;
+    END;
+
+! Invalidate any windows on the file, if requested.
+!
+
+IF TESTBITSC (CLEANUP_FLAGS[CLF_INVWINDOW])
+AND .PRIMARY_FCB NEQ 0
+THEN KERNEL_CALL (ZERO_WINDOWS, .PRIMARY_FCB);
+
+RETURN 1;
+
+END;					! end of routine CLEANUP
+
+GLOBAL ROUTINE ZERO_WINDOWS (FCB) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine invalidates all windows currently in use on the
+!	indicated FCB. This routine must be executed in kernel mode.
+!
+! CALLING SEQUENCE:
+!	ZERO_WINDOWS (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of FCB
+!
+! IMPLICIT INPUTS:
+!	CURRENT_WINDOW: address of caller's window, if any
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	all windows marked empty, caller's turned
+!
+!--
+
+BEGIN
+
+MAP
+	FCB		: REF BBLOCK;
+
+LOCAL
+	P		: REF BBLOCK,	! window pointer
+	DUMMY,				! dummy storage for REMQUE return
+	WINDOW_SEGMENT	: REF BBLOCK,	! pointer to window segment
+	NEXT_SEGMENT	: REF BBLOCK;	! pointer to window after next one
+
+EXTERNAL ROUTINE
+	DEALLOCATE;			! deallocate dynamic memory
+
+! Loop through the window list off the FCB, zeroing all the retrieval pointer
+! counts. Then turn the user's window to VBN 1 if it exists.
+!
+
+P = .FCB[FCB$L_WLFL];
+
+UNTIL .P EQL FCB[FCB$L_WLFL] DO
+    BEGIN
+    P[WCB$W_NMAP] = 0;
+    WINDOW_SEGMENT = .P[WCB$L_LINK];
+    UNTIL .WINDOW_SEGMENT EQL 0
+    DO
+	BEGIN
+	NEXT_SEGMENT = .WINDOW_SEGMENT[WCB$L_LINK];
+	REMQUE (.WINDOW_SEGMENT, DUMMY);
+	DEALLOCATE (.WINDOW_SEGMENT);
+	WINDOW_SEGMENT = .NEXT_SEGMENT;
+	END;
+    P[WCB$L_LINK] = 0;
+    P[WCB$V_COMPLETE] = 0;
+    P = .P[WCB$L_WLFL];
+    END;
+
+! ***** Note: When handling of window misses goes into its final form,
+! this routine must also scan the I/O queue on the UCB and look for I/O
+! into the blocks just deallocated. All such requests must be yanked out
+! of the queue and routed to the ACP for error processing.
+
+RETURN 1;
+
+END;					! end of routine ZERO_WINDOWS
+
+GLOBAL ROUTINE ZERO_IDX =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine initializes the index in a directory FCB to an unknown
+!	state. It will be rebuilt with the next several lookups.
+!	It also bumps the sequence count to indicate a change in contents.
+!
+!
+! CALLING SEQUENCE:
+!	ZERO_IDX ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	DIR_FCB: directory FCB to init
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1
+!
+! SIDE EFFECTS:
+!	directory index zeroed
+!
+!--
+
+BEGIN
+
+EXTERNAL
+	DIR_FCB		: REF BBLOCK;	! address of directory FCB
+
+
+DIR_FCB[FCB$W_DIRSEQ] = .DIR_FCB[FCB$W_DIRSEQ] + 1;
+IF .DIR_FCB[FCB$V_DIR]
+THEN CH$FILL (-1, FCB$S_DIRIDX, DIR_FCB[FCB$B_DIRIDX]);
+
+RETURN 1;
+
+END;					! end of routine ZERO_IDX
+
+GLOBAL ROUTINE ERR_CLEANUP =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs the cleanup needed after a file
+!	operation that has terminated in an error.
+!
+! CALLING SEQUENCE:
+!	ERR_CLEANUP ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CLEANUP_FLAGS: indicate specific actions to do
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	file deaccessed if necessary
+!	channel window pointer cleared
+!
+!--
+
+BEGIN
+
+EXTERNAL
+	PMS_SUB_NEST,			! depth count on subfunction metering
+	CONTEXT_START,			! start of active context area
+	CONTEXT_SAVE,			! start of context save area
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	IO_PACKET	: REF BBLOCK,	! I/O packet for current operation
+	UNREC_COUNT,			! count of unrecorded but allocated blocks
+	UNREC_LBN,			! LBN of above
+	UNREC_RVN,			! RVN of above
+	NEW_FID,			! file number of unrecorded file ID
+	NEW_FID_RVN,			! volume containing new file ID
+	USER_STATUS	: VECTOR,	! user I/O status block
+	PREV_LINK	: BBLOCK,	! old back pointer of file
+	PREV_INAME	: VECTOR [,BYTE], ! old internal file name
+	SUPER_FID	: BBLOCK,	! FID of superseded file
+	SECOND_FIB	: BBLOCK,	! FIB for secondary file operation
+	CURRENT_FIB	: REF BBLOCK,	! pointer to FIB currently in use
+	FILE_HEADER	: REF BBLOCK,	! current file header
+	PRIMARY_FCB	: REF BBLOCK,	! FCB of this file
+	DIR_CONTEXT	: BBLOCK,	! directory scan context area
+	DIR_FCB		: REF BBLOCK,	! FCB of directory file
+	CURRENT_WINDOW	: REF BBLOCK,	! window for this file
+	PREV_VERSION,			! version number of removed entry
+	PREV_NAME	: VECTOR [,BYTE]; ! file name of removed entry
+
+DIR_CONTEXT_DEF;
+
+EXTERNAL LITERAL
+	CONTEXT_SIZE;			! length of context area
+
+EXTERNAL ROUTINE
+	PMS_END_SUB,			! end metering of current subfunction
+	CLOSE_FILE,			! close internal file
+	DEACC_QFILE,			! deaccess the quota file
+	DEALLOCATE,			! deallocate dynamic memory
+	SEND_SYMBIONT,			! send file to job controller
+	SWITCH_VOLUME,			! switch to desired volume
+	RESTORE_DIR,			! restore directory context
+	DIR_SCAN,			! scan directory file
+	MAKE_ENTRY,			! create new directory entry
+	REMOVE,				! remove a directory entry
+	READ_BLOCK,			! read a disk block
+	MARK_DIRTY,			! mark disk block for write back
+	WRITE_BLOCK,			! write a disk block
+	DELETE_FILE,			! delete a file
+	DELETE_FID,			! delete a file number
+	RETURN_BLOCKS,			! return blocks to storage map
+	TRUNCATE,			! file truncate routine
+	INVALIDATE,			! invalidate a buffer
+	READ_HEADER,			! read file header
+	INIT_FCB2,			! initialize FCB
+	UPDATE_FCB,			! update FCB contents
+	NEXT_HEADER,			! read next extension file header
+	MAKE_EXTFCB,			! create extension FCB
+	CHECKSUM,			! checksum file header
+	REMAP_FILE;			! rebuild the windows for a file
+
+
+! If a subfunction was being executed, turn off metering now.
+!
+
+IF .PMS_SUB_NEST NEQ 0
+THEN
+    BEGIN
+    PMS_SUB_NEST = 1;
+    PMS_END_SUB ();
+    END;
+
+! We repeat the entire procedure twice if a secondary file operation was
+! in progress (indicated by non-zero saved context).
+!
+
+WHILE 1 DO
+BEGIN
+
+! Locals are declared here to prevent their scope from extending around the
+! entire main loop and raising havoc with register assignment.
+!
+
+LOCAL
+	NAME_DESC	: BBLOCK [FND_LENGTH], ! file name descriptor block
+	HEADER		: REF BBLOCK,	! address of file header
+	IDENT_AREA	: REF BBLOCK,	! ident area of file header
+	FCB		: REF BBLOCK,	! FCB pointer
+	WINDOW_SEGMENT	: REF BBLOCK,	! address of the next window segment
+	NEXT_SEGMENT	: REF BBLOCK,	! address of one beyond the next window
+	RECADDR		: REF BBLOCK,	! address of directory record
+	DIR_FLAGS	: BITVECTOR [32], ! directory cleanup flags
+	UNREC_LOCAL,			! local copy of UNREC_COUNT
+	FID_LOCAL,			! local copy of NEW_FID
+	T1,				! random temps
+	T2,
+	T3;
+
+! Show that cleanup is in progress.
+!
+
+CLEANUP_FLAGS[CLF_CLEANUP] = 1;
+
+! If an internal file is open, close it first.
+!
+
+IF TESTBITSC (CLEANUP_FLAGS[CLF_CLOSEFILE])
+THEN CLOSE_FILE (.CURRENT_WINDOW);
+
+! Invalidate the file ID cache, if necessary.
+!
+
+IF TESTBITSC (CLEANUP_FLAGS[CLF_FLUSHFID])
+THEN KERNEL_CALL (FLUSH_FIDCACHE);
+
+! Deaccess the quota file, if we were in the final stages of a quota file
+! enable.
+!
+
+IF TESTBITSC (CLEANUP_FLAGS[CLF_DEACCQFILE])
+THEN KERNEL_CALL (DEACC_QFILE);
+
+! If there is a file header resident, it probably needs to be checksummed.
+!
+
+IF .FILE_HEADER NEQ 0
+THEN CHECKSUM (.FILE_HEADER);
+
+! Clean out the window pointer in the user's channel if necessary.
+!
+
+IF TESTBITSC (CLEANUP_FLAGS[CLF_ZCHANNEL])
+THEN KERNEL_CALL (ZERO_CHANNEL);
+
+! If there are unrecorded blocks allocated from the storage map, return them.
+!
+
+IF (UNREC_LOCAL = .UNREC_COUNT) NEQ 0
+THEN
+    BEGIN
+    UNREC_COUNT = 0;
+    SWITCH_VOLUME (.UNREC_RVN);
+    RETURN_BLOCKS (.UNREC_LBN, .UNREC_LOCAL);
+    END;
+
+! If there is a dangling file ID (from a partial create or header extension),
+! dispose of it.
+!
+
+IF (FID_LOCAL = .NEW_FID) NEQ 0
+THEN
+    BEGIN
+    NEW_FID = 0;
+    SWITCH_VOLUME (.NEW_FID_RVN);
+    DELETE_FID (.FID_LOCAL);
+    END;
+
+! Get back the primary file header of the file in process.
+!
+
+HEADER = .FILE_HEADER;
+IF .HEADER NEQ 0
+THEN
+    BEGIN
+    FILE_HEADER = 0;
+    HEADER = READ_HEADER ((IF .CURRENT_FIB NEQ 0
+			    THEN CURRENT_FIB[FIB$W_FID]
+			    ELSE 0),
+			   .PRIMARY_FCB);
+    END;
+
+! Send the file to the job controller if it is to be spooled.
+!
+
+IF TESTBITSC (CLEANUP_FLAGS[CLF_DOSPOOL])
+THEN SEND_SYMBIONT (.BBLOCK [.IO_PACKET[IRP$L_SVAPTE], AIB$L_DESCRIPT],
+		    .HEADER, .PRIMARY_FCB);
+
+! Deaccess the file if requested.
+!
+
+IF TESTBITSC (CLEANUP_FLAGS[CLF_DEACCESS])
+THEN KERNEL_CALL (MAKE_DEACCESS);
+
+! Deallocate the window block if called for.
+!
+
+IF TESTBITSC (CLEANUP_FLAGS[CLF_DELWINDOW])
+THEN
+    IF .CURRENT_WINDOW NEQ 0
+    THEN
+	BEGIN
+	WINDOW_SEGMENT = .CURRENT_WINDOW;
+	DO
+	    BEGIN
+	    NEXT_SEGMENT = .WINDOW_SEGMENT[WCB$L_LINK];
+	    KERNEL_CALL (DEALLOCATE, .WINDOW_SEGMENT);
+	    WINDOW_SEGMENT = .NEXT_SEGMENT;
+	    END
+	UNTIL .WINDOW_SEGMENT EQL 0;
+	CURRENT_WINDOW = 0;
+	END;
+
+! Fix the file header back link, if it was modified.
+!
+
+IF TESTBITSC (CLEANUP_FLAGS[CLF_FIXLINK])
+THEN IF .HEADER NEQ 0
+THEN
+    BEGIN
+    CH$MOVE (FID$C_LENGTH, PREV_LINK, HEADER[FH2$W_BACKLINK]);
+    IDENT_AREA = .HEADER + .HEADER[FH2$B_IDOFFSET]*2;
+    CH$MOVE (MINU (FILENAME_LENGTH, FI2$S_FILENAME), PREV_INAME,
+	     IDENT_AREA[FI2$T_FILENAME]);
+    CHECKSUM (.HEADER);
+    MARK_DIRTY (.HEADER);
+    END;
+
+! If a file deletion is called for, do it.  This is either a create that
+! failed later on, or a real delete.
+!
+
+IF TESTBITSC (CLEANUP_FLAGS[CLF_DELFILE])
+THEN IF .HEADER NEQ 0
+THEN
+    BEGIN
+    CLEANUP_FLAGS[CLF_TRUNCATE] = 0;	! no truncate necessary after a delete
+    DELETE_FILE (.CURRENT_FIB, .HEADER);
+    END;
+
+! If an extend operation failed, truncate the file.
+!
+
+IF TESTBITSC (CLEANUP_FLAGS[CLF_TRUNCATE])
+THEN IF .HEADER NEQ 0
+THEN
+    BEGIN
+    T1 = .CURRENT_FIB[FIB$L_EXSZ];	! save the data returned by EXTEND
+    T2 = .CURRENT_FIB[FIB$L_EXVBN];	! so it won't be smashed by TRUNCATE
+    T3 = .USER_STATUS[1];
+    CURRENT_FIB[FIB$L_EXSZ] = 0;
+    TRUNCATE (.CURRENT_FIB, .HEADER);
+    HEADER = .FILE_HEADER;			! follow buffer shuffling
+    CURRENT_FIB[FIB$L_EXSZ] = .T1;
+    CURRENT_FIB[FIB$L_EXVBN] = .T2;
+    USER_STATUS[1] = .T3;
+    CLEANUP_FLAGS[CLF_INVWINDOW] = 0;	! windows were never extended, so no need
+    CHECKSUM (.HEADER);
+    END;
+
+! Various errors leave the file control block screwed up. If needed,
+! rebuild it and its extensions from scratch.
+!
+
+IF TESTBITSC (CLEANUP_FLAGS[CLF_FIXFCB])
+AND .PRIMARY_FCB NEQ 0
+AND .HEADER NEQ 0
+THEN
+    IF .PRIMARY_FCB[FCB$V_DIR]
+    OR .PRIMARY_FCB[FCB$W_ACNT] NEQ 0
+    THEN
+	BEGIN
+	FCB = .PRIMARY_FCB;
+	KERNEL_CALL (DEL_EXTFCB, .FCB);
+	KERNEL_CALL (INIT_FCB2, .FCB, .HEADER);
+	WHILE 1 DO
+	    BEGIN
+	    HEADER = NEXT_HEADER (.HEADER, .FCB);
+	    IF .HEADER EQL 0 THEN EXITLOOP;
+	    FCB = KERNEL_CALL (MAKE_EXTFCB, .HEADER, .FCB, 1);
+	    END;
+	IF .FCB NEQ .PRIMARY_FCB
+	THEN
+	    BEGIN
+	    HEADER = READ_HEADER (0, .PRIMARY_FCB);
+	    KERNEL_CALL (UPDATE_FCB, .HEADER);
+	    END;
+	END;
+
+! Cleanup any cathedral windows which have broken.
+!
+
+IF TESTBITSC (CLEANUP_FLAGS[CLF_REMAP]) THEN REMAP_FILE ();
+
+! Do directory operation cleanups. We could have entered a new file, removed
+! an old one, or both, or done a supersede. A supersede is a replacement of
+! the FID for the same name, type, and version.
+!
+
+DIR_FLAGS = .CLEANUP_FLAGS;
+CLEANUP_FLAGS[CLF_SUPERSEDE] = 0;
+CLEANUP_FLAGS[CLF_REENTER] = 0;
+CLEANUP_FLAGS[CLF_REMOVE] = 0;
+
+IF .DIR_FLAGS[CLF_SUPERSEDE]
+OR .DIR_FLAGS[CLF_REENTER]
+OR .DIR_FLAGS[CLF_REMOVE]
+THEN
+    BEGIN
+    SWITCH_VOLUME (.CURRENT_FIB[FIB$W_DID_RVN]);
+
+! Buffer pool thrashing may have kicked out the directory block we need.
+! re-read it and recompute the buffer pointers.
+!
+
+    IF .DIR_ENTRY NEQ 0
+    THEN RESTORE_DIR (DIR_CONTEXT);
+
+! If a directory entry needs to be removed, do so. Pointers are all set
+! up for the REMOVE routine.
+!
+
+    IF .DIR_FLAGS[CLF_REMOVE]
+    THEN REMOVE (0);
+
+! If a directory entry needs to be re-entered, do so. If the entry was
+! removed theough an auto-purge, we need to rescan to the point of
+! removal because a directory shuffle may have invalidated the
+! pointers. Construct a name descriptor from the saved name and version
+! and call the enter routine.
+!
+
+    IF .DIR_FLAGS[CLF_REENTER]
+    THEN
+	BEGIN
+	CH$FILL (0, FND_LENGTH, NAME_DESC);
+	NAME_DESC[FND_COUNT] = .PREV_NAME[0];
+	NAME_DESC[FND_STRING] = PREV_NAME[1];
+	NAME_DESC[FND_VERSION] = .PREV_VERSION;
+	IF .DIR_FLAGS[CLF_SUPERSEDE]
+	THEN
+	    BEGIN
+	    LAST_ENTRY[0] = 0;
+	    DIR_SCAN (NAME_DESC, 0, 0, 0, 0, 0, -1);
+	    CH$MOVE (FID$C_LENGTH, SUPER_FID, CURRENT_FIB[FIB$W_FID]);
+	    END;
+	MAKE_ENTRY (NAME_DESC, .CURRENT_FIB);
+	CLEANUP_FLAGS[CLF_REMOVE] = 0;
+	WRITE_BLOCK (.DIR_BUFFER);
+	END;
+
+! A supersede cleanup consists simply of replacing the superseded file ID
+! in the directory record. Note that the supersede bit could also be set
+! by a create/auto-purge, which also sets the remove and enter bits, and
+! is handled above.
+!
+
+    IF .DIR_FLAGS[CLF_SUPERSEDE]
+    AND NOT .DIR_FLAGS[CLF_REENTER]
+    AND NOT .DIR_FLAGS[CLF_REMOVE]
+    THEN
+	BEGIN
+	DIR_VERSION[DIR$W_VERSION] = .PREV_VERSION;
+	CH$MOVE (FIB$S_FID, SUPER_FID, DIR_VERSION[DIR$W_FID]);
+	MARK_DIRTY (.DIR_BUFFER);
+	END
+
+
+    END;				! end of directory cleanup processing
+
+! Copy the saved context, if any back into the primary context and repeat
+! the cleanup.
+!
+
+IF .CONTEXT_SAVE EQL 0 THEN EXITLOOP;
+CH$MOVE (CONTEXT_SIZE, CONTEXT_SAVE, CONTEXT_START);
+CONTEXT_SAVE = 0;
+
+END;					! end of major loop
+
+RETURN 1;
+
+END;					! end of routine ERR_CLEANUP
+
+ROUTINE FLUSH_FIDCACHE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine empties the file ID cache by zeroing the entry count.
+!	It must be called in kernel mode.
+!
+!
+! CALLING SEQUENCE:
+!	FLUSH_FIDCACHE ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1
+!
+! SIDE EFFECTS:
+!	file ID cache cleared
+!
+!--
+
+BEGIN
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK;	! VCB of volume
+
+LOCAL
+	FID_CACHE	: REF BBLOCK;	! file ID cache
+
+
+FID_CACHE = .BBLOCK [.CURRENT_VCB[VCB$L_CACHE], VCA$L_FIDCACHE];
+FID_CACHE[VCA$W_FIDCOUNT] = 0;
+
+1
+END;					! end of routine FLUSH_FIDCACHE
+
+ROUTINE MAKE_DEACCESS =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs the machinery for deaccessing a file.
+!
+! CALLING SEQUENCE:
+!	MAKE_DEACCESS ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	PRIMARY_FCB: FCB of file
+!	CURRENT_WINDOW: window of file
+!	CURRENT_VCB: VCB of volume in process
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	file deaccessed
+!
+!--
+
+BEGIN
+
+LOCAL
+	WINDOW_SEGMENT	: REF BBLOCK,	! address of the next window segment
+	DUMMY;				! dummy local to receive REMQUE
+
+EXTERNAL
+	PRIMARY_FCB	: REF BBLOCK,	! FCB of file
+	CURRENT_WINDOW	: REF BBLOCK,	! window of file
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume
+	PMS$GL_OPEN	: ADDRESSING_MODE (ABSOLUTE);
+					! system count of currently open files
+
+
+! Unlink the window from the FCB. Clear the applicable access conditions
+! in the FCB.
+!
+
+WINDOW_SEGMENT = .CURRENT_WINDOW;
+DO
+    BEGIN
+    IF .WINDOW_SEGMENT[WCB$L_WLFL] NEQ 0 THEN REMQUE (.WINDOW_SEGMENT, DUMMY);
+    WINDOW_SEGMENT = .WINDOW_SEGMENT[WCB$L_LINK];
+    END
+UNTIL .WINDOW_SEGMENT EQL 0;
+
+IF .CURRENT_WINDOW[WCB$V_NOREAD]
+THEN PRIMARY_FCB[FCB$V_EXCL] = 0;
+
+IF .CURRENT_WINDOW[WCB$V_NOTRUNC]
+THEN PRIMARY_FCB[FCB$W_TCNT] = .PRIMARY_FCB[FCB$W_TCNT] - 1;
+
+IF .CURRENT_WINDOW[WCB$V_NOWRITE]
+THEN PRIMARY_FCB[FCB$W_LCNT] = .PRIMARY_FCB[FCB$W_LCNT] - 1;
+
+! For a write access, bump down the writer count. If this is the
+! last write, and the file is the index file or the storage map, clear
+! the appropriate flag in the VCB.
+!
+
+IF .CURRENT_WINDOW[WCB$V_WRITE]
+THEN
+    BEGIN
+    PRIMARY_FCB[FCB$W_WCNT] = .PRIMARY_FCB[FCB$W_WCNT] - 1;
+    IF .PRIMARY_FCB[FCB$W_WCNT] EQL 0
+    THEN
+	BEGIN
+	IF .PRIMARY_FCB[FCB$W_FID_NUM] EQL 1
+	    THEN CURRENT_VCB[VCB$V_WRITE_IF] = 0;
+	IF .PRIMARY_FCB[FCB$W_FID_NUM] EQL 2
+	    THEN CURRENT_VCB[VCB$V_WRITE_SM] = 0;
+	END;
+    END;
+
+PRIMARY_FCB[FCB$W_ACNT] = .PRIMARY_FCB[FCB$W_ACNT] - 1;
+
+! If this was the last access, and this is not a directory FCB, yank the FCB
+! out of the FCB list and dump its extensions, if any.
+!
+
+IF .PRIMARY_FCB[FCB$W_ACNT] EQL 0
+AND NOT .PRIMARY_FCB[FCB$V_DIR]
+THEN
+    BEGIN
+    REMQUE (.PRIMARY_FCB, DUMMY);
+    DEL_EXTFCB (.PRIMARY_FCB);
+    END;
+
+PMS$GL_OPEN = .PMS$GL_OPEN - 1;		! bump down count of open files
+CURRENT_VCB[VCB$W_TRANS] = .CURRENT_VCB[VCB$W_TRANS] - 1;
+
+RETURN 1;
+
+END;					! end of routine MAKE_DEACCESS
+
+GLOBAL ROUTINE DEL_EXTFCB (START_FCB) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine removes and deallocates all extension FCB's, if any,
+!	linked to the indicated FCB.
+!
+! CALLING SEQUENCE:
+!	DEL_EXTFCB (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of primary FCB or 0
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	FCB's deallocated
+!
+!--
+
+BEGIN
+
+MAP
+	START_FCB	: REF BBLOCK;	! FCB argument
+
+LOCAL
+	FCB		: REF BBLOCK,	! running FCB pointer
+	NEXT_FCB	: REF BBLOCK,	! next extension FCB
+	P		: REF BBLOCK,	! pointer to chase for VCB
+	DUMMY;				! dummy local to receive REMQUE
+
+EXTERNAL ROUTINE
+	DEALLOCATE;			! deallocate dynamic memory
+
+! Checking for null pointers, find the first extension FCB. Follow the extension
+! list and remove and deallocate the extension FCB's, cleaning out the pointers
+! on the way. For each FCB removed, we must find the VCB (by chasing around the
+! FCB list) and decrement the transaction count.
+!
+
+IF .START_FCB EQL 0 THEN RETURN 1;
+FCB = .START_FCB[FCB$L_EXFCB];
+START_FCB[FCB$L_EXFCB] = 0;
+UNTIL .FCB EQL 0 DO
+    BEGIN
+    NEXT_FCB = .FCB[FCB$L_EXFCB];
+
+    P = .FCB[FCB$L_FCBFL];
+    UNTIL .P[VCB$B_TYPE] EQL DYN$C_VCB
+    DO P = .P[FCB$L_FCBFL];
+    P[VCB$W_TRANS] = .P[VCB$W_TRANS] - 1;
+
+    FCB[FCB$L_EXFCB] = 0;
+    REMQUE (.FCB, DUMMY);
+    DEALLOCATE (.FCB);
+    FCB = .NEXT_FCB;
+    END;
+
+RETURN 1;
+
+END;					! end of routine DEL_EXTFCB
+
+ROUTINE ZERO_CHANNEL =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine zeroes out the window pointer being returned to
+!	the user for his channel control block. It also credits one to the
+!	user's open file quota.
+!	This routine must be executed in kernel mode.
+!
+! CALLING SEQUENCE:
+!	ZERO_CHANNEL ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	IO_PACKET: I/O packet of request
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	channel window pointer cleared, file quota bumped
+!
+!--
+
+BEGIN
+
+LOCAL
+	ABD		: REF BBLOCKVECTOR [,ABD$C_LENGTH],
+					! buffer descriptors
+	JIB		: REF BBLOCK,	! Job information block address
+	PCB		: REF BBLOCK;	! address of user process control block
+
+EXTERNAL
+	IO_PACKET	: REF BBLOCK,	! I/O packet in process
+	SCH$GL_PCBVEC	: REF VECTOR ADDRESSING_MODE (ABSOLUTE);
+					! system PCB vector
+
+
+					! pointer to buffer descriptors
+ABD = .BBLOCK [.IO_PACKET[IRP$L_SVAPTE], AIB$L_DESCRIPT];
+ABD[ABD$C_WINDOW, ABD$W_COUNT] = 4;
+.ABD[ABD$C_WINDOW, ABD$W_TEXT] + ABD[ABD$C_WINDOW, ABD$W_TEXT] + 1 = 0;
+
+PCB = .SCH$GL_PCBVEC[.(IO_PACKET[IRP$L_PID])<0,16>];
+JIB = .PCB[PCB$L_JIB];
+JIB[JIB$W_FILCNT] = .JIB[JIB$W_FILCNT] + 1;
+
+RETURN 1;
+
+END;					! end of routine ZERO_CHANNEL
+
+END
+ELUDOM
+

@@ -1,0 +1,312 @@
+MODULE DEACCS (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This routine implements the DEACCESS function.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  6-Jan-1977  23:29
+!
+! MODIFIED BY:
+!
+!	V02-006	ACG0258		Andrew C. Goldstein,	26-Jan-1982  16:56
+!		Fix reference to RVN 1 in expiration date processing
+!
+!	V02-005	ACG0230		Andrew C. Goldstein,	23-Dec-1981  23:46
+!		Add expiration date support
+!
+!	V02-004	ACG0247		Andrew C. Goldstein,	23-Dec-1981  20:49
+!		Update revision count only if written
+!
+!	V02-003	ACG0245		Andrew C. Goldstein,	23-Dec-1981  20:48
+!		Move queueing of spool file to cleanup
+!
+!	V02-002	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:25
+!		Previous revision history moved to [F11B.SRC]F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+GLOBAL ROUTINE DEACCESS  =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine implements the DEACCESS function.
+!	If an attribute list is present, attributes are written.
+!
+! CALLING SEQUENCE:
+!	DEACCESS ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	IO_PACKET: I/O packet in process
+!	CURRENT_WINDOW: window of file
+!	PRIMARY_FCB: FCB of file
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	file deaccessed
+!	FCB may be deleted
+!	header may be modified
+!
+!--
+
+BEGIN
+
+BUILTIN
+	CMPM,
+	SUBM;
+
+LABEL
+	CHECK_EXPIRE;			! check file expiration date
+
+LOCAL
+	K,				! local copy of truncate lock count
+	ABD		: REF BBLOCKVECTOR [,ABD$C_LENGTH],
+					! buffer descriptors
+	DAY_TIME	: VECTOR [2],	! time of day
+	DAY_TIME2	: VECTOR [2],	! time of day
+	FIB		: REF BBLOCK,	! FIB
+	FCB		: REF BBLOCK,	! pointer to FCB
+	UCB		: REF BBLOCK,	! UCB of RVN 1
+	PRIMARY_VCB	: REF BBLOCK,	! VCB of RVN 1
+	HEADER		: REF BBLOCK,	! file header
+	IDENT_AREA	: REF BBLOCK;	! header ident area
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	USER_STATUS	: VECTOR,	! I/O status going back to user
+	IO_PACKET	: REF BBLOCK,	! I/O packet in process
+	FILE_HEADER	: REF BBLOCK,	! global copy of current file header
+	CURRENT_WINDOW	: REF BBLOCK,	! window of file
+	PRIMARY_FCB	: REF BBLOCK,	! FCB of file
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume
+	CURRENT_RVT	: REF BBLOCK;	! RVT of volume set
+
+EXTERNAL ROUTINE
+	GET_FIB,			! get FIB of request
+	READ_HEADER,			! read file header
+	MARK_DIRTY,			! mark buffer for write-back
+	WRITE_ATTRIB,			! write attributes routine
+	TRUNCATE,			! truncate file
+	UPDATE_FCB,			! update contents of FCB
+	CHECKSUM;			! compute file header checksum
+
+
+! Set the cleanup flags to cause the deaccess to occurr.
+! Find the buffer descriptor and FIB.
+!
+
+CLEANUP_FLAGS[CLF_ZCHANNEL] = 1;
+CLEANUP_FLAGS[CLF_DEACCESS] = 1;
+CLEANUP_FLAGS[CLF_DELWINDOW] = 1;
+
+					! pointer to buffer descriptors
+ABD = .BBLOCK [.IO_PACKET[IRP$L_SVAPTE], AIB$L_DESCRIPT];
+FIB = GET_FIB (.ABD);
+FCB = .PRIMARY_FCB;
+
+! Make sure irrelevant parameters are not present.
+!
+
+IF .FIB[FIB$V_EXTEND]
+THEN ERR_STATUS (SS$_BADPARAM);
+
+! If the file is accessed for write, if we must update the expiration
+! date, or if the file is marked for delete or is marked bad and this
+! is the last access, read the header.
+!
+
+IF .CURRENT_WINDOW[WCB$V_WRITE]
+OR .CURRENT_WINDOW[WCB$V_EXPIRE]
+OR ((.FCB[FCB$V_MARKDEL] OR .FCB[FCB$V_BADBLK] OR .CLEANUP_FLAGS[CLF_SPOOLFILE])
+    AND .FCB[FCB$W_ACNT] EQL 1)
+THEN
+    BEGIN
+    HEADER = READ_HEADER (0, .FCB);
+    IDENT_AREA = .HEADER + .HEADER[FH2$B_IDOFFSET]*2;
+    END;
+
+! If this the last deaccess from a file marked for delete, delete the file.
+! If the file is a spool file, send it to the job controller.
+!
+
+IF .FCB[FCB$W_ACNT] EQL 1
+THEN
+    BEGIN
+    IF .FCB[FCB$V_MARKDEL]
+    THEN CLEANUP_FLAGS[CLF_DELFILE] = 1;
+
+    IF .CLEANUP_FLAGS[CLF_SPOOLFILE]
+    THEN CLEANUP_FLAGS[CLF_DOSPOOL] = 1;
+
+! If the FCB is marked bad, now set the bad block bit in the file header.
+!
+
+    IF .FCB[FCB$V_BADBLK]
+    THEN
+	BEGIN
+	HEADER[FH2$V_BADBLOCK] = 1;
+	MARK_DIRTY (.HEADER);
+	END;
+    END;
+
+! Update the expiration date of the file if necessary.
+!
+
+IF .CURRENT_WINDOW[WCB$V_EXPIRE]
+THEN
+    BEGIN
+    IF  (.CURRENT_WINDOW[WCB$L_WRITES] NEQ 0
+	 OR .CURRENT_WINDOW[WCB$L_READS] NEQ 0
+	 OR .PRIMARY_FCB[FCB$L_EFBLK] EQL 0)
+    AND .HEADER[FH2$B_MPOFFSET] - .HEADER[FH2$B_IDOFFSET] GEQU
+	($BYTEOFFSET (FI2$Q_EXPDATE) + FI2$S_EXPDATE) / 2
+    THEN
+	BEGIN
+	CHECK_EXPIRE: BEGIN
+	PRIMARY_VCB = .CURRENT_VCB;
+	IF .PRIMARY_VCB[VCB$W_RVN] NEQ 0
+	THEN
+	    BEGIN
+	    UCB = .VECTOR [CURRENT_RVT[RVT$L_UCBLST], 0];
+	    IF .UCB EQL 0
+	    THEN LEAVE CHECK_EXPIRE;
+	    PRIMARY_VCB = .UCB[UCB$L_VCB];
+	    END;
+
+	$GETTIM (TIMADR = DAY_TIME);
+	DAY_TIME2[0] = .DAY_TIME[0];
+	DAY_TIME2[1] = .DAY_TIME[1];
+	SUBM (2,
+	      PRIMARY_VCB[VCB$Q_RETAINMAX],
+	      DAY_TIME2,
+	      DAY_TIME2);
+	IF NOT .CURRENT_WINDOW[WCB$V_WRITE]
+	AND CMPM (2, IDENT_AREA[FI2$Q_EXPDATE], DAY_TIME2) GEQ 0
+	THEN LEAVE CHECK_EXPIRE;
+	SUBM (2,
+	      PRIMARY_VCB[VCB$Q_RETAINMAX],
+	      DAY_TIME,
+	      IDENT_AREA[FI2$Q_EXPDATE]);
+	MARK_DIRTY (.HEADER);
+	END;				! end of block CHECK_EXPIRE
+	END;
+    END;
+
+! Do deaccess processing for a write accessed file.
+! Increment the revision count of the file. If a deaccess lock was
+! requested on the file, set the lock bit. Then process the write
+! attributes, if any. If attributes were written, then clear the
+! lock bit.
+!
+
+IF .CURRENT_WINDOW[WCB$V_WRITE]
+THEN
+    BEGIN
+    MARK_DIRTY (.HEADER);
+    IF .CURRENT_WINDOW[WCB$L_WRITES] NEQ 0
+    AND .HEADER[FH2$B_MPOFFSET] - .HEADER[FH2$B_IDOFFSET] GEQU
+	($BYTEOFFSET (FI2$Q_REVDATE) + FI2$S_REVDATE) / 2
+    THEN
+	BEGIN
+	IDENT_AREA[FI2$W_REVISION] = .IDENT_AREA[FI2$W_REVISION] + 1;
+	$GETTIM (TIMADR = IDENT_AREA[FI2$Q_REVDATE]);
+	END;
+
+    IF .CURRENT_WINDOW[WCB$V_DLOCK]
+    THEN HEADER[FH2$V_LOCKED] = 1;
+
+    IF .IO_PACKET[IRP$W_BCNT] GTR ABD$C_ATTRIB
+    AND .USER_STATUS[0]
+    THEN
+	BEGIN
+	WRITE_ATTRIB (.HEADER, .ABD);
+	HEADER = .FILE_HEADER;
+	HEADER[FH2$V_LOCKED] = 0;
+	END;
+
+! If a truncate is requested, do it (if the file was write accessed).
+!
+
+    IF .FIB[FIB$V_TRUNC]
+    THEN
+	BEGIN
+	IF .CURRENT_VCB[VCB$V_NOALLOC]
+	THEN ERR_EXIT (SS$_WRITLCK);
+
+	K = .FCB[FCB$W_TCNT];
+	IF .CURRENT_WINDOW[WCB$V_NOTRUNC]
+	THEN K = .K - 1;
+	IF .K NEQ 0
+	THEN ERR_EXIT (SS$_ACCONFLICT);
+
+	CHECKSUM (.HEADER);
+	TRUNCATE (.FIB, .HEADER);
+	CLEANUP_FLAGS[CLF_FIXFCB] = 0;
+	KERNEL_CALL (UPDATE_FCB, .FILE_HEADER);
+	END;
+    END;
+
+! Return failure to let the error cleanup do the actual deaccessing.
+!
+
+RETURN 0;
+
+END;					! end of routine DEACCESS
+
+END
+ELUDOM

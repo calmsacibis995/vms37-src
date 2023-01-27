@@ -1,0 +1,2284 @@
+MODULE UAFPARSE (IDENT = 'V03-002') =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:	System Management Utility Program
+!
+! ABSTRACT:	Parsing subroutines for the AUTHORIZE utility
+!
+! ENVIRONMENT:
+!
+! AUTHOR:	Henry M. Levy	, CREATION DATE: 1-June-1977
+!
+! MODIFIED BY:
+!
+!	001 	JWT0023		Jim Teague	17-Mar-1982
+!		Enforce default directory syntax more strictly by
+!		cranking the spec through tparse.
+!	
+!	002	JWT0029		Jim Teague	20-Apr-1982
+!		Completely disable /maxacctjobs
+!
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	UPDATE_RECORD,			! modify all specified fields
+	GETCPUTIM,			! get cpu time quota
+	GETDEVICE,			! get default device name
+	GETDIRECTORY,			! get default directory
+	GETFLAGS,			! get flag bits
+	GETPASSWORD,			! get user password
+	GETPRIV,			! get process privileges
+	GETUIC,				! get user identification code
+	PARSE_HOURS,			! parse hourly restriction ranges
+	PARSE_UIC,			! obtain UIC group and member
+	PARSE_WILD,			! parse wildcarded user specification
+	GETSTRING,			! get string from input
+	GETVAL,				! get numeric value from user
+	CVTNUM,				! convert decimal ascii to binary
+	GETSFLAGS,			! get secondary day login flags
+	GETPFLAGS,			! get primary day login flags
+	GETPRIMEDAYS,			! get primary day list
+	SET_RANGE;			! set hourly restriction bits
+
+
+EXTERNAL ROUTINE
+	lib$tparse : ADDRESSING_MODE (GENERAL),
+	lib$lookup_key : ADDRESSING_MODE (GENERAL),
+	cli$dcl_parse,
+	cli$present,
+	cli$get_value,
+	FAOOUT,				! output formatted message
+	LGI$HPWD,			! hash password routine
+	LIB$CVT_DTIME,			! convert ASCII to system delta time
+	PRV$SETPRIV;			! set privilege bits based on
+					! privilege names
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'SYS$LIBRARY:TPAMAC';
+
+LIBRARY 'SYS$LIBRARY:LIB';
+
+!
+! MACROS:
+!
+
+MACRO
+    CSTRING[] = (UPLIT BYTE(%CHARCOUNT(%STRING(%REMAINING)),
+		%STRING(%REMAINING)) )%,
+
+!
+! Macro to create string descriptor for command parameters and
+!	qualifiers
+!
+    SD[A] =
+	BIND %NAME('SD_',A) = $descriptor(a)%;
+
+
+     SD(
+      	'token1',	'token2',	'account',	'astlm',
+	'biolm',	'bytlm',	'cli',  	'cputime',
+	'device',	'diolm',	'directory',	'enqlm',
+	'fillm',	'flags',	'lgicmd',	'maxjobs',
+	'owner',	'password',	'pbytlm',	'pflags',
+  	'pgflquota',	'p_restrict',	'prclm',	'priority',
+	'privileges',	'sflags',	's_restrict',	'shrfillm',
+	'tqelm',	'uic',		'wsdefault', 	'wsextent',
+	'wsquota',	'display',	'primedays',	'maxacctjobs'
+	);
+
+
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+	begin_range = 1,		! argument defines start of hourly range
+	end_range = 2,			!   "	     "     end   "    "      "
+	single_hour = 3,		! no range specified: single hour
+	FALSE = 0 ,			! logical false
+	TRUE = 1 ,			! logical true
+
+	BYTE_LENGTH = 8 ,		! bits per byte
+	WORD_LENGTH = 16 ,		! bits per word
+	LONG_LENGTH = 32 ,		! bits per longword
+
+	ENCRYPT = UAF$C_Purdy,		! encryption algorithm to use
+
+	BLANK = ' ',			!  delimiters
+	COLON = ':',
+	COMMA = ',',
+	CR = 13,
+	EQUALS = '=',
+	LF = 10,
+	LPAREN = '(' ,
+	RPAREN = ')' ,
+	SINGLE_QUOTE = '''' ,
+	SLASH = '/',
+	TAB = '	',
+	ZERO = 0,
+
+	COUNTED_STRING = 1,		! counted string type indicator
+	FILLED_STRING = 2;		! filled string type indicator
+
+OWN
+	tparse_block: BLOCK[tpa$c_length0,BYTE]
+		      PRESET( [tpa$l_count]   = tpa$k_count0,
+		      	      [tpa$l_options] = tpa$m_abbrev),
+	address,
+	left_bit,
+	right_bit,
+	primary: INITIAL ( false ),
+  	enqlim : INITIAL ( false );
+
+GLOBAL BIND
+!
+! Define the default delimiter string used by GETTOKEN to find
+! the end of the next input token.
+!
+
+	DELIMSTR = CSTRING(
+			%CHAR( BLANK ) ,
+			%CHAR( TAB ) ,
+			%CHAR( COMMA ) ,
+			%CHAR( SLASH ) ,
+			%CHAR( EQUALS ) ,
+			%CHAR( COLON ) ,
+			%CHAR( ZERO ) ,
+			%CHAR( CR ) ,
+			%CHAR( LF ) ,
+			%CHAR( RPAREN ) ,
+			) ;
+
+BIND
+!
+! A delimiter string to parse character strings
+!
+
+	STRINGDLM = CSTRING(
+		%CHAR(BLANK) ,
+		%CHAR(TAB) ,
+		%CHAR(SLASH) ,
+		%CHAR(ZERO) ),
+
+!
+! A delimiter string to parse quoted strings
+!
+
+	QUOTEDLM = CSTRING(
+		%CHAR(SINGLE_QUOTE) ,
+		%CHAR(ZERO) ),
+
+!
+! A delimiter string to parse the Member subfield of a UIC
+!
+
+	UICDLM = CSTRING( %CHAR(']') , %CHAR(SLASH) , %CHAR(ZERO) ,
+			%CHAR(BLANK) , %CHAR(TAB) , %CHAR(COLON) ),
+
+!
+! ASCII numbers from '0' through hex 'F'
+!
+
+    NUMBERS = UPLIT BYTE('0123456789ABCDEF'),
+
+!
+! 'NO' prefix descriptor for negating privileges
+!
+	no_dsc = $descriptor('NO'),
+	star_dsc = $descriptor('*'),
+!
+! Message strings.
+!
+
+BADVALUE = CSTRING('error in value specification \!AD\'),
+EXTRAPARM = CSTRING('superfluous parameter detected \!AD\'),
+INVDEV = CSTRING('device name too long to add trailing ":"!/',
+	'\!AD\'),
+INVSTR = CSTRING('string too long for field \!AD\'),
+INVUSERSPEC = CSTRING('error in user specification \!AD\'),
+NAMETOOBIG = CSTRING('username too long'),
+NOQUOTE = CSTRING('quoted string missing end quote \!AD\'),
+NOUSERSPEC = CSTRING('missing user specification'),
+PRVNOTFND = CSTRING('invalid privilege name \!AD\'),
+PRVNOTUNQ = CSTRING('privilege name not unique \!AD\'),
+PWDSYNTAX = CSTRING('invalid password syntax'),
+UICERR = CSTRING('error in UIC specification \!AD\'),
+VALTOOBIG = CSTRING('value too large for field \!AD\') ;
+
+!
+! EXTERNAL REFERENCES:
+!
+
+
+EXTERNAL LITERAL
+
+    num_flags ,			! # entries in FLAG_TABLE
+    num_opflags ,		! # entries in OPFLAG_TABLE
+    num_pdflags ,		! # entries in prime days table
+
+    lib$_ambkey,		! status for ambiguous keyword
+    lib$_unrkey,		! status for unrecognized keyword
+
+    cli$_abkeyw,		! message symbol for "ambiguous keyword"
+    cli$_ivkeyw,		! message symbol for "unrecognized keyword"
+
+    PRV$_NOTUNQ ,
+    PRV$_INVNAM ;
+
+EXTERNAL				! Global storage from UAFMAIN
+!	by_account,
+	AUTHORIZE_COMMANDS,
+	CMDLINDSC: BLOCK [8,BYTE],
+	call_count,
+	KEYNOTFND ,			! Message strings
+	KEYNOTUNQ ,
+	NOARG ,
+	SYMBOL_STR ,			! Symbolic character set
+	rename,				! RENAME in progress?
+	add,				!   or an ADD?
+	copy,				!   or is it a COPY?
+	match_tokenlen,
+	match_token,
+	TOKENDSC: BLOCK[8,BYTE] ,
+	TOKENLEN: WORD ,		! Bound to TOKENDSC[DSC$W_LENGTH]
+	TOKENPTR ,			! Bound to TOKENDSC[DSC$A_POINTER]
+	UIC_FLAG ,			! Wildcard parsing flags
+	GRP_WILD ,
+	MEM_WILD ,
+	STR_WILD ,
+					! Keyword tables
+	FLAG_TABLE ,
+	OPFLAG_TABLE ,
+	PDFLAG_TABLE ,
+
+
+!	UAFRAB: BLOCK[RAB$C_BLN,BYTE] ,
+	TIME_BUF: BLOCK[8,BYTE] ,	! Buffer to receive current system time
+	PWD_FLAG ,			! User did not supply password flag
+	REC_USER_DSC,			! Descriptor for RECBUF[UAF$T_USERNAME]
+	REC_ENCRYPT_DSC,		! Descriptor for RECBUF[UAF$Q_PWD]
+	RECBUF: BLOCK[UAF$C_LENGTH,BYTE] ; ! The current UAF record
+
+!********************************************************************
+!
+!	Beginning of tparse states for hourly range specs
+!
+!********************************************************************
+$init_state (parse_states, parse_keys);
+
+$state	( ,
+	(tpa$_decimal, dash, set_range,,, begin_range  ));
+
+$state	(dash,
+	('-', endhour ),
+	(tpa$_eos, tpa$_exit, set_range,,, single_hour ));
+
+$state	(endhour,
+	(tpa$_decimal, terminal, set_range,,, end_range  ));
+
+$state 	(terminal,
+	(tpa$_eos, tpa$_exit ));
+
+!*******************************************************************
+!
+!	Beginning of tparse states for default directory spec
+!
+!********************************************************************
+
+$init_state( dir_states, dir_keys );
+
+$state(,
+	('<', got_angle),
+	('[', got_square),
+	(tpa$_symbol, no_delim));
+!
+! have seen an angle bracket
+!
+$state(got_angle,
+	(tpa$_symbol, angle_sym));
+
+!
+! have seen an angle bracket and symbol string
+!
+$state(angle_sym,
+	('.', got_angle),
+	('>', end_spec));
+
+!
+! have seen a square bracket
+!
+$state(got_square,
+	(tpa$_symbol, square_sym));
+
+!
+! have seen square bracket and a symbol string
+!
+$state(square_sym,
+	('.', got_square),
+	(']', end_spec));
+
+!
+! symbol string with no delimiters
+!
+$state(no_delim,
+	('.', no_sym),
+	(tpa$_eos, tpa$_exit));
+
+!
+! subdirectory part of symbol string
+!
+$state(no_sym,
+	(tpa$_symbol, no_delim));
+
+!
+! have found appropriate ending delimiter
+!
+$state(end_spec,
+	(tpa$_eos, tpa$_exit));
+
+
+GLOBAL ROUTINE UPDATE_RECORD =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Scan the remainder of the user's input command line for parameters
+!	and parameter values.  Pull off each parameter keyword and check
+!	that it is valid, then call the associated routine to process
+!	the supplied value or string. 
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true -> all keywords and parameters were specified correctly
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+LOCAL
+    status;
+
+enqlim = false;
+status = false;
+
+!
+! If this is part of a series of calls from WILD_USER, the command
+!    line must be reparsed after the first call
+
+IF .call_count NEQ 0
+THEN
+    cli$dcl_parse(CMDLINDSC, authorize_commands);
+
+IF cli$present(sd_password)
+THEN
+    BEGIN
+    cli$get_value(sd_password,tokendsc);
+    IF NOT GETPASSWORD()
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF .rename
+THEN
+    RETURN TRUE;
+
+!
+! Check that we're not at the end of the command line. Continue
+! processing parameters until the end is reached.
+!
+
+IF cli$present(sd_account)
+THEN
+    BEGIN
+    cli$get_value(sd_account,tokendsc);
+    IF NOT GETSTRING(RECBUF[UAF$T_ACCOUNT], UAF$S_ACCOUNT, FILLED_STRING)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_astlm)
+THEN
+    BEGIN
+    cli$get_value(sd_astlm,tokendsc);
+    IF NOT GETVAL(RECBUF[UAF$W_ASTLM], WORD_LENGTH)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_biolm)
+THEN
+    BEGIN
+    cli$get_value(sd_biolm,tokendsc);
+    IF NOT GETVAL(RECBUF[UAF$W_BIOLM], WORD_LENGTH)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_bytlm)
+THEN
+    BEGIN
+    cli$get_value(sd_bytlm,tokendsc);
+    IF NOT GETVAL(RECBUF[UAF$L_BYTLM], LONG_LENGTH )
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_cli)
+THEN
+    BEGIN
+    cli$get_value(sd_cli,tokendsc);
+    IF NOT GETSTRING(RECBUF[UAF$T_DEFCLI], UAF$S_DEFCLI, FILLED_STRING)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_cputime)
+THEN
+    BEGIN
+    cli$get_value(sd_cputime,tokendsc);
+    IF NOT GETCPUTIM()
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_device)
+THEN
+    BEGIN
+    cli$get_value(sd_device,tokendsc);
+    IF NOT GETDEVICE()
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_diolm)
+THEN
+    BEGIN
+    cli$get_value(sd_diolm,tokendsc);
+    IF NOT GETVAL(RECBUF[UAF$W_DIOLM], WORD_LENGTH)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_directory)
+THEN
+    BEGIN
+    cli$get_value(sd_directory,tokendsc);
+    IF NOT GETDIRECTORY()
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_enqlm)
+THEN
+    BEGIN
+    cli$get_value(sd_enqlm,tokendsc);
+    enqlim = true;
+    IF NOT GETVAL(RECBUF[UAF$W_ENQLM], WORD_LENGTH)
+    THEN RETURN FALSE;
+    status = true;
+    enqlim = false;
+    END;
+
+IF cli$present(sd_fillm)
+THEN
+    BEGIN
+    cli$get_value(sd_fillm,tokendsc);
+    IF NOT GETVAL(RECBUF[UAF$W_FILLM], WORD_LENGTH)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_flags)
+THEN
+    BEGIN
+    IF NOT GETFLAGS()
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_lgicmd)
+THEN
+    BEGIN
+    cli$get_value(sd_lgicmd,tokendsc);
+    IF NOT GETSTRING(RECBUF[UAF$T_LGICMD], UAF$S_LGICMD, COUNTED_STRING)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_maxjobs)
+THEN
+    BEGIN
+    cli$get_value(sd_maxjobs,tokendsc);
+    IF NOT GETVAL(RECBUF[UAF$B_MAXPROC], BYTE_LENGTH)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_owner)
+THEN
+    BEGIN
+    cli$get_value(sd_owner,tokendsc);
+    IF NOT GETSTRING(RECBUF[UAF$T_OWNER], UAF$S_OWNER, FILLED_STRING)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_pbytlm)
+THEN
+    BEGIN
+    cli$get_value(sd_pbytlm,tokendsc);
+    IF NOT GETVAL(RECBUF[UAF$L_PBYTLM], LONG_LENGTH)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_pflags)
+THEN
+    BEGIN
+    IF NOT GETPFLAGS()
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_pgflquota)
+THEN
+    BEGIN
+    cli$get_value(sd_pgflquota,tokendsc);
+    IF NOT GETVAL(RECBUF[UAF$L_PGFLQUOTA], 3 * BYTE_LENGTH)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_p_restrict)
+THEN
+    BEGIN
+    primary = true;
+    IF NOT PARSE_HOURS()
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_prclm)
+THEN
+    BEGIN
+    cli$get_value(sd_prclm,tokendsc);
+    IF NOT GETVAL(RECBUF[UAF$W_PRCCNT], WORD_LENGTH)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_primedays)
+THEN
+    BEGIN
+    IF NOT GETPRIMEDAYS()
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_priority)
+THEN
+    BEGIN
+    cli$get_value(sd_priority,tokendsc);
+    IF NOT GETVAL(RECBUF[UAF$B_PRI], BYTE_LENGTH)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_privileges)
+THEN
+    BEGIN
+    IF NOT GETPRIV()
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_sflags)
+THEN
+    BEGIN
+    IF NOT GETSFLAGS()
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_s_restrict)
+THEN
+    BEGIN
+    primary = false;
+    IF NOT PARSE_HOURS()
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_shrfillm)
+THEN
+    BEGIN
+    cli$get_value(sd_shrfillm,tokendsc);
+    IF NOT GETVAL( RECBUF[UAF$W_SHRFILLM], WORD_LENGTH )
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_tqelm)
+THEN
+    BEGIN
+    cli$get_value(sd_tqelm,tokendsc);
+    IF NOT GETVAL(RECBUF[UAF$W_TQCNT], WORD_LENGTH)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_uic)
+THEN
+    BEGIN
+    cli$get_value(sd_uic,tokendsc);
+    IF NOT GETUIC()
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_wsdefault)
+THEN
+    BEGIN
+    cli$get_value(sd_wsdefault,tokendsc);
+    IF NOT GETVAL(RECBUF[UAF$W_DFWSCNT], WORD_LENGTH)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_wsextent)
+THEN
+    BEGIN
+    cli$get_value(sd_wsextent,tokendsc);
+    IF NOT GETVAL(RECBUF[UAF$W_WSEXTENT], WORD_LENGTH)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF cli$present(sd_wsquota)
+THEN
+    BEGIN
+    cli$get_value(sd_wsquota,tokendsc);
+    IF NOT GETVAL(RECBUF[UAF$W_WSQUOTA], WORD_LENGTH)
+    THEN RETURN FALSE;
+    status = true;
+    END;
+
+IF .copy OR .add
+THEN
+    RETURN true;
+
+RETURN .status;
+END;
+
+GLOBAL ROUTINE GETCPUTIM =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Fill in the CPU time limit in the proper field in RECBUF.
+!
+! INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true -> success
+!	false -> invalid value supplied
+!
+!--
+
+LOCAL
+    tmptokenptr,
+    tmptokenlen,
+    tmptokendsc: VECTOR [2],
+    QUOTE ,				! time string was enclosed in quotes
+    DELTA_TIME: VECTOR[2,LONG] ,	! system delta time temporary
+    CPU_TIME ,				! CPU time work variables
+    REMAINDER ;
+
+BUILTIN
+    EDIV ;
+
+tmptokenptr = .TOKENPTR;
+tmptokenlen = .TOKENLEN;
+
+!
+! Check to see if the string is contained in quotes.
+!
+
+QUOTE = FALSE ;
+
+IF .(.tmptokenptr)<0,8>  EQL SINGLE_QUOTE 
+THEN ( QUOTE = TRUE ;
+       tmptokenptr = .tmptokenptr + 1;
+       tmptokenlen = .tmptokenlen - 1;);
+
+!
+! If this was a quoted string then make sure we terminated
+!     on a quote.
+!
+
+IF .QUOTE 
+THEN
+    IF .(.tmptokenptr + .tmptokenlen - 1)<0,8> EQL SINGLE_QUOTE 
+    THEN
+        tmptokenlen = .tmptokenlen - 1
+    ELSE
+        RETURN
+	    FAOOUT( NOQUOTE , .TOKENLEN, .TOKENPTR) ;
+
+!
+! Set up descriptor for conversion
+!
+tmptokendsc [0] = .tmptokenlen;
+tmptokendsc [1] = .tmptokenptr;
+    
+!
+! Convert ASCII to system delta time
+!
+
+IF NOT LIB$CVT_DTIME( tmptokendsc , DELTA_TIME )
+THEN
+    RETURN FAOOUT( BADVALUE , .TOKENLEN, .TOKENPTR) ;
+
+!
+! Convert system delta time to a longword value which is in .01 sec. units
+!
+
+IF (EDIV( %REF(-200000), DELTA_TIME, CPU_TIME, REMAINDER ) AND PSL$M_V) NEQ 0
+THEN
+    RETURN FAOOUT( VALTOOBIG , .TOKENLEN, .TOKENPTR) ;
+
+RECBUF[UAF$L_CPUTIM] = (.CPU_TIME ^ 1) + (IF .REMAINDER EQL 0 THEN 0 ELSE 1) ;
+
+TRUE
+END;
+
+GLOBAL ROUTINE GETDEVICE =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Fill in the default device name in RECBUF.
+!	Will also append an ending colon if omitted.
+!
+! INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true -> update successful
+!	false -> error in specification
+!--
+
+LOCAL
+    STRLEN ;
+
+IF NOT GETSTRING( RECBUF[UAF$T_DEFDEV] , UAF$S_DEFDEV , COUNTED_STRING )
+THEN
+    RETURN FALSE ;
+
+!
+! Check to see that string has ending ':'
+! and add one if not.
+! If string length is zero, then field has been removed so
+! there's no need for the check.
+!
+
+STRLEN = .(RECBUF[UAF$T_DEFDEV])<0,8> ;			! get string length
+
+IF .STRLEN EQL 0
+THEN
+    RETURN TRUE ;
+
+IF .(RECBUF[UAF$T_DEFDEV] + .STRLEN)<0,8> NEQ COLON
+THEN
+    BEGIN
+    IF .STRLEN GEQ UAF$S_DEFDEV-1
+    THEN
+	RETURN FAOOUT( INVDEV , .TOKENLEN, .TOKENPTR) ;
+    (RECBUF[UAF$T_DEFDEV]+.STRLEN+1)<0,8> = COLON ;
+    (RECBUF[UAF$T_DEFDEV])<0,8> = .STRLEN + 1 ;
+    END;
+RETURN TRUE ;
+END;
+
+GLOBAL ROUTINE GETDIRECTORY =
+BEGIN
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine parses the user default directory and places
+!	it into the buffer if the form is correct.  If delimiters
+!	are not present, they are added.
+!
+! INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+! 	TOKENLEN = length of default directory string
+!	TOKENPTR = pointer to default directory string 
+!
+!--
+LOCAL
+    angle_delim : BYTE,
+    tmptokenlen,
+    tmptokenptr,
+    QUOTE;
+
+tmptokenptr = .TOKENPTR;
+tmptokenlen = .TOKENLEN;
+!
+! Assume no quoted string
+!
+QUOTE = false;
+
+!
+! If quoted string, skip past opening quote
+!
+IF .(.tmptokenptr)<0,8> EQL SINGLE_QUOTE
+THEN
+    BEGIN
+    QUOTE = true;
+    tmptokenptr = .tmptokenptr + 1;
+    tmptokenlen = .tmptokenlen - 1;
+    END;
+
+!
+! If quoted string, it had better end in a quote...
+!
+IF .QUOTE
+THEN
+    IF .(.tmptokenptr + .tmptokenlen - 1)<0,8>  EQL  SINGLE_QUOTE
+    THEN
+	tmptokenlen = .tmptokenlen - 1
+    ELSE
+	RETURN FAOOUT(NOQUOTE, .TOKENLEN, .TOKENPTR);
+
+!
+! Crank directory spec through tparse
+!
+tparse_block [tpa$l_stringcnt] = .tokenlen;
+tparse_block [tpa$l_stringptr] = .tokenptr;
+
+IF NOT lib$tparse( tparse_block, dir_states, dir_keys )
+THEN
+    RETURN FAOOUT(BADVALUE, .tokenlen, .tokenptr);
+
+
+!
+! Check for opening delimiter--but we'll remove it anyway
+!
+IF .(.tmptokenptr)<0,8> EQL '['  OR  .(.tmptokenptr)<0,8> EQL '<'
+THEN
+    BEGIN
+    tmptokenptr = .tmptokenptr + 1;
+    tmptokenlen = .tmptokenlen - 1;
+    END;
+
+angle_delim = false;
+!
+! But we have to add one on the end if there isn't already one there
+!
+IF .(.tmptokenptr + .tmptokenlen - 1)<0,8>  NEQ  ']'
+THEN
+    IF .(.tmptokenptr + .tmptokenlen - 1)<0,8>  EQL '>'
+    THEN
+	angle_delim = true
+    ELSE	
+	BEGIN
+	(.tmptokenptr + .tmptokenlen)<0,8>  =  ']';
+	tmptokenlen = .tmptokenlen + 1;
+        END;
+
+!
+! Make sure that the string isn't too long
+!
+IF .tmptokenlen + 1  GEQ  UAF$S_DEFDIR
+THEN
+    RETURN FAOOUT(INVSTR, .TOKENLEN, .TOKENPTR);
+
+!
+! Move length into first byte, delimiter into second
+!
+(RECBUF[UAF$T_DEFDIR])<0,8> = .tmptokenlen + 1;
+IF .angle_delim
+THEN
+    RECBUF[UAF$T_DEFDIR] + 1 = '<'
+ELSE
+    RECBUF[UAF$T_DEFDIR] + 1 = '[';
+
+!
+! Move rest of string into buffer
+!
+CH$MOVE( .tmptokenlen , .tmptokenptr, RECBUF[UAF$T_DEFDIR] + 2);
+
+RETURN TRUE;
+
+END;
+
+GLOBAL ROUTINE GETFLAGS =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Get login flag bit settings.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	FLAG_TABLE - table of flag bit numbers and ascii names
+!
+! OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true -> successful completion
+!	false -> error in flag name
+!--
+
+LOCAL
+	status,
+	keyword_dsc :  VECTOR [2],
+	no_flag,
+	CODE ,					! return from find_val
+	IENTRY;
+
+MAP
+	no_dsc: VECTOR,
+	FLAG_TABLE: VECTOR;
+
+!
+! Retrieve flag values as long as there are any present
+!
+
+WHILE cli$get_value(sd_flags, TOKENDSC) DO
+    !
+    ! Initialize keyword descriptor
+    !
+    BEGIN
+    keyword_dsc [0] = .TOKENLEN;
+    keyword_dsc [1] = .TOKENPTR;
+    no_flag = false;
+
+    !
+    ! If 'NO' prefix specified, set no_flag and adjust the
+    !    keyword descriptor to remove the 'NO'
+    !
+    IF CH$EQL(2, .no_dsc [1], 2, .keyword_dsc [1])
+    THEN
+	BEGIN
+	keyword_dsc [0] = .keyword_dsc [0] - 2;
+   	keyword_dsc [1] = .keyword_dsc [1] + 2;
+	no_flag = true;
+	END;
+
+    IF (status = lib$lookup_key( keyword_dsc, flag_table, code))
+    THEN
+        !
+	! valid flag, set bit
+	!
+	(RECBUF[UAF$B_FLAGS])<.code,1> = NOT .no_flag
+    ELSE
+	SELECT .status OF
+	    SET
+	    !
+	    ! ambiguous keyword?
+	    !
+	    [lib$_ambkey] : SIGNAL( cli$_abkeyw );
+	    !
+	    ! unrecognized keyword?
+	    !
+	    [lib$_unrkey] : SIGNAL( cli$_ivkeyw );
+	    !
+	    ! whatever, always return an error if we're in here
+	    !
+	    [ALWAYS]      : RETURN false;
+	    TES;
+
+    END;
+RETURN TRUE;
+END;
+
+GLOBAL ROUTINE GETSFLAGS =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Get secondary day login flag bit settings.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	OPFLAG_TABLE - table of flag bit numbers and ascii names
+!
+! OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true -> successful completion
+!	false -> error in flag name
+!--
+
+LOCAL
+	status,
+	keyword_dsc :  VECTOR [2],
+	no_flag,
+	CODE ,					! return from find_val
+	IENTRY;
+
+MAP
+	no_dsc: VECTOR,
+	OPFLAG_TABLE: VECTOR;
+!
+! Retrieve keywords as long as they are present
+! 
+WHILE cli$get_value(sd_sflags, TOKENDSC) DO
+
+    BEGIN
+    keyword_dsc [0] = .TOKENLEN;
+    keyword_dsc [1] = .TOKENPTR;
+    no_flag = false;
+    !
+    ! Test for 'NO' prefix.  If present, adjust keyword descriptor
+    !    to remove it, and set 'NO' flag
+    !
+    IF CH$EQL(2, .no_dsc [1], 2, .keyword_dsc [1])
+    THEN
+	BEGIN
+	keyword_dsc [0] = .keyword_dsc [0] - 2;
+   	keyword_dsc [1] = .keyword_dsc [1] + 2;
+	no_flag = true;
+	END;
+
+    IF (status = lib$lookup_key( keyword_dsc, opflag_table, code))
+    THEN
+        !
+	! valid flag, set bit
+	!
+	(RECBUF[UAF$B_SDAYFLAGS])<.code,1> = NOT .no_flag
+    ELSE
+	SELECT .status OF
+	    SET
+	    !
+	    ! ambiguous keyword?
+	    !
+	    [lib$_ambkey] : SIGNAL( cli$_abkeyw );
+	    !
+	    ! unrecognized keyword?
+	    !
+	    [lib$_unrkey] : SIGNAL( cli$_ivkeyw );
+	    !
+	    ! whatever, always return an error if we're in here
+	    !
+	    [ALWAYS]      : RETURN false;
+	    TES;
+
+    END;
+
+RETURN TRUE;
+END;
+
+GLOBAL ROUTINE SET_RANGE  =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Set or clear appropriate hourly login restriction bits
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!
+! OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true -> successful completion
+!	false -> error in flag name
+!--
+BUILTIN ap;
+
+MAP ap: REF BLOCK[,BYTE];
+
+LOCAL
+    flag,
+    width,
+    leftmost,
+    wrap;
+
+!
+! flag indicates whether we're processing the first or last hour in a range;
+!	or a single hour
+!
+flag = .ap [tpa$l_param];
+
+!
+! Test flag and set field ranges
+!
+CASE .flag FROM 1 TO 3 OF
+    SET
+    [begin_range] : right_bit = .ap [tpa$l_number]; 
+
+    [end_range  ] : left_bit = .ap [tpa$l_number];
+
+    [single_hour] : left_bit = .right_bit;
+
+    TES;
+
+!
+! If this was the first hour, return to parse the rest of the spec
+!
+IF .flag EQL begin_range
+THEN
+    RETURN true;
+
+!
+! Make sure hour is not out of range
+!
+IF .left_bit  GTR 23  OR  .left_bit  LSS 0   OR
+   .right_bit GTR 23  OR  .right_bit LSS 0
+THEN
+    RETURN false;
+
+wrap = false;
+leftmost = .left_bit;
+
+!
+! If the starting bit is greater than the ending bit, allow field to wrap
+!
+IF .left_bit LSS .right_bit
+THEN
+    BEGIN
+    leftmost = 23;
+    wrap = true;
+    END;
+
+!
+! Set field width(s) and set appropriate bits
+!
+width = .leftmost - .right_bit + 1;
+
+(.address)<.right_bit, .width> = -1;
+
+IF .wrap
+THEN
+    (.address)<0,.left_bit+1> = -1;
+
+!
+! Clear wrap flag
+!
+wrap = false;
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE GETPASSWORD =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Action routine to process password.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	sets hashed password field in recbuf
+!
+! ROUTINE VALUE:
+!
+!	true -> success
+!	false -> failure
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+LOCAL
+    tmptokenlen,
+    tmptokenptr: REF VECTOR[,BYTE],
+    tmptokendsc: VECTOR [2],
+    QUOTE ;				! password string was enclosed in quotes
+
+
+tmptokenlen = .TOKENLEN;
+tmptokenptr = .TOKENPTR;
+
+!
+! Check to see if the string is contained in quotes.
+!
+
+QUOTE = FALSE ;
+
+IF .(.tmptokenptr)<0,8> EQL SINGLE_QUOTE 
+THEN ( QUOTE = TRUE ;
+       tmptokenptr = .tmptokenptr + 1;
+       tmptokenlen = .tmptokenlen - 1;);
+
+!
+! If this was a quoted string then make sure we terminated
+!     on a quote.
+!
+
+IF .QUOTE 
+THEN
+   IF .(.tmptokenptr + .tmptokenlen - 1)<0,8> EQL SINGLE_QUOTE 
+    THEN
+        tmptokenlen = .tmptokenlen - 1
+    ELSE
+        RETURN
+	    FAOOUT( NOQUOTE , .TOKENLEN, .TOKENPTR) ;
+
+tmptokendsc [0] = .tmptokenlen;
+tmptokendsc [1] = .tmptokenptr;
+
+!
+! Check string for proper length.
+!
+IF .tmptokenlen GTRU 31  
+THEN
+    RETURN FAOOUT( PWDSYNTAX ) ;
+
+!
+! Allow null password
+!
+IF .tmptokenlen EQL 0
+THEN
+    BEGIN
+    CH$FILL ( 0, 8, RECBUF[UAF$Q_PWD] );
+    PWD_FLAG = false;
+    RETURN TRUE;
+    END;
+
+!
+! Check new password for illegal characters
+!
+
+INCRU COUNTER TO .tmptokenlen-1
+DO
+    IF CH$FAIL(CH$FIND_CH(.SYMBOL_STR<0,8>,SYMBOL_STR+1,.tmptokenptr[.COUNTER]))
+    THEN
+	RETURN FAOOUT( PWDSYNTAX ) ;
+
+$GETTIM(TIMADR = TIME_BUF) ;			! Obtain a 16 bit salt
+RECBUF[UAF$W_SALT] = .TIME_BUF<3*8,16> ;
+RECBUF[UAF$B_ENCRYPT] = ENCRYPT ;
+
+LGI$HPWD( REC_ENCRYPT_DSC, tmptokendsc, .RECBUF[UAF$B_ENCRYPT],
+			.RECBUF[UAF$W_SALT], REC_USER_DSC ) ;
+PWD_FLAG = FALSE ;				! User has supplied a password
+
+RETURN TRUE;
+END;
+
+GLOBAL ROUTINE GETPFLAGS =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Get prime day login flag bit settings.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	OPFLAG_TABLE - table of flag bit numbers and ascii names
+!
+! OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true -> successful completion
+!	false -> error in flag name
+!--
+
+LOCAL
+	status,
+	keyword_dsc :  VECTOR [2],
+	no_flag,
+	CODE ,					! return from find_val
+	IENTRY;
+
+MAP
+	no_dsc: VECTOR,
+	OPFLAG_TABLE: VECTOR;
+
+!
+! Retrieve keywords as long as any are present
+! 
+WHILE cli$get_value(sd_pflags, TOKENDSC) DO
+
+    BEGIN
+    keyword_dsc [0] = .TOKENLEN;
+    keyword_dsc [1] = .TOKENPTR;
+    no_flag = false;
+
+    !
+    ! Test for presence of 'NO'prefix.  If present,adjust descriptor
+    !    to remove it, and set no_flag.
+    !
+    IF CH$EQL(2, .no_dsc [1], 2, .keyword_dsc [1])
+    THEN
+
+	BEGIN
+	keyword_dsc [0] = .keyword_dsc [0] - 2;
+   	keyword_dsc [1] = .keyword_dsc [1] + 2;
+	no_flag = true;
+	END;
+
+    IF (status = lib$lookup_key( keyword_dsc, opflag_table, code))
+    THEN
+        !
+	! valid flag, set bit
+	!
+	(RECBUF[UAF$B_PDAYFLAGS])<.code,1> = NOT .no_flag
+    ELSE
+	SELECT .status OF
+	    SET
+	    !
+	    ! ambiguous keyword?
+	    !
+	    [lib$_ambkey] : SIGNAL( cli$_abkeyw );
+	    !
+	    ! unrecognized keyword?
+	    !
+	    [lib$_unrkey] : SIGNAL( cli$_ivkeyw );
+	    !
+	    ! whatever, always return an error if we're in here
+	    !
+	    [ALWAYS]      : RETURN false;
+	    TES;
+
+    END;
+
+RETURN TRUE;
+END;
+
+GLOBAL ROUTINE PARSE_HOURS =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Parse hourly login restrictions for primary or secondary days
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!
+! OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true -> successful completion
+!	false -> error in flag name
+!--
+LOCAL 
+    status;
+
+!
+! Clear login restriction bits for appropriate days
+!
+IF .primary
+THEN
+    BEGIN
+    status = cli$get_value(sd_p_restrict,tokendsc);
+    (RECBUF [UAF$L_PDAYHOURS])<0,24> = 0;
+    address = RECBUF [UAF$L_PDAYHOURS];
+    END
+ELSE
+    BEGIN
+    status = cli$get_value(sd_s_restrict,tokendsc);
+    (RECBUF [UAF$L_SDAYHOURS])<0,24> = 0;
+    address = RECBUF [UAF$L_SDAYHOURS];
+    END;
+
+!
+! If qualifier was null, then a clear was all that requested
+!
+IF .TOKENLEN EQL 0
+THEN
+    RETURN true;
+
+WHILE .status DO
+    BEGIN
+    !
+    ! Turn the token over to tparse for parsing
+    !
+    tparse_block [tpa$l_stringcnt] = .TOKENLEN;
+    tparse_block [tpa$l_stringptr] = .TOKENPTR;
+
+    IF NOT lib$tparse ( tparse_block, parse_states, parse_keys )
+    THEN
+	RETURN FAOOUT ( BADVALUE, .tokenlen, .tokenptr);
+
+    !
+    ! Fetch ranges for appropriate qualifier
+    !
+    IF .primary
+    THEN
+        status = cli$get_value(sd_p_restrict,tokendsc)
+    ELSE
+	status = cli$get_value(sd_s_restrict,tokendsc);
+    END;
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE GETPRIMEDAYS =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Get list of day considered prime days.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	PDFLAG_TABLE - table of flag bit numbers and ascii names
+!
+! OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true -> successful completion
+!	false -> error in flag name
+!--
+
+LOCAL
+	status,
+	keyword_dsc :  VECTOR [2],
+	no_flag,
+	CODE ,					! return from find_val
+	IENTRY;
+
+MAP
+	no_dsc: VECTOR,
+	PDFLAG_TABLE: VECTOR;
+
+!
+! Retrieve keywords as long as they are present
+!
+WHILE cli$get_value(sd_primedays, TOKENDSC) DO
+
+    BEGIN
+    keyword_dsc [0] = .TOKENLEN;
+    keyword_dsc [1] = .TOKENPTR;
+    no_flag = false;
+
+    !
+    ! Test for presence of the 'NO' prefix.  If present, adjust the
+    !    descriptor to remove it, and set no_flag
+    !
+    IF CH$EQL(2, .no_dsc [1], 2, .keyword_dsc [1])
+    THEN
+	BEGIN
+	keyword_dsc [0] = .keyword_dsc [0] - 2;
+   	keyword_dsc [1] = .keyword_dsc [1] + 2;
+	no_flag = true;
+	END;
+
+    IF (status = lib$lookup_key( keyword_dsc, pdflag_table, code))
+    THEN
+        !
+	! valid flag, set bit
+	!
+	(RECBUF[UAF$B_PRIMEDAYS])<.code,1> =  .no_flag
+    ELSE
+	SELECT .status OF
+	    SET
+	    !
+	    ! ambiguous keyword?
+	    !
+	    [lib$_ambkey] : SIGNAL( cli$_abkeyw );
+	    !
+	    ! unrecognized keyword?
+	    !
+	    [lib$_unrkey] : SIGNAL( cli$_ivkeyw );
+	    !
+	    ! whatever, always return an error if we're in here
+	    !
+	    [ALWAYS]      : RETURN false;
+	    TES;
+
+    END;
+
+RETURN TRUE;
+END;
+
+GLOBAL ROUTINE GETPRIV =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Process privilege mask specification and set or
+!	clear proper bits in privilege quadword in RECBUF.
+!
+! INPUTS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true -> input processed successfully
+!	false -> error in privilege specification
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+LOCAL
+	PRVDSC: VECTOR[2,LONG] ;		! for privilege name descriptor
+
+!
+! Loop through if this is a list and check all of the names.
+! Set or clear appropriate bits depending on the 'NO' prefix.
+!
+
+WHILE cli$get_value(sd_privileges, tokendsc) DO
+    BEGIN
+    PRVDSC [0] = .tokenlen;
+    PRVDSC [1] = .tokenptr;
+
+    SELECT  PRV$SETPRIV( PRVDSC, RECBUF[UAF$Q_PRIV])   OF
+
+	SET
+	!
+	! Privilege name not found
+	!
+ 	[PRV$_INVNAM]:
+	    RETURN FAOOUT ( PRVNOTFND, .tokenlen, .tokenptr );
+
+	!
+	! Privilege name not unique
+	!
+	[PRV$_NOTUNQ]:
+	    RETURN FAOOUT ( PRVNOTUNQ, .tokenlen, .tokenptr );
+
+    TES;
+
+    END;
+
+RETURN TRUE ;
+END;
+
+GLOBAL ROUTINE GETUIC =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Process UIC specification
+!
+! INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!--
+
+!
+! Parse UIC and return error if invalid.
+!
+
+IF NOT PARSE_UIC( RECBUF[UAF$W_GRP] , RECBUF[UAF$W_MEM] )
+THEN
+    RETURN FAOOUT( UICERR , .TOKENLEN, .TOKENPTR) ;
+
+TRUE
+END;
+
+GLOBAL ROUTINE PARSE_UIC( RETGRP , RETMEM ) =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine to parse and validate a UIC or directory string.
+!	The UIC is returned as group and member elements.
+!
+! INPUTS:
+!
+!	RETGRP - address of a word to receive the group number
+!	RETMEM - address of a word to receive the member number
+!
+! IMPLICIT INPUTS:
+!
+!	TOKENPTR - address of first character past delimiter
+!
+! OUTPUTS:
+!
+!	RETGRP and RETMEM receive group and member numbers if
+!	no errors are encountered.
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VAUE:
+!
+!	true -> no errors found
+!	false -> error in UIC specification
+!
+! SIDE EFFECTS:
+!
+!	None
+!--
+
+LOCAL
+	group_len,
+	group_ptr: REF VECTOR[,BYTE],
+	mem_len,
+	mem_ptr:REF VECTOR[,BYTE],
+	comma_ptr:REF VECTOR[,BYTE],
+	GROUP ,					! group number
+	MEMBER ;				! member number
+
+group_ptr = .TOKENPTR;
+group_len = .TOKENLEN;
+
+!
+! Check if the first char is a left bracket '[' and skip it if
+! so.
+!
+
+IF .(.group_ptr)<0,8> EQL '['
+THEN
+    BEGIN
+    group_ptr = .group_ptr + 1;
+    group_len = .group_len - 1;
+    END;
+
+!
+! Get the binary group number, check for errors.
+!
+comma_ptr = CH$FIND_CH(.group_len, .group_ptr, %C',');
+mem_ptr = .comma_ptr + 1;
+mem_len = .group_len - (.comma_ptr - .group_ptr + 1 );
+group_len = .comma_ptr - .group_ptr;
+
+IF .(.mem_ptr + .mem_len - 1)<0,8> EQL ']'
+THEN
+    mem_len = .mem_len - 1;
+
+IF NOT CVTNUM( .group_len, .group_ptr, 8 , GROUP )
+THEN
+    RETURN FALSE ;
+
+!
+! Get binary member number
+!
+
+IF NOT CVTNUM( .mem_len, .mem_ptr, 8 , MEMBER )
+THEN
+    RETURN FALSE ;
+
+!
+! Check that UIC had valid elements.  Must be three digit octal numbers.
+!
+
+IF .GROUP GTR %O'377' OR .MEMBER GTR %O'377'
+THEN 
+    RETURN FALSE ;
+
+!
+! UIC was successfully parsed.  Return correct data, plus true indicaton.
+!
+
+(.RETGRP)<0,16> = .GROUP ;
+(.RETMEM)<0,16> = .MEMBER ;
+RETURN TRUE ;
+END;
+
+GLOBAL ROUTINE PARSE_WILD( NULLDEFAULT ) =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Parse one of six methods by which User Authorization File
+!	records may be specified.  This routine defines boolean
+!	variables for input to the WILD_USER routine.
+!
+! INPUTS:
+!
+!	NULLDEFAULT	TRUE => A null user specification defaults to *
+!
+! IMPLICIT INPUTS:
+!
+!	The parsing variables NEXTTOKEN, TOKENLEN, and TOKENPTR are modified.
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	The following boolean variables are decided:
+!
+!	UIC_FLAG - UIC form (instead of username)
+!	GRP_WILD - Group wild card (implies UIC_FLAG)
+!	MEM_WILD - Member wild card (implies UIC_FLAG)
+!	STR_WILD - all users alphabetically (implies NOT UIC_FLAG)
+!
+!	RECBUF - The appropriate keys are initialized
+!
+! ROUTINE VALUE:
+!
+!	If the syntax does not follow one of the six methods the routine
+!	returns FALSE.  The outputs are meaningful only when the value
+!	returned is TRUE.
+!
+!--
+LOCAL
+    tmptokenlen,
+    tmptokenptr,
+    group_len,
+    group_ptr,
+    comma_ptr,
+    GROUP ,				! group number
+    MEMBER ;				! member number
+MAP
+    star_dsc: VECTOR;
+
+!
+! Identify the next token in the command buffer.
+!
+
+IF NOT cli$present(sd_token1) OR
+   NOT cli$get_value(sd_token1,tokendsc) OR
+   .TOKENLEN EQL 0
+THEN
+    IF NOT .NULLDEFAULT
+    THEN
+        RETURN FAOOUT ( NOUSERSPEC )
+    ELSE
+        BEGIN
+	UIC_FLAG = false;
+	GRP_WILD = false;
+	MEM_WILD = false;
+	STR_WILD = true;
+	match_token = '*';
+	match_tokenlen = 1;
+	RETURN TRUE;
+	END
+ELSE
+    BEGIN
+    tmptokenlen = .TOKENLEN;
+    tmptokenptr = .TOKENPTR;
+    END;
+
+
+!
+! Decide whether a UIC or a Username form was used.
+!
+
+IF .(.tmptokenptr)<0,8> EQL '['
+THEN
+    BEGIN
+    UIC_FLAG = TRUE ;
+    STR_WILD = FALSE ;
+    tmptokenptr = .tmptokenptr + 1 ;
+    tmptokenlen = .tmptokenlen - 1 ;
+
+    IF .(.tmptokenptr + .tmptokenlen - 1)<0,8> EQL ']'
+    THEN
+      	tmptokenlen = .tmptokenlen - 1
+
+    ELSE
+  	RETURN FAOOUT (INVUSERSPEC, .TOKENLEN, .TOKENPTR);
+
+    !
+    ! Find comma
+    !
+    IF CH$FAIL(comma_ptr = CH$FIND_CH(.tmptokenlen, .tmptokenptr, %C','))
+    THEN
+	RETURN FAOOUT( INVUSERSPEC, .TOKENLEN, .TOKENPTR);     
+
+    !
+    ! Decide whether or not the Group subfield is wildcarded.
+    !
+    IF .(.tmptokenptr)<0,8>  EQL  '*'
+    THEN
+	BEGIN
+	GRP_WILD = TRUE ;
+	group_len = 1;
+	END
+
+    ELSE
+	BEGIN
+	GRP_WILD = FALSE ;
+	group_ptr = .tmptokenptr;
+	group_len = .comma_ptr - .group_ptr;
+
+	IF NOT CVTNUM( .group_len, .group_ptr, 8 , GROUP )
+	THEN
+	    RETURN FAOOUT( INVUSERSPEC , .TOKENLEN , .TOKENPTR ) ;
+	RECBUF[UAF$W_GRP] = .GROUP ;
+	END ;
+
+    tmptokenptr = .comma_ptr + 1;
+    tmptokenlen = .tmptokenlen - .group_len - 1;
+
+    !
+    ! Decide whether or not the Member subfield is wildcarded.
+    !
+
+    IF .(.tmptokenptr)<0,8> EQL '*'
+    THEN
+	BEGIN
+	MEM_WILD = TRUE ;
+
+	!
+	! Whether it is wildcarded or not this subfield is initialized
+	! for the wildcard processor.
+	!
+
+	RECBUF[UAF$W_MEM] = 0 ;
+	END
+    ELSE
+	BEGIN
+	MEM_WILD = FALSE ;
+	IF NOT CVTNUM( .tmptokenlen, .tmptokenptr, 8 , MEMBER )
+	THEN
+	    RETURN FAOOUT( INVUSERSPEC , .TOKENLEN , .TOKENPTR ) ;
+	RECBUF[UAF$W_MEM] = .MEMBER ;
+	END    ;
+
+    END
+ELSE
+    BEGIN
+    UIC_FLAG = FALSE ;
+    GRP_WILD = FALSE ;
+    MEM_WILD = FALSE ;
+
+    !
+    ! Decide whether or not the Username is wildcarded.
+    !
+
+    IF NOT CH$FAIL(CH$FIND_CH( .tmptokenlen, .tmptokenptr, '*'))
+	  OR
+       NOT CH$FAIL(CH$FIND_CH( .tmptokenlen, .tmptokenptr, '%'))
+!	  OR
+!       .by_account
+    THEN
+	BEGIN
+	match_tokenlen = .TOKENLEN;
+	CH$MOVE( .TOKENLEN, .TOKENPTR, match_token);
+	STR_WILD = TRUE;
+	END
+    ELSE
+	BEGIN
+	STR_WILD = FALSE ;
+	CH$COPY( .TOKENLEN , .TOKENPTR , %CHAR(' ') ,
+			UAF$S_USERNAME , RECBUF[UAF$T_USERNAME] ) ;
+	END ;
+    END ;
+
+TRUE
+END;
+
+GLOBAL ROUTINE GETSTRING( ADDR , MAXSIZE , TYPE ) =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads a string variable and stores it as
+!	a blank filled or counted string in the field supplied.
+!	The first character is checked to see if it is a quote
+!	or double quote and if so, a different terminator
+!	set is used so that embedded blanks may be contained
+!	in the string.
+!
+! INPUTS:
+!
+!	ADDR - address to store string
+!	MAXSIZE - size of field in which string will be stored.
+!		 If this is a counted string, the maximum input
+!		 acceptable is MAXSIZE - 1
+!	TYPE - string type, either COUNTED_STRING or FILLED_STRING
+!
+! IMPLICIT INPUTS:
+!
+!       none
+!
+! OUTPUTS:
+!
+!	none
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true -> string inserted successfully
+!	false -> string too long
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+
+LOCAL
+    tmptokenlen,
+    tmptokenptr,
+    QUOTE ;					! reading quoted string
+
+tmptokenlen = .TOKENLEN;
+tmptokenptr = .TOKENPTR;
+
+!
+! Check to see if the string is contained in quotes.
+!
+
+QUOTE = FALSE ;
+IF .(.tmptokenptr)<0,8> EQL SINGLE_QUOTE 
+THEN ( QUOTE = TRUE ;
+       tmptokenptr = .tmptokenptr + 1;
+       tmptokenlen = .tmptokenlen - 1;);
+
+!
+! If this was a quoted string then make sure we terminated
+!     on a quote.
+!
+IF .QUOTE 
+THEN
+   IF .(.tmptokenptr + .tmptokenlen - 1)<0,8> EQL SINGLE_QUOTE 
+   THEN
+        tmptokenlen = .tmptokenlen - 1
+    ELSE
+        RETURN
+	    FAOOUT( NOQUOTE , .TOKENLEN, .TOKENPTR) ;
+
+
+IF .TYPE EQL COUNTED_STRING
+THEN
+    MAXSIZE = .MAXSIZE - 1 ;
+
+IF .tmptokenlen GTR .MAXSIZE
+THEN
+    RETURN
+	FAOOUT( INVSTR , .TOKENLEN, .TOKENPTR) ;
+
+IF .TYPE EQL COUNTED_STRING
+THEN
+    BEGIN
+    (.ADDR)<0,8> = .tmptokenlen;
+    CH$MOVE( .tmptokenlen, .tmptokenptr, .ADDR+1 ) ;
+    END 
+ELSE
+    CH$COPY( .tmptokenlen, .tmptokenptr, %CHAR(BLANK) ,
+		.MAXSIZE , .ADDR ) ;
+RETURN TRUE ;
+END;
+
+ROUTINE GETVAL(ADDR , SIZE) =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine to return binary value for next ASCII decimal
+!	number in the input stream.
+!
+! INPUTS:
+!
+!	ADDR - address to return converted value
+!	SIZE - size in bits of field in which to return value
+!
+! IMPLICIT INPUTS:
+!
+!	NEXTTOKEN - contains address of delimiter preceeding the number
+!
+! OUTPUTS:
+!
+!	field described by ADDR and SIZE receives binary value
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true -> value converted successfully
+!	false -> non-numeric character encounted before next
+!		delimiter found
+!
+! SIDE EFFECTS:
+!
+!	If error is encountered, an error message will be printed.
+!
+!--
+
+LOCAL
+	temp_size,
+	VALUE ;					! for value returned
+						! by CVTNUM routine
+
+!
+! Check for no value supplied
+!
+
+IF .TOKENLEN EQL 0
+THEN
+    RETURN
+	FAOOUT( NOARG , .TOKENLEN, .TOKENPTR) ;
+
+!
+! Convert to decimal. Report error if any non-numerics encountered.
+!
+
+IF NOT CVTNUM( .TOKENLEN , .TOKENPTR , 10 , VALUE )
+THEN
+    RETURN
+	FAOOUT( BADVALUE , .TOKENLEN, .TOKENPTR) ;
+
+temp_size = .SIZE;
+
+IF .enqlim
+THEN
+    temp_size = .temp_size - 1;
+
+!
+! Check that the value supplied is within the size of
+! the field to be stored.
+!
+
+IF .VALUE< .temp_size , 32 - .temp_size > NEQ 0
+THEN
+    RETURN FAOOUT( VALTOOBIG , .TOKENLEN, .TOKENPTR) ;
+
+!
+! Finally , store the value in field specified .
+!
+
+(.ADDR)<0,.SIZE> = .VALUE ;
+
+RETURN TRUE ;
+END;
+
+ROUTINE CVTNUM( SIZE , ADR , RADIX , VALADR ) =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCIRPTION:
+!
+!	Routine to convert ascii digits to binary.
+!
+! INPUTS:
+!
+!	SIZE - number of digits in input buffer
+!	ADR - address of the buffer containing ascii digits
+!	RADIX - radix of number to be converted
+!	VALADR - address of longword to receive converted value
+!
+! IMPLICIT INPUTS:
+!
+!	none
+!
+! OUTPUTS:
+!
+!	longword pointed to by VALADR receives converted value
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	true -> value successfully converted
+!	false -> non-numeric encountered before end of string
+!
+! SIDE EFFECTS:
+!
+!	none
+!--
+BIND
+	SUM = .VALADR ;				! address ref scaler
+
+
+SUM = 0 ;
+
+!
+! Loop thorugh buffer.  Stop on end of string or non-decimal digit.
+!
+
+INCR I FROM .ADR TO ( .ADR + .SIZE - 1 )
+DO
+    BEGIN
+    LOCAL
+	DIGIT ,
+	POINTER ;
+
+    DIGIT = .(.I)<0,8> ;
+
+    !
+    ! Check validity of digit depending on radix
+    !
+
+
+    IF CH$FAIL(POINTER = CH$FIND_CH( .RADIX , NUMBERS , .DIGIT )) 
+    THEN
+	RETURN FALSE
+    ELSE
+	SUM = (.SUM*.RADIX) + ( .POINTER - NUMBERS )
+    END;
+
+RETURN TRUE ;
+END;
+
+END
+ELUDOM

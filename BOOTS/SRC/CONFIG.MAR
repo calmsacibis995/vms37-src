@@ -1,0 +1,1672 @@
+	.TITLE	CONFIG - CSR AND VECTOR UTITLITY
+	.IDENT	'V03-001'
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+;
+; AUTHOR:  Jake VanNoy		Creation Date:	18-JAN-1981
+;
+; FACILITY:	BOOTS, SYSGEN
+;
+; MODIFIED BY:
+;
+;	V03-001	JLV0191		Jake VanNoy		15-MAR-1982
+;		Add RX211 REARNG. Change floating CSR calculation in 
+;		CONFIGURE to track change made to the real autoconfigure 
+;		algorithm. Add some G^'s.
+;
+;	V02-008	JLV0172		Jake VanNoy		27-Jan-1982
+;		Add UDA to REARNG, equivalence DZ32 with DZ11. 
+;		Fix bug in SHOW/UNIBUS that always showed 0 for 
+;		first CSR in group.
+;
+;	V02-007	JLV0169		Jake VanNoy		25-Jan-1982
+;		Remove CONNECT's to MASSBUS devices from SHOW/CON/COM
+;		and replace with AUTOCONFIGURE <nexus>. Move routine
+;		CHECK_CSR to NONPAGED_CODE psect.
+;
+;	V02-006	JLV0130		Jake VanNoy		31-DEC-1981
+;		Add use of RIO$OUTPUT_LINE for output. Add SIGNAL
+;		macro. Add BOO$SHOW_UNIBUS routine.
+;
+;	V02-005	JLV0116		Jake VanNoy		12-Nov-1981
+;		Only close files if /OUTPUT or /INPUT specified.
+;		Add invalid adapter check to BOO$SHOCONFIG.
+;
+;	V02-004	JLV0074		Jake VanNoy		29-Aug-1981
+;		Changed some of the EQUIV macros.
+;
+;	V02-003	JLV0034		Jake VanNoy		29-June-1981
+;		Added AT$_CI to adapter name list.
+;
+; 	V02-002	JLV0011		Jake VanNoy		7-May-1981
+;		Allow spaces or commas in command line, prompt with
+;		DEVICE> rather than CONFIG>, change syntax of SAVE 
+;		to SHO/CON/COMMAND_FILE.
+;
+;	V02-001	JLV0001		Jake VanNoy		27-Feb-1981
+;		Added INC_CHAR macro to call ACF$INC_CHAR so changes 
+;		to the device naming conventions are automatically
+;		reflected here. CNF$PREV_UNIBUS changes for the same
+;		reason. Use UBT$_ offsets in CONFIGURE. Add code to
+;		SHOW/CONFIGURE to implement SAVE command. Add "No
+;		devices on adadpter" warning. Reformat displays.
+;
+; ABSTRACT:	
+;			
+;	CONFIG is a utility routine used to calculate the CSR and  vector
+;	addresses  that  AUTOCONFIGURE would assign to a configuration on
+;	the UNIBUS.  Input consists of a list of devices that make up any
+;	possible  configuration  of devices on the UNIBUS.  
+;
+;     Form of input: A file of <device type, # of, previous #> pairs.  The
+;	ordering of the devices in this file is unimportant, the utility 
+;	will calculate ranking. The previous # is the count of this device
+;	type that were configured on previous UNIBUS's.
+;
+;     Output: A list of CSR and  vector  addresses  that  AUTOCONFIGURE
+;          would use for such a configuration.
+;
+;     Sample of input:
+;
+;          CR11
+;	   ! comments are allowed after "!"
+;          LP11,2,2
+;          DC11,6
+;          DT11,,1
+;          RL211,3
+;
+;          where  the absence of a number of controllers is taken to mean 
+;          that there is one such device.  Unrecognized device types will 
+;          be flagged as errors.  Use of equivalent names will be noted -
+;          e.g.  the use of RL211 above will result in the line:
+;
+;             Equivalent Name - Device RL211 will be output as RL11.
+; 
+;--
+
+.PAGE
+
+; 
+; MACRO LIBRARY CALLS 
+; 
+  
+	$ACFDEF				;DEFINE ACF OFFSETS 
+	$ADPDEF
+	$CRBDEF
+	$DCDEF
+	$DDBDEF
+	$DSCDEF
+	$IDBDEF
+	$SSDEF
+	$SYSGMSGDEF
+	$TPADEF
+	$UCBDEF
+	$VECDEF
+
+;
+; CONSTANTS:
+;
+
+UBA_IOBASE = 8*512	
+
+SPACE = ^X20
+BUFFER_SIZE = 128
+
+UBA_V_SUPPORT  = 0
+UBA_M_SUPPORT  = 1
+
+UBA_V_FLOATCSR = 1
+UBA_M_FLOATCSR = 2
+
+UBA_V_FLOATVEC = 2
+UBA_M_FLOATVEC = 4
+
+.PAGE
+.SBTTL EQUIVALENT NAMES MACRO
+
+;
+; MACROS:
+;
+
+	.MACRO	SIGNAL	message
+
+	.IF NB MESSAGE
+	MOVL	Message,R0
+	.ENDC
+
+	BSBW	SIGNAL_R0
+
+	.Endm	SIGNAL
+
+;
+; 
+; macro to generate equivalences data structure 
+; 
+; This macro creates a tree-like data structure where
+; each pair of nodes consists of two names. The first
+; name is a name which appears in the autoconfigure table
+; and the second name is another possible name for the
+; same device.
+; The two macros FIND_EQV are then used
+; to give one the other node, given the first.
+;
+
+	.MACRO	EQUIV	NAME1,NAME2 
+  
+		.PSECT	ACF_NAMES 
+	$NAME1$=. 
+		.ASCID	/NAME1/		;name in ubatable 
+  
+		.PSECT	EQV_NAMES 
+	$NAME2$=. 
+		.ASCID	/NAME2/		;equivalent name 
+  
+		.PSECT	EQV_DESC 
+	$EQV_DESC$=. 
+		.LONG	$NAME1$ 
+		.LONG	$NAME2$ 
+  
+		.PSECT	EQV_DATA 
+		.LONG	$EQV_DESC$ 
+  
+	.ENDM	EQUIV
+  
+.PAGE
+.SBTTL REARNG; REARRANGE DEVICES ARRAY MACRO
+  
+; 
+; macro to rearrange numbers in DEVICES array 
+; intended to handle exceptions like RL11 
+; where one device is fx,fx and another is fx,fl, etc. 
+; 
+; 
+; INPUT
+; 
+;	R11   - address of DEVICES
+;	FIRST - first name in ubatable (upper listing) 
+;	OCC1  - which occurance of FIRST to find
+;	SECOND- second name in ubatable 
+;	OCC2  - which occurance of SECOND to find
+; 
+; OUTPUT
+;
+;   	The DEVICES array becomes: 
+;	DEVICES[second] := DEVICES[first] - 1 
+;	DEVICES[first] := 1 
+;	 
+;-
+
+.MACRO	REARNG	FIRST,OCC1,SECOND,OCC2 ,?L1
+
+
+	PUSHAL	FIRST			; First device
+	PUSHL	#OCC1			; Occurance
+	PUSHAL	SECOND			; Second device
+	PUSHL	#OCC2			; Occurance
+	CALLS	#4,W^REARNG_DEV		; Rearrange
+	BLBS	R0,L1			; Better not be error
+	BRW	EXIT			; Will fail to run if so
+L1:
+
+	.ENDM	REARNG 
+
+;+
+;
+; Macro to increment controller name by calling routine in AUTOCONFG
+;
+;-
+
+.MACRO	INC_CHAR
+
+	PUSHL	R1			; Save R1
+	MOVL	W^L_DEVNAME,R1		; Address of device name
+	BSBW	ACF$INC_CHAR		; Increment character, routine does not
+					; 	return status
+	POPL	R1			; Restore R1
+	
+.ENDM	INC_CHAR
+
+
+.PAGE
+.SBTTL	SYMBOLS AND DATA AREA
+
+.PSECT	PAGED_DATA	rd,wrt,noexe,quad
+; 
+; LOCAL VARIABLES:
+; 
+DEV_LINE:   .ASCID @Device: !AC !_Name: !4<!AC!> !_ CSR: !6OL!AC !_ Vector:@-
+@ !3OL!AC !_Support: !AC @
+RSV:		.ASCII	/RSV/ 
+RL11:		.ASCIC	/RL11/ 
+RL211:		.ASCIC	/RL211/ 
+TS11:		.ASCIC	/TS11/ 
+RX211:		.ASCIC	/RX211/
+UDA:		.ASCIC	/UDA/
+LPA11:		.ASCIC	/LPA11/ 
+DR11B:		.ASCIC	/DR11B/ 
+DEVICES:	.BLKB	100		;array of device counts as read in 
+ 
+L_DEVNAME:	.LONG	0		;addr. of device name 
+L_DRVNAME:	.LONG	0		;addr. of driver name 
+L_ROUTINE:	.LONG	0		;addr. of routine name 
+ACF_NAME:	.LONG	0		;used in routine lookup
+OFFSET:		.LONG	0
+NUM:		.LONG	0		;number of devices 
+
+FX:		.ASCIC	/ / 
+FL:		.ASCIC	/*/ 
+YES:		.ASCIC	/yes/ 
+NO:		.ASCIC	/no/ 
+SUP:		.LONG	0 
+W_CSRBASE:	.LONG	0		;addr. of current csr 
+W_VECBASE:	.LONG	0		;addr. of current vector 
+B_CNUMVEC:	.BYTE	0		;number of vectors 
+OUTPUT_DESC:
+UPCASE_SRC:	.ASCID	//		;only need ascid block
+UPCASE_DST:	.ASCID	//		;has to BUFFER_SIZE long
+		.BLKB	BUFFER_SIZE	;here's the block
+
+CONF_PR:	.ASCID	/DEVICE> /
+
+BOO$GL_TR::	.LONG	0		; For /ADAPTER =
+
+null:		.ascid	//
+fao_d_outbuf:
+			.long	128
+			.long	buf
+buf:			.blkb	128
+fao_d_ctrstr:
+	.ASCID	@ Address !6OL (!XL) responds with value !XW (hex) @
+fao_q_oneuba:
+	.ascid	@!/!/ ** UNIBUS map for nexus #!UL on !%D ** @
+fao_w_outlen:		.word	0
+
+.PAGE
+.SBTTL	TPARSE TABLE FOR CONFIG INPUT LINE
+
+$INIT_STATE	CNF$STATE,CNF$KEYTBL
+
+$STATE
+$TRAN	!DEVICE,TPA$_EXIT		; Parse device line
+$TRAN	'!',TPA$_EXIT			; Allow comment
+$TRAN	TPA$_BLANK,TPA$_EXIT		; Allow non-null line with only blanks
+
+$STATE	DEVICE
+$TRAN	TPA$_STRING,NUMBER,CNF$FIND_DEVICE
+
+$STATE	NUMBER
+$TRAN	<','>				; Accept ","
+$TRAN	TPA$_LAMBDA			; But make it optional
+$STATE
+$TRAN	TPA$_DECIMAL,NUMBER2,CNF$SET_VALUE ; Allow device,m,n
+$TRAN	TPA$_LAMBDA,NUMBER2,CNF$SET_VALUE ; Allow device,,n
+
+
+$STATE	NUMBER2				; Previous UNIBUS count
+$TRAN	<','>
+$TRAN	TPA$_LAMBDA	
+$STATE
+$TRAN	TPA$_DECIMAL,TPA$_EXIT,CNF$PREV_UNIBUS ; Second # is prev unibus dev count
+$TRAN	TPA$_LAMBDA,TPA$_EXIT
+
+$END_STATE
+  
+PARAM_BLK:	.BLKB	TPA$K_LENGTH0
+.PAGE
+.SBTTL EQV_TABLE DATA
+
+.PSECT 	EQV_DATA 
+ 
+ ;  
+ ; Data for equivalences table. First device name is as it appears in the
+ ; autoconfigure table. Second device is a possible second name (for whatever 
+ ; reason). The program uses this table to allow either device name as input.
+ ;
+ 
+ AB_EQV_TABLE::
+  
+ ;		acf	 eqv	 why
+ ;		----     -----  ---------------------------- 
+	EQUIV	RK611	,RK711	;multiple names
+
+	EQUIV	DZ11	,DZ32	;multiple names
+   
+ 	EQUIV	DR11C	,DR11A  ;multiple names
+   
+ 	EQUIV	DL11C	,DL11D  ;multiple names
+ 	EQUIV	DL11C	,DL11E  ;multiple names
+   
+ 	EQUIV	RL11	,RL211  ;multiple names
+   
+   	EQUIV	RX211	,RX02	;multiple names
+ 
+ 	EQUIV	DR11W	,XA11  	;multiple names
+ 	EQUIV	DR11W	,DR11  	;because of chapter 14 How To Write... 
+   
+ 	.LONG	0		;end of list 
+.PAGE  
+.SBTTL	TPARSE ACTION ROUTINES
+
+.PSECT	PAGED_CODE	rd,nowrt,exe,long
+
+;+
+;
+; These are the TPARSE action routines called by the parsing table 
+; within the CONFIGURE module and from SYSBOOCMD. The routines called 
+; from SYSBOOCMD are prefixed by BOO$, the routines called by CONFIGURE's
+; TPARSE table are prefixed by CNF$, other routines in this module that 
+; are called as subroutines have no prefix.
+;
+;-
+
+.ENTRY	BOO$NO_RESET, ^M<>
+
+	BBSS	#BOO$V_NORESET,BOO$GL_CMDOPT,10$ ; Set /NORESET bit1
+10$:	RET
+
+.ENTRY	BOO$SET_TR, ^M<>
+
+	MOVL	TPA$L_NUMBER(AP),BOO$GL_TR	; Set /ADAPTER = number
+	RET
+
+.PAGE
+;+
+;
+; This is a TPARSE action routine that offsets the device controller
+; character to allow correct device names on mutiple UNIBUS configurations
+;
+;-
+
+.ENTRY	CNF$PREV_UNIBUS, ^M<R2,R3>
+
+	MOVL	W^OFFSET,R2		; Offset of this device into UBATABLE
+	MOVAL	L^ACF$AB_UBATABLE[R2],R2 ; Address in table
+	CLRL	R3			; Index
+
+10$:	MOVL	@(R2),R1		; Address of ascic device name string
+	BSBW	ACF$INC_CHAR		; Increment character
+	AOBLSS	TPA$L_NUMBER(AP),R3,10$ ; Add one and branch while LSS
+	MOVL	#1,R0			; Set success
+	RET				; Return
+
+;
+; routine to set value in device array
+;
+
+.ENTRY	CNF$SET_VALUE, ^M<R2,R3,R4,R5,R6,R7>
+
+	CVTLB	TPA$L_NUMBER(AP),R2	; Convert to byte
+	BVS	20$			; Overflow error
+	BLEQ	20$			; zero or negative
+
+	MOVAB	W^DEVICES,R3		; Base of array
+	MOVL	W^OFFSET,R4		; Offset into array
+	TSTB	(R3)[R4]		; Make sure its zero
+	BEQL	10$			; Branch if OK
+
+;	device has been input by user twice - 
+; 	replace original value and notify user.
+
+	PUSHL	TPA$L_NUMBER(AP)	; Second number for this device
+	MOVZBL	(R3)[R4],-(SP)		; First number that was input
+	PUSHL	W^L_DEVNAME		; Name of device
+	PUSHL	#3			; Number of FAO parameters
+	PUSHL	#SYSG$_TWICE		; Error message
+	CALLS	#5,G^LIB$SIGNAL		; Signal error
+
+10$:	MOVB	R2,(R3)[R4] 		; Insert number of devices into array
+	BRB	30$			; Return success
+
+20$:
+	SIGNAL	#SYSG$_OUT_RANGE	; message - warning
+
+30$:	MOVL	#1,R0			; Set success
+	RET				; Return
+.PAGE
+.ENTRY	CNF$FIND_DEVICE, ^M<R2,R3,R4,R5,R6,R7>
+
+; Check first for equivalence name
+
+	MOVAB	AB_EQV_TABLE,R4		; Address of equivalences table
+
+10$:	MOVL	(R4)+,R5		; Get next equivalence
+	BEQL	20$			; End of list - no equivalence found
+
+	MOVL	(R5)+,W^ACF_NAME	; Possible real device name
+	MOVL	(R5)+,R6		; Equivalence name to match against
+	CMPC5	TPA$L_TOKENCNT(AP),@TPA$L_TOKENPTR(AP), -
+		#^A/ /,(R6),@4(R6)	; Check for match
+	BNEQ	10$			; Branch if not
+
+	MOVL	W^ACF_NAME,R6		; Address of real device name
+
+; signal change to ACF_NAME
+
+	PUSHL	4(R6)			; Address of ACF_NAME
+	MOVZWL	(R6),-(SP)		; Length of ACF_NAME
+	PUSHL	TPA$L_TOKENPTR(AP)	; Address of equivalence name
+	PUSHL	TPA$L_TOKENCNT(AP)	; Length of equivalence name
+	PUSHL	#4			; Number of FAO params
+	PUSHL	#SYSG$_EQV_NOTICE	; Message name
+	CALLS	#6,G^LIB$SIGNAL
+
+	MOVZWL	(R6),TPA$L_TOKENCNT(AP)	; Move in real count
+	MOVL	4(R6),TPA$L_TOKENPTR(AP) ; Move in real device name address
+
+;
+; Find the string in UBATABLE
+;
+
+
+20$:	PUSHL	TPA$L_TOKENPTR(AP)	; Push address of string to match
+	PUSHL	TPA$L_TOKENCNT(AP)	; Push length of string
+	PUSHL	#1			; Find first occurance
+	CALLS	#3,W^LOOKUP		;      in UBATABLE
+	BLBC	R0,30$			; Branch if error
+
+	MOVL	#1,R0			; Return success
+30$:	RET				;
+
+.PAGE
+.SBTTL	ROUTINE LOOKUP 
+
+;+
+;
+; FUNCTIONAL DESCRIPTION
+;
+;	This routine locates a device name in UBATABLE
+;
+; CALLING SEQUENCE
+;
+;	PUSHL	<address of string to match against>
+;	PUSHL	<length of string>
+;	PUSHL	<which occurance of string to get>
+;	CALLS	#3,LOOKUP
+;
+; INPUT PARAMETERS
+;
+;	as above
+;
+; OUTPUT PARAMETERS
+;
+;	R0	Completion code
+;	OFFSET	Offset count into UBATABLE for device
+;
+;-
+
+; CONSTANTS
+
+OCCURANCE = 4
+LENGTH	  = 8
+ADDRESS   = 12
+
+.ENTRY	LOOKUP, ^M<R2,R3,R4,R5,R6>
+
+	MNEGL	#1,R4			; Initialize counter
+	MOVAB	L^ACF$AB_UBATABLE,R5	; Base address
+
+10$:	MOVL	(R5)+,R6		; Next device in table
+	BEQL	20$			; device not found - error
+	INCL	R4			; Increment counter
+	MOVAB	@8(R6),R1		; Address of device name string
+	MOVZBL	(R1),R0			; length of string
+	MOVL	R1,W^L_DEVNAME		; Save device name
+	CMPC5	R0,1(R1),#^A/ /, -
+		LENGTH(AP),@ADDRESS(AP)	; Match ?
+	BNEQ	10$			; Branch if not
+
+	DECL	OCCURANCE(AP)		; Decrement occurances
+	BNEQ	10$			; Not this one, keep looking
+
+	MOVL	#1,R0			; Return success
+	MOVL	R4,W^OFFSET		; Save offset into table
+	RET				; Return
+
+20$:	; signal no match
+
+	PUSHL	ADDRESS(AP)		; Address of unknown device string
+	PUSHL	LENGTH(AP)		; Length of string
+	PUSHL	#2			; Number of FAO arguments
+	PUSHL	#SYSG$_DEVNOTKNWN	; Device not known message
+	CALLS	#4,G^LIB$SIGNAL		; SIGNAL error
+	MOVL	#SYSG$_DEVNOTKNWN,R0	; Set error so TPARSE will not continue
+30$:	RET				; Return
+
+.PAGE
+.SBTTL	BOO$CONFIGURE - HYPOTHETICAL CONFIGURATION
+
+;++
+;
+; ABSTRACT:
+;
+;	BOO$CONFIGURE is the main TPARSE action routine called from SYSBOOCMD.
+;
+; INPUT:
+;
+;	OUTNAM_ADDR	address of ascii output file spec (Default = SYS$OUTPUT)
+;	OUTNAM_SIZE	size of ascii string
+;	INNAM_ADDR	address of ascii input file spec (Default = SYS$INPUT)
+;	INNAM_SIZE	size of ascii string
+;
+;--
+
+.ENTRY	BOO$CONFIGURE, ^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+; Open output file
+
+	BSBW	BOO$OPEN_OUTPUT_2	; Open /output= file (D=sys$output)
+ 	BLBS	R0,20$			; branch if no error
+
+10$:	SIGNAL				; Signal
+	BRW	50$			; Exit on error
+
+; Open input file
+
+20$:	BSBW	BOO$OPEN_INPUT_2	; Open /input= file (D=sys$input)
+ 	BLBC	R0,10$ 			; Branch if error
+	
+40$:	BBS	#BOO$V_NORESET,BOO$GL_CMDOPT,45$ ; Branch if /NORESET
+	BSBW	IOC$AUTORESET 		; Reset names
+
+45$:	MOVC5	#0,W^DEVICES,#0,#100,W^DEVICES ; Zero device array
+
+	MOVAL	W^UPCASE_SRC,R6		; Set up calls to STR$UPCASE 
+	MOVW	#BUFFER_SIZE,(R6)	;     made in READ-PARSE_INPUT
+	MOVAL	W^RIO$AB_INBUFFER,4(R6)	; Address in descriptor
+	MOVAL	W^UPCASE_DST,R8		; Destination descritor
+	MOVW	#BUFFER_SIZE,(R8)	; Length (Address already filled in)
+
+	BSBW	READ_PARSE_INPUT	; Handle user input
+	BLBC	R0,50$			; Branch on error
+	BSBW	ADDRESS_CALC		; Process input
+
+50$:	MOVL	#1,R0			; Set success for tparse
+ 	RET				; Return to SYSBOOCMD
+
+.PAGE
+READ_PARSE_INPUT:
+
+	MOVC5	#0,W^RIO$AB_INBUFFER,#^A/ /,-
+		#BUFFER_SIZE,W^RIO$AB_INBUFFER ; Blank buffer
+
+	BBC	#BOO$V_INPUT,-
+		BOO$GL_CMDOPT,5$	; Branch if /INPUT not specified
+	$GET	RAB=RIO_INRAB2
+	BLBC	R0,7$
+	TSTW	RIO_INRAB2+RAB$W_RSZ 	; Test for zero bytes read in
+	BEQL	READ_PARSE_INPUT	; Read another record
+	BRB	20$			; Branch
+5$:	
+	PUSHAB	CONF_PR			; Addess of prompt
+	PUSHL	R6			; Push address
+	CALLS	#2,G^LIB$GET_INPUT	; Get input
+	BLBC	R0,7$
+	BEQL	READ_PARSE_INPUT	; Branch if zero
+	BRB	20$
+
+7$:
+	CMPL	R0,#RMS$_EOF		; End of file ?
+	BNEQ	10$			; Branch if not
+	MOVL	#1,R0			; Set success
+	RSB				; Return
+
+10$:
+	SIGNAL				; Signal
+	RSB				; Return
+		
+20$:
+
+; Must do upcasing since RMS only supports CVT in the ROP field for tty input
+
+	PUSHL	R6			; Source of UPCASE
+	PUSHL	R8			; Destination of UPCASE
+	CALLS	#2,G^STR$UPCASE		; Upcase input string
+	BLBS	R0,30$			; Branch if no error
+
+	SIGNAL				; Signal error
+	RSB				; Return
+
+30$:	MOVAL	W^PARAM_BLK,R7		; Parameter block for tparse
+	MOVL	#TPA$K_COUNT0,TPA$L_COUNT(R7) ; # of longwords in param block
+	BISL	#TPA$M_ABBREV,TPA$L_OPTIONS(R7) 
+					; Allow abbreviations, parse blanks
+	MOVL	#BUFFER_SIZE,TPA$L_STRINGCNT(R7) ; Size of BUFFER
+	MOVL	4(R8),TPA$L_STRINGPTR(R7) ; Address of BUFFER
+	MOVL	#1,TPA$L_NUMBER(R7)	; Default of one device
+
+	PUSHAB	W^CNF$KEYTBL		; Set up for call to TPARSE
+	PUSHAB	W^CNF$STATE 		;  by putting key table and state
+	PUSHL	R7			;  and the param blk on stack
+	CALLS	#3,G^LIB$TPARSE		; Call TPARSE
+	BLBC	R0,40$			; Branch on error
+	BRW	READ_PARSE_INPUT	; Continue to read input
+
+40$:	CMPL	R0,#SYSG$_ABORT		; Has a fatal error occurred ?
+	BNEQ	50$			; Branch if not
+	RSB				; Return on error
+
+50$:	CMPL	R0,#LIB$_SYNTAXERR	; TPARSE error ?
+	BEQL	60$			; Branch if not
+	BRW	READ_PARSE_INPUT	; Other errors already signaled
+
+60$:
+	PUSHL	TPA$L_TOKENPTR(R7)	; token that couldn't be parsed
+	PUSHL	TPA$L_TOKENCNT(R7)	; length of token 
+	PUSHL	#2			; Number of FAO params
+	PUSHL	#SYSG$_SYNTAX		; Error message
+	CALLS	#4,G^LIB$SIGNAL		; Signal the error
+	BRW	READ_PARSE_INPUT
+
+.PAGE
+.SBTTL ROUTINE ADDRESS_CALC
+ 
+ADDRESS_CALC:
+;
+; Make modifications to devices array and then simulate AUTOCONFIGURE
+; algorithm by running through same decision process as it does.
+; the difference is this code uses an array (devices) to tell what
+; devices are there rather than the EXE$TEST_CSR routine to actually
+; see if the device is physically present.
+;
+
+;
+; execeptions in devices array
+;	 
+; some modifications must be made to the devices array
+; to allow proper positioning of devices
+;
+; all these special cases are handled here
+;
+
+; the first exeception is the RSV device that, although it
+; exists in the ubatable and is legal input as define above,
+; it is a placeholder (a non-device) and cannot exist.
+; therefore, the place in the devices array is checked to assure
+; it is zero
+
+	MOVAL	W^DEVICES,R11
+
+	PUSHAL	W^RSV			; Address of string
+	PUSHL	#3			; Length of string
+	PUSHL	#1			; find first occurance
+	CALLS	#3,LOOKUP		;  in UBATABLE
+	MOVL	W^OFFSET,R7		; Offset of device into UBATABLE 
+
+ 	TSTB	(R11)[R7]		; Must be zero 
+ 	BEQL	10$ 			; Since RSV is a non-device
+					; (.i.e just a placeholder)
+
+	SIGNAL	#SYSG$_RSV_ERR		; Signal message
+ 	CLRB	(R11)[R7] 		; Zero out RSV
+
+;
+; the following devices (RL11, TS11, LPA11, DR11B) all have
+; a single fixed, fixed (or fixed, floating) address with 
+; the remainder as fixed, floating (or floating, floating).
+; 
+; REARNG checks the first position and if it as greater than
+; one shifts the balance to the second (where they should be)
+;
+ 
+10$:	REARNG	RL11,  1,	RL11,   2
+ 	REARNG	TS11,  1,	TS11,	2
+	REARNG	LPA11, 1,	LPA11,	2
+	REARNG	UDA,   1,	UDA,    2
+	REARNG	RX211, 1,	RX211,  2
+	REARNG	DR11B, 1,	DR11B,	2
+	REARNG	DR11B, 2,	DR11B,	3	; special case
+.PAGE
+
+;++
+; 
+; devices array is now in final form and ready to be interpretted 
+; as a list of devices on a UNIBUS. The following code keeps track 
+; of the CSR and vector addresses as it scans through the devices array. 
+; The devices array is in sorted order since it follows the ordering in 
+; the autoconfigure table. 
+; 
+;--
+ 
+	MOVAB	L^ACF$AB_UBATABLE,R9	; Initialize
+	MOVW	#^O160010,W^W_CSRBASE	; Starting csr(minus high order bits) 
+	MOVW	#^O300	 ,W^W_VECBASE	; Starting vector 
+	MNEGL	#1,R7			; Counter (index into devices) 
+   
+LOOP:	MOVL	(R9)+,R10		; Get first device addr. 
+	BNEQ	10$			; Zero at end of list
+	BRW	EXIT 			; Exit
+  
+10$: 	MOVL	UBT$L_DEVNAME(R10),W^L_DEVNAME	; Address of device name 
+	MOVL	UBT$L_DRVNAME(R10),W^L_DRVNAME	; Address of driver name 
+	MOVL	UBT$L_RTNNAME(R10),W^L_ROUTINE	; Address of routine name 
+	MOVB	UBT$B_NUMVEC(R10),W^B_CNUMVEC	; Number of vectors 
+	MOVAB	UBT$B_FLAGS(R10),R3		; Byte flag 
+	MOVAB	UBT$W_REMAINDER(R10),R10 	; Remainder of UBADEV entry
+	 
+	INCL	R7 			; Increment counter
+	MOVZBL	(R11)[R7],W^NUM		; Get count of this device 
+  
+; 
+; now determine if device is (fixed csr, fixed vector) or 
+; (fixed csr,floating vector), or (floating csr, floating vector) 
+; much of this code was extracted (and massaged) from AUTOCONFIGURE 
+; 
+; R1 used for vector addresses 
+; R2 used for CSR addresses
+;
+  	BBC	#UBA_V_FLOATVEC,(R3),FX_FX ; Branch if not floating vector
+
+; device has a floating vector   
+; round up to next valid vector address 
+; boundary for next device in the table 
+; store in R1  
+
+	MOVZWL	(R10),R1		; Get vector modulo mask 
+	ADDW	W^W_VECBASE,R1		; Round up 
+	BICW	(R10)+,R1		; Truncate to actual vector offset 
+	BBC	#UBA_V_FLOATCSR,(R3),20$ ; If clear - fixed CSR 
+	BRW	FL_FL 
+20$:	BRW	FX_FL 
+    
+.PAGE
+
+FX_FX:  ;fixed csr/fixed vector 
+   
+10$:	MOVZWL	(R10)+,R2		; Get csr offset 
+	BNEQ	30$			; Zero at end of fixed addresses
+	TSTL	W^NUM			; Better be zero 
+	BEQL	20$			; Branch if OK
+	BRW	TOO_MANY		; Error - fatal 
+20$:	BRW 	LOOP				 
+   
+30$:	MOVZWL	(R10)+,R1		; Get vector address 
+	TSTL	W^NUM			; Any of this type device left? 
+	BNEQ	40$ 
+	BRW	LOOP			; No device - no effect 
+40$:	PUSHAL	FX
+	PUSHAL	FX
+	CALLS	#2,W^PUT_LINE		; Output one line for this device
+	INC_CHAR 			; Increment controller
+	DECL	W^NUM 			; Decrement number
+	BRW	10$			; Loop
+
+   
+FX_FL:	;fixed csr/floating vector 
+   
+10$:	MOVZWL	(R10)+,R2		; Get fixed csr from ubatable 
+	BNEQ	20$			; Zero indicates end of list 
+	BRW	40$			; Branch to test num if zero 
+   
+20$:	TSTL	W^NUM			; Zero ? 
+	BNEQ	30$			; No - generate addresses 
+	BRW	40$			; Yes - finish up this device 
+   
+30$:	PUSHAL	FX
+	PUSHAL	FL 	
+	CALLS	#2,W^PUT_LINE		; Output one line for this device
+	BLBS	R0,35$			; Branch if no overflow of addresses
+	BRW	EXIT			; Fatal error - exit
+
+35$:	INC_CHAR 			; Increment controller
+   
+	DECL	W^NUM			; One less device 
+	MOVZBL	W^B_CNUMVEC,R0		; Get number of vectors 
+	MULL2	#4,R0			; Calculate next vector addr. 
+	ADDL2	R0,R1			; Add in offset 
+  
+	BRW	10$ 			; Loop
+  
+40$:	TSTL	W^NUM			; Better be zero 
+	BEQL	50$ 			; If = 0 , o.k.
+	BRW	TOO_MANY 		; If =/= 0 , error
+   
+50$:	MOVZBL	(R11)[R7],W^NUM		; Has there been a change in R1 
+	TSTL	W^NUM			;   (other than rounding off)
+	BNEQ	60$			; Yes - restore w_vecbase 
+	BRW	LOOP			; No - loop 
+60$:	MOVW	R1,W^W_VECBASE 		; Update vec_csrbase
+	BRW	LOOP 			; Loop
+   
+   
+FL_FL:  ;floating csr/floating vector 
+   
+20$:	MOVZWL	W^W_CSRBASE,R2		; R2 will be CSR register 
+	ADDW	(R10),R2		; Round to next csr 
+	BICW	(R10),R2		; Truncate back to csr offset 
+  
+30$:	TSTL	W^NUM			; Zero ? 
+	BNEQ	40$			; No - generate addresses 
+	BRW	50$			; Restore vecbase, etc. 
+  
+40$:	PUSHAL	FL 			; Floating
+	PUSHAL	FL 			; Floating
+	CALLS	#2,W^PUT_LINE		; output one line for this device
+	BLBS	R0,45$			; Branch if no overflow of addresses
+	BRW	EXIT			; Fatal error - exit
+
+45$:	INC_CHAR 			; Increment controller
+  	DECL	W^NUM			; One less device to do 
+	MOVZBL	W^B_CNUMVEC,R0		; Get number of controller int. vec.'s 
+	MULL2	#4,R0			; Calculate next vector 
+	ADDL2	R0,R1 			; Add in offset
+
+	ADDW	(R10),R2		; Calculate next csr 
+	INCL	R2 			; Increment CSR
+	BRW	30$ 			; Loop
+   
+50$:	MOVW	R1,W^W_VECBASE		; Save new vector offset 
+	MOVW 	R2,W^W_CSRBASE		; Save new csr offset 
+
+60$:	ADDW	#2,W^W_CSRBASE		; Advance past one register block 
+
+	BRW	LOOP 
+
+TOO_MANY: 
+	PUSHL	#SYSG$_ABORT		;  Fatal error - stop processing
+	CLRL	-(SP)
+	PUSHL	#SYSG$_TOO_MNY		;  Illegal configuration
+	CALLS	#3,G^LIB$SIGNAL		;  Ran out of fixed addresses
+
+EXIT:
+	BBC	#BOO$V_OUTPUT,-
+		BOO$GL_CMDOPT,10$	; Branch if /OUTPUT not specified
+	$CLOSE	FAB=RIO_OUTFAB2 	; Close files
+10$:
+	BBC	#BOO$V_INPUT,-
+		BOO$GL_CMDOPT,20$	; Branch if /INPUT not specified
+ 	$CLOSE	FAB=RIO_INFAB2		; Close input file
+20$:
+	RSB				; and return
+
+
+	.PAGE
+	.SBTTL ROUTINE PUT_LINE
+
+;++ 
+;
+; routine to output csr and vector 
+;
+;
+; CALLING SEQUENCE
+;
+;	PUSHAL	<FX or FL>
+;	PUSHAL	<FX or FL>
+;	CALLS	#2,PUT_LINE
+;
+; 
+; INPUT 
+;
+;  R1 is value of current vecbase (to be output)
+;  R2 is value of current csrbase (ditto)
+;  l_routine and l_devname give the current device name
+;  R3 has the address of the flag byte for this device
+;
+;
+; OUTPUT 
+;
+; A single line of output for this device
+;
+;  (e.g. Device: DZ11	Name: TTA	CSR: ...  Vector ... Support ...)
+;
+;--
+
+.ENTRY	PUT_LINE,^M<>
+
+	MOVQ	R1,-(SP)		; Save R1,R2
+	CMPL	#^O1000,R1		; Compare to largest legal value
+	BLEQ	10$			; Branch if error
+	CMPL	#^O177777,R2		; Compare to largest legal value
+	BGEQ	20$			; Branch if OK
+
+10$:	
+	PUSHL	#SYSG$_ABORT		; Fatal error
+	CLRL	-(SP)
+	PUSHL	#SYSG$_OVERFLOW		; Overflow on addresses
+	CALLS	#3,G^LIB$SIGNAL		; Signal error
+	CLRL	R0			; Set error
+	RET				; Return
+
+20$:	BISL2	#^O760000,R2		; OR in correct high order bits 
+ 	MOVAB	W^NO,W^SUP		; Initialize sup to "no"
+	BBC	#UBA_V_SUPPORT,(R3),30$	; Device supported ? 
+	MOVAB	W^YES,W^SUP 		; Change sup to "yes"
+  
+30$:	$FAO_S	CTRSTR=DEV_LINE, - 	; Format string
+		OUTBUF=RIO$AB_OUTBUF,   - 
+		OUTLEN=RIO$GW_OUTLEN,      - 
+		P1=L_ROUTINE,    -	; Routine name 
+		P2=L_DEVNAME,    -	; Device name 
+		P3=R2,           -	; Current csr
+		P4=8(AP),        -	; '*' if floating, ' ' if fixed 
+		P5=R1,           -	; Current vector
+		P6=4(AP),        -	; '*' if floating, ' ' if fixed 
+		P7=SUP			; Yes/no for support 
+		 
+	SIGNAL				; Signal if error
+	BSBW	RIO$OUTPUT_LINE		; Output line
+
+40$:	MOVQ	(SP)+,R1		; Restore R1,R2
+	RET				; Return
+.PAGE
+.SBTTL	ROUTINE REARNG_DEV 
+
+;+
+;
+; FUNCTIONAL DESCRIPTION
+;
+; 	This routine is used to rearrange devices in the DEVICES array.
+; 	Its purpose is to move numbers from a device that changes from
+; 	fixed,fixed allocation to fixed,floating or from fixed,floating
+; 	to floating,floating. A number of devices on the UNIBUS are allocated
+; 	I/O space in such a manner. CONFIGURE allows the input of these
+; 	devices all in one line and this routine does the shuffling that
+; 	is required to have one device at the first and the remanider
+; 	at the second loation in I/O space. Two calls to this routine must
+; 	be made for DR11b's who have all three types of allocation.
+;	
+; CALLING SEQUENCE
+;
+;	Via REARNG macro 
+;
+; INPUT PARAMETERS
+;
+;	First(AP)  First name to lookup in UBATABLE
+;	Occ1(AP)   Which occurance of the first device to find
+;	Second(AP) Second name to lookup in UBATABLE
+;	Occ2(AP)   Which occurance of this device to find
+;	R11	   Address of UBATABLE
+;
+; OUTPUT
+;
+; 	As explained above and in the REARNG macro
+;
+;-
+
+; CONSTANTS
+
+FIRST  = 16
+OCC1   = 12
+SECOND = 8
+OCC2   = 4
+
+.ENTRY	REARNG_DEV,^M<R2,R3>
+
+	MOVL	FIRST(AP),R1		; Address of ASCIC string
+	ADDL3	#1,R1,-(SP)		; Push address of actual string
+	MOVZBL	(R1),-(SP)		; Push length of string
+	PUSHL	OCC1(AP)		; which occurance to find
+	CALLS	#3,LOOKUP		; Find occurance in UBATABLE
+	MOVL	W^OFFSET,R2		; Save position
+
+	MOVL	SECOND(AP),R1		; Address of ASCIC string
+	ADDL3	#1,R1,-(SP)		; Push address of actual string
+	MOVZBL	(R1),-(SP)		; Push length of string
+	PUSHL	OCC2(AP)		; which occurance to find
+	CALLS	#3,LOOKUP		; Find occurance in UBATABLE
+	MOVL	W^OFFSET,R3		; Save position
+
+	TSTB	(R11)[R3]		; Is DEVICES[second] = 0
+	BEQL	10$			; Branch if OK
+	
+;  Signal layout error
+
+	PUSHL	#SYSG$_ABORT		; Unrecoverable - abort
+	PUSHL	FIRST(AP)		; First device
+	PUSHL	SECOND(AP)		; Second device
+	PUSHL	#2			; Number of FAO argumants
+	PUSHL	#SYSG$_INPUT_ERR	; message name
+	CALLS	#5,G^LIB$SIGNAL		; Signal message
+	CLRL	R0
+	BRB	30$
+
+10$:	CMPB	#1,(R11)[R2]		; Is 1 >= DEVICES[first]
+	BGEQ	20$			; If geq, ok
+	MOVB	(R11)[R2],(R11)[R3]	; Copy first to second
+	DECB	(R11)[R3]		;  and subtract one from it
+	MOVB	#1,(R11)[R2]		; Force one of first type
+
+20$:	MOVL	#1,R0
+30$:	RET
+
+.PAGE
+.SBTTL	VARIABLES USED IN SHOW/CONFIGURATION
+
+.PSECT PAGED_DATA	rd,wrt,noexe,quad
+;
+; variables used in SHOW/CONFIGURATION
+;
+
+NAME:
+NAME_L:
+	.LONG	0			;DEVICE NAME DESCRIPTOR
+	.LONG	NAME_S
+NAME_S:	.ASCII	/XXXXXXXXXXXXXXX/
+UNIT:	.LONG	0			;NUMBER UNITS ON CONTROLLER
+NVECT:	.LONG	0			;NUMBER OF DEVICE VECTORS ( 1 OR 2)
+T_NVECT:.LONG	0			;TMP NVECT
+AVECT1:	.LONG	0			;IDB VECTOR 1 ADDRESS
+AVECT2:	.LONG	0			;IDB VECTOR 2 ADDRESS (IF PRESENT)
+VCSR:	.LONG	0			;VIRTUAL CSR FOR DEVICE
+CSR:	.LONG	0			;UNIBUS CSR ADDRESS
+TR:	.LONG	0			;SBI TR NUMBER
+ADP_TYPE:
+	.LONG	0			;ADDRESS OF ADP TEXT
+OVECT1:	.LONG	0			;VECTOR1
+OVECT2: .LONG	0			;VECTOR2 (IF PRESENT)
+UCB_SAVE: .LONG	0			; 
+DRIVER:	.LONG	0
+DEV_FOUND: .BYTE 0 			; 
+OTHER_BLOCK:	.BLKB	32
+SHOW_UBA:
+	.ASCID	@ Name: !4<!AS!> Units: !2<!UW!> Nexus:!2<!UW!> !5<(!AD)!>@ -
+ 		@ CSR: !6OL  Vector1: !3OW  Vector2: !3OW@
+
+SHOW_OTHER:
+	.ASCID	@ Name: !4<!AS!> Units: !2<!UW!> Nexus:!2<!UW!> !5<(!AD)!> @
+
+CONNECT_UBA:
+	.ASCID 	@CONNECT !AS!UW /ADAP=!UW /CSR=%O!6OL /VECT=%O!3OW @ -
+		@/NUMV=!2OW /DRIVER=!AC @	
+CONNECT_OTHER:
+	.ASCID 	@AUTOCONFIGURE !UL@
+
+SHOCON_HEADER:
+	.ASCID	@!/!_System CSR and Vectors on !%D!/@
+
+SAVE_HEADER:
+	.ASCID	@$ RUN SYS$SYSTEM:SYSGEN@
+
+;
+; The following is a table of longword text strings that are used 
+; to print adapter type. Proper ordering is assumed to follow
+; the DCDEF definition.
+;  
+; Note - There is a big assumption here that each ASCII string is
+; EXACTLY four bytes long.
+;
+
+AL_ADP_TEXT:
+
+	Assume	AT$_MBA  EQ 0
+	Assume	AT$_UBA  EQ 1
+	Assume	AT$_DR   EQ 2
+	Assume	AT$_MPM  EQ 3
+	Assume	AT$_CI	 EQ 4
+	Assume	AT$_NULL EQ 5
+
+	.LONG	^A/MBA /		; adapter type = 0
+	.LONG	^A/UBA /		; adapter type = 1
+	.LONG	^A/DR  /		; adapter type = 2
+	.LONG	^A/MPM /		; adapter type = 3
+	.LONG	^A/CI  /		; adapter type = 4
+	.LONG	^A/NUL /		; adapter type = 5
+	.LONG	^A/UNK /		; adapter type >= 6 - UNKNOWN
+
+L_MAXADP:	.LONG	7		; Highest legal adapter type + 1
+.PAGE
+.SBTTL	INITIALIZATION CODE FOR SYSTEM DUMP
+
+;
+;SHOW/CONFIGURATION - Rick Spitz
+;SHOW/CON/COMMAND
+;
+;	THIS PROGRAM WILL DUMP OUT A LIST OF CSR AND VECTOR
+;	ADDRESSES CONTAINED IN THE VMS DEVICE DATA STRUCTURES
+;
+;
+
+.PSECT	PAGED_CODE	rd,nowrt,exe,long
+ 
+.ENTRY	BOO$SHOCONFIG, ^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	MOVAL	OTHER_BLOCK,R2		; Zero other block
+	CLRQ	(R2)+			; 8 bytes at a time
+	CLRQ	(R2)+			; (this assumes max of 32 nexuses)
+	CLRQ	(R2)+
+	CLRQ	(R2)+
+
+	TSTL	BOO$GL_TR		; Is there an adapter?
+	BGEQ	5$			; Branch if greater than or equal to 0
+	BRW	50$			; Must have been an invalid adapter
+
+5$:	BSBW	BOO$OPEN_OUTPUT_2	; Open /output= file (D=sys$output)
+	BLBS	R0,20$			; Branch if ok
+
+	SIGNAL				; Signal error
+	BRW	40$			; exit on error
+
+20$:	BBS	#BOO$V_SAVE,BOO$GL_CMDOPT,25$ ; Branch if SAVE command
+	$FAO_S	CTRSTR=SHOCON_HEADER, -
+		OUTBUF=RIO$AB_OUTBUF,-
+		OUTLEN=RIO$GW_OUTLEN 	; Format string
+	BRB	30$	
+
+25$:	$FAO_S	CTRSTR=SAVE_HEADER, -
+		OUTBUF=RIO$AB_OUTBUF,-
+		OUTLEN=RIO$GW_OUTLEN 	; Format string
+
+30$:	SIGNAL				; Signal if error
+	BSBW	RIO$OUTPUT_LINE
+
+	$CMEXEC_S	EXEC		; Change mode to exec to allow
+ 					;  read to executive data structures
+	SIGNAL				; Check for error
+	BLBC	R0,40$			; Branch on error
+	BLBS	DEV_FOUND,40$		; Branch if device has been printed
+	PUSHL	BOO$GL_TR		; Adapter #
+	PUSHL	#1			; # of FAO params
+	PUSHL	#SYSG$_NODEVADAP	; Set warning "no devices on adapter"
+	CALLS	#3,G^LIB$SIGNAL		; Signal error
+40$:
+	BBC	#BOO$V_OUTPUT,-
+		BOO$GL_CMDOPT,50$	; Branch if /OUTPUT not specified
+	$CLOSE	FAB=RIO_OUTFAB2		; Close file
+50$:	CLRL	BOO$GL_TR		; Clear TR for subsequent calls
+	MOVL	#1,R0			; Set success for tparse
+	RET				; Return
+
+.PAGE
+.SBTTL	DATA BASE SCAN
+
+;	EXEC MODE ROUTINE TO SCAN DEVICE DATA BASE AND
+;	COMPUTE CSR AND VECTORS FOR EACH DEVICE IN THE SYSTEM
+;
+;	REGISTER USAGE:
+;		R2	DDB
+;		R3	UCB
+;		R4	CRB
+;		R5	ADP
+;
+
+.ENTRY	EXEC, ^M<R2,R3>			; Entry mask
+	CLRB	DEV_FOUND		; Zero flag
+	MOVL	G^IOC$GL_DEVLIST,R2	; DDB header
+	BRB	DDB1
+
+DDBLOOP: MOVL	DDB$L_LINK(R2),R2	; Get next ddb address
+	BNEQ	DDB1			; More to do
+	BRW	DONE			; Finished
+
+DDB1:	MOVZBL	#1,UNIT			; Clear unit count
+	CLRL	OVECT1			; Output vectors
+	CLRL	OVECT2			; 1 & 2
+	MOVAB	DDB$T_NAME(R2),R3	; Address of generic name
+	MOVZBL	(R3)+,NAME_L		; Length of name
+
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; save for move character
+	MOVC5	NAME_L,(R3),#SPACE,#15,NAME_S	; copy name
+	POPR	#^M<R0,R1,R2,R3,R4,R5>
+
+	MOVL	DDB$L_UCB(R2),R3	; address of first ucb
+	MOVL	R3,UCB_SAVE		; save for SAVE command
+	MOVL	UCB$L_CRB(R3),R4	; CRB address
+
+UCB1:	MOVL	UCB$L_LINK(R3),R3	; Follow UCB link
+	BEQL	10$			; no more units,try next device
+	INCL	UNIT			; Increment units on this controller
+	BRB	UCB1			; Skip this unit
+
+10$:	CLRL	NVECT			; Init number of vectors
+	CLRQ	AVECT1			; Init both vectors
+	CMPW	CRB$W_SIZE(R4),#CRB$C_LENGTH+VEC$C_LENGTH ; Single vector?
+	BLSS	VECT1			; 1 vector
+;
+;	DEVICE HAS TWO VECTORS
+;
+	MOVAL	CRB$L_INTD2+2(R4),AVECT2 ; Address of second vector
+	INCL	NVECT			; Count of vectors
+VECT1:
+	MOVAL	CRB$L_INTD+2(R4),AVECT1
+	INCL	NVECT
+	MOVL	NVECT,T_NVECT		; Save count in temp
+	MOVL	CRB$L_INTD+VEC$L_IDB(R4),R5 ; Idb address
+	MOVL	IDB$L_CSR(R5),VCSR	; Virtual csr addresss
+	MOVL	IDB$L_ADP(R5),R5	; Adaptor block for device
+	BNEQ	20$			; Physical device
+	BRW	DDBLOOP			; Skip it
+
+20$:	MOVZWL	ADP$W_TR(R5),TR		; TR number for adaptor
+	MOVL	BOO$GL_TR,R7		; Input from /ADAPTER =
+	BEQL	22$			; Branch if non-existent
+	CMPL	TR,R7			; Must be equal
+	BEQL	22$			; Branch if yes
+	BRW	DDBLOOP			; Try another device
+
+;
+; Get text string associated with adapter number
+;
+
+22$:	MOVZWL	ADP$W_ADPTYPE(R5),R7	; Get adapter type
+	CMPL	#L_MAXADP,R7		; Compare to legal maximum
+	BGEQ	25$			; Branch if legal
+	MOVL	#L_MAXADP,R7		; Set to unknown (UNK)
+
+25$:	MULL	#4,R7			; Set up for longword offset
+	MOVAL	AL_ADP_TEXT,R6		; Get address of text table
+	ADDL3	R7,R6,ADP_TYPE		; Add them together
+
+	CMPW	#AT$_UBA,ADP$W_ADPTYPE(R5) ; Is it a UBA?
+	BEQL	30$			; yes
+	BRW	PRINT			; no,print (no device vectors)
+30$:
+	MOVL	ADP$L_VECTOR(R5),R6	; vector table address
+;
+	.SBTTL	VECTOR TABLE SCAN
+
+;	SCAN VECTOR TABLE FOR PROPER VECTOR
+
+	CLRL	R7			; init count
+100$:
+	MOVL	(R6)+,R8		; get a vector
+	CMPL	R8,AVECT1		; is it first
+	BEQLU	130$			; yes
+	CMPL	R8,AVECT2		; second?
+	BEQLU	130$			; yes
+	BICL	#1,R8			; mask interrupt stack bit
+	ADDL2	#2,R8			; 11/750 vectors point to pushr
+	CMPL	R8,AVECT1		; is it first
+	BEQLU	130$			; yes
+	CMPL	R8,AVECT2		; second?
+	BEQLU	130$			; yes
+110$:
+	AOBLSS	#128,R7,100$		; try next one
+	MNEGL	#1,OVECT1		; error no vector found (or only 1 of 2)
+	MNEGL	#1,OVECT2
+	BRB	PRINT
+130$:
+	DECL	T_NVECT			; first or second?
+	BGEQ	140$			; first
+	ASHL	#2,R7,R8		; mult by 4 ( vectors are 4 bytes long)
+	MOVL	R8,OVECT2
+	BRB	PRINT			; both vectors loaded,print
+140$:
+	ASHL	#2,R7,R8		; mult by 4
+	MOVL	R8,OVECT1
+	TSTL	T_NVECT			; if single vector, then done
+	BEQL	PRINT
+	CLRL	T_NVECT			; reset so second vector goes to
+					; to field 2
+	BRB	110$
+;
+	.SBTTL	VIRTUAL CSR CONVERSION
+
+;	CONVERT CSR TO PHYSICAL AND PRINT RECORD
+;
+PRINT:
+	MOVL	G^MMG$GL_SPTBASE,R0	; System page table
+	MOVL	VCSR,R1			; Virtual CSR
+	EXTZV	#9,#21,R1,R1		; Get VPN
+	MOVL	(R0)[R1],R0		; Get PTE
+	ASHL	#9,R0,R0		; Shift to page field
+	INSV	VCSR,#0,#9,R0		; Add byte offset
+	BICL2	#^XFFFC0000,R0		; Mask all but low 18 bits
+	MOVL	R0,CSR			; Physical CSR
+
+	.SBTTL	MESSAGE OUTPUT
+;
+;	BUILD MESSAGE
+;
+	MOVB	#1,DEV_FOUND		; Set device found flag
+	BBC	#BOO$V_SAVE,BOO$GL_CMDOPT,10$ ; Branch if SHOW/CONFIG command
+	BRW	SAVE_OUTPUT		; Branch to SAVE output
+
+10$:	CMPW	#AT$_UBA,ADP$W_ADPTYPE(R5) ; Is it a UBA?
+	BNEQ	20$			; Branch if not
+	$FAO_S	CTRSTR=SHOW_UBA,-
+		OUTBUF=RIO$AB_OUTBUF,-
+		OUTLEN=RIO$GW_OUTLEN,-
+		P1=#NAME, -
+		P2=UNIT,  -
+		P3=TR,	  -
+		P4=#3,	  -
+		P5=ADP_TYPE,-
+		P6=CSR,   -
+		P7=OVECT1,-
+		P8=OVECT2
+	BRB	30$
+
+20$:	$FAO_S	CTRSTR=SHOW_OTHER,-
+		OUTBUF=RIO$AB_OUTBUF,-
+		OUTLEN=RIO$GW_OUTLEN,-
+		P1=#NAME, -
+		P2=UNIT,  -
+		P3=TR,	  -
+		P4=#3,	  -
+		P5=ADP_TYPE
+;
+;	OUTPUT MESSAGE
+;
+30$:	SIGNAL				; FAO error?
+	BSBW	RIO$OUTPUT_LINE		; Output line
+	BRW	DDBLOOP			; Get next device
+
+SAVE_OUTPUT:
+	MOVL	UCB_SAVE,R3		; Head of list
+	MOVAL	DDB$T_DRVNAME(R2),DRIVER ; Driver name
+20$:	MOVL	UCB$W_UNIT(R3),R6	; Unit number
+
+	CMPW	#AT$_UBA,ADP$W_ADPTYPE(R5) ; Is it a UBA?
+	BNEQ	40$			; No, other
+
+	$FAO_S	CTRSTR=CONNECT_UBA,-	; Format CONNECT line
+		OUTBUF=RIO$AB_OUTBUF,-
+		OUTLEN=RIO$GW_OUTLEN,-
+		P1=#NAME, -
+		P2=R6,    -
+		P3=TR,    - 
+		P4=CSR,	  -
+		P5=OVECT1,-
+		P6=NVECT, -
+		P7=DRIVER
+	BRB	50$
+
+40$:	MOVZWL	ADP$W_TR(R5),R0		; Get nexus number
+	BBSS	R0,OTHER_BLOCK,80$	; Ignore if this one's been done
+	$FAO_S	CTRSTR=CONNECT_OTHER,-	; Format AUTOCONFIGURE command for bus
+		OUTBUF=RIO$AB_OUTBUF,-
+		OUTLEN=RIO$GW_OUTLEN,-
+		P1=ADP$W_TR(R5)
+
+;
+;	OUTPUT CONNECT LINE
+;
+50$:	SIGNAL				; Check FAO status
+	BSBW	RIO$OUTPUT_LINE		; Output the line
+
+70$:	MOVL	UCB$L_LINK(R3),R3	; Next UCB
+	BEQL	80$			; Branch if at end of list
+	BRW	20$			; Loop if not
+
+80$:	BRW	DDBLOOP			; Get next device
+
+DONE:	MOVL	#1,R0			; Set success
+	RET				; Return
+
+
+.SBTTL	BOO$SHOW_UNIBUS
+
+;++
+; BOO$SHOW_UNIBUS 
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is called via the SHOW/UNIBUS command. It's function is
+; to test every word of memory in UNIBUS I/O space and return the
+; CSR, virtual address of that CSR, and the data at that location if
+; the address responds. This is used as a debugging aid for new UNIBUS
+; configurations. Command requires CMKRNL and results in IPL being raised.
+;
+; NOTE that reading a CSR may remove a character from a buffer or otherwise
+; make the device act strange.
+;
+;
+;
+; CALLING SEQUENCE:
+;
+;	Called as a TPARSE action routine.
+;
+; INPUT PARAMETERS:
+;
+;	TPA$L_PARAM(AP) = 0, if no /ADAPTER was specified.
+;			= 1, if /ADAPTER was specified.
+;	BOO$GL_TR has nexus number if TPA$L_PARAM(AP) = 1
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL
+;	SS$_NOPRIV - No privilege
+;	SYSG$_NEXNOTUBA - nexus not a UNIBUS
+;
+; SIDE EFFECTS:
+;
+;	All UNIBUS I/O locations that respond are read from.
+;
+;--
+
+.Entry	BOO$SHOW_UNIBUS,^M<R2,R3,R4,R5,R6,R7,R8>
+
+	BLBS	TPA$L_PARAM(AP),100$	; Branch if /ADAPTER specified
+;
+; Loop through all UNIBUS's on system
+;
+
+	MOVL	G^EXE$GL_NUMNEXUS,R7	; Number of nexuses
+	CLRL	R8			; Count
+
+10$:	$CMEXEC_S W^GET_ADP		; Loop through all nexuses
+	CMPL	#SYSG$_NEXNOTUBA,R0	; nexus not UNIBUS?
+	BEQL	20$			; Error expected, continued
+	BLBC	R0,210$			; Other error, exit
+
+	CALLS	#0,W^One_Unibus		; UNIBUS found, format 
+	BLBC	R0,210$			; Exit on error
+
+20$:	AOBLSS	R7,R8,10$		; LOOP
+	BRB	200$			; Exit, status OK
+
+;
+; Do a single adapter as specified
+;
+
+100$:
+	MOVL	W^BOO$GL_TR,R8		; Set nexus number
+	$CMEXEC_S W^GET_ADP		; Is it a UNIBUS ?, get CSR
+	BLBC	R0,210$			; Branch on any error
+		
+	CALLS	#0,W^One_Unibus		; UNIBUS found, format 
+	BLBC	R0,210$			; Exit on error
+
+200$:	MOVL	#SS$_NORMAL,R0		; Set success
+210$:	RET				; Return to TPARSE
+
+
+
+;+
+; One_Unibus
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; Format the data for a single UNIBUS.
+;
+; CALLING SEQUENCE:
+;
+;	Calls	#0,One_Unibus
+;
+; INPUT PARAMETERS:
+;
+;	R6 = ADP CSR
+;	R8 = Adapter number
+;
+;--
+
+One_Unibus: .word ^M<>
+
+	$FAO_S	CTRSTR = FAO_Q_ONEUBA,-
+		OUTBUF = RIO$AB_OUTBUF,-
+		OUTLEN = RIO$GW_OUTLEN,-
+		P1 = R8
+	BSBW	RIO$OUTPUT_LINE
+
+	CLRL	R3			; To be offset into UBA I/O space
+
+10$:	$CMKRNL_S W^CHECK_CSR
+	CMPL	#SYSG$_ENDUBA,R0	; End of UNIBUS I/O Space?
+	BEQL	100$			; Branch if done
+	BLBC	R0,200$			; Exit if error	
+
+	CMPL	#SYSG$_SKIPPED,R0	; Was section skipped?
+	BNEQ	20$			; Branch if not
+	
+	PUSHL	R1			; Save value in CSR
+	CLRW	RIO$GW_OUTLEN		; Zero length
+	BSBW	RIO$OUTPUT_LINE		; Output a blank line
+	POPL	R1			; Restore value in CSR
+
+20$:	
+	BISL3	#^O760000,R3,R5		; Octal offset
+	$FAO_S	CTRSTR = FAO_D_CTRSTR,-
+		OUTBUF = RIO$AB_OUTBUF,-
+		OUTLEN = RIO$GW_OUTLEN,-
+		P1 = R5,-
+		P2 = R2,-
+		P3 = R1
+	
+	BLBC	R0,200$			; Exit on error
+	BSBW	RIO$OUTPUT_LINE		; Output line
+	BRB	10$			; Loop
+
+100$:	MOVL	#SS$_NORMAL,R0		; Set success
+200$:	RET				; Exit
+
+
+;+
+;	CHECK_CSR
+;
+; CALLING SEQUENCE:
+;
+;	$CMKRNL	CHECK_CSR
+;
+; INPUT:
+;
+;	R3 = CSR address offset
+;	R6 = address of ADP CSR for that nexus
+;
+; OUTPUT:
+;
+;	R1 = Data at location
+;	R2 = CSR virtual address
+;	R3 = CSR offset (Context)
+;	R6 = unchanged
+;
+; RETURN STATUS:
+;
+;	SS$_NORMAL    - Next CSR responded
+;	SYSG$_SKIPPED - responding CSR was found but only after skipping
+;			at least one word in the UNIBUS I/O Space.
+;	SYSG$_ENDUBA  - End of UNIBUS I/O Space was encountered.
+;
+;
+;-
+
+	.PSECT	NONPAGED_CODE	rd,nowrt,exe,long
+
+CHECK_CSR:	.word	0		; Entry mask
+
+	PUSHL	#SS$_NORMAL		; Assume success
+
+10$:	MOVL	#SYSG$_ENDUBA,R0	; Assume end
+	CMPL	#^O17776,R3		; Loop through legal CSR's
+	BLEQ	40$			; Exit if done
+
+	ADDL2	#2,R3			; Add 2 and try again
+	MOVAB	UBA_IOBASE(R6)[R3],R2	; Calcuate UNIBUS CSR address
+
+	MOVL	R2,R0			; Set input for EXE$TEST_CSR (R6 too.)
+	DSBINT				; Disable interupts  (needed for 780)
+	JSB	G^EXE$TEST_CSR		; Test location
+	BLBS	R0,30$			; LBS if location exists
+	ENBINT				; Restore IPL
+	MOVL	#SYSG$_SKIPPED,(SP)	; Set section skipped
+	BRB	10$			; Loop
+
+30$:	MOVZWL	(R2),R1			; Get data in register, Zero high word
+	ENBINT				; Enable interrupts
+	POPL	R0			; Set success
+
+40$:	RET
+
+
+;+
+;	GET_ADP
+;
+; CALLING SEQUENCE:
+;
+;	$CMEXEC	GET_ADP
+;
+; INPUT:
+;
+;	R8: nexus number to search for
+;
+; OUTPUT:
+;
+;	R6 = address of ADP CSR for that nexus
+;
+; RETURN STATUS:
+;
+;	SS$_NORMAL    - R6 is set appropriately
+;	SYSG$_NEXNOTUBA - specified nexus is not a UBA
+;
+;-
+
+	.PSECT	PAGED_CODE	rd,nowrt,exe,long
+
+GET_ADP:	.word 0			; Entry mask
+
+	MOVL	#SS$_NORMAL,R0		; Assume success
+	MOVL	G^IOC$GL_ADPLIST,R2	; Get ADP list header
+
+10$:	CMPW	R8,ADP$W_TR(R2)		; Loop looking for nexus
+	BEQL	15$			; Branch if found match
+	MOVL	ADP$L_LINK(R2),R2	; Get next ADP
+	BNEQ	10$			; Branch if not end of list
+
+	BRB	20$			; End of list, no nexus found
+
+15$:	MOVL	ADP$L_CSR(R2),R6	; Get ADP CSR
+	CMPW	#AT$_UBA,-
+		ADP$W_ADPTYPE(R2)	; Make sure it's a UBA
+	BEQL	30$			; Branch if OK
+20$:	MOVL	#SYSG$_NEXNOTUBA,R0	; Set error
+30$:	RET				; Return
+
+
+;+
+; SIGNAL_R0
+;
+; Call LIB$SIGNAL with R0 as the error if low bit is clear in R0.
+;
+;-
+
+SIGNAL_R0:
+
+	BLBS	R0,10$			; Branch if no error
+	PUSHL	R0			; Save R0
+	PUSHL	R0			; Set up for signal
+	CALLS	#1,G^LIB$SIGNAL		; Signal message
+	POPL	R0			; Restore R0
+10$:	RSB
+
+	.END

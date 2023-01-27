@@ -1,0 +1,806 @@
+MODULE lib_cross (					!Cross reference of an object library
+			IDENT='V03-000'
+			) =
+
+BEGIN
+!
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!
+!++
+!
+! FACILITY:  Library command processor
+!
+! ABSTRACT:
+!
+!	The VAX/VMS librarian is invoked by DCL to process the LIBRARY
+!	command.  It utilizes the librarian procedure set to perform
+!	the actual modifications to the library.
+!
+! ENVIRONMENT:
+!
+!	VAX native, user mode.
+!
+!--
+!
+!
+! AUTHOR:  Benn Schreiber,	 CREATION DATE:  09-Oct-1979
+!
+! MODIFIED BY:
+!
+!	V02-004		RPG0034		Bob Grosso	7-Aug-1981
+!		lib$gl_ctlmsk now a quadword
+!
+!	V02-003	BLS0029		Benn Schreiber		23-Dec-1980
+!		Redo messages to use message compiler
+!--
+
+LIBRARY
+	'SYS$LIBRARY:STARLET.L32';		!System macro definitions
+REQUIRE
+	'PREFIX';		!SET OF GENERAL MACROS ETC
+REQUIRE
+	'LIBDEF';		!Librarian structure defs.
+REQUIRE
+	'LBRDEF';		!Library processor defs.
+REQUIRE
+	'CRFMDL';		!Cross ref. internal defines.
+
+EXTERNAL
+    lbr$gl_rmsstv : ADDRESSING_MODE (GENERAL),	!RMS STV from librarian
+    lib$gl_creflags : BLOCK,	!Cross reference indicator flags
+    lib$gl_modnamix,		!Index for module names
+    lib$gl_modlisl : VECTOR,	!List head for /ONLY
+    lib$gl_outfdb : REF BBLOCK,	!Pointer to output FDB
+    lib$gl_ctlmsk : BLOCK [1],	!Control flags
+    lib$gl_libfdb : REF BBLOCK,	!Pointer to library fdb
+    lib$gl_inpfdb : REF BBLOCK,	!Pointer to input file fdb
+    lib$al_rab : BBLOCK,	!RAB for output
+    lib$gl_type,		!Type of library
+    lib$gl_libctl;		!Library control index
+
+FORWARD ROUTINE
+    lib_crfout,			!Output one cref line
+    newpage,			!New page for listing
+    outputsubhdr,		!Output cref sub header
+    crferror,			!Error handler for cross reference errors
+    cross_one_module,		!Cross reference one module
+    prohdr,			!Routine to process module headers
+    progsd,			!Routine to process gsd records
+    pronul,			!Routine to process ignored records
+    propsectdef,		!Process p-section definitions
+    symbols,			!Process symbol definitions and references
+    entpnts,			!Process entry point definitions
+    procedef,			!Process procedure declarations
+    prosymbol;			!Do all the work of symbol resolution
+
+EXTERNAL ROUTINE
+    lib_open_out,				!Open output file
+    lib_close_out,				!Close output file
+    lib_get_mem,				!Allocate virtual memory
+    lib_get_zmem,				!Allocate zeroed virtual memory
+    lib_free_mem,				!and give it back
+    lib_log_op,					!Log operation on console
+    SYS$FAO : ADDRESSING_MODE (GENERAL),	!Formatted ASCII output
+    crf$insrtkey : ADDRESSING_MODE (GENERAL),
+    crf$insrtref : ADDRESSING_MODE (GENERAL),
+    crf$out : ADDRESSING_MODE (GENERAL),
+    lib$crf_ins_key : ADDRESSING_MODE (GENERAL),!Insert key name definition into cross reference
+    lib$crf_ins_ref : ADDRESSING_MODE (GENERAL),!Insert key reference into cross reference
+    lib$crf_output  : ADDRESSING_MODE (GENERAL),!Output cross reference
+    lib$lp_lines : ADDRESSING_MODE (GENERAL),	!Figure number of lines per page
+    lbr$find : ADDRESSING_MODE (GENERAL),	!Find module by RFA
+    lbr$get_record : ADDRESSING_MODE (GENERAL),	!Read a record
+    lbr$get_index : ADDRESSING_MODE (GENERAL);	!Return contents of index
+
+EXTERNAL LITERAL
+    lbr$_nomtchfou,				!No match found
+    lib$_notobjlib,				!Not an object library
+    lib$_nomtchfou,				!No match found
+    lib$_indexerr,				!Index error
+    lib$_lookuperr;				!Lookup error in library
+ 
+OWN
+    gsdoffset,							!Offset into concatenated gsd record
+    symbolstring : REF VECTOR [,BYTE], 				!Pointer to current symbol
+    recdesc : BBLOCK [dsc$c_s_bln],				!String descriptor for record
+    found1,							!True when one found
+    curmod : REF BBLOCK,					!Pointer to current module descriptor
+    symbolval,							!Value of current symbol
+    linecount,							!Number of lines on current page
+    linesperpage,						!Number of lines per page
+    pagenum,							!Current page number
+    current_time : VECTOR [2],					!Current time
+    listingwidth : INITIAL (lib$c_lisreclng),			!Width of listing line
+    cursubhdr : REF BBLOCK,					!Pointer to current sub header
+    curheader : REF BBLOCK,					!Pointer to current header descriptor
+    maxsymlng,							!Maximum length of symbol seen
+    maxmodlng,							!Maximum length of module seen
+    a_zero : INITIAL (0),					!A long zero
+    listdefext : descriptor ('SYS$DISK:[].LIS'),		!New default filename for listing file
+!
+! Headers for top of page
+!
+    crfsymheader : descriptor ('Cross reference by symbol'),
+    crfvalheader : descriptor ('Cross reference by value'),
+    crfmdfheader : descriptor ('Cross reference of definitions in module'),
+    crfmrfheader : descriptor ('Cross reference of references in module'),
+!
+! Sub headers for cross reference
+!
+    crfsymsubhdr : BBLOCK [dsc$c_s_bln*2],				!Final string descriptor stored here
+    crfsymsubproto1 : BBLOCK [dsc$c_s_bln] INITIAL (stringdesc (	!Subheader for cref by symbol
+			'<Symbol!>!11<Value!>!')),
+    crfsymsubproto2 : BBLOCK [dsc$c_s_bln] INITIAL (stringdesc (
+			'<Defined By!>Referenced By ...')),
+    crfsymsubproto3 : BBLOCK [dsc$c_s_bln] INITIAL (stringdesc (
+			'<!6*-!>!11<!5*-!>!')),
+    crfsymsubproto4 : BBLOCK [dsc$c_s_bln] INITIAL (stringdesc (
+			'<!10*-!>!17*-')),
+    crfvalsubhdr : BBLOCK [dsc$c_s_bln*2] INITIAL (stringdesc (		!Subheader for cref by value
+			'!10<Value!>Symbols...'),
+			stringdesc ('!10<!5*-!>!10*-')),
+    crfmdfsubhdr : BBLOCK [dsc$c_s_bln*2], 				!Final string descriptor stored here
+    crfmdfsubproto1 : BBLOCK [dsc$c_s_bln] INITIAL (stringdesc (	!Subheader for cref of module defs
+			'<Module!>Symbol definitions...')),
+    crfmdfsubproto2 : BBLOCK [dsc$c_s_bln] INITIAL (stringdesc(
+			'<!6*-!>!21*-')),
+    crfmrfsubhdr : BBLOCK [dsc$c_s_bln*2], 				!Final string descriptor stored here
+    crfmrfsubproto1 : BBLOCK [dsc$c_s_bln] INITIAL (stringdesc (	!Subheader for cref of module refs
+			'<Module!>Symbol references...')),
+    crfmrfsubproto2 : BBLOCK [dsc$c_s_bln] INITIAL (stringdesc (
+			'<!6*-!>!20*-')),
+    fao_newpage : descriptor ('!^'),					!Output a form feed
+    fao_pageheader : descriptor ('!40AS !60AS !17%D  Page !UL'), 	!Top of page header
+    fao_crefao : descriptor ('!AC!UL!AC'),				!Fao control string to create fao control string
+    fao_crefao2 : descriptor ('!AC!UL!AS!UL!AS'),			!Fao control string to create fao control string
+    fao_crefao3 : descriptor ('!AC!UL!AS'),				!Fao control string to create fao control string
+    fao_exclam : countedstring ('!'),
+    fao_ac : countedstring ('AC'),
+    fao_sym : BBLOCK [8],						!Fao control string created here
+    fao_symdesc : BBLOCK [dsc$c_s_bln] INITIAL (8, fao_sym),		!String descriptor for fao_sym
+    fao_mod : BBLOCK [8],						!Fao control string created here
+    fao_modesc : BBLOCK [dsc$c_s_bln] INITIAL (8, fao_mod),		!String descriptor for fao_mod
+!
+! Cross reference data base
+!
+	symbolfield : $crffield (fao_string = '!31AC',		! for long names
+				field_width = 31),
+	symbolend :   $crffieldend,
+
+	spacefield : $crffield (fao_string = ' ',		! spaces between symbol and vale
+				field_width = 1),
+	spaceend : $crffieldend,
+
+	nullfield : $crffield (fao_string = ' ',		! field of zero width
+				field_width = 0),
+	nullend : $crffieldend,
+
+	valuefield : $crffield (fao_string = '!XL',		! hex longword value
+				field_width = 8),
+	valueend : $crffieldend,
+
+	valueflags : $crffield (fao_string = '!3* ',		! default suffix
+				field_width = 3),		! when none of following applies
+		reloc_suf : $crffield (bit_mask = gsy$m_rel,	! relocatable only
+				fao_string = '-R ',		! suffix
+				field_width = 3),	
+		undef_suf : $crffield (bit_mask = gsy$m_def,	! suffix on undefined
+				set_clear = 0,			! symbol values
+				fao_string = '-* ',
+				field_width = 3),
+	valflgsend : $crffieldend,
+
+	refnceflags : $crffield (fao_string = '!3* ',		! default spaces when none of
+				field_width = 3),		! the following references
+		weak_pre : $crffield (bit_mask = gsy$m_weak,	! prefix for weak reference
+				fao_string = 'WK-',
+				field_width = 3),
+	reflagsend : $crffieldend,
+
+	referencer : $crffield (fao_string = '!31AC',		! for long names
+				field_width = 32),
+	reflngend :  $crffieldend,
+
+	relsymval : $crffield (fao_string = '!4* ',
+				field_width = 4),
+		reloc_pre : $crffield (bit_mask = gsy$m_rel,
+					fao_string = '  R-',
+					field_width = 4),
+	relsymvalend : $crffieldend,
+
+	lib_crfsymval : $crfctltable (keytype = ascic,		! define the table that drives
+				error = crferror,
+				output = lib_crfout,
+				key1table = symbolfield,
+				key2table = spacefield,		! the cross reference to produce
+				val1table = valuefield,		! the formated symbol table
+				val2table = valueflags,		! listing lines
+				ref2table = referencer,		! each entry here is a
+				ref1table = refnceflags),	! pointer to the formats
+	lib_crfbyval : $crfctltable (keytype = bin_u32,		! define the table that drives
+				error = crferror,
+				output = lib_crfout,
+				key1table = valuefield,		! cref to produce the cross
+				key2table = spacefield,		! reference of symbols
+				val1table = 0,			! sorted by value
+				val2table = 0,
+				ref2table = symbolfield,
+				ref1table = spacefield),
+	lib_crfmoddef : $crfctltable (keytype = ascic,		! Cross ref of syms defined in module
+				error = crferror,
+				output = lib_crfout,
+				key1table = symbolfield,
+				key2table = spacefield,
+				val1table = 0,
+				val2table = 0,
+				ref2table = referencer,
+				ref1table = 0),
+	lib_crfmodref : $crfctltable (keytype = ascic,		! Cross ref of syms referenced in module
+				error = crferror,
+				output = lib_crfout,
+				key1table = symbolfield,
+				key2table = spacefield,
+				val1table = 0,
+				val2table = 0,
+				ref2table = referencer,
+				ref1table = 0);
+				
+
+BIND
+    reclng = recdesc [dsc$w_length] : WORD,		!Name the length of the record
+    objrec = recdesc [dsc$a_pointer] : REF BBLOCK,	!and the pointer
+    objvec = recdesc [dsc$a_pointer] : REF VECTOR [,BYTE], ! name pointer as a bytevector pointer
+    recdispatch = PLIT (				!Set up maximum allowed record type
+		prohdr,					!0 - module header
+		progsd,					!1 - gsd records
+		pronul,					!2 - tir
+		pronul,					!3 - end of module
+		pronul,					!4 - dbg - check sequence and copy
+		pronul,					!5 - tbt - check sequence and copy
+		pronul) : VECTOR;			!6 - lnk - check sequence and copy
+
+GLOBAL ROUTINE lib_cross_obj =
+BEGIN
+!++
+!
+! Read all modules in object library and create cross reference.
+! Then print it
+!
+! Implicit inputs:
+!
+!	Library is open
+!
+! Outputs:
+!
+!	The cross reference listing file is written and closed.
+!
+!--
+
+LOCAL
+    symsubhdr1 : BBLOCK [lib$c_lisreclng],
+    symsubhdr2 : BBLOCK [lib$c_lisreclng],
+    mdfsubhdr1 : BBLOCK [lib$c_lisreclng],
+    mdfsubhdr2 : BBLOCK [lib$c_lisreclng],
+    mrfsubhdr1 : BBLOCK [lib$c_lisreclng],
+    mrfsubhdr2 : BBLOCK [lib$c_lisreclng],
+    desc : REF BBLOCK,
+    lnblk : REF BBLOCK,
+    status,
+    keydesc : BBLOCK [dsc$c_s_bln];
+
+BIND
+    symbolfaodesc = symbolfield [fld$b_faodsc] : BBLOCK,	!FAO descriptor for cref
+    refncfaodesc = referencer [fld$b_faodsc] : BBLOCK,
+    outdefext = lib$gl_outfdb [fdb$l_defext] : BBLOCK;
+
+BUILTIN
+    INSQUE,
+    REMQUE;
+
+IF .lib$gl_type NEQ lbr$c_typ_obj
+THEN BEGIN
+    SIGNAL (lib$_notobjlib, 1, lib$gl_libfdb [fdb$l_namdesc]);
+    RETURN lib$_notobjlib;
+    END;
+
+found1 = false;
+maxsymlng = 6;							!Min symbol length is 6
+maxmodlng = 6;							! as is module
+$GETTIM (TIMADR = current_time);				!Get time for listing
+CH$MOVE (dsc$c_s_bln, listdefext, outdefext);			!Set default extn.
+IF NOT .lib$gl_ctlmsk [lib$v_only]				!If not /ONLY
+THEN BEGIN
+    perform (lib_get_zmem (lnb$c_fixedsize + 1, lnblk));	!Then make up one
+    INSQUE (.lnblk, .lib$gl_modlisl [1]);			!Insert into queue
+    lnblk [lnb$b_namlng] = 1;
+    CH$FILL (%ASCII '*', 1, lnblk [lnb$t_name]);
+    END;
+!
+! Figure # lines per page
+!
+linesperpage = lib$lp_lines () - 6;
+pagenum = 0;							! and start with page 1
+!
+! Look at each block set up for /ONLY, and cross reference each module
+! that matches.
+!
+WHILE NOT REMQUE (.lib$gl_modlisl, lnblk)
+DO BEGIN
+    keydesc [dsc$w_length] = .lnblk [lnb$b_namlng];
+    keydesc [dsc$a_pointer] = lnblk [lnb$t_name];
+    IF (status = lbr$get_index (lib$gl_libctl, lib$gl_modnamix,	!Search index for matches
+				cross_one_module, keydesc)) EQL lbr$_nomtchfou
+		THEN SIGNAL (lib$_nomtchfou, 1, keydesc)
+		ELSE IF NOT .status
+		    THEN SIGNAL (lib$_indexerr, 1, lib$gl_libfdb [fdb$l_namdesc],
+				.status, .lbr$gl_rmsstv);
+    lib_free_mem (lnb$c_fixedsize + .lnblk [lnb$b_namlng], .lnblk); !Deallocate the block
+    END;
+!
+! Call CRF to output the listing, close files and we are done
+!
+IF NOT .found1
+THEN RETURN lbr$_nomtchfou;
+perform (lib_open_out (.lib$gl_outfdb, lib$gl_libfdb [fdb$t_nam], !Open output file with carriage control
+						 true));
+!
+! Create fao strings for symbols and modules
+!
+SYS$FAO (fao_crefao, fao_symdesc, fao_symdesc, fao_exclam,!Create fao control string for symbols
+			.maxsymlng, fao_ac);
+SYS$FAO (fao_crefao, fao_modesc, fao_modesc, fao_exclam, !Create fao control string for modules
+			.maxmodlng, fao_ac);
+
+symbolfield [fld$b_maxlng] = .maxsymlng;
+referencer [fld$b_maxlng] = .maxmodlng + 1;
+
+IF .lib$gl_creflags [lib$v_crfbysym]
+THEN BEGIN
+    CH$MOVE (dsc$c_s_bln, fao_symdesc, symbolfaodesc);	!Set up string descriptors
+    CH$MOVE (dsc$c_s_bln, fao_modesc, refncfaodesc);
+    crfsymsubhdr [dsc$w_length] = lib$c_lisreclng;	!Set up sub header fao control strings
+    crfsymsubhdr [dsc$a_pointer] = symsubhdr1;
+    SYS$FAO (fao_crefao2, crfsymsubhdr, crfsymsubhdr, fao_exclam,
+			.maxsymlng + 1, crfsymsubproto1,
+			.maxmodlng + 7, crfsymsubproto2);
+    desc = crfsymsubhdr + dsc$c_s_bln;
+    desc [dsc$w_length] = lib$c_lisreclng;
+    desc [dsc$a_pointer] = symsubhdr2;
+    SYS$FAO (fao_crefao2, .desc, .desc, fao_exclam,
+			.maxsymlng + 1, crfsymsubproto3,
+			.maxmodlng + 7, crfsymsubproto4);
+    curheader = crfsymheader;
+    cursubhdr = crfsymsubhdr;
+    linecount = .linesperpage;				!Force new page
+    crf$out (lib_crfsymval, .listingwidth, .linesperpage - 4,
+		.linesperpage, crf$k_defs_refs, crf$k_delete);
+    END;
+
+IF .lib$gl_creflags [lib$v_crfbyval]
+THEN BEGIN
+    curheader = crfvalheader;
+    cursubhdr = crfvalsubhdr;
+    linecount = .linesperpage;				!Force new page
+    crf$out (lib_crfbyval, .listingwidth, .linesperpage - 4,
+		.linesperpage, crf$k_vals_refs, crf$k_delete);
+    END;
+
+IF .lib$gl_creflags [lib$v_crfbymod]
+THEN BEGIN
+    CH$MOVE (dsc$c_s_bln, fao_modesc, symbolfaodesc);	!Set up string descriptors
+    CH$MOVE (dsc$c_s_bln, fao_symdesc, refncfaodesc);
+    symbolfield [fld$b_maxlng] = .maxmodlng;
+    referencer [fld$b_maxlng] = .maxsymlng + 1;
+    crfmdfsubhdr [dsc$w_length] = lib$c_lisreclng;	!Create the fao control string for sub header
+    crfmdfsubhdr [dsc$a_pointer] = mdfsubhdr1;
+    SYS$FAO (fao_crefao3, crfmdfsubhdr, crfmdfsubhdr, fao_exclam,
+			.maxmodlng+1, crfmdfsubproto1);
+    desc = crfmdfsubhdr + dsc$c_s_bln;
+    desc [dsc$w_length] = lib$c_lisreclng;
+    desc [dsc$a_pointer] = mdfsubhdr2;
+    SYS$FAO (fao_crefao3, .desc, .desc, fao_exclam,
+			.maxmodlng+1, crfmdfsubproto2);
+    curheader = crfmdfheader;
+    cursubhdr = crfmdfsubhdr;
+    linecount = .linesperpage;				!Force new page
+    crf$out (lib_crfmoddef, .listingwidth, .linesperpage - 4,
+		.linesperpage, crf$k_vals_refs, crf$k_delete);
+
+    crfmrfsubhdr [dsc$w_length] = lib$c_lisreclng;	!Create the fao control string for sub header
+    crfmrfsubhdr [dsc$a_pointer] = mrfsubhdr1;
+    SYS$FAO (fao_crefao3, crfmrfsubhdr, crfmrfsubhdr, fao_exclam,
+			.maxmodlng+1, crfmrfsubproto1);
+    desc = crfmrfsubhdr + dsc$c_s_bln;
+    desc [dsc$w_length] = lib$c_lisreclng;
+    desc [dsc$a_pointer] = mrfsubhdr2;
+    SYS$FAO (fao_crefao3, .desc, .desc, fao_exclam,
+			.maxmodlng+1, crfmrfsubproto2);
+    curheader = crfmrfheader;
+    cursubhdr = crfmrfsubhdr;
+    linecount = .linesperpage;				!Force new page
+    crf$out (lib_crfmodref, .listingwidth, .linesperpage - .linecount,
+		.linesperpage, crf$k_vals_refs, crf$k_delete);
+    END;
+lib_close_out (.lib$gl_outfdb, false);
+RETURN true
+END;					!Of lib_cross_lib
+
+ROUTINE cross_one_module (keydesc, keyrfa) =
+BEGIN
+!++
+!
+! This routine is called by the library procedures for each module
+! in the index that matches the current /only module name.  The
+! module is read in its entirety and a cross reference is added to
+! the cross reference in progress.
+!
+! Inputs:
+!
+!	keydesc		pointer to string descriptor for module name
+!	keyrfa		pointer to rfa of module
+!
+!--
+
+MAP
+    keydesc : REF BBLOCK,
+    keyrfa  : REF BBLOCK;
+
+LOCAL
+    status,
+    bufdesc : BBLOCK [dsc$c_s_bln],
+    recbuf : BBLOCK [lbr$c_maxrecsiz];
+
+perform (lib_get_zmem (mnb$c_fixedsize + .keydesc [dsc$w_length], 
+					curmod));	!Allocate module name block
+curmod [mnb$b_namlng] = .keydesc [dsc$w_length];
+IF .keydesc [dsc$w_length] GTR .maxmodlng		!Check for new larger module name
+    THEN maxmodlng = .keydesc [dsc$w_length];
+CH$MOVE (.keydesc [dsc$w_length], .keydesc [dsc$a_pointer], 	!Copy module name
+			curmod [mnb$t_name]);
+!
+! FIND the module so we can read the text
+!
+rms_perform (lbr$find (lib$gl_libctl, .keyrfa),			!Point to the module
+		lib$_lookuperr, .lbr$gl_rmsstv, 1, lib$gl_libfdb [fdb$l_namdesc]);
+bufdesc [dsc$w_length] = lbr$c_maxrecsiz;
+bufdesc [dsc$a_pointer] = recbuf;
+recdesc [dsc$a_pointer] = recbuf;				!**temp
+!
+! Read the module and dispatch on each record
+!
+WHILE (status = lbr$get_record (lib$gl_libctl, bufdesc, recdesc)) NEQ rms$_eof
+DO perform ((.recdispatch [.objrec [obj$b_rectyp]]) ());
+found1 = true;
+RETURN true
+END;								!Of cross_one_module
+
+ROUTINE prohdr =
+BEGIN
+!
+BIND
+	modidstring = objrec [mhd$t_name] + .objrec [mhd$b_namlng] : VECTOR [,BYTE];
+!
+
+RETURN true
+END;			! OF prohdr
+
+ROUTINE progsd =
+BEGIN
+!
+!++
+!	Verify GSD records and dispatch on the four sub-types:
+!		(0) P-SECTION definition
+!		(1) Symbol definition/reference
+!		(2) Entry point definition
+!		(3) Procedure declaration
+!--
+BIND
+	gsddispatch = PLIT (
+			propsectdef,
+			symbols,
+			entpnts,
+			procedef) : VECTOR;
+
+gsdoffset = obj$c_subtyp;
+
+WHILE .gsdoffset LSSU .reclng DO
+	perform (( .gsddispatch [.objvec [.gsdoffset]]) ());
+RETURN true
+END;		! Of progsd
+
+ROUTINE pronul =
+BEGIN
+!
+! Null routine
+!
+RETURN true
+END;
+ROUTINE propsectdef =
+BEGIN
+!
+BIND
+	psctdef = objvec [.gsdoffset] : BBLOCK;
+LOCAL
+	length;
+
+length = psctdef [gps$t_name] - psctdef [gps$t_start] +		! Compute the offset of next GSD
+		.psctdef [gps$b_namlng];
+gsdoffset = .gsdoffset + .length;				! From length of this
+RETURN true
+END;		! Of propsectdef
+
+ROUTINE symbols =
+BEGIN
+!
+LOCAL
+	length;
+!
+BIND
+	symbolrec = objvec [.gsdoffset] : BBLOCK;
+
+IF NOT .symbolrec [gsy$v_def]
+!
+! its a reference
+!
+THEN BEGIN
+	length = symbolrec [srf$t_name] - symbolrec [srf$t_start] +
+			.symbolrec [srf$b_namlng];
+	symbolstring = symbolrec [srf$b_namlng];	! Point to the symbol string
+	symbolval = a_zero;				! Value will be zero
+	perform (prosymbol ());				!
+     END
+ELSE BEGIN
+!
+! Definition
+!
+	length = symbolrec [sdf$t_name] - symbolrec [sdf$t_start] +
+			.symbolrec [sdf$b_namlng];
+	symbolstring = symbolrec [sdf$b_namlng];	! Point to the symbol
+	symbolval = symbolrec [sdf$l_value];		! Point to value
+	perform (prosymbol ());
+     END;
+gsdoffset = .gsdoffset + .length;	! Update the gsd offset for next
+RETURN true
+END;					!Of symbols
+
+ROUTINE entpnts =
+BEGIN
+!
+LOCAL
+	length;
+!
+BIND
+	symbolrec = objvec [.gsdoffset] : BBLOCK;
+!
+length = symbolrec [epm$t_name] - symbolrec [epm$t_start] +
+			.symbolrec [epm$b_namlng];
+symbolstring = symbolrec [epm$b_namlng];				! Point to the symbol
+symbolval = symbolrec [epm$l_addrs];
+perform (prosymbol ());
+gsdoffset = .gsdoffset + .length;				! Else update the offset for next
+RETURN true
+END;						! Of entpnts
+
+ROUTINE procedef =
+BEGIN
+!
+!	A procedure definition is an extended entry point definition, carrying with
+!	it a description of the procedure's formal arguments. processing these consists
+!	in normal symbol definition processing followed by:-
+!		(1) Validation of the format of formal description (i.e. just check
+!			that minimum number of arguments specified is less than
+!			or equal to the maximum.
+!
+!
+LOCAL
+    argcount;
+
+perform (entpnts ());
+!
+! Skip the args
+!
+BEGIN
+    BIND
+	formals = objvec [.gsdoffset] : BBLOCK;
+	gsdoffset = .gsdoffset + fml$c_size;			! Update record pointer
+	IF (argcount = .formals [fml$b_maxargs]) NEQ 0		! If there are args
+	THEN INCRU i FROM 1 TO .argcount			! then skip them too
+	DO BEGIN
+	    BIND
+		argdesc = objvec [.gsdoffset] : BBLOCK;
+
+	    gsdoffset = .gsdoffset + .argdesc [arg$b_bytecnt] + arg$c_size;
+	    END;
+     END;
+RETURN true
+END;					! Of procedef
+
+ROUTINE prosymbol =
+BEGIN
+
+!++
+! This routine does all the work of processing a symbol
+!--
+BIND
+    symbolrec = objvec [.gsdoffset] : BBLOCK;
+
+LOCAL
+    symdesc : REF BBLOCK,
+    weakflag,
+    definition;
+
+IF .symbolstring [0] GTR .maxsymlng
+    THEN maxsymlng = .symbolstring [0];
+perform (lib_get_zmem (snb$c_fixedsize + .symbolstring [0], symdesc));
+symdesc [snb$w_flags] = .symbolrec [gsy$w_flags];
+symdesc [snb$b_namlng] = .symbolstring [0];
+CH$MOVE (.symbolstring [0], symbolstring [1], symdesc [snb$t_name]);
+symdesc [snb$l_value] = ..symbolval;
+weakflag = .symbolrec [gsy$v_weak];
+definition = false;
+IF .symbolrec [gsy$v_def]
+    THEN definition = true;
+IF .lib$gl_creflags [lib$v_crfbysym]			!If cross ref by symbols
+THEN BEGIN
+IF .definition
+    THEN perform (lib$crf_ins_key (lib_crfsymval, symdesc[snb$b_namlng], !Insert key definition if a definition
+				symdesc [snb$l_value], symdesc [snb$w_flags]));
+!    THEN perform (crf$insrtkey (lib_crfsymval, symdesc [snb$b_namlng],
+!				symdesc [snb$l_value], .symdesc [snb$w_flags]));
+!
+! Insert reference
+!
+perform (lib$crf_ins_ref (lib_crfsymval, symdesc [snb$b_namlng],
+		curmod [mnb$b_namlng], weakflag, definition));
+!perform (crf$insrtref (lib_crfsymval, symdesc [snb$b_namlng],
+!		curmod [mnb$b_namlng], .weakflag, .definition));
+END;					!Of cref by symbols
+!
+! If absolute definition, insert reference to value into cross reference by value table
+!
+IF .definition AND NOT .symbolrec [gsy$v_rel]
+	AND .lib$gl_creflags [lib$v_crfbyval]
+    THEN perform (lib$crf_ins_ref (lib_crfbyval, symdesc [snb$l_value], .symbolstring,
+				symdesc [snb$w_flags], a_zero));
+!    THEN perform (crf$insrtref (lib_crfbyval, symdesc [snb$l_value], .symbolstring,
+!				.symdesc [snb$w_flags], .a_zero));
+!
+! If cross referencing by modules, insert into the proper table
+!
+IF .lib$gl_creflags [lib$v_crfbymod]
+    THEN perform (lib$crf_ins_ref ((IF .definition THEN lib_crfmoddef
+						ELSE lib_crfmodref),
+			curmod [mnb$b_namlng],	symdesc [snb$b_namlng],
+			symdesc [snb$w_flags],	a_zero));
+!    THEN perform (crf$insrtref ((IF .definition THEN lib_crfmoddef
+!						ELSE lib_crfmodref),
+!			curmod [mnb$b_namlng],	symdesc [snb$b_namlng],
+!			.symdesc [snb$w_flags],	.a_zero));
+
+RETURN true
+END;								! Of symbol 
+
+ROUTINE lib_crfout (linedesc) =
+BEGIN
+!
+! This routine outputs a line to the listing file
+!
+! Inputs:
+!
+!	linedesc	address of string descriptor for line
+!
+
+MAP
+    linedesc : REF BBLOCK;
+
+LOCAL
+    ptr;
+
+linecount = .linecount + 1;					!Count the line
+IF .linecount GTR .linesperpage					!If its time for a new page
+THEN perform (newpage ());					! then do it now
+lib$al_rab [rab$w_rsz] = .linedesc [dsc$w_length];
+lib$al_rab [rab$l_rbf] = .linedesc [dsc$a_pointer];
+!
+! Eliminate extra blanks from the end of the line
+!
+IF .lib$al_rab [rab$w_rsz] NEQ 0
+THEN BEGIN
+    ptr = .lib$al_rab [rab$l_rbf] + .lib$al_rab [rab$w_rsz];
+    WHILE (
+	    ptr = .ptr - 1;
+	    CH$RCHAR (.ptr) EQL %ASCII ' '
+	   )
+	DO lib$al_rab [rab$w_rsz] = .lib$al_rab [rab$w_rsz] - 1;
+    END;
+rms_perform ($PUT (RAB = lib$al_rab),
+		lib$_writeerr,
+		.lib$al_rab [rab$l_stv], 1, lib$gl_outfdb [fdb$l_namdesc]);
+RETURN true
+END;								!Of lib_crfout
+
+ROUTINE newpage =
+BEGIN
+!
+! This routine outputs a new page to the listing file
+!
+LOCAL
+    pagebuffer : BBLOCK [lib$c_lisreclng],
+    pagedesc : BBLOCK [dsc$c_s_bln];
+
+BIND
+    linelen = pagedesc [dsc$w_length] : WORD;
+
+pagedesc [dsc$w_length] = lib$c_lisreclng;
+pagedesc [dsc$a_pointer] = pagebuffer;
+pagenum = .pagenum + 1;						!Next page
+linecount = 0;							!Start count at 0
+perform (SYS$FAO (fao_newpage, linelen, pagedesc));
+perform (lib_crfout (pagedesc));
+pagedesc [dsc$w_length] = lib$c_lisreclng;
+linecount = 0;							!Form feed does not count as a line
+perform (SYS$FAO (fao_pageheader, linelen, pagedesc,		!Format page header
+		.curheader, lib$gl_libfdb [fdb$l_namdesc],
+		current_time, .pagenum));
+perform (lib_crfout (pagedesc));				! and output it
+perform (outputsubhdr ());					!Output sub headers
+RETURN true
+END;								!Of newpage
+ROUTINE outputsubhdr =
+BEGIN
+!
+! Output the cross referenc sub headers
+!
+LOCAL
+    linebuffer : BBLOCK [lib$c_lisreclng],
+    linedesc : BBLOCK [dsc$c_s_bln];
+
+BIND
+    linelen = linedesc [dsc$w_length] : WORD,
+    subhdrline1 = .cursubhdr : BBLOCK,				!String descriptor for line 1
+    subhdrline2 = .cursubhdr + dsc$c_s_bln : BBLOCK;		! and line 2
+
+linedesc [dsc$w_length] = 0;
+linedesc [dsc$a_pointer] = linebuffer;
+perform (lib_crfout (linedesc));				!Write a blank line
+linedesc [dsc$w_length] = lib$c_lisreclng;
+perform (SYS$FAO (subhdrline1, linelen, linedesc));		!Format line 1
+perform (lib_crfout (linedesc));				! and output it
+linedesc [dsc$w_length] = lib$c_lisreclng;
+perform (SYS$FAO (subhdrline2, linelen, linedesc));		!Format line 2
+perform (lib_crfout (linedesc));				! and output it
+RETURN true
+END;								!Of outputsubhdr
+ROUTINE crferror (errorcode) =
+BEGIN
+!
+! This routine is called by cross reference if an error is detected
+!
+SIGNAL (.errorcode);
+RETURN true
+END;							!Of crferror
+END
+ELUDOM

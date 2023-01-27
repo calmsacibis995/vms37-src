@@ -1,0 +1,605 @@
+MODULE SMALOC (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This module contains the routines that manipulate the volume
+!	storage bitmap. These include the routines to allocate a contiguous
+!	area, deallocate an area, and the  basic bitmap scanner.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  21-Feb-1977  18:42
+!
+! MODIFIED BY:
+!
+!	V02-003	ACG0195		Andrew C. Goldstein,	3-Mar-1981  22:54
+!		Fix 4096 block boundary problem by checking zero in BITSCAN
+!
+!	V02-002	ACG0167		Andrew C. Goldstein,	7-May-1980  18:52
+!		Previous revision history moved to F11A.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+!
+! Modes of operation of the bit scanner.
+!
+
+LITERAL
+	FIND_SET	= 0,		! find first one
+	FIND_CLEAR	= 1,		! find first zero
+	SET_BITS	= 2,		! set n bits
+	CLEAR_BITS	= 3;		! clear n bits
+
+
+FORWARD ROUTINE
+	ALLOC_BLOCKS	: NOVALUE,
+	RETURN_BLOCKS	: NOVALUE,
+	BITSCAN,
+	SET_SMVBN	: NOVALUE,
+	UPDATE_FREE	: NOVALUE;
+
+GLOBAL ROUTINE ALLOC_BLOCKS (FIB, BLOCKS_NEEDED, START_LBN, BLOCKS_ALLOC) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine allocates a single contiguous area of disk.
+!	Mode of allocation is determined by the allocation control
+!	in the FIB.
+!
+! CALLING SEQUENCE:
+!	ALLOC_BLOCKS (ARG1, ARG2, ARG3, ARG4)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of FIB for this operation
+!	ARG2: number of blocks to allocate
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: ADDRESS OF VCB IN PROCESS
+!
+! OUTPUT PARAMETERS:
+!	ARG3: address of longword to store starting LBN
+!	ARG4: address of longword to store block count
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	storage map and VCB modified
+!
+!--
+
+BEGIN
+
+MAP
+	FIB		: REF BBLOCK;	! FIB of request
+
+LOCAL
+	BITS_NEEDED,			! number of map bits to allocate
+	START_BLOCK,			! starting storage map VBN
+	START_BIT,			! bit address in storage map
+	BIT_COUNT,			! number of bits to scan
+	FIRST_SET,			! start of free area
+	BITS_SCANNED,			! number of bits processed by scanner
+	END_BIT,			! last bit processed
+	BEST_STARTBIT,			! start of largest free area
+	BEST_BITSFOUND;			! size of largest free area
+
+LABEL
+	MAP_SCAN;			! code block to scan the storage map
+
+EXTERNAL
+	USER_STATUS	: VECTOR,	! user I/O status block
+	CURRENT_UCB	: REF BBLOCK,	! UCB of volume
+	CURRENT_VCB	: REF BBLOCK;	! VCB of volume
+
+
+! Adjust the desired block count to a bit count through the volume
+! cluster factor. Set up the running parameters.
+!
+
+BITS_NEEDED = (.BLOCKS_NEEDED + .CURRENT_VCB[VCB$W_CLUSTER] - 1)
+		/ .CURRENT_VCB[VCB$W_CLUSTER];
+BEST_BITSFOUND = 0;
+START_BLOCK = .CURRENT_VCB[VCB$B_SBMAPVBN];
+
+! The outer loop potentially scans the map twice: once from the given starting
+! point through to the end and then from beginning to end, if necessary to
+! locate a large contiguous area with a bad start.
+!
+
+MAP_SCAN:
+    BEGIN
+    WHILE 1 DO
+	BEGIN
+	START_BIT = .START_BLOCK * 4096;
+	BIT_COUNT = .CURRENT_UCB[UCB$L_MAXBLOCK] - .START_BIT;
+
+! Now scan the bitmap for the first free block. Having found it, scan
+! to see how many free blocks there are there. If it is a non-contiguous
+! allocation, accept the blocks regardless. If it is contiguous, and the
+! free area is too small, keep looking.
+!
+
+	WHILE 1 DO
+	    BEGIN
+	    IF BITSCAN (FIND_SET, .START_BIT, .BIT_COUNT, FIRST_SET, BITS_SCANNED)
+	    THEN EXITLOOP;		! out if end of map
+
+	    BIT_COUNT = .BIT_COUNT - .BITS_SCANNED;
+	    BITSCAN (FIND_CLEAR, .FIRST_SET, MIN (.BIT_COUNT, .BITS_NEEDED),
+			START_BIT, BITS_SCANNED);
+
+	    BIT_COUNT = .BIT_COUNT - .BITS_SCANNED;
+
+	    IF .BITS_SCANNED GTRU .BEST_BITSFOUND
+	    THEN
+		BEGIN
+		BEST_STARTBIT = .FIRST_SET;
+		BEST_BITSFOUND = .BITS_SCANNED;
+		END;
+
+	    IF .BEST_BITSFOUND GEQU .BITS_NEEDED
+	    OR NOT (.FIB[FIB$V_ALCON] OR .FIB[FIB$V_ALCONB])
+	    THEN LEAVE MAP_SCAN;	! found what we were after
+
+	    IF .BIT_COUNT EQL 0
+	    THEN EXITLOOP;		! end of storage map
+
+	    END;			! end of map scan loop
+
+! We get here when we run into the end of the storage map. If the scan
+! started in the middle, do it once more from the top.
+!
+
+	IF .START_BLOCK EQL 0 THEN LEAVE MAP_SCAN;
+	START_BLOCK = 0;
+	END;				! end of outer loop
+    END;				! end of block MAP_SCAN
+
+! We have either found a cluster of free blocks suitable to the occasion
+! or we have searched the entire map. If nothing was found, or for a
+! normal contiguous request, return error if the number of blocks is
+! insufficient; otherwise, allocate the blocks.
+!
+
+IF .BEST_BITSFOUND EQL 0
+OR (.FIB[FIB$V_ALCON] AND NOT .FIB[FIB$V_ALCONB]
+    AND .BEST_BITSFOUND LSSU .BITS_NEEDED)
+THEN
+    BEGIN
+    USER_STATUS[1] = .BEST_BITSFOUND * .CURRENT_VCB[VCB$W_CLUSTER];
+    ERR_EXIT (SS$_DEVICEFULL);
+    END;
+
+BITSCAN (CLEAR_BITS, .BEST_STARTBIT, .BEST_BITSFOUND, END_BIT, BITS_SCANNED);
+
+KERNEL_CALL (SET_SMVBN, .END_BIT / 4096);
+
+.START_LBN = .BEST_STARTBIT * .CURRENT_VCB[VCB$W_CLUSTER];
+.BLOCKS_ALLOC = .BEST_BITSFOUND * .CURRENT_VCB[VCB$W_CLUSTER];
+
+KERNEL_CALL (UPDATE_FREE, - ..BLOCKS_ALLOC);
+
+END;					! end of routine ALLOC_BLOCKS
+
+GLOBAL ROUTINE RETURN_BLOCKS (START_LBN, BLOCK_COUNT) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns a single contiguous area to the storage map.
+!
+! CALLING SEQUENCE:
+!	RETURN_BLOCKS (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: starting LBN to free
+!	ARG2: number of blocks to free
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!	CURRENT_UCB: UCB of device
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	storage map and VCB modified
+!
+!--
+
+BEGIN
+
+LOCAL
+	VOLUME_SIZE,			! size in logical blocks of volume
+	START_BIT,			! starting bit number in storage map
+	BIT_COUNT,			! number of bits to set
+	DUMMY1,				! dummies to receive return data
+	DUMMY2;				! from BITSCAN, which is not used
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume in process
+	CURRENT_UCB	: REF BBLOCK;	! UCB of device unit
+
+
+! First check the blocks being returned against the volume size.
+!
+
+VOLUME_SIZE =	.CURRENT_UCB[UCB$B_SECTORS] *
+		.CURRENT_UCB[UCB$B_TRACKS] *
+		.CURRENT_UCB[UCB$W_CYLINDERS];
+
+IF .START_LBN + .BLOCK_COUNT GTRU .VOLUME_SIZE
+THEN ERR_EXIT (SS$_BADFILEHDR);
+
+! Divide down by the volume cluster factor to convert blocks to storage
+! map bits. If there are non-zero remainders, reject the operation on grounds
+! of a bad file header.
+!
+
+IF .START_LBN MOD .CURRENT_VCB[VCB$W_CLUSTER] NEQ 0
+THEN ERR_EXIT (SS$_BADFILEHDR);
+START_BIT = .START_LBN / .CURRENT_VCB[VCB$W_CLUSTER];
+
+IF .BLOCK_COUNT MOD .CURRENT_VCB[VCB$W_CLUSTER] NEQ 0
+THEN ERR_EXIT (SS$_BADFILEHDR);
+BIT_COUNT = .BLOCK_COUNT / .CURRENT_VCB[VCB$W_CLUSTER];
+
+! Call the bit scanner to set the appropriate
+! bits. Finally update the volume free block count.
+!
+
+BITSCAN (SET_BITS, .START_BIT, .BIT_COUNT, DUMMY1, DUMMY2);
+
+KERNEL_CALL (UPDATE_FREE, .BLOCK_COUNT);
+
+END;					! end of routine RETURN_BLOCKS
+
+GLOBAL ROUTINE BITSCAN (MODE, STARTBIT, BITCOUNT, STOPBIT, LENGTHFOUND) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is the basic bitmap scanner. It scans the bitmap
+!	over the specified number of bits, performing the operation
+!	specified by the mode.
+!
+! CALLING SEQUENCE:
+!	BITSCAN (ARG1, ARG2, ARG3, ARG4, ARG5)
+!
+! INPUT PARAMETERS:
+!	ARG1: mode of operation - see module preface
+!	ARG2: starting bit address in bitmap
+!	ARG3: maximum number of bits to process
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: address of VCB in process
+!
+! OUTPUT PARAMETERS:
+!	ARG4: address of longword to receive ending bit address
+!	ARG5: address of longword to receive number of bits scanned
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1 if maximum bit count processed
+!	0 if not
+!
+! SIDE EFFECTS:
+!	bitmap blocks may be altered, read, and written
+!
+!--
+
+BEGIN
+
+LOCAL
+	COUNT,				! number of bits to go
+	BLOCK,				! current bitmap block number
+	CBYTE,				! current byte offset in block
+	CBIT,				! current bit number within byte
+	BYTELIM,			! number of bytes to scan
+	BITLIM,				! number of bits to scan
+	BUFFER,				! address of bitmap buffer
+	ENDBYTE,			! end of current byte scan
+	ENDBIT;				! end of current bit scan
+
+EXTERNAL
+	BITMAP_VBN,			! VBN of current storage map block
+	BITMAP_BUFFER	: REF BITVECTOR, ! address of current map block
+	CURRENT_VCB	: REF BBLOCK;	! VCB in process
+
+EXTERNAL ROUTINE
+	MARK_DIRTY,			! mark buffer for writeback
+	READ_BLOCK;			! read a disk block
+
+
+! Initialize by setting the count and setting up the pointers to
+! the starting position. Read the first map block. The case of a
+! zero count is handled specially to avoid bitmap edge problems.
+!
+
+COUNT = .BITCOUNT;
+IF .COUNT EQL 0
+THEN
+    BEGIN
+    .LENGTHFOUND = 0;
+    .STOPBIT = .STARTBIT;
+    RETURN 1;
+    END;
+
+BLOCK = .STARTBIT<12,20>;
+IF .BLOCK GEQU .CURRENT_VCB[VCB$B_SBMAPSIZE]
+THEN BUG_CHECK (BADSBMBLK, FATAL, 'ACP tried to reference off end of bitmap');
+
+IF .BLOCK+1 EQL .BITMAP_VBN
+THEN
+    BUFFER = .BITMAP_BUFFER
+ELSE
+    BEGIN
+    BUFFER = READ_BLOCK (.BLOCK+.CURRENT_VCB[VCB$L_SBMAPLBN], 1, BITMAP_TYPE);
+    BITMAP_VBN = .BLOCK+1;
+    BITMAP_BUFFER = .BUFFER;
+    END;
+
+CBYTE = .BUFFER + .STARTBIT<3,9>;
+CBIT = .STARTBIT<0,3>;
+
+! The outer loop allows us to use the same set of bit processing instructions
+! for the odd bits at both the start and end of the scan.
+!
+
+WHILE 1 DO
+    BEGIN
+
+! Process bits from the starting position up to the first byte boundary.
+!
+
+    BITLIM = MIN (8 - .CBIT, .COUNT);	! max number of bits to scan
+    CASE .MODE FROM 0 TO 3 OF
+	SET
+	[FIND_SET]:	FFS (CBIT, BITLIM, .CBYTE, ENDBIT);
+
+	[FIND_CLEAR]:	FFC (CBIT, BITLIM, .CBYTE, ENDBIT);
+
+	[SET_BITS]:	(IF NOT FFS (CBIT, BITLIM, .CBYTE, ENDBIT)
+			THEN ERR_EXIT (SS$_BADFILEHDR)
+			ELSE
+			    BEGIN
+			    (.CBYTE)<.CBIT, .BITLIM> = -1;
+			    MARK_DIRTY (.BUFFER);
+			    END);
+
+	[CLEAR_BITS]:	(IF NOT FFC (CBIT, BITLIM, .CBYTE, ENDBIT)
+			THEN ERR_EXIT (SS$_DEVICEFULL)
+			ELSE
+			    BEGIN
+			    (.CBYTE)<.CBIT, .BITLIM> = 0;
+			    MARK_DIRTY (.BUFFER);
+			    END);
+
+	TES;
+
+! Update the counters and pointers.
+!
+
+    COUNT = .COUNT - (.ENDBIT - .CBIT);
+
+! If we are now positioned on a byte boundary, we can process the bitmap
+! on a byte by byte basis. Page through the bitmap until the count runs out.
+!
+
+    IF .COUNT EQL 0 OR .ENDBIT NEQ 8 THEN EXITLOOP;
+
+    CBYTE = .CBYTE + 1;
+    CBIT = 0;
+
+    WHILE 1 DO
+	BEGIN
+	BYTELIM = MIN (.COUNT/8, 512 - (.CBYTE-.BUFFER));
+
+	CASE .MODE FROM 0 TO 3 OF
+	    SET
+
+	    [FIND_SET]:	    ENDBYTE = CH$FIND_NOT_CH (.BYTELIM, .CBYTE, 0);
+
+	    [FIND_CLEAR]:   ENDBYTE = CH$FIND_NOT_CH (.BYTELIM, .CBYTE, 255);
+
+	    [SET_BITS]:	    (IF NOT CH$FAIL (ENDBYTE = CH$FIND_NOT_CH (.BYTELIM,
+				    .CBYTE, 0))
+			    THEN ERR_EXIT (SS$_BADFILEHDR)
+			    ELSE
+				BEGIN
+				CH$FILL (255, .BYTELIM, .CBYTE);
+				MARK_DIRTY (.BUFFER);
+				END);
+
+	    [CLEAR_BITS]:   (IF NOT CH$FAIL (ENDBYTE = CH$FIND_NOT_CH (.BYTELIM,
+				    .CBYTE, 255))
+			    THEN ERR_EXIT (SS$_DEVICEFULL)
+			    ELSE
+				BEGIN
+				CH$FILL (0, .BYTELIM, .CBYTE);
+				MARK_DIRTY (.BUFFER);
+				END);
+
+	    TES;
+
+	IF CH$FAIL (.ENDBYTE) THEN ENDBYTE = .CBYTE + .BYTELIM;
+
+! If the count runs out or we run into an end condition leave the loop.
+! Otherwise read the next block, wrapping around the end of the bitmap
+! when necessary, and loop.
+!
+
+	COUNT = .COUNT - (.ENDBYTE - .CBYTE) * 8;
+	IF .ENDBYTE - .BUFFER NEQ 512 OR .COUNT EQL 0 THEN EXITLOOP;
+
+	BLOCK = .BLOCK + 1;
+	IF .BLOCK GEQU .CURRENT_VCB[VCB$B_SBMAPSIZE]
+	THEN BUG_CHECK (BADSBMBLK, FATAL, 'ACP tried to reference off end of bitmap');
+
+	BUFFER = READ_BLOCK (.BLOCK+.CURRENT_VCB[VCB$L_SBMAPLBN], 1, BITMAP_TYPE);
+	BITMAP_VBN = .BLOCK+1;
+	BITMAP_BUFFER = .BUFFER;
+	CBYTE = .BUFFER;
+	END;				! end of block scan loop
+
+! We have either found the desired end condition or the count will run
+! out within the next byte. Process the final byte bit by bit.
+!
+
+    IF .COUNT EQL 0 THEN EXITLOOP;
+    CBYTE = .ENDBYTE;
+    END;				! end of major loop
+
+! Scan is completed. Return the output values.
+!
+
+.LENGTHFOUND = .BITCOUNT - .COUNT;
+.STOPBIT = .STARTBIT + ..LENGTHFOUND;
+RETURN .COUNT EQL 0;
+
+END;					! end of routine BITSCAN
+
+ROUTINE SET_SMVBN (VBN) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine updates the current storage map VBN in the VCB.
+!	It must be called in kernel mode.
+!
+! CALLING SEQUENCE:
+!	SET_SMVBN (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: new storage map VBN
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	CURRENT_VCB: address of volume VCB
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	storage map VBN altered
+!
+!--
+
+BEGIN
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK;	! VCB of volume
+
+
+CURRENT_VCB[VCB$B_SBMAPVBN] = .VBN;
+
+END;					! end of routine SET_SMVBN
+
+ROUTINE UPDATE_FREE (COUNT) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine updates the free block count in the volume's VCB.
+!	It must be called in kernel mode.
+!
+! CALLING SEQUENCE:
+!	UPDATE_FREE (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: value (positive or negative) to alter free count
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	CURRENT_VCB: VCB of volume
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	free count altered
+!
+!--
+
+BEGIN
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK;	! VCB of volume
+
+
+CURRENT_VCB[VCB$L_FREE] = .CURRENT_VCB[VCB$L_FREE] + .COUNT;
+
+END;					! end of routine UPDATE_FREE
+
+END
+ELUDOM

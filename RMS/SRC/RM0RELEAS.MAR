@@ -1,0 +1,976 @@
+	$BEGIN	RM0RELEAS,004,$RMS0,<RELEASE BUFFER ROUTINE>
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; Facility: rms32
+;
+; Abstract:
+;		this module releases a buffer for all file
+;		organizations, handling writing if dirty
+;		and sharing.
+;
+; Environment:
+;		star processor running starlet exec.
+;
+; Author: L F Laverdure,	 creation date: 30-MAR-1977
+;
+; Modified By:
+;
+;	V03-004	CDS0019		C D Saether		13-Apr-1982
+;		If write back qio (in blocking ast routine) fails,
+;		note error, reset DFW flag and dismiss AST without
+;		releasing lock, and setting WRITEBACK.
+;		If a reader finds DFW and WRITEBACK set, the buffer
+;		is written on release (a locker also writes
+;		it back if WRITEBACK is set).
+;		Invalidate global buffer if GBPB released with
+;		VAL flag cleared.
+;
+;	V03-003	CDS0018		C D Saether		 5-Apr-1982
+;		Force total release of buffer when released and invalid.
+;
+;	V03-002	CDS0017		C D Saether		31-Mar-1982
+;		Fixup BLB pointer from BDB when doing KEEPLOCK release
+;		and other accessors are present.
+;
+;	V03-001	CDS0016		C D Saether		 1-Mar-1982
+;		Decrement GBD use count in code that clears out
+;		GBPB as all GBPB's are dequeued.  Increment use
+;		count on GBPB before calling routine to free local
+;		buffer in case stall occurs so that other streams
+;		will not select it.
+;		Only clear out BDB on keeplock release if use count
+;		is zero.
+;		Bugcheck if a reader (didn't say LOCK initially)
+;		has modified a buffer and the write was deferred.
+;		If this happens we get into trouble further on.
+;							26-Feb-1982
+;		Reflect fact that all accesses except read lock on
+;		DFW buffer hold lock in EX mode.  Situation previously
+;		being checked where CR lock held on release of dirty
+;		buffer no longer possible.
+;							17-Feb-1982
+;		Changes to allow for release of modified global
+;		buffer.
+;
+;	V02-027	CDS0015		C D Saether		27-Jan-1982
+;		Specify SYNCSTS in blocking ast enq request.
+;		Make tracing easier to enable.
+;
+;	V02-026	CDS0014		C D Saether		25-Jan-1982
+;		Add patchable support for tracing.
+;
+;	V02-025	CDS0013		C D Saether		18-Jan-1982
+;		Support to release global buffers.
+;
+;	V02-024	CDS0012		C D Saether		11-Jan-1982
+;		Dequeue lock entirely in blocking AST finish routine
+;		if other streams have that buffer accessed.
+;
+;	V02-023	CDS0011		C D Saether		30-Dec-1981
+;		Set AST_DCL flag in BDB in write back completion
+;		routine to note that IOSB in BDB should be checked
+;		for errors.
+;
+;	V02-022	CDS0010		C D Saether		24-Dec-1981
+;		Clear BLB flags except dfw when releasing lock.
+;		Add commented out trace calls.
+;
+;	V02-021	CDS0009		C D Saether		 9-Dec-1981
+;		Modifications to support deferred buffer write back.
+;
+;	V02-020	CDS0008		C D Saether		 7-Dec-1981
+;		Don't set the event flag after conversion anymore and
+;		deallocate it.  Use the macro for the DEQ.
+;
+;	V02-019	CDS0007		C D Saether		30-Nov-1981
+;		SYS$DEQ now has four (instead of 3) arguments.
+;
+;	V02-018	CDS0006		C D Saether		22-Nov-1981
+;		Enhance commentary.  Do not set event flag on conversions.
+;
+;	V02-017	CDS0005		C D Saether		 8-Oct-1981
+;		Do not update value block on nobuffer reads.
+;
+;	V02-016	CDS0004		C D Saether		25-Sep-1981
+;		Change checks such that lock_id of zero is ok.
+;
+;	V02-015	CDS0003		C D Saether		20-Aug-1981
+;		Rewrite.
+;
+;
+;--
+;
+
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+
+;
+; Macros:
+;
+
+	$IFBDEF
+	$IRBDEF
+	$CSHDEF
+	$BDBDEF
+	$BLBDEF
+	$DEQDEF
+	$ENQDEF
+	$GBDDEF
+	$GBHDEF
+	$GBPBDEF
+	$LCKDEF
+	$RLSDEF
+	$FABDEF
+	$RMSDEF
+	$IMPDEF
+	$IODEF
+	
+;
+; Equated Symbols:
+;
+
+;
+; Own Storage:
+;
+
+
+	.SBTTL	RM$RELEASE - RELEASE BUFFER FOR ALL FILE ORGS
+
+;++
+; RM$RELEASE
+;
+; For all file organizations:
+;	1) if the buffer valid and dirty and
+;	   any of the flags rls$v_wrt_thru, rls$v_keep_lock* or
+;	   rls$v_return set, writes the buffer out,
+;	   possibly writing behind
+;	This routine is not prepared for anyone to call it with
+;	   rls$v_return set and R4 pointing to a GBPB, however.
+;	2) if the flag rls$v_return set, waits for
+;	   read-ahead or write-behind to complete,
+;	   if any, and returns the bdb and
+;	   buffer to the free memory lists
+;	3) if the rls$v_keep_lock* bit off release access
+;	   to the block, otherwise, retain access to block
+;	4) if entry rm$rlnerr is invoked clear all error
+;	   producing bdb flags, clear release control flags
+;	   and fall thru to rm$release
+;	5) if an error occurs and rls$v_keep_acc is not set in flags,
+;	   call rm$rlnerr before returning (i.e., deaccess bdb)
+;
+;	*  note: rls$v_keep_lock is only input for the
+;	   relative and indexed file organizations.
+;
+; Calling sequence:
+;
+;	bsbw	rm$release
+;	bsbw	rm$rlnerr	- alternate entry to merely free the bdb
+;
+;
+; Input Parameters:
+;
+;	r11	impure area address
+;	r10	ifab address
+;	r9	irab/ifab address
+;	r8	rab/fab address
+;	r4	bdb address
+;	r3	release control flags	(not an input for entry at rm$rlnerr)
+;
+; Implicit Inputs:
+;
+;	ifb$b_caseorg
+;	bdb$b_flgs
+;	if block written, all inputs to rm$seqwtbd
+;
+; Output Parameters:
+;
+;	r0	status code
+;	r1,r2,ap destroyed
+;	r3	zeroed if entry at rm$rlnerr otherwise unchanged
+;	r4,r5	destroyed if rls$v_return set
+;
+; Implicit Outputs:
+;
+;	bdb$v_drt  -  cleared if not defered write
+;	bdb$v_val and bdb$v_prm	cleared on entry at rm$rlnerr
+;	the various outputs from rm$seqwtbd
+;
+; Completion Codes:
+;
+;	standard rms.
+;
+; Side Effects:
+;
+;	may have switched to running at ast level.
+;--
+
+
+TRACE:
+	JSB	RM$RLS_IN
+	BSBB	RLS
+	JSB	RM$RLS_OUT
+	RSB
+
+
+;
+; entry for unconditional release
+; clear all possible error producing flags and fall thru
+;
+
+RM$RLNERR::
+	BICB2	#BDB$M_VAL!BDB$M_DRT!BDB$M_PRM,BDB$B_FLGS(R4)
+RM$RLNER1::
+	MOVL	#RLS$M_DEQ, R3		; Release entirely.
+
+;
+; normal entry
+;
+
+RM$RELEASE::
+	$TSTPT	RELEASE
+	BRB	RLS			; Patch for tracing.
+	BRB	TRACE			; Branch over this normally.
+RLS:
+	PUSHL	R3			; save flags
+	TSTL	R4			; Is there a structure?
+	BEQL	SUCXIT			; Assume this was lock blb and no locks.
+	ASSUME	BLB$B_BID EQ BDB$B_BID
+	ASSUME	BDB$B_BID EQ GBPB$B_BID
+	CMPB	#BLB$C_BID, BDB$B_BID(R4) ; Is this a BLB?
+	BEQL	ISBLB			; This is lock BLB.
+	ASSUME	BDB$V_VAL EQ 0
+	BLBS	BDB$B_FLGS(R4),10$	; branch if buffer valid
+	BICB2	#BDB$M_DRT,BDB$B_FLGS(R4); make sure dirty not set
+	BISL2	#RLS$M_DEQ, (SP)	; force total release if invalid.
+10$:
+	ASSUME	FAB$C_SEQ EQ 0
+	TSTB	IFB$B_ORGCASE(R10)	; sequential file org?
+	BNEQ	RLS_SHARED		; branch if not
+
+;
+; release for sequential file org (non-shared)
+;
+; write the buffer if dirty
+;
+
+	BBC	#BDB$V_DRT,BDB$B_FLGS(R4),20$; branch if not dirty
+	BSBW	RM$SEQWTBD		; write the buffer
+
+;
+; note: this code not executed if unit record
+;
+
+	BLBC	R0,ERRXFR		; branch if errors
+
+;
+; return bdb and buffer if requested
+;
+
+20$:	ASSUME	RLS$V_RETURN EQ 0
+EXIT:	BLBC	(SP),SUCXIT		; branch if return not requested
+
+;
+;!!!!! if write behind, must await i/o done !!!!!
+;
+
+	BSBW	RM$RETBDB		; return bdb & buffer
+SUCXIT:	RMSSUC
+
+;
+; clean up stack and return
+;
+
+RLSXIT:	MOVL	(SP)+,R3		; Restore release flags.
+	RSB
+
+;
+;  error occurred  -  do rlnerr call 
+;
+
+ERRXFR:	PUSHL	R0			; save status
+	BSBB	RM$RLNERR		; release access
+	POPR	#^M<R0>			; restore status code
+	BRB	RLSXIT			; and return
+
+	.SBTTL	SUPPORT ROUTINES AND INFREQUENT PATHS
+;++
+; INCR_SEQNUM
+;
+; Bump sequence number and invalidate global buffer copy if
+; necessary.
+;
+; Input:
+; R4 = BDB or GBPB address.
+;
+; Output:
+; Sequence number is incremented.
+;
+; Destroys AP always.  May destroy R1, R3 (if INVGBL called).
+;
+;--
+
+INCR_SEQNUM:
+	MOVL	IFB$L_GBH_PTR(R10), AP	; Get gbl buff hdr if any.
+	BEQL	10$			; Br if none (must be BDB).
+	ASSUME	<BDB$C_BID & 1> EQ 0
+	ASSUME	<GBPB$C_BID & 1> EQ 1
+	ASSUME	BDB$B_BID EQ GBPB$B_BID
+	BLBS	BDB$B_BID(R4), 10$	; Br if GBPB.
+	BSBW	INVGBL			; Invalidate gbl copy if any.
+	ASSUME	BDB$L_VBNSEQNO EQ GBPB$L_VBNSEQNO
+10$:	INCL	BDB$L_VBNSEQNO(R4)	; Bump seq num in BDB.
+	RSB				; Return.
+
+ISBLB:	MOVL	R4,R2			; Get BLB into right register.
+	CLRL	R4			; Note no BDB/GBPB.
+	BRW	DEQ			; Dequeue the lock.
+
+NOTLOCKED:
+	RMSPBUG	FTL$_NOTLOCKED		; Not locked correctly.
+
+NOLOCK:
+	BBS	#RLS$V_DEQ, (SP), DQBDB	; Make BDB free if DEQ spec'd.
+	BBC	#RLS$V_KEEP_LOCK, (SP), EXIT ; If not keep lock, exit.
+	CLRL	R4			; So we know there is no BLB when this
+					; non-existent lock is released.
+	BRB	SUCXIT			; And return with success.
+DQBDB:	ASSUME	RLS$V_RETURN EQ 0
+	BLBS	(SP), EXIT		; Exit if 'return' spec'd.
+	RMSSUC				; Load R0 with success.
+	BRW	DEQBDB			; Branch to free up BDB.
+GBPB:
+
+;
+; This is a lock on a global buffer.
+; Deq the GBPB entirely.  If the buffer was marked invalid,
+; mark the GBD invalid also.
+;
+
+	BISL2	#RLS$M_DEQ, (SP)	; Force deq of gbpb.
+	ASSUME	BDB$V_VAL EQ 0
+	BLBS	GBPB$B_FLGS(R4), DQBR	; Br if valid.
+	MOVL	IFB$L_GBH_PTR(R10), AP	; Get global buffer header.
+	BSBW	INVGBL			; Invalidate GBD.
+DQBR:	BRW	DEQ			; And go release lock.
+
+
+	.SBTTL	SHARED FILE SUPPORT (RELATIVE AND INDEXED)
+
+RLS_SHARED:
+	TSTW	BDB$W_USERS(R4)		; Check use count.
+	BEQL	NOTLOCKED		; Bug if zero.
+	BBC	#BDB$V_DRT, BDB$B_FLGS(R4),- ; Branch if not dirty.
+		CHECK_LOCK
+	BBS	#RLS$V_DEQ, R3, WRITE	; If DEQ just write (seqnum correct).
+	BITL	#RLS$M_RETURN - 	; Check for options that
+		! RLS$M_WRT_THRU ! RLS$M_KEEP_LOCK,- ; disable deferred write.
+		R3
+	BNEQ	10$			; If any set, then write it.
+	BBS	#IFB$V_DFW, (R10), CHECK_LOCK ; Don't write if deferred write.
+
+;
+; The sequence number is only bumped here if the buffer is actually written.
+; This prevents invalidating cached buffers when readers have accessed
+; a dirty buffer.  The sequence number is also bumped later when a locker
+; converts EX to PW.
+;
+
+10$:	BSBB	INCR_SEQNUM		; Bump count, inv gbl if necessary.
+WRITE:
+	BSBW	RM$SEQWTBD		; Write the buffer.
+	BLBC	R0, ERRXFR		; Branch on error.
+CHECK_LOCK:
+	DECW	BDB$W_USERS(R4)		; Decrement use count.
+	TSTL	BDB$L_VBN(R4)		; Was this buffer only (vbn 0)?
+	BEQL	DQBDB			; If so, then make buffer free.
+	MOVL	BDB$L_BLB_PTR(R4), R2	; Get pointer to BLB.
+	BEQL	NOLOCK			; No lock on this one.
+10$:	MOVL	BLB$L_OWNER(R2), AP	; Get owner of this BLB.
+	BEQL	HAVE_BLB		; EQL is NL lock.
+	CMPL	R9, AP			; Check owner of this BLB.
+	BEQL	HAVE_BLB		; EQL then it's ours.
+	ASSUME	BLB$L_FLNK EQ 0
+	MOVL	(R2), R2		; Get next BLB.
+	CMPL	BLB$L_BDB_ADDR(R2), R4	; Still in the chain?
+	BEQL	10$			; Check the owner.
+	BRB	NOTLOCKED		; Something is wrong.
+
+;
+; This is a locker who wanted to defer write back of the buffer, but
+; a blocking AST has already arrived so we must write it now.
+;
+
+WB:
+	INCW	BDB$W_USERS(R4)		; Bump user count back up
+	BRB	WRITE			; and write the buffer back.
+HAVE_BLB:
+
+;
+; Assumption is being made that DFW can only be set at this time
+; if this lock is being held by a reader.  If this is a write lock (LOCK)
+; then DFW was cleared when the lock was granted, even if it was DFW
+; prior to that time.  The exception is when rm$release has been called
+; from rm$cache to free a DFW buffer - which was just written above -
+; with the rls$v_deq flag set.  In this case, the blb$v_lock flag is
+; still set from the original cache call that made the buffer dirty.
+; At any rate, if this is really a reader, and this is a DFW buffer,
+; then the lock is simply retained and no further action taken.
+;
+
+	ASSUME	BDB$L_VBNSEQNO EQ GBPB$L_VBNSEQNO
+	MOVL	BDB$L_VBNSEQNO(R4),BLB$L_VALSEQNO(R2) ; Update value block.
+	BBC	#RLS$V_KEEP_LOCK, (SP), 25$ ; Continue if not keeplock.
+	BRW	KEEPLOCK		; Branch if keeplock.
+25$:
+	BBS	#BDB$V_DRT, BDB$B_FLGS(R4), 35$ ; Branch if dirty.
+	BICB2	#BLB$M_DFW, BLB$B_BLBFLGS(R2) ; Can't be DFW if not dirty.
+	ASSUME	<BDB$C_BID & 1> EQ 0
+	ASSUME	<GBPB$C_BID & 1> EQ 1
+	ASSUME	BDB$B_BID EQ GBPB$B_BID
+	BLBS	BDB$B_BID(R4), GBPB	; Br to DEQ GBPB.
+
+	TSTW	BDB$W_USERS(R4)		; Any other accessors?
+	BEQL	30$			; EQL then branch to convert the lock.
+	BRW	DEQ1			; If other accessors, dq blb entirely.
+30$:	BBS	#RLS$V_DEQ, (SP), DQBR	; Branch if dequeue requested.
+	CLRL	BLB$L_OWNER(R2)		; No owner for a NL lock.
+	ASSUME	LCK$K_NLMODE EQ 0
+	CLRL	-(SP)			; Want to convert to NL.
+	CLRQ	-(SP)			; Acmode and protection.
+	CLRQ	-(SP)			; No block AST or parameter.
+	BRB	FINISH_ARGS		; Rejoin main line.
+
+35$:
+
+;
+; At this point we have a dirty buffer.  This can only happen if
+; deferred write was enabled, as otherwise the dirty flag got
+; cleared when the buffer was written above.
+;
+
+	ASSUME	BLB$V_LOCK EQ 0
+	BLBC	BLB$B_BLBFLGS(R2), DFW_RD ; Branch if a reader.
+
+;
+; This is a locker and deferred write is desired.
+; If this is a global buffer, branch off to copy it to a local buffer
+; so that a blocking ast will write out the local copy.  This simplifies
+; the global cache replacement algorithm so that it doesn't have to
+; deal with the problem of forcing another process to write a modified
+; buffer from the global cache.
+; The COPY_GBL code will return with R4 pointing to the BDB clone if
+; it succeeds at the DFW_FIN label.  If it fails, it branches back to
+; the WRITE label above to flush the buffer to disk, and it won't come
+; here again.
+;
+
+	BSBW	INCR_SEQNUM		; Bump seq num, inv gbl if local.
+	INCL	BLB$L_VALSEQNO(R2)	; Do value block also.
+	ASSUME	<BDB$C_BID & 1> EQ 0
+	ASSUME	<GBPB$C_BID & 1> EQ 1
+	ASSUME	BDB$B_BID EQ GBPB$B_BID
+	BLBC	BDB$B_BID(R4), CHKWB	; Branch if this is a BDB.
+	BRW	COPY_GBL		; Else branch to copy buffer.
+
+;
+; If the WRITEBACK flag is set in the BLB we must go back and write through
+; the buffer because a blocking AST arrived after we selected the BLB.
+;
+
+CHKWB:	BBSC	#BLB$V_WRITEBACK,-	; Need to write back?
+		BLB$B_BLBFLGS(R2), WB	; Branch if yes.
+DFW_FIN:
+	MOVL	R10, BLB$L_OWNER(R2)	; Ifab owns a dfw lock.
+	PUSHL	#LCK$K_PWMODE		; Convert to PW mode.
+	CLRQ	-(SP)			; Acmode and protection.
+	PUSHAL	W^BLOCK_AST		; Want block ast for DFW.
+	PUSHL	R2			; BLB is AST parameter.
+	BISB2	#BLB$M_DFW, BLB$B_BLBFLGS(R2) ; Note this is DFW lock.
+FINISH_ARGS:
+	CLRQ	-(SP)			; No comp AST or parid.
+	CLRL	-(SP)			; No resource name.
+	PUSHL	#LCK$M_SYSTEM ! LCK$M_SYNCSTS - ; lock options.
+		! LCK$M_CONVERT
+	BBS	#BLB$V_NOBUFFER,-	; Check if originally nobuffer req.
+		BLB$B_BLBFLGS(R2), 50$	; and don't store value if so.
+	BITB	#BLB$M_LOCK ! BLB$M_DFW,- ; Check if value block needs
+		BLB$B_BLBFLGS(R2)	; to be stored.
+	BEQL	50$			; Readers don't update VALBLK.
+	BISL2	#LCK$M_VALBLK, (SP)	; Store value block.
+50$:	PUSHAL	BLB$W_LKSTS(R2)		; Lock status block.
+	CLRL	BLB$W_LKSTS(R2)		; Init to zero.
+	PUSHL	9*4(SP)			; Lock mode requested.
+	BSBW	RM$SETEFN		; Get EFN to use.
+	CALLS	#11, @#SYS$ENQ		; Do the conversion.
+	POPL	R3			; Pop requested mode off stack.
+	BSBW	RM$DEALLEFN		; Deallocate the event flag.
+	BICB2	#^CBLB$M_DFW, BLB$B_BLBFLGS(R2) ; Clear all blbflgs except dfw
+	BLBC	R0, 70$			; Exit on error.
+	MOVZWL	BLB$W_LKSTS(R2), R0	; Get status.
+	BLBC	R0, 70$			; Branch on error.
+	MOVB	R3, BLB$B_MODEHELD(R2)	; Store mode granted in blb.
+70$:	BRW	RLSXIT			; And exit.
+
+;
+; Out of line check to make sure that WRITEBACK is in progress if DFW
+; was clear.  Normally expect either DFW is set, or buffer wasn't dirty
+; to begin with and we wouldn't have gotten here.
+;
+
+L1:	BBS	#BLB$V_WRITEBACK,-	; Writeback is the only reason DFW
+		BLB$B_BLBFLGS(R2), L2	; should be clear.
+	BSBW	NOTLOCKED		; BSBW because we won't come back
+					; from the bugcheck and we can tell
+					; where it came from.
+DFW_RD:
+;
+; This is a reader, yet the buffer is dirty.
+; Make sure that this is a deferred write lock as otherwise it means
+; the caller did not lock the bucket when RM$CACHE was called.
+; If WRITEBACK is also set, there was a problem on the blocking AST qio
+; and the buffer should be written back now and released.
+; The BLB we are using is the PW lock.
+;
+
+	BBC	#BLB$V_DFW, BLB$B_BLBFLGS(R2), L1 ; If not dfw, check further.
+	BBS	#BLB$V_WRITEBACK,-	; Br if buffer must be written back.
+		BLB$B_BLBFLGS(R2), CHKWB ; Only occurs if block ast qio failed.
+L2:	MOVL	R10, BLB$L_OWNER(R2)	; Ifab is owner of DFW locks.
+	BRW	SUCXIT			; and exit.
+DEQ1:
+
+;
+; There are other streams que'd for the same lock, so DEQ this
+; lock and make the BLB available.  Also must get BDB$L_BLB_PTR
+; pointing to the next BLB if it was pointing to this one.
+; A separate GBPB is associated with every access to a GBD so
+; therefore the structure through this path will always be a BDB.
+;
+
+	BICL2	#RLS$M_DEQ, (SP)	; Clear DEQ so BDB isn't released.
+	BSBB	FIX_BLBPTR		; Fixup BLB pointer.
+	INCW	IFB$W_AVLCL(R10)	; Note BLB is free.
+DEQ:
+	MOVL	BLB$L_LOCK_ID(R2), R1	; Is lock id 0?
+	BEQL	15$			; Yes it is, don't do DEQ.
+	CLRL	R0			; Assume no value block.
+	BBS	#BLB$V_NOBUFFER,-	; Check if originally nobuffer req.
+		BLB$B_BLBFLGS(R2), 10$	; and don't update value if so.
+	BITB	#BLB$M_LOCK ! BLB$M_DFW,- ; Check if value block needs
+		BLB$B_BLBFLGS(R2)	; to be stored.
+	BEQL	10$			; EQL then don't store.
+	MOVAL	BLB$L_VALBLK(R2), R0	; Note value block.
+10$:	$DEQ_S	LKID=R1 VALBLK=(R0)	; Dequeue the lock.
+15$:
+	ASSUME	BLB$B_MODEHELD EQ <BLB$B_BLBFLGS + 1>
+	CLRW	BLB$B_BLBFLGS(R2)	; Clear out all flags.
+	CLRL	BLB$L_BDB_ADDR(R2)	; Disassociate from BDB.
+	ASSUME	BLB$L_VBN EQ <BLB$L_OWNER + 4>
+	CLRQ	BLB$L_OWNER(R2)		; Clear owner and vbn.
+	CLRQ	BLB$W_LKSTS(R2)		; Clear lock status block.
+	REMQUE	(R2), R2		; Remove from chain.
+	INSQUE	(R2), @IFB$L_BLBBLNK(R10) ; Insert at end.
+	TSTL	R4			; Is there a BDB?
+	BNEQ	30$			; Continue if BDB present.
+20$:	BRW	RLSXIT			; Otherwise done now.
+30$:	BBC	#RLS$V_DEQ, (SP), 20$	; Return if deq flag not set.
+					; (came from deq1 label above).
+DEQBDB:
+	POPL	R3			; Restore release flags.
+DQBDB1:
+	ASSUME	<BDB$C_BID & 1> EQ 0
+	ASSUME	<GBPB$C_BID & 1> EQ 1
+	ASSUME	BDB$B_BID EQ GBPB$B_BID
+	BLBC	BDB$B_BID(R4), 10$	; Br if this is a BDB.
+	MOVL	GBPB$L_GBD_PTR(R4), AP	; Get pointer to GBD.
+	DECW	GBD$W_USECNT(AP)	; Reduce use count on GBD.
+	MOVB	GBPB$B_CACHE_VL(R4),-	; Store cache value in GBD.
+		GBD$B_CACHE_VAL(AP)
+	BRB	20$			; Br to finish up.
+10$:	INCW	IFB$W_AVLCL(R10)	; Note another buffer available.
+	ASSUME	BDB$B_CACHE_VAL EQ <BDB$B_FLGS + 1>
+20$:	CLRW	BDB$B_FLGS(R4)		; Clear cache_val and flgs.
+	CLRL	BDB$L_BLB_PTR(R4)	; Remove pointer to BLB.
+	ASSUME	BDB$L_VBNSEQNO EQ <BDB$L_VBN + 4>
+	CLRQ	BDB$L_VBN(R4)		; Clear vbn and seq num.
+	REMQUE	(R4), R4		; Remove from chain.
+	INSQUE	(R4), @IFB$L_BDB_BLNK(R10) ; Insert at end.
+	RSB				; And return.
+
+;++
+; FIX_BLBPTR
+;
+; Routine to point BLB_PTR from BDB to next BLB when a BLB is being removed.
+;
+; Input:
+; R4 = BDB
+; R2 = BLB
+;
+;--
+FIX_BLBPTR:
+	CMPL	BDB$L_BLB_PTR(R4), R2	; Is BDB pointing to this BLB?
+	BNEQ	20$			; NEQ it's not, so continue.
+	ASSUME	BLB$L_FLNK EQ 0
+	MOVL	(R2), R0		; Get next BLB.
+	CMPL	BLB$L_BDB_ADDR(R0), R4	; Does it point to this BDB?
+					; This assumes this offset in the
+					; ifab from the listhead fails always.
+	BEQL	10$			; EQL points to same BDB.
+	CLRL	R0			; No other BLB's point to this BDB.
+10$:	MOVL	R0, BDB$L_BLB_PTR(R4)	; Set or clear as appropriate.
+20$:	RSB				; Return.
+
+KEEPLOCK:
+	TSTW	BDB$W_USERS(R4)		; Is use count zero?
+	BNEQ	20$			; NEQ others are queued for BDB.
+	BSBB	DQBDB1			; Free up buffer.
+10$:	CLRL	BLB$L_BDB_ADDR(R2)	; No BDB assoc. with BDB now.
+	MOVL	R2, R4			; Return BLB address in R4.
+	BRW	SUCXIT			; And return.
+
+20$:	BSBB	FIX_BLBPTR		; Fixup BLB pointer.
+	REMQUE	(R2), R2		; Remove from chain.
+	INSQUE	(R2), @IFB$L_BLBBLNK(R10) ; Insert at end.
+	INCW	IFB$W_AVLCL(R10)	; Note one less accessor on buffer.
+	BRB	10$			; Clear pointer and exit.
+
+;++
+; INVGBL
+;
+; This routine scans the global buffer cache when a local
+; buffer has just been modified.  Any existing global copy must be
+; invalidated because no locks are held on global buffers when they
+; are not accessed.  Note that the fact that this bucket was just
+; modified means that an exclusive lock is held on that bucket by
+; this stream, hence any other accessors on that buffer must be
+; queued waiting for their lock to be granted.  In that case, simply
+; force a read by stuffing the sequence number.   If no other
+; accessors are present, move the GBD to the end of the list to
+; identify it as a free buffer.
+;
+; Inputs:
+;
+; R4 - Address of associated with BLB, if any.
+; AP - Address of GBH
+;
+; Destroys R1, R3, AP.
+;--
+INVGBL:
+	MOVL	BDB$L_VBN(R4), R3	; Get VBN just written.
+	MOVL	AP, R1			; Init for scan.
+10$:
+	ASSUME	GBH$L_GBD_FLNK EQ 0
+	ASSUME	GBD$L_FLINK EQ 0
+	ADDL2	(R1), R1		; Pick up next GBD.
+	CMPL	R1, AP			; Back to list head?
+	BEQL	20$			; EQL all done, did not find match.
+	CMPL	GBD$L_VBN(R1), R3	; Is this same bucket?
+	BLSSU	10$			; No, keep scanning.
+	BEQL	30$			; EQL this is the same.
+20$:					; Drop thru, then not in list.
+	RSB				; Return.
+30$:
+	BICB2	#GBD$M_VALID, GBD$B_FLAGS(R1) ; Invalidate buffer.
+	TSTW	GBD$W_USECNT(R1)	; Anyone que'd for this one?
+	BNEQ	20$			; NEQ yes, so just return.
+
+;
+; Remove from current position in list.
+;
+
+	ASSUME	GBD$L_FLINK EQ 0
+	ASSUME	GBD$L_BLINK EQ 4
+	ADDL3	(R1), R1, R3		; R3 = successor.
+	ADDL2	4(R1), 4(R3)		; Succ blink = my blink.
+
+	ADDL3	4(R1), R1, R3		; R3 = predecessor.
+	ADDL2	(R1), (R3)		; pred flink = my flink.
+
+;
+; Set VBN to -1.  Zero out cache_val, number bytes in use, flags.
+;
+
+	ASSUME	<GBD$B_FLAGS + 1> EQ GBD$B_CACHE_VAL
+	CLRW	GBD$B_FLAGS(R1)		; Clear flags, cache_val.
+	CLRW	GBD$W_NUMB(R1)		; Clear numb bytes used.
+	MNEGL	#1, GBD$L_VBN(R1)	; Set invalid VBN.
+
+;
+; Now put this GBD at the end of the list.
+; AP = list head.
+;
+
+	ADDL2	4(AP), AP		; AP = predecessor.
+	SUBL3	R1, AP, R3		; R3 = offset from me to pred.
+	MOVL	R3, 4(R1)		; My blink points to pred.
+	ADDL3	(AP), R3, (R1)		; My flink = pred's flink.
+
+	MNEGL	R3, (AP)		; Pred flink = me (opp of me to pred).
+
+	ADDL3	(R1), R1, R3		; R3 = successor.
+	SUBL3	R3, R1, 4(R3)		; Succ blink = me.
+	RSB				; All done.
+
+;++
+; COPY_GBL
+;
+; Copy the global buffer to a local buffer if deferred write is
+; desired to avoid the problems of deferred write from the global
+; cache.
+;
+; Input:
+; R4 - GBPB address.
+;
+; Output:
+; R4 - BDB copy addr if branch to DFW_FIN
+;	else same as input GBPB if branch to WRITE.
+;
+; Destroys R0, R1, R3, AP.
+;--
+COPY_GBL:
+
+;
+; First try to get a local buffer to copy to
+;
+
+	DECW	IFB$W_AVLCL(R10)	; Reduce local available count.
+	BGEQ	10$			; Branch if one is already free.
+	INCW	GBPB$W_USERS(R4)	; Bump use count so other streams
+					; won't take it if free_lcl stalls.
+	BSBW	RM$FREE_LCL		; Else call routine to free one.
+	BLBC	R0, NO_BUFF		; Branch if that fails.
+	DECW	GBPB$W_USERS(R4)	; Put use count back.
+10$:	PUSHR	#^M<R2,R5>		; Save registers.
+	MOVL	GBPB$L_VBN(R4), R1	; VBN of bucket to copy.
+	MOVZWL	GBPB$W_NUMB(R4), R2	; Size of bucket to copy.
+	BSBW	RM$GET_LCL_BUFF		; Get the local buffer.
+					; Returns BDB addr in R5.
+	MOVB	GBPB$B_CACHE_VL(R4),-	; Copy cache value.
+		BDB$B_CACHE_VAL(R5)
+	MOVL	GBPB$L_VBNSEQNO(R4),-	; Copy sequence number from GBPB.
+		BDB$L_VBNSEQNO(R5)
+	MOVL	(SP), AP		; Pickup saved BLB address.
+	MOVL	AP, BDB$L_BLB_PTR(R5)	; Point BDB to BLB.
+	MOVL	R5, BLB$L_BDB_ADDR(AP)	; Point BLB to BDB.
+	MOVL	GBPB$L_ADDR(R4), R1	; Get source addr for copy.
+	BSBW	DQBDB1			; Reset the fields in the GBPB.
+	PUSHL	R5			; Save the BDB address.
+	MOVC3	R2, (R1), @BDB$L_ADDR(R5) ; Copy the buffer.
+	POPL	R4			; Get BDB addr into R4.
+	BISB2	#BDB$M_VAL!BDB$M_DRT,-	; Note valid and dirty.
+		BDB$B_FLGS(R4)
+	POPR	#^M<R2,R5>		; Restore original values.
+	BRW	DFW_FIN			; Jump back into mainline.
+NO_BUFF:
+
+;
+; Couldn't get a local buffer to copy to.
+; Fix local available count and branch back to force write of the
+; global buffer.
+;
+
+	INCW	IFB$W_AVLCL(R10)	; Put count back.
+	BRW	WRITE			; Go write it through then.
+
+;++
+; BLOCK_AST
+;
+; This is the deferred buffer write back routine which is specified
+; as the blocking AST when a dirty buffer is held in the cache with
+; a PW lock.
+;
+;--
+	.ENTRY	BLOCK_AST,^M<R4,R5,R10>
+	MOVL	4(AP), R4		; AST parameter is BLB address.
+	BSBB	SETUP			; Setup R4, R5, and R10.
+
+;
+; Note that the fact the BDB is checked out prior to checking the DFW
+; flag is assuming that those pointers in the BLB are not being mucked
+; with after CACHE clears the DFW flag and prior to the time the lock
+; is converted or DEQ'd in RELEASE.
+;
+
+	BBCC	#BLB$V_DFW,-		; Check if BLB is being accessed
+		BLB$B_BLBFLGS(R4),-	; already for lock access, and if
+		SETWRTBCK		; so, simply set writeback flag.
+	ASSUME	IFB$B_BID EQ IRB$B_BID
+	CMPB	IFB$B_BID(R10), #IFB$C_BID ; Is this an ifab?
+	BEQL	WRTBCK
+	CMPB	IRB$B_BID(R10), #IRB$C_BID ; Then this better be an irab.
+	BNEQ	BADOWN			; If not, then complain.
+	ASSUME	IRB$L_IFAB_LNK EQ 0
+	MOVL	(R10), R10		; Get ifab address into R10 then.
+WRTBCK:
+	MOVZWL	IFB$W_CHNL(R10), R0	; Get channel into R0.
+	MOVZWL	BDB$W_NUMB(R5), R1	; Get size of buffer into R1.
+	MOVL	BDB$L_ADDR(R5), R10	; Address of buffer.
+
+	$QIO_S	EFN = #IMP$C_ASYQIOEFN,- ; Initiate write to disk.
+		CHAN = R0,-
+		FUNC = #IO$_WRITEVBLK,-
+		IOSB = BDB$L_IOSB(R5),-
+		ASTADR = BLKASTFIN,-
+		ASTPRM = R4,-
+		P1 = (R10),-
+		P2 = R1,-
+		P3 = BDB$L_VBN(R5)
+	BLBC	R0, WBQIOERR		; Branch if qio failed.
+
+SETWRTBCK:
+	BISB2	#BLB$M_WRITEBACK,-	; Note buffer writeback necessary,
+		BLB$B_BLBFLGS(R4)	; in progress, or attempted.
+	RET				; Exit from the blocking AST.
+
+WBQIOERR:
+
+;
+; An error has occured attempting to write back the dirty buffer.
+; Note the error in the status block (as an aid to figuring out what
+; happened if everyone gets stuck), reset DFW and set WRITEBACK
+; so that any further accessors try to write this buffer again
+; and hopefully it works then, or at least someone will see another error.
+; Until some operation touches this buffer and releases the lock,
+; other processes attempting to access this buffer are stuck.
+; Expected problem here is lack of AST quota.
+;
+
+	MOVL	R0, BDB$L_IOSB(R5)	; This might be handy in a dump.
+	BISB2	#BLB$M_DFW, BLB$B_BLBFLGS(R4) ; Set DFW on again so further
+					; accessors don't stall waiting for
+					; a write back that won't happen.
+	BRB	SETWRTBCK		; Set writeback flag and exit.
+
+;++
+; SETUP
+;
+; Setup registers and verify structures.
+;
+; Input:
+;	R4 - BLB address
+;		BLB$L_BDB_ADDR
+;		BLB$L_OWNER
+;
+; Output:
+;	R4 - BLB
+;	R5 - BDB
+;	R10 - owner
+;
+; Bugcheck if BLB not a BLB or BDB not a BDB.  Owner not checked.
+;
+;--
+
+SETUP:
+	ASSUME	<BLB$B_BID + 1> EQ BLB$B_BLN
+	CMPW	BLB$B_BID(R4),-		; Verify this is really a BLB
+		#<BLB$C_BID +<BLB$C_BLN/4@8>> ; by checking BID and BLN fields.
+	BNEQ	10$			; Bugcheck if no good.
+	MOVL	BLB$L_BDB_ADDR(R4), R5	; Get BDB address.
+	ASSUME	<BDB$B_BID + 1> EQ BDB$B_BLN
+	CMPW	BDB$B_BID(R5),-		; Verify this is a BDB
+		#<BDB$C_BID +<BDB$C_BLN/4@8>> ; by checking BID and BLN fields.
+	BNEQ	20$			; NEQ then BDB not right.
+	MOVL	BLB$L_OWNER(R4), R10	; Assume owner is the ifab.
+	RSB				; Return.
+10$:
+	RMSPBUG	FTL$_BADBLB		; BLB is bad.
+20$:
+	RMSPBUG	FTL$_BADBDB		; BDB is bad.
+BADOWN:
+	RMSPBUG	FTL$_BADOWNER		; Owner field no good.
+
+
+;++
+; BLKASTFIN
+;
+; This is the completion routine for the deferred write back qio.
+;
+;--
+
+	.ENTRY	BLKASTFIN, ^M<R4,R5,R9,R10>
+	BSBW	RM$BLKFINCHK		; Check for AST's inhibited.
+	MOVL	R9, R4			; Want BLB addr into R4.
+	BSBB	SETUP			; Setup R4, R5, and R10.
+	BICB2	#BDB$M_DRT, BDB$B_FLGS(R5) ; Clear dirty.
+	BICB2	#BLB$M_DFW, BLB$B_BLBFLGS(R4) ; Not dfw anymore.
+
+;
+; The LOCK flag is being used here to indicate that a thread has
+; stalled after finding the DFW flag clear on a DFW BLB.
+;
+
+	BBSC	#BLB$V_LOCK,-		; Br if necessary to start thread.
+		BLB$B_BLBFLGS(R4), STARTTHREAD
+	ASSUME	IFB$B_BID EQ IRB$B_BID
+	CMPB	IRB$B_BID(R10), #IRB$C_BID ; Is this an irab?
+	BEQL	CLRWRTBCK		; Don't convert lock if so.
+	CMPB	IFB$B_BID(R10), #IFB$C_BID ; It should be an ifab then.
+	BNEQ	BADOWN			; Bugcheck if not an ifab.
+	TSTW	BDB$W_USERS(R5)		; Any other streams have this accessed?
+	BNEQ	DQ			; Branch if so.
+CONVNL:
+	$ENQ_S	EFN = #IMP$C_ASYQIOEFN,- ; Convert the lock to NL.
+		LKMODE = #LCK$K_NLMODE,-
+		LKSB = BLB$W_LKSTS(R4),-
+		FLAGS = #LCK$M_SYSTEM!LCK$M_CONVERT!LCK$M_SYNCSTS
+	CLRL	BLB$L_OWNER(R4)		; No owner anymore.
+	ASSUME	LCK$K_NLMODE EQ 0
+	CLRB	BLB$B_MODEHELD(R4)	; NL lock held now.
+CLRWRTBCK:
+	BICB2	#BLB$M_WRITEBACK,-	; Clear writeback flag.
+		BLB$B_BLBFLGS(R4)
+SETASTDCL:
+	BISB2	#BDB$M_AST_DCL,-	; Note writeback has occurred.
+		BDB$B_FLGS(R5)
+	RET				; And exit.
+STARTTHREAD:
+
+;
+; Starting a stalled thread.
+; Declare the AST, then convert the lock.
+;
+
+	$DCLAST_S ASTADR = RM$STALLAST,- ; Declare AST to start stalled thread.
+		ASTPRM = BLB$L_OWNER(R4)
+	BRB	CONVNL			; And exit.
+DQ:
+
+;
+; Other streams have this buffer accessed.  Setup registers correctly and
+; branch into release code that will dequeue the lock entirely.
+;
+
+	MOVL	R4, R2			; BLB expected in R2.
+	MOVL	R5, R4			; BDB expected in R4.
+	PUSHAB	SETASTDCL		; Release will RSB back.
+	CLRL	-(SP)			; No release flags.
+	BRW	DEQ1			; Go do it.
+	.END

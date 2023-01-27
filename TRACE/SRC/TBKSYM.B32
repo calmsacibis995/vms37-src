@@ -1,0 +1,483 @@
+MODULE TBKSYM (	IDENT = 'V03-000' ) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	TRACEBACK
+!
+! ABSTRACT:
+!	This module contains all routines used by
+!	traceback which actually look at the DST.
+!	These routines interface to reality via
+!	those in TBKINT.B32
+!
+! Version	1.0
+!
+! ENVIRONMENT:
+!	This module runs on VAX under VAX/VMS, user mode, non-AST level.
+!
+! Author:
+!	Kevin Pammett, Creation Date: 18-jan-78.
+!
+! MODIFIED BY:
+!		Dale Roedger, 09 November 1978
+!
+! Revision History:
+!
+!	02	24-feb-78	KGP	-EXC_TYPE has to be an OWN so that
+!					 we only initialize it once.
+!	03	28-FEB-78	KGP	-SYMBOLIZE is now truly NOVALUE and
+!					 it works OK if the DST doesn't exist.
+!	04	2-mar-78	KGP	-Beginning exception_type for
+!					 FTN PC correlation is now decided
+!					 in BAS (is no longer local to DPC)
+!					-We reject a symbolization for which
+!					 the relative PC == absolute PC
+!					 i.e. symbols whose value is 0.
+!	05	8-MAR-78	KGP	-NEW REQUIRE FILE NAMES
+!	06	10-mar-78	KGP	-SYMBOLIZE now knows about end-of-RTN
+!					 entries and uses this to know about
+!					 the length of ROUTINES.
+!	07	14-mar-78	KGP	-Call to PC_TO_LINE now has
+!					 one less parameter.
+!	08	26-APR-78	DAR	Modified require and library directives
+!					for native build.
+!	09	15-JUN-78	DAR	Changed all DBG$ symbols to TBK$.
+!	1.01	09-NOV-78	DAR	Added new DST types _EPT and _R11,
+!					and modified output for COBOL
+! 1.02	3-NOV-79	JBD	Added statement number support.
+! 1.03	14-jan-80	JBD	Added nested routine support.
+! 1.04	28-Jan-80	JBD	Fixed some nesting problems. Was corrupting
+!				the best routine.
+!--
+
+! Table of contents:
+!
+FORWARD ROUTINE
+	TBK$SYMBOLIZE : NOVALUE;
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+
+REQUIRE 'SRC$:TBKPCT.REQ';
+REQUIRE 'SRC$:TBKGEN.REQ';
+REQUIRE 'SRC$:TBKRST.REQ';
+REQUIRE 'SRC$:TBKSER.REQ';
+
+!
+! MACROS:
+!
+
+!
+! EQUATED SYMBOLS:
+!
+LITERAL
+	TBK_ANY		= 0,	! Turn on if any diagnostics are on.
+	TBK_SYM1	= 0,	! Specific output in TBK$SYMBOLIZE
+	TBK_SYM2	= 0,	! List DSTs in TBK$SYMBOLIZE
+	TBK_SYM3	= 0;	! How to symbolize.
+LITERAL
+	MAX_NEST_DEPTH	= 100;	! Maximum number of nested routines to
+				! reliably traceback.
+
+%IF TBK_ANY
+%THEN
+FORWARD ROUTINE
+	PR_CS : NOVALUE;		! Routine to print diagnostics during
+					! debug of traceback
+%FI
+
+!
+! OWN STORAGE:
+!
+
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+	tbk$pc_to_line,			! FORTRAN PC-to-line_number correlation.
+	tbk$get_dst_rec,		! Make a certain DST record available.
+	tbk$get_nxt_dst,		! Make the next DST record available.
+	tbk$positon_dst;		! Make a certain DST record available
+					!   and set up for tbk$get_nxt_dst
+
+
+EXTERNAL
+	TBK$GL_EXC_TYPE,		! Initial FAULT/TRAP type for PC
+					! correlation.
+	TBK$MODULE_CS : CS_POINTER,
+	TBK$ROUTINE_CS : CS_POINTER,
+	TBK$GL_STMT,
+	TBK$GL_LINE,
+	TBK$REL_PC,
+
+	TBK$MODULE_DST : REF DST_RECORD;
+
+GLOBAL ROUTINE tbk$symbolize(value) : NOVALUE =
+
+!++
+! Functional Specification:
+!
+!	Given a (supposed) PC value, look thru the
+!	entire DST (of TBT records only) and find the best
+!	possible symbolization for it.
+!
+! Routine Value:
+!	NOVALUE
+!
+! Side Effects:
+!
+!	The entire DST is scanned.
+!	GLOBAL variables are used for communication with
+!	other traceback routines.
+!--
+BEGIN
+	LOCAL
+		RTN_RCD,			! Type of last routine record
+		current_rtn : ref dst_record,
+		IN_MODULE : REF DST_RECORD,
+		BEST_VALUE,
+		BEST_DST : REF DST_RECORD,
+		BEST_MODULE : REF DST_RECORD,
+		nt_count,
+		DST_REC_ID,
+		DST_RECRD : REF DST_RECORD,
+		RTN_NEST_VECTOR : VECTOR[MAX_NEST_DEPTH],
+		RTN_NESTING;
+
+%IF TBK_SYM3
+%THEN
+	$FAO_TT_OUT('symbolize !XL as ',.value);
+%FI
+	! Assume that no symbolization can be found.
+	! Also, explicitly remove all previous
+	! symbolizations so that what is left set after
+	! this one definately referrs to this symbolization.
+
+	BEST_MODULE = 0;
+	BEST_VALUE = 0;
+	current_rtn = 0;
+	TBK$MODULE_CS = 0;
+	TBK$ROUTINE_CS = 0;
+	TBK$GL_STMT = TBK$GL_LINE = 0;
+	TBK$REL_PC = .value;
+	TBK$MODULE_DST = 0;
+
+	! Position the DST to the beginning.
+
+	IF( NOT TBK$POSITON_DST(0) )
+	THEN
+		RETURN;
+
+	RTN_NESTING = 0;
+	RTN_NEST_VECTOR[.RTN_NESTING] = 0;
+
+	WHILE( (DST_RECRD = TBK$GET_NXT_DST( DST_REC_ID )) NEQ 0 )
+		DO
+		BEGIN
+
+		! Process each record depending on its DST type.
+%IF TBK_SYM2
+%THEN
+		! For diagnostic purposes we list out the entire record.
+
+		IF( .DST_RECRD[DSTR_TYPE] EQL DSC$K_DTYPE_MOD)
+		THEN
+			BEGIN
+			$FAO_TT_OUT('MC for module ');
+			pr_cs(dst_recrd[dstr_name]);
+			end;
+		$FAO_TT_OUT( 'DST Rec Id=!XL, is at !XL, for !UD bytes.',
+			.DST_REC_ID, .DST_RECRD, .DST_RECRD[ DSTR_SIZE ] );
+
+		! Dump the record in bytes.
+
+		INCR I FROM 0 TO .DST_RECRD[ DSTR_SIZE ]
+			DO
+			$FAO_TT_OUT('!XB ',.DST_RECRD[ .I, 0, 8, 0 ] );
+
+%FI
+
+		CASE .DST_RECRD[ DSTR_TYPE ] FROM DST_DST_LOWEST TO DST_DST_HIGHEST OF
+
+		    SET
+
+		    [DSC$K_DTYPE_MOD]:	! Module Begin Record.
+
+			BEGIN
+			IN_MODULE = .DST_RECRD;
+			END;
+
+		    [DSC$K_DTYPE_EOM]:	! Module End Record.
+
+			BEGIN
+			IN_MODULE = 0;
+			END;
+
+		    [DSC$K_DTYPE_RTN]:		! Routine DSTs.
+
+			BEGIN
+			LOCAL
+				RBEGIN;	! Address where routine begins.
+
+			RTN_RCD = .DST_RECRD[DSTR_TYPE];
+			current_rtn = .dst_recrd;
+			RBEGIN = .DST_RECRD[ DSTR_VALUE ];
+			IF .RTN_NESTING LSS MAX_NEST_DEPTH
+			THEN
+				BEGIN		! Push current routine.
+%IF TBK_SYM1 %THEN
+				$FAO_TT_OUT('Pushing routine !XL', .current_rtn);
+				$FAO_TT_OUT('	index: !SL', .rtn_nesting);
+%FI
+				RTN_NEST_VECTOR[.RTN_NESTING] = .CURRENT_RTN;
+				RTN_NESTING = .RTN_NESTING + 1;
+				END;
+
+%IF TBK_SYM1
+%THEN
+			$FAO_TT_OUT('routine begins: !XL',.RBEGIN);
+%FI
+			END;
+
+		    [DSC$K_DTYPE_LBL,	! label or literal
+		     DSC$K_DTYPE_SLB,	! labels.
+		     DSC$K_DTYPE_EPT,	! Entry point records.
+		     DSC$K_DTYPE_DPC,	! delta-PC tables.
+		     DSC$K_DTYPE_R11,	! Thread / line correlation tables.
+		     DSC$K_DTYPE_FLD]:	! FIELD records.
+
+					;	! These records are not used in TRACEBACK.
+
+		    [DSC$K_DTYPE_EOR]:		! End of Routine
+			BEGIN
+			! When we hit an end-of-routine record, we check the
+			! start and ending addresses of the routine at the
+			! top of the stack. If the PC is within these addresses,
+			! then this is the routine we want.
+			LOCAL
+				RBEGIN;		! Address where routine begins
+
+			! Note that the current routine is always the top of
+			! the stack.
+			CURRENT_RTN = .RTN_NEST_VECTOR[.RTN_NESTING - 1];
+			RBEGIN = .CURRENT_RTN[DSTR_VALUE];
+%IF TBK_SYM1 %THEN
+			IF( .CURRENT_RTN NEQ 0 )
+			THEN
+				$FAO_TT_OUT('routine ends at !XL',
+					.dst_recrd[ dstr_value ] + .current_rtn[ dstr_value ]);
+%FI
+
+
+			! Now see if this routine contains the PC (.VALUE)
+			IF .value LEQA .RBEGIN + .dst_recrd[dstr_value]
+			AND .RBEGIN LEQA .VALUE
+			THEN
+				BEGIN	! This routine contains the PC. Mark it.
+				best_module = .IN_MODULE;
+				best_value = .RBEGIN;
+				best_dst = .CURRENT_RTN;
+				EXITLOOP;
+				END;
+
+			! If we got this far, then the PC is not within the
+			! current routine. So we POP the routine from the
+			! stack.
+			IF .RTN_NESTING GTR 0
+			THEN
+				BEGIN		! Pop the last routine
+				RTN_NESTING = .RTN_NESTING - 1;
+				RTN_NEST_VECTOR[.RTN_NESTING] = 0;
+
+				CURRENT_RTN = .RTN_NEST_VECTOR[.RTN_NESTING];
+%IF TBK_SYM1 %THEN
+				$FAO_TT_OUT('Popped to routine !XL', .CURRENT_RTN);
+				$FAO_TT_OUT('	index !SL', .RTN_NESTING);
+%FI
+				END;
+
+			RTN_RCD = .DST_RECRD[DSTR_TYPE];
+			END;
+
+		    [DSC$K_DTYPE_PCT]:	! Psect DSTs.
+			BEGIN
+			LOCAL
+				PBEGIN,
+				PEND;
+			BIND
+			    PSECT_LENGTH
+					=	! Pick up the field length, which
+						! is after the NAME so must be
+						! dynamically located.
+
+					(.DST_RECRD[ DSTR_NAME ]	! The symbol-name count,
+					+ DST_RECRD[ DSTR_NAME ]	!  plus its address,
+					+ 1 ) : LONG;			!  addresses the LENGTH.
+
+			PBEGIN = .DST_RECRD[ DSTR_VALUE ];
+			PEND = .DST_RECRD[ DSTR_VALUE ] + .PSECT_LENGTH +1;
+%IF TBK_SYM1
+%THEN
+			$FAO_TT_OUT('PSECT begins: !XL, ends !XL',
+				.PBEGIN,.PEND);
+%FI
+			IF( (.PBEGIN LEQA .VALUE)
+			   AND
+			    (.PEND GEQA .VALUE)
+			   AND
+			    (.pbegin GTRA 0 )
+			  )
+			THEN
+				! Adopt the new one only if it is
+				! better than a previous match.
+
+				IF( .PBEGIN GEQA .BEST_VALUE )
+				THEN
+					BEGIN
+		
+					! This P-sect is better so adopt it.
+
+					BEST_MODULE = .IN_MODULE;
+					BEST_VALUE = .PBEGIN;
+					BEST_DST = .DST_RECRD;
+					END;
+			END;
+	
+		    [INRANGE] :
+			BEGIN
+			0;		! Other types of records get ignored
+			END;
+
+		    [OUTRANGE]:
+
+			BEGIN
+
+			! The only reason for not making the "SRM types"
+			! part of the above CASE is because of the huge
+			! case table which gets generated otherwise.
+
+			IF( .DST_RECRD[ DSTR_TYPE ] EQL DSC$K_DTYPE_Z )
+			THEN
+				BEGIN
+
+				! BLISS type ZERO records.
+				! Whatever symbol this is, it contributes
+				! a name, for sure, and either a literal
+				! or a static.  We assume the worst!
+
+				NT_COUNT = .NT_COUNT +1;
+				END
+			ELSE
+			IF( .DST_RECRD[ DSTR_TYPE ] LEQ DST_TYP_HIGHEST )
+						AND
+			  ( .DST_RECRD[ DSTR_TYPE ] GEQ DST_TYP_LOWEST )
+			THEN
+				BEGIN
+
+				! These types are candidates for
+				! the LVT and NT tables only.
+
+				NT_COUNT = .NT_COUNT +1;
+				END;
+
+			END;
+		    TES;
+
+		! Go back and process the next DST record.
+
+		END;
+
+%IF TBK_SYM3
+%THEN
+	IF( .BEST_MODULE NEQ 0 )
+	THEN
+		$FAO_TT_OUT(' module !AC, symbol !AC, + !XL',
+			best_module[DSTR_NAME],
+			best_dst[ dstr_name ],
+			.value - .best_value)
+	ELSE
+		$FAO_TT_OUT('*****');
+%FI
+	! Pass back info via the TBK globals.
+
+	IF( .BEST_MODULE NEQ 0 )
+	THEN
+		BEGIN
+		TBK$MODULE_DST = .BEST_MODULE;
+		!+
+		! Try to translate this PC into its 
+		! corresponding %line number.
+		!-
+		IF NOT TBK$PC_TO_LINE (.VALUE, .BEST_DST, .TBK$GL_EXC_TYPE, TBK$GL_LINE, TBK$GL_STMT)
+		THEN			! Make sure we don't print a meaningless
+		    TBK$GL_STMT = tbk$gl_line = 0;    ! line number later on.
+
+		TBK$MODULE_CS = BEST_MODULE[ DSTR_NAME ];
+
+		TBK$ROUTINE_CS = BEST_DST[ DSTR_NAME ];
+		TBK$REL_PC = .VALUE - .BEST_VALUE;
+		END;
+
+	RETURN;		! The values are returned via globals.
+END;
+
+%IF TBK_ANY
+%THEN
+	! This routine is only used by DEBUGging output routines.
+
+ROUTINE PR_CS( ADDR )  : NOVALUE =
+
+
+!++
+! Functional Description:
+!	Print out a counted string in an
+!	unambiguous way for debugging purposes.
+!--
+
+BEGIN
+	MAP
+		ADDR : REF VECTOR[,BYTE];
+
+	! Don't get fooled!
+
+	IF( .ADDR EQL 0 )
+	THEN
+		$FAO_TT_OUT( '**** PR_CS AT 0 **** ' )
+	ELSE
+		$FAO_TT_OUT( 'Name(!UB.): "!AC".  ' , .ADDR[0], ADDR[0] );
+END;
+
+%FI
+
+END				!End of module
+ELUDOM

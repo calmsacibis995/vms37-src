@@ -1,0 +1,1902 @@
+	.TITLE	XF$DRSUP -- DR32 SUPPORT ROUTINES
+	.IDENT	'V03-001'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY:	DR32 SUPPORT ROUTINES
+;
+; ABSTRACT:
+;	Provide high-level language interface to DR32
+;
+; ENVIRONMENT:	USER MODE LIBRARY ROUTINES
+;
+; MODIFIED BY:
+;
+;	V03-001 SBL3001		Steven B. Lionel	30-Mar-1982
+;		Change module name to XF$DRSUP.  Make PRE_AST, GET_ADDR
+;		and DEVICE_FAB local symbols.
+;
+;	V02-004 PRD0006		Paul R. DeStefano	1-Mar-1982
+;		Correct symbols LIB$GET_VM in ALOCCMD and LIB$FREE_VM in
+;		XF$CLEANUP.  Symbols were not position independent.
+;
+;	V02-003	TCM0002		Trudy C. Matthews	6-Jul-1981
+;		In XF$GETPKT, correct the instruction that stores the
+;		function code in the user supplied argument to only store
+;		a word instead of a longword.
+;
+;	V02-002	TCM0001		Trudy C. Matthews	15-Jun-1981
+;		In ALOCCMD, correct algorithm that initializes free command
+;		memory pointers.
+;
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; MACROS:
+;
+	$SSDEF				;define status returns
+	$XFDEF				;DR32-specific definitions
+	$$DRDEFS			;support routine definitions
+	$CTXDEF				;offsets into contxt array
+	$IODEF				;I0 status definitions
+	$SHRDEF				;shared status definitions
+
+;macro DEFAULT_TEST tests for defaulted FORTRAN-procedure arguments
+
+	.MACRO	DEFAULT_TEST	ARGPOS, LABEL1, LABEL2
+;ARGPOS contains the position of an argument in the argument list
+
+	CMPL	(AP), #ARGPOS		;arg given?
+	BLSS	LABEL1			;argument was not supplied
+	TSTL	<ARGPOS*4>(AP)		;if address = 0
+	BEQL	LABEL2			;argument was defaulted
+	.ENDM	DEFAULT_TEST
+
+;macro QRETRY executes an interlocked queue instruction and retries
+;if failure.
+;INPUTS:
+;	OPCODE = opcode name: INSQHI, INSQTI, REMQHI, REMQTI
+;	OPERAND1 = first operand for opcode
+;	OPERAND2 = second operand for opcode
+;	SUCCESS = label to branch to if operation succeeds
+;	ERROR = label to branch to if operation fails
+;OUTPUTS:
+;	R0 is destroyed
+
+	.MACRO	QRETRY	OPCODE,OPERAND1,OPERAND2,SUCCESS,ERROR,?LOOP,?OK
+	CLRL	R0
+LOOP:
+	OPCODE	OPERAND1, OPERAND2
+	.IF NB 	SUCCESS			;"C" bit clear <=> success
+	BCC	SUCCESS
+	.IFF
+	BCC	OK
+	.ENDC
+	AOBLSS	#RETRY_LIMIT, R0, LOOP	;queue is interlocked. Retry.
+	.IF NB ERROR
+	BRB	ERROR			;retry limit exceeded and queue
+	.ENDC				;is still locked. Assume error.
+OK:
+	.ENDM	QRETRY
+
+;
+; REGISTER CONVENTIONS:
+;	R6 : address of CONTXT array
+;	R7 : address of current command packet
+;	R10: address of command block
+;
+
+	.SBTTL	XF$SETUP
+;++
+;CONTXT ARRAY:
+
+;	 31			      0
+;	+-------------------------------+
+;	|				|  :CTX$Q_IOSB
+;	+--    I/O status block       --+
+;	|				|
+;	+-------------------------------+
+;	|   device and command control	|  :CTX$L_CONTROL
+;	+-------------------------------+
+;	|  	buffer size		|  :CTX$L_BYTECNT
+;	+-------------------------------+
+;	|	buffer address		|  :CTX$L_BFRVA
+;	+-------------------------------+
+;	|  residual memory byte count	|  :CTX$L_MEMCNT
+;	+-------------------------------+
+;	|   residual DDI byte count	|  :CTX$L_DDICNT
+;	+-------------------------------+
+;	|  DR32 status longword (DSL)	|  :CTX$L_DSL
+;	+-------------------------------+
+;	|    size of command block      |  :CTX$L_CMDSIZ   :CTX$B_CMDTBL
+;	+-------------------------------+
+;	|   address of command block    |  :CTX$L_CMDBLK
+;	+-------------------------------+
+;	|     size of data block	|  :CTX$L_DATASIZ
+;	+-------------------------------+
+;	|    address of data block	|  :CTX$L_DATABLK
+;	+-------------------------------+
+;	| address of pre- AST routine	|  :CTX$L_PRE_AST
+;	+-------------------------------+
+;	|     pre- AST parameter	|  :CTX$L_PRE_PARM
+;	+-------------------------------+  
+;	|		| flags	| datart|  :CTX$B_DATART  CTX$B_FLAGS
+;	+-------------------------------+
+;	| addr to receive addr of gobit |  :CTX$L_GOBITADR
+;	+-------------------------------+
+;	| event flag #	| # of buffers	|  :CTX$W_NUMBUF  :CTX$W_EFN
+;	+-------------------------------+
+;	| address of packet AST routine |  :CTX$L_PKTAST
+;	+-------------------------------+
+;	|   packet AST parameter	|  :CTX$L_ASTPARM
+;	+-------------------------------+
+;	| size of each buffer in BARRAY |  :CTX$L_BUFSIZ
+;	+-------------------------------+
+;	|   address of IDEVMSG array    |  :CTX$L_IDEVMSG
+;	+-------------------------------+
+;	|   address of ILOGMSG array    |  :CTX$L_ILOGMSG
+;	+-------------------------------+
+;	|size of IDEVMSG|size of ILOGMSG|  :CTX$W_ILOGSIZ :CTX$W_IDEVSIZ
+;	+-------------------------------+
+;	| address of free memory list	|  :CTX$L_FREELIST
+;	+-------------------------------+
+;		note: CONTXT offsets are defined in $CTXDEF
+
+; FUNCTIONAL DESCRIPTION:
+;
+;	(1) allocates command area
+;	(2) allocates and initializes hardware queue headers
+;	(3) initializes free command memory list
+;	(4) initializes many fields in the CONTXT array
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/G	XF$SETUP (contxt, barray, bufsiz, numbuf, [idevmsg], -
+;			  [idevsiz], [ilogmsg], [ilogsiz], [cmdsiz], -
+;			  [status])
+;
+; INPUT PARAMETERS:
+;    offsets to AP:
+	CONTXT = 4	;a  50-word array that contains context and
+			;status information concerning the current 
+			;transfer
+	BARRAY = 8	;base address of data area
+	BUFSIZ = 12	;the size in bytes of each buffer in BARRAY
+	NUMBUF = 16	;the number of buffers in BARRAY
+	IDEVMSG = 20	;array to receive input device messages
+	IDEVSIZ = 24	;size in bytes of device message array
+	ILOGMSG = 28	;array to receive input log messages
+	ILOGSIZ = 32	;size in bytes of log message array
+	CMDSIZ = 36	;size of command area to allocate
+;
+; OUTPUT PARAMETERS:
+;
+	STATUS = 40	;a longword array to receive status of call
+;
+; IMPLICIT OUTPUTS:
+;
+;	fields in CONTXT:	CTX$L_BUFSIZ
+;				CTX$L_CMDBLK
+;				CTX$L_CMDSIZ
+;				CTX$L_DATABLK
+;				CTX$L_DATASIZ
+;				CTX$L_IDEVMSG
+;				CTX$W_IDEVSIZ
+;				CTX$L_ILOGMSG
+;				CTX$W_ILOGSIZ
+;				CTX$W_NUMBUF
+;
+; COMPLETION CODES:
+;
+;	(1) SS$_NORMAL		normal successful completion
+;	(2) SS$_BADPARAM	invalid input argument
+;	(3) error status returns from LIB$GET_VM
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+	.PSECT	_XF$CODE	SHR,PIC,EXE,NOWRT
+
+	.ENTRY	XF$SETUP	^M<R2,R3,R6>
+
+;store input parameters in CONTXT array
+
+	MOVZWL	#SS$_BADPARAM, R0	;set R0 for possible error 
+					;return
+	CMPL	(AP), #4		;4 obligatory parameters
+	BGEQ	10$
+	BRW	FINISH			;needed parameter defaulted
+10$:	MOVL	CONTXT(AP), R6		;R6 contains address of CONTXT
+					;array
+	MOVL	BARRAY(AP), CTX$L_DATABLK(R6)	;address of buf array
+	MOVW	@NUMBUF(AP), CTX$W_NUMBUF(R6)	;number of buffers
+	MOVL	@BUFSIZ(AP), CTX$L_BUFSIZ(R6)	;size of each buffer
+
+;determine size of data area, and store in CONTXT
+
+	MOVZWL	CTX$W_NUMBUF(R6), R2	;R2 <- # of buffers in BARRAY
+	MULL3	 R2, -				;number of buffers X
+		CTX$L_BUFSIZ(R6), -		;size of each buffer
+		CTX$L_DATASIZ(R6)
+
+;store addresses and sizes of arrays to receive input messages
+
+MSG_ARRAYS:
+	CLRQ	CTX$L_IDEVMSG(R6)	;zero addresses of device and
+					;log message arrays
+	CLRL	CTX$W_ILOGSIZ(R6)	;assume sizes of device and
+					;log message arrays = 0
+
+	DEFAULT_TEST	<IDEVMSG/4>, 10$, 10$
+				;if IDEVMSG defaulted, goto 10$
+	MOVL	IDEVMSG(AP), CTX$L_IDEVMSG(R6)
+					;store addr of IDEVMSG array
+	DEFAULT_TEST	<IDEVSIZ/4>, 10$, 10$
+				;if IDEVSIZ defaulted, goto 10$
+	MOVW	@IDEVSIZ(AP), CTX$W_IDEVSIZ(R6)
+					;store size of IDEVMSG array
+10$:	DEFAULT_TEST	<ILOGMSG/4>, CMDSIZ_TEST, CMDSIZ_TEST
+				;if ILOGMSG defaulted, goto CMDSIZ_TEST
+	MOVL	ILOGMSG(AP), CTX$L_ILOGMSG(R6)
+					;store addr of ILOGMSG array
+	DEFAULT_TEST	<ILOGSIZ/4>, CMDSIZ_TEST, CMDSIZ_TEST
+				;if ILOGSIZ defaulted, goto CMDSIZ_TEST
+	MOVW	@ILOGSIZ(AP), CTX$W_ILOGSIZ(R6)
+					;store size of ILOGSIZ array
+
+
+CMDSIZ_TEST:
+;determine size of command area , and store in CONTXT
+
+	DEFAULT_TEST	<CMDSIZ/4>, COMSIZ, COMSIZ	
+					;was size of command block given
+					;if not, goto COMSIZ
+
+	ADDL3	#24, @CMDSIZ(AP), CTX$L_CMDSIZ(R6)	;yes, add space
+					;for queue headers,
+					;and store in CONTXT
+	BRB	ALOC
+
+;default command size = NUMBUF * (size of fixed portion of command
+;packet + idevsiz + ilogsiz) * arbitrary constant ( originally = 3)
+
+COMSIZ:
+	CLRL	R3
+	ADDW3	CTX$W_IDEVSIZ(R6), -	;this sum will be <= 256
+		CTX$W_ILOGSIZ(R6), R3
+	ADDL2	#XF$B_PKT_DEVMSG, R3	;add in fixed portion of packet
+	MULL3	R2, R3, CTX$L_CMDSIZ(R6) ;R2 = NUMBUF
+	MULL2	#CMDSIZ_K, CTX$L_CMDSIZ(R6)	;multiply by constant
+
+;intialize the addr of the addr of the go bit in CONTXT now so that
+;XF$PKTBLD may be called before XF$STARTDEV.  It will be initialized
+;again in XF$STARTDEV; this is a dummy initialization.
+
+ALOC:
+	MOVAL	<CTX$B_CMDTBL + XF$B_CMT_FLAGS>(R6),-	;request go bit
+		<CTX$B_CMDTBL + XF$L_CMT_GBITAD>(R6)	;addr in here
+
+;All input parameters have been stored.  Now allocate and initialize
+;command area.
+
+	BSBB	ALOCCMD			;allocate command area
+					;and initialize queue heads
+					;status returned in R0
+FINISH:
+	DEFAULT_TEST	<STATUS/4>, END, END	;was status arg given?
+					;if not, branch to END
+	MOVL	R0, @STATUS(AP)		;yes, store status return
+
+END:	RET
+
+	.SBTTL	ALOCCMD -- ALLOCATE COMMAND AREA 
+;			   AND INITIALIZE HARDWARE QUEUES
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called by XF$SETUP to dynamically allocate the
+;	virtual memory that will be used as the command block during a 
+;	DR32 data transfer.  If successful, it initializes the first 3
+;	quadwords as headers of the INPUT, TERMINATION, and FREE queues.
+;	When this routine exits, command memory looks like:
+;	31		      0
+;	+-----------------------+
+;	|     INPTQ FLINK	|  :CMD$L_INPTQ
+;	+-----------------------+
+;	|     INPTQ BLINK	|
+;	+-----------------------+
+;	|     TERMQ FLINK	|  :CMD$L_TERMQ
+;	+-----------------------+
+;	|     TERMQ BLINK	|
+;	+-----------------------+
+;	|     FREEQ FLINK	|  :CMD$L_FREEQ
+;	+-----------------------+
+;	|     FREEQ BLINK	|
+;	+-----------------------+
+;	|	   0		|  :first longword of command space
+;	+-----------------------+
+;	| size of packet memory	|
+;	+-----------------------+
+;	|	   .		|
+;	|	   .		|
+;	| memory available to	|
+;	|  build command packets|
+;	|	   .		|
+;	|	   .		|
+;	+-----------------------+
+;
+; CALLING SEQUENCE:
+;
+;	BSBB	ALOCCMD
+;	BSBW	ALOCCMD
+;			called by XF$SETUP
+;
+
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT INPUTS:
+;
+;	address of CONTXT array in R6
+;	CONTXT fields used as inputs:	CTX$L_CMDSIZ
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;
+;	fields in CONTXT:
+;		CTX$L_CMDBLK	address of allocated command area
+;		CTX$L_FREELIST	address of first longword on free list
+;
+; COMPLETION CODES:
+;
+;	R0 contains status of call to LIB$GET_VM
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+
+
+ALOCCMD:
+	PUSHL	R10			;save register
+
+;round size of command area up to next page boundary before allocating
+
+	ADDL2	#PAGEMASK, CTX$L_CMDSIZ(R6)	;increase size past
+						;next boundary
+	BICW	#PAGEMASK, CTX$L_CMDSIZ(R6)	;truncate back to 
+						;multuple
+
+;allocate command area
+
+	PUSHAL	 CTX$L_CMDBLK(R6)		;receives address of
+						;allocated area
+	PUSHAL	CTX$L_CMDSIZ(R6)		;size to allocate
+	CALLS	#2, G^LIB$GET_VM		;get virtual memory
+	BLBC	R0, 10$				;error check
+
+;initialize hardware queues 
+
+	MOVL	CTX$L_CMDBLK(R6), R10		;R10 points to beginning
+						;of command block
+	CLRQ	CMD$L_INPTQ(R10)		;initialize queue head
+	CLRQ	CMD$L_TERMQ(R10)		;initialize
+	CLRQ	CMD$L_FREEQ(R10)		;initialize queue head
+
+;initialize list of free memory chunks
+
+	MOVAL	<CMD$L_FREEQ+8>(R10),-	;FREELIST points to 
+		CTX$L_FREELIST(R6)	;first available blk of memory
+
+;The amount of command block memory available for building packets =
+;the size of command area - space reserved for queue heads.
+
+	SUBL3	#24,CTX$L_CMDSIZ(R6), -	;store size of initially
+		<CMD$L_FREEQ+12>(R10)	;available command memory
+	CLRL	@CTX$L_FREELIST(R6)	;initialize free block pointer
+10$:	POPR	#^M<R10>
+	RSB
+
+	.SBTTL	XF$STARTDEV -- START DEVICE
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	(1) build command table required by Startdata QIO
+;	(2) assign a channel to the device
+;	(3) issue the Startdata QIO
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/G	XF$STARTDEV (CONTXT, DEVNAM,  [PKTAST], [ASTPARM], 
+;			      [EFN], [MODES], [DATART], [STATUS])
+;
+; INPUT PARAMETERS:
+;
+; offsets to AP:
+	CONTXT = 4		;address of CONTXT array
+	DEVNAM = 8		;character string; device name of DR32
+	PKTAST = 12		;address of packet AST
+	ASTPARM = 16		;address of AST parameter
+	EFN = 20		;event flag associated with transfer
+	MODES = 24		;contains several switches
+	DATART = 28		;data rate of transfer
+;
+; IMPLICIT INPUTS:
+;
+;fields in the CONTXT array:
+;	CTX$L_CMDBLK
+;	CTX$L_CMDSIZ
+;	CTX$L_DATABLK
+;	CTX$L_DATASIZ
+;
+; OUTPUT PARAMETERS:
+;
+	STATUS = 32		;optional status return
+;
+; IMPLICIT OUTPUTS:
+;
+;	various fields in the CONTXT array
+;
+; COMPLETION CODES:
+;
+;	(1) SS$_NORMAL		normal successful completion
+;	(2) SS$_BADPARAM	needed parameter defaulted
+;	(3) error returns from:
+;		$CREATE
+;		$QIO
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+
+	.PSECT	_XF$DATA	NOEXE
+DEVICE_FAB:
+	$FAB	FOP = UFO			;User File Open option
+
+
+	.PSECT	_XF$CODE	EXE,NOWRT,SHR,PIC
+	.ENTRY	XF$STARTDEV	^M<R2,R3,R6>
+
+	MOVL	CONTXT(AP), R6		;R6 <- addr of CONTXT
+
+;++
+;Two of the device-dependent parameters of the Startdata QIO are the
+;address and the size of a 'command table'.
+;The format of this command table is:
+;	 31			      0
+;	+-------------------------------+
+;	|    size of command block	|  :XF$L_CMT_CBLKSIZ
+;	+-------------------------------+
+;	|   address of command block	|  :XF$L_CMT_CBLKAD
+;	+-------------------------------+
+;	|     size of data block	|  :XF$L_CMT_BBLKSIZ
+;	+-------------------------------+
+;	|    address of data block	|  :XF$L_CMT_BBLKAD
+;	+-------------------------------+
+;	| address of packet AST routine |  :XF$L_CMT_PASTAD
+;	+-------------------------------+
+;	|   packet AST parameter	|  :XF$L_CMT_PASTPM
+;	+-------------------------------+
+;	|		| flags | datart|  :XF$B_CMT_RATE  :XF$B_CMT_FLAGS
+;	+-------------------------------+  
+;	|addr to receive addr of go bit |  :XF$L_CMT_GBITAD
+;	+-------------------------------+
+;
+;This command table is embedded in the CONTXT array 
+; (offset: CTX$B_CMDTBL).  The first 4 longwords have already been
+;initialized by XF$SETUP.  Now build the remainder of the table.
+;--
+
+	CLRQ	<CTX$B_CMDTBL + XF$L_CMT_PASTAD>(R6)	;zero AST fields
+	CLRQ	CTX$L_PKTAST(R6)
+	CLRB	<CTX$B_CMDTBL + XF$B_CMT_FLAGS>(R6)	;flags default
+	MOVZBW	#EFN_DEF, CTX$W_EFN(R6)	;assume event flag # defaulted
+	MOVAL	<CTX$B_CMDTBL + XF$L_CMT_GBITAD>(R6),-	;request go bit
+		<CTX$B_CMDTBL + XF$L_CMT_GBITAD>(R6)	;addr in here
+
+
+
+;++
+;Determine if an AST routine is supplied.  If so, store in the 
+;command table the address of a pre- AST routine, which is part of the
+;support package.  This pre- AST routine will take the AST, and after
+;some checks call the user AST routine.  The AST parameter in the
+;command table will point to 2 longwords elsewhere in the CONTXT
+;array, which will contain the address of the user AST routine and its
+;parameter.
+;--
+PKTAST_TEST:
+	DEFAULT_TEST	<PKTAST/4>, ASSIGN_CHN, EFN_TEST
+	MOVAL	PRE_AST,-		;put pre- AST routine address in
+		<CTX$B_CMDTBL + XF$L_CMT_PASTAD>(R6) ;command table
+	MOVAL	CTX$L_PKTAST(R6), -	;pre- AST parm is a pointer to
+		<CTX$B_CMDTBL + XF$L_CMT_PASTPM>(R6) ;user AST address
+	MOVL	PKTAST(AP), -		;put user AST addr into CONTXT 
+		CTX$L_PKTAST(R6)
+	DEFAULT_TEST	<ASTPARM/4>, ASSIGN_CHN, EFN_TEST
+	MOVL	@ASTPARM(AP), -		;put user AST parm in CONTXT
+		CTX$L_ASTPARM(R6)
+
+EFN_TEST:
+	DEFAULT_TEST	<EFN/4>, ASSIGN_CHN, MODE_TEST
+	MOVW	@EFN(AP), CTX$W_EFN(R6)	;put event flag # in CONTXT
+
+MODE_TEST:
+	DEFAULT_TEST	<MODES/4>, ASSIGN_CHN, DATART_TEST
+	MOVB	@MODES(AP),-		;put flags into command table
+		<CTX$B_CMDTBL + XF$B_CMT_FLAGS>(R6)
+
+DATART_TEST:
+	DEFAULT_TEST	<DATART/4>, ASSIGN_CHN, ASSIGN_CHN
+					;if < 3 args, goto ASSIGN_CHN
+	MOVB	@DATART(AP), -		;put data rate into cmd table
+		<CTX$B_CMDTBL + XF$B_CMT_RATE>(R6)
+	BISB	#XF$M_CMT_SETRTE, -	;set data rate bit in FLAGS var
+		<CTX$B_CMDTBL+XF$B_CMT_FLAGS>(R6)	;of cmd table
+;++
+;The command table is now complete.
+;Assign a channel to the DR32.  The RMS $CREATE service with the User
+;File Open option in the FOP field of the FAB is nothing more than a
+;glorified assign channel, but it buys you multiple levels of logical
+;name translation.
+;--
+
+;initialize the FAB with the device name supplied by the caller
+
+ASSIGN_CHN:
+	DEFAULT_TEST	<DEVNAM/4>, BADPARM, BADPARM
+	MOVAL	DEVICE_FAB, R3		;R3 <- addr of FAB
+	MOVL	DEVNAM(AP), R2		;R2 <- addr of devnam descriptor
+
+;++
+;The address of the FORTRAN character string descriptor is in R2.
+;The descriptor looks like:
+;	+-------------------------------+
+;	|   size of char string array	|  :(R2)
+;	+-------------------------------+
+;	|  address of character string	|
+;	+-------------------------------+
+;
+;If the statically declared size of the array is larger than the actual
+;string, the string will be padded with blanks.  Find the true size of
+;the character string before assigning the channel.
+;--
+	MOVL	4(R2), FAB$L_FNA(R3)	;move addr of char string to FAB
+	LOCC	#^O40, (R2), @FAB$L_FNA(R3) ;find first blank
+	SUBL2	FAB$L_FNA(R3), R1	;R1 <- length of char string
+	MOVB	R1, FAB$B_FNS(R3)	;move size of string into FAB
+	$CREATE	FAB = DEVICE_FAB	;returns channel # in STV field
+	BLBC	R0, STAT		;store error status
+
+;issue QIO specifying evf to be set on every packet interrupt
+
+10$:	$QIO_S	EFN = CTX$W_EFN(R6), -
+		CHAN = FAB$L_STV(R3), -
+		FUNC = #IO$_STARTDATA!IO$M_SETEVF, -
+		IOSB = CTX$Q_IOSB(R6), -	;also embedded in CONTXT
+		ASTADR = @CTX$L_PRE_AST(R6), -	;packet AST address
+		ASTPRM = CTX$L_PRE_PARM(R6), -
+		P1 = CTX$B_CMDTBL(R6), -	;addr of command table
+		P2 = #XF$K_CMT_LENGTH		;size of command table
+	BRB	STAT			;R0 contains status of QIO call
+
+BADPARM:
+	MOVZWL	#SS$_BADPARAM, R0	;needed argument defaulted
+STAT:
+	DEFAULT_TEST	<STATUS/4>, END_STARTDEV, END_STARTDEV
+	MOVL	R0, @STATUS(AP)		;store status
+END_STARTDEV:
+	RET
+
+	.SBTTL	PRE_AST -- pre - user AST routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	Check if the AST routine is interrupting  critical code in the
+;	main routine; that is, if it could leave the list of free 
+;	memory in an invalid state.
+;	If so, turn off AST's, reschedule this AST, and return.
+;	If not, call the user - specified AST routine.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/G PRE_AST (ASTPARM)
+;
+; INPUT PARAMETERS:
+;
+;	ASTPARM	points to two consecutive longwords containing
+;	the address of the user's AST and the user ASTPARM.
+;
+; IMPLICIT INPUTS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+PRE_AST:
+	.WORD	0
+	MOVL	4(AP), R1		;R1 <- addr of quadword 
+					;containing addr of PKTAST
+					;and ASTPARM
+	BBSC	#CRITICAL_BIT, R1, -	;determine if interrupting
+		IMMEDIATE_EXIT		;critical code; if so, exit
+;++
+;all OK; call user AST-level routine
+;--
+
+	PUSHL	20(AP)			;saved PSL
+	PUSHL	16(AP)			;saved PC
+	PUSHL	12(AP)			;saved R1
+	PUSHL	8(AP)			;saved R0
+	PUSHL	4(R1)			;user AST-level parameter
+	CALLS	#5, @(R1)		;call user AST-level routine
+	BRB	END_PRE_AST
+;++
+;Come here if interrupted main routine during critical code. 
+;Disable AST's and reschedule this AST.
+;The main level routine will re-enable AST's when it exits the
+;critical section of code.
+;--
+IMMEDIATE_EXIT:
+	$SETAST_S	#0		;disable AST's
+	$DCLAST_S	PRE_AST, R1	;reschedule this AST
+
+END_PRE_AST:
+	RET
+
+	.SBTTL	XF$PKTBLD
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	(1) finds # of bytes needed for command packet
+;	(2) searches freelist to find space for packet and allocates it
+;	(3) builds command packet
+;	(4) puts it on input queue
+;	(5) sets 'go' bit
+;
+;		format of a command packet:
+;	 31			       0
+;	+-------------------------------+
+;	| self - relative forward link  |	  
+;	+-------------------------------+
+;	| self - relative backward link |
+;	+-------------------------------+
+;	|pktctl |cmdctl |loglen |msglen |  :(see below)
+;	+-------------------------------+
+;	|   byte count			|  :XF$L_PKT_BFRSIZ
+;	+-------------------------------+
+;	|    virtual address of buffer  |  :XF$L_PKT_BFRADR
+;	+-------------------------------+
+;	|  residual memory byte count	|  :XF$L_PKT_RMBCNT
+;	+-------------------------------+
+;	|  residual DDI byte count	|  :XF$L_PKT_RDBCNT
+;	+-------------------------------+
+;	|  DR32 Status Longword (DSL)	|  :XF$L_PKT_DSL
+;	+-------------------------------+
+;	|  DR - device message		|  :XF$B_PKT_DEVMSG
+;	| 	//	//	//	|
+;	+-------------------------------+
+;	|	log area		|
+;	|	//	//	//	|
+;	+-------------------------------+
+;	|  address of ACTION routine    |
+;	+-------------------------------+
+;	|  address of ACTION parameter  |
+;	+-------------------------------+
+;
+;	The log area and ACTION fields have no symbolic offset because
+;	the length of the device message field is variable.  The third
+;	longword of the command packet looks like this:
+;
+;	 8			      0
+;	+------------------------------+
+;	| length of device message     |  :XF$B_PKT_MSGLEN
+;	+------------------------------+
+;	|   length of log area         |  :XF$B_PKT_LOGLEN
+;	+------------------------------+
+;	| command control (function)   |  :XF$B_PKT_CMDCTL
+;	+------------------------------+
+;	|  packet control byte         |  :XF$B_PKT_PKTCTL
+;	+------------------------------+
+
+; CALLING SEQUENCE:
+;
+;	CALLS/G	XF$PKTBLD (contxt, func, [index], [difsize], [devmsg],
+;			[devsiz], [logsiz], [modes], [action],
+;			[actparm], [status])
+;
+; INPUT PARAMETERS:
+;
+;offsets to AP
+
+	CONTXT = 4		;context array
+	FUNC = 8		;a word containing a legal DR function
+	INDEX = 12		;the index of a buffer in BARRAY
+	DIFSIZE = 16		;alternate byte count
+	DEVMSG = 20		;location of a device message
+	DEVSIZ = 24		;size of device message in bytes
+	LOGSIZ = 28		;amt of space to reserve for log msg
+	MODES = 32		;flags and control bits to go in pkt
+	ACTION = 36		;address of an ACTION routine
+	ACTPARM = 40		;address of ACTION routine parameter
+;
+; OUTPUT PARAMETERS:
+;
+	STATUS = 44		;optional status returns (see below)
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	(1) SS$_NORMAL		normal successful completion
+;	(2) SS$_BADPARAM	input parameter error
+;	(3) SS$_BADQUEUEHDR		INPUT queue interlock timeout
+;	(4) SS$_INSFMEM		not enough space to build packet
+;	(5) SHR$_NOCMDMEM	command memory not allocated
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+
+	.ENTRY	XF$PKTBLD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+;a command packet is divided into distinct areas
+;    1. hardware portion
+;	a. fixed length
+;	b. variable length
+;    2. software portion
+
+;both the hardware and the software portions must be allocated command
+;space; however, only the size of the hardware portion will be made 
+;known to the DR32 hardware
+
+;the majority of packet information is contained in the hardware-fixed
+;portion of the command packet.  The hardware-variable portion has two
+;optional variable-length fields -- the device message field
+;and the log message field.  These fields can be from 0 - 256
+;bytes; however, they must be an integer number of longwords.
+;the software portion of the command packet contains the address of the
+;ACTION routine(if specified) and the address of its parameter
+;ACTPARM (if specified)
+
+;in this section of code:
+;	R2 will accumulate the total # of bytes for the command packet
+
+;compute total size of command packet by determining lengths of
+;variable-length and optional fields
+
+	MOVZBL	#32, R2			;initialize R2 with # bytes in
+					;hardware-fixed potion of packet
+	CLRQ	R8			;initialize device message and
+	CLRQ	R3			;log area sizes to 0
+
+;if < 5 arguments, R2 contains total size of packet--goto BITS
+;if DEVSIZ was defaulted, branch to LOGSIZE
+	DEFAULT_TEST	<DEVSIZ/4>, BITS, LOGSIZE
+					;was size of device msg given?
+	MOVZWL	@DEVSIZ(AP), R3		;yes, round DEVSIZ up to
+					;longword boundary
+	ADDL3	#QUADWORD_MASK, R3, R8
+	BICL	#QUADWORD_MASK, R8
+	CMPW	R8, #256		;is size of dev msg > 256?
+	BLEQU	10$			;no, branch around error
+	BRW	INVALID_ARG		;yes, error
+10$:	ADDL2	R8, R2			; add size to byte count
+;R3 contains the actual size of the device message
+;R8 contains the size rounded up to the next longword boundary
+
+
+;if < 6 arguments supplied, R2 contains total size-- goto BITS
+;if LOGSIZ was defaulted, branch to see if ACTION routine was given
+LOGSIZE:
+	DEFAULT_TEST	<LOGSIZ/4>, BITS, ACTION_ROUTINE
+					;was size of log message given?
+
+	MOVZWL	@LOGSIZ(AP), R4		;yes, round LOGSIZ up to
+					;longword boundary
+	ADDL3	#QUADWORD_MASK, R4, R9
+	BICL	#QUADWORD_MASK, R9
+	CMPW	R9, #256		;is size of log msg > 256 bytes?
+	BLEQU	GO			;no, branch around error path
+BR:	BRW	INVALID_ARG		;yes, error
+GO:	ADDL2	R9,R2			; no, add size to byte count
+;R4 contains the actual size of the space reserved for log message
+;R9 contains the size rounded up to the next longword boundary
+
+ACTION_ROUTINE:
+	DEFAULT_TEST	<ACTION/4>, BITS, BITS
+					;was ACTION routine given?
+					;if no, branch to BITS
+	ADDL2	#8, R2			;yes,add 4 bytes for ACTION addr
+					; + 4 bytes for ACTPARM address
+
+
+;at this point:
+;	R2 contains the number of bytes needed for command packet
+
+BITS:	
+	MOVL	CONTXT(AP), R6		;address of CONTXT array in R6
+	MOVL	CTX$L_CMDBLK(R6), R10	;R10 <- addr of command block
+	BNEQ	2$			;is command area allocated?
+	BRW	TRANSFER_HALTED		;no, return error
+2$:	MOVAL	CTX$L_FREELIST(R6), R1	;R1 <- addr of freelist head
+
+	BSBW	XF$$ALOCPKT		;input: # bytes in R2
+					;	freelist head in R1
+					;output: addr of pkt in R1
+	BLBS	R0, 5$			;test low bit for error
+	BRW	NO_MEM			;not enough space
+
+5$:	MOVL	R1, R7			;preserve addr of packet from
+					;destruction by MOVC5
+	MOVL	R2, R11			;save size of packet
+
+;now build the packet
+
+;first compute the addresses of and insert the variable-length fields
+;	R7:  address of command packet
+;	R3:  actual size of device message (in bytes)
+;	R8: size of device msg, rounded up to next longword boundary
+;	R4: actual size of log area (in bytes)
+;	R9: size of log area, rounded up to next longword boundary
+
+NEXT:	MOVB	R3, XF$B_PKT_MSGLEN(R7)	;put size of dev msg
+					;into packet
+	MOVB	R4, XF$B_PKT_LOGLEN(R7)	;put in size of log area
+	MOVB	#MODES_DEFAULT, XF$B_PKT_PKTCTL(R7)
+					;put default MODES into packet
+
+;size of device message is in packet, now put the message itself in
+	DEFAULT_TEST	<DEVMSG/4>, FUNC_FIELD, FUNC_FIELD
+					;if no dev msg, goto FUNC_FIELD
+
+;move device message into packet, filling with 0's to next longword
+;boundary
+	MOVC5	R3, @DEVMSG(AP), #0, R8, XF$B_PKT_DEVMSG(R7)
+
+;add the size of the fixed portion of the command packet to the sizes
+;of the device and log message fields to get the byte offset from the
+;beginning of the command packet to the ACTION routine field
+
+FUNC_FIELD:
+
+	MOVAB	XF$B_PKT_DEVMSG(R8)[R9], R8 ;R8 <- offset of ACTION 
+
+;insert fixed-length arguments in the order they were supplied
+
+	DEFAULT_TEST	<FUNC/4>, INV, INV
+					;if FUNC defaulted, goto
+					;INVALID_ARG
+	CMPW	@FUNC(AP), #15		;function codes are from 0:15
+	BLEQU	OK			;branch around error path
+INV:	BRW	INVALID_ARG		;invalid function code
+OK:	MOVB	@FUNC(AP), XF$B_PKT_CMDCTL(R7)
+					;insert function code
+					;high bits must be zero
+
+INDEX_FIELD:
+	CLRQ	XF$L_PKT_BFRSIZ(R7)	;clear byte count & buffer addr
+					;(assume no data transfer)
+	DEFAULT_TEST	<INDEX/4>, FIELDS_DONE, MODES_FIELD
+					;if < 3 args goto FIELDS_DONE
+					;else if defaulted goto MODES_FI
+	MOVZWL	@INDEX(AP), R1		;R1 <- index of buffer
+	BEQL	INV			;index of 0 is invalid
+	CMPW	R1, CTX$W_NUMBUF(R6)	;index > number of buffers?
+	BGTRU	INV			;yes, invalid buffer index
+	DECL	R1			;R1 <- buffer offset from base
+					;of buffer array
+	MULL2	CTX$L_BUFSIZ(R6), R1	;R1 <- byte offset from base of
+					;buffer array of this buffer
+	ADDL3	CTX$L_DATABLK(R6), R1,-	
+		XF$L_PKT_BFRADR(R7)	;put buffer addr into packet
+	DEFAULT_TEST	<DIFSIZE/4>, 10$, 10$
+	MOVL	@DIFSIZE(AP), XF$L_PKT_BFRSIZ(R7)
+					;alternate transfer byte count
+	BRB	MODES_FIELD
+10$:	MOVL	CTX$L_BUFSIZ(R6), XF$L_PKT_BFRSIZ(R7)
+					;standard transfer byte count
+
+MODES_FIELD:
+	DEFAULT_TEST	<MODES/4>, FIELDS_DONE, ACTION_FIELD
+					;if MODES is defaulted, goto
+					; 	FIELDS_DONE
+					;default MODES already in pkt
+	MOVB	@MODES(AP), XF$B_PKT_PKTCTL(R7)
+					;sets	(1) interrupt control
+					;	(2)length error bit
+					;	(3) pkt control bits
+					;to user-supplied values
+
+ACTION_FIELD:
+	DEFAULT_TEST	<ACTION/4>, FIELDS_DONE, FIELDS_DONE
+	BISB2	#XF$M_PKT_ACTBIT, -	;set "ACTION routine given" bit
+		XF$B_PKT_PKTCTL(R7)	;in packet control field of pkt
+;R8 contains byte offset from beginning of command packet to ACTION
+;routine field of packet
+
+	ADDL2	R7, R8			;R8 <- addr of ACTION field
+	MOVL	ACTION(AP), (R8)+	;put addr of ACTION routine into
+					;packet
+
+	DEFAULT_TEST <ACTPARM/4>, HT, HT	;if ACTPARM defaulted, 
+						;goto HT
+	MOVL 	ACTPARM(AP), (R8)	;put addr of ACTPARM in pkt
+
+
+;the packet is now completely built and ready to be put on the INPUT q.
+HT:					;Insert pkt at head or tail
+					;of input queue?
+	BBC	#XF$V_PKT_HT, @MODES(AP),-
+		INSERT_AT_TAIL		;clear bit <==> tail
+INSERT_AT_HEAD:
+;R10 contains the address of the command block
+
+	QRETRY -
+	INSQHI	(R7), CMD$L_INPTQ(R10) -;attempt insertion
+		SUCCESS = SET_GO_BIT -
+		ERROR = Q_FAILURE	;exceeded retry limit
+
+FIELDS_DONE:
+INSERT_AT_TAIL:
+	QRETRY -
+	INSQTI	(R7), CMD$L_INPTQ(R10) -;attempt insertion at tail
+		ERROR = Q_FAILURE	;exceeded retry limit
+
+SET_GO_BIT:
+
+	MOVB	#1, @<CTX$B_CMDTBL+XF$L_CMT_GBITAD>(R6)
+					;notify the Dr that there is a
+					;packet on the INPUT queue
+
+	MOVZWL	#SS$_NORMAL, R0		;success status return
+	BRB	STORE_STAT		;branch around error paths
+INVALID_ARG:
+	MOVZWL	#SS$_BADPARAM, R0	;input parameter error
+	BRB	DEALLOCATE
+Q_FAILURE:
+	MOVZWL	#SS$_BADQUEUEHDR, R0	;interlocked queue timeout
+DEALLOCATE:				;inputs to XF$$DEALOCPKT:
+	MOVAL	CTX$L_FREELIST(R6), R1	;R1: address of freelist head
+	MOVL	R11, R3			;R3: size of packet in bytes
+					;R7: address of packet
+	BSBB	XF$$DEALOCPKT		;deallocate the packet
+	BRB	STORE_STAT
+NO_MEM:
+	MOVZWL	#SS$_INSFMEM, R0	;not enough space to build pkt
+	BRB	STORE_STAT
+TRANSFER_HALTED:
+	MOVZWL	#SHR$_NOCMDMEM, R0	;command memory not allocated
+STORE_STAT:
+	DEFAULT_TEST	<STATUS/4>, END_PKTBLD, END_PKTBLD
+					;was STATUS arg given?
+	MOVL	R0, @STATUS(AP)	;yes, store status return
+END_PKTBLD:
+	RET
+
+	.SBTTL	XF$$ALOCPKT -- ALLOCATE A COMMAND PACKET 
+;			       	AND RETURN ITS ADDRESS
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called by XF$PKTBLD to allocate a command 
+;	packet.  It searches the list of free chunks of command
+;	space to find the required amount of memory.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	XF$$ALOCPKT
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT INPUTS:
+;
+;	R1 contains the address of a pointer to the free list
+;	R2 contains the number of bytes needed for packet
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;
+;	R1 contains the address of the allocated packet
+;
+; COMPLETION CODES:
+;
+;	returned in R0 : not enough memory available
+;			 1 = sucess
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+XF$$ALOCPKT::				;allocate memory
+	PUSHR	#^M<R2,R3>
+
+;Since command packets must be quadword aligned, the allocation 
+;granularity of each packet is 8 bytes.
+
+	ADDL2	#GRANULARITY, R2	;round size up to next
+	BICL2	#GRANULARITY, R2	;quadword boundary
+	MOVL	R1, R0			;copy address of first free
+					;block address
+	BISB2	#CRITICAL_MASK, -	;set bit in AST parm to indicate
+		<CTX$B_CMDTBL+XF$L_CMT_PASTPM>(R6)
+					;"entering critical code"
+;Find a piece of memory large enough for requested allocation.
+
+10$:	MOVL	R0, R1			;save addr of previous free blk
+	MOVL	(R1), R0		;get addr of next free block
+	BEQL	END_ALOCPKT		;if equal no memory available
+	CMPL	R2, 4(R0)		;free block big enough?
+	BGTRU	10$			;no, go try next block
+
+;free block found
+
+	BEQL	EQUAL			;if eql free block is exact size
+
+;Free block is bigger than requested allocation.  Allocate what was
+;asked for and put remainder of block back on free list.
+
+	ADDL3	R0, R2, R3		;R3 <- addr of new free block
+
+	MOVL	(R0)+, (R3)+		;copy link to new free block
+	SUBL3	R2, (R0), (R3)		;calc size of new free block
+	MOVAL	-(R3), -(R0)		;set link to new free block
+
+;Remove block from free list.
+EQUAL:
+	MOVL	(R0), (R1)		;copy link to new free block
+	MOVAB	(R0)+, R1		;R1 <- addr of allocated blk
+					;R0 indicates success
+	BBSC	#CRITICAL_BIT, -	;did AST interrupt critical code
+		<CTX$B_CMDTBL+XF$L_CMT_PASTPM>(R6), -
+		END_ALOCPKT		;if not, branch to END_ALOCPKT
+	$SETAST_S	#1		;if so, the AST routine disabled
+					;AST's and rescheduled itself,so
+					;upon exiting critical code,
+					;re-enable AST's
+END_ALOCPKT:
+	POPR	#^M<R2,R3>
+	RSB
+
+	.SBTTL	XF$$DEALOCPKT -- DEALLOCATE COMMAND PACKET
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called by XF$GETPKT and XF$PKTBLD to return
+;	the memory used for a command packet.  It searches the list
+;	of free blocks of memory to find where to return the packet
+;	memory, and agglomerates the returned memory with adjacent
+;	blocks if possible.
+;
+; CALLING SEQUENCE:
+;
+;	NONE
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT INPUTS:
+;
+;	R1 = address of allocation region listhead
+;	R3 = size of blocks in bytes
+;	R7 = address of block to be deallocated
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	NONE
+;
+; SIDE EFFECTS:
+;
+;	R1, R3, and R7 are destroyed
+;
+;--
+
+XF$$DEALOCPKT::
+	PUSHL	R2
+	ADDL2	#GRANULARITY, R3	;round size up to next
+	BICL2	#GRANULARITY, R3	;quadword boundary
+	BISB2	#CRITICAL_MASK, -	;set bit in AST parm to indicate
+		<CTX$B_CMDTBL+XF$L_CMT_PASTPM>(R6)
+					;"entering critical code"
+
+;Find where in free list to return the memory.
+
+10$:	MOVL	R1, R2			;R2 <- addr of prev free block
+	MOVL	(R2), R1		;R1 <- addr of next free block
+	BEQL	20$			;if equal, end of list
+	CMPL	R7, R1			;block logically go here?
+	BGTRU	10$			;no, keep looking
+
+;Determine of returned memory can be agglomerated with the block of
+;memory immediately following it.
+
+20$:	MOVL	R1, (R7)		;assume no agglomeration
+	ADDL3	R7, R3, -(SP)		;calculate addr of end of block
+	CMPL	R1, (SP)+		;end of block = next in list?
+	BNEQ	30$			;if neq do not agglomerate
+	MOVL	(R1)+, (R7)		;move link to block being freed
+	ADDL2	(R1), R3		;R3 <- length of new free block
+
+;Determine if returned memory can be agglomerated with the block of
+;memory immediately preceeding it.
+
+30$:	PUSHL	R2			;calc end addr of previos block
+	MOVL	R7, (R2)+		;assume no agglomeration
+	ADDL2	(R2), (SP)		;add length to block base addr
+	CMPL	R7, (SP)+		;end addr = block being freed?
+	BNEQ	40$			;no, do not agglomerate blocks
+	ADDL2	(R2), R3		;R3 <- size of new free block
+	MOVL	(R7), -(R2)		;move link to previous free blk
+	MOVL	R2, R7			;set addr of new free block
+
+40$:	MOVL	R3, 4(R7)		;set size of free block
+	BBSC	#CRITICAL_BIT, -	;did AST interrupt critical code
+		<CTX$B_CMDTBL+XF$L_CMT_PASTPM>(R6), -
+		END_DEALOCPKT
+	$SETAST_S	#1		;if so, the AST routine disabled
+					;AST's and rescheduled itself,so
+					;upon exiting critical code,
+					;re-enable AST's
+
+END_DEALOCPKT:
+	POPR	#^M<R2>
+	RSB
+
+	.SBTTL	XF$FREESET -- PUT PACKETS ON FREEQ
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	Determine the size of the packets to be released onto the FREE
+;	queue according to input arguments.  Then build the number of
+;	packets specified and release them onto the FREE queue.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/G	 XF$FREESET(contxt, [numpkt], [intctrl], [action], -
+;				[actparm], [status])
+;
+; INPUT PARAMETERS:
+;
+;offsets to AP:
+	CONTXT = 4		;context array
+	NUMPKT = 8		;number of packets to put on FREEQ
+	INTCTRL = 12		;interrupt control bits to put in pkt
+	ACTION = 16		;address of ACTION routine
+	ACTPARM = 20		;address of ACTION parameter
+;
+; IMPLICIT INPUTS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;offsets to AP:
+	STATUS = 24		;status returns (see completion codes)
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	(1) SS$_NORMAL		normal successful completion
+;	(2) SS$_BADQUEUEHDR		INPUT queue interlock timeout
+;	(3) SS$_INSFMEM		not enough memory to build packet
+;	(4) SHR$_NOCMDMEM	command memory is not allocated
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+	.ENTRY	XF$FREESET	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10>
+	MOVL	CONTXT(AP), R6		;R6 <- addr of CONTXT
+	MOVL	CTX$L_CMDBLK(R6), R10	;R10 <- addr of command area
+	BNEQ	FIND_SIZE		;if addr of command area = 0,
+					;transfer is halted
+	BRW	TRANS_HALTED		;error path
+
+
+
+;++
+;determine the size of the packets to be released onto the FREEQ by
+;looking at the input arguments
+;--
+
+;find size of field to reserve for device message
+
+FIND_SIZE:
+	MOVZWL	CTX$W_IDEVSIZ(R6), R2	;R2 <- size of dev msg
+	ADDL2	#QUADWORD_MASK, R2	;round up to quadword boundary
+	BICL	#QUADWORD_MASK, R2	;R2 <- size of devmsg field
+	ADDL2	#32, R2			;R2 <- size of command packet
+
+;determine if ACTION routine and ACTPARM are to be put in command pkt
+
+	MOVL	R2, R7			;R7 <- offset of ACTION routine
+	CLRQ	R3			;assume no ACTION or ACTPARM
+	DEFAULT_TEST	<ACTION/4>, 5$, 5$
+					;if defaulted, goto 5$
+	MOVL	ACTION(AP), R3		;R3 <- addr of ACTION routine
+	ADDL2	#8, R2			;add sizes of ACTION and ACTPARM
+					;to total packet size
+	DEFAULT_TEST	<ACTPARM/4>, 5$, 5$
+					;if defaulted, goto 5$
+	MOVL	ACTPARM(AP), R4	;R4 <- addr of ACTPARM
+
+;find the interrupt control bits to be put in packet
+
+5$:	MOVZBL	#INT_DEFAULT, R8	;default interrupt ctrl setting
+	DEFAULT_TEST	<INTCTRL/4>, 10$, 10$
+					;if defaulted goto 10$
+	MOVB	@INTCTRL(AP), R8	;R8 <- interrupt control bits
+
+;find the number of packets to be put onto the FREEQ
+
+10$:	MOVZBL	#1, R5			;default # of pkts to put on 
+					;FREEQ
+	DEFAULT_TEST	<NUMPKT/4>, ANOTHER_PKT, ANOTHER_PKT
+					;if defaulted goto ANOTHER_PKT
+	MOVZWL	@NUMPKT(AP), R5		;R5 <- # of pkts to put on queue
+
+;++
+;build a packet
+;--
+ANOTHER_PKT:
+	MOVAL	CTX$L_FREELIST(R6), R1	;R1 <- addr of ptr to freelist
+	BSBW	XF$$ALOCPKT		;input: size of pkt in R2
+					;	freelist ptr in R1
+					;returns addr of pkt in R1
+	BLBC	R0, NOT_MEM		;not enough memory to build in
+	PUSHR	#^M<R1,R2,R3,R4,R5>	;preserve from MOVC5
+	MOVC5	#0, DUMMY_ADR, #0, R2, (R1)	;zero the packet
+	POPR	#^M<R1,R2,R3,R4,R5>	;restore registers
+
+;put address of ACTION routine and addr of ACTPARM into packet
+;R3 contains addr of ACTION routine, R4 contains addr of parameter
+;R7 contains offset from beginning of packet to ACTION routine field
+
+	TSTL	R3			;addr of ACTION routine
+	BEQL	5$			;no ACTION routine if addr = 0
+	MOVAB	(R1)[R7], R9		; R9 <- addr of ACTION field
+	MOVQ	R3, (R9)		;put ACTION and ACTPARM in pkt
+	BISB2	#XF$M_PKT_ACTBIT, -	;set "ACTION routine given" bit
+		XF$B_PKT_PKTCTL(R1)	;in packet control field of pkt
+
+;insert interrupt control bits into packet
+
+5$:	INSV	R8, #XF$V_PKT_INTCTL,-	;put interrupt control bits
+		#XF$S_PKT_INTCTL, XF$B_PKT_PKTCTL(R1)	;into packet
+
+;put size of device message into packet
+
+	MOVB	CTX$W_IDEVSIZ(R6), XF$B_PKT_MSGLEN(R1)
+
+;put packet onto FREEQ
+
+	QRETRY -
+	INSQTI	(R1), CMD$L_FREEQ(R10) -;attempt to insert packet
+		ERROR = BAD_QUEUE	;exceeded retry limit
+
+A_OK:					;packet is on queue
+
+	SOBGTR	R5, ANOTHER_PKT		;go do another packet
+
+
+
+;++
+;all the packets have been successfully inserted onto the FREEQ
+;--
+
+	MOVZWL	#SS$_NORMAL, R0		;success status return
+	BRB	END_FREESET
+
+BAD_QUEUE:
+	MOVZWL	#SS$_BADQUEUEHDR, R0	;interlock timeout
+	BRB	END_FREESET
+NOT_MEM:
+	MOVZWL	#SS$_INSFMEM, R0	;not enough command space
+	BRB	END_FREESET
+TRANS_HALTED:
+	MOVZWL	#SHR$_NOCMDMEM, R0	;transfer halted; command 
+					;space deallocated
+END_FREESET:
+	DEFAULT_TEST	<STATUS/4>, 10$, 10$
+	MOVL	R0, @STATUS(AP)		;store status
+10$:	RET
+
+	.SBTTL	XF$GETPKT -- GET A PACKET
+;			     FROM THE TERMINATION QUEUE
+;++
+; FUNCIONAL DESCRIPTION:
+;
+;	Attempt to remove a packet from the TERMQ. If successful, break
+;the packet up into its various fields and return them to the caller. If
+;an ACTION routine is specified in the packet, call it.  Finally, return
+;the memory that was used to build this packet.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/G	XF$GETPKT (contxt, [waitflg], [func], [index], -
+;			   [devflag], [logflag], [status])
+;
+; INPUT PARAMETERS:
+;
+;offsets to AP:
+	CONTXT = 4		;context array
+	WAITFLG = 8		;wait for event flag/immediate return
+;
+; IMPLICIT INPUTS:
+;
+;fields in the CONTXT array:
+;	CTX$L_DATABLK
+;	CTX$W_NUMBUF
+;	CTX$L_IDEVMSG
+;	CTX$L_IDEVSIZ
+;	CTX$L_ILOGMSG
+;	CTX$L_ILOGSIZ
+;
+; OUTPUT PARAMETERS:
+;
+;offsets to AP:
+	FUNC = 12		;function specified in packet
+	INDEX = 16		;buffer index specified in packet
+	DEVFLAG = 20		;set if device message in packet
+	LOGFLAG = 24		;set if log message in packet
+	STATUS = 28		;status return
+;
+; IMPLICIT OUTPUTS:
+;
+;fields in the CONTXT array:
+;	CTX$L_MEMCNT
+;	CTX$L_DDICNT
+;	CTX$L_DSL
+;
+
+; COMPLETION CODES:
+;
+;	(1) SS$_NORMAL		normal successful completion
+;	(2) SS$_BADQUEUEHDR		TERM queue interlocked timeout
+;	(3) SHR$_HALTED		XF$CLEANUP was called
+;	(4) SHR$_QEMPTY(=0)	no packet, but transfer still going
+;	(5) SHR$_NOCMDMEM	no command memory was allocated at the
+;				time of the call to this routine
+;	(6) status of ACTION routine
+;		XF$GETPKT's status is an input to the ACTION routine.
+;		The ACTION routine may overwrite the status argument 
+;		with a status return of its own.
+;
+; SIDE EFFECTS:
+;
+;	If XF$CLEANUP was called, neither the command packets nor the
+;	queues are any longer accessible.
+;
+;--
+
+
+	.ENTRY	XF$GETPKT	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	MOVL	CONTXT(AP), R6		;R6 <- addr of CONTXT
+
+	CLRL	R2			;assume WAITFLG defaulted
+	DEFAULT_TEST	<WAITFLG/4>, 10$, 10$
+					;default is event flag wait
+	MOVZBL	@WAITFLG(AP), R2	;input to GET_ADDR
+10$:	BSBW	GET_ADDR		;returns addr of pkt in R7, if
+					;there is  a pkt on TERMQ
+	BLBS	R0, DISSECT_PKT		;status returned in R0
+	BRW	STORE_STATUS		;error in removing pkt
+					;from TERMQ
+
+
+;++
+;come here if successfully removed a packet from TERMQ
+;
+;give the user as many command packet fields as he supplied variables
+;to hold
+;--
+DISSECT_PKT:
+
+;++
+;compute sizes of device and log message fields
+;
+;the "actual size" of the device message is the number of bytes 
+;specified by the DEVSIZ argument in the call to XF$PKTBLD.  This is the
+;value stored in the XF$B_PKT_MSGLEN field of the packet.
+;the "packet size" of the device message refers to the fact that the
+;device message field is 0-filled to the next longword boundary in the
+;packet.  A similar situation occurs with the log message field.
+;--
+
+	MOVZBL	XF$B_PKT_MSGLEN(R7), R8	;R8 <- actual size of device msg
+	ADDL3	#QUADWORD_MASK, R8, R9	;round size up to longword bound
+	BICL	#QUADWORD_MASK, R9	;R9 <- packet size of dev msg
+
+	MOVZBL	XF$B_PKT_LOGLEN(R7), R10 ;R10 <- actual size of log msg
+	ADDL3	#QUADWORD_MASK, R10, R11 ;round up to longword boundary
+	BICL	#QUADWORD_MASK, R11	;R11 <- packet size of log msg
+
+
+	DEFAULT_TEST	<FUNC/4>, TRANSFER_STATUS, INDEX_TEST
+				;if < 3 args goto TRANSFER_STATUS
+				;else if FUNC defaulted goto INDEX_TEST
+
+;store function from packet into supplied argument
+
+	MOVZBW	XF$B_PKT_CMDCTL(R7), @FUNC(AP)
+
+
+
+INDEX_TEST:
+	DEFAULT_TEST	<INDEX/4>, TRANSFER_STATUS, DEVFLAG_TEST
+				;if < 4 args goto TRANSFER_STATUS
+				;else if INDEX defaulted goto DEVFLAG
+
+;convert buffer address in packet to index
+
+	MOVL	XF$L_PKT_BFRADR(R7),R3	; was a data buffer transferred?
+	BEQL	10$			; if addr = 0, no
+	SUBL3	CTX$L_DATABLK(R6),R3,R3	; yes, R3 <- byte offset from base
+					; of buffer array
+	DIVL2	CTX$L_BUFSIZ(R6), R3	;R3 <- index offset from base
+	INCL	R3			;R3 <- index of buffer
+10$:	MOVW	R3, @INDEX(AP)		;store index
+
+
+
+DEVFLAG_TEST:
+
+;determine if there is a device message in this packet
+;R8 contains actual size of device message
+;The setting of DEVFLAG is a bit convoluted; it stems from the fact 
+;that there are no spare registers left to hold DEVFLAG'S future value
+;and relies on the fact that MOVC5 clears R2.
+
+	MOVB	#TRUE, R2		;R2 is the complement of DEVFLAG
+					; (assume no device message)
+	BBC	#XF$V_PKT_FREQPK, -	;was this packet taken from the
+		XF$L_PKT_DSL(R7), -	;FREEQ (does it contain
+		10$			;unsolicited input)?
+					;if not, goto 10$	
+	TSTL	CTX$L_IDEVMSG(R6)	;was the array to store the
+					;device message given?
+	BEQL	10$			;no, goto 10$	
+
+;move the device message field from the packet into the array IDEVMSG,
+;which was specified in the call to XF$SETUP
+
+	MOVC5	R8, XF$B_PKT_DEVMSG(R7), #0,-
+		CTX$W_IDEVSIZ(R6), @CTX$L_IDEVMSG(R6)
+10$:	DEFAULT_TEST	<DEVFLAG/4>, TRANSFER_STATUS, LOGFLAG_TEST
+				;if < 5 args goto TRANSFER_STATUS
+				;else if DEVFLAG defaulted goto LOGFLAG_
+	MCOMB	R2, @DEVFLAG(AP)	;set DEVFLAG appropriately
+
+
+LOGFLAG_TEST:
+
+;determine if there is a log message in this packet
+;R10 contains actual size of log message
+;the same note on the setting of DEVFLAG applies to LOGFLAG
+
+	MOVB	#TRUE, R2		;R2 is the complement of LOGFLAG
+					; (assume no log message)
+	BBC	#<XF$V_PKT_DDISTS+XF$V_PKT_LOG>, -	;is "log msg in"
+		XF$L_PKT_DSL(R7), -	;bit set in the packet?
+		10$			;branch if not
+	TSTL	CTX$L_ILOGMSG(R6)	;was the array to store the
+					;device message given?
+	BEQL	10$			;no, goto 10$	
+
+;move the log message field from the packet into the array ILOGMSG,
+;which was specified in the call to XF$SETUP
+;R9 contains packet size of device message
+
+	MOVC5	R10, XF$B_PKT_DEVMSG(R7)[R9], #0, -
+		CTX$W_ILOGSIZ(R6), @CTX$L_ILOGMSG(R6)
+10$:	DEFAULT_TEST	<LOGFLAG/4>, TRANSFER_STATUS, TRANSFER_STATUS
+				;if LOGFLAG defaulted goto TRANSFER_STAT
+	MCOMB	R2, @LOGFLAG(AP)	;set LOGFLAG appropriately
+
+;++
+; return the third through the eighth longword of the command packet
+; to the user by copying them into CONTXT
+;--
+TRANSFER_STATUS:
+	MOVQ	XF$B_PKT_MSGLEN(R7), CTX$L_CONTROL(R6)
+				;control longword and byte count
+	MOVQ	XF$L_PKT_BFRADR(R7), CTX$L_BFRVA(R6)
+				;buf addr & residual mem byte count
+	MOVQ	XF$L_PKT_RDBCNT(R7), CTX$L_DDICNT(R6)
+				;residual DDI count  and
+				;DR32 status longword
+	MOVZWL	#SS$_NORMAL, R0		;success status
+
+;++
+;store the status of GETPKT now (if a status argument was given), 
+;before the call to the ACTION routine.  GETPKT's status is an input
+;to the ACTION routine.
+;--
+STORE_STATUS:
+	DEFAULT_TEST	<STATUS/4>, 10$, 10$
+				;if STATUS defaulted goto 10$
+	MOVL	R0, @STATUS(AP)	;store status
+10$:	BLBC	R0, END_GETPKT		;if no packet, goto end
+
+;determine size of packet through log message field
+;R9 contains packet size of device message
+;R11 contains packet size of log message field
+
+	MOVAB	XF$B_PKT_DEVMSG(R9)[R11], R3
+					;R3 <- devmsg size+logmsg size
+					; + size of fixed part of pkt
+					;(this is an ADDL, not a MOVA)
+
+;++
+;IF an ACTION routine is associated with this packet
+;	THEN call it
+;the ACTION routine may substitute its status for GETPKT's status
+;--
+ACTION_TEST:
+	BBC	#XF$V_PKT_ACTBIT, XF$B_PKT_PKTCTL(R7), RETURN_SPACE
+					;if bit is clear, there is no
+					;ACTION routine associated with
+					;this packet
+;++
+;R3 contains the size of the packet in bytes, up to and including the
+;log message field.  Add this to the base address of the packet to find
+;the addresses of the ACTION routine and the ACTION
+;routine's parameter.  Then add the size of the two addresses to R3, to
+;calculate the total size of the command packet
+;--
+
+	MOVAB	(R7)[R3], R4		;R4 <- addr of addr of ACTION
+					;routine
+	ADDL2	#8, R3			;R3 <- total size of packet
+
+
+;input arguments to ACTION routine
+	PUSHL	STATUS(AP)
+	PUSHL	INDEX(AP)
+	PUSHL	FUNC(AP)
+	PUSHL	LOGFLAG(AP)
+	PUSHL	DEVFLAG(AP)
+	PUSHL	4(R4)			;addr of ACTION routine param
+	PUSHL	CONTXT(AP)
+	CALLS	#7, @(R4)		;call user-supplied ACTION 
+					;routine
+					;status returned in STATUS arg
+
+;++
+;return the memory the command packet was built from
+;--
+RETURN_SPACE:
+					;inputs to XF$$DEALOCPKT:
+	MOVAL	CTX$L_FREELIST(R6), R1	;R1: addr of freelist header
+					;R3: size of packet in bytes
+					;R7: addr of packet to return
+	BSBW	XF$$DEALOCPKT		;return the packet space
+					;(R1, R3, R7 are destroyed)
+
+END_GETPKT:
+	RET
+
+
+	.SBTTL	GET_ADDR -- GET PACKET ADDRESS
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called by XF$GETPKT to remove a packet from the
+;	TERMQ and return its address.  The routine, depending on
+;	conditions, 
+;	(1) returns with address of packet, or
+;	(2) returns with status "TERMQ empty", or
+;	(3) determines that this data transaction has completed, and
+;	    calls XF$CLEANUP before returning
+;
+; CALLING SEQUENCE:
+;
+;	BSBB/W	GET_ADDR
+;		called by: XF$GETPKT
+;		calls (under conditions) XF$CLEANUP
+;
+; INPUT PARAMETERS:
+;
+;	R2 is a switch that determines what action to take when
+;	TERMQ is empty
+;		R2 = 0: wait for event flag
+;		R2 .NE. 0: immediate return with "TERMQ empty" status
+; IMPLICIT INPUTS:
+;
+;	R6 contains the address of the CONTXT array
+;	fields in CONTXT:
+;		CTX$L_CMDBLK
+;		CTX$Q_IOSB
+;		CTX$W_EFN
+;
+; OUTPUT PARAMETERS:
+;
+;	R7 contains address of command packet, if one was successfully
+;	removed from the TERMQ
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+
+; COMPLETION CODES:
+;
+;	R0 contains status of call
+;	status returns:
+;		(1) SS$_NORMAL:	normal successful completion
+;				packet address is in R7
+;		(2) SS$_BADQUEUEHDR:	interlocked queue timeout
+;		(3) SHR$_HALTED:	XF$CLEANUP was called
+;		(4) SHR$_QEMPTY: no packet, but transfer still going
+;		(5) SHR$_NOCMDMEM:	command memory not allocated at
+;					the time this routine was called
+;		(6) error returns from system calls
+;			$WAITFR
+;			LIB$FREE_VM
+;			LIB$DASSGN
+;
+; SIDE EFFECTS:
+;
+;	If XF$CLEANUP was called (it is called when the TERMQ is empty
+;	and the transfer is halted), then the command area was 
+;	deallocated and the device's channel deassigned.
+;
+;--
+
+GET_ADDR:
+	PUSHR	#^M<R1,R2,R10>
+	MOVL	CTX$L_CMDBLK(R6), R10	;R10 <- addr of command block
+	BEQL	CLEANUP_DONE		;if 0, command area has been 
+					;deallocated
+
+;++
+;attempt to remove packet from head of TERM queue
+;if succeed in removing a packet then goto HAVE_PACKET
+;this is partly an otpimization to prevent clearing the event flag when 
+;there is a packet on the TERMQ and partly a test to see if CLEANUP can
+;be done .
+;--
+REM_TERMQ:
+	CLRL	R1			;retry count
+10$:	REMQHI	CMD$L_TERMQ(R10), R7	;R7 <- addr of packet
+	BVC	HAVE_PACKET		;removal succeeded
+	BCC	20$			;TERMQ empty
+	AOBLEQ	#RETRY_LIMIT, R1, 10$	;queue locked. retry.
+
+;exceeded retry limit and queue is still locked
+;assume queue can no longer be valid
+
+	BRB	QUEUE_ERROR
+
+;++
+;there is no packet on the TERMQ; if in addition the transfer is 
+;halted, then clean up.
+;--
+20$:	TSTW	CTX$Q_IOSB(R6)		;test status of transfer
+	BNEQ	CLEANUP			;br if transfer halted
+
+;++
+;come here if there is no packet on the TERMQ but the transfer is still
+;going.  Test R2 to determine whether to immediately return with
+;"TERMQ empty" status or whether to wait for the event flag to be set.
+;--
+	TSTB	R2			;wait for event flag?
+	BNEQ	TERMQ_EMPTY		;no, immediate return
+;++
+;come here to wait for an event flag to be set before
+;re-attempting to remove an entry from the TERM queue
+;--
+WAIT_FOR_EF:
+	MOVZWL	CTX$W_EFN(R6), R2	;get event flag number
+	$CLREF_S	EFN = R2	;clear event flag
+
+	CLRL	R1			;retry count
+10$:	REMQHI	CMD$L_TERMQ(R10), R7	;R7 <- addr of packet
+	BVC	HAVE_PACKET		;removal succeeded
+	BCC	20$			;TERMQ empty
+	AOBLEQ	#RETRY_LIMIT, R1, 10$	;queue locked. retry.
+
+;exceeded retry limit and queue is still locked
+;assume queue can no longer be valid
+
+	BRW	QUEUE_ERROR
+
+20$:	TSTW	CTX$Q_IOSB(R6)		;has transfer halted?
+	BNEQ	CLEANUP			;yes, go clean up
+
+	$WAITFR_S	EFN = R2	;wait for flag to be set
+	BLBS	R0, REM_TERMQ		;re-attempt a packet
+	BRB	END_GET_ADDR		;R0 contains error status from
+					;WAITFR call
+;++
+;Come here iff there is nothing on TERMQ and transfer is halted.
+;--
+CLEANUP:
+	PUSHL	R6			;addr of CONTXT array
+	CALLS	#1, XF$CLEANUP		;(1) deallocates command area
+					;(2) deassigns channel
+	BLBC	R0, END_GET_ADDR
+	MOVZWL	#SHR$_HALTED, R0	;transfer JUST halted
+	BRB	END_GET_ADDR
+
+
+;status paths
+
+CLEANUP_DONE:
+	MOVZWL	#SHR$_NOCMDMEM, R0	;command area deallocated
+	BRB	END_GET_ADDR
+
+QUEUE_ERROR:
+	MOVZWL	#SS$_BADQUEUEHDR, R0	;interlock timeout occurred
+	BRB	END_GET_ADDR
+
+HAVE_PACKET:
+	MOVZWL	#SS$_NORMAL, R0		;packet's address is in R7
+	BRB	END_GET_ADDR
+
+TERMQ_EMPTY:
+	MOVZWL	#SHR$_QEMPTY, R0	;no packet on TERMQ
+
+END_GET_ADDR:
+
+	POPR	#^M<R1,R2,R10>
+	RSB
+
+
+	.SBTTL	XF$CLEANUP
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	(1) deassign channel
+;	(2) deallocate virtual memory
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/G	 XF$CLEANUP(CONTXT, [STATUS])
+;
+; INPUT PARAMETERS:
+;
+	CONTXT = 4		
+;
+; IMPLICIT INPUTS:
+;
+;	fields in CONTXT array:
+;		CTX$L_CMDBLK
+;		CTX$L_CMDSIZ
+;
+; OUTPUT PARAMETERS:
+;
+	STATUS = 8		;optional status word
+;
+; IMPLICIT OUTPUTS:
+;
+;	R0 contains status also (used when XF$GETPKT calls XF$CLEANUP)
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL	-- successful completion
+;	SHR$_NOCMDMEM	-- command memory was not allocated at the time
+;			   of this call to XF$CLEANUP
+;	error returns from:
+;		LIB$FREE_VM
+;		$DASSGN
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+
+	.ENTRY	XF$CLEANUP	^M<R2,R6>
+
+	MOVL	CONTXT(AP), R6		;R6 <- addr of CONTXT
+
+	MOVZWL	#SHR$_NOCMDMEM, R0	;assume cmd memory not allocated
+	TSTL	CTX$L_CMDBLK(R6)	;is address non-zero?
+	BEQL	10$			;branch if cmd mem not allocated
+
+;deassign channel (also cancels any IO still in progress)
+
+	MOVAL	DEVICE_FAB, R2		;channel number still in FAB
+	$DASSGN_S	CHAN = FAB$L_STV(R2)
+					;deassign the channel
+	BLBC	R0, 10$			;error from $DASSGN
+
+;deallocate dynamic virtual memory
+
+	PUSHAL	CTX$L_CMDBLK(R6)	;address of virtual memory
+	PUSHAL	CTX$L_CMDSIZ(R6)	;size of virtual memory block
+	CALLS	#2, G^LIB$FREE_VM	;return the memory
+	BLBC	R0, 10$			;error return
+	CLRL	CTX$L_CMDBLK(R6)	;signal command mem returned
+
+;see if STATUS argument supplied
+
+10$:	DEFAULT_TEST	<STATUS/4>, END_CLEANUP, END_CLEANUP
+	MOVL	R0, @STATUS(AP)	;store status of call
+
+END_CLEANUP:
+	RET
+
+	.END

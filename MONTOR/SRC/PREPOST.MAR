@@ -1,0 +1,1150 @@
+	.TITLE	PREPOST	- VAX/VMS Monitor Pre-post Collection Rtns
+	.IDENT	'V03-002'
+ 
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY:  VAX/VMS MONITOR Utility
+;
+; ABSTRACT:
+;
+;	The pre- and post- collection routines perform class-specific
+;	data collection which does not conform to the scheme required
+;	by the FETCH routine.
+;
+; ENVIRONMENT: Each routine is entered in EXEC mode. Some routines
+;		 elevate to kernel mode and some additionally raise
+;		 IPL to synchronize data base access with VMS.
+;
+; AUTHOR: Henry M. Levy		, CREATION DATE: 28-March-1977
+;	  Thomas L. Cafarella
+;
+; MODIFIED BY:
+;
+;	V03-002 TLC1018		Thomas L. Cafarella	12-Apr-1982	16:00
+;		Collect all data at KERNEL mode instead of EXEC. Also,
+;		assume idle time on attached processor is subtracted
+;		from the NULL process PHD when a STOP/CPU is issued.
+;
+;	V03-001	TLC1017		Thomas L. Cafarella	04-Apr-1982	16:00
+;		Close small window in raising to IPL SYNCH.
+;
+;	V03-001	TLC1015		Thomas L. Cafarella	01-Apr-1982	16:00
+;		Change .PSECT options in order to group image sections.
+;
+;	V03-001	TLC1014		Thomas L. Cafarella	01-Apr-1982	13:00
+;		Correct attached processor time reporting for MODES.
+;
+;--
+
+
+	.SBTTL	DECLARATIONS
+	.PSECT	DSPDATA,QUAD,NOEXE
+;
+; INCLUDE FILES:
+;
+
+	$PCBDEF				; Process control block definitions
+	$PHDDEF				; Process header definitions
+	$IPLDEF				; Define Interrupt Processor Levels
+	$CDBDEF				; Define Class Descriptor Block
+	$MRBDEF				; Define Monitor Request Block
+	$MBPDEF				; Define Monitor Buffer Pointers
+	$MCADEF				; Define Monitor Communication Area
+	$MONDEF				; Monitor Recording File Definitions
+
+;
+; MACROS:
+;
+
+;
+; Local Macro Definitions
+;
+
+;
+; ALLOC Macro - Dynamically allocate space on the stack.
+;
+
+	.MACRO	ALLOC	LENGTH,RSLDESC,RSLBUF
+	SUBL	#<LENGTH+3>&<^C3>,SP
+	.IF	NB,RSLBUF
+	MOVL	SP,RSLBUF
+	.ENDC
+	PUSHL	SP
+	PUSHL	#LENGTH
+	MOVL	SP,RSLDESC
+	.ENDM	ALLOC
+
+
+;
+; EQUATED SYMBOLS:
+;
+
+
+
+;
+; OWN STORAGE:
+;
+
+
+
+FCPCALLS::	.LONG	0		; total calls to FCP
+FCPCACHE::	.LONG	0		; FCP directory cache hits
+FCPCPU::	.LONG	0		; FCP CPU time used
+FCPREAD::	.LONG	0		; FCP disk reads
+FCPWRITE::	.LONG	0		; FCP disk writes
+
+;
+; Space for accumulating statistics on the nonpaged pool.
+; (do not change order)
+;
+
+HOLECNT::	.LONG	0		; number of blocks in nonpaged pool
+HOLESUM::	.LONG	0		; total space in pool
+BIGHOLE::	.LONG	0		; largest hole in pool
+SMALLCNT::	.LONG	0		; number of holes < 32 bytes
+SMALLHOLE::	.LONG	0		; smallest hole in pool
+IRPCNT::	.LONG	0		; number of I/O (intermed) request packets
+LRPCNT::	.LONG	0		; number of large request packets
+SRPCNT::	.LONG	0		; number of small request packets
+
+SYSFAULTS::	.LONG	0		; count of system space page faults
+
+;
+; Data for the Lock class
+;
+
+LOCKCNT::				; current number of locks in the system
+	.BLKL	1
+RESCNT::				; current number of resources in the system
+	.BLKL	1
+
+;
+; Data for the MODES class
+;
+
+MPSTRTIM: .BLKQ	1			; save area for MP start time
+BASE:	.LONG 0,0,0,0,0,0,0		; 7 Secondary base counter values
+
+
+	.SBTTL	FCP_PRE - FCP Class Pre-collection Rtn
+	.PSECT	$$MONCODE,NOWRT,EXE
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine accumulates statistics from the File Control Primitive
+;	data base and saves them in global variables so that they
+;	may be fetched and processed by the standard FETCH
+;	collection routine.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/CALLG
+;
+; INPUTS:
+;
+;	4(AP) - address of current collection buffer (unused by this rtn)
+;
+; IMPLICIT INPUTS:
+;
+;	PMS$GL_FCP2 - pointer to ten arrays of FCP data
+;
+; OUTPUTS:
+;
+;	None
+;
+; IMPLICIT OUTPUTS:
+;
+;	FCPCALLS - contains total calls made to FCP
+;	FCPCACHE - total FCP cache hits
+;	FCPCPU - percent of CPU time used by FCP during the last
+;		interval
+;	FCPREAD - total FCP disk reads
+;	FCPWRITE - total FCP disk writes
+;
+; ROUTINE VALUE:
+;
+;	R0 = YES, if subsequent FETCH collection is required.
+;	R0 = NO,  if subsequent FETCH collection is NOT required.
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+.ENTRY	FCP_PRE, ^M<>
+
+;
+; Compute total calls to fcp
+;
+
+	MOVL	#5,R0			; sum first six counters
+	CLRL	W^FCPCALLS		; clear counter
+10$:
+	ADDL	PMS$GL_FCP2[R0],W^FCPCALLS ; add in next counter
+	SOBGEQ	R0,10$			; continue till done
+
+;
+; Compute disk reads and writes, cache hits, and % CPU TIME
+;
+
+	MOVL	#9,R0			; sum 10 entries in each array
+	CLRQ	W^FCPREAD		; clear reads and writes
+	CLRQ	W^FCPCACHE		; clear cache and cpu time
+20$:
+	ADDL	PMS$GL_FCP2+<20*4>[R0],W^FCPREAD ; sum reads
+	ADDL	PMS$GL_FCP2+<30*4>[R0],W^FCPWRITE ; sum writes
+	ADDL	PMS$GL_FCP2+<40*4>[R0],W^FCPCACHE ; cache hits
+	ADDL	PMS$GL_FCP2+<50*4>[R0],W^FCPCPU ; sum cpu tics used
+	SOBGEQ	R0,20$
+;
+; Indicate to caller that FETCH collection IS required.
+;
+
+	MOVL	#YES,R0			; FETCH collection required
+	RET				; return
+
+	.SBTTL	POOL_PRE - Pre-collection for Pool Statistics
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Routine to accumulate statistics on behavior of SRP/IRP/LRP
+;	lookaside lists and nonpaged dynamic memory pool.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/CALLG
+;
+; INPUTS:
+;
+;	4(AP) - address of current collection buffer (unused by this rtn).
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	LRPCNT, IRPCNT, SRPCNT, HOLECNT, BIGHOLE, SMALLHOLE,
+;	SMALLCNT, and HOLESUM are set by subroutine SCANPOOL
+;
+; ROUTINE VALUE:
+;
+;	R0 = YES, if subsequent FETCH collection is required.
+;	R0 = NO,  if subsequent FETCH collection is NOT required.
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+.ENTRY	POOL_PRE, ^M<>
+
+	$CMKRNL_S B^SCANPOOL		; get stats in kernel mode
+	MOVL	#YES,R0			; indicate FETCH collection IS required
+	RET				; return
+
+;++
+; SCANPOOL - subroutine to update pool statistics
+;
+; CALLING SEQUENCE:
+;
+;	$CMKRNL_S SCANPOOL
+;
+; IMPLICIT INPUTS:
+;
+;	IOC$GL_SRPFL - address of SRP listhead
+;	IOC$GL_IRPFL - address of IRP listhead
+;	IOC$GL_LRPFL - address of LRP listhead
+;	EXE$GL_NONPAGED - address of nonpaged pool listhead
+;
+; IMPLICIT OUTPUTS:
+;
+;	SRPCNT - number of packets in SRP list
+;	IRPCNT - number of packets in IRP list
+;	LRPCNT - number of packets in LRP list
+;	HOLECNT - number of memory blocks in NONPAGED pool
+;	BIGHOLE - largest memory block
+;	SMALLHOLE - smallest memory block
+;	SMALLCNT - number of 32 byte or smaller blocks
+;	HOLESUM - total space in nonpaged pool
+;
+; SIDE EFFECTS:
+;
+;	must synchronize data base
+;--
+
+SCANPOOL:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10> ; register save mask
+
+;
+; Initialize all variables possible at this level.
+;
+
+	CLRQ	R2			; clear holecnt, holesum
+	CLRQ	R4			; clear for bighole, smallcnt
+	MNEGL	#1,R6			; make smallest hole very large
+	CLRL	R7			; clear for IRP counter
+	CLRQ	R9			; clear for LRP, SRP counters
+
+;
+; Touch last word of sequence to make sure all code is resident.
+;
+
+	TSTL	B^120$			; make sure all code is resident
+
+;
+; Save address of nonpaged listhead and run at IPL
+; contained there.
+;
+
+	MOVAL	EXE$GL_NONPAGED,R8	; get nonpaged pool listhead
+	DSBINT	(R8)+			; set ipl for pool access
+
+;
+; Run through the SRP list and count the packets remaining
+;
+
+	MOVAL	IOC$GL_SRPFL,R0		; get SRP listhead address
+	MOVL	R0,R1			; copy header address
+
+10$:	MOVL	(R1),R1			; get forward link
+	CMPL	R1,R0			; point back to header?
+	BEQL	20$			; done if so
+	INCL	R10			; count one more packet
+	BRB	10$			; loop back for more
+20$:
+
+;
+; Run through the IRP list and count the packets remaining
+;
+
+	MOVAL	IOC$GL_IRPFL,R0		; get IRP listhead address
+	MOVL	R0,R1			; copy header address
+
+30$:	MOVL	(R1),R1			; get forward link
+	CMPL	R1,R0			; point back to header?
+	BEQL	40$			; done if so
+	INCL	R7			; count one more packet
+	BRB	30$			; loop back for more
+40$:
+
+;
+; Run through the LRP list and count the packets remaining
+;
+
+	MOVAL	IOC$GL_LRPFL,R0		; get LRP listhead address
+	MOVL	R0,R1			; copy header address
+
+50$:	MOVL	(R1),R1			; get forward link
+	CMPL	R1,R0			; point back to header?
+	BEQL	60$			; done if so
+	INCL	R9			; count one more packet
+	BRB	50$			; loop back for more
+60$:
+
+;
+; Now run through the nonpaged pool, count the blocks, and check the
+; smallest and largest holes.
+;
+
+	MOVL	R8,R0			; get pool listhead address
+70$:	MOVL	(R0),R0			; get address of next block
+	BEQL	110$			; branch if zero, list done
+	INCL	R2			; note one more block
+	MOVL	4(R0),R1		; get size of block
+	ADDL	R1,R3			; add in size of this block
+	CMPL	R1,R6			; is this smallest found?
+	BGEQU	80$			; branch if not
+	MOVL	R1,R6			; else save it
+80$:	CMPL	R1,R4			; is this largest found?
+	BLEQU	90$			; branch if not
+	MOVL	R1,R4			; else update largest
+90$:	CMPL	R1,#32			; is this one of the small ones?
+	BGTRU	100$			; branch if not
+	INCL	R5			; note another small hole
+100$:	BRB	70$			; go on to next block
+110$:	ENBINT				; enable interrupts
+120$:	MOVQ	R2,W^HOLECNT		; save variables
+	MOVQ	R4,W^BIGHOLE		; ...
+	MOVQ	R6,W^SMALLHOLE		; ...
+	MOVQ	R9,W^LRPCNT		; ...
+	RET
+
+	.SBTTL	LOCK_PRE - Pre-collection for Lock Statistics
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Routine to count the number of locks and resources in the system.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/CALLG
+;
+; INPUTS:
+;
+;	None
+;
+; IMPLICIT INPUTS:
+;
+;	LCK$GL_IDTBL	Contains address of lock id table
+;	LCK$GL_MAXID	Contains maximum lock id
+;	LCK$GL_HASHTBL	Contains address of resource hash table
+;	LCK$GL_HTBLCNT	Contains # entries in hash table (expresses as a
+;			power of two)
+;
+; OUTPUTS:
+;
+;	None
+;
+; IMPLICIT OUTPUTS:
+;
+;	LOCKCNT and RESCNT are set.
+;
+; ROUTINE VALUE:
+;
+;	R0 = YES, if subsequent FETCH collection is required.
+;	R0 = NO,  if subsequent FETCH collection is NOT required.
+;
+; SIDE EFFECTS:
+;
+;	None
+;--
+
+.ENTRY	LOCK_PRE, ^M<R2,R3,R4,R5>
+
+;
+; Initialize to count the number of locks
+;
+
+	MOVL	G^LCK$GL_IDTBL,R5	; Get address of lock id table
+	MOVL	G^LCK$GL_MAXID,R4	; Get maximum lock id
+	CLRL	R3			; Initialize counter of locks
+
+;
+; Count the number of locks
+;
+
+10$:	TSTL	(R5)+			; Is there a lock in this slot?
+	BGEQ	20$			; No
+	INCL	R3			; Yes, bump counter
+20$:	SOBGEQ	R4,10$			; Repeat for all entries in table
+	MOVL	R3,LOCKCNT		; Store final value
+
+;
+; Count the number of resources
+;
+
+	$CMKRNL_S	B^COUNT_RES	; Do it in kernel mode
+
+	MOVL	#YES,R0			; Indicate FETCH collection IS required
+	RET
+
+;++
+; COUNT_RES - Routine to count resources
+;
+; CALLING SEQUENCE:
+;
+;	$CMKRNL_S	COUNT_RES
+;
+; IMPLICIT INPUTS:
+;
+;	LCK$GL_HASHTBL	Contains address of resource hash table
+;	LCK$GL_HTBLCNT	Contains # entries in hash table (expresses as a
+;			power of two)
+;
+; IMPLICIT OUTPUTS:
+;
+;	RESCNT - Number of resources
+;
+; SIDE EFFECTS:
+;
+;	Must raise IPL to synchronize database access
+;--
+
+COUNT_RES:
+	.WORD	^M<R2,R3,R4,R5>
+
+;
+; Initialize to count resources
+;
+
+	MOVL	G^LCK$GL_HASHTBL,R5	; Get address of hash table
+	MOVL	G^LCK$GL_HTBLCNT,R0	; Get size of table as power of two
+	ASHL	R0,#1,R4		; Convert to number of entries
+	CLRL	R3			; Initialize resource counter
+
+;
+; Count resources
+;
+
+20$:	MOVAL	(R5)+,R0		; Get address of next list head
+	SETIPL	50$			; Raise IPL (and lock pages in w.s.)
+30$:	MOVL	(R0),R0			; Get next element in list
+	BEQL	40$			; Reached end of list
+	INCL	R3			; Bump counter
+	BRB	30$			; Continue down list
+40$:	SETIPL	#0			; Lower IPL
+	SOBGTR	R4,20$			; Repeat for next list
+	MOVL	R3,RESCNT		; Store final value
+	RET
+
+50$:	.LONG	IPL$_SYNCH
+	ASSUME	.-20$  LE  512		; Make sure it doesn't exceed two pages
+
+	.SBTTL	DECNET_PRE - Pre-collection for DECnet Statistics
+
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Routine to calculate current size of LRP lookaside
+;	list for inclusion in the DECNET class.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/CALLG
+;
+; INPUTS:
+;
+;	4(AP) - address of current collection buffer (unused by this rtn).
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUTS:
+;
+;	none
+;
+; IMPLICIT OUTPUTS:
+;
+;	LRPCNT is set by subroutine SCANLRP.
+;
+; ROUTINE VALUE:
+;
+;	R0 = YES, if subsequent FETCH collection is required.
+;	R0 = NO,  if subsequent FETCH collection is NOT required.
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+.ENTRY	DECNET_PRE, ^M<>
+
+	$CMKRNL_S B^SCANLRP		; scan LRP list in kernel mode
+	MOVL	#YES,R0			; indicate FETCH collection IS required
+	RET				; return
+
+;++
+; SCANLRP - subroutine to calculate LRP count
+;
+; CALLING SEQUENCE:
+;
+;	$CMKRNL_S SCANLRP
+;
+; IMPLICIT INPUTS:
+;
+;	IOC$GL_LRPFL - address of LRP listhead
+;	EXE$GL_NONPAGED - address of nonpaged pool listhead
+;
+; IMPLICIT OUTPUTS:
+;
+;	LRPCNT - number of packets in LRP list
+;
+; SIDE EFFECTS:
+;
+;	must synchronize data base
+;--
+
+SCANLRP:
+	.WORD	^M<R2,R3>		; register save mask
+
+
+	CLRL	R3			; clear LRP counter
+
+;
+; Touch last word of sequence to make sure all code is resident.
+;
+
+	TSTL	B^30$			; make sure all code is resident
+
+;
+; Save address of nonpaged listhead and run at IPL
+; contained there.
+;
+
+	MOVAL	EXE$GL_NONPAGED,R2	; get nonpaged pool listhead
+	DSBINT	(R2)+			; set ipl for pool access
+
+;
+; Run through the LRP list and count the packets remaining
+;
+
+	MOVAL	IOC$GL_LRPFL,R0		; get LRP listhead address
+	MOVL	R0,R1			; copy header address
+
+10$:	MOVL	(R1),R1			; get forward link
+	CMPL	R1,R0			; point back to header?
+	BEQL	20$			; done if so
+	INCL	R3			; count one more packet
+	BRB	10$			; loop back for more
+
+20$:	ENBINT				; enable interrupts
+30$:	MOVL	R3,W^LRPCNT		; save LRP count for FETCH rtn
+	RET
+
+	.SBTTL	PAGE_PRE - PAGE Class Pre-collection Rtn
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine simply grabs the system page fault
+;	count and places it into a location accessible to
+;	the FETCH rtn.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/CALLG
+;
+; INPUTS:
+;
+;	4(AP) - address of current collection buffer (unused by this rtn)
+;
+; IMPLICIT INPUTS:
+;
+;	MMG$GL_SYSPHD - system process header address
+;
+; OUTPUTS:
+;
+;	None
+;
+; IMPLICIT OUTPUTS:
+;
+;	SYSFAULTS - contains accumulated total of system page faults
+;
+; ROUTINE VALUE:
+;
+;	R0 = YES, if subsequent FETCH collection is required.
+;	R0 = NO,  if subsequent FETCH collection is NOT required.
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+.ENTRY	PAGE_PRE, ^M<>
+
+	MOVL	MMG$GL_SYSPHD,R0	; get system header address
+	MOVL	PHD$L_PAGEFLTS(R0),W^SYSFAULTS ; store system page fault count
+					; for page display
+;
+; Indicate to caller that FETCH collection IS required.
+;
+
+	MOVL	#YES,R0			; FETCH collection required
+	RET				; return
+
+	.SBTTL	STATES_PRE - STATES Class Pre-collection Rtn
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; 	Loop through all PCBs and count the number of processes in
+;	each scheduling state.  The counts are accumulated in the
+;	collection buffer passed to this rtn by the FETCH rtn.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/CALLG
+;
+; INPUTS:
+;
+;	4(AP) - address of current collection buffer (data portion)
+;
+; IMPLICIT INPUTS:
+;
+;	CDBPTR - global variable, pointer to current CDB
+;	SCH$GL_PCBVEC - contains address of PCB vector
+;	SCH$GL_MAXPIX - maximum process index
+;
+; OUTPUTS:
+;
+;	Collection buffer filled with appropriate state count values.
+;
+; IMPLICIT OUTPUTS:
+;
+;	BARSIZE - global variable altered to indicate size of VT55
+;		  bar for histogram display.
+;
+; ROUTINE VALUE:
+;
+;	R0 = YES, if subsequent FETCH collection is required.
+;	R0 = NO,  if subsequent FETCH collection is NOT required.
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+.ENTRY	STATES_PRE,	^M<R2,R3,R4,R5,R6>
+
+;
+; Reset counters in collection buffer to zero
+;
+
+	MOVL	CDBPTR,R6		; Get STATES CDB ptr
+	MOVC5	#0,(SP),#0,CDB$W_BLKLEN(R6),@4(AP) ; zero collection buffer
+	MOVL	SCH$GL_MAXPIX,R5	; get max number of processes
+
+	MOVZBL	#15,W^BARSIZE		; shrink bar size for VT55
+	MOVL	SCH$GL_PCBVEC,R0	; get address of PCB vector
+	CLRL	R1			; clear counter
+	MOVL	(R0)[R1],R2		; get address of null process PCB
+	SUBL3	#4,4(AP),R3		; address to put data ( states start at one)
+	MOVL	R2,R4			; copy null PCB for first time
+	BRB	20$			; skip null check first time through
+10$:
+	MOVL	(R0)[R1],R4		; get next PCB address
+	CMPL	R4,R2			; does this point to null PCB?
+	BEQL	30$			; try next one if so
+20$:	MOVZWL	PCB$W_STATE(R4),R4	; else get state number
+	INCL	(R3)[R4]		; incr counter for that state
+30$:	AOBLEQ	R5,R1,10$		; continue until max index
+
+;
+; Indicate to caller that FETCH collection is NOT required.
+;
+
+	MOVL	#NO,R0			; FETCH collection NOT required
+	RET				; return
+
+	.SBTTL	MODES_PRE - MODES Class Pre-collection Rtn
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Fetch and store the 6 mode counters for each processor
+;	(Interrupt, Kernel, Executive, Supervisor, User, Compat
+;	mode tick counters). Also, compute and store null time
+;	on each processor. Then adjust Primary Kernel and Secondary
+;	Interrupt times to remove the idle ticks contained in
+;	those counters.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/CALLG
+;
+; INPUTS:
+;
+;	4(AP) - address of current collection buffer (data portion)
+;
+; IMPLICIT INPUTS:
+;
+;	SCH$GL_PCBVEC  - contains address of PCB vector
+;
+; OUTPUTS:
+;
+;	None
+;
+; IMPLICIT OUTPUTS:
+;
+;	Collection buffer filled with 7 (or 14, if multiprocessor)
+;	mode counter values. The values are fetched directly from
+;	the system, with the exception of:
+;
+;		Primary Kernel
+;		Primary Null
+;		Secondary Interrupt
+;		Secondary Null
+;
+;	These values are calculated as follows. Pick up Secondary
+;	Null from MPS$GL_NULLCPU. Re-compute Secondary Interrupt
+;	by subtracting Secondary Null from it. Compute Primary Null
+;	by subtracting Secondary Null from NULL PHD CPUTIM. Finally,
+;	re-compute Primary Kernel by subtracting Primary Null from it. 
+;
+; ROUTINE VALUE:
+;
+;	R0 = YES, if subsequent FETCH collection is required.
+;	R0 = NO,  if subsequent FETCH collection is NOT required.
+;
+; SIDE EFFECTS:
+;
+;	None
+;--
+
+.ENTRY	MODES_PRE, ^M<R2,R3,R4>
+
+	CLRL	R4			; assume no Secondary null time
+	MOVL	4(AP),R2		; get pointer to coll buff (data portion)
+	MOVAL	G^PMS$GL_KERNEL,R3	; get ptr to Primary mode counters
+
+;
+; Load collection buffer with Primary mode counters
+;
+
+10$:
+	MOVL	<4*4>(R3),(R2)+		; Interrupt
+	MOVQ	(R3),(R2)+		; Kernel, Exec
+	MOVQ	<2*4>(R3),(R2)+		; Supervisor, User
+	MOVL	<5*4>(R3),(R2)+		; Compat
+	MOVL	@SCH$GL_PCBVEC,R1	; get null pcb address
+	MOVL	PCB$L_PHD(R1),R1	; get null phd address
+	MOVL	PHD$L_CPUTIM(R1),(R2)	; get idle time on Primary
+
+;
+; Load collection buffer with Secondary mode counters
+;
+
+	MOVL	SPTR,R1			; load SYI pointer
+	CMPB	MNR_SYI$B_MPCPUS(R1),#1	; just one processor?
+	BEQL	50$			; yes -- skip Secondary processing
+
+	ADDL3	#<7*4>,4(AP),-(SP)	; push addr of Secondary coll buff
+	PUSHL	#1			; push argument count
+	MOVL	SP,R1			; save arg list address
+	$CMKRNL_S  W^GETSEC,(R1)	; get secondary ctrs into coll buff
+
+	MOVL	4(AP),R2		; re-instate collection buffer ptr
+	MOVL	<13*4>(R2),R4		; save Secondary null for use below
+
+;
+; Establish new BASE counters if necessary
+;
+
+	BLBC	R0,30$			; br if no need to estab new base
+
+;
+; Get pointer to Secondary counters from PREVIOUS collection buffer
+;
+
+	MOVL	CDBPTR,R1		; get MODES CDB pointer
+	MOVL	CDB$A_BUFFERS(R1),R2	; get buffer block pointer
+	MOVL	MBP$A_BUFFERA(R2),R3	; assume buffer A is PREVIOUS
+	BBS	#CDB$V_SWAPBUF,CDB$L_FLAGS(R1),20$ ; branch if so
+	MOVL	MBP$A_BUFFERB(R2),R3	; else load buffer B ptr
+20$:
+	ADDL2	#<MNR_CLS$K_HSIZE+<7*4>>,R3 ; point to counters
+
+	MOVAL	W^BASE,R2		; get ptr to base counters
+	MOVQ	(R3)+,(R2)+		; establish new base
+	MOVQ	(R3)+,(R2)+		; ....
+	MOVQ	(R3)+,(R2)+		; ....
+	MOVL	(R3),(R2)		; ....
+
+;
+; Add BASE counter values to collection buffer
+;
+
+30$:
+	MOVAL	W^BASE,R3		; address of BASE counters
+	ADDL3	#<7*4>,4(AP),R2		; compute addr of coll buff ctrs
+	MOVL	#7,R1			; load number of counters
+40$:
+	ADDL2	(R3)+,(R2)+		; add BASE ctr value to coll buff
+	SOBGTR	R1,40$			; loop for each counter
+
+;
+; Compute Primary Kernel time and Primary Null time
+;
+
+50$:
+	MOVL	4(AP),R2		; re-instate collection buffer ptr
+	SUBL2	R4,<6*4>(R2)		; compute null time on Primary
+	SUBL2	<6*4>(R2),<1*4>(R2)	; subtract it from Primary kernel mode
+
+	MOVL	#NO,R0			; indicate FETCH collection NOT required
+	RET				; return
+
+;++
+; GETSEC - Routine to get Secondary processor mode counters
+;
+; CALLING SEQUENCE:
+;
+;	$CMKRNL_S  GETSEC,arglist_addr
+;
+; INPUTS:
+;
+;	4(AP) - address of Secondary portion of CURRENT collection buffer
+;
+; OUTPUTS:
+;
+;	None
+;
+; IMPLICIT INPUTS:
+;
+;	EXE$GL_MP      - contains address of multiprocessing code
+;	MPS$AL_CPUTIME - contains address of Secondary mode counters
+;	MPS$GL_NULLCPU - contains count of Secondary null ticks
+;	MPS$GQ_MPSTRTIM - quadword time at which MP code loaded
+;	MPSTRTIM -       MPS$GQ_MPSTRTIM value at previous interval
+;	MCA$A_MPADDR -   EXE$GL_MP value at previous interval
+;
+; IMPLICIT OUTPUTS:
+;
+;	Secondary portion of CURRENT collection buffer is filled
+;
+; ROUTINE VALUE:
+;
+;	R0 = YES, if loading of new BASE counters is required.
+;	R0 = NO,  if loading of new BASE counters is NOT required.
+;
+; SIDE EFFECTS:
+;
+;	Must raise IPL to synchronize database access
+;--
+
+GETSEC:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	CLRQ	R5			; clear Secondary mode counter regs
+	CLRQ	R7			; ....
+	CLRQ	R9			; ....
+	CLRL	R11			; ....
+
+;
+; Pick up all data needed from MP data structures at IPL SYNCH
+;
+
+10$:	SETIPL	30$			; Raise IPL (and lock pages in w.s.)
+	MOVL	G^EXE$GL_MP,R0		; get ptr to MP code
+	BEQL	20$			; br if not there
+	MOVL	MPS$GL_NULLCPU(R0),R11	; get Secondary null time
+	MOVAB	MPS$AL_CPUTIME(R0),R4	; get ptr to Secondary mode counters
+
+;
+; Get Secondary mode counters
+;
+
+	MOVL	<4*4>(R4),R5		; Interrupt
+	MOVQ	(R4),R6			; Kernel, Exec
+	MOVQ	<2*4>(R4),R8		; Supervisor, User
+	MOVL	<5*4>(R4),R10		; Compat
+
+	MOVQ	MPS$GQ_MPSTRTIM(R0),R2	; get MP start time
+
+20$:	SETIPL	#0			; lower IPL
+	BRB	40$			; branch around data
+
+30$:	.LONG	IPL$_SYNCH
+	ASSUME	.-10$  LE  512		; Make sure it doesn't exceed two pages
+
+;
+; Move counter registers into CURRENT collection buffer
+;
+
+40$:
+	SUBL2	R11,R5			; compute Secondary interrupt time
+					; (by subtracting out null time)
+	MOVL	4(AP),R4		; get addr of Secondary coll buff
+	MOVQ	R5,(R4)+		; move in the counter values
+	MOVQ	R7,(R4)+		; ....
+	MOVQ	R9,(R4)+		; ....
+	MOVL	R11,(R4)		; ....
+
+;
+; Determine if new BASE counters have to be established
+;
+
+	MOVL	MCAPTR,R1		; get MCA pointer
+	TSTL	MCA$A_MPADDR(R1)	; was MP running at last interval?
+	BEQL	60$			; no -- don't need new BASE
+	MOVL	R0,MCA$A_MPADDR(R1)	; save MP addr for this interval
+	BEQL	50$			; if 0 now, need new BASE
+	CMPL	W^MPSTRTIM+4,R3		; has MP start time changed?
+	BNEQU	50$			; yes -- need new BASE
+	CMPL	W^MPSTRTIM,R2		; check the other half of time
+	BEQLU	60$			; no change -- don't need new base
+50$:
+	MOVL	#YES,R0			; indicate new BASE ctr values needed
+	BRB	70$			; go return
+60$:
+	MOVL	R0,MCA$A_MPADDR(R1)	; save MP addr for this interval
+	MOVL	#NO,R0			; indicate new BASE values not needed
+70$:
+	MOVQ	R2,W^MPSTRTIM		; save new MP start time
+	RET
+
+	.SBTTL	PROC_PRE - PROCESSES Class Pre-collection Rtn
+;++
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; 	Loop through all PCBs and collect information on each
+;	process, as well as the process count. The info is stored
+;	in the collection buffer passed to this rtn by the FETCH rtn.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/CALLG
+;
+; INPUTS:
+;
+;	4(AP) - address of current collection buffer (data portion)
+;
+; IMPLICIT INPUTS:
+;
+;	None
+;
+; OUTPUTS:
+;
+;	None
+;
+; IMPLICIT OUTPUTS:
+;
+;	Collection buffer filled with data for each process.
+;
+; ROUTINE VALUE:
+;
+;	R0 = YES, if subsequent FETCH collection is required.
+;	R0 = NO,  if subsequent FETCH collection is NOT required.
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+.ENTRY	PROC_PRE, ^M<>
+
+	$CMKRNL_S B^SCANPROCS,(AP)	; Scan all processes in kernel mode
+
+;
+; Indicate to caller that FETCH collection is NOT required.
+;
+
+	MOVL	#NO,R0			; FETCH collection NOT required
+	RET				; Return
+
+;++
+; SCANPROCS - subroutine to scan processes in kernel mode
+;
+; CALLING SEQUENCE:
+;
+;	$CMKRNL_S SCANPROCS,(AP)
+;
+; IMPLICIT INPUTS:
+;
+;	SCH$GL_PCBVEC - contains address of PCB vector
+;	SCH$GL_MAXPIX - maximum process index
+;
+; IMPLICIT OUTPUTS:
+;
+;	Collection buffer filled with data for each process.
+;
+; SIDE EFFECTS:
+;
+;	Some of this routine is executed at IPL SYNCH to synchronize
+;	the use of the PCB Vector and the PHD for each process.
+;--
+
+SCANPROCS:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Register save mask
+
+	ADDL3	#MNR_PRO$K_PSIZE,4(AP),R4 ; Point past the prefix to ...
+					; ... beginning of data blocks
+	CLRL	R5			; Clear process counter
+	MOVL	SCH$GL_PCBVEC,R2	; Point to top of PCB vector
+	MOVL	(R2),R0			; Get NULL PCB address
+	MOVL	PCB$L_PID(R0),R7	; ... and its PID
+	MOVL	R0,R6			; Remember NULL PCB address
+	CLRL	R3			; Clear current pix
+	BRB	30$			; Jump into loop to collect the NULL process
+
+10$:
+	SETIPL	80$			; Synchronize use of PCB vector
+	MOVL	(R2)[R3],R0		; Get next PCB address
+	MOVL	PCB$L_PID(R0),R7	; ... and its PID
+	SETIPL	#0			; Back to IPL 0
+
+	CMPL	R6,R0			; Is this an empty slot (= NULL PCB)?
+	BNEQ	30$			; No -- go collect it
+	BRW	70$			; Yes -- skip collection
+
+30$:
+	MOVL	PCB$L_PID(R0),	    MNR_PRO$L_PID(R4)		; Move PCB items
+	MOVL	PCB$L_UIC(R0),	    MNR_PRO$L_UIC(R4)		; ... into
+	MOVW	PCB$W_STATE(R0),    MNR_PRO$W_STATE(R4)		; ... collection
+	MOVB	PCB$B_PRI(R0),	    MNR_PRO$B_PRI(R4)		; ... buffer
+	MOVQ	PCB$T_LNAME(R0),    MNR_PRO$O_LNAME(R4)		; 1st half of p name cstring
+	MOVQ	PCB$T_LNAME+8(R0),  MNR_PRO$O_LNAME+8(R4)	; ... second half
+	MOVW	PCB$W_GPGCNT(R0),   MNR_PRO$W_GPGCNT(R4)	;
+	MOVW	PCB$W_PPGCNT(R0),   MNR_PRO$W_PPGCNT(R4)	;
+
+	SETIPL	80$			; Synchronize use of PCB vector
+	MOVZWL	R7,R1			; Turn PID into PCB vector index
+	MOVL	(R2)[R1],R1		; Get PCB address
+	CMPL	PCB$L_PID(R1),R7	; Check to see if PID is still the same
+	BEQLU	40$			; Continue if so
+	SETIPL	#0			; Otherwise, return to IPL 0,
+	BRB	70$			; ... and skip this process
+
+40$:
+	MOVL	PCB$L_STS(R0),R7	; Save status field while SYNCHed
+	BBS	#PCB$V_RES,R7,50$	; If process resident, go after PHD info
+	SETIPL	#0			; Otherwise, return to IPL 0,
+	CLRQ	R8			; ... indicate no PHD statistics
+	CLRQ	R10			; ...
+	BRB	60$			; ... and continue
+
+50$:
+	MOVL	PCB$L_PHD(R0),R1	; Get PHD address
+	MOVL	PHD$L_DIOCNT(R1),R8	; Get PHD stats while still at raised IPL
+	MOVL	PHD$L_PAGEFLTS(R1),R9	; Use registers to avoid page faults
+	MOVL	PHD$L_CPUTIM(R1),R10	; ...
+	MOVL	PHD$L_BIOCNT(R1),R11	; ...
+	SETIPL	#0			; Back to IPL 0
+
+60$:
+	MOVL	R7,MNR_PRO$L_STS(R4)	; Status field into collection buffer
+	MOVL	R8,MNR_PRO$L_DIOCNT(R4)	; Four PHD fields into collection buffer
+	MOVL	R9,MNR_PRO$L_PAGEFLTS(R4) ; ...
+	MOVL	R10,MNR_PRO$L_CPUTIM(R4) ; ...
+	MOVL	R11,MNR_PRO$L_BIOCNT(R4) ; ...
+
+	INCL	R5			; Count this process
+	ADDL2	#MNR_PRO$K_DSIZE,R4	; ... and point to next data block in buffer
+
+70$:
+	ACBL	SCH$GL_MAXPIX,#1,R3,10$	; Loop once for each process in PCBVEC
+	MOVL	4(AP),R1		; Point to prefix portion of coll buffer
+	MOVL	R5,MNR_PRO$L_PCTREC(R1) ; Move # of procs this record into buffer
+	MOVL	R5,MNR_PRO$L_PCTINT(R1) ; Move # of procs this interval into buffer
+	RET				; Return to EXEC mode for exit
+
+80$:	.LONG	IPL$_SYNCH
+	ASSUME	.-10$  LE  512		; Make sure it doesn't exceed two pages
+
+.END

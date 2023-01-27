@@ -1,0 +1,325 @@
+MODULE	OPCOMINIT	(
+			 LANGUAGE (BLISS32),
+			 IDENT = 'V03-000'
+			) =
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!
+!	OPCOM
+!
+! ABSTRACT:
+!
+!	This module contains the logic to start and initialize OPCOM.
+!
+! Environment:
+!
+!	VAX/VMS operating system.
+!
+! Author:
+!
+!	Steven T. Jeffreys
+!
+! Creation date:
+!
+!	March 10, 1981
+!
+! Revision history:
+!
+! V02-002	STJ0162		Steven T. Jeffreys,	08-Feb-1982
+!		Make references to library routines use general addressing mode.
+!
+!
+!--
+
+BEGIN						! Start of OPCOMMAIN
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:OPCOMDEF.REQ';
+
+FORWARD ROUTINE
+
+	OPCOM_INIT	: NOVALUE,	! Initialization routine
+	KERNEL_SETUP;			! Kernel mode setup
+
+BUILTIN
+
+	INSQUE,					! Insert entry onto a queue
+	REMQUE;					! Remove entry from a queue
+
+
+GLOBAL ROUTINE OPCOM_INIT : NOVALUE =
+
+!++
+! Functional description:
+!
+!	This routine will start OPCOM and perform all of
+!	the necesary initialization to ensure OPCOM's
+!	correct functioning.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	The operator mailbox exists and is available.
+!	The process has CHMKRNL privilege.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	The operator logfile will be created on the system disk.
+!
+! Routine value:
+!
+!	SS$_NOPRIV	- The process does not have CHKRNL privilege.
+!	SS$_DEVALLOC 	- The operator mailbox already has a listener.
+!	SS$_NORMAL	- OPCOM successfully completed its shutdown sequence.
+!--
+
+BEGIN						! Start of OPCOM_INIT
+
+EXTERNAL ROUTINE
+
+	OPRENABLE_HANDLER: NOVALUE,		! Enable operator terminal
+	LOGFILE_HANDLER	 : NOVALUE,		! Initialize system logfile
+	TIME_STAMP	 : NOVALUE,		! Issue periodic timestamp
+	LIB$GET_VM	 : ADDRESSING_MODE (GENERAL);	! Get VM block
+
+EXTERNAL LITERAL
+
+	TIMESTAMP_PENDING,			! Global status flag
+	BUSY,					! Global status flag
+	LOGGING_ENABLED,			! Global status flag
+	OCD_K_TYPE,				! OCD structure type
+	MIN_SCOPE,				! Min scope value
+	MAX_SCOPE,				! Max scope value
+	MIN_DS_TYPE,				! Min DS_TYPE value
+	MAX_DS_TYPE;				! Max DS_TYPE value
+
+EXTERNAL
+	
+	GLOBAL_STATUS	: BITVECTOR,		! Global status flags
+	OCD_VECTOR	: VECTOR,		! Pointers to OCD's
+	SCB_TABLE	: VECTOR,		! Start of SCB table
+	WAIT_DELTA	: BBLOCK,		! Quadword AST wait time
+	OPA0_ENABLE_MSG	: BBLOCK,		! Descriptor of enable message
+	LOGFILE_MSG	: BBLOCK,		! Descriptor of INIT message
+	OPER_MBX_CHAN	: WORD,			! Channel to _MBA2:
+	OPER_MBX_NAME	: BBLOCK,		! Quadword descriptor of '_MBA2:'
+	LOGFILE_FAB	: REF BBLOCK,		! RMS control structure
+	LOGFILE_RAB	: REF BBLOCK,		! RMS control structure
+	LOGFILE_OPEN	: LONG;			! Global boolean
+
+LOCAL
+
+	IOSB		: BBLOCK [8],		! I/O status block
+	SIZE		: LONG,			! Size of data structure
+	TYPE		: LONG,			! Type of data structure
+	BLOCK		: REF BBLOCK,		! VM block
+	SCB		: REF BBLOCK,		! SCB block
+	STATUS		: LONG;
+
+!
+! Assign a channel to the operator mailbox, _MBA2:.  The mailbox is
+! defined by the EXEC module DEVICEDAT, and has an initial reference
+! count of 1.  This means that no one can allocate the device, no one
+! can delete it, and that once we assign a channel to it, the reference
+! count had better be 2.  If the $ASSIGN fails, then give up.
+!
+IF NOT (STATUS = $ASSIGN (CHAN=OPER_MBX_CHAN, DEVNAM=OPER_MBX_NAME))
+THEN
+    $EXIT (CODE=.STATUS);
+
+!
+! We now have a channel to the operator mailbox.  Now we must go into kernel
+! mode to do some further checking.  We must guaranty that we have CHMKRNL
+! privilege, and that the reference count on the operator mailbox is equal to
+! 2.  While in kernel mode, also set the OPR bit in the default operator UCB,
+! _OPA0:.
+!
+IF NOT (STATUS = $CMKRNL (ROUTIN=KERNEL_SETUP))
+THEN
+    !
+    ! Something is wrong.  The only error that we can tolerate is the
+    ! nonexistence of _OPA0:, which is indicated by a status of SS$_NOSUCHDEV.
+    ! Any other error condition will force us to abort.
+    !
+    IF NOT (.STATUS EQL SS$_NOSUCHDEV)
+    THEN
+	$EXIT (CODE=.STATUS);
+!
+! Build the look-aside lists for all data structures.
+!
+INCR J FROM MIN_DS_TYPE TO MAX_DS_TYPE DO
+    BEGIN
+    SCB  = .SCB_TABLE [.J-1];		! Get the SCB address
+    SIZE = .SCB [SCB_W_SIZE];		! Get data structure size
+    TYPE = .J;				! Get data structure type
+    INCR I FROM 1 TO .SCB [SCB_W_LAL_COUNT] DO
+	BEGIN
+	!
+	! Allocate a block of memory, initialize it, and
+	! put it on the appropriate look-aside list.
+	!
+	IF NOT (STATUS = LIB$GET_VM (SIZE, BLOCK))
+	THEN
+	    $EXIT (CODE=.STATUS);
+	CH$FILL (0, .SIZE, .BLOCK);	! Zero the block
+	BLOCK [HDR_L_FLINK] = BLOCK [HDR_L_FLINK];
+	BLOCK [HDR_L_BLINK] = BLOCK [HDR_L_FLINK];
+	BLOCK [HDR_W_SIZE] = .SIZE;	! Set block size
+	BLOCK [HDR_B_TYPE] = .TYPE;	! Set block type
+	BBLOCK [BLOCK [HDR_L_STATUS], HDR_V_LAL] = TRUE;	! Mark this as an LAL block
+	INSQUE (BLOCK [HDR_L_FLINK], SCB [SCB_L_FLINK]);
+	END;
+    END;
+!
+! Set up _OPA0: as the default operator.  This is
+! done by calling the enable handler with a the
+! address of a buffer descriptor that points to a
+! predefined enable message.
+!
+OPRENABLE_HANDLER (OPA0_ENABLE_MSG);
+
+!
+! Open the log file.  This is done by calling the
+! INIT message handler with the address of a buffer
+! descriptor that points to a predefined INIT message.
+! Set logging enabled.
+!
+LOGFILE_HANDLER (LOGFILE_MSG);
+GLOBAL_STATUS [LOGGING_ENABLED] = TRUE;
+
+!
+! Set the operator mailbox protection to
+! allow OWNER reads and writes.
+!
+IF NOT (STATUS = $QIO  (FUNC = (IO$_SETMODE OR IO$M_SETPROT),
+			CHAN = .OPER_MBX_CHAN,
+			IOSB = IOSB,
+			P2 = READ_WRITE
+		       ))
+THEN
+   $EXIT (CODE=.STATUS);
+
+!
+! Check the function status.
+!
+IF NOT (STATUS = .IOSB [0,0,16,0])
+THEN
+   $EXIT (CODE=.STATUS);
+
+!
+! Set the timer ast for the first time stamp message.
+! Also set the associated GLOBAL_STATUS bits.
+!
+GLOBAL_STATUS [BUSY] = TRUE;
+GLOBAL_STATUS [TIMESTAMP_PENDING] = FALSE;
+IF NOT (STATUS = $SETIMR (DAYTIM = WAIT_DELTA, ASTADR = TIME_STAMP))
+THEN
+    $EXIT (CODE = .STATUS);
+
+END;						! End of OPCOM_INIT
+
+
+ROUTINE KERNEL_SETUP =
+
+!++
+! Functional description:
+!
+!	This routine executes in kernel mode, and performs some
+!	additional setup necessary for the correct operation of OPCOM.
+!
+! Input:
+!
+!	None.
+!
+! Implicit Input:
+!
+!	A channel has been assigned to _MBA2:.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	If the _OPA0: exists, then the OPR bit in its UCB is set.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	SS$_NORMAL	if everything worked.
+!	SS$_DEVALLOC if _MBA2: has a reference count greater than 2.
+!	SS$_NOSUCHDEV	if _OPA0: does not exist.
+!--
+
+BEGIN						! Start of KERNEL_SETUP
+
+EXTERNAL ROUTINE
+
+	EXE$SETOPR	: ADDRESSING_MODE (GENERAL); ! Set or clear OPR bit
+
+EXTERNAL
+
+	SYS$GL_OPRMBX	: BBLOCK ADDRESSING_MODE (GENERAL);	! Address of MBA2 UCB
+
+OWN
+
+	DEF_OPER_DEV	: DESCRIPTOR ('_OPA0:');! Default operator device name
+
+LOCAL
+
+	STATUS		: LONG;
+
+!
+! Check the reference count in the _MBA2: UCB.  If it is greater than 2,
+! it means that there is already a listener at the mailbox.
+!
+IF SYS$GL_OPRMBX[UCB$W_REFC] GTR 2
+THEN
+    RETURN (SS$_DEVALLOC);
+
+!
+! Set the OPR bit in the default operator UCB.
+!
+RETURN (EXE$SETOPR (DEF_OPER_DEV,ON));
+END;						! End of KERNEL_SETUP
+
+END
+ELUDOM						! End of OPCOMINIT

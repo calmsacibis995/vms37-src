@@ -1,0 +1,571 @@
+	.TITLE	OTS$CVTTF		; Convert text to real (F only)
+	.IDENT	/1-004/			; File: OTSCVTTF.MAR  Edit: JAW1004
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY: Language-independent support library
+;
+; ABSTRACT:
+;
+;	Performs conversion of character strings containing numbers to
+;	the F_floating data type.  This routine supports Fortran F, E, D
+;	and G format conversion, as well as similar types in other
+;	languages.
+;
+; ENVIRONMENT: Runs at any access mode, AST Reentrant
+;
+; AUTHOR: John A. Wheeler, 17-Apr-1981: Version 1
+;
+; MODIFIED BY:
+;
+;--
+
+	.SBTTL	HISTORY			; Detailed current edit history
+
+; EDIT HISTORY:
+;
+; 1-001	- Original. JAW 17-Apr-1981
+; 1-002 - Don't define HANDLER as global symbol.  SBL 13-May-1981
+; 1-003 - Add call to OTS$CVT_T_D to assure a correctly-rounded result
+;	  in all cases.  Also improve exception handler.  JAW 12-Jul-1981
+; 1-004 - Add logic to handle tabs amid leading spaces.  Add check for
+;	  depth in handler.  Add check of result of OTS$CVT_T_D.  Remove
+;	  instruction which canceled handler.  Note ASCII dependencies.
+;	  JAW 23-Aug-1981
+;
+
+	.SBTTL	DECLARATIONS
+;
+; LIBRARY MACRO CALLS:
+;
+	$PSLDEF				; PSL$ symbols
+	$CHFDEF				; CHF$ symbols
+	$SSDEF				; SS$ symbols
+;
+; EXTERNAL SYMBOLS:
+;
+	.DSABL	GBL			; Require all external symbols to be declared
+	.EXTRN	OTS$_INPCONERR
+	.EXTRN	OTS$CVT_T_D		; D_floating input conversion
+
+;
+; MACROS:
+;
+;	NONE
+;
+; PSECT DECLARATIONS:
+;
+	.PSECT	_OTS$CODE	PIC, SHR, QUAD, EXE, NOWRT
+;
+; EQUATED SYMBOLS:
+;
+; Flags passed by the caller (relocated from bits 0:6 to bits 8:14, to
+; allow this routine's local flags to be referenced with BICB and BISB).
+;
+
+V_SKIPBLANKS	= 8			; If set, blanks are ignored.
+					; (Bit 0 for caller)
+V_ONLY_E	= 9			; If set, only E or e exponents
+					; are allowed (BASIC+2, PL/I).
+					; (Bit 1 for caller)
+V_ERR_UFLO	= 10			; If set, underflow is an error.
+					; (Bit 2 for caller)
+V_DONTROUND	= 11			; If set, don't round value.
+					; (Bit 3 for caller)
+V_SKIPTABS	= 12			; If set, tabs are ignored.
+					; (Bit 4 for caller)
+V_EXP_LETTER	= 13			; If set, an exponent must begin
+					; with a valid exponent letter.
+					; If clear, the exponent letter
+					; may be omitted.
+					; (Bit 5 for caller)
+V_FORCESCALE	= 14			; If set, the scale factor is
+					; always applied.  If clear, it
+					; is only applied if there is no
+					; exponent present in the string
+					; (Bit 6 for caller)
+
+
+; Local flags.  Do not use bits 0, 1, 3 or 5, which get set when the
+; sign character (^X2B or ^X2D) is OR'ed into R2.  (ASCII dependency.)
+
+V_MINUS		= 2			; Minus sign seen--MUST BE BIT 2
+V_SIGN		= 4			; Sign (plus or minus) seen
+V_POINT		= 6			; Decimal point seen
+V_EXPO		= 7			; Exponent seen
+
+M_SIGN		= 1@V_SIGN		; Mask for V_SIGN
+M_MINUS		= 1@V_MINUS		; Mask for V_MINUS
+M_POINT		= 1@V_POINT		; Mask for V_POINT
+
+
+	.SBTTL	OTS$CVT_T_F - convert text to F_floating
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	OTS$CVT_T_F converts a text string containing a representation
+;	of a numeric value to an F_floating representation of that
+;	value.  The routine supports FORTRAN F, E, D and G input type
+;	conversion as well as similar types for other languages.
+;
+;	The description of the text representation converted by
+;	OTS$CVT_T_F is as follows:
+;
+;		<0 or more blanks>
+;		<"+", "-" or nothing>
+;		<0 or more decimal digits>
+;		<"." or nothing>
+;		<0 or more decimal digits>
+;		<exponent or nothing, where exponent is:
+;			<	<<"E", "e", "D", "d", "Q", "q">
+;				<0 or more blanks>
+;				<"+", "-" or nothing>>
+;				or
+;				<"+" or "-">>
+;			<0 or more decimal digits>>
+;		<end of string>
+;
+;		Notes:	1. Unless the caller flag bit V_SKIPBLANKS
+;			   is set, blanks are equivalent to
+;			   decimal "0".  If V_SKIPBLANKS is set,
+;			   blanks are always ignored.
+;			2. There is no difference in semantics
+;			   between any of the 6 valid exponent
+;			   letters.
+;			3. If the caller flag bit V_ONLY_E is set,
+;			   the only valid exponent letters are
+;			   "E" and "e"; any others will be treated
+;			   as an invalid character.
+;			4. If the caller flag bit V_SKIPTABS is set,
+;			   tab characters are ignored else they are
+;			   an error.
+;			5. If the caller flag bit V_EXP_LETTER is set,
+;			   the exponent, if present, must start with
+;			   a valid exponent letter, e.g. 1.2E32.
+;			   If clear, the exponent letter may be omitted,
+;			   e.g. 1.2+32.
+;
+;
+; CALLING SEQUENCE:
+;
+;	status.wlc.v = OTS$CVT_T_F (in_str.rt.dx, value.wf.r 
+;			[, digits_in_fract.rlu.v
+;			[, scale_factor.rl.v
+;			[, caller_flags.rlu.v,
+;			[, ext_bits.wb.r]]]])
+
+;
+; INPUT PARAMETERS:
+;
+	inp_str		= 4		; Input string descriptor
+
+	digits_in_fract	= 12		; If no decimal point is
+					; present in input, specifies
+					; how many digits are to be
+					; treated as being to the right
+					; of the decimal point.
+					; If omitted, 0 is the default.
+
+	scale_factor	= 16		; Signed scale factor.  If
+					; present, and exponent absent,
+					; the result value is divided by
+					; 10**factor.  If V_FORCESCALE
+					; is set, the scale factor is
+					; always applied.
+
+	flags		= 20		; Flags supplied by caller
+;
+; IMPLICIT INPUTS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+	value		= 8		; Floating result by reference
+
+	ext_bits	= 24		; If present, the value will
+					; NOT be rounded and the first
+					; 8 bits after truncation will
+					; be returned in this argument
+					; as a byte.  This value is
+					; suitable for use as the
+					; extension operand in an EMOD
+					; instruction.
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	OTS$_INPCONERR	- Error if illegal character in input, floating
+;			  overflow, or floating underflow (if enabled).
+;
+;	SS$_NORMAL	- Success
+;
+;
+; SIDE EFFECTS:
+;
+;	NONE
+;
+;--
+
+	.SBTTL	Initialization
+
+;+
+; Register usage:
+;
+;	R0:R1	- Descriptor for input string
+;	R2	- flags (caller's and ours)
+;	R3	- digits_in_fraction
+;	R4:R5	- significand, as D_floating number
+;	R6	- next character
+;	R7	- utility register
+;	R8	- count of digits held in R9 (up to 9)
+;	R9	- digit accumulator
+;	R10	- count of significant digits seen
+;-
+
+;+
+; NOTE:  This routine contains specific dependencies on the ASCII
+; character set, as noted in comments throughout.
+;-
+
+	.ENTRY	OTS$CVT_T_F, ^M<R2, R3, R4, R5, R6, R7, R8, R9, R10>
+;+
+; Initialization
+;-
+	MOVQ	@inp_str(AP), R0	; R0:R1 = string descriptor.
+	CLRQ	R2			; Flags and digits_in_fract = 0.
+	CMPB	(AP), #<flags/4>	; Is fifth argument present?
+	BLSSU	10$			; Branch if not, leaving R2 = 0.
+	ASHL	#8, flags(AP), R2	; Get caller flags & clear ours.
+10$:	CLRD	R4			; R4:R5 (significand) = 0
+
+;+
+; Begin digit accumulation for fraction or exponent
+;-
+
+	CLRQ	R8			; Count and accumulator = 0
+	CLRL	R10			; Significant digit count = 0
+
+RESTRT:	SKPC	#^A/ /, R0, (R1)	; Skip blanks (clears LH(R0)).
+	BBC	#V_SKIPTABS, R2, NEXT	; Branch if tabs are illegal.
+	MOVL	R0, R7			; Save character pointer in R7.
+	SKPC	#^A/	/, R0, (R1)	; Skip tabs if present.
+	CMPL	R0, R7			; Were any tabs skipped?
+	BNEQ	RESTRT			; If so, try for more blanks.
+
+	.SBTTL	Main loop
+
+NEXT:	SOBGEQ	R0, 10$			; Check for end of string.
+	BRW	END			; Branch at end.
+10$:	CVTBL	(R1)+, R6		; Fetch next character.
+	BLSS	ERROR			; Error if between 128 and 255.
+					; (ASCII dependency.)
+	BBSC	#6, R6, LETTER		; Branch if between 64 and 127
+					;  and map character to 0:63.
+					;  (ASCII dependency.)
+	MOVZBL	W^OFFSET[R6], R7	; Get branch displacement.
+	JMP	B^ACTION[R7]		; Dispatch to action routine.
+
+ACTION:
+
+;+
+; Tab
+;-
+
+TAB:	BBS	#V_SKIPTABS, R2, NEXT	; If tabs are legal, ignore.
+ERROR:	MOVL	#OTS$_INPCONERR, R0	; Else error.
+	CLRF	@value(AP)		; Store zero as result on error.
+	RET				; Return to caller.
+
+;+
+; Decimal point
+;-
+
+POINT:	BBSS	#V_POINT, R2, ERROR	; If 2nd decimal point, error.
+	CLRL	R3			; Reset digits_in_fraction.
+	BRB	DIGDON			; Go indicate sign now known.
+
+;+
+; Blank
+;-
+
+BLANK:	BBS	#V_SKIPBLANKS, R2, NEXT ; If BLANK=NULL, ignore blank.
+	MOVB	#^A/0/, R6		; Otherwise treat as a zero.
+
+;+
+; Zero
+;-
+
+ZERO:	TSTW	R10			; Has significance started yet?
+	BEQL	NONSIG			; Branch if nonsignificant zero.
+
+;+
+; Digit (1-9, or significant zero)
+;-
+
+DIGIT:	AOBLEQ	#38, R10, USE		; Are we beyond the 38th digit?
+	BRB	NONSIG			; Yes: treat as nonsignificant.
+USE:	AOBLEQ	#9, R8, ROOM		; Is there room for digit in R9?
+	BBS	#V_EXPO, R2, ERROR	; No.  If exponent digit, error.
+	CVTLD	R9, R8			; Float R9 into R8:R9.
+	MULD	W^TEN9, R4		; Accumulate a super-digit.
+	ADDD	R8, R4			; ...
+	MOVQ	#1, R8			; R8 (digit count) = 1
+					; R9 (digit accumulator) = 0
+
+ROOM:	MOVAL	(R9)[R9], R9		; Multiply R9 by 10 and add the
+	MOVAW	-^X30(R6)[R9], R9	; digit in R6 (strip zone bits).
+					; (ASCII dependency.)
+NONSIG:	INCL	R3			; Count digit in fraction.
+DIGDON:	BISB	#M_SIGN, R2		; Indicate sign now known.
+	BRB	NEXT			; Go get next character.
+
+
+
+;+
+; Sign (+ or -) (^X2B or ^X2D, respectively)
+;-
+
+SIGN:	BBSS	#V_SIGN, R2, SIGN2	; Branch if second sign.
+SIGN1:	BISB	R6, R2			; OR the sign character into R2.
+					; (ASCII dependency.)
+	BRB	NEXT			; Go get next character.
+SIGN2:	BBS	#V_EXP_LETTER, R2, ERROR ; If letter is required, error.
+	INCL	R0			; Throw back the second sign,
+	DECL	R1			;  ...
+	BRB	E			;  and pretend we saw an E.
+
+;+
+; Any character whose value is ^X40 or greater (normally a letter)
+;-
+
+LETTER:	BBS	R6, B^LTRE, E		; Branch if letter is E or e.
+	BBC	R6, B^LTRDQ, ERROR	; Branch if letter is not DdQq.
+DQ:	BBS	#V_ONLY_E, R2, ERROR	; If D or Q not allowed, error.
+E:	BICB	#M_SIGN, R2		; Allow sign again after letter.
+EXPO:	BBSS	#V_EXPO, R2, ERROR	; If second exponent, error.
+	BRB	TERM			; Go terminate the significand.
+					; Equivalent to BSB TERM.
+EXPO1:	BICB	#M_MINUS, R2		; Restore default sign (plus).
+	BRW	RESTRT			; Go restart digit accumulation.
+
+;+
+; Bit vectors for use in identifying valid exponent letters.
+;-
+
+LTRE:	.QUAD	^X0000002000000020	; Bits to identify E and e.
+					; (ASCII dependency.)
+LTRDQ:	.QUAD	^X0002001000020010	; Bits to identify D, Q, d, q.
+					; (ASCII dependency.)
+
+.SBTTL	End-of-string processing
+
+END:	BBC	#V_EXPO, R2, TERM	; Branch if no exponent seen.
+	BBC	#V_MINUS, R2, FINISH	; Is the exponent negative?
+	MNEGL	R9, R9			; Yes: negate it.
+	BRB	FINISH			; Go finish up.
+		
+;+
+; Terminate the significand.  (The code between TERM and TERMX is also
+; "called" at EXPO.)
+;-
+
+TERM:	TSTD	R4			; Were there more than 9 digits?
+	BEQL	10$			; Branch if not.
+	CVTLD	R9, R6			; Yes: float final super-digit.
+	MULD	W^TENTAB[R8], R4	; Make room in R4.
+	ADDD	R6, R4			; Accumulate final super-digit.
+	BRB	20$			; Continue.
+
+10$:	CVTLD	R9, R4			; Float the significand.
+20$:	BBC	#V_MINUS, R2, 30$	; Was there a minus sign?
+	MNEGD	R4, R4			; Yes: negate the result.
+30$:	BBSS	#V_POINT, R2, 50$	; Was there a decimal point?
+					; Disallow second decimal point.
+
+40$:	CLRL	R3			; Set digits_in_fract to 0.
+	CMPB	(AP), #<digits_in_fract/4> ; Is third argument present?
+	BLSSU	50$			; Branch if not.
+	MOVL	digits_in_fract(AP), R3	; Yes: use the argument.
+50$:	SUBL	#38, R10		; Did we ignore any digits?
+	BLEQ	60$			; Branch if not.
+	SUBL	R10, R3			; If so, reduce R3 accordingly.
+60$:	PUSHL	R3			; Save digits_in_fract on stack.
+	CLRQ	R8			; Count and accumulator = 0
+	CLRL	R10			; Significand digit count = 0
+TERMX:	BBS	#V_EXPO, R2, EXPO1	; Continue at EXPO1 if V_EXPO=1.
+					; Otherwise continue at FINISH.
+
+;+
+; Here to finish up.  The significand is in R4:R5 in D_floating, and the
+; exponent is in R9 as an integer.  Digits_in_fract is on the stack.
+;-
+
+FINISH:	TSTD	R4			; Is the significand zero?
+	BEQL	STORE1			; If so, no scaling is needed.
+	CMPB	(AP), #<scale_factor/4>	; Is fourth argument present?
+	BLSSU	NOSF			; Branch if not.
+	BBS	#V_FORCESCALE, R2, APSF	; Branch if scaling is required.
+	BBS	#V_EXPO, R2, NOSF	; Branch if exponent is present.
+APSF:	SUBL	scale_factor(AP), R9	; Apply explicit scale factor.
+NOSF:
+	MOVAB	W^HANDLER, (FP)		; Establish exception handler.
+	BBC	#V_ERR_UFLO, R2, 10$	; Is underflow an error?
+	BISPSW	#PSL$M_FU		; Yes: enable it.
+10$:	MNEGL	#10, R0			; R0 = -10 (for use in ACBL)
+	SUBL	(SP)+, R9		; Apply digits in fraction.
+
+
+;+
+; We now have the final scale factor (FSF) in R9.
+;-
+
+	BEQL	STORE			; If zero, no scaling is needed.
+	BGTR	POSFSF			; Branch if FSF is positive.
+	MNEGL	R9, R9			; R9 = |FSF|
+	BRB	NEGFSF			; Continue with negative FSF.
+NEGX:	DIVD	W^TEN10, R4		; Divide R4 by 10**10.
+	BEQL	STORE			; If R4 goes to zero, quit.
+NEGFSF:	ACBL	#1, R0, R9, NEGX	; Deduct 10 from FSF and test.
+	DIVD	W^TENTAB+^D80[R9], R4	; Apply remainder of FSF.
+	BRB	STORE			; Continue.
+
+POSX:	MULD	W^TEN10, R4		; Multiply R4 by 10**10.
+POSFSF:	ACBL	#1, R0, R9, POSX	; Deduct 10 from FSF and test.
+	MULD	W^TENTAB+^D80[R9], R4	; Apply remainder of FSF.
+;+
+; Test the result to see whether rounding error could have affected the
+; 25th fraction bit, which is the rounding bit for the conversion to F.
+; A carry into this bit may have occurred if it is a one followed by a
+; string of zeroes, or is a zero followed by a string of ones.  The
+; error cannot exceed 8 LSB, since a maximum of sixteen floating-point
+; instructions capable of introducing error have been executed.
+;-
+STORE:	BICL3	#^X000F0000, R5, R7	; Mask off low-order 4 bits.
+	CMPL	R7, #^XFFF07FFF		; Is rounding bit 0, others 1?
+	BEQL	CALLTD			; If so, call OTS$CVT_T_D.
+	CMPL	R7, #^X00008000		; Is rounding bit 1, others 0?
+	BEQL	CALLTD			; If so, call OTS$CVT_T_D.
+STORE1:	CMPB	(AP), #<ext_bits/4>	; Is sixth argument present?
+	BGEQU	EXTBIT			; Branch if so.
+	BBS	#V_DONTROUND, R2, NORND	; If bit 3 is set, don't round.
+	CVTDF	R4, @value(AP)		; Store rounded value.
+	BRB	RET1			; And return.
+EXTBIT:	ASHL	#-8, R5, R5		; Align next 8 bits in R5<0:7>.
+	MOVB	R5, @ext_bits(AP)	; Store extra precision bits.
+NORND:	MOVF	R4, @value(AP)		; Store unrounded value.
+RET1:	MOVL	#SS$_NORMAL, R0		; Indicate success.
+	RET				; Return to caller.
+
+
+;+
+; Here to call OTS$CVT_T_D.  Build a list of five arguments, including
+; any passed by the caller, on the stack.
+;-
+CALLTD:	SUBL	#8, SP			; Make room for double result.
+					; (This specific location may or
+					; may not be used.)
+	CLRL	-(SP)			; Provide default fifth arg.
+	CLRQ	-(SP)			; Provide default 3rd, 4th arg.
+	MOVZBL	(AP), R7		; Extend argument count.
+10$:	PUSHL	(AP)[R7]		; Copy each argument passed.
+	SOBGTR	R7, 10$			; Step to next argument.
+	MOVAL	20(SP), 4(SP)		; Substitute our result field.
+	CALLS	#5, G^OTS$CVT_T_D	; Call double input conversion,
+					; always passing five arguments.
+	BLBS	R0, 20$			; If successful, proceed.
+	BRW	ERROR			; Else return OTS$_INPCONERR.
+20$:	MOVQ	(SP)+, R4		; Transfer result to R4:R5.
+	BRB	STORE1			; Continue.
+
+;+
+; Table of powers of ten.  This is a zero-origin table whose 0th entry
+; is never referenced (since we never want to multiply/divide by 10**0).
+;-
+
+	.ALIGN	QUAD
+TENTAB=.-8
+ 	.QUAD	^X0000000000004220	; .DOUBLE 1.0E1
+	.QUAD	^X00000000000043C8	; .DOUBLE 1.0E2
+ 	.QUAD	^X000000000000457A	; .DOUBLE 1.0E3
+	.QUAD	^X000000004000471C	; .DOUBLE 1.0E4
+ 	.QUAD	^X00000000500048C3	; .DOUBLE 1.0E5
+	.QUAD	^X0000000024004A74	; .DOUBLE 1.0E6
+ 	.QUAD	^X0000000096804C18	; .DOUBLE 1.0E7
+	.QUAD	^X00000000BC204DBE	; .DOUBLE 1.0E8
+TEN9: 	.QUAD	^X000000006B284F6E	; .DOUBLE 1.0E9
+TEN10: 	.QUAD	^X0000000002F95115	; .DOUBLE 1.0E10
+
+
+HANDLER:
+	.WORD	^M<>			; Save nothing
+;+
+; The only anticipated exceptions are floating overflow and floating
+; underflow.  Continue at ERROR in either case.  Otherwise resignal.
+;-
+	MOVL	CHF$L_SIGARGLST(AP), R0	; R0 = address of signal array
+	CMPW	CHF$L_SIG_NAME(R0), #SS$_FLTOVF ; Overflow trap?
+	BEQL	ERR
+	CMPW	CHF$L_SIG_NAME(R0), #SS$_FLTUND	; Underflow trap?
+	BEQL	ERR
+	CMPW	CHF$L_SIG_NAME(R0), #SS$_FLTOVF_F ; Overflow fault?
+	BEQL	ERR
+	CMPW	CHF$L_SIG_NAME(R0), #SS$_FLTUND_F ; Underflow fault?
+	BNEQ	RESIG
+ERR:	MOVL	CHF$L_MCHARGLST(AP), R1	; R1 = addr of mechanism array
+	TSTL	CHF$L_MCH_DEPTH(R1)	; Is the depth zero?
+	BNEQ	RESIG			; No: resignal.
+	MOVAB	ERROR, CHF$L_SIG_NAME+4(R0) ; Change return PC to ERROR.
+	MOVL	#SS$_CONTINUE, R0	; Continue.
+	RET				; Return.
+
+RESIG:	MOVL	#SS$_RESIGNAL, R0	; None of the above; resignal.
+	RET				; Return.
+
+
+	.SBTTL	Table of offsets to action routines
+
+HT=TAB-ACTION				; Tab
+er=ERROR-ACTION				; Error
+DP=POINT-ACTION				; Decimal point
+BL=BLANK-ACTION				; Blank
+ZR=ZERO-ACTION				; Zero
+DG=DIGIT-ACTION				; Digit (1-9)
+SI=SIGN-ACTION				; Sign (+ or -)
+
+; (ASCII dependency.)
+
+OFFSET:	.BYTE	er,er,er,er,er,er,er,er,er,HT,er,er,er,er,er,er	; 00-0F
+	.BYTE	er,er,er,er,er,er,er,er,er,er,er,er,er,er,er,er	; 10-1F
+	.BYTE	BL,er,er,er,er,er,er,er,er,er,er,SI,er,SI,DP,er	; 20-2F
+	.BYTE	ZR,DG,DG,DG,DG,DG,DG,DG,DG,DG,er,er,er,er,er,er	; 30-3F
+
+	.END

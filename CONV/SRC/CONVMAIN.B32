@@ -1,0 +1,1115 @@
+%TITLE	'VAX-11 CONVERT'
+MODULE	CONV$MAIN	( IDENT='V03-001',
+			OPTLEVEL=3
+			) =
+
+BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! Facility:	VAX-11 CONVERT
+!
+! Abstract:	CONVERT main routines
+!
+! Contents:
+!		CONVERT
+!		GET_RECORD
+!		GET_VM
+!		FREE_VM
+!		GET_TEMP_VM
+!		FREE_TEMP_VM
+!		EXCEPTION
+!		END_OF_FILE
+!
+! Environment:
+!
+!		VAX/VMS Operating System
+!
+!--
+
+!
+! Author:	Keith B Thompson	Creation date:	June-1980
+!
+!
+! Modified by:
+!
+!	V03-001	KBT0016		Keith Thompson		18-Mar-1982
+!		Add control-y processing in get_record and fix call to
+!		conv$$rms_read_error in conv$$exception
+!
+!****
+
+
+PSECT
+	OWN	= _CONV$OWN	(PIC),
+	GLOBAL	= _CONV$GLOBAL	(PIC),
+	PLIT	= _CONV$PLIT	(SHARE,PIC),
+	CODE	= _CONV$CODE	(SHARE,PIC);
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+REQUIRE	'SRC$:CONVERT';
+REQUIRE	'SRC$:CONVDEF';
+
+DEFINE_ERROR_CODES;
+
+EXTERNAL ROUTINE
+	LIB$GET_VM		: ADDRESSING_MODE(GENERAL),
+	LIB$FREE_VM		: ADDRESSING_MODE(GENERAL),
+	CONV$$SORT_PRIMARY	: JSB_REG11,
+	CONV$$FAST_LOAD		: JSB_REG11,
+	CONV$$RMS_READ_ERROR	: NOVALUE;
+
+FORWARD ROUTINE
+	CONV$$GET_RECORD	: JSB_LINK,
+	CONV$$FREE_TEMP_VM	: JSB_LINK NOVALUE,
+	CONV$$EXCEPTION,
+	CONV$$END_OF_FILE	: NOVALUE;
+
+EXTERNAL
+	CONV$GL_APPEND		: LONG,
+	CONV$GL_CREATE		: LONG,
+	CONV$GL_EXC		: LONG,
+	CONV$GL_EXIT		: LONG,
+	CONV$GL_FAST		: LONG,
+	CONV$GL_FIX		: LONG,
+	CONV$GL_MERGE		: LONG,
+	CONV$GL_PAD		: LONG,
+	CONV$GL_PAD_CHAR	: LONG,
+	CONV$GL_SHARE		: LONG,
+	CONV$GL_SORT		: LONG,
+	CONV$GL_TRUNCATE	: LONG,
+
+	CONV$AB_FLAGS		: BLOCK [ ,BYTE ],
+	CONV$GL_VALID_COUNT,
+	CONV$GL_EXCEPT_COUNT,
+	CONV$GB_CURRENT_FILE	: BYTE,
+	CONV$GW_OUT_MRS		: WORD,
+	CONV$GW_UDF_MRS		: WORD,
+	CONV$GW_IN_REC_SIZ	: SIGNED WORD,
+	CONV$GW_OUT_REC_SIZ	: SIGNED WORD,
+	CONV$GL_RECORD_COUNT,
+	CONV$GW_MAX_REC_SIZ	: WORD,
+	CONV$GL_REC_BUF_PTR,
+	CONV$GL_VFC_BUF_PTR,
+	CONV$GL_RFA_BUFFER,
+
+	CONV$AB_RFA_FAB		: $FAB_DECL,
+	CONV$AB_RFA_RAB		: $RAB_DECL,
+	CONV$AB_IN_FAB		: $FAB_DECL,
+	CONV$AB_IN_RAB		: $RAB_DECL,
+	CONV$AB_IN_NAM		: $NAM_DECL,
+	CONV$AB_OUT_FAB		: $FAB_DECL,
+	CONV$AB_OUT_RAB		: $RAB_DECL,
+	CONV$AB_OUT_NAM		: $NAM_DECL,
+	CONV$AB_EXC_RAB		: $RAB_DECL;
+
+OWN
+	DYN_AREA_CNT,
+	DYN_AREA_ADDR	: VECTOR [ 10,LONG ],
+	DYN_AREA_SIZE	: VECTOR [ 10,LONG ],
+
+	TMP_AREA_CNT,
+	TMP_AREA_ADDR	: VECTOR [ 32,LONG ],
+	TMP_AREA_SIZE	: VECTOR [ 32,LONG ],
+
+	BYTE_COUNT	: SIGNED LONG,
+	N_RFAS,
+	REC_ADJUST	: SIGNED LONG;		! Record size adjustment
+
+%SBTTL	'CONVERT'
+GLOBAL ROUTINE	CONV$$CONVERT =
+!++
+!
+! Functional Description:
+!
+!	Sets up the record buffer pointers and any format conversion,
+!	sorts the input file if needed and loads the output file.
+!
+!	How the buffers work:
+!
+!	The main record buffer:
+!
+!		--------------------------------------//-----------------
+!		|		|					|
+!		|		|					|
+!		--------------------------------------//-----------------
+!		^		^
+!		|		|
+!	   VFC_BUF_PTR	   REC_BUF_PTR
+!
+!
+!	No /FIXED_CONTROL
+!
+! INPUT RAB:   RHB	       UBF
+!		|		|
+!		--------------------------------------//-----------------
+!		|		|					|
+!		|		|					|
+!		--------------------------------------//-----------------
+!		|		|
+! OUTPUT RAB:  RHB	       RBF
+!
+!
+!	With /FIXED_CONTROL
+!
+!	Input file VFC, output file not:
+!
+! INPUT RAB:   RHB	       UBF
+!		|		|
+!		--------------------------------------//-----------------
+!		|		|					|
+!		|		|					|
+!		--------------------------------------//-----------------
+!		|
+! OUTPUT RAB:  RBF
+!
+!
+!	Output file VFC, input file not:
+!
+! INPUT RAB:   UBF
+!		|
+!		--------------------------------------//-----------------
+!		|		|					|
+!		|		|					|
+!		--------------------------------------//-----------------
+!		|		|
+! OUTPUT RAB:  RHB	       RBF
+!
+!
+! Calling Sequence:
+!
+!	CONV$$CONVERT()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!
+!	CONV$_SUCCESS or error code
+!
+! Routines Called:
+!
+!	CONV$$SORT_PRIMARY
+!	CONV$$FAST_LOAD
+!	CONV$$GET_RECORD
+!	$PUT
+!	CONV$$EXCEPTION
+!	CONV$$END_OF_FILE
+!	CONV$$FREE_TEMP_VM
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_KEY_BLOCK_GLOBAL;
+
+    ! Setup Buffer Pointers etc.
+    !
+    ! If the FIX Option is on and only one of the files
+    ! has VFC Format will pointers be moved
+    !
+    IF .CONV$GL_FIX AND
+	(( .CONV$AB_IN_FAB [ FAB$B_RFM ] EQL FAB$C_VFC ) XOR
+	 ( .CONV$AB_OUT_FAB [ FAB$B_RFM ] EQL FAB$C_VFC ))
+    THEN
+
+	IF .CONV$AB_IN_FAB [ FAB$B_RFM ] EQL FAB$C_VFC
+	THEN
+	    BEGIN
+
+	    ! The Input File is VFC
+	    !
+	    REC_ADJUST = .CONV$AB_IN_FAB [ FAB$B_FSZ ];
+	    CONV$AB_IN_RAB [ RAB$L_RHB ] = .CONV$GL_VFC_BUF_PTR;
+	    CONV$AB_IN_RAB [ RAB$L_UBF ] = .CONV$GL_REC_BUF_PTR;
+	    CONV$AB_OUT_RAB [ RAB$L_RBF ] = .CONV$GL_VFC_BUF_PTR
+	    END
+	ELSE
+	    BEGIN
+
+	    ! The Output File is VFC
+	    !
+	    REC_ADJUST = - .CONV$AB_OUT_FAB [ FAB$B_FSZ ];
+	    CONV$AB_IN_RAB [ RAB$L_UBF ] = .CONV$GL_VFC_BUF_PTR;
+	    CONV$AB_OUT_RAB [ RAB$L_RHB ] = .CONV$GL_VFC_BUF_PTR;
+	    CONV$AB_OUT_RAB [ RAB$L_RBF ] = .CONV$GL_REC_BUF_PTR
+	    END
+    ELSE
+	BEGIN
+
+	! Either they Both are or are not VFC files
+	!
+	REC_ADJUST = 0;
+	CONV$AB_IN_RAB [ RAB$L_UBF ] = .CONV$GL_REC_BUF_PTR;
+	CONV$AB_IN_RAB [ RAB$L_RHB ] = .CONV$GL_VFC_BUF_PTR;
+	CONV$AB_OUT_RAB [ RAB$L_RBF ] = .CONV$GL_REC_BUF_PTR;
+	CONV$AB_OUT_RAB [ RAB$L_RHB ] = .CONV$GL_VFC_BUF_PTR;
+
+	! Take care of some special cases
+	!
+	! If the output file is CR and the input is FTN then we must drop
+	! the fortran print control character
+	!
+	IF .CONV$AB_OUT_FAB [ FAB$V_CR ] AND .CONV$AB_IN_FAB [ FAB$V_FTN ]
+	THEN
+	    BEGIN
+	    CONV$AB_OUT_RAB [ RAB$L_RBF ] = .CONV$AB_OUT_RAB [ RAB$L_RBF ] + 1;
+	    REC_ADJUST = -1
+	    END;
+
+	! If the output file is FTN and the input file is not the make room
+	! for the carraige control and put in a space (like CR format)
+	!
+	IF .CONV$AB_OUT_FAB [ FAB$V_FTN ] AND
+		( .CONV$AB_OUT_FAB [ FAB$V_CR ] OR .CONV$AB_OUT_FAB [ FAB$V_PRN ] )
+	THEN
+	    BEGIN
+
+	    LOCAL RECORD_BUFFER : REF VECTOR [ ,BYTE ];
+
+	    RECORD_BUFFER = .CONV$AB_IN_RAB [ RAB$L_UBF ];
+
+	    RECORD_BUFFER [ 0 ] = 20;			! 20 = ASCII space
+
+	    CONV$AB_IN_RAB [ RAB$L_UBF ] = .CONV$AB_IN_RAB [ RAB$L_UBF ] + 1;
+	    REC_ADJUST = 1
+
+	    END;
+
+	! If the output file is PRN and the input is not VFC
+	! then put LF - CR control info into the VFC field of the output
+	! NOTE: VMS print files are "018D" in stead of "8A8D" which would
+	!	be more reasonable?
+	!
+	IF .CONV$AB_OUT_FAB [ FAB$V_PRN ] AND
+				( .CONV$AB_IN_FAB [ FAB$B_RFM ] NEQU FAB$C_VFC )
+	THEN
+	    BEGIN
+
+	    LOCAL RECORD_BUFFER : REF VECTOR [ ,BYTE ];
+
+	    RECORD_BUFFER = .CONV$AB_OUT_RAB [ RAB$L_RHB ];
+
+	    RECORD_BUFFER [ 0 ] = %X'01';		! One LF
+	    RECORD_BUFFER [ 1 ] = %X'8D'		! CR
+
+	    END;
+
+	END;
+
+    ! The exception record is always the record pointed to by the output rab
+    !
+    CONV$AB_EXC_RAB [ RAB$L_RBF ] = .CONV$AB_OUT_RAB [ RAB$L_RBF ];
+
+    ! Initialize some Variables
+    !
+    CONV$AB_IN_RAB [ RAB$W_USZ ] = .CONV$GW_MAX_REC_SIZ;
+    BYTE_COUNT = 0;
+
+    ! If SORT is on then sort the records on the output primary key
+    !
+    IF .CONV$GL_SORT
+    THEN
+	RET_ON_ERROR( CONV$$SORT_PRIMARY() );
+
+    BEGIN		! STATUS local
+
+    LOCAL	STATUS	: LONG;
+
+    ! If FAST then call FAST_LOAD, otherwise do it the slow way
+    !
+    IF .CONV$GL_FAST
+    THEN
+	STATUS = CONV$$FAST_LOAD()
+    ELSE
+	BEGIN
+
+	! Enter Main Loop
+	!
+	! Loop untill an error or end of file
+	!
+	WHILE ( STATUS = CONV$$GET_RECORD() )
+	DO
+	    BEGIN	! Main Loop
+
+	    ! Set the size of the record to OUT_REC_SIZE which is set by GET_RECORD
+	    !
+	    CONV$AB_OUT_RAB [ RAB$W_RSZ ] = .CONV$GW_OUT_REC_SIZ;
+
+	    ! Write the record, if there was an error call the exception handler
+	    !
+	    IF NOT ( STATUS = $PUT ( RAB=CONV$AB_OUT_RAB ) )
+	    THEN
+
+		! If the exception handler returned with an error
+		! then it was fatal
+		!
+		IF NOT ( STATUS = CONV$$EXCEPTION( .STATUS ) )
+		THEN
+		    EXITLOOP;
+
+	    END;	! Main Loop
+
+	! Finish off this file
+	!
+	CONV$$END_OF_FILE()
+
+	END;
+
+    ! Deallocate all of the temporary memory used by this run
+    !
+    CONV$$FREE_TEMP_VM();
+
+    ! If end of file thats normal
+    !
+    IF ( .STATUS EQL RMS$_EOF )
+    THEN
+	STATUS = CONV$_SUCCESS;
+
+    RETURN .STATUS
+
+    END			! STATUS local
+    END;
+
+%SBTTL	'GET_RECORD'
+GLOBAL ROUTINE	CONV$$GET_RECORD : JSB_LINK =
+!++
+!
+! Functional Description:
+!
+!	Gets a record from the input file and processes it
+!
+! Calling Sequence:
+!
+!	CONV$$GET_RECORD()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!
+!	CONV$_SUCCESS or status returned by $GET
+!
+! Routines Called:
+!
+!	$READ
+!	CONV$$RMS_READ_ERROR	- By RMS as an AST
+!	$GET
+!	CONV$$EXCEPTION
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    LABEL
+	GET_REC,
+	EXC_REC;
+
+    OWN
+	RFA_IDX		: LONG;
+
+    LOCAL
+	STATUS		: LONG;
+
+    ! RFA Vector declarations
+    !
+    BIND
+	RFA0	= .CONV$GL_RFA_BUFFER : RFA0_VECTOR [ 256 ],
+	RFA4	= .CONV$GL_RFA_BUFFER : RFA4_VECTOR [ 256 ];
+
+    STATUS = _SET;
+
+    ! Loop while ok (we could fail from a fatal exception)
+    !
+    WHILE .STATUS
+    DO
+	BEGIN		! Main While loop
+
+GET_REC:
+	    BEGIN	! GET_REC Block
+
+	    ! If Input Format is UDF then we do some strange things
+	    !
+	    IF .CONV$AB_IN_FAB [ FAB$B_RFM ] EQLU FAB$C_UDF
+	    THEN
+		BEGIN	! UDF Block
+
+		! If the Byte Count from last time is Positive then we must move
+		! the Chracters Left Over to the Front of the Buffer
+		!
+		IF .BYTE_COUNT GEQ .CONV$GW_UDF_MRS
+		THEN
+		    BEGIN
+
+		    ! Set status here because we dont do a READ
+		    !
+		    STATUS = CONV$_SUCCESS;
+
+		    ! Cut down BYTE_COUNT the size of the last record
+		    !
+		    BYTE_COUNT = .BYTE_COUNT - .CONV$GW_UDF_MRS;
+
+		    ! Move the extra characters to the front of the buffer
+		    !
+		    CH$MOVE ( .BYTE_COUNT,
+				.CONV$GL_REC_BUF_PTR + .CONV$GW_UDF_MRS,
+				.CONV$GL_REC_BUF_PTR )
+		    END;
+
+		! Read some Blocks to Get the Record
+		!
+		WHILE .BYTE_COUNT LSS .CONV$GW_UDF_MRS
+		DO
+		    BEGIN	! READ While loop
+
+		    ! Point the RAB buffer to the position just after the last
+		    ! character left over from last time
+		    !
+		    CONV$AB_IN_RAB [ RAB$L_UBF ] = .CONV$GL_REC_BUF_PTR + .BYTE_COUNT;
+
+		    IF ( NOT ( STATUS = $READ( RAB=CONV$AB_IN_RAB,
+						ERR=CONV$$RMS_READ_ERROR ) ) )
+		    THEN
+
+			! If Byte Count is > 0 then use that and give EOF
+			! next time
+			!
+			IF .BYTE_COUNT GTR 0
+			THEN
+			    BEGIN
+			    CONV$GW_IN_REC_SIZ = .BYTE_COUNT;
+			    BYTE_COUNT = 0;
+			    LEAVE GET_REC
+			    END
+			ELSE
+			    RETURN .STATUS;
+
+		    BYTE_COUNT = .BYTE_COUNT + .CONV$AB_IN_RAB [ RAB$W_RSZ ];
+
+		    ! If we got a Short Record then we are also done
+		    !
+		    IF .CONV$AB_IN_RAB [ RAB$W_RSZ ] LSSU BLOCK_SIZE
+		    THEN
+
+			! Check to see if the short part put us over the limit
+			!
+			IF .BYTE_COUNT GTR .CONV$GW_UDF_MRS
+			THEN
+			    EXITLOOP
+			ELSE
+			    BEGIN
+			    CONV$GW_IN_REC_SIZ = .BYTE_COUNT;
+			    BYTE_COUNT = 0;
+			    LEAVE GET_REC
+			    END;
+
+		    END;  	! READ While Loop
+
+		! Get Ready for Next Time
+		!
+		CONV$GW_IN_REC_SIZ = .CONV$GW_UDF_MRS
+
+		END	! UDF Block
+
+	    ! For NON UDF Files do a Regular Get
+	    !
+	    ELSE
+		BEGIN	! Regular GET Block
+
+		! If Reading a file by an RFA file first get the RFA
+		!
+		IF .CONV$AB_FLAGS [ CONV$V_RFA ]
+		THEN
+		    BEGIN
+
+		    ! If we ran out of RFAs get some more
+		    !
+		    IF .N_RFAS EQL 0
+		    THEN
+			IF ( NOT ( STATUS = $READ( RAB=CONV$AB_RFA_RAB,
+						  ERR=CONV$$RMS_READ_ERROR ) ) )
+			THEN
+			    RETURN .STATUS
+			ELSE
+			    BEGIN
+
+			    ! RFAs are six bytes long so we can tell how
+			    ! many there are
+			    !
+			    N_RFAS = .CONV$AB_RFA_RAB [ RAB$W_RSZ ] / 6;
+			    RFA_IDX = 0
+
+			    END;
+
+		    ! Get an RFA
+		    !
+		    CONV$AB_IN_RAB [ RAB$L_RFA0 ] = .RFA0 [ .RFA_IDX ];
+		    CONV$AB_IN_RAB [ RAB$W_RFA4 ] = .RFA4 [ .RFA_IDX ];
+
+		    RFA_IDX = .RFA_IDX + 1;
+		    N_RFAS = .N_RFAS - 1
+
+		    END;
+
+		! Finally get a record!  If the i/o was complete under
+		! control-y just ignore it and try again
+		!
+		DO
+
+		! rms_read_error will return if the error was end of file
+		!
+		( IF ( NOT ( STATUS = $GET( RAB = CONV$AB_IN_RAB,
+					    ERR = CONV$$RMS_READ_ERROR ) ) )
+		THEN
+		    RETURN .STATUS )
+
+		WHILE .STATUS EQLU RMS$_CONTROLY;
+
+		! Set the input record size
+		!
+		CONV$GW_IN_REC_SIZ = .CONV$AB_IN_RAB [ RAB$W_RSZ ]
+
+		END;	! Regular GET Block
+
+	    END;	! GET_REC Block
+
+
+	! We have a record so count it
+	!
+	CONV$GL_RECORD_COUNT = .CONV$GL_RECORD_COUNT + 1;
+
+	! Make adjustments on the record size if necessary
+	!
+	CONV$GW_IN_REC_SIZ = .CONV$GW_IN_REC_SIZ + .REC_ADJUST;
+
+
+! Check fo exception conditions ie. is the record to long to short ect...
+! The exception record block has a series of test to check the valididy
+! of the record if an exception record is found exit of the block will
+! repeat the process of getting a record with out exiting.  If all checks
+! suceed then we drop through an exit
+!
+EXC_REC:
+	    BEGIN	! EXC_REC Block
+
+	    ! If record size is negative then the input record
+	    ! is to short to fill the VFC portion of the output file
+	    !
+	    IF .CONV$GW_IN_REC_SIZ LSS 0
+	    THEN
+		BEGIN
+		CONV$GW_IN_REC_SIZ = .CONV$GW_IN_REC_SIZ - .REC_ADJUST;
+		STATUS = CONV$$EXCEPTION( CONV$_VFC );
+		LEAVE EXC_REC
+		END;
+
+	    ! If Output File MRS is 0 then we check for index key size if necc.
+	    !
+	    IF .CONV$GW_OUT_MRS EQL 0
+	    THEN
+		CONV$GW_OUT_REC_SIZ = .CONV$GW_IN_REC_SIZ
+	    ELSE
+
+		! If the Record is Longer then MRS Check for Truncate or
+		! Exception
+		!
+		IF .CONV$GW_IN_REC_SIZ GTR .CONV$GW_OUT_MRS
+		THEN
+
+		    ! If Truncate then set the Record's size to MRS
+		    !
+		    IF .CONV$GL_TRUNCATE
+		    THEN
+			CONV$GW_OUT_REC_SIZ = .CONV$GW_OUT_MRS
+		    ELSE
+			BEGIN
+			STATUS = CONV$$EXCEPTION( CONV$_RTL );
+			LEAVE EXC_REC
+			END
+		ELSE
+
+		    ! If the file is fixed an the record is short...
+		    !
+		    IF ( .CONV$AB_OUT_FAB [ FAB$B_RFM ] EQL FAB$C_FIX ) AND
+			 ( .CONV$GW_IN_REC_SIZ LSS .CONV$GW_OUT_MRS )
+		    THEN
+
+			! If PAD then pad the short record
+			!
+			IF .CONV$GL_PAD
+			THEN
+			    BEGIN
+			    CH$FILL ( .CONV$GL_PAD_CHAR,
+				      .CONV$GW_OUT_MRS - .CONV$GW_IN_REC_SIZ,
+				      .CONV$GL_REC_BUF_PTR + .CONV$GW_IN_REC_SIZ );
+			    CONV$GW_OUT_REC_SIZ = .CONV$GW_OUT_MRS
+			    END
+			ELSE
+			    BEGIN
+			    STATUS = CONV$$EXCEPTION( CONV$_RTS );
+			    LEAVE EXC_REC
+			    END
+		    ELSE
+			CONV$GW_OUT_REC_SIZ = .CONV$GW_IN_REC_SIZ;
+
+	    ! If we made it this far then we have an ok record
+	    !
+	    RETURN .STATUS
+
+	    END;	! EXC_REC Block
+
+	END;		! Main While loop
+
+	RETURN .STATUS
+
+    END;
+
+%SBTTL	'GET_VM'
+GLOBAL ROUTINE	CONV$$GET_VM ( BYTES ) : JSB_LINK =
+!++
+!
+! Functional Description:
+!
+!	Allocates virtual memory and records it so that it can
+!	be returned by CONV$$FREE_VM
+!
+! Calling Sequence:
+!
+!	CONV$$GET_VM( bytes )
+!
+! Input Parameters:
+!
+!	bytes	- Number of bytes to allocate
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!
+!	R0 -	Address of start of memory allocated
+!
+! Routines called:
+!
+!	LIB$GET_VM
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    LOCAL	POINTER;
+
+    ! Allocate the memory and quit if errors
+    !
+    IF NOT LIB$GET_VM( BYTES,POINTER )
+    THEN
+	SIGNAL_STOP( CONV$_INSVIRMEM );
+
+    ! Keep track of allocated memory so we can give it back latter
+    !
+    DYN_AREA_SIZE [ .DYN_AREA_CNT ] = .BYTES;
+    DYN_AREA_ADDR [ .DYN_AREA_CNT ] = .POINTER;
+    DYN_AREA_CNT = .DYN_AREA_CNT + 1;
+
+    RETURN .POINTER
+
+    END;
+
+%SBTTL	'FREE_VM'
+GLOBAL ROUTINE CONV$$FREE_VM : JSB_LINK NOVALUE =
+!++
+!
+! Functional Description:
+!
+!	Returns virtual memory allocated by CONV$$GET_VM
+!
+! Calling Sequence:
+!
+!	CONV$$FREE_VM()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	none
+!
+! Routines called:
+!
+!	LIB$FREE_VM
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    ! Deallocate memory
+    !
+    WHILE ( .DYN_AREA_CNT NEQ 0 )
+    DO
+	BEGIN
+	DYN_AREA_CNT = .DYN_AREA_CNT - 1;
+	LIB$FREE_VM(	DYN_AREA_SIZE [ .DYN_AREA_CNT ],
+			DYN_AREA_ADDR [ .DYN_AREA_CNT ] )
+	END;
+
+    RETURN
+
+    END;
+
+%SBTTL	'GET_TEMP_VM'
+GLOBAL ROUTINE	CONV$$GET_TEMP_VM ( BYTES ) : JSB_LINK =
+!++
+!
+! Functional Description:
+!
+!	Allocates virtual memory and records it so that it can
+!	be returned by CONV$$FREE_TEMP_VM
+!
+! Calling Sequence:
+!
+!	CONV$$GET_TEMP_VM( bytes )
+!
+! Input Parameters:
+!
+!	bytes	- Number of bytes to allocate
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!
+!	R0 -	Address of start of memory allocated
+!
+! Routines called:
+!
+!	LIB$GET_VM
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    LOCAL	POINTER;
+
+    ! Allocate the memory and quit if errors
+    !
+    IF NOT LIB$GET_VM( BYTES,POINTER )
+    THEN
+	SIGNAL_STOP( CONV$_INSVIRMEM );
+
+    ! Keep track of allocated memory so we can give it back latter
+    !
+    TMP_AREA_SIZE [ .TMP_AREA_CNT ] = .BYTES;
+    TMP_AREA_ADDR [ .TMP_AREA_CNT ] = .POINTER;
+    TMP_AREA_CNT = .TMP_AREA_CNT + 1;
+
+    RETURN .POINTER
+
+    END;
+
+%SBTTL	'FREE_TEMP_VM'
+GLOBAL ROUTINE CONV$$FREE_TEMP_VM : JSB_LINK NOVALUE =
+!++
+!
+! Functional Description:
+!
+!	Returns virtual memory allocated by CONV$$GET_TEMP_VM
+!
+! Calling Sequence:
+!
+!	CONV$$FREE_TEMP_VM()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	none
+!
+! Routines called:
+!
+!	LIB$FREE_VM
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    ! Deallocate memory
+    !
+    WHILE ( .TMP_AREA_CNT NEQ 0 )
+    DO
+	BEGIN
+	TMP_AREA_CNT = .TMP_AREA_CNT - 1;
+	LIB$FREE_VM(	TMP_AREA_SIZE [ .DYN_AREA_CNT ],
+			TMP_AREA_ADDR [ .DYN_AREA_CNT ] )
+	END;
+
+    RETURN
+
+    END;
+
+%SBTTL	'EXCEPTION'
+GLOBAL ROUTINE	CONV$$EXCEPTION ( CODE : BLOCK [ 4,BYTE ] ) =
+!++
+!
+! Functional Description:
+!
+!	Logs an exception record and if an exception file was specified
+!	writes the record into it
+!
+! Calling Sequence:
+!
+!	CONV$$EXCEPTION( code )
+!
+! Input Parameters:
+!
+!	code	- Convert exception code
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!
+!	CONV$_SUCCESS or
+!	CONV$_FATALEXC	- if fatal exception
+!
+! Routines Called:
+!
+!	CONV$$RMS_READ_ERROR
+!	$PUTMSG
+!	$PUT
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    OWN
+	MESSAGE_VECTOR	: VECTOR [ 2,LONG ] INITIAL ( 1,0 );
+
+    ! If this is a rms error the see if it is one of the recoverable ones
+    ! If it is not then call rms_read_error with the output rab which
+    ! will contain the error code in the sts field
+    !
+    IF .CODE [ STS$V_FAC_NO ] EQLU 1		! RMS facility code is 1
+    THEN
+	SELECTONEU .CODE OF
+	SET
+	    [ RMS$_DUP ] : CODE = CONV$_DUP;
+
+	    [ RMS$_KEY ] : CODE = CONV$_KEY;
+
+	    [ OTHERWISE ]: CONV$$RMS_READ_ERROR ( CONV$AB_OUT_RAB );
+
+	TES;
+
+    ! If this is a call from dcl output an exception message
+    !
+    IF .CONV$AB_FLAGS [ CONV$V_DCL ]
+    THEN
+	BEGIN
+
+	MESSAGE_VECTOR [ 1 ] = .CODE;
+
+	$PUTMSG( MSGVEC=MESSAGE_VECTOR )
+
+	END;
+
+    ! If there is an exception file put the record into it
+    !
+    IF .CONV$GL_EXC
+    THEN
+	BEGIN
+
+	! Stuff the size of the record which caused the exception
+	!
+	CONV$AB_EXC_RAB [ RAB$W_RSZ ] = .CONV$GW_IN_REC_SIZ;
+
+	! Write the exception record
+	!
+	$PUT ( RAB=CONV$AB_EXC_RAB )
+
+	END;
+
+    ! Count the exception
+    !
+    CONV$GL_EXCEPT_COUNT = .CONV$GL_EXCEPT_COUNT + 1;
+
+    ! If /EXIT was specified exit with fatal excpetion
+    ! else return normal
+    !
+    IF .CONV$GL_EXIT
+    THEN
+	RETURN CONV$_FATALEXC
+    ELSE
+	RETURN CONV$_SUCCESS;
+
+    END;
+
+%SBTTL	'END_OF_FILE'
+GLOBAL ROUTINE	CONV$$END_OF_FILE : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!	Closes the current input file
+!
+! Calling Sequence:
+!
+!	CONV$$END_OF_FILE
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	none
+!
+! Routines Called:
+!
+!	$DISCONNECT
+!	$CLOSE
+!	$ERASE
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    ! Disconnect the input RAB (Which FAB is closed depends on which was open)
+    !
+    $DISCONNECT( RAB=CONV$AB_IN_RAB );
+
+    ! If the real input file was open close it
+    !
+    IF .CONV$AB_FLAGS [ CONV$V_IN ]
+    THEN
+	BEGIN
+	$CLOSE( FAB=CONV$AB_IN_FAB );
+	CONV$AB_FLAGS [ CONV$V_IN ] = _CLEAR
+	END;
+
+    ! If the RFA file was used, either for the primary sort or secondary sorts
+    ! then close it.
+    !
+    IF .CONV$AB_FLAGS [ CONV$V_RFA ] OR .CONV$AB_FLAGS [ CONV$V_SOR ]
+    THEN
+	BEGIN
+	$DISCONNECT( RAB=CONV$AB_RFA_RAB );
+	$CLOSE( FAB=CONV$AB_RFA_FAB );
+	$ERASE( FAB=CONV$AB_RFA_FAB );
+	CONV$AB_FLAGS [ CONV$V_RFA ] = _CLEAR
+	END;
+
+    ! Calculate Totals
+    !
+    CONV$GL_VALID_COUNT = .CONV$GL_RECORD_COUNT - .CONV$GL_EXCEPT_COUNT;
+
+    RETURN
+
+    END;
+
+END ELUDOM

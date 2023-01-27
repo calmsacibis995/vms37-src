@@ -1,0 +1,585 @@
+MODULE TBKSSV (	IDENT = 'V03-000' ) =
+BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+! FACILITY:
+!	TRACEBACK
+!
+!++
+! Abstract:
+!	FAO formatting routine and output
+!
+! Version:	11
+!
+! History:
+!	Author:
+!		Carol Peters, 11 January 1978 : Version 01
+!
+!	Modified by:
+!		Dale Roedger, 14 August 1978: Version 11
+!
+! Revision history:
+!
+!	02	18-jan-78	KGP	-Added a modified version of
+!					 DBGEXC's dbg$report_msg
+!	03	24-feb-78	KGP	-Threw away REPORT_MSG as we now
+!					 use a system call for this.
+!	04	28-fev-78	KGP	-New routine TBK$IO_SETUP to allow us
+!					 to do I/O as SYS$PUTMSG does it.
+!	05	01-mar-78	KGP	-New I/O scheme more like DEBUG's.  i.e.
+!					 we always 'encode' into an output buffer
+!					 and then only do 1 $PUT
+!					-IO_SETUP now works from LOCALs to do
+!					 the PUTMSG logical name translation.
+!					-TBK$OUT_PUT now $PUTs to both
+!					 SYS$OUTPUT and SYS$ERROR if the two
+!					 are not the same.
+!	06	7-mar-78	KGP	-New routine  TBK$PUTMSG which writes
+!					 out messages (via SYS$PUTMSG)
+!	07	8-mar-78	KGP	-Changed all REQUIRE file names so
+!					 that TRACE is now separate from DEBUG.
+!	08	27-mar-78	KGP	-Renamed TBK$PUTMSG to TBK$FAKE_MSG
+!					-Added TBK$PUT_MSG which is almost
+!					 excatly like DEBUG's new (5X33) DBG$PUTMSG.
+!					 This routine sorts out the problem of
+!					 software- vs hardware-generated SIGNALs.
+!	09	26-APR-78	DAR	Modified require and library directives
+!					for native build.
+!	10	15-JUN-78	DAR	Changed all DBG$ symbols to TBK$.
+!					TBK$FAO_OUT checks for stream active and
+!					retries $PUT.
+!	11	14-AUG-78	DAR	In TBK$PUTMSG we should subtract 2 from
+!					SIG_ARG_LIST count if the exception code
+!					is not found in the table of hardware
+!					exceptions.
+!--
+
+! Table of contents:
+!
+FORWARD ROUTINE
+	TBK$FAKE_MSG : NOVALUE,		! Write out fake traceback messages.
+	tbk$put_msg,			! Write out system-generated SIGNAL messages.
+	tbk$fao_put : novalue,		! Format into an output buffer.
+	TBK$IO_SETUP : NOVALUE,		! Init I/O to SYS$OUTPUT and SYS$ERROR.
+	tbk$out_put : novalue,
+	TBK$FAO_OUT : NOVALUE;		! Formatted output routine.
+
+!
+! Include files:
+!
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+
+REQUIRE 'SRC$:TBKPCT.REQ';
+REQUIRE 'SRC$:TBKGEN.REQ';
+REQUIRE 'LIB$:TRACEMSG.REQ';
+
+!
+! External symbols:
+!
+EXTERNAL ROUTINE
+	sys$putmsg: ADDRESSING_MODE (GENERAL),	! write out messages.
+	sys$trnlog: ADDRESSING_MODE (GENERAL),	! translate logical names
+	sys$faol: ADDRESSING_MODE (GENERAL);	! Format an ASCII string
+
+EXTERNAL
+	tbk$cp_out_str : REF VECTOR[, BYTE],		! POINTS INTO CURRENT OUTPUT BUFFER.
+	tbk$gl_buf_siz,				! holds current character count in output buffer
+	tbk$output_buf : VECTOR[,byte],
+	tbk$gl_outprab: BLOCK [, BYTE], 	! RAB for 'SYS$OUTPUT'
+	tbk$gl_errrab: BLOCK [, BYTE];	 	! RAB for 'SYS$ERROR'
+
+GLOBAL ROUTINE tbk$fao_out (string, arguments) : NOVALUE =
+!++
+! Functional description:
+!	Sets up input and output string descriptors. Then calls
+!	FAO to format the string. Then sends the formatted string to
+!	SYS$OUTPUT, and then to SYS$ERROR as the two are not
+!	the same.
+!
+! Formal parameters:
+!	string		- the address of a counted control string to FAO
+!	arguments	- may be absent. arguments to be applied to the
+!			  FAO control string.
+!
+! Implicit inputs:
+!	The RABs have been set up in TBK$IO_SETUP.
+!
+! Output parameters:
+!	none
+!
+! Implicit outputs:
+!	none.
+!
+! Routine value:
+!	novalue
+!
+! Side effects:
+!	If either $PUT fails we cause an $EXIT
+!	with the associated status code.
+!--
+
+BEGIN
+	
+	MAP
+		string		: REF VECTOR [, BYTE];
+
+	LOCAL
+		out_buf		: VECTOR [tty_out_width, BYTE],
+		inp_desc	: VECTOR [2],
+		out_desc	: VECTOR [2],
+		status;
+
+	! Set up the needed string descriptors
+	! and do the formatting.
+
+	inp_desc [0] = .string [0];
+	inp_desc [1] = string [1];
+	out_desc [0] = tty_out_width;
+	out_desc [1] = out_buf;
+	sys$faol (inp_desc, tbk$gl_outprab [rab$w_rsz], out_desc, arguments);
+
+	! Output always goes to SYS$OUTPUT.
+
+	tbk$gl_outprab [rab$l_rbf] = out_buf;
+	status = $PUT (RAB = tbk$gl_outprab);
+
+	IF .status EQL RMS$_RSA			! Record stream active error
+	THEN
+	    BEGIN
+	    $WAIT (RAB = tbk$gl_outprab);
+	    status = $PUT (RAB = tbk$gl_outprab);
+	    END;
+
+
+	!+
+	! Output only goes to SYS$ERROR if its ISI
+	! number is different from SYS$OUTPUT's.
+	!-
+	IF( .TBK$GL_OUTPRAB[ RAB$W_ISI ] NEQ .TBK$GL_ERRRAB[ RAB$W_ISI ] )
+	THEN
+		BEGIN
+		tbk$gl_errrab [ rab$w_rsz ] = .tbk$gl_outprab[ rab$w_rsz ];
+		tbk$gl_errrab [rab$l_rbf] = out_buf;
+		status = $PUT (RAB = tbk$gl_errrab);
+		IF .status EQL RMS$_RSA		! Record stream active error
+		THEN
+		    BEGIN
+		    $WAIT (RAB = tbk$gl_errrab);
+		    status = $PUT (RAB = tbk$gl_errrab);
+		    END;
+		END;
+
+END;
+
+GLOBAL ROUTINE TBK$OUT_PUT  : NOVALUE =
+!++
+! Functional Description:
+!	Cause the current output buffer to be output
+!	to SYS$OUTPUT [and to SYS$ERROR if the latter is
+!	different from the former].
+!
+!	Also do the needed initialization so that a subsequent
+!	call to TBK$FAO_PUT will go as expected.
+!
+! Calling Sequence:
+!	TBK$OUT_PUT ()
+!
+! Inputs:
+!	none.
+!
+! Implicit Inputs:
+!	TBK$OUTPUT_BUF	- is a pointer to the beginning of the current
+!			output buffer.  This is supposed to be a counted
+!			string except that no one has supplied the count yet.
+!			i.e. we expect that the actual string to be printed
+!			starts in byte TBK$OUTPUT_BUF+1.
+!	tbk$cp_out_str - points into this output buffer at the first
+!			 place in the buffer which is NOT to be printed.
+!	tbk$gl_buf_siz - holds count of characters in buffer
+!
+! Outputs:
+!	Except for the leading <cr><lf> (by definition of SYS$OUTPUT),
+!	the string is printed, exactly as it is in the
+!	buffer - ie, it should contain whatever carriage control 
+!	you want.
+!
+! Implicit Outputs:
+!	A setup is done for subsequent I/O.
+!
+! Routine Value:
+!	NOVALUE.
+!
+! Side Effects.
+!	1 or 2 lines of output are $PUT.
+!--
+
+	BEGIN
+
+	! Fill in the count, and pass it to QIO.
+
+	tbk$output_buf [0] = .tbk$gl_buf_siz;
+	tbk$fao_out( uplit( %ascic '!AC'), tbk$output_buf );
+
+	tbk$cp_out_str = tbk$output_buf +1;
+	tbk$gl_buf_siz = 0;
+	END;
+
+GLOBAL ROUTINE tbk$fake_msg( exception_name, parameter ) : novalue =
+!++
+! Functional Description:
+!
+!	Put out TRACE 'error' messages via SYS$PUTMSG.
+!
+!	The reason we specify that this is via SYS$PUTMSG is that
+!	we want IT to decide where the output should go to.
+!	The reason we can't use PUTMSG directly is that it
+!	wants the argument of a signal array as its parameter
+!	when we simply have a message number and must therefore
+!	fake the signal.
+!	The reason we can't use LIB$SIGNAL to put out the
+!	message is 1) we don't want a signal to be generated
+!			on top of the signal we are already handling,
+!	and
+!		   2) LIB$SIGNAL's signal leaves it up to someone else
+!			(namely CLI's default frame or last chance handler)
+!			to decide where the output goes to, and we
+!			don't want to loose control of this, and
+!			more importantly, this someone else takes it
+!			upon itself to decide whether to give us
+!			back control again - we ALWAYS want control back
+!			when we do TBK$PUTMSG.
+!
+! Formal Parameters:
+!
+!	exception_name	-The error message longword
+!	parameter	-If non-zero, this parameter is passed on
+!			 to PUTMSG in the signal arg list.
+!
+! Implicit Inputs:
+!
+!	At most 1 parameter will be passed along with the
+!	signal array list.
+!
+! Side Effects:
+!
+!	The message gets put out to the same place that all TRACE's
+!	other stuff goes to.
+!
+!	The usual action taken on messages, based on their severity
+!	level, is overridden here - we always get control back
+!	and continue TRACEback.
+!
+!--
+
+BEGIN
+	LOCAL
+				! 'FAKE' signal array to build
+				! args to SYS$PUTMSG in.
+		SIGNAL_ARRAY : VECTOR[6,LONG];
+
+	! There must be atleast 2 entries in the
+	! signal array.  The 0th element is the
+	! count of the rest, the next is always the
+	! exception name. Subsequent ones are
+	! supposed parameters to the error message
+	! along with their FAO arg count.
+	! We only support having 0 or 1 associated
+	! parameters becasue that's all we need.
+
+	signal_array[0] = 1;
+	signal_array[1] = .exception_name;
+
+	! If we got an arg, we pass it on.
+
+	IF( .PARAMETER NEQ 0 )
+	THEN
+		BEGIN
+
+		! Adding 1 arg means upping the total arg count
+		! by two because we stuff in the new arg, and
+		! its count (1), too.
+
+		SIGNAL_ARRAY[0] = .SIGNAL_ARRAY[0] + 2;
+		signal_array[2] = 1;
+		SIGNAL_ARRAY[3] = .PARAMETER;
+		END;
+
+	! Now we can just let the system routine
+	! take care of formatting and writing out
+	! the message.
+
+	SYS$PUTMSG( signal_array, 0, 0);
+END;
+
+GLOBAL ROUTINE TBK$PUT_MSG (sig_arg_list) =
+!++
+! Functional description:
+!	Reports a system-generated message by calling SYS$PUTMSG.
+!	This routine checks the exception name to see if the exception is not
+!	a hardware exception.  If it is not a hardware exception 2 is subtracted
+!	from the signal argument list count before calling SYS$PUTMSG.
+!	After SYS$PUTMSG returns the original count is restored.
+!
+! Inputs:
+!	sig_arg_list	- the address of the signal argument list.
+!
+! Implicit inputs:
+!	None
+!
+! Outputs:
+!	none
+!
+! Implicit outputs:
+!	none
+!
+! Routine value:
+!	The status value returned by SYS$PUTMSG.
+!
+! Side effects:
+!	SYS$PUTMSG is called - this defines the process
+!	logical name upon which TBK$IO_SETUP depends.
+!
+!	The message is output.
+!--
+
+BEGIN
+
+	LOCAL
+		status,
+		orig_arg_count,
+		index,
+		excep_name : BLOCK [%UPVAL, BYTE],
+		table_value : BLOCK [%UPVAL, BYTE];
+
+	MAP
+		sig_arg_list : REF VECTOR;
+
+	BIND
+		hardware_excep = UPLIT WORD (ss$_accvio, ss$_artres, ss$_intovf,
+				ss$_intdiv, ss$_fltovf, ss$_fltdiv, ss$_fltund,
+				ss$_decovf, ss$_subrng, ss$_astflt, ss$_break,
+				ss$_cmodsupr, ss$_cmoduser, ss$_compat,
+				ss$_debug, ss$_opccus, ss$_opcdec, ss$_pagrderr,
+				ss$_radrmod, ss$_roprand, ss$_ssfail, ss$_tbit,
+				0) : VECTOR [, WORD];
+
+	orig_arg_count = .sig_arg_list[0];		! Get orignial arg. count
+	excep_name = .sig_arg_list[1];			! Get exception name
+	IF (.excep_name[STS$V_FAC_NO] NEQ 0)		! Not SYSTEM facility
+	THEN
+		BEGIN
+		sig_arg_list[0] = .sig_arg_list[0] - 2;	! update argument count
+		END
+	ELSE
+		BEGIN
+		index = 0;
+		!+
+		! This loop will exit with -1 if the exception name is not found.
+		! In that case we must subtract 2 from the signal argument list
+		! argument count before calling SYS$PUTMSG.
+		!-
+		IF (WHILE (.hardware_excep[.index] NEQ 0)
+		    DO
+		    BEGIN
+		    table_value = .hardware_excep[.index]; ! pick up next value
+		    IF (.excep_name[STS$V_CODE] EQL .table_value[STS$V_CODE])
+		    THEN
+			EXITLOOP 0;
+
+		    index = .index + 1;
+		    END)
+		THEN
+		    sig_arg_list[0] = .sig_arg_list[0] - 2;
+		END;
+
+	! Now, finally, output the message.
+
+	status = SYS$PUTMSG (.sig_arg_list, 0, 0);
+	sig_arg_list[0] = .orig_arg_count;
+
+	! Return the status which PUTMSG returned.
+
+	RETURN(.STATUS);
+
+END;
+
+GLOBAL ROUTINE tbk$fao_put( STRING, ARGUMENTS ) : NOVALUE =
+!++
+! FUNCTIONAL DESCRIPTION
+!	DO JUST WHAT $FAO DOES, ONLY HERE WE WORK IN
+!	CO-OPERATION WITH A GLOBAL CHARACTER BUFFER INTO
+!	WHICH WE ARE ENCODING ARBITRARY LINES OF OUTPUT.
+!
+!	All output done within TRACE should use this
+!	routine to build output lines.  Then, once the buffer
+!	has been filled, a call to TBK$OUT_PUT should be
+!	made to cause the $PUT.
+!
+! FORMAL PARAMETERS:
+!	STRING	  - A COUNTED STRING WHICH CONTAINS THE DIRECTIVES FOR $FAO.
+!	ARGUMENTS - THE ARGS FOR $FAO.
+!
+! IMPLICIT INPUTS:
+!	tbk$cp_out_str	- POINTER TO WHERE WE ARE IN THE
+!			CURRENT OUTPUT BUFFER.
+!	tbk$gl_buf_siz	- count of characters in output buffer.
+!
+! OUTPUTS:
+!	THE $FAO OUTPUT IS PUT INTO THE OUTPUT BUFFER.
+!
+! IMPLICIT OUTPUTS:
+!	THE GLOBAL CHARACTER POINTER IS INCREMENTED SO THAT IT
+!	POINTS (AS ALWAYS) TO THE NEXT AVAILABLE PLACE IN THE
+!	OUTPUT BUFFER. The buffer count variable is incremented
+!	by the size of this string.
+!
+! ROUTINE VALUE:
+!	NONE.
+!
+! SIDE EFFECTS:
+!	NONE.
+!--
+
+	BEGIN
+	MAP
+		STRING : REF VECTOR[,BYTE];
+	LOCAL
+		INP_DESC : VECTOR[2],		! INPUT DESC FOR $FAO.
+		OUT_DESC : VECTOR[2],		! OUTPUT DESC FOR $FAO.
+		STR_SIZE : WORD;		! $FAO RETURNS OUTPUT SIZE HERE.
+	!+
+	! BUILD THE DESCRIPTORS THAT $FAO WANTS, ASK IT TO DO
+	! THE ENCODING, COPYING THE OUTPUT INTO OUR GLOBAL
+	! OUTPUT BUFFER, AND FINALLY UPDATE THE GLOBAL POINTER
+	! TO THE NEXT FREE CHARACTER POSITION IN THE BUFFER.
+	!-
+
+	INP_DESC[0] = .STRING[0];
+	INP_DESC[1] = STRING[1];
+	OUT_DESC [0] = TTY_OUT_WIDTH - 1 - .tbk$gl_buf_siz;
+	OUT_DESC[1] = .tbk$cp_out_str;
+	SYS$FAOL( INP_DESC, STR_SIZE, OUT_DESC, ARGUMENTS );
+	tbk$cp_out_str = .tbk$cp_out_str + .STR_SIZE;
+	tbk$gl_buf_siz = .tbk$gl_buf_siz + .STR_SIZE;
+	END;
+
+GLOBAL ROUTINE TBK$IO_SETUP : NOVALUE =
+!++
+! Functional Description:
+!
+!	Set up the output FABs so that TRACE can
+!	output without opening or connecting to SYS$OUTPUT
+!	and/or SYS$ERROR.
+!
+!	This is done by assuning that SYS$PUTMSG has already
+!	done this AND that it has created a process logical
+!	name (SYS$PUTMSG) to allow us to 'steal' the ISI
+!	numbers we need to properly initialize the RABs.
+!
+! Implicit Inputs:
+!
+!	The equivalence name for SYS$PUTMSG has the following
+!	format:
+!
+!		|  2 bytes    |  2 bytes     |  2 bytes   |
+!		|-----|-------|------|-------|-----|------|
+!		|  ERROR_ISI  |  OUTPUT_ISI  |   ^x11B    |
+!		|-----|-------|------|-------|-----|------|
+!
+!	The ^X11B is simply a prefix made up in the SYS$PUTMSG
+!	creation-of-logical-name code to ensure that if
+!	we get a TRNLOG here we get what we expect.  If this
+!	prefix is NOT there we punt.
+!
+! Side Effects:
+!
+!	The equivalence string for SYS$PUTMSG is requested
+!	from the 'process' logical name table.  From this 'fake'
+!	string is extracted the ISI numbers for SYS$ERROR and
+!	SYS$OUTPUT.  These ISIs are stuffed into the
+!	2 RABs we use for $PUTting.
+!--
+
+BEGIN
+	LOCAL
+				! Character string descriptor for 
+				! SYS$PUTMSG logical name
+		putmsg_desc : vector[2,long],
+
+				! Character string descriptor for resultant
+				! equivalent string (from TRNLOG)
+		equiv_desc : vector[2,long],
+
+				! Equivalence name has a supposed
+				! fixed format.  (See above).
+		equiv_string : vector[8,word],
+
+		status;
+
+
+
+	! Set up a descriptor for the logical name
+	! SYS$PUTMSG and for the equivalence name
+	! we assume SYS$PUTMSG has created, and then
+	! translate this name to its 'equivalence' string.
+
+	PUTMSG_DESC[0] = %CHARCOUNT (%ASCII 'SYS$PUTMSG' );
+	PUTMSG_DESC[1] = UPLIT BYTE (%ASCII 'SYS$PUTMSG' );
+	EQUIV_DESC[0] = 16;		! Special name fits into 8 words.
+	EQUIV_DESC[1] = EQUIV_STRING;
+
+	STATUS = SYS$TRNLOG(	PUTMSG_DESC,
+				0,		! Ignore resultant length
+				EQUIV_DESC,	! Resultant string descriptor.
+				0,		! Ignore "found" table.
+				0,		! Ignore access mode
+				LOG$C_PROCESS	! Look in "process" table only
+			   );
+	IF( NOT .STATUS EQL SS$_NORMAL )
+	THEN
+		$EXIT( code = .STATUS );
+		! no return
+
+	! Check for the special identifying word
+	! in the equivalence string.
+
+	IF( .EQUIV_STRING[0] NEQ %X'11B' )
+	THEN
+		$EXIT( code = TBK$_NOIOCHAN );
+
+	! Initialize what is needed by the rest of
+	! TRACE's output routines. i.e. The output buffer
+	! pointers, and the ISI numbers we stuff
+	! into the RABs we use for SYS$ERROR and SYS$OUTPUT.
+
+	tbk$gl_outprab[ RAB$W_ISI ] = .EQUIV_STRING[1];
+	tbk$gl_errrab[ RAB$W_ISI ] = .EQUIV_STRING[2];
+
+	tbk$cp_out_str = tbk$output_buf +1;
+	tbk$gl_buf_siz = 0;
+END;
+
+END
+ELUDOM

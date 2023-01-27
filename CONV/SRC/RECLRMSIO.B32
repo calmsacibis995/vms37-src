@@ -1,0 +1,1055 @@
+%TITLE	'VAX-11 CONVERT/RECLAIM'
+MODULE	RECL$RMSIO	( IDENT='V03-002',
+			OPTLEVEL=3
+			) =
+
+BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! Facility:	VAX-11 CONVERT/RECLAIM
+!
+! Environment:
+!
+!		VAX/VMS Operating System
+!
+!
+! Abstract:	CONVERT/RECLAIM facility RMS I/O routines
+!
+! Contents:
+!		ALLOCATE_BUFFERS
+!		GET_LAST_VBN
+!		OPEN_FILE
+!		GET_NEXT_KEY
+!		GET_NEXT_BUCKET
+!		WRITE_BUCKET
+!		WRITE_AREA_DESC
+!		WRITE_KEY_DESC
+!		WRITE_BLOCK
+!
+!--
+
+!
+! Author:	Keith B Thompson
+!		Peter Lieberwirth	Creation date:	August-1981
+!
+!
+! Modified by:
+!
+!	V03-002	KBT0040		Keith Thompson		3-Apr-1982
+!		Add recl$gl_search_buffer and allocate it.  Also make
+!		sure you find the last data level bucket.
+!
+!	V03-001	KBT0009		Keith Thompson		16-Mar-1982
+!		Store LEVEL of bucket in RTX, correct first VBN at data
+!		level and make sure the last bucket at the index levels
+!		is found. Also correct bug in error processing and fix
+!		the way we wirte area descriptors.
+!
+!****
+
+
+PSECT
+	OWN	= _CONV$RECL_D	(PIC),
+	GLOBAL	= _CONV$RECL_D	(PIC),
+	PLIT	= _CONV$PLIT	(SHARE,PIC),
+	CODE	= _CONV$RECL_S	(SHARE,PIC);
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+REQUIRE	'SRC$:CONVERT';
+REQUIRE	'SRC$:CONVDEF';
+REQUIRE	'SRC$:RECLDEF';
+
+DEFINE_ERROR_CODES;
+
+EXTERNAL ROUTINE
+	RECL$$SWAP_BUFFERS	: NOVALUE JSB_REG_9,
+	CONV$$RMS_ERROR		: NOVALUE,
+	CONV$$RMS_OPEN_ERROR	: NOVALUE,
+	CONV$$RMS_READ_ERROR	: NOVALUE,
+	CONV$$GET_VM		: JSB_LINK,
+	CONV$$GET_TEMP_VM	: JSB_LINK;
+
+FORWARD ROUTINE
+	RECL$$GET_NEXT_BUCKET	: NOVALUE JSB_REG_9,
+	GET_LAST_VBN		: JSB_REG_9,
+	WRITE_BLOCK		: NOVALUE;
+
+EXTERNAL
+	CONV$AB_FLAGS		: BLOCK [ ,BYTE ],
+	RECL$GL_BUCKET_COUNT	: LONG,
+	RECL$GL_DATA_COUNT	: LONG,
+	RECL$GL_INDEX_COUNT	: LONG;
+
+GLOBAL
+	RECL$GL_SEARCH_BUFFER	: LONG,
+	RECL$GL_WRITE_AREA	: LONG INITIAL ( 0 ),
+	RECL$GL_WRITE_KEY	: LONG INITIAL ( 0 ),
+
+	RECL$GL_AREA_BLOCK	: LONG,
+
+	RECL$AB_IN_FAB		: $FAB_DECL,
+	RECL$AB_IN_RAB		: $RAB_DECL;
+
+OWN
+	KEY_REF		: BYTE INITIAL ( -1 ),
+	PROLOGUE	: REF BLOCK [ ,BYTE ],
+
+	IN_XABSUM	: $XABSUM( NXT=0 ),
+	IN_NAM		: $NAM_DECL;
+
+
+%SBTTL	'ALLOCATE_BUFFERS'
+GLOBAL ROUTINE	RECL$$ALLOCATE_BUFFERS : JSB_REG_9 =
+!++
+!
+! Functional Description:
+!
+!	Allocates context buffers, two bucket buffers for each level
+!	and reads in first virtical row of index and data buckets.
+!
+! Calling Sequence:
+!
+!	RECL$$ALLOCATE_BUFFERS()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!
+!	SS$_NORMAL
+!
+! Routines Called:
+!
+!	CONV$$GET_VM
+!	RECL$$GET_NEXT_BUCKET
+!	GET_LAST_VBN
+!	RECL$$SWAP_BUFFERS
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_REGISTERS_9;
+
+    LOCAL
+	BYTES,
+	RTX_SIZE,			! Size in bytes of the context buffer
+	DAT_BUF_SIZE,			! Size in bytes of level 0 bucket buffer
+	IDX_BUF_SIZE;			! Size in bytes of level >0 bucket buffer
+
+    ! Get the number of bytes for the context block, one for each level
+    !
+    RTX_SIZE = ( .KEY_DESC [ KEY$B_ROOTLEV ] + 1 ) * RTX$K_BLN;
+
+    ! Get the number of bytes for the data level buffers
+    !
+    DAT_BUF_SIZE = .KEY_DESC [ KEY$B_DATBKTSZ ] * BLOCK_SIZE;
+
+    ! Get the number of bytes for the index level bucket buffers
+    !
+    IDX_BUF_SIZE = .KEY_DESC [ KEY$B_IDXBKTSZ ] * BLOCK_SIZE;
+
+    ! Add em up NOTE: Two bucket buffers for each level and a search buffer
+    !		      which is index bucket size
+    !
+    BYTES = .RTX_SIZE + ( 2 * ( .DAT_BUF_SIZE +
+			( .IDX_BUF_SIZE * .KEY_DESC [ KEY$B_ROOTLEV ] ) ) ) +
+			.IDX_BUF_SIZE;
+
+    ! Allocate the virtual memory and point the context block to it
+    !
+    RTX = CONV$$GET_TEMP_VM( .BYTES );
+
+    ! Zero the bytes for the contex block
+    !
+    CH$FILL( 0,.RTX_SIZE,.RTX );
+
+    ! Set the size, area number and first VBN of the data level bucket
+    !
+    RTX [ RTX$W_BUCKET_SIZE ]	= .DAT_BUF_SIZE;
+    RTX [ RTX$B_AREA ]		= .KEY_DESC [ KEY$B_DANUM ];
+    RTX [ RTX$L_FIRST_VBN ]	= .KEY_DESC [ KEY$L_LDVBN ];
+
+    ! Set up the pointers for the data level buffers
+    !
+    RTX [ RTX$L_CURRENT_BUFFER ] = .RTX + .RTX_SIZE;
+    RTX [ RTX$L_PREVIOUS_BUFFER ] = .RTX [ RTX$L_CURRENT_BUFFER ] +
+								.DAT_BUF_SIZE;
+
+    ! Set up the pointers for the rest of the context blocks
+    !
+    BEGIN
+
+    LOCAL
+	BUF_PTR;
+
+    ! Keep a pointer of where we are in the bucket buffers
+    ! 
+    BUF_PTR = .RTX [ RTX$L_PREVIOUS_BUFFER ] + .DAT_BUF_SIZE;
+
+    ! Loop once for each level
+    !
+    INCR I FROM 1 TO .KEY_DESC [ KEY$B_ROOTLEV ]
+    DO
+	BEGIN
+
+	! Point to the next block
+	!
+	RTX = .RTX + RTX$K_BLN;
+
+	! Fill in the buffer pointers etc.
+	!
+	RTX [ RTX$L_CURRENT_BUFFER ]	= .BUF_PTR;
+	RTX [ RTX$L_PREVIOUS_BUFFER ]	= .BUF_PTR + .IDX_BUF_SIZE;
+	RTX [ RTX$W_BUCKET_SIZE ]	= .IDX_BUF_SIZE;
+	RTX [ RTX$B_LEVEL ]		= .I;
+
+	! Set the area number of the block (Since there are two possible areas
+	! depending on the level in the index we must check )
+	!
+	IF .I EQLU 1
+	THEN
+	    RTX [ RTX$B_AREA ] = .KEY_DESC [ KEY$B_LANUM ]
+	ELSE
+	    RTX [ RTX$B_AREA ] = .KEY_DESC [ KEY$B_IANUM ];
+
+	BUF_PTR = .BUF_PTR + ( .IDX_BUF_SIZE * 2 )
+
+	END;
+
+    ! The last piece is the search buffer
+    !
+    RECL$GL_SEARCH_BUFFER = .BUF_PTR
+
+    END;
+
+    ! At the finish of the above loop the context block is pointing
+    ! to the root block
+    !
+    BEGIN
+
+    LOCAL
+	LAST_VBN;
+
+    ! To read in the first and last bucket in each level of the index we
+    ! first read in the root then search downward, also set the
+    ! first vbn pointer for the root
+    !
+    RTX [ RTX$L_NEXT_VBN ]	= .KEY_DESC [ KEY$L_ROOTVBN ];
+    RTX [ RTX$L_FIRST_VBN ]	= .KEY_DESC [ KEY$L_ROOTVBN ];
+    RTX [ RTX$L_PREVIOUS_VBN ]	= .KEY_DESC [ KEY$L_ROOTVBN ];
+
+    ! Read in root bucket
+    !
+    RECL$$GET_NEXT_BUCKET();
+
+    ! Get the last index record vbn
+    !
+    LAST_VBN = GET_LAST_VBN();
+
+    ! Loop once for each level    NOTE: This loop will also set the first_vbn
+    !
+    INCR I FROM 1 TO .KEY_DESC [ KEY$B_ROOTLEV ] BY 1
+    DO
+	BEGIN
+
+	! Move down the levels
+	!
+	RTX = .RTX - RTX$K_BLN;
+
+	! Use vbn found for the next get
+	!
+	RTX [ RTX$L_NEXT_VBN ]	= .LAST_VBN;
+
+	! Read in the last bucket bucket
+	!
+	RECL$$GET_NEXT_BUCKET();
+
+	!+
+	! If this is an index bucket make sure this is the last one in the
+	! level, is not (rms had a update failure) get the last bucket.
+	! If it is a data bucket we want to go all the way to the end of the
+	! chain so we cah start at the beginning of the file
+	!-
+
+	! Check for last bucket in chain. NOTE: GET_NEXT_BUCKET sets BUCKET
+	!					    to the current buffer
+	!
+	WHILE NOT .BUCKET [ BKT$V_LASTBKT ]
+	DO
+	    BEGIN
+
+	    ! Swap the buffers
+	    !
+	    RECL$$SWAP_BUFFERS();
+
+	    ! Get the next bucket in the chain
+	    !
+	    RECL$$GET_NEXT_BUCKET()
+
+	    END;
+
+	! If this is the index level get the last vbn pointer in the bucket
+	!
+	IF .RTX [ RTX$B_LEVEL ] GTRU 0
+	THEN
+	    LAST_VBN = GET_LAST_VBN();
+
+	! Swap the buffers
+	!
+	RECL$$SWAP_BUFFERS();
+
+	! Get the next bucket in the chain which should be the first
+	!
+	RECL$$GET_NEXT_BUCKET();
+
+	! If index level set the first index record vbn (because of duplicates
+	! etc. this is not always true for data level buckets)
+	!
+	IF .RTX [ RTX$B_LEVEL ] GTRU 0
+	THEN
+	    RTX [ RTX$L_FIRST_VBN ] = .RTX [ RTX$L_CURRENT_VBN ]
+
+	END
+
+    END;
+
+    RETURN RECL$_SUCCESS
+
+    END;
+
+%SBTTL	'GET_LAST_VBN'
+ROUTINE	GET_LAST_VBN : JSB_REG_9 =
+!++
+!
+! Functional Description:
+!
+!	Returns the VBN pointer of the last index record in the bucket
+!
+! Calling Sequence:
+!
+!	GET_LAST_VBN()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	VBN of the last index record in the bucket
+!
+! Routines Called:
+!	none
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_REGISTERS_9;
+
+    LOCAL
+	VBN_FREE_SPACE,
+	VBN_POINTER;
+
+    VBN_POINTER = .RTX [ RTX$W_BUCKET_SIZE ] - 4;
+
+    VBN_FREE_SPACE = .BUCKET[ .VBN_POINTER, 0, 16, 0 ];
+
+    VBN_POINTER = .VBN_FREE_SPACE + 1;
+
+    RETURN .BUCKET [	.VBN_POINTER,
+			0,
+			(( .BUCKET [ BKT$V_PTR_SZ ] + 2 ) * 8 ),
+			0 ]
+
+    END;
+
+%SBTTL	'OPEN_FILE'
+GLOBAL ROUTINE	RECL$$OPEN_FILE	( FILE_NAME_DESC ) =
+!++
+!
+! Functional Description:
+!
+!	Opens the input file described by the string descriptor FILE_NAME_DESC
+!
+! Calling Sequence:
+!
+!	RECL$$OPEN_FILE( file_name_desc )
+!
+! Input Parameters:
+!
+!	file_name_desc	- Address of a descriptor
+!
+! Implicit Inputs:
+!
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!
+!	RMS or CONVERT error code or ss$_normal
+!
+! Routines Called:
+!
+!	CONV$$GET_VM
+!	$PARSE
+!	CONV$$RMS_OPEN_ERROR
+!	$SEARCH
+!	$OPEN
+!	$DISPLAY
+!	$CONNECT
+!	CONV$$GET_VM
+!	$READ
+!	CONV$$RMS_ERROR
+!
+! Side Effects:
+!
+!	Opens the input file and reads in the prologue
+!
+!--
+
+    BEGIN
+
+    BIND
+	FILE_NAME = FILE_NAME_DESC : REF DESC_BLK;
+
+    LOCAL
+	KEY_BLOCK_SIZE,
+	AREA_BLOCK_SIZE,
+	VM_POINTER,
+	BYTES;
+
+    ! Allocate some name block buffers
+    !
+    BYTES = ESA_BUF_SIZ + RSA_BUF_SIZ;
+
+    VM_POINTER = CONV$$GET_VM ( .BYTES );
+
+    ! Initialize the rms blocks
+    !
+    $NAM_INIT ( NAM = IN_NAM,
+		ESA = .VM_POINTER,
+		ESS = ESA_BUF_SIZ,
+		RSA = .VM_POINTER + ESA_BUF_SIZ,
+		RSS = RSA_BUF_SIZ );
+
+    $FAB_INIT ( FAB = RECL$AB_IN_FAB,
+		CTX = CONV$_OPENIN,
+		FAC = <BRO,GET,PUT>,
+		FNA = .FILE_NAME [ DSC$A_POINTER ],
+		FNS = .FILE_NAME [ DSC$W_LENGTH ],
+		FOP = NAM,
+		NAM = IN_NAM,
+		XAB = IN_XABSUM );
+		
+    $RAB_INIT ( RAB = RECL$AB_IN_RAB,
+		FAB = RECL$AB_IN_FAB,
+		ROP = BIO );
+
+    ! Parse the file name
+    !
+    $PARSE( FAB=RECL$AB_IN_FAB,ERR=CONV$$RMS_OPEN_ERROR );
+
+    ! We are not allowing wildcards
+    !
+    IF .IN_NAM [ NAM$V_WILDCARD ]
+    THEN
+	RETURN CONV$_NOWILD;
+
+    ! Search for the file
+    !
+    $SEARCH( FAB=RECL$AB_IN_FAB,ERR=CONV$$RMS_OPEN_ERROR );
+
+    ! Open the file
+    !
+    $OPEN( FAB=RECL$AB_IN_FAB,ERR=CONV$$RMS_OPEN_ERROR );
+
+    ! Get all good info about the file
+    !
+    $DISPLAY( FAB=RECL$AB_IN_FAB );
+
+    ! If the file is not index then error
+    !
+    IF .RECL$AB_IN_FAB [ FAB$B_ORG ] NEQU FAB$C_IDX
+    THEN
+	RETURN CONV$_NOTIDX;
+
+    ! Make sure it is the correct prologue version
+    !
+    IF .IN_XABSUM [ XAB$W_PVN ] LSS 3
+    THEN
+	RETURN CONV$_PLV;
+
+    ! Connect the stream
+    !
+    $CONNECT( RAB=RECL$AB_IN_RAB,ERR=CONV$$RMS_OPEN_ERROR );
+
+    ! Say that the file is open
+    !
+    CONV$AB_FLAGS [ CONV$V_RECL ] = _SET;
+
+    ! Allocate space for the prologue blocks
+    !
+    ! Find the size for the key descriptors ( and the first prologue block)
+    !
+    KEY_BLOCK_SIZE = ( ( ( ( .IN_XABSUM [ XAB$B_NOK ] - 1 ) + 4 ) / 5 ) + 1 ) *
+								BLOCK_SIZE;
+
+    ! Find the size for the area descriptors
+    !
+    AREA_BLOCK_SIZE = ( ( .IN_XABSUM [ XAB$B_NOA ] + 6 ) / 7 ) * BLOCK_SIZE;
+
+    ! Add the bytes for the area descriptor and key descriptor and prologue
+    !
+    BYTES = .AREA_BLOCK_SIZE + .KEY_BLOCK_SIZE;
+
+    ! Allocate space
+    !
+    PROLOGUE = CONV$$GET_VM( .BYTES );
+
+    ! Read in the prologue
+    !
+    RECL$AB_IN_RAB [ RAB$L_BKT ] = 1;
+    RECL$AB_IN_RAB [ RAB$L_UBF ] = .PROLOGUE;
+    RECL$AB_IN_RAB [ RAB$W_USZ ] = .BYTES;
+
+    ! The error is reading the prologue
+    !
+    RECL$AB_IN_RAB [ RAB$L_CTX ] = CONV$_PROERR;
+
+    $READ ( RAB=RECL$AB_IN_RAB,ERR=CONV$$RMS_READ_ERROR );
+
+    RECL$GL_AREA_BLOCK = .PROLOGUE + .KEY_BLOCK_SIZE;
+
+    RETURN RECL$_SUCCESS
+
+    END;
+
+
+%SBTTL	'GET_NEXT_KEY'
+GLOBAL ROUTINE	RECL$$GET_NEXT_KEY : JSB_REG_9 =
+!++
+!
+! Functional Description:
+!
+!	Gets the next key of reference in the file
+!
+! Calling Sequence:
+!
+!	RECL$$GET_NEXT_KEY()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!
+!	RECL$_SUCCESS	- Next key ready
+!	RECL$_FAILURE	- No more keys
+!
+! Routines Called:
+!	none
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_REGISTERS_9;
+
+    ! Search for a key which has an initialized index
+    !
+    DO
+	BEGIN
+
+	! Up the key of reference
+	!
+	KEY_REF = .KEY_REF + 1;
+
+	! Have we done all the keys
+	!
+	IF .KEY_REF GEQU .IN_XABSUM [ XAB$B_NOK ]
+	THEN
+	    RETURN RECL$_FAILURE;
+
+	! The primary key is easy
+	!
+	IF .KEY_REF EQLU 0
+	THEN
+	    KEY_DESC = .PROLOGUE
+	ELSE
+
+	    ! SECONDARY KEYS NOT SUPPORTED
+	    !
+	    RETURN RECL$_FAILURE
+
+	END
+
+    UNTIL ( NOT .KEY_DESC [ KEY$V_INITIDX ] );
+
+    ! We have a winner
+    !
+    RETURN RECL$_SUCCESS
+
+    END;
+
+%SBTTL	'GET_NEXT_BUCKET'
+GLOBAL ROUTINE	RECL$$GET_NEXT_BUCKET : NOVALUE JSB_REG_9 =
+!++
+!
+! Functional Description:
+!
+!	Gets the bucket in the horizontal chain
+!
+! Calling Sequence:
+!
+!	RECL$$GET_NEXT_BUCKET()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	none
+!
+! Routines Called:
+!
+!	$READ
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    DEFINE_REGISTERS_9;
+
+    LOCAL
+	LAST_BYTE;
+
+    ! Set the bucket pointer to the current buffer at this level
+    !
+    BUCKET = .RTX [ RTX$L_CURRENT_BUFFER ];
+
+    ! A simple check could save an IO
+    !
+    IF ( NOT ( .RTX [ RTX$L_CURRENT_VBN ] EQLU .RTX [ RTX$L_NEXT_VBN ] ) )
+    THEN
+	BEGIN
+
+	! Point RMS to the target bucket
+	!
+	RECL$AB_IN_RAB [ RAB$L_UBF ] = .BUCKET;
+	RECL$AB_IN_RAB [ RAB$W_USZ ] = .RTX [ RTX$W_BUCKET_SIZE ];
+	RECL$AB_IN_RAB [ RAB$L_BKT ] = .RTX [ RTX$L_NEXT_VBN ];
+
+	! If error signal a readerr
+	!
+	RECL$AB_IN_RAB [ RAB$L_CTX ] = CONV$_READERR;
+
+	! Get the bucket
+	!
+	$READ( RAB=RECL$AB_IN_RAB,ERR=CONV$$RMS_READ_ERROR );
+
+	! Check to see if the bucket is valid
+	!
+	! Check the address sample and check bytes
+	!
+	LAST_BYTE = .RTX[ RTX$W_BUCKET_SIZE ] - 1;
+
+	! If there are any errors signal them and stop
+	!
+	IF .BUCKET [ BKT$W_ADRSAMPLE ] NEQU .RTX [ RTX$L_NEXT_VBN ]
+	    OR
+	    .BUCKET[ BKT$B_CHECKCHAR ] NEQU .BUCKET[ .LAST_BYTE, 0, 8, 0 ]
+	THEN
+	    BEGIN
+
+	    LOCAL
+		NAM_DESC	: DESC_BLK;
+
+	    NAM_DESC [ DSC$W_LENGTH ] = .IN_NAM [ NAM$B_RSL ];
+	    NAM_DESC [ DSC$A_POINTER ] = .IN_NAM [ NAM$L_RSA ];
+
+	    ! Signal a readerr with the file name and the vbn which broke
+	    !
+	    SIGNAL_STOP( CONV$_READERR,
+			 1,
+			 NAM_DESC,
+			 CONV$_INVBKT,
+			 1,
+			 .RTX [ RTX$L_NEXT_VBN ] )
+
+	    END;
+    
+	! Set the new buckets vbn
+	!
+	RTX [ RTX$L_CURRENT_VBN ] = .RTX [ RTX$L_NEXT_VBN ];
+
+	END;
+
+    ! Set the next bucket address
+    !
+    RTX [ RTX$L_NEXT_VBN ] = .BUCKET [ BKT$L_NXTBKT ];
+
+    RETURN
+
+    END;
+
+%SBTTL	'WRITE_BUCKET'
+GLOBAL ROUTINE	RECL$$WRITE_BUCKET ( BUCKET_BLOCK ) : NOVALUE JSB_REG_9 =
+!++
+!
+! Functional Description:
+!
+!	Writes the bucket pointed to by the first longword in bucket_block
+!	to the VBN given in the second longword
+!
+! Calling Sequence:
+!
+!	RECL$$WRITE_BUCKET( bucket_block )
+!
+! Input Parameters:
+!
+!	bucket_block	- Pointer to a two longword block which looks like:
+!
+!					------------------
+!			Bucket_block :	| Buffer_address |
+!					|----------------|
+!					|  Target_vbn    |
+!					------------------
+!
+! Implicit Inputs:
+!
+!	The size of the bucket to be writen is taken from the current
+!	context block
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	none
+!
+! Routines Called:
+!
+!	$WRITE
+!
+! Side Effects:
+!
+!	Bucket check bytes incremented.
+!
+!--
+
+    BEGIN
+
+    DEFINE_REGISTERS_9;
+
+    LOCAL
+	LAST_BYTE,
+	OUT_BUCKET:	REF BLOCK [ ,BYTE ];
+
+    BIND
+	BKT_BLK = BUCKET_BLOCK : REF VECTOR [ 2,LONG ];
+
+    ! Update the check bytes, first point to the buffer and then increment
+    ! the first check character and then copy it to the last check character.
+    !
+    OUT_BUCKET = .BKT_BLK[ 0 ];
+
+    ! Point to the last byte (final check byte) in the buffer.
+    !
+    LAST_BYTE = .RTX[ RTX$W_BUCKET_SIZE ] - 1;
+
+    ! Actually update the check bytes.
+    !
+    OUT_BUCKET[ BKT$B_CHECKCHAR ] = .OUT_BUCKET[ BKT$B_CHECKCHAR ] + 1;
+    OUT_BUCKET[ .LAST_BYTE, 0, 8, 0 ] = .OUT_BUCKET[ BKT$B_CHECKCHAR ];
+
+    ! Point RMS to the target bucket
+    !
+    RECL$AB_IN_RAB [ RAB$L_RBF ] = .BKT_BLK [ 0 ];
+    RECL$AB_IN_RAB [ RAB$L_BKT ] = .BKT_BLK [ 1 ];
+    RECL$AB_IN_RAB [ RAB$W_RSZ ] = .RTX [ RTX$W_BUCKET_SIZE ];
+
+    ! If error signal a write error
+    !
+    RECL$AB_IN_RAB [ RAB$L_CTX ] = CONV$_WRITEERR;
+
+    ! NOTE: rms_read_error also works for writes
+    !
+    $WRITE( RAB=RECL$AB_IN_RAB,ERR=CONV$$RMS_READ_ERROR );
+
+    RETURN
+
+    END;
+
+%SBTTL	'WRITE_AREA_DESC'
+GLOBAL ROUTINE	RECL$$WRITE_AREA_DESC : NOVALUE JSB_REG_9 =
+!++
+!
+! Functional Description:
+!
+!	Writes back an area descriptor in the prologue to the file
+!
+! Calling Sequence:
+!
+!	WRITE_AREA_DESC()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	none
+!
+! Routines Called:
+!
+!	WRITE_BLOCK
+!
+! Side Effects:
+!
+!	count in RECL$GL_WRITE_AREA the number of times this routine is called
+!	to write an area descriptor block.
+!
+!--
+
+    BEGIN
+
+    DEFINE_REGISTERS_9;
+
+    LOCAL
+	AREA_VBN;
+
+    ! Figure this one out for yourself!
+    !
+    AREA_VBN = .PROLOGUE [ PLG$B_AVBN ] + ( ( .RTX [ RTX$B_AREA ] -1 ) / 8 );
+
+    ! For fun, count the number of times we write an area descriptor
+    !
+    RECL$GL_WRITE_AREA = .RECL$GL_WRITE_AREA + 1;
+
+    WRITE_BLOCK( .AREA_VBN );
+
+    RETURN
+
+    END;
+
+%SBTTL	'WRITE_KEY_DESC'
+GLOBAL ROUTINE	RECL$$WRITE_KEY_DESC : NOVALUE JSB_REG_9 =
+!++
+!
+! Functional Description:
+!
+!	Writes back the current key descriptor in the prologue to the file
+!
+! Calling Sequence:
+!
+!	WRITE_KEY_DESC()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	none
+!
+! Routines Called:
+!
+!	WRITE_BLOCK
+!
+! Side Effects:
+!
+!	count in RECL$GL_WRITE_KEY the number of times this routine gets
+!	called to write a key descriptor block.
+!
+!--
+
+    BEGIN
+
+    DEFINE_REGISTERS_9;
+
+    LOCAL
+	KEY_VBN;
+
+    IF .KEY_REF EQLU 0
+    THEN
+	KEY_VBN = 1
+    ELSE
+	KEY_VBN = 0;
+
+    ! For fun, count the number of times we write a key descriptor
+    !
+    RECL$GL_WRITE_KEY = .RECL$GL_WRITE_KEY + 1;
+
+    WRITE_BLOCK( .KEY_VBN );
+
+    RETURN
+
+    END;
+
+%SBTTL	'WRITE_BLOCK'
+ROUTINE	WRITE_BLOCK ( VBN ) : NOVALUE =
+!++
+!
+! Functional Description:
+!
+!	Calculates the checksums and writes back
+!	a block in the prologue to the file
+!
+! Calling Sequence:
+!
+!	WRITE_AREA_DESC()
+!
+! Input Parameters:
+!	none
+!
+! Implicit Inputs:
+!	none
+!
+! Output Parameters:
+!	none
+!
+! Implicit Outputs:
+!	none
+!
+! Routine Value:
+!	none
+!
+! Routines Called:
+!
+!	$WRITE
+!
+! Side Effects:
+!	none
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	    CHECKSUM	: WORD,
+	    BLOCK	: REF VECTOR [ ,WORD ];
+
+    ! Point to the block we want to write
+    !
+    BLOCK = .PROLOGUE + ( ( .VBN - 1 ) * BLOCK_SIZE );
+
+    ! Recalculate the check sum
+    !
+    CHECKSUM = 0;
+
+    ! Find the checksum for this block
+    !
+    INCR I FROM 0 TO 254 BY 1
+    DO
+	CHECKSUM = .CHECKSUM + .BLOCK [ .I ];
+
+    ! Write the check sum into the bucket
+    !
+    BLOCK [ 255 ] = .CHECKSUM;
+
+    ! Write the area descriptors
+    !
+    RECL$AB_IN_RAB [ RAB$L_BKT ] = .VBN;
+    RECL$AB_IN_RAB [ RAB$L_RBF ] = .BLOCK;
+    RECL$AB_IN_RAB [ RAB$W_RSZ ] = BLOCK_SIZE;
+
+    ! If error signal a prologue write error
+    !
+    RECL$AB_IN_RAB [ RAB$L_CTX ] = CONV$_PROL_WRT;
+
+    $WRITE( RAB=RECL$AB_IN_RAB,ERR=CONV$$RMS_ERROR );
+
+    RETURN
+
+    END;
+
+END	ELUDOM

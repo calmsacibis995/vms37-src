@@ -1,0 +1,760 @@
+	$BEGIN	RM0DIRSCN,010,P$RMS0MISC,<READ DIRECTORY FILES>
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; FACILITY: RMS32
+;
+; ABSTRACT:
+;	This module performs the basic scanning of a directory
+;	file as an optimization to performing ACP QIO's for every
+;	file name in a directory file.
+;
+; ENVIRONMENT:
+;	VAX/VMS
+;
+; AUTHOR:
+;	Tim Halvorsen	October, 1979
+;
+; MODIFIED BY:
+;
+;	V02-070	JAK0070		J A Krycka	02-FEB-1982
+;		Fix broken branch.
+;
+;	V02-009	JWH0002		Jeffrey W. Horn 02-DEC-1981
+;		Add relative version numbers.  Also moved directory
+;		BDB definitions to RMSINTSTR.MDL BDB definition.
+;
+;	V02-008	JWH0001		Jeffrey W. Horn 18-NOV-1981
+;		Change multi-block logic to reflect removal of
+;		DIR$V_PREVREC flag.
+;
+;	V02-007	JWH38296	Jeffrey W. Horn	22-SEP-1981
+;		Round up EBK,FFB pair to nearest block boundry if not on
+;		a block boundry.
+;
+;	V02-006	JAK0060		J A Krycka	01-JUL-1981
+;		Fix broken branch.
+;
+;	V02-005	REFORMAT	Frederick E. Deen, Jr.	    23-Jul-1980
+;		This code was reformatted to adhere to RMS standards
+;
+;	V004	TMH0004		Tim Halvorsen	22-Jan-1980
+;		Fix bug in error reporting from parse_name.  Was not
+;		clearing off return status longword off stack before
+;		doing an RSB.
+;
+;	V003	TMH0003		Tim Halvorsen	17-Jan-1980
+;		Fix to not return NOSUCHFILE unless both BDB$L_ADDR
+;		equals BDB$L_RECORD and BDB$L_VERSION=0.  Was getting
+;		NOSUCHFILE if search started on 2nd or 3rd version of
+;		first record.
+;
+;	V002	TMH0002		Tim Halvorsen	04-Jan-1980
+;		Return NOSUCHFILE if WILD and NO FILES matched at all.
+;		Eliminate optimization to exit after no versions found
+;		in matched record for nonwild patterns because it was
+;		incorrectly checking the summary wildcard bit rather than
+;		the name/type/ver WC bits and probably is not worth it.
+;
+;	V001	TMH0001		Tim Halvorsen	24-Nov-1979
+;		Add more checks to version parsing to return error
+;		if illegal file type.
+;--
+;
+
+
+	.SBTTL	DEFINITIONS
+
+;
+;	Symbol definitions
+;
+
+	$IFBDEF				; IFAB definitions
+	$FWADEF				; FWA definitions
+	$BDBDEF				; BDB definitions
+	$FIBDEF				; FIB definitions
+	$DEVDEF				; Device Characteristics bits
+	$CCBDEF				; CCB definitions
+	$UCBDEF				; UCB definitions
+	$FH2DEF				; ODS-2 File header definitions
+	$DIRDEF				; Directory File definitions
+	DIR$M_TYPE	= <1@DIR$S_TYPE-1>@DIR$V_TYPE
+	$ATRDEF				; Attribute List definitions
+	$IODEF				; I/O function codes
+
+
+	.SBTTL	RM$READDIR, READ DIRECTORY FILE INTO MEMORY
+
+;++
+;
+; RM$READDIR - Read directory file into memory
+;
+;	This routine attempts to read the directory file into
+;	virtual memory owned by EXEC mode.  A directory buffer
+;	descriptor is setup to contain the current status of
+;	the search thru the directory file.
+;
+; INPUTS:
+;
+;	R11 = address of IMPURE AREA
+;	R10 = FWA address
+;	R9 = IFAB address
+;	DID of FWA is used as FID of directory, channel is assigned.
+;
+; OUTPUTS:
+;
+;	R0 = status code (true if ok, error if could not be read)
+;	FWA$L_DBD = address of DBD, 0 if none allocated
+;	R1-R7 destroyed.
+;--
+
+RM$READDIR::
+	BBC	#DEV$V_SDI,-			; branch if direc. structured
+		IFB$L_PRIM_DEV(R9),10$
+	MOVZWL	#SS$_BADIRECTORY,R0		; set unable to read directory
+	RSB
+
+;
+;	Allocate a BDB (buffer descriptor block).  Miscellaneous
+;	fields in the BDB will be used to hold scan context.
+;
+
+10$:	PUSHL	R10				; save R10
+	MOVL	R9,R10				; RM$ALBDB wants IFB addr in R10
+	BSBW	RM$ALBDB			; allocate BDB
+	POPL	R10				; restore R10
+	BLBC	R0,90$				; branch if error
+	MOVL	R1,R7				; save BDB address
+
+;
+;	Copy the current contents of FWA$T_ATR_LIST onto the stack
+;	while we use the area for the attributes list.  The contents
+;	will be restored on completion of the ACP request.
+;
+
+	SUBL	#28,SP			        ; alloc. 28 bytes for ATR_LIST
+	MOVC	#28,FWA$T_ATR_LIST(R10),(SP) 	; save previous contents
+
+;
+;	Setup attributes list
+;
+
+	MOVAB	FWA$T_ATR_LIST(R10),R5		; address of attributes list
+	MOVW	#IFB$C_FHAEND-IFB$B_RFMORG,-	; file attributes
+		(R5)+
+	MOVW	#ATR$C_RECATTR,(R5)+
+	MOVAB	IFB$B_RFMORG(R9),(R5)+
+	MOVW	#4,(R5)+			; file characteristics longword
+	MOVW	#ATR$C_UCHAR,(R5)+
+	MOVAB	FWA$W_UCHAR(R10),(R5)+
+	ASSUME	FH2$B_STRUCLEV LT 8		; assume STRUCLEV in 1st quadword
+	MOVW	#8,(R5)+			; 1st 8 bytes of file hder blk
+	MOVW	#ATR$C_HEADER,(R5)+
+	MOVAB	FWA$T_STATBLK(R10),(R5)+
+	CLRL	(R5)
+
+;
+;	Setup FIB fields
+;
+
+	MOVL	#FIB$C_ACCDATA,FWA$Q_FIB(R10)	; set length of FIB
+	MOVAB	FWA$T_FIBBUF(R10),R4		; address of FIB
+	CLRL	FIB$L_ACCTL(R4)			; allow other readers/writers
+	MOVL	FIB$W_DID(R4),FIB$W_FID(R4)	; copy DID to FID
+	MOVW	FIB$W_DID+4(R4),FIB$W_FID+4(R4)
+
+;
+;	Request file attributes from the ACP
+;
+
+	PUSHL	#0				; P6 = 0
+	PUSHAB	FWA$T_ATR_LIST(R10)		; P5 = addr of attribute list
+	CLRQ	-(SP)				; P3/P4 = 0
+	PUSHL	#0				; P2 = 0
+	MOVZWL	#IO$_ACCESS!IO$M_ACCESS,R0	; ACP function code
+	BSBW	RM$FCPFNC			; call ACP and wait for reply
+	MOVL	R0,R6				; save status
+	MOVC	#28,(SP),FWA$T_ATR_LIST(R10)	; restore previous FWA contents
+	ADDL	#28,SP				; deallocate stack space
+	MOVL	R6,R0				; restore status
+	BLBS	R0,20$				; branch if ok
+
+;
+;	Process error - deallocate BDB and return with status
+;
+
+70$:	PUSHL	R0				; save status
+	BSBW	DEACCESS			; deaccess file
+	JSB	RM$RETDIRBDB			; deallocate dir. buffer and BDB
+	POPL	R0				; restore STATUS
+90$:	RSB					; return with STATUS
+
+;
+;	If the directory is not a directory file or ODS-1
+;	structure, then exit with error.  We only read ODS-2.
+;
+
+20$:	MOVZWL	#SS$_BADIRECTORY,R0		; assume invalid directory
+	CMPB	FWA$T_STATBLK+FH2$B_STRUCLEV(R10),#2
+						; if not ODS-2
+	BNEQ	70$				; then exit with error
+	BBC	#FH2$V_DIRECTORY,-		; branch if not directory
+		FWA$W_UCHAR(R10),70$  	
+
+;
+;	Allocate enough space to hold the entire directory file.
+;
+
+	ROTL	#16,IFB$L_EBK(R9),R2		; swap words of FILES-11 EBK
+	TSTW	IFB$W_FFB(R9)			; First free byte at blk bound?
+	BEQL	25$				; Branch if yes.
+	CLRW	IFB$W_FFB(R9)			; No; Round up.
+	INCL	R2				; Increment block number
+25$:	DECL	R2				; EOF file always points to last+1
+	MOVL	R2,IFB$L_EBK(R9)		; set to nbr of blocks in file
+	ASHL	#9,R2,R2			; convert blocks to bytes
+	BICL3	#^XFFFF,R2,R1			; check if over 64k bytes
+	BNEQ	70$				; if over max. transfer size, skip it
+	JSB	RM$GETPAG			; allocate # blocks needed
+	BLBC	R0,70$				; branch if not available
+	MOVW	R2,BDB$W_SIZE(R7)		; store # bytes obtained
+	MOVL	R3,BDB$L_ADDR(R7)		; and address of buffer
+
+;
+;	Remember DIRSEQ at the start of the transfer.  We will
+;	check if afterwards to verify the validity of the file.
+;
+
+	BSBW	RM$GETCCB			; get CCB address in R1
+	MOVL	CCB$L_UCB(R1),R6		; get UCB address
+30$:	MOVW	UCB$W_DIRSEQ(R6),-
+		BDB$W_DIRSEQ(R7)		; save DIRSEQ value
+
+;
+;	Read the entire directory file into the buffer
+;
+
+	CLRQ	-(SP)				; P5/P6 = 0
+	MOVQ	#1,-(SP)			; P4 = 0, P3 = VBN 1
+	MOVZWL	BDB$W_SIZE(R7),-(SP)		; P2 = transfer size
+	PUSHL	BDB$L_ADDR(R7)			; P1 = buffer address
+	MOVZWL	#IO$_READVBLK,R0		; set I/O function code
+	BSBW	RM$FCPFNC_ALT2			; read directory file
+	BLBC	R0,70$				; branch if error
+
+;
+;	Check if DIRSEQ has changed while we were reading the
+;	directory file.  If so, then keep trying until it goes
+;	unchanged over the I/O.  This is to prevent invalid data
+;	while in the middle of an ACP directory update.
+;
+
+40$:	CMPW	UCB$W_DIRSEQ(R6),-		; DIRSEQ changed?
+		BDB$W_DIRSEQ(R7)
+	BNEQ	30$				; if so, repeat transfer
+
+;
+;	Deaccess the file
+;
+
+	BSBB	DEACCESS			; deaccess the file
+
+;
+;	Initialize directory scan context
+;
+
+	MOVL	#1,BDB$L_VBN(R7)		; set current VBN being searched
+	MOVL	BDB$L_ADDR(R7),-		; set address of next record
+		BDB$L_RECORD(R7)
+	CLRL	BDB$L_VERSION(R7)		; set version uninitialized
+	CLRL	BDB$L_LAST(R7)			; set last rec adr uninitzd
+
+	MOVL	#1,R0				; exit with success
+	RSB
+
+;
+;	Deaccess the file
+;
+
+DEACCESS:
+	CLRQ	-(SP)				; P5/P6 = 0
+	CLRQ	-(SP)				; P3/P4 = 0
+	CLRQ	-(SP)				; P1/P2 = 0
+	MOVZWL	#IO$_DEACCESS,R0		; ACP function code
+	BSBW	RM$FCPFNC_ALT2			; call the ACP and wait for reply
+	RSB					; return with status
+
+	.SBTTL	RM$DIRSCAN, SEARCH FOR NEXT FILE IN DIRECTORY
+
+;++
+;
+; RM$DIRSCAN - Search for next file in directory
+;
+;	This routine returns the next file name given the
+;	file name search string and the current search context.
+;
+; Inputs:
+;
+;	R2/R3 = descriptor of file name/type/version string
+;	R7 = directory BDB address
+;	R9 = IFAB address
+;	R10 = FWA address
+;
+; Outputs:
+;
+;	R0 = status code
+;	result name string stored in result buffer
+;	IFB$L_RNS_LEN(R9) = length of result name string
+;	BDB$L_VERSION = address of version entry
+;	BDB$L_RECORD = address of current record
+;	BDB$L_VBN = block number currently being scanned
+;--
+
+RM$DIRSCAN::
+	MOVZWL	#SS$_NOMOREFILES,-(SP)		; preset error status
+	CMPL	BDB$L_ADDR(R7),-		; is this the first search?
+		BDB$L_RECORD(R7)
+	BNEQ	2$				; branch if not
+	TSTL	BDB$L_VERSION(R7)		; if first search, version=0
+	BNEQ	2$				; branch if not first search
+	MOVZWL	#SS$_NOSUCHFILE,(SP)		; if so, return NOSUCHFILE on error
+
+;
+;	Save the input parameters on the stack as:
+;		(SP) = quadword descriptor of file name and type
+;		4(SP) = version number (binary), -1=all, 0=highest
+;
+
+2$:	BSBW	PARSE_NAME			; parse into string and version #
+	BLBS	R0,5$				; branch if successful
+	ADDL	#4,SP				; POP status longword
+	RSB					; return with status from PARSE_NAME
+5$:	PUSHR	#^M<R2,R3,R4>			; save parameters on STACK
+
+;
+;	Loop over each block of the directory until EOF
+;
+
+10$:	CMPL	BDB$L_VBN(R7),-			; EOF yet?
+		IFB$L_EBK(R9)
+	BLEQU	15$				; if not, continue
+	BRW	600$				; otherwise, exit with failure
+15$:	SUBL3	#1,BDB$L_VBN(R7),R1		; block number - 1
+	MULL	#512,R1				; compute offset into directory
+	ADDL	BDB$L_ADDR(R7),R1		; address of current block
+	MOVAB	512-1(R1),R5			; R5 = last byte of the block
+	MOVL	BDB$L_RECORD(R7),R6		; R6 = address of current record
+
+;
+;	Loop over each record within the block
+;
+
+20$:	CMPW	DIR$W_SIZE(R6),#^XFFFF		; end of block marker?
+	BEQL	300$				; if so, skip to next block
+
+;
+;	Verify the length field of the current record
+;
+
+	MOVZWL	DIR$W_SIZE(R6),R0		; get length of record
+	MOVAB	2(R0)[R6],R3			; R3 = address of next record
+	CMPL	R3,R5				; outside of block boundary?
+	BLEQU	25$				; branch if ok
+	BRW	ERRDIR				; exit with illegal dir format
+
+;
+;	Pick up address of current version.  If none, start at first.
+;
+
+25$:	MOVZBL	DIR$B_NAMECOUNT(R6),R2		; R2 = # chars in name string
+	MOVL	BDB$L_VERSION(R7),R4		; R4 = address of current version
+	BNEQ	50$				; branch if version ok
+	MOVAB	DIR$C_LENGTH+1(R6)[R2],R4  	; skip to first version
+	BICL3	#1,R4,R4
+	MOVAB	-DIR$C_VERSION(R5),R0		; highest allowable within block
+	CMPL	R4,R0				; outside of block boundary?
+	BGTRU	ERRDIR				; yes, bad directory format
+
+
+;
+;	First version in record, see if we are starting a new file name
+;
+
+30$:	PUSHR	#^M<R2,R3,R4,R5>
+	MOVL	BDB$L_LAST(R7),R1
+	BEQL	40$				; branch if there wasn't one
+	CMPC3	R2,DIR$T_NAME(R1),DIR$T_NAME(R6); same as last record?
+	BEQL	45$				; branch if so
+40$:	CLRL	BDB$L_VERCOUNT(R7)		; first version of this filename
+45$:	POPR	#^M<R2,R3,R4,R5>		; restore registers
+
+;
+;	Determine if this record matches the input name and type
+;
+
+50$:	PUSHR	#^M<R2,R3,R4,R5>
+	MOVAB	DIR$T_NAME(R6),R3		; R2/R3 = name being checked
+	MOVQ	4*4(SP),R4			; R4/R5 = name pattern
+	JSB	FMG$MATCH_NAME			; check if name matches
+	POPR	#^M<R2,R3,R4,R5>		; restore registers
+	BLBC	R0,200$				; if not, exit this record
+
+
+
+;
+;	Loop through each version entry looking for the desired one.
+;
+
+60$:	CMPL	R4,R3				; past last version?
+	BGEQU	200$				; branch if so
+	MOVL	8(SP),R0			; pick up desired version #
+	BSBW	MATCH_VERSION			; check if version entry matches
+	BLBS	R0,500$				; branch if match found
+	ADDL	#DIR$C_VERSION,R4		; skip to next version entry
+	BRB	60$				; and keep looking
+
+;
+;	No match found.  Exit with failure
+;
+
+600$:	BRB	EXIT				; exit with status
+
+;
+;	Skip to next record in the file
+;
+
+200$:	BSBB	NEXT_RECORD			; skip to next record
+	BLBC	R0,ERRDIR			; if error, bad format directory
+	CLRL	BDB$L_VERSION(R7)		; mark no version address yet
+	BRB	20$				; scan this new record
+
+;
+;	We have searched an entire block.  Skip to the next block.
+;
+
+300$:	INCL	BDB$L_VBN(R7)			; increment block number
+	MOVAB	1(R5),BDB$L_RECORD(R7)		; set record address to next block
+	CLRL	BDB$L_VERSION(R7)		; clear version address
+	BRW	10$				; search this new block
+
+;
+;	Match found.  Exit with success
+;
+
+500$:	MOVL	R6,BDB$L_RECORD(R7)		; save record address
+	MOVAB	DIR$C_VERSION(R4),-		; set version address
+		BDB$L_VERSION(R7)		;  to the next version entry
+	BSBW	RETURN_FID			; return FID to FIB buffer
+	BSBW	CONSTRUCT_NAME			; construct result file name
+	MOVL	#1,12(SP)			; set return status = successful
+	BRB	EXIT
+
+;
+;	Illegal directory file format
+;
+
+ERRDIR:	MOVZWL	#SS$_BADIRECTORY,12(SP)		; set error status
+
+;
+;	Deallocate directory buffer
+;
+
+EXIT:	ADDL	#3*4,SP				; remove parameters from STACK
+	POPL	R0				; get return status
+	RSB
+
+	.SBTTL	NEXT_RECORD, SUBROUTINE TO FIND NEXT RECORD
+
+;++
+;
+; NEXT_RECORD - Find next record
+;
+;	This subroutine is called to skip to the next record
+;	in the directory file.
+;
+; Inputs:
+;
+;	R6 = address of current record
+;	R5 = address of last byte of current block
+;
+; Outputs:
+;
+;	R0 = true if successful, false if illegal directory format
+;--
+
+NEXT_RECORD:
+	MOVZWL	DIR$W_SIZE(R6),R0		; get length of current record
+	CMPL	R0,-				; minimum length allowable
+		#DIR$C_LENGTH+DIR$C_VERSION
+	BLSSU	80$				; branch if illegal
+	MOVAB	2(R0)[R6],R6			; advance to next record in block
+	CMPL	R6,R5				; check if exceeded block boundary
+	BGTRU	80$				; branch if illegal format
+	CMPW	DIR$W_SIZE(R6),#^XFFFF		; if end-of-block marker, skip checks
+	BEQL	20$				; branch if so
+	BLBS	R6,80$				; all records must be word aligned
+	BLBS	DIR$W_SIZE(R6),80$		; and the size must also be in words
+	ASSUME	DIR$C_FID EQ 0
+	BITB	DIR$B_FLAGS(R6),-		; check if DIR$V_TYPE=DIR$C_FID
+		#DIR$M_TYPE
+	BNEQ	80$				; branch if not
+20$:	MOVL	#1,R0
+	RSB
+80$:	CLRL	R0				; illegal format record
+	RSB
+
+	.SBTTL	MATCH_VERSION, CHECK IF VERSION ENTRY MATCHES
+
+;++
+;
+; MATCH_VERSION - Check if version entry matches
+;
+;	This routine checks if the current version entry matches
+;	the requested version number.
+;
+; INPUTS:
+;
+;	R0 = requested version number
+;	R7 = directory BDB address
+;	R6 = address of current record
+;	R4 = address of current version entry
+;	R2 = DIR$B_NAMECOUNT(R6)
+;
+; OUTPUTS:
+;
+;	R0 = true if matches, else false
+;	R1 destroyed.
+;--
+
+MATCH_VERSION:
+	TSTB	BDB$B_VERTYP(R7)		; check if wild version
+	BGTR	70$				; if all, match immediately
+	TSTL	R0				; check version number
+	BLSS	60$				; branch if relative
+	BNEQ	50$				; branch if specific value
+
+;
+;	Version = 0, match only highest version
+;
+
+	TSTL	BDB$L_VERCOUNT(R7)		; is it first vers of file
+	BEQL	70$				; match if yes
+
+;
+;	Version = #, check if matches
+;
+
+50$:	CMPW	R0,DIR$W_VERSION(R4)		; check if matches
+	BEQL	70$				; if so, match immediately
+	CLRL	R0				; no match
+	BRB	EXIT_MATCH
+
+;
+;	Relative version number, see if this one
+;
+
+60$:	CMPL	R0,BDB$L_VERCOUNT(R7)		; current relative offset?
+	BEQL	70$				; yes, successful match
+	CLRL	R0				; no match
+	BRB	EXIT_MATCH
+
+
+;
+;	Report successful match
+;
+
+70$:	MOVL	#1,R0				; match
+
+EXIT_MATCH:
+	DECL	BDB$L_VERCOUNT(R7)		; bump version count
+	MOVL	R6,BDB$L_LAST(R7)		; save adr of this record
+	RSB
+
+	.SBTTL	PARSE_NAME, PARSE FILE NAME STRING
+
+;++
+;
+; PARSE_NAME - Parse file name string
+;
+;
+;	This routine parses the file name string into a
+;	string composed of the file name and type and a
+;	binary number representing the version number.
+;	It is assumed that all portions of the file string
+;	are present (file name, type and version).
+;
+; INPUTS:
+;
+;	R2/R3 = string descriptor
+;	R7 = directory BDB address
+;
+; OUTPUTS:
+;
+;	R0 = status
+;	R2/R3 = descriptor of file name/type string
+;	R4 = version number
+;--
+
+PARSE_NAME:
+	CLRL	R4				; preset result to 0
+	CLRB	BDB$B_VERTYP(R7)		; preset version type to nonwild
+	MOVL	#1,R1				; preset base factor to 1
+10$:	DECL	R2				; decrement string size
+	BLEQ	40$				; get out if string runs out
+	MOVZBL	(R3)[R2],R0			; get last character
+	CMPB	R0,#^A'*'			; asterisk means all versions
+	BEQL	20$				; branch if so
+	SUBB	#^A'0',R0			; check lower bounds
+	BLSS	30$				; branch if not numeric
+	CMPB	R0,#9				; check upper bounds
+	BGTRU	30$				; branch if not numeric
+	MULL	R1,R0				; multiply by base factor
+	ADDL	R0,R4				; add to result
+	MULL	#10,R1				; multiply base by 10
+	BRB	10$
+
+20$:	MOVB	#1,BDB$B_VERTYP(R7)		; set version type to 1 (wild)
+	BRB	10$				; and continue to remove semicolon
+
+30$:	MOVZBL	(R3)[R2],R0			; get last character
+	CMPB	R0,#^A'-'			; negative version?
+	BNEQ	40$				; no, branch
+	MNEGL	R4,R4				; yes, negate binary version #
+	DECL	R2				; decrement string size
+40$:	MOVZBL	(R3)[R2],R0			; get last character
+	CMPB	R0,#^A';'			; terminator must be ';'
+	BEQL	90$				; if so, exit ok
+	CMPB	R0,#^A'.'			; alternate syntax
+	BEQL	90$				; if so, exit ok
+	MOVZWL	#SS$_BADFILEVER,R0		; set error status
+	RSB					; exit
+90$:	MOVL	#1,R0				; success
+	RSB
+
+	.SBTTL	CONSTRUCT_NAME, CONSTRUCT RESULT FILE NAME STRING
+
+;++
+;
+; CONSTRUCT_NAME - Construct RESULT FILE NAME STRING
+;
+;
+;	This routine constructs a result file name string
+;	given the address of the record and version entry
+;	which represents the file name.
+;
+; INPUTS:
+;
+;	R10 = FWA address
+;	R9 = IFAB address
+;	R6 = address of record
+;	R4 = address of version entry
+;
+; OUTPUTS:
+;
+;	R0-R3,R5 destroyed.
+;	Result string is copied to buffer FWA$Q_NAME
+;	IFB$L_RNS_LEN = result string length
+;--
+
+CONSTRUCT_NAME:
+	MOVL	FWA$Q_NAME+4(R10),R3		; set result buffer address
+	MOVZBL	DIR$B_NAMECOUNT(R6),R0		; file name size
+	PUSHL	R4				; save version entry address
+	MOVC	R0,DIR$T_NAME(R6),(R3)		; copy to result buffer
+	MOVB	#^A';',(r3)+			; append semi-colon
+	POPL	R4				; restore version address
+
+;
+;	Bypass leading zeros
+;
+
+	MOVZWL	DIR$W_VERSION(R4),R0		; get binary version number
+	MOVL	#10000,R1			; divisor (largest is 65000)
+10$:	BEQL	20$				; branch if divisor hits zero
+	DIVL3	R1,R0,R2			; get upper digit
+	BNEQ	20$				; branch if non-zero digit
+	DIVL	#10,R1				; go to next position down
+	BRB	10$				; continue skipping leading zeros
+
+;
+;	Convert binary version number to ASCII
+;
+
+20$:	TSTL	R1				; check divisor
+30$:	BEQL	50$				; branch if divisor hits zero
+	DIVL3	R1,R0,R2			; get upper digit
+	ADDB3	#^A'0',R2,(R3)+			; write character to buffer
+	EMUL	#1,R0,#0,-(SP)			; convert version to quadword
+	EDIV	R1,(SP)+,R0,R0			; version = version mod divisor
+	DIVL	#10,R1				; go to next position down
+	BRB	30$				; loop until done
+50$:	SUBL3	FWA$Q_NAME+4(R10),R3,-		; return result length
+		IFB$L_RNS_LEN(R9)
+	RSB					; exit
+
+	.SBTTL	RETURN_FID, RETURN FID TO FIB BUFFER
+
+;++
+;
+; RETURN_FID - Return FID to FIB buffer
+;
+;
+;	Return the FID of the matched directory file name
+;	to the FIB buffer in the FWA.
+;
+; INPUTS:
+;
+;	R10 = FWA address
+;	R4 = address of version entry
+;
+; Outputs:
+;
+;	The FID is copied to the FIB.
+;--
+
+RETURN_FID:
+
+;
+;	Return FID to FIB buffer
+;
+
+	MOVAB	FWA$T_FIBBUF(R10),R0		; address of FIB
+	MOVL	DIR$W_FID_NUM(R4),-		; copy num and seq
+		FIB$W_FID_NUM(R0)
+	MOVW	DIR$W_FID_RVN(R4),-		; copy relative volume
+		FIB$W_FID_RVN(R0)
+
+;
+;	If the relative volume number is 0, then substitute
+;	the relative volume number of its parent directory.
+;
+
+	TSTB	FIB$B_FID_RVN(R0)		; check if low byte zero
+	BNEQ	60$				; branch if not zero
+	MOVB	FIB$B_DID_RVN(R0),-		; substitute parent RVN
+		FIB$B_FID_RVN(R0)
+60$:	RSB					; exit
+
+	.END

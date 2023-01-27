@@ -1,0 +1,319 @@
+MODULE workq (IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  DECnet V2.0 event logger
+!
+! ABSTRACT:
+!
+!	This module contains routines to manage the internal
+!	work queue.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. unprivileged user mode,
+!
+! AUTHOR:  Tim Halvorsen, June 1980
+!
+! Modified by:
+!
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';		! VAX/VMS common definitions
+
+REQUIRE 'SYS$LIBRARY:UTILDEF';		! Misc. VMS definitions
+
+REQUIRE 'LIB$:WQDEF';			! Structure definitions
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    wkq$add_work_item,			! Add a work item
+    wkq$do_work_item,			! Dequeue and execute a work item
+    wkq$add_timed_work,			! Add a timed work item
+    wkq$cancel_timed_work,		! Cancel timed work item
+    timer_ast:		NOVALUE;	! Timer AST routine
+
+!
+! BUILTIN functions
+!
+
+BUILTIN
+    INSQUE,				! INSQUE instruction
+    REMQUE;				! REMQUE instruction
+
+!
+! OWN storage
+!
+
+OWN
+    work_queue:		VECTOR [2]	! Work queue listhead
+			INITIAL(work_queue,work_queue),
+    timed_queue:	VECTOR [2]	! Timed work queue listhead
+			INITIAL(timed_queue,timed_queue);
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    lib$get_vm:	ADDRESSING_MODE(GENERAL),	! Allocate storage
+    lib$free_vm: ADDRESSING_MODE(GENERAL);	! Deallocate storage
+
+GLOBAL ROUTINE wkq$add_work_item (action_routine, arg1, arg2) =
+
+!---
+!
+!	This routine adds a single work item to the work queue.
+!	A $WAKE is performed for the first work item added.
+!
+! Inputs:
+!
+!	action_routine = Address of routine to call to perform work.
+!	arg1/2 = Arguments to be passed to action routine when called.
+!
+! Outputs:
+!
+!	routine = status code
+!---
+
+BEGIN
+
+LOCAL
+    length,				! Length of allocate/deallocation
+    entry:	REF BBLOCK;		! Address of work queue entry
+
+length = wqe$c_length;			! Length of a work queue entry
+return_if_error(LIB$GET_VM(length,entry));	! Allocate entry
+CH$FILL(0,wqe$c_length,.entry);		! Zero the entry
+
+entry [wqe$l_pc] = .action_routine;	! Store address of action routine
+entry [wqe$l_arg1] = .arg1;		! then store 2 arguments
+entry [wqe$l_arg2] = .arg2;		! assume both arguments must be given
+
+IF INSQUE(.entry, .work_queue [1])	! Queue entry at tail of list
+THEN
+    $WAKE();				! If first, wakeup process
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE wkq$do_work_item =
+
+!---
+!
+!	This routine dequeues the next work item to be performed
+!	and calls the action routine associated with the item.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	routine = True if successful, false if nothing in queue
+!---
+
+BEGIN
+
+LOCAL
+    length,				! Length of work queue entry
+    entry:	REF BBLOCK;		! Address of entry in queue
+
+IF REMQUE(.work_queue [0], entry) 	! Remove first entry from queue
+THEN
+    RETURN false;			! If none, return unsuccessful
+
+(.entry [wqe$l_pc])(.entry [wqe$l_arg1], .entry [wqe$l_arg2]); ! Call routine
+
+length = wqe$c_length;
+LIB$FREE_VM(length, entry);		! Deallocate entry
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE wkq$add_timed_work (action_routine, arg1, arg2, time, reqid) =
+
+!---
+!
+!	This routine adds a timed work item to the work queue
+!	to be executed at the specified time.  Any outstanding
+!	work item for the same reqid is canceled before the new
+!	one is added.
+!
+! Inputs:
+!
+!	action_routine = Address of routine to call to perform work.
+!	arg1/2 = Arguments to be passed to action routine when called.
+!	time = Delta or absolute time at which the work item should be done.
+!	reqid = Request identification to be associated with the time based
+!		work item.  There may be no more than one work item in the
+!		work queue with this request id.
+!
+! Outputs:
+!
+!	routine = status code
+!---
+
+BEGIN
+
+LOCAL
+    status,
+    length,				! Length of allocate/deallocation
+    entry:	REF BBLOCK,		! Address of work queue entry
+    p:		REF BBLOCK;		! Address of entry being scanned
+
+length = wqe$c_length;			! Length of a work queue entry
+return_if_error(LIB$GET_VM(length,entry));	! Allocate entry
+CH$FILL(0,wqe$c_length,.entry);		! Zero the entry
+
+entry [wqe$l_pc] = .action_routine;	! Store address of action routine
+entry [wqe$l_arg1] = .arg1;		! then store 2 arguments
+entry [wqe$l_arg2] = .arg2;		! assume both arguments must be given
+entry [wqe$l_reqid] = .reqid;		! Store request id
+
+wkq$cancel_timed_work(.reqid);		! Cancel outstanding request (if any)
+
+INSQUE(.entry, .timed_queue [1]);	! Insert at end of queue
+
+status = $SETIMR(DAYTIM=.time, ASTADR=timer_ast, REQIDT=.reqid);
+
+IF NOT .status				! If error occurred setting timer,
+THEN
+    BEGIN
+    LIB$FREE_VM(length,entry);		! Deallocate the storage
+    REMQUE(.entry, entry);		! Remove entry from queue
+    RETURN .status;			! and return with status
+    END;
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE wkq$cancel_timed_work (reqid) =
+
+!---
+!
+!	This routine cancels a timed work item in the work queue
+!	from being executed at the specified time.
+!
+! Inputs:
+!
+!	reqid = Request identification associated with the work item.
+!
+! Outputs:
+!
+!	routine = True if request dequeued, false if not found in work queue.
+!---
+
+BEGIN
+
+LOCAL
+    p:		REF BBLOCK;		! Address of entry being scanned
+
+p = .timed_queue [0];			! Get at first entry in timed queue
+
+WHILE .p NEQ timed_queue [0]		! Until the end of list
+DO
+    BEGIN
+    IF .p [wqe$l_reqid] EQL .reqid	! If already a request with this reqid,
+    THEN
+	BEGIN
+	$CANTIM(REQIDT=.reqid);		! Cancel the previous request
+	REMQUE(.p, p);			! Remove entry from queue
+	RETURN true;			! Return successful
+	END;
+    p = .p [wqe$l_flink];		! Skip to next in chain
+    END;
+
+RETURN false;				! Indicate request not in work queue
+
+END;
+
+ROUTINE timer_ast (reqid): NOVALUE =
+
+!---
+!
+!	This AST is called when a timer has run out for a work
+!	queue item.  The action routine associated with the
+!	item is called.
+!
+! Inputs:
+!
+!	reqid = Request identification for this timer request
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+LOCAL
+    entry:	REF BBLOCK,		! Address of work entry begin scanned
+    length;				! Length of work queue entry
+
+entry = .timed_queue [0];		! Get first timed entry
+
+WHILE .entry NEQ timed_queue [0]	! Until end of queue
+DO
+    BEGIN
+    IF .reqid EQL .entry [wqe$l_reqid]	! If matching item is found,
+    THEN
+	BEGIN
+	REMQUE(.entry, entry);		! Remove entry from queue
+
+	wkq$add_work_item(.entry [wqe$l_pc],	! Insert onto normal work queue
+		.entry [wqe$l_arg1], 
+		.entry [wqe$l_arg2]);
+
+	length = wqe$c_length;
+	LIB$FREE_VM(length, entry);	! Deallocate entry
+	RETURN;
+	END;
+    entry = .entry [wqe$l_flink];	! Skip to next entry in chain
+    END;
+
+!
+!	A timer has run out without a corresponding work item in the queue.
+!	Ignore the timer AST.
+!
+
+RETURN;
+
+END;
+
+END
+ELUDOM

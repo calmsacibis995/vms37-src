@@ -1,0 +1,595 @@
+MODULE mdlgen ( IDENT = 'V03-000' ) =
+
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:  Message compiler
+!
+! ABSTRACT:  
+!
+!	This compiler translates message definition language
+!	into object modules.  This module is called by the parser
+!	to generate an MDL file.
+!
+! ENVIRONMENT: 
+!
+!	VAX/VMS operating system, unprivileged user mode.
+!
+! AUTHOR:  Peter George, December 1980
+!
+! Modified by:
+!
+!	V02-003 PCG0003		Peter George		04-Mar-1981
+!		Alter CONCAT and DESC macro calls so that multiple
+!		UPLIT's are no longer generated.
+!
+!	V02-002 PCG0002		Peter George		02-Feb-1981
+!		Generate FACILITY constant definition to
+!		specify facility numbers.  Also, change 
+!		format of hexadecimal output.
+!
+!	V02-001	PCG0001		Peter George		15-Jan-1981
+!		Add processing for the /MACRO facility
+!		qualifier.
+!
+!--
+
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';		! VMS common definitions
+
+REQUIRE 'SRC$:MSG.REQ';			! Message common definitions
+
+
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    mdl_start_struc,			! Output $STRUC command
+    mdl_define_constant,		! Define message or literal constant
+    mdl_end_struc,			! Output E command
+    mdl_comment,			! Output a comment
+    mdl_put_record;			! Output a line to mdl file
+!
+! Macros
+!
+
+MACRO
+
+! Create a descriptor for a static string
+
+    DESC (string) =
+	%CHARCOUNT (string), UPLIT BYTE (string)%,
+
+! Concatenate two or more strings
+
+   CONCAT (result, source) [] =
+	CH$MOVE (.source, .(source+4), .result[0] + .result[1]);
+	result[0] = .result[0] + .source;
+	concat (result, %REMAINING)%;
+
+!
+! Literals
+!
+
+LITERAL
+    system_bit = 1,			! /SYSTEM facility qualifier indicator
+    prefix_bit = 2,			! /PREFIX facility qualifier indicator
+    macro_bit = 3,			! /MACRO facility qualifier indicator
+    dectohex_switch = %X'FFFF',		! Value to switch from decimal to hex at
+    record_offset = 8,			! Column where record starts
+    comment_offset = 5,			! Number of spaces to insert when appending a comment
+    symbol_size = obj$c_symsiz,		! Maximum symbol name size
+    line_size = 132;			! Length of output record buffer
+
+!
+! Storage definitions
+!
+
+OWN
+    value_offset,						! Column where values starts
+    struc_init:		INITIAL (false),			! Structure initialized flag
+    prefix:		VECTOR [line_size,BYTE],		! Prefix buffer
+    prefix_desc:	VECTOR [2] INITIAL (0,prefix),		! Symbol name prefix descriptor
+    output_buffer:	VECTOR [line_size, BYTE],		! Output buffer
+    output_desc:	VECTOR [2] INITIAL (0,output_buffer);	! Descriptor of output buffer
+
+OWN
+    bracket:	    VECTOR [2] 				! '>' descriptor
+		    INITIAL (DESC ('>')),
+    cbracket:	    VECTOR [2]				! 'C <' descriptor
+		    INITIAL (DESC ('C <')),
+    comma:	    VECTOR [2]				! ',' descriptor
+		    INITIAL (DESC (',')),
+    e:	    	    VECTOR [2] 				! 'E' descriptor
+		    INITIAL (DESC ('E')),
+    facility: 	    VECTOR [2]				! 'FACILITY,' descriptor
+		    INITIAL (DESC ('FACILITY,')),
+    semicolon:	    VECTOR [2] 				! ';' descriptor
+		    INITIAL (DESC (';')),
+    struct:	    VECTOR [2]				! '$STRUCT ' descriptor
+		    INITIAL (DESC ('$STRUCT ')),
+    ul:		    VECTOR [2]				! '!UL' descriptor
+		    INITIAL (DESC ('!UL')),
+    xl:		    VECTOR [2] 				! '<^X!XL>' descriptor
+		    INITIAL (DESC (%STRING ('<^X', '!XL', '>')));
+
+!
+! External storage
+!
+
+EXTERNAL
+    mdl_rab:	BBLOCK,					! Output file RAB
+    mdl_fab:	BBLOCK;					! Output file FAB
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    syntax_error,						! Signal syntax error
+    rms_error;							! Signal RMS-type error
+
+
+GLOBAL ROUTINE mdl_start_struc (facility_desc, facility_number, macro_desc, facility_flags) =
+
+!--
+!
+!	This routine outputs the following two lines:
+!
+!		$STRUCT facility_name,macro_suffix
+!		C <constant_prefix,tag_string,
+!		FACILITY,facility_number
+!
+!	Where, 1) facility_name is defined by either /MACRO, /PREFIX,
+!	or the default facility name, depending on which is present;
+!	2) macro_suffix is defined only when /MACRO is present and is
+!	then the last three characters of the macro name; 3) constant_prefix
+!	is defined by the /PREFIX qualifier or the default facility
+!	name if the qualifier is not present; 4) tag_string is either 
+!	'$_' or '_' depending on whether the /SYSTEM qualifier is 
+!	present or not; and 5) facility_number is the facility number
+!	specified.
+!
+! Inputs:
+!
+!	facility_desc   = Address of descriptor of facility name.
+!		 	  /PREFIX qualifier is used if present.
+!
+!	facility_number = Facility number passed by value.
+!
+!	macro_desc      = Address of descriptor of string specified by the
+!			  /MACRO qualifier.
+!
+!	facility_flags  = Bitvector idicating which facility 
+!			  qualifiers are present.
+!
+! Outputs:
+!
+!	None
+!
+!--
+
+BEGIN
+
+MAP
+    facility_desc:  REF VECTOR,
+    macro_desc:	    REF VECTOR,
+    facility_flags: REF BITVECTOR;
+
+LOCAL
+    buffer:	    VECTOR [line_size, BYTE],		! Line to be output
+    buffer_desc:    VECTOR [2],				! Buffer descriptor
+    constant_desc:  VECTOR [2],				! Facility name descriptor for constant line
+    faoout_buf:	    VECTOR [line_size, BYTE],		! FAO output buffer
+    faoout_desc:    VECTOR [2],				! Descriptor to accept output from FAO
+    struc_desc:	    VECTOR [2],				! Structure name descriptor
+    suffix_desc:    VECTOR [2],				! Macro name suffix descriptor
+    tag_desc:       VECTOR [2],				! Tag field descriptor
+    tag:	    VECTOR [line_size, BYTE];		! Tag built when /PREFIX is specified
+
+struc_init = true;					! Set stucture active flag
+constant_desc[0] = .facility_desc[0];			! Initialize structure name
+constant_desc[1] = .facility_desc[1];			!   descriptor from parameter
+
+IF .facility_flags [prefix_bit] 			! /PREFIX specified
+THEN BEGIN
+     
+     prefix_desc[0] = .constant_desc[0];		! Pickup prefix as literaly specified
+     prefix_desc[1] = .constant_desc[1];
+
+     tag_desc[0] = 2;					! Remove last character or two of
+     tag_desc[1] = tag;					!   prefix as tag
+
+     constant_desc[0] = .constant_desc[0] - 2;		! Remove tag from structure name
+
+     CH$MOVE (2, .constant_desc[0] + .constant_desc[1], .tag_desc[1]);
+
+     IF ( NOT .facility_flags [system_bit] )		! /SYSTEM not specified
+     THEN BEGIN
+          tag_desc[0] = .tag_desc[0] - 1;		! Remove '$' from tag
+          tag_desc[1] = .tag_desc[1] + 1;
+	  constant_desc[0] = .constant_desc[0] + 1;
+          END;
+
+     END
+
+ELSE BEGIN						! /PREFIX not specified
+
+     tag_desc[0] = 2;					! Initialize tag field
+     tag_desc[1] = UPLIT ('$_');			! Assuming /SYSTEM specified
+
+     IF ( NOT .facility_flags [system_bit] )		! /SYSTEM not specified
+     THEN BEGIN
+          tag_desc[0] = .tag_desc[0] - 1;		! Remove '$' from tag
+          tag_desc[1] = .tag_desc[1] + 1;
+          END;
+
+     prefix_desc[0] = 0;				! Clear prefix length
+     prefix_desc[1] = prefix;				! Set up prefix buffer
+
+     CONCAT (prefix_desc, 				! Put together symbol name prefix
+	     constant_desc,
+	     tag_desc);
+
+     END;
+
+value_offset = record_offset + symbol_size - .prefix_desc[0];	! Initialize symbol value offset
+
+mdl_put_record ( UPLIT (DESC (' ') ));			! Output a blank line
+
+buffer_desc[0] = record_offset;				! Initialize buffer descriptor
+buffer_desc[1] = buffer;
+CH$FILL (' ', record_offset, buffer);			! Clear beginning of line
+
+IF .facility_flags [macro_bit]				! /MACRO qualifier present
+THEN BEGIN
+
+     struc_desc[0] = .macro_desc[0] - 4;		! Remove $ and suffix
+     struc_desc[1] = .macro_desc[1] + 1;
+
+     suffix_desc[0] = 3;				! Initialize suffix
+     suffix_desc[1] = .struc_desc[1] + .struc_desc[0];
+
+     CONCAT (buffer_desc, 				! Put together $STRUCT line
+	     struct,
+	     struc_desc,
+	     comma,
+	     suffix_desc);
+
+     END
+
+ELSE BEGIN
+
+     struc_desc[0] = .constant_desc[0];			! Use default structure name
+     struc_desc[1] = .constant_desc[1];
+
+     CONCAT (buffer_desc, 				! Put together $STRUCT line
+	     struct,
+	     struc_desc);
+
+     END;
+
+mdl_put_record (buffer_desc);				! Output $STRUCT line
+mdl_put_record ( UPLIT (DESC (' ') ));			! Output blank line
+
+buffer_desc[0] = record_offset;				! Reset buffer size
+
+CONCAT (buffer_desc, 					! Put together constant header
+	cbracket,
+	constant_desc,
+	comma,
+	tag_desc,
+	comma);
+
+mdl_put_record (buffer_desc);				! Output constant header
+
+buffer_desc[0] = record_offset;				! Initialize buffer descriptor
+CH$FILL (' ', .value_offset, buffer);			! Clear beginning of line
+
+CONCAT (buffer_desc,					! Put together FACILITY constant definition
+	facility);
+
+buffer_desc[0] = .value_offset;				! Move buffer ptr to column for values
+
+CONCAT (buffer_desc,					! Use decimal notation
+	ul);
+
+faoout_desc[0] = line_size;				! Set maximum buffer size
+faoout_desc[1] = faoout_buf;				! Set FAO output buffer
+
+$FAO (buffer_desc, faoout_desc[0],			! Convert numeric value to string descriptor
+      faoout_desc, .facility_number);
+
+mdl_put_record (faoout_desc);				! Output constant statement
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE mdl_define_constant (name_desc, value, msg_flag, tparse) =
+
+!--
+!
+!	This routine outputs constant lines in the following format:
+!
+!		symbol_name, symbol_value
+!
+!	It can be called either to output message symbols or literals.
+!	In the latter case, it checks to be sure that the literal name
+!	is consistent with the $STRUCT statement.  If it is not, a warning
+!	is issued and the literal is omitted.
+!
+! Inputs:
+!
+!	name_desc = 	Address of descriptor of symbol name.
+!
+!	value =		Symbol value.
+!
+!	msg_flag =	Set if a message symbol and not a literal.
+!
+!	tparse =	Address of tparse block, when present.
+!
+! Outputs:
+!
+!	None
+!
+!--
+
+BEGIN
+
+MAP
+    name_desc:	    REF VECTOR;
+
+LOCAL
+    buffer:	    VECTOR [line_size, BYTE],		! Line to be output
+    buffer_desc:    VECTOR [2],				! Buffer descriptor
+    faoout_desc:    VECTOR [2],				! Descriptor to accept output from FAO
+    faoout_buf:	    VECTOR [line_size, BYTE],		! FAO output buffer
+    symbol_desc:    VECTOR [2];				! Symbol name descriptor
+
+IF ( NOT .struc_init ) 					! Structure not initialized
+THEN BEGIN
+     syntax_error (.tparse, emsg (nofacil));		! Signal warning
+     RETURN true;					! Exit
+     END;
+
+symbol_desc[0] = .name_desc[0];				! Initialize symbol name descriptor
+symbol_desc[1] = .name_desc[1];
+
+IF ( NOT .msg_flag )					! Symbol is a literal
+THEN BEGIN
+
+     IF CH$NEQ (.prefix_desc[0], .prefix_desc[1],	! Be sure that literal prefix is
+		.prefix_desc[0], .symbol_desc[1] )	! consistent with $STRUCT statement
+     THEN BEGIN
+	  syntax_error (.tparse, emsg (litconf));	! Signal warning
+	  RETURN true;					! Do not output
+	  END;
+
+     symbol_desc[0] = .symbol_desc[0] - .prefix_desc[0];	! Remove prefix
+     symbol_desc[1] = .symbol_desc[1] + .prefix_desc[0];
+
+     END;
+
+buffer_desc[0] = record_offset;				! Initialize buffer descriptor
+buffer_desc[1] = buffer;
+ 
+CH$FILL (' ', .value_offset, buffer);			! Clear beginning of line
+
+CONCAT (buffer_desc, 					! Put together constant  statement
+	symbol_desc,					! Symbol name comes first
+	comma);						! Then a comma
+
+buffer_desc[0] = .value_offset;				! Move buffer ptr along
+
+IF ..value LEQU dectohex_switch	
+THEN (CONCAT (buffer_desc,				! Use decimal notation
+ 	      ul))
+ELSE (CONCAT (buffer_desc,				! Use hexadecimal notation
+	      xl));
+
+faoout_desc[0] = line_size;				! Set maximum buffer size
+faoout_desc[1] = faoout_buf;				! Set FAO output buffer
+
+$FAO (buffer_desc, faoout_desc[0], 			! Convert numeric value to string descriptor
+      faoout_desc, ..value);
+
+mdl_put_record (faoout_desc);				! Output constant statement
+
+RETURN true;
+
+END;
+
+
+GLOBAL ROUTINE mdl_end_struc =
+
+!--
+!
+!	This routine outputs an end statement and cleans up
+!	the previous series of constant commands.
+!
+!		>
+!		E
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	None
+!
+!--
+
+BEGIN
+
+LOCAL
+    buffer:	    VECTOR [line_size, BYTE],		! Line to be output
+    buffer_desc:    VECTOR [2];				! Buffer descriptor
+
+IF ( NOT .struc_init)					! Structure not initialized
+THEN RETURN true;					! Exit
+
+struc_init = false;					! Clear structure active flag
+buffer_desc[0] = record_offset;				! Initialize buffer descriptor
+buffer_desc[1] = buffer;
+CH$FILL (' ', record_offset, buffer);			! Clear beginning of line
+
+CONCAT (buffer_desc, 					! Put together '>' statement
+	bracket);
+mdl_put_record (buffer_desc);				! Output that line
+
+buffer_desc[0] = record_offset;				! Reset buffer size
+
+CONCAT (buffer_desc, 					! Put together 'E' statement
+	e);
+mdl_put_record (buffer_desc);				! Output that line
+
+mdl_put_record ( UPLIT (DESC (' ') ));			! Output blank line
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE mdl_comment (comment_desc, new_line_flag) =
+
+!--
+!
+!	This routine outputs a comment either appended directly
+!	to the end of the previous record, i.e. on the same line
+!	as the previous record, or on a new line, depending on
+! 	the value of the new_line_flag.
+!
+! Inputs:
+!
+!	comment_desc = 	Descriptor of comment.
+!
+!	new_line_flag =  Set if comment should be placed on a
+!			 new line.
+!
+! Outputs:
+!
+!	None
+!
+!--
+
+BEGIN
+
+MAP
+    comment_desc :  REF VECTOR;
+
+LOCAL
+    buffer:	    VECTOR [line_size, BYTE],		! Line to be output
+    buffer_desc:    VECTOR [2];				! Buffer descriptor
+
+buffer_desc[0] = 0;					! Initialize buffer descriptor
+buffer_desc[1] = buffer;
+
+IF ( NOT .new_line_flag ) 				! Append to previous line
+THEN BEGIN
+
+     buffer_desc[0] = comment_offset;			! Skip a few spaces
+     CH$FILL (' ', comment_offset, buffer);
+
+     END;
+
+CONCAT (buffer_desc,					! Put together comment record
+	semicolon,
+	.comment_desc);
+
+mdl_put_record (buffer_desc, 				! Output record
+	IF NOT .new_line_flag THEN true ELSE false);
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE mdl_put_record (record_desc, append_to_buffer_flag) =
+
+!--
+!
+!	This routine puts a record into the mdl file.
+!
+! Inputs:
+!
+!	record_desc = Descriptor of record to be buffered.
+!
+!	append_to_buffer_flag = Set if buffer should be expanded.
+!			 	[Default is clear.]
+!
+! Outputs:
+!
+!	None
+!
+!--
+
+BEGIN
+
+MAP
+    record_desc:	REF VECTOR;
+
+BUILTIN
+    NULLPARAMETER;					! True if not specified
+
+LOCAL
+    status;						! Status code
+
+IF .mdl_fab [fab$w_ifi] EQL 0				! If file not opened
+THEN RETURN true;					! Exit
+
+IF NULLPARAMETER(2)					! New_line_flag not input or null
+
+THEN BEGIN						! Output and then reset buffer
+     mdl_rab [rab$w_rsz] = .output_desc[0];		! Initialize output record
+     mdl_rab [rab$l_rbf] = .output_desc[1];
+
+     status = $PUT (RAB = mdl_rab);			! Output line
+
+     IF ( NOT .status ) 					! If error
+     THEN rms_error (emsg (writeerr), mdl_fab, mdl_rab);	! Then report it
+
+     output_desc[0] = .record_desc[0];					! Reset buffer size
+     CH$MOVE (.record_desc[0], .record_desc[1], .output_desc[1]);	! Reset buffer
+
+     RETURN .status;
+     END
+
+ELSE BEGIN						! Simply modify old buffer
+     CONCAT (output_desc, .record_desc);		! Append record to buffer
+     RETURN true;
+     END;
+
+END;
+
+END
+ELUDOM

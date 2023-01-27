@@ -1,0 +1,672 @@
+%title 'PHONE - VAX/VMS Telephone Facility'
+	module phone (	main=phn$phone,
+			ident='V03-001') = begin
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! Facility:	VAX/VMS Telephone Facility, Main Module
+!
+! Abstract:	This facility allows the user to talk to other users on the
+!		local node or any other node.  The goal of this facility
+!		is to simulate a real telephone as closely as possible,
+!		hopefully resulting in good human engineering.
+!
+!		Special thanks to Tim Halvorsen, author of TALK, the original
+!		VAX/VMS telephone facility.
+!
+!
+! Environment:	Native, User mode.  The following privileges are required for
+!		full operation; PHONE should be installed with them:
+!
+!			NETMBX	To call over the network.
+!			OPER	To ring a phone via broadcasting.
+!			PRMMBX	To talk to any other user.
+!			WORLD	To obtain information about other processes.
+!
+!		For remote communication, we assume all participating nodes
+!		have DECnet Phase III, with routing.
+!
+! Author: Paul C. Anagnostopoulos, Creation Date: 18 November 1980
+!
+! Modified By:
+!
+!	V03-001	PCA0045		Paul Anagnostopoulos	26-Mar-1982
+!		Major changes to convert from process name to user name.
+!--
+
+%sbttl 'Module Declarations'
+!
+! Libraries and Requires:
+!
+
+library 'sys$library:starlet.l32';
+literal global_data = 1;		! To suppress generation of external
+require 'phonereq';			! data declarations.
+
+!
+! Table of Contents:
+!
+
+forward routine
+	phn$phone: novalue,
+	phn$init_main: novalue,
+	phn$dcl_command_line: novalue,
+	phn$queue_smb: novalue,
+	phn$kill_smb: novalue,
+	phn$prepare_users_target: novalue;
+
+!
+! External References:
+!
+
+external routine
+	cli$end_parse: addressing_mode(general),
+	cli$get_value: addressing_mode(general),
+	cli$present: addressing_mode(general),
+	lib$free_vm: addressing_mode(general),
+	lib$get_vm: addressing_mode(general),
+	ots$cvt_ti_l: addressing_mode(general),
+	phn$answered,
+	phn$busy,
+	phn$cmd_parse,
+	phn$exit_handler,
+	phn$facsimile2,
+	phn$forced_link,
+	phn$held,
+	phn$help2,
+	phn$hungup,
+	phn$init_slave,
+	phn$init_term,
+	phn$inform,
+	phn$kbd_get,
+	phn$kbd_route,
+	phn$directory2,
+	phn$listen,
+	phn$make_pub,
+	phn$mbx_enable,
+	phn$mbx_name,
+	phn$rang_in,
+	phn$rejected,
+	phn$ring_out,
+	phn$talk,
+	phn$unheld,
+	str$trim: addressing_mode(general);
+
+!
+! Own Variables:
+!
+
+! The following is the head of the SMB queue, which is only manipulated
+! by this module.
+
+own
+	smb_queue_head: vector[2,long]
+			initial(rep 2 of (smb_queue_head));
+
+!
+! Global Variables:
+!
+! The following declarations constitute all the global data for the facility.
+!
+! First we declare a buffer to hold our DECnet node name:
+
+global
+	own_described_buffer(phn$gq_node_name,9);
+
+! Next we declare the variables that will contain the command qualifiers:
+
+global
+	own_described_buffer(phn$gq_switch_hook,1),
+	phn$gl_viewport_size: long,
+	phn$gb_scroll: byte;
+
+! Now we declare the head of the PUB chain.
+
+global
+	phn$gq_pubhead: vector[2,long]
+			initial(rep 2 of (phn$gq_pubhead));
+
+! Finally, we have a byte of global flags necessary for controlling
+! screen dynamics.
+
+global
+	phn$gb_flags: byte
+		      initial(%b'00000000');
+
+%sbttl 'PHN$PHONE - Mainline Routine'
+!++
+! Functional Description:
+!	This is the main routine for the PHONE facility.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$phone: novalue = begin
+
+own
+	routine_table: vector[19,long] initial(
+		phn$kbd_get,
+		phn$kbd_route,
+		phn$cmd_parse,
+		phn$talk,
+		phn$help2,
+		phn$ring_out,
+		0,				! Network slave SMB only.
+		phn$rang_in,
+		phn$hungup,
+		phn$busy,
+		phn$answered,
+		phn$rejected,
+		0,				! Network slave SMB only.
+		phn$listen,
+		phn$directory2,
+		phn$facsimile2,
+		phn$forced_link,
+		phn$held,
+		phn$unheld);
+
+local
+	status: long,
+	s: ref smb;
+
+
+! The very first thing we do is find out if this VAX is running DECnet, and
+! set up a global buffer with the node name, or null string if not.
+! Eliminate any underscore in the name for prettiness.
+
+status = $trnlog(lognam=describe('SYS$NODE'),
+		 rsllen=phn$gq_node_name,
+		 rslbuf=phn$gq_node_name);
+if .status eqlu ss$_notran then
+	phn$gq_node_name[len] = 0
+else (
+	check (.status);
+	if ch$rchar(.phn$gq_node_name[ptr]) eqlu '_' then (
+		dec (phn$gq_node_name[len]);
+		inc (phn$gq_node_name[ptr]);
+	);
+);
+
+! It is possible that we have been fired up as a network slave for
+! someone on a remote node that wants to talk to someone on our node.
+! The following routine will check for this, and will never return
+! if it is the case.
+
+phn$init_slave();
+
+! I guess not.  Begin an interactive session by initializing.
+
+phn$init_main();
+
+! This is the main processing loop.  We wait for routines to put Steering
+! Message Blocks on the queue.  We then remove them one by one and call
+! the specified steering message routine, passing it the message text in
+! the block.  Whenever the queue empties, we go back to waiting.
+
+loop (
+
+	! Wait for an SMB to be placed on the queue.  There may already be one.
+
+	status = $clref(efn=phn$k_smbefn);
+	if .status nequ ss$_wasset then (
+		check (.status);
+		status = $waitfr(efn=phn$k_smbefn);
+		check (.status);
+	);
+
+	! We have at least one SMB.  Go into a loop removing them from the
+	! front of the queue.  When we empty the queue, go back and wait.
+
+	while not remque(.smb_queue_head[0],s) do (
+
+		! If the SMB type code is valid, call the appropriate
+		! steering message routine.  Pass it the message text
+		! descriptor, which it can clobber.
+
+		if (.s[smb_w_type] gequ 1) and
+		   (.s[smb_w_type] lequ %allocation(routine_table)/4) then
+
+			(.routine_table[.s[smb_w_type]-1]) (s[smb_q_msg])
+		else
+			phn$inform(phn$_badsmb);
+
+		! Get rid of the SMB.
+
+		phn$kill_smb(.s);
+	);
+);
+
+end;
+
+%sbttl 'PHN$INIT_MAIN - Initialize Our Wonderfullness'
+!++
+! Functional Description:
+!	This routine is called at the very beginning of execution
+!	to initialize everything.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$init_main: novalue = begin
+
+own
+	exit_status: long,
+	exit_control_block: vector[4,long]
+			initial(0,phn$exit_handler,1,exit_status);
+own
+	own_described_buffer(user_name,12);
+bind
+	get_name = uplit(word(12),word(jpi$_username),
+			 long(user_name+8),
+			 long(user_name),
+			 long(0));
+
+local
+	status: long,
+	op: ref pub;			! Pointer to our PUB.
+
+
+! We begin by obtaining our user name.
+
+status = $getjpi(efn=phn$k_getjpiefn,
+		 itmlst=get_name);
+check (.status);
+status = $waitfr(efn=phn$k_getjpiefn);
+check (.status);
+str$trim(user_name,user_name,user_name);
+
+! Now we can create a PUB to represent ourselves, known as "our PUB".  Our
+! PUB is always assumed to be the first one on the PUB chain.
+
+status = phn$make_pub(user_name,op);
+check (.status);
+op[pub_v_temporary] = false;
+
+! Now we have to assign ourselves to our receive mailbox, the mailbox that
+! other users will send us messages in.  The mailbox may already have been
+! created by some other user trying to call us, so first we try to assign
+! to it.
+
+begin
+local
+	local_described_buffer(mbx_name,4+16);
+
+phn$mbx_name(user_name,mbx_name);
+status = $assign(devnam=mbx_name,
+		 chan=op[pub_w_channel]);
+if .status nequ ss$_ivdevnam then
+	check (.status)
+else (
+	! Nope, our mailbox doesn't exist.  Try to create a permanent
+	! mailbox with the name.  Mark it for deletion so we don't leave
+	! crud around later.
+
+	status = $crembx(prmflg=1,
+			 chan=op[pub_w_channel],
+			 maxmsg=phn$k_mbxsize,
+			 lognam=mbx_name);
+	if .status nequ ss$_nopriv then (
+		check (.status);
+		status = $delmbx(chan=.op[pub_w_channel]);
+		check (.status);
+	) else (
+
+		! Too bad, we don't have the privilege to create a permanent
+		! mailbox.  Try to create a temporary one so the guy can at
+		! least talk to him/herself.
+
+		status = $crembx(prmflg=0,
+				 chan=op[pub_w_channel],
+				 maxmsg=phn$k_mbxsize,
+				 lognam=mbx_name);
+		check (.status);
+	);
+);
+end;
+
+! Now we can enable our mailbox, allowing an AST to be delivered when someone
+! sends us a message.  There may already be a message waiting.
+
+phn$mbx_enable();
+
+! Now we have to obtain the various goodies from the command line.  This is
+! done after enabling our mailbox so any messages from other people will be
+! handled before any subcommand included on the PHONE command.
+
+phn$dcl_command_line();
+
+! Finally we initialize the user's terminal.  This is done last so that
+! anything the user types will be handled after any subcommand included
+! on the PHONE command.
+
+status = phn$init_term();
+check (.status);
+
+! From this point on, we want to perform some clean-up if the user exits.
+
+status = $dclexh(desblk=exit_control_block);
+check (.status);
+
+return;
+
+end;
+
+%sbttl 'PHN$DCL_COMMAND_LINE - Get Command Line Goodies'
+!++
+! Functional Description:
+!	This routine is called to "parse the command line".  All the work
+!	has been done by DCL, but we need to use the callback mechanism
+!	to get the information.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$dcl_command_line: novalue = begin
+
+local
+	status: long;
+
+
+! First we get the switch hook character as specified by the qualifier.
+
+cli$get_value(describe('SWITCH_HOOK'),phn$gq_switch_hook);
+
+! Now we get the viewport size, as specified by the qualifier.  We have
+! to convert the value to binary and make sure it's within the valid range.
+
+begin
+local
+	local_described_buffer(size_buf,10);
+
+cli$get_value(describe('VIEWPORT_SIZE'),size_buf);
+status = ots$cvt_ti_l(size_buf,phn$gl_viewport_size,4,%b'11');
+if .status eqlu ss$_normal then
+	phn$gl_viewport_size = min(max(pub_k_minlines,.phn$gl_viewport_size),
+				       pub_k_maxlines)
+else
+	phn$gl_viewport_size = pub_k_maxlines;
+end;
+
+! Now we get the scroll flag, as specified by the qualifier.
+
+phn$gb_scroll = cli$present(describe('SCROLL'));
+
+! Now we have to retrieve the command line tokens.  If present, these
+! make up a phone command that we are to execute first.  Sit in a loop
+! and queue cmd_parse steering messages for each token.
+
+incru i from 1 to 4 do (
+
+	local
+		local_described_buffer(token_buf,80);
+
+	cli$get_value((case .i from 1 to 4 of set
+		       [1]:	describe('TOKEN1');
+		       [2]:	describe('TOKEN2');
+		       [3]:	describe('TOKEN3');
+		       [4]:	describe('TOKEN4');
+		       tes),				token_buf);
+	str$trim(token_buf,token_buf,token_buf);
+
+	if .token_buf[len] gequ 1 then (
+		phn$queue_smb(smb__cmd_parse,describe(' '));
+		phn$queue_smb(smb__cmd_parse,token_buf);
+	);
+);
+
+! Now we can queue a carriage return to end the command.  It doesn't hurt
+! if there wasn't a command.
+
+phn$queue_smb(smb__cmd_parse,describe(%char(ret)));
+
+return;
+
+end;
+
+%sbttl 'PHN$QUEUE_SMB - Queue a Steering Message Block'
+!++
+! Functional Description:
+!	This routine is called to create a Steering Message Block and
+!	queue in onto the SMB queue.
+!
+! Formal Parameters:
+!	type		The type code for the SMB.
+!	text		Address of descriptor of optional message text.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$queue_smb(type,text): novalue = begin
+
+bind
+	text_dsc = .text: descriptor;
+
+local
+	status: long,
+	smb_size: long,
+	s: ref smb;
+
+builtin
+	nullparameter;
+
+
+! We begin by calculating the total size of the SMB and allocating
+! memory for it.
+
+smb_size = smb_k_size + (if nullparameter(2) then 0
+				      else .text_dsc[len]);
+status = lib$get_vm(smb_size,s);
+check (.status);
+
+! Now we fill in the new SMB with its length, the message type code,
+! and the message text.  We also build a descriptor for the message text.
+
+s[smb_w_length] = .smb_size;
+s[smb_w_type] = .type;
+begin
+bind
+	smb_msg_dsc = s[smb_q_msg]: descriptor;
+
+if nullparameter(2) then
+	smb_msg_dsc[len] = 0
+else (
+	ch$move(.text_dsc[len],.text_dsc[ptr],s[smb_t_msgbuf]);
+	smb_msg_dsc[len] = .text_dsc[len];
+	smb_msg_dsc[ptr] = s[smb_t_msgbuf];
+);
+end;
+
+! Now we can queue the new SMB onto the end of the steering message queue.
+! If the queue was empty, make sure we set the event flag to awaken the
+! main loop.
+
+status = insque(.s,.smb_queue_head[1]);
+if .status eqlu 1 then
+	$setef(efn=phn$k_smbefn);
+
+return;
+
+end;
+
+%sbttl 'PHN$KILL_SMB - Kill an Obsolete SMB'
+!++
+! Functional Description:
+!	This routine is called to deallocate an obsolete Steering
+!	Message Block.
+!
+! Formal Parameters:
+!	obsolete_smb	Address of the obsolete SMB.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$kill_smb(obsolete_smb): novalue = begin
+
+bind
+	os = .obsolete_smb: smb;
+
+local
+	status: long,
+	smb_size: long;
+
+
+! All we have to do is get the length of the SMB and deallocate it.
+
+smb_size = .os[smb_w_length];
+status = lib$free_vm(smb_size,obsolete_smb);
+check (.status);
+return;
+
+end;
+
+%sbttl 'ANL$PREPARE_USERS_TARGET - Prepare Target Entered by User'
+!++
+! Functional Description:
+!	This routine is called to prepare a target entered by the user.
+!	It performs a logical name translation in case the user entered
+!	a logical name.  It also handles node names without the double colon.
+!
+! Formal Parameters:
+!	users		Address of descriptor of user's target.
+!	just_node	A flag, true if target is just a node name.
+!	final		Address of descriptor of buffer to receive final
+!			target.  We set the length.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$prepare_users_target(users,just_node,final): novalue = begin
+
+bind
+	users_dsc = .users: descriptor,
+	final_dsc = .final: descriptor;
+
+local
+	status: long;
+
+
+! First we try translating the user's target as if it were a logical name.
+! If that fails, we just move the target into the final buffer.
+
+status = $trnlog(lognam=users_dsc,
+		 rsllen=final_dsc[len],
+		 rslbuf=final_dsc);
+if .status eqlu ss$_ivlognam then (
+	final_dsc[len] = .users_dsc[len];
+	ch$move(.users_dsc[len],.users_dsc[ptr], .final_dsc[ptr]);
+) else
+	check (.status);
+
+! Now if this is supposed to be just a node name, the double colon is
+! optional.  Add it if we need to.
+
+if .just_node and .final_dsc[len] gtru 0 then
+	if ch$neq(2,.final_dsc[ptr]+.final_dsc[len]-2, 2,uplit byte ('::'),' ') then (
+		ch$move(2,uplit byte ('::'), .final_dsc[ptr]+.final_dsc[len]);
+		final_dsc[len] = .final_dsc[len] + 2;
+	);
+
+return;
+
+end;
+
+end eludom

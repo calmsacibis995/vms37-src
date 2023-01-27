@@ -1,0 +1,1156 @@
+	.TITLE	MOUNTVER - Mount Verification routines
+	.IDENT	'V03-001'
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; Facility:
+;
+;	Executive I/O system.
+;
+; Abstract:
+;
+;	This module contains most of the code necessary to implement
+;	mount verification.  Support routines not in this module are
+;	contained in other modules in the EXEC, notably IOSUBNPAG.
+;
+; Environment:
+;
+;	This code executes in KERNEL mode, at device IPL
+;	or higher, and the code must therefore be resident.
+;
+; Author:
+;
+;	Steven T. Jeffreys
+;
+; Creation date:
+;
+;	June 10, 1981
+;
+; Update history:
+;
+;
+;	V03-001	STJ0230		Steven T. Jeffreys	22-Mar-1982
+;		- Clear MVIRP bit in IRP when starting offline verification.
+;
+;	V02-009	STJ0210		Steven T. Jeffreys	10-Feb-1982
+;		Correct link-time truncation errors that resulted from
+;		the growth of the system image.
+;
+;	V02-008	BLS0144		Benn Schreiber		 6-Feb-1982
+;		Correct link-time truncation error
+;
+;	V02-007	STJ0168		Steven T. Jeffreys,	06-Jan-1982
+;		- Check the VCB$V_MOUNTVER bit to ensure that the volume
+;		  is a candidate for mount verification.
+;		- Change the console message format to conform to the
+;		  system message convention.
+;		- Notify operator when mount verification completes.
+;
+;	V02-006	STJ0146		Steven T. Jeffreys,	26-Oct-1981
+;		- Enhance the SEND_MESSAGE routine to enable it to
+;		  broadcast a message directly to the console terminal.
+;		- Define the console messages.
+;		- Define the message type and text table.
+;
+;	V02-005	STJ0133		Steven T. Jeffreys,	23-Oct-1981
+;		- Fix bugs found by inspection.
+;		- Created the TIME_DELAY subroutine.
+;		- Removed the GETIRP subroutine
+;
+;	V02-004	STJ0128		Steven T. Jeffreys,	14-Oct-1981
+;		No longer set IRP$V_PHYSIO for homeblock reads.
+;
+;	V02-003	STJ0102		Steven T. Jeffreys
+;		- Correct an erroneous reference to the MVIRP bit.
+;		- Take advantage of some changes to the UCB and DDT
+;		  that will allow some code to be simplified.
+;
+; 	V02-002	STJ0084		Steven T. Jeffreys
+;		Fix bug that causes multiple requeing of I/O packets
+;		to the UCB's work queue.
+;
+;--
+
+	.PAGE
+	.SBTTL	Declarations
+;
+; Macro definitions
+;
+	$CADEF				; Define conditional assembly symbols
+	$DDBDEF				; Define Device Data Block fields
+	$DDTDEF				; Define Driver Dispatch Table fields
+	$DEVDEF				; Define device characteristics bits
+	$DYNDEF				; Define block type symbols
+	$HM1DEF				; Define ODS-1 home block fields
+	$HM2DEF				; Define ODS-2 home block fields
+	$IODEF				; Define I/O function codes
+	$IRPDEF				; Define I/O Request Packet fields
+	$MSGDEF				; Define system message type codes
+	$PTEDEF				; Define Page Table Entry fields
+	$SSDEF				; Define system status codes
+	$UCBDEF				; Define Unit Control Block fields
+	$VCBDEF				; Define Volume Control Block fields
+
+;+
+; Define a macro to build a table of message identifiers.
+; Note that the WMOUNTVERMSG psect must reside in the nonpaged
+; portion of the exec.  The psect name was chosen so that would
+; be linked in immediately following WIONONPAGED, although this
+; is not essential.
+;
+; Input:
+;
+;	MSG_NAME	: A symbol that will be defined as the index into the
+;			  message identification table for this message.
+;	OPCOM_MSG_NUM	: The system message number of the corresponding OPCOM
+;			  message.
+;	NOSUFFIX	: True or false.  if present, then do not include the
+;			  suffix with the formatted message.  By default the
+;			  suffix is included.
+;	MSG_TEXT	: The actual message text.  It must be delimited.
+;-
+
+	.MACRO	BUILD_TABLE	MSG_NAME,OPCOM_MSG_NUM,NOSUFFIX,MSG_TEXT,?L1
+	.IF	NDF,TABLE_INDEX
+	TABLE_INDEX = 0
+	.ENDC
+	.ENABLE LSB
+	.PSECT	WMOUNTVERMSG
+L1:	.ASCID	MSG_TEXT
+	.PSECT	WIONONPAGED
+	.WORD	OPCOM_MSG_NUM
+	.IF	B,NOSUFFIX
+	.WORD	0			; Include suffix
+	.IFF
+	.WORD	1			; Do not include suffix
+	.ENDC
+	.ADDRESS L1
+	.DISABLE LSB
+	MSG_NAME = TABLE_INDEX
+	TABLE_INDEX = TABLE_INDEX + 1
+	.ENDM	BUILD_TABLE
+;
+; Own storage (read only)
+;
+
+	.PSECT	WIONONPAGED
+MSG_TABLE:				; Starting address of message table.
+	BUILD_TABLE	OFFLINE,MSG$_DEVOFFLINX,,<" is offline.">
+	BUILD_TABLE	WRONGVOL,MSG$_WRONGVOL,,<" contains the wrong volume.">
+	BUILD_TABLE	WRITELOCK,MSG$_DEVWRTLCK,,<" has been write-locked.">
+	BUILD_TABLE	MVCOMPLETE,MSG$_MVCOMPLETE,1,<" has completed mount verification.">
+	BUILD_TABLE	MVABORTED,MSG$_MVABORTED,1,<" has aborted mount verification.">
+;
+; The following message text is part of every message, and does not
+; require an entry in the message table.
+;
+
+	.PSECT	WMOUNTVERMSG
+PREFIX:	.ASCIC	"%SYSTEM-I-MOUNTVER, "  
+SUFFIX:	.ASCIC	"  Mount verification in progress."
+
+;
+; The following literal is used as carriage control
+; in the message sent to the operator's console.  
+;
+CAR_CTRL	= ^X0A0D		; <cr><lf> characters
+CAR_CTRL_SIZE	= 2			; Size in bytes
+	.PAGE
+	.SBTTL	EXE$MOUNTVER - initial entry point
+;++
+; EXE$MOUNTVER
+;
+; Functional description:
+;
+;	Mount verification is the mechanism whereby Files-11 volumes are
+;	are brought back online after a catastrophic (but hopefully transient)
+;	hardware problem has rendered the volume unusable.
+;
+;	This is the main routine, and initial entry point of the
+;	mount verification code.  For a detailed discussion of
+;	the implementation, please see the section entitled "Design Notes".
+;
+; Input:
+;
+;	R0,R1	 = I/O status
+;	R2	 = scratch
+;	R3	 = IRP address
+;	R4	 = scratch
+;	R5	 = UCB address
+;	0(SP)	 = return address of caller
+;       4(SP)	 = return address of caller's caller
+;
+; Output:
+;
+;	None.
+;
+; Side Effects:
+;
+;	Providing that whatever external event has caused a given
+;	volume to undergo mount verification has been corrected,
+;	normal I/O activity will resume on the device.  Otherwise,
+;	the volume will do no useful work until mount verification
+;	is complete, and will appear to be hung.
+;
+; Design Notes:
+;
+;	Mount verification (MV for short) is only done for FILES-11
+;	disk volumes.  Tapes are already covered by the magnetic
+;	tape ACP, and handling foreign disk volumes would open a
+;	security hole that would be difficult to close.
+;
+;	There are two error conditions that can cause a volume to
+;	undergo mount verification.  The first arises when a volume
+;	is somehow hardware writelocked sometime after it was mount
+;	write-enabled.  (The writelock recovery mechanism is covered
+;	in detail in the funtional description of the WRITLCK_HNDLR
+;	routine, and will not be covered here.)
+;
+;	The second, and more serious, situation is the result of the 
+;	volume being declared software invalid.  The volume-valid
+;	bit in the volume's UCB is cleared by the driver when it
+;	detects a situation that warrants such action, such as the
+;	device issuing an ONLINE interrupt.  This implies that the
+;	volume has been spun down, and then spun back up, so the
+;	contents of the drive may not be the same.  It is MV's task
+;	to notify the operator of the situation, and to verify that
+;	the volume (if any) now in the drive is the same one that
+;	was there originally.
+;
+;	What follows is a series of one-liners and short paragraphs
+;	that are meant to explain various design decisions, and
+;	to explain obscure parts of the code.  There is no particular
+;	order to the notes.
+;
+;	The blackhole page was used as the home block read buffer
+;	because it is guarranteed to be resident and available.
+;	Since I/O requests tend to pile up as MV proceeds, pool
+;	will become scarcer, and it may not be possible to allocate
+;	a 512 byte piece of pool.
+;
+;	Broadcasting a message directly to the operator's console
+;	is done to ensure that someone is notified of MV being in
+;	progess.  OPCOM cannot be relied on since it may not be
+;	present, or the very nature of the problem may prevent it
+;	from operating (eg.  OPCOM is swapped out, and the system
+;	disk is undergoing MV).
+;
+;	The code is optimized for size over speed, since the code
+;	is infrequently executed, but must be resident.
+;
+;	Once MV starts, normal I/O activity on the device ceases until
+;	MV completes or the volume is dismounted.  Unfortunately, there
+;	is a deadlock problem with the ACP, because to dismount a volume
+;	an ACP I/O request must be done to the volume, and that can't
+;	happen since we're in MV, so the ACP hangs waiting for the I/O
+;	to complete.  Worse, requests will pile up at the ACP, and
+;	other processes will be hung by the hung ACP.  The situation
+;	clears itself up nicely when MV completes.
+;
+;	MV consists of the code in this module, support routines in
+;	other modules, and a driver-dependent piece of code that
+;	is pointed to by the driver's DDT.  The covention is that
+;	if R3 is nonzero, the routine should assume that R3 points
+;	to an IRP and requeue the IRP.  If R3 is zero, dequeue the
+;	first IRP and resume normal I/O activity.  The cell in the
+;	DDT is DDT$L_MNTVER, and it defaults to IOC$MNTVER.
+;
+;	The cell EXE$GL_SVAPTE maps the blackhole page into S0 space,
+;	and is set up by INIT at system boot time.
+;
+;	MV is entered by the common I/O completion routine, IOC$REQCOM.
+;	This may be different for DISK_CLASS drivers.
+;--
+	.PAGE
+	.PSECT	WIONONPAGED
+
+EXE$MOUNTVER::				; Initial entry point
+;
+; Determine if mount verification is possible and necessary.
+;
+	;
+	; The device must be file oriented, and contain a mounted
+	; volume that is not mounted /FOREIGN.  In addition, the volume
+	; must have a VCB with the 
+	;
+	BBC	#DEV$V_MNT,-		; Branch if device not mounted
+		UCB$L_DEVCHAR(R5),10$	;
+	BBC	#DEV$V_FOD,-		; Branch if device not file oriented
+		UCB$L_DEVCHAR(R5),10$	;
+	BITL	#<DEV$M_FOR!DEV$M_SQD>,-; Is this a foreign or sequential device?
+		UCB$L_DEVCHAR(R5)	;
+	BNEQ	10$			; Branch if either is true
+	;
+	; Check the VCB$V_MOUNTVER bit to ensure the volume
+	; is a candidate for mount verification.
+	;
+	MOVL	UCB$L_VCB(R5),R4	; Get the VCB address
+	BEQL	10$			; Exit if none
+	BBC	#VCB$V_MOUNTVER,-	; Exit if bit not set
+		VCB$B_STATUS2(R4),10$	;
+	;
+	; If the medium is offline, or the volume is
+	; invalid, the error can be recovered from.
+	;
+	CMPW	#SS$_MEDOFL,R0		; Is the media (disk volume) offline?
+	BEQL	20$			; Branch if true
+	CMPW	#SS$_VOLINV,R0		; Is the volume invalid?
+	BEQL	20$			; Branch if true
+	;
+	; If the volume has been writelocked, make sure that it was
+	; an accidental writelock.  If the software writelock bit is
+	; on, then the volume was mounted with the volume write protected.
+	; If the bit is not set, then the volume has been mounted for
+	; read/write access, and has since been (accidentally) write protected.
+	;
+	CMPW	#SS$_WRITLCK,R0		; Is the device writelocked?
+	BNEQ	10$			; Branch if not
+	BBS	#DEV$V_SWL,-		; Branch if software writelocked
+		UCB$L_DEVCHAR(R5),10$	;
+	BRW	WRITLCK_HNDLR		; Recover from accidental writelock
+10$:	RSB				; Mount verifcation is not called for - exit
+;
+; Make sure that this IRP is not one of ours.
+;
+20$:	CMPL	#END_IO,IRP$L_PID(R3)	; Is this a hand-crafted IRP?
+	BEQL	10$			; Branch if it was
+	BBCC	#IRP$V_MVIRP,-		; Clear the MV bit in the IRP
+		IRP$W_STS(R3),30$	;
+;
+; The error can be recovered from.
+;
+30$:	BSBW	CLEANUP_IO		; Clean up the I/O operation
+	;
+	; Perform any driver-specific initialization for mount verification.
+	; R5 points to the device UCB, and R3 points to the IRP.
+	;
+	BSBW	DRIVER_CODE
+	TSTL	(SP)+			; Discard the return address
+	BBSS	#UCB$V_MNTVERIP,-	; Set mount verification in progress
+		UCB$W_STS(R5),10$	; (return to caller's caller if already set)
+;
+; Inform interested parties that the device needs attention.
+;
+	MOVL	#OFFLINE,R4		; Set message code
+	BSBW	SEND_MESSAGE		; Send message
+;
+; Allocate an IRP.  If non exists, exit.
+;
+	MOVZWL	#IRP$K_LENGTH,R1	; Set IRP size
+	BSBW	EXE$ALONONPAGED		; Allocate an IRP
+	MOVL	R2,R3			; Copy IRP address
+	BLBS	R0,40$			; Branch if success
+	BRW	ERROR_EXIT		; Exit if no IRP available
+;
+; Calculate the maximum time for which we will
+; continue to attempt mount verification.  Store
+; the value in the IRP.
+;
+40$:	MOVZWL	G^IOC$GW_MVTIMEOUT,R0	; Get delta time
+	ADDL3	G^EXE$GL_ABSTIM,R0,-	; Add site-specific delta time to current time
+		IRP$L_ASTPRM(R3)	; Fall through...
+		
+BUILD_PACKACK_IRP:
+	BSBW	INIT_IRP		; Set request-independent fields in the IRP
+	;
+	; Determine if the device supports a PACKACK function.
+	; If it does, then issue a PACKACK request, else attempt
+	; to read the volume's home block.
+	;
+	BBSS	#UCB$V_VALID,-		; Set volume valid
+		UCB$W_STS(R5),10$	;
+10$:	MOVL	UCB$L_DDT(R5),R1	; Get address of DDT
+	MOVL	DDT$L_FDT(R1),R1	; Get address of FDT masks
+	BBC	#IO$_PACKACK,(R1),-	; Branch if PACKACK not supported
+		BUILD_RDHOME_IRP	;
+	;
+	; Set the request dependent fields in the IRP and start the I/O.
+	;
+20$:	ASSUME	IO$_PHYSICAL GE IO$_PACKACK
+	MOVW	#<IRP$M_PHYSIO	! -	; Set physical I/O function
+		  IRP$M_MVIRP>,-	; Mark this a mount verification IRP
+		IRP$W_STS(R3)		;
+	MOVW	#<IO$_PACKACK ! IO$M_INHERLOG>,-
+		IRP$W_FUNC(R3)		; Set function code, inhibit error logging
+	BSBW	START_IO		; Start I/O request
+;
+; When the PACKACK I/O is done, control returns here.
+;
+	BLBS	IRP$L_MEDIA(R3),-	; Branch if success, otherwise try again
+		BUILD_RDHOME_IRP	;
+
+PAUSE:	;
+	; Check the VCB$V_MOUNTVER bit to ensure the volume
+	; is still a candidate for mount verification.  If
+	; so, wait for a little while.
+	;
+	MOVL	UCB$L_VCB(R5),R0	; Get the VCB address
+	BEQL	20$			; Exit if none
+	BBC	#VCB$V_MOUNTVER,-	; Exit if bit not set
+		VCB$B_STATUS2(R0),20$	;
+	CMPL	G^EXE$GL_ABSTIM,-	; Have we run out of time?
+		IRP$L_ASTPRM(R3)	;
+	BLSS	10$			; Branch if we still have time
+	BICB	#<1@VCB$V_MOUNTVER>,-	; Out of time -- disable MV
+		VCB$B_STATUS2(R0)	;
+	BRB	20$			; Exit
+10$:	BSBW	TIME_DELAY		; Pause for a bit
+	BRB	BUILD_PACKACK_IRP	; Retry the packack
+20$:	BRW	ERROR_EXIT		; Exit
+;
+; Build an IRP to read the volume's home block.  The read operation
+; will also require a 1 page (512 byte) buffer.  The BLAKHOLE page
+; is used.
+;
+BUILD_RDHOME_IRP:
+	BSBW	INIT_IRP		; Reset the IRP to its initial state
+	ASSUME	IO$_PHYSICAL GE IO$_READPBLK
+	BISW	#<IRP$M_FUNC	! -	; Set READ I/O
+		IRP$M_MVIRP>,-		; Set mount verification I/O
+		IRP$W_STS(R3)		;
+	MOVW	#<IO$_READPBLK!IO$M_INHERLOG>,-	; Set function code
+		IRP$W_FUNC(R3)		;
+	MOVL	G^EXE$GL_SVAPTE,-	; Copy SVAPTE for the read buffer
+		IRP$L_SVAPTE(R3)	;
+	MOVW	#512,IRP$W_BCNT(R3)	; Set I/O transfer count
+	;
+	; Get the VCB address from the UCB, and get the homeblock
+	; LBN from the VCB.  Convert the LBN to a physical disk address
+	; and store it in the IRP.
+	;
+	MOVL	UCB$L_VCB(R5),R0	; Get VCB address
+	BEQL	ERROR_EXIT		; Branch if no VCB
+	MOVL	VCB$L_HOMELBN(R0),R0	; Get home block LBN
+	BSBW	IOC$CVTLOGPHY		; Calcuate and store disk address
+	BSBB	GET_BUFFER		; Get I/O buffer
+	BSBW	START_IO		; Start I/O request
+;
+; When the RDHOME I/O completes, control returns here.
+;
+	BLBS	IRP$L_MEDIA(R3),10$	; Branch if success (and clean stack)
+	BSBB	FREE_BUFFER		; Release the I/O buffer
+	BRB	RDHOME_FAILED		; Rejoin the common error path
+	;
+	; Validate the data in the home block and then
+	; check to see if this is the same volume as
+	; the one described in the VCB.
+	;
+10$:	BSBW	VALIDATE_VOLUME		; Do lots of things
+	BSBB	FREE_BUFFER		; Release the I/O buffer
+	BLBC	R0,RDHOME_FAILED	; Branch if error
+	MOVL	#MVCOMPLETE,R4		; Set message code
+	BSBW	SEND_MESSAGE		; Send message to console
+	;
+	; The mount verification has successfully completed.
+	; Drop through to the normal exit code.
+	;	
+;
+; This is the common exit path for mount verification.
+; Return all resources, clear MNTVERIP, and resume normal
+; I/O activity for the device.
+;
+NORMAL_EXIT:
+	MOVL	R3,R0			; Copy IRP address
+	BSBW	COM$DRVDEALMEM		; Deallocate the IRP
+	BICW	#<UCB$M_MNTVERIP ! -	; Clear MNTVERIP and WRONGVOL
+		  UCB$M_WRONGVOL>, -	;
+		UCB$W_STS(R5)		;
+	CLRL	R3			; Clear pointer to IRP
+	BSBW	DRIVER_CODE		; Do driver-specific clean-up
+	RSB				; Exit
+;
+; Attempt to recover from an error encountered while reading
+; the home block or while validating the volume.
+;
+RDHOME_FAILED:				; Attempt to recover from a read error
+	CMPW	#SS$_INCVOLLABEL,R0	; Is this the correct volume?
+	BEQL	20$			; Branch if not
+	BBSC	#UCB$V_WRONGVOL,-	; Clear WRONGVOL bit
+		UCB$W_STS(R5),10$	;
+10$:	BRW	PAUSE			; Retry mount verification
+	;
+	; The wrong volume is in the drive.  If this is the first time
+	; for this volume, inform all interested parties of the event.
+	;
+20$:	BBSS	#UCB$V_WRONGVOL,-	; Branch if not the first time
+		UCB$W_STS(R5),10$	;
+	MOVL	#WRONGVOL,R4		; Set message code
+	BSBW	SEND_MESSAGE		; Send message to console
+	BRB	10$			; Try again
+;
+; This is the error exit path for mount verification.
+; Since the operation never completed, clear volume valid
+; to prevent the volume from being used.
+;
+ERROR_EXIT:
+	MOVL	#MVABORTED,R4		; Set message code
+	BSBW	SEND_MESSAGE		; Send message to console
+	BBCC	#UCB$V_VALID,-		; Clear volume valid and join common code
+		UCB$W_STS(R5),-		;
+		NORMAL_EXIT		;
+	BRB	NORMAL_EXIT		; Branch to common exit code
+
+	.PAGE
+	.SBTTL	GET_BLAKHOLE - allocate the blakhole page
+;++
+; GET_BUFFER
+;
+; Functional description:
+;
+;	This routine will attempt to allocate the blakhole page
+;	for to the caller.  If the page is not busy, the page is
+;	marked busy and control returns to the caller.  If the page
+;	is busy, the caller's context is folded up into a fork block,
+;	and the fork block is put on the blakhole page wait queue.
+;
+; Input:
+;
+;	R5	= Device UCB address (doubles as fork block address)
+;      4(SP)	= Return address of caller
+;
+; Output:
+;
+;	R3..R5	are preserved.
+;++
+
+GET_BUFFER:				; Allocate a 512 byte buffer
+	BBSS	S^#EXE$V_BLKHOLBSY,-	; Mark the blackhole page busy and
+		G^EXE$GL_SYSFLAGS,10$	; branch if it already was.
+	RSB				; Return to caller
+	;
+	; The page is busy. Put the caller in the wait queue.
+	;
+10$:	MOVQ	R3,UCB$L_FR3(R5)	; Save R3 and R4
+	POPL	UCB$L_FPC(R5)		; Save return address
+	INSQUE	(R5),@L^EXE$GQ_BLKHOLWQ+4 ; Put the UCB in the wait queue.
+	RSB				; Return to caller's caller
+	.PAGE
+	.SBTTL	FREE_BUFFER - release an I/O buffer
+;++
+; FREE_BUFFER
+;
+; Functional description:
+;
+;	This routine is called by the current owner of the blakhole page
+;	to make the page available.  If the blakhole page wait queue is
+;	not empty, a fork process will be created for the waiting device,
+;	and the blakhole page will be given to that process.
+; 
+; Input:
+;
+;	R5	= UCB address
+;
+; Output:
+;
+;	R3..R5	are preserved
+;--
+
+FREE_BUFFER:				; Release an I/O buffer
+	;
+	; Remove first entry from wait queue.  If empty, then return.
+	;
+	REMQUE	@L^EXE$GQ_BLKHOLWQ,R1	; Remove first entry from wait queue
+	BVC	20$			; Branch if somebody was waiting
+	BBCC	#EXE$V_BLKHOLBSY,-	; Mark blakhole page idle
+		G^EXE$GL_SYSFLAGS,10$	;
+10$:	RSB				; Return
+	;
+	; Restore the waiting fork process's context
+	; and call it at its return address.
+	;
+20$:	PUSHR	#^M<R3,R4,R5>		; Save current fork context
+	MOVL	R1,R5			; Copy UCB address
+	MOVQ	UCB$L_FR3(R5),R3	; Restore R3 and R4
+	JSB	@UCB$L_FPC(R5)		; Call waiting fork process
+	POPR	#^M<R3,R4,R5>		; Restore fork context
+	RSB				; Return
+	.PAGE
+	.SBTTL	Put device into a wait state
+;+
+; TIME_DELAY
+;
+; Functional description:
+;
+;	This routine will put the specified device into a wait
+;	state for a short while.  This is accomplished by using
+;	the driver timeout mechansim.  After waiting, return to
+;	the caller.
+;
+; Input:
+;
+;	R5 = device ucb address
+;	R0 .. R4 are scratch registers
+;
+; Output:
+;
+;	None.
+;-
+
+WAIT_TIME = 2				; # of seconds to wait
+
+TIME_DELAY:				; Pause for a moment
+	BICW	#<UCB$M_TIMOUT ! -	; Clear status bits.  This includes:
+		  UCB$M_POWER  ! -	;	Timeout occurred
+		  UCB$M_INT>,-		;	Powerfail occurred
+		UCB$W_STS(R5)		;	Interrupt expected
+	MOVL	R3,UCB$L_FR3(R5)	; Save R3
+	POPL	UCB$L_FR4(R5)		; Save return address
+	MOVAB	B^30$,UCB$L_FPC(R5)	; Set timeout return address
+	BISW	#UCB$M_TIM,UCB$W_STS(R5); Enable device timeout
+	ADDL3	#WAIT_TIME,-		; Calculate and save due time
+		L^EXE$GL_ABSTIM,-	;
+		UCB$L_DUETIM(R5)	;
+	RSB				; Return to caller's caller
+	.WORD	30$ - .			; Byte displacement to timeout handler
+	;
+	; Control returns here when the timeout occurs.
+	;
+30$:	BICW	#<UCB$M_TIMOUT ! -	; Clear timeout and powerfail bits
+		  UCB$M_POWER>,-	;
+		UCB$W_STS(R5)		;
+	MOVQ	UCB$L_FR3(R5),R3	; Restore R3 and R4
+	FORK				; Create a fork process
+	JMP	(R4)			; Return to caller
+	.PAGE
+	.SBTTL	INIT_IRP - set request independent fields of the IRP
+;++
+; INIT_IRP
+;
+; Functional description:
+;
+;	Zero an IRP and then set certain request-independent
+;	fields to their initial values.
+;
+; Input:
+;
+;	R3	= IRP address
+;	R5	= UCB address
+;
+; Output:
+;
+;	R0,R1,R2,R4  are overwritten
+;	R3	= IRP address
+;	R5  	= UCB address
+;--
+
+INIT_IRP:				; Set request-independent fields of IRP
+;
+; Zero the IRP.
+;
+	PUSHL	IRP$L_ASTPRM(R3)	; Save the MV timeout time
+	PUSHR	#^M<R3,R5>		; Save IRP and UCB address from MOVC5
+	MOVC5	#0,(R0),#0,#IRP$C_LENGTH,(R3)	; Zero the IRP
+	POPR	#^M<R3,R5>		; Restore IRP and UCB address
+	POPL	IRP$L_ASTPRM(R3)	; Restore the MV timeout time
+;
+; Set the request-independent fields of the IRP.
+;
+	MOVL	R3,R4			; Copy the IRP address
+	;
+	; Initialize the IRP list head.
+	;
+	ASSUME	IRP$L_IOQFL EQ 0
+	ASSUME	IRP$L_IOQBL EQ 4
+	MOVQ	R3,(R4)+		; Init IRP list head and increment R4
+	;
+	; Set the size, type and access mode fields.
+	;
+	ASSUME	IRP$W_SIZE  EQ 8
+	ASSUME	IRP$B_TYPE  EQ 10
+	ASSUME	IRP$B_RMOD  EQ 11
+	MOVL	#<<DYN$C_IRP@16>!IRP$C_LENGTH>,(R4)
+	;
+	; Set the UCB address.  All other fields remain zero for now.
+	;
+	MOVL	R5,IRP$L_UCB(R3)	; Set UCB address
+	RSB
+	.PAGE
+	.SBTTL	VALIDATE_VOLUME
+;++
+; VALIDATE_VOLUME
+;
+;	This routine will check to see if the home block that was just
+;	read contains valid data, and if so it will check to see if the
+;	home block belongs to same volume as the one described in the
+;	VCB for this device.  If both checks succeed, return success.
+;	If either check fails, return failure.
+;
+; Input:
+;
+;	R3	= IRP address
+;	R5	= UCB address
+;
+; Output:
+;
+;	R3 and R5 are preserved.
+;	R0 = 1 if success, 0 if an error condition was detected
+;
+; Side effects:
+;
+;	If the volume now physicaly mounted in the device is not
+;	the same volume as the one described in the VCB, then the
+;	interested parties will be informed, and the mount verification
+;	will be restarted.
+;--
+
+VALIDATE_VOLUME:
+	;
+	; Create a virtual address to access the I/O buffer.
+	;
+	SUBL3	G^MMG$GL_SPTBASE,-	; Calculate byte offset to SPT
+		G^EXE$GL_SVAPTE,R4	;
+	ASHL	#7,R4,R4		; Shift to create virtual address
+	BBSS	#PTE$V_VALID,R4,10$	; Set high bit to make it a system address
+	;
+	; Compare the volume serial number and volume name in the VCB
+	; with those stored on the stack.  If they are identical, then
+	; this is the correct volume.  The following assumptions must
+	; be true if we are to avoid special-casing ODS-1 and ODS-2 volumes.
+	;
+	ASSUME	HM2$L_SERIALNUM EQ HM1$L_SERIALNUM
+	ASSUME	HM2$T_VOLNAME	EQ HM1$T_VOLNAME2
+	;
+	MOVL	UCB$L_VCB(R5),R2	; Get VCB address
+	CMPL	HM2$L_SERIALNUM(R4),-	; Check volume serial number
+		VCB$L_SERIALNUM(R2)	;
+	BNEQ	10$			; Branch if not equal
+	PUSHR	#^M<R3,R4,R5>		; Save registers
+	CMPC3	#12,VCB$T_VOLNAME(R2),-	; Check volume name
+		HM2$T_VOLNAME(R4)	;
+	POPR	#^M<R3,R4,R5>		; Restore registers
+	BNEQ	10$			; Branch if not same volume
+	BSBB	CHECKSUM		; Checksum the home block
+	BLBC	R0,13$			; Branch if checksums do not agree
+13$:	RSB
+;
+; It seems that the volume mounted in the device is not the same as the
+; volume described in the VCB.  If the home block checksum agrees with
+; the calculated checksum, then the volumes truly are different.  If the
+; checksums do not agree, then the perceived difference between the volumes
+; could be due to a corrupted home block, or some device activity on the
+; blakhole page.  In any case, the read operation will have to be retried.
+;
+10$:	BSBB	CHECKSUM		; Checksum the home block
+	BLBC	R0,13$			; The checksums do not compare
+;
+; The volumes are different.  Return an approptiate status code.
+;
+	MOVZWL	#SS$_INCVOLLABEL,R0	; Set return status
+	RSB				; Return
+	.PAGE
+	.SBTTL	CHECKSUM - compute the home block checksum
+;++
+; CHECKSUM
+;
+; Functional description:
+;
+;	This routine will calculate the home block checksum
+;	and compare the calculated checksum against the checksum
+;	stored in the home block.  If the checksums are equal,
+;	return a success status.
+;
+; Input:
+;
+;	R4	= home block buffer address
+;
+; Ouput:
+;
+;	R0	= status value
+;	R3 and R5 are preserved
+;--
+
+CHECKSUM:				; Compute home block checksum
+	;
+	; Note that the home block checksum is stored in the last
+	; word of the home block.  After the checksum loop completes,
+	; R3 points to the stored checksum, and R1 contains the
+	; calculated checksum.  The following assumptions must be
+	; true for this technique to work.
+	;
+	ASSUME	HM2$W_CHECKSUM2 EQ HM1$W_CHECKSUM2
+	ASSUME	HM2$W_CHECKSUM2/2 EQ 255
+	;
+	CLRQ	R0			; Assume failure; clear total
+	MOVZBL	#255,R2			; Set loop counter
+10$:	ADDW2	(R4)+,R1		; Sum adjacent words
+	SOBGTR	R2,10$			; Branch if more to go
+	CMPW	R1,(R4)			; Compare checksums
+	BNEQ	13$			; Branch if not equal
+	INCL	R0			; Set success status
+13$:	RSB				; Return
+	.PAGE
+	.SBTTL	START_IO
+;++
+; START_IO
+;
+; Functional description:
+;
+;	This routine is called to initiate an I/O to a device.  The
+;	request is packed in an 'internal' IRP.  This means that the
+;	PID field of the IRP contains the address of a routine to be
+;	called by IOPOST to finish processing the I/O request.  Note
+;	that the PID field will be set to the address of a generic
+;	post-processor, which will in turn branch to the actual post
+;	processing routine.
+;
+; Input:
+;
+;	R0,R1,R2,R4 are scratch registers
+;	R3	= IRP address
+;	R5	= UCB address
+;	 (SP)	= address of action routine to post-process the I/O
+;
+; Output:
+;
+;	None.
+;--
+
+START_IO:				; Start an internal I/O request
+	MOVAB	B^END_IO,IRP$L_PID(R3)	; Set I/O post address
+	POPL	IRP$L_AST(R3)		; Set action routine address
+					; Note that the stack is now clean.
+	;
+	; Begin optional I/O performance measurement.
+	;
+	.IF	DF	CA$_MEASURE_IOT
+	JSB	PMS$START_RQ		; Start I/O request measurement
+	.ENDC
+
+	BRW	IOC$INITIATE		; Start the I/O immediately
+	.PAGE
+	.SBTTL	END_IO
+;++
+; END_IO
+;
+; Functional description:
+;
+;	This routine performs some common I/O post-processing
+;	before dispatching to the specific post-processing routine,
+;	whose address is stored in IRP$L_AST(R3).  This routine is
+;	called by IOPOST, at IPL 4, so it is necessary to get into
+;	the proper driver fork context before continuing.
+;
+; Input:
+;
+;	R5	= IRP address
+;	IPL	= IPL$_POST
+;
+; Output:
+;
+;	R5	= UCB address
+;	R3	= IRP address
+;
+;--
+
+END_IO:					; End of I/O request
+	;
+	; Complete I/O performance measurement.
+	;
+	.IF	DF	CA$_MEASURE_IOT
+	JSB	PMS$END_RQ		; Gather performance data
+	.ENDC
+	;
+	MOVL	R5,R3			; Copy IRP addres
+	MOVL	IRP$L_UCB(R3),R5	; Get UCB address
+	DSBINT	UCB$B_FIPL(R5)		; Raise IPL to driver FORK level
+	JSB	@IRP$L_AST(R3)		; Dispatch to post processing routine
+	ENBINT				; Restore IPL
+	RSB				; Return
+	.PAGE
+	.SBTTL	CLEANUP_IO
+;++
+; CLEANUP_IO
+;
+; Functional description:
+;
+;	This routine is called to perform any necessary cleanup on the
+;	I/O request that has come into the main entry point of mount
+;	verification.
+;
+; Input:
+;
+;	R0,R1	= Status of the I/O operation
+;	R3	= IRP address
+;	R5	= UCB address
+;
+; Output:
+;
+;	All registers are preserved.
+;--
+
+CLEANUP_IO:				; Finish processing an I/O packet
+	;
+	; If I/O performance measurement is enabled, call the proper routine
+	; to gather the performance data.  Note that the performance routine
+	; assumes that IRP$L_MEDIA and IRP$L_MEDIA+4 contain the I/O status.
+	; However, these longwords currently contain some information that will
+	; be needed to later restart the request.  Therefore, the contents of
+	; IRP$L_MEDIA and IRP$L_MEDIA+4 must be saved and later restored.
+	;
+	.IF	DF	CA$_MEASURE_IOT
+	MOVQ	IRP$L_MEDIA(R3),-(SP)	; Save info from IRP
+	MOVQ	R0,IRP$L_MEDIA(R3)	; Set I/O status
+	JSB	G^PMS$END_IO		; Take performance measurement
+	MOVQ	(SP)+,IRP$L_MEDIA(R3)	; Restore info to IRP
+	.ENDC
+	RSB				; Return
+	.PAGE
+	.SBTTL	DRIVER_CODE - Driver specific code
+;++
+; DRIVER_CODE
+;
+; Functional description:
+;
+;	This routine will call the driver specific routine that is necessary
+;	to begin and end mount verification.  The address of the routine is
+;	stored in the cell DDT$L_MNTVER.  If a driver does not specify the
+;	contents of DDT$L_MNTVER, it defaults to the address of IOC$MNTVER.
+;
+; Input:
+;
+;	R3	= IRP address or 0
+;	R5	= UCB address
+;
+; Output:
+;
+;	None.
+;
+; Side effects:
+;
+;	Driver specific, but the contents of R0,R1,R2 and R4 may be overwritten.
+;--
+
+DRIVER_CODE:				; Call driver specific code
+	MOVL	UCB$L_DDT(R5),R0	; Get DDT address
+	JMP	@DDT$L_MNTVER(R0)	; Branch to driver specified routine
+	.PAGE
+	.SBTTL	WRITLCK_HNDLR
+;++
+; WRITLCK_HNDLR
+;
+; Functional description:
+;
+;	This routine will allow the file system to recover from the
+;	accidental hardware writelocking of a FILES-11 volume.  The
+;	method used is to mark the current IRP as a mount verification
+;	IRP, and try the request over again.  If the request then
+;	succeeds, nothing more need be done.  If the request fails again,
+;	keep trying until it succeeds.  If this is the first time this
+;	request has failed (the MVIRP bit will be clear), then inform
+;	all interested parties that the device has been writelocked.
+;
+;	Note that writelock recovery is not interlocked by the MVNVERIP
+;	bit.  This will allow recovery of a device offline error to supersede
+;	writelock recovery.  If this were not done, it would be possible to
+;	become deadlocked by an offline error occurring after a writelock
+;	error.
+;
+; Input:
+;
+;	R0,R1	= I/O status
+;	R3	= IRP address
+;	R5	= UCB address
+;
+; Output:
+;
+;	None.
+;--
+
+WRITLCK_HNDLR:				; Recover from accidental writelock
+	TSTL	(SP)+			; Remove return address from stack
+	BSBB	CLEANUP_IO		; Clean up current I/O operation
+	;
+	; To prevent the error log to become saturated with entries
+	; due the repeated failure of this request, inhibit error logging
+	; for this operation.  Note that if error logging had previously
+	; been enabled, then the error log will already contain an entry
+	; for this request.
+	;
+	BBSS	#IO$V_INHERLOG,-	; Inhibit error logging
+		IRP$W_FUNC(R3),10$	;
+	;
+	; If mount verification is already in progress, then
+	; requeue this request to the device and try again later.
+	;
+10$:	BBC	#UCB$V_MNTVERIP,-	; Branch if mount verification not in progress
+		UCB$W_STS(R5),20$	;
+	BSBB	DRIVER_CODE		; Requeue the IRP to the driver
+	RSB				; Return to caller's caller
+	;
+	; Mark this IRP as a mount verification IRP.  If it already is,
+	; then retry the I/O immediately.
+	;
+20$:	BBSS	#IRP$V_MVIRP,-		; Branch if already set and set the bit
+		IRP$W_STS(R3),30$	;
+;
+; This is the first time this IRP has come through.  Inform all
+; interested parties that the device has been writelocked.
+;
+	MOVZBL	#WRITELOCK,R4	; Set message type code
+	BSBB	SEND_MESSAGE		; Send message to interested parties
+;
+; Try the I/O over again.
+;
+30$:	BSBW	TIME_DELAY		; Pause for a bit
+	BRW	IOC$INITIATE		; Retry the I/O
+	.PAGE
+	.SBTTL	SEND_MESSAGE
+;++
+; SEND_MESSAGE
+;
+; Functional description:
+;
+;	This routine is used to inform all interested parties of a mount
+;	verification related event.  A message is sent to OPCOM, which will
+;	in turn send the message to all operators enabled to receive DEVICE
+;	or DISK messages.
+;
+;	Since there is a possibility that OPCOM will not be able to relay
+;	the message to the operator, also send a message that is targeted
+;	explicitly at the operator's console.
+;
+; Input:
+;
+;	R2	= Message code
+;
+; Output:
+;
+;	None.  Contents of R0 .. R2 are destroyed
+;
+;--
+
+SAVED_R1 =	0			;.
+SAVED_R2 =	4			; .
+SAVED_R3 =	8			;  . Offsets to saved registers
+SAVED_R4 =	12			; .
+SAVED_R5 =	16			;.
+DEVNAM_SIZE	= 20			; Allow 20 character device names
+POOL_OVERHEAD	= 2+IRP$W_SIZE		; Allow for listhead and size fields
+MSG_OVERHEAD	= POOL_OVERHEAD + DEVNAM_SIZE + <2 * CAR_CTRL_SIZE>
+MSG_START	= POOL_OVERHEAD		; First usuable byte in pool
+
+SEND_MESSAGE:				; Send message to interested parties
+;
+; Send message to OPCOM.
+;
+	PUSHR	#^M<R1,R2,R3,R4,R5>	; Save registers
+	BSBW	GET_MSG_ID		; Put address of message Id in R4
+	MOVZWL	(R4),R4			; Get the OPCOM message number
+	MOVAB	G^SYS$GL_OPRMBX,R3	; Get operator mailbox UCB address
+	JSB	G^EXE$SNDEVMSG		; Mail message to OPCOM; ignore failure
+;
+; Send message to _OPA0:.
+;
+	;
+	; Calculate the total message size and allocate a block
+	; of nonpaged pool in which to build the message.
+	; SIZE = prefix_size + message_size + suffix_size + pool_header_size + device_name_size
+	;
+	CLRL	R1			; Clear result
+	ADDB3	W^SUFFIX,W^PREFIX,R1	; Calculate size of prefix and suffix
+	BSBB	GET_MSG_ID		; Get address of message identifier
+	ADDB2	@4(R4),R1		; Add in (unformatted) message size
+	ADDB2	#MSG_OVERHEAD,R1	; Add in message overhead
+	BSBW	EXE$ALONONPAGED		; Allocate the necessary pool
+	BLBC	R0,13$			; If no pool available, give up
+	;
+	; Build the message in the pool just allocated.
+	; The entire message consists of the prefix, followed by
+	; the formatted device name, followed by the message text,
+	; followed by the sufix.
+	;
+	; R1 = actual pool size
+	; R2 = address of pool
+	;
+	MOVW	R1,IRP$W_SIZE(R2)	; Save size of pool in the block itself
+	MOVL	R2,SAVED_R2(SP)		; Save address of pool
+	MOVAB	MSG_START(R2),R3	; Get address of message buffer.
+	MOVW	#CAR_CTRL,(R3)+		; Insert leading <cr><lf>
+	MOVAB	W^PREFIX,R1		; Get address of prefix ASCIC string
+	BSBB	COPY_ASCIC		; Copy string to buffer (R5 destroyed)
+	MOVL	SAVED_R5(SP),R5		; Restore R5
+	MOVL	#DEVNAM_SIZE,R0		; Set device name size
+	MOVL	R3,R1			; Set buffer address
+	BSBW	IOC$CVT_DEVNAM		; Format the device name (R1 = result length)
+	ADDL	R1,R3			; Point to next byte in msg buffer
+	BSBB	GET_MSG_ID		; R4 = address of message identifier
+	MOVQ	@4(R4),R0		; Get message text descriptor
+	BSBB	COPY_STRING		; Copy message text to buffer
+	BSBB	GET_MSG_ID		; Get message text descriptor
+	BBS	#0,2(R4),10$		; Branch if suffix not requested
+	MOVAB	W^SUFFIX,R1		; Get address of suffix ASCIC string
+	BSBB	COPY_ASCIC		; Copy suffix to the buffer
+10$:	MOVW	#CAR_CTRL,(R3)+		; Insert trailing <cr><lf>
+	;
+	; Send the message to _OPA0:
+	;
+	MOVL	SAVED_R2(SP),R4		; Restore pool address
+	MOVAB	MSG_START(R4),R2	; Get start of message address
+	SUBL3	R2,R3,R1		; Calculate the length of the message
+	MOVAB	G^OPA$UCB0,R5		; Get console terminal UCB address
+	BSBW	IOC$BROADCAST		; Send the message
+	MOVL	R4,R0			; Copy pool address
+	BSBW	COM$DRVDEALMEM		; Deallocate the pool
+	MOVZWL	#SS$_NORMAL,R0		; Set success status
+13$:	POPR	#^M<R1,R2,R3,R4,R5>	; Restore R1 .. R5
+	RSB				; Return
+
+;+
+; This is a local subroutine to index into the message
+; identifier table and return the address of the correct
+; entry in R4.  Note that the stack depth has changed due
+; to the return address on the stack.
+;-
+GET_MSG_ID:				; Return address of message identifier
+	MOVL	4+SAVED_R4(SP),R4	; Get the table index number
+	MOVAQ	W^MSG_TABLE[R4],R4	; Calculate the entry index
+	RSB				; Return
+
+
+;+
+; This routine is a spcial case of COPY_STRING.  On input, R1 is
+; assumed to contain the address of an ASCIC string.  Execution
+; drops through to COPY_STRING, and will return from there to the caller.
+;-
+COPY_ASCIC:				; Special case of COPY_STRING
+	MOVZBL	(R1)+,R0		; Get length of string and advance the pointer
+
+;+
+; This routine is used to copy a string to a buffer.
+;
+; Input:
+;
+;	R0 = string length
+;	R1 = string address
+;	R3 = buffer address
+;
+; Output:
+;
+;	R3 = address of next byte in the buffer.
+;	     (This is a fortuitous side-effect of the MOVC3 instruction.)
+;-
+COPY_STRING:				; Copy a string to a buffer
+	MOVC3	R0,(R1),(R3)		; Go to it!
+	RSB				; Return
+	.END

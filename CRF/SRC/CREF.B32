@@ -1,0 +1,1022 @@
+MODULE crf_cref (			! Cross reference facility
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+%TITLE	'Cross reference facility';
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  Cross reference
+!
+! ABSTRACT:
+!
+!	The cross reference facility is a set of routines to input the cross
+!	reference data and output the cross reference on demand.
+!
+! ENVIRONMENT:
+!
+!	VAX native, user mode.
+!
+!--
+!
+!
+! AUTHOR:  Benn Schreiber,	 CREATION DATE:  3-Dec-1979
+!
+! MODIFIED BY:
+!
+!	V03-002		BLS0124		Benn Schreiber		1-Jan-1982
+!		Ensure that refindent and refsperline are initialized before
+!		being used.  Better checking of output line too long.
+!
+!	V03-001		BLS0059		Benn Schreiber		1-Jul-1981
+!		If just printing keys and values, go through delete logic.
+!--
+
+%SBTTL	'Declarations';
+LIBRARY
+	'SYS$LIBRARY:STARLET.L32';
+REQUIRE
+	'CRFMDL';			!Cross reference definitions
+REQUIRE
+	'CRFERRMSG';			!Cross reference messages
+!
+! Define VMS block structures
+!
+STRUCTURE
+	BBLOCK [O, P, S, E; N] =
+		[N]
+		(BBLOCK + O) <P, S, E>;
+!
+! Macro to execute a given sequence of commands and return if any error
+!
+MACRO
+    perform (command) =
+	BEGIN
+	LOCAL
+	    status;
+	status = command;
+	IF NOT .status			! If error detected,
+	THEN RETURN creferror (.status); ! then return with error (after calling user routine if there is one)
+	END%;
+
+LINKAGE
+    JSB_0 = JSB : GLOBAL (controlreg = 11),
+    JSB_1 = JSB (REGISTER = 0) : GLOBAL (controlreg = 11) 
+				PRESERVE (2, 3, 4) NOTUSED (5, 6, 7, 8, 9, 10),
+    JSB_2 = JSB (REGISTER = 0, REGISTER = 1) : GLOBAL (controlreg = 11) 
+						PRESERVE (2, 3, 4) NOTUSED (5, 6, 7, 8, 9, 10),
+    CALL_2 = CALL (STANDARD, STANDARD) : GLOBAL (controlreg = 11),
+    CALL_3 = CALL (STANDARD, STANDARD, STANDARD) : GLOBAL (controlreg = 11),
+    CALL_4 = CALL (STANDARD, STANDARD, STANDARD, STANDARD) : GLOBAL (controlreg = 11),
+    CALL_SYS = CALL : PRESERVE (2, 3, 4, 5, 6, 7, 8, 9, 10, 11);
+
+EXTERNAL ROUTINE
+    sort_hash_table,			!Sort hash table into linked list
+    get_mem : JSB_2,			!Allocate virtual memory
+    get_zmem : JSB_2,			!Allocate zeroed virtual memory
+    free_mem : JSB_2,			! and deallocate it
+    SYS$FAO : ADDRESSING_MODE (GENERAL) CALL_SYS; !Formatted ascii output
+
+GLOBAL LITERAL
+    crf$c_maxcol = 64,			!Max cols on cref of symbol/value
+    crf$c_maxlinwid = 132;		!Maximum line width
+
+EXTERNAL LITERAL
+    crf$c_hashsize;			!Size of hash table
+
+LITERAL
+    crf$c_linextra = 10,		!Extra padding in line buffer
+    true = 1,				!True
+    false = 0;				! and false
+
+FORWARD ROUTINE
+    add_key : CALL_2,			!Add/lookup key in hash table
+    creferror : JSB_1;			!Call user routine on error
+
+%SBTTL	'add_key -- add key to hash table';
+ROUTINE add_key (keyadr, entryadr) : CALL_2 =
+BEGIN
+
+!++
+!	Lookup/insert a key into the hash table
+!
+! Inputs:
+!
+!	keyadr		Address of ascic key or binary value
+!	entryadr	Address of longword to store entry address
+!
+! Outputs:
+!
+!	Address of key block is returned in .entryadr
+!
+!--
+
+ROUTINE compute_hash (ascbin, keyadr) : JSB_2 =
+BEGIN
+
+!++
+!	Compute the hash value for a key
+!
+! Inputs:
+!
+!	ascbin		0 if ascic, 1 if binary keys
+!	keyadr		address of ascic string or binary value
+!
+! Outputs:
+!
+!	Routine value is hash value for key
+!
+!--
+
+LOCAL
+    hashval;
+
+IF NOT .ascbin
+THEN BEGIN
+    MAP
+	keyadr : REF VECTOR [,BYTE];
+
+!
+! Hash value for ascic keys is the number of letters in the key
+! plus the sum of all the letters.
+!
+    hashval = 0;
+    INCRU i FROM 0 TO .keyadr [0]
+	DO hashval = .hashval + .keyadr [.i];
+    RETURN ((.hashval AND %X'7FFFFFFF') MOD crf$c_hashsize)
+    END
+!
+! Hash value for binary keys is low 31 bits of value
+!
+ELSE RETURN ((..keyadr AND %X'7FFFFFFF') MOD crf$c_hashsize);
+END;
+
+!
+! Main body of add_key
+!
+MAP
+    keyadr : REF VECTOR [,BYTE];
+
+LOCAL
+    ch_result,
+    ascbin,
+    thisval,
+    newbinarykey,
+    keystring : REF VECTOR [,BYTE],
+    prevkey : REF BBLOCK,
+    thiskey : REF BBLOCK;
+
+EXTERNAL REGISTER
+    controlreg = 11 : REF BBLOCK;
+
+BIND
+    hashtable = .controlreg [crf$l_hasht] : VECTOR [,LONG];
+
+.entryadr = 0;
+ascbin = .controlreg [crf$v_binary];
+IF .ascbin
+    THEN newbinarykey = ..keyadr;
+!
+! See if we just dealt with this key last call
+!
+IF (thiskey = .controlreg [crf$l_lastkey]) NEQ 0
+THEN 
+    IF (
+	IF .ascbin
+	    THEN .newbinarykey EQL .thiskey [key$l_keyadr]
+	    ELSE BEGIN
+		keystring = .thiskey [key$l_keyadr];
+		CH$EQL (.keyadr [0], keyadr [1],
+			.keystring [0], keystring [1])
+		END
+	)
+	THEN BEGIN
+	    controlreg [crf$l_lastkey] = 0;		!Assume we won't hit it again
+	    .entryadr = .thiskey;
+	    RETURN crf$_keyprventr
+	    END;
+
+!
+! Look through the bucket for the key
+!
+controlreg [crf$l_lastkey] = 0;				!No last key
+prevkey = hashtable [compute_hash (.ascbin, .keyadr)];
+thiskey = .prevkey [key$l_next];
+WHILE .thiskey NEQ 0
+DO BEGIN
+    IF (
+	IF .ascbin
+	THEN BEGIN
+	    thisval = .thiskey [key$l_keyadr];
+	    .newbinarykey EQL .thisval
+	    END
+	ELSE BEGIN
+	    keystring = .thiskey [key$l_keyadr];
+	    (ch_result = CH$COMPARE (.keyadr [0], keyadr [1],
+				.keystring [0], keystring [1])) EQL 0
+	END
+	)
+
+    THEN BEGIN
+!
+! Found in the table
+!
+	
+	.entryadr = .thiskey;
+	RETURN crf$_keyprventr
+	END
+
+    ELSE BEGIN
+	IF (
+	    IF .ascbin
+		THEN .newbinarykey LSSU .thisval
+		ELSE (.ch_result LSS 0)
+	    )
+	THEN EXITLOOP;
+	prevkey = .thiskey;
+	thiskey = .thiskey [key$l_next];
+	END;
+    END;
+!
+! Not in the table, so insert it
+!
+perform (get_mem (key$c_length, thiskey));		!Allocate it
+thiskey [key$l_reflist] = 0;
+thiskey [key$w_defflg] = 0;
+thiskey [key$l_defnam] = 0;
+thiskey [key$l_next] = .prevkey [key$l_next];
+prevkey [key$l_next] = .thiskey;
+thiskey [key$l_keyadr] = (IF .ascbin
+				THEN .newbinarykey
+				ELSE .keyadr);
+.entryadr = .thiskey;
+controlreg [crf$l_lastkey] = .thiskey;
+controlreg [crf$l_entries] = .controlreg [crf$l_entries] + 1;
+RETURN crf$_key1stentr
+END;							!Of add_key
+
+%SBTTL	'get_hash -- Allocate hash table if needed'
+ROUTINE get_hash : JSB_0 =
+BEGIN
+
+!++
+!	Allocate a hash table if none allocated
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	hash table allocated if not done so
+!
+!--
+
+EXTERNAL REGISTER
+    controlreg = 11 : REF BBLOCK;
+
+IF .controlreg [crf$l_hasht] EQL 0
+THEN BEGIN
+    perform (get_zmem (crf$c_hashsize *4, controlreg [crf$l_hasht]));
+    controlreg [crf$l_lastkey] = 0;
+    controlreg [crf$l_entries] = 0;
+    END;
+
+RETURN true
+
+END;				!Of get_hash
+
+%SBTTL	'crf$insrtkey -- Insert key into hash table';
+GLOBAL ROUTINE crf$insrtkey (control, keyadr, valadr, valflg) =
+BEGIN
+
+!++
+!	Insert a key into the table
+!
+! Inputs:
+!
+!	control		Address of cross-reference control block
+!	keyadr		Address of ASCIC key or binary value
+!	valadr		Address of key value
+!	valflg		flags word
+!
+! Outputs:
+!
+!	key is entered into table
+!
+!--
+
+MAP
+    control : REF BBLOCK;
+
+LOCAL
+    cachentry : REF BBLOCK,
+    status;
+
+GLOBAL REGISTER
+    controlreg = 11 : REF BBLOCK;
+
+controlreg = .control;
+
+IF NOT (status = get_hash ())
+    THEN RETURN .status;
+
+status = add_key (.keyadr, cachentry);		!Add/lookup key in hash table
+!
+! Update entry in cache
+!
+IF .cachentry NEQ 0				!If it was found/allocated
+THEN BEGIN
+    cachentry [key$l_valadr] = .valadr;
+    cachentry [key$w_valflg] = .valflg;
+    END;
+
+RETURN .status
+END;						!Of crf$insrtkey
+
+%SBTTL	'crf$insrtref -- Insert reference to a key';
+GLOBAL ROUTINE crf$insrtref (control, keyadr, refadr, reflag, defind) =
+BEGIN
+
+!++
+!	Insert a reference to a key.  If the key is not in the table, it is
+!	inserted.
+!
+! Inputs:
+!
+!	control		Address of cross-reference control table
+!	keyadr		Address of ASCIC key or binary value
+!	refadr		Address of ASCIC string for referencer
+!	reflag		referencer flags
+!	defind		0 = reference, 1 = definition
+!
+!--
+
+MAP
+    control : REF BBLOCK,
+    refadr : REF VECTOR [,BYTE];
+
+LOCAL
+    cachentry : REF BBLOCK,
+    defnam : REF VECTOR [,BYTE],
+    refblk : REF BBLOCK,
+    lastref : REF BBLOCK,
+    ch_result,
+    status;
+
+GLOBAL REGISTER
+    controlreg = 11 : REF BBLOCK;
+
+controlreg = .control;
+
+IF NOT (status = get_hash ())
+    THEN RETURN .status;
+
+status = add_key (.keyadr, cachentry);			!Add/lookup key
+IF .cachentry EQL 0					!If no memory today
+    THEN RETURN .status;
+!
+! If defining reference, then put definer name info in, else add to
+! the reference list
+!
+IF .defind
+
+THEN BEGIN
+    IF (defnam = .cachentry [key$l_defnam]) NEQ 0
+	THEN free_mem (.defnam [0] + 1, defnam [0]);			!Deallocate old name
+
+    perform (get_mem (.refadr [0] + 1, defnam));			!Allocate space for definer name
+    CH$MOVE (.refadr [0] + 1, .refadr, .defnam);			! and fill it in
+    cachentry [key$l_defnam] = .defnam;
+    cachentry [key$w_defflg] = .reflag;
+    RETURN crf$_success
+    END
+
+ELSE BEGIN
+!
+! Not the defining reference, look through the reference list, find the insertion point and insert
+! this reference if not already there
+!
+    refblk = cachentry [key$l_reflist];
+    lastref = .refblk;
+
+    WHILE (refblk = .refblk [ref$l_next]) NEQ 0
+    DO BEGIN
+	ch_result = CH$COMPARE (.refadr [0], refadr [1],
+			.refblk [ref$b_reflng], refblk [ref$t_refnam]);
+	IF .ch_result EQL 0
+	    THEN RETURN crf$_refprventr
+	    ELSE IF .ch_result LSS 0					!Found the point
+		THEN EXITLOOP;
+	lastref = .refblk;						!Remember last ref
+	END;
+!
+! Insert the new reference
+!
+    perform (get_mem (ref$c_fixedsize + .refadr [0], refblk));		!Allocate memory for it
+    refblk [ref$l_next] = .lastref [ref$l_next];
+    lastref [ref$l_next] = .refblk;
+    refblk [ref$w_refflg] = .reflag;
+    CH$MOVE (.refadr [0] + 1, refadr [0], refblk [ref$b_reflng]);	!Move in reference name
+    RETURN crf$_success;
+    END;
+END;									!Of crf$insrtref
+
+%SBTTL	'creferror -- call user error routine';
+ROUTINE creferror (errorcode) : JSB_1 =
+BEGIN
+
+!++
+!	Call user error routine on error
+!
+! Inputs:
+!
+!	errorcode	the error code to pass to user
+!
+!--
+
+EXTERNAL REGISTER
+    controlreg = 11 : REF BBLOCK;
+
+BIND ROUTINE
+    user_error_routine = controlreg [crf$l_error];
+
+IF .user_error_routine NEQ 0				!If user supplied routine
+    THEN (.user_error_routine) (.errorcode);
+
+RETURN .errorcode
+END;							!Of creferror
+
+%SBTTL	'crf$out -- output the cross reference';
+GLOBAL ROUTINE crf$out (control, linwid, linespage1, linesucpag, printind, saveind) =
+BEGIN
+
+!++
+!	Output the cross reference
+!
+! Inputs:
+!
+!	control		Address of cross-reference control table
+!	linwid		Width of listing line
+!	linespage1	Number of lines on first page
+!	linesucpag	Number of lines on succeeding pages
+!	printind	print indicator (crf$k_values, crf$k_vals_refs, crf$k_defs_refs)
+!	saveind		save tree indicator (crf$k_save, crf$k_delete)
+!
+!--
+
+ROUTINE maxfieldwidth (tableaddr) : JSB_1 =
+BEGIN
+
+!++
+!	Search through the field descriptors for the one with the
+!	maximum length and return it.
+!
+! Inputs:
+!
+!	tableaddr		Address of start of field descriptors
+!
+! Routine value:
+!
+!	width of biggest field descriptor
+!
+!--
+
+LOCAL
+    wid,
+    fldptr : REF BBLOCK;
+
+IF .tableaddr EQL 0				!If no table, return 0
+ THEN RETURN 0;
+
+fldptr = .tableaddr;
+wid = 0;					!Set max width to 0
+
+WHILE .fldptr [fld$w_mask] NEQ 0		!Loop through all looking for larger width
+DO BEGIN
+    IF .wid LSSU .fldptr [fld$b_maxlng]		! and if one is found
+	THEN wid = .fldptr [fld$b_maxlng];	! then set max width to that
+    fldptr = fldptr [fld$t_nxtdesc];		!Link to next field descriptor
+    END;
+
+RETURN .wid					!Return maximum width
+
+END;						!Of maxfieldwidth
+
+ROUTINE formatfield (fieldwidth, outdesc, faocontrol, faoarg) : CALL_4 =
+BEGIN
+
+!++
+!	Format a field
+!
+! Inputs:
+!
+!	fieldwidth	width of the field
+!	outdesc		address of string descriptor for buffer
+!	faocontrol	address of fao control string
+!	faoarg		argument for fao
+!
+! Outputs:
+!
+!	string is formatted, outdesc is updated.
+!
+!--
+
+MAP
+    outdesc : REF BBLOCK;
+
+LOCAL
+    length : WORD;
+
+EXTERNAL REGISTER
+    controlreg = 11 : REF BBLOCK;
+
+perform (SYS$FAO (.faocontrol, length, .outdesc, .faoarg));		!Format the field
+outdesc [dsc$w_length] = .outdesc [dsc$w_length] - .fieldwidth;		!Adjust the descriptor
+outdesc [dsc$a_pointer] = .outdesc [dsc$a_pointer] + .fieldwidth;
+
+RETURN true
+
+END;						!Of formatfield
+
+ROUTINE findformat (outdesc, keyflag, formatdesc) : CALL_3 =
+BEGIN
+
+!++
+!	Find format associated with a bit mask and the format the field
+!
+! Inputs:
+!
+!	outdesc		address of string descriptor for outpt buffer
+!	keyflag		flags to find format for
+!	formatdesc	address of start of cref field descriptors
+!
+! Outputs:
+!
+!	field is formatted, outdesc is updated.
+!
+!--
+
+LOCAL
+    fldptr : REF BBLOCK,
+    curfld : REF BBLOCK,
+    mask,
+    comflags;
+
+EXTERNAL REGISTER
+    controlreg = 11 : REF BBLOCK;
+
+comflags = NOT .keyflag;				!Get complement of flags
+comflags = .comflags AND %X'FFFF';			! trimmed to a word
+fldptr = .formatdesc;					!Point to the format descriptors
+curfld = .fldptr;					! ...
+
+WHILE (mask = .curfld [fld$w_mask]) NEQ	0		!Look at all field descriptors
+DO BEGIN
+    mask = .mask AND fld$m_usrbits;			!Get mask this descriptor
+    IF (IF NOT .curfld [fld$b_set_clr]			!Check if set or clear bits
+		THEN (.mask AND (NOT .comflags)) EQL 0	! and compare
+		ELSE (.mask  AND (NOT .keyflag)) EQL 0
+	)
+	THEN fldptr = .curfld;				!If it matches then remember it
+    curfld = curfld [fld$t_nxtdesc];			!Link to next field
+    END;
+
+RETURN formatfield (.fldptr [fld$b_maxlng], .outdesc,	!Format the field and return
+			fldptr [fld$b_faodsc], .keyflag)
+
+END;						!Of findformat
+
+ROUTINE outputline (linedesc, protodesc)  : CALL_2 =
+BEGIN
+
+!++
+!	Output line by calling user routine
+!
+! Inputs:
+!
+!	linedesc		address of string descriptor for line
+!	protodesc		address of original string descriptor for line
+!
+! Outputs:
+!
+!	linedesc		reset to protodesc
+!	buffer pointed to by protodesc is blank-filled.
+!
+!	user output routine is called.
+!
+!--
+
+MAP
+    linedesc : REF BBLOCK,
+    protodesc : REF BBLOCK;
+
+LOCAL
+    desc : BBLOCK [dsc$c_s_bln];
+
+EXTERNAL REGISTER
+    controlreg = 11 : REF BBLOCK;
+
+desc [dsc$w_length] = .protodesc [dsc$w_length] - 	!Set descriptor to length of line to print
+			.linedesc [dsc$w_length];
+desc [dsc$a_pointer] = .protodesc [dsc$a_pointer];
+CH$MOVE (dsc$c_s_bln, .protodesc, .linedesc);		!Reset the descriptor
+
+(.controlreg [crf$l_output]) (desc);		 	!Call user routine to output line
+
+CH$FILL (%ASCII ' ', .desc [dsc$w_length],		!Blank fill used part of line
+			.desc [dsc$a_pointer]);
+
+RETURN true
+
+END;						!Of outputline
+
+ROUTINE formatkeyval (keyadr, linedesc) : CALL_2 =
+BEGIN
+
+!++
+!	Format key1/key2/val1/val2 fields for a key
+!
+! Inputs:
+!
+!	keyadr		Address of ASCIC string or value of binary key
+!	linedesc	Address of string descriptor for output line
+!
+! Outputs:
+!
+!	fields are formatted into output line.
+!
+!--
+
+MAP
+    keyadr : REF BBLOCK,
+    linedesc : REF BBLOCK;
+
+LOCAL
+    fieldwidth,
+    curfld : REF BBLOCK;
+
+EXTERNAL REGISTER
+    controlreg = 11 : REF BBLOCK;
+
+IF (curfld = .controlreg [crf$l_k1fmtbl]) NEQ 0			!Get field descriptor for key 1
+    THEN formatfield (.curfld [fld$b_maxlng], .linedesc,	! and format the field
+		curfld [fld$b_faodsc], .keyadr [key$l_keyadr]);
+
+IF (curfld = .controlreg [crf$l_k2fmtbl]) NEQ 0			!If key2 field descriptor present
+THEN findformat (.linedesc, .keyadr [key$w_valflg], .curfld);	! then find format and output it
+
+IF (curfld = .controlreg [crf$l_v1fmtbl]) NEQ 0			!If val1 field descriptor present
+THEN IF .keyadr [key$l_valadr] EQL 0				! then handle 0-address
+    THEN BEGIN
+	fieldwidth = .curfld [fld$b_maxlng];			! by getting the field width
+	linedesc [dsc$w_length] = .linedesc [dsc$w_length] - .fieldwidth; ! and just skipping the field
+	linedesc [dsc$a_pointer] = .linedesc [dsc$a_pointer] + .fieldwidth;
+	END
+    ELSE formatfield (.curfld [fld$b_maxlng], .linedesc, curfld [fld$b_faodsc],	!otherwise format val1
+				.(.keyadr [key$l_valadr]));
+
+IF (curfld = .controlreg [crf$l_v2fmtbl]) NEQ 0			!Format val2 field if present
+THEN findformat (.linedesc, .keyadr [key$w_valflg], .curfld);
+
+RETURN true
+
+END;						!Of formatkeyval
+
+!
+! Main body of CRF$OUT
+!
+
+MAP
+    control : REF BBLOCK;
+
+LOCAL
+    linebuf : BBLOCK [crf$c_maxlinwid + crf$c_linextra],
+    sortedkeys : REF VECTOR [,LONG],
+    refsperline,
+    refindent,
+    fldesc : REF BBLOCK,
+    curkey : REF BBLOCK,
+    refdesc : REF BBLOCK,
+    refcount : REF BBLOCK,
+    refsize,
+    keyvalsiz,
+    linesthispage,
+    linecount,
+    curlinedesc : BBLOCK [dsc$c_s_bln],
+    linedesc : BBLOCK [dsc$c_s_bln];
+
+GLOBAL REGISTER
+    controlreg = 11 : REF BBLOCK;
+
+!
+! If nothing has been entered into the cross ref then quit now
+!
+
+controlreg = .control;
+IF .controlreg [crf$l_hasht] EQL 0
+    OR .controlreg [crf$l_entries] EQL 0
+    THEN RETURN true;
+
+!
+! Make sure output routine is present
+!
+
+IF .controlreg [crf$l_output] EQL 0
+    THEN RETURN creferror (crf$_no_outrtn);
+
+!
+! Initialize output line to blanks, set up descriptors for line
+!
+
+CH$FILL (%ASCII ' ', crf$c_maxlinwid + crf$c_linextra, linebuf);
+linedesc [dsc$w_length] = .linwid;
+linedesc [dsc$a_pointer] = linebuf;
+CH$MOVE (dsc$c_s_bln, linedesc, curlinedesc);
+!
+! Sort the hash table 
+!
+perform (get_mem (.controlreg [crf$l_entries] * 4, sortedkeys));
+sort_hash_table (crf$c_hashsize, .sortedkeys);
+!
+! Determine widths of various parts of line
+!
+refindent = 0;
+
+IF (fldesc = .controlreg [crf$l_k1fmtbl]) NEQ 0
+    THEN refindent = .fldesc [fld$b_maxlng];
+
+IF (fldesc = .controlreg [crf$l_k2fmtbl]) NEQ 0
+    THEN refindent = .refindent + maxfieldwidth (.fldesc);
+
+IF (fldesc = .controlreg [crf$l_v1fmtbl]) NEQ 0
+    THEN refindent = .refindent + .fldesc [fld$b_maxlng];
+
+IF (fldesc = .controlreg [crf$l_v2fmtbl]) NEQ 0
+    THEN refindent = .refindent + maxfieldwidth (.fldesc);
+!
+! Make sure that key1/key2/val1/val2 can fit on line
+!
+IF .refindent GTRU .linwid OR .linwid GTRU crf$c_maxlinwid
+    THEN RETURN crf$_linelng;
+
+keyvalsiz = .refindent;					!Remember width of key1/key2/val1/val2
+
+linesthispage = .linespage1;				!Set number of lines on first page
+
+!
+! If just printing keys and values, then do it all now
+!
+
+IF .printind EQL crf$k_values
+THEN BEGIN
+    LOCAL
+	keypointer : VECTOR [crf$c_maxcol, LONG],
+	lwidth : VECTOR [2],
+	keysperline,
+	thispointer : REF BBLOCK,
+	blanksbtwncol,
+	columnsleft;
+
+    BUILTIN EDIV;
+
+!
+! Figure the number of keys per line and the number of spaces
+! between columns.
+!
+
+    lwidth [0] = .linwid;					!Put width into a quadword
+    lwidth [1] = 0;
+    EDIV (keyvalsiz, lwidth, keysperline, columnsleft);		!divide to get number of columns, and spaces left
+    keysperline = .keysperline - 1;				!One less column than keys
+    IF (blanksbtwncol = .columnsleft / .keysperline) EQL 0	!figure blanks between columns
+    THEN BEGIN
+	keysperline = .keysperline - 1;				!if none, then one less key per line
+	columnsleft = .columnsleft + .keyvalsiz;		!adjust columns left
+	blanksbtwncol = .columnsleft / .keysperline;		!Recompute blanks between columns
+	END;
+    keysperline = .keysperline + 1;				!readjust number of keys per line
+
+    CH$FILL (0, (.keysperline - 1) * 4, keypointer [1]);
+    keypointer [0] = 1;
+!
+! Loop until all are printed
+!
+    WHILE .keypointer [0] LEQ .controlreg [crf$l_entries]
+    DO BEGIN
+	!
+	!  Find key that goes in each column
+	!
+	INCRU col FROM 1 TO .keysperline - 1
+	DO keypointer [.col] = .keypointer [.col - 1]  + .linesthispage;
+	!
+	! Now loop over all lines on page
+	!
+	INCRU currentline FROM 1 TO .linesthispage
+	DO BEGIN
+
+	    !
+	    ! Loop over each column on line
+	    !
+	    INCRU col FROM 0 TO .keysperline - 1
+	    DO IF .keypointer [.col] LEQ .controlreg [crf$l_entries]
+		AND (thispointer = .sortedkeys [.keypointer [.col] - 1]) NEQ 0
+	    THEN BEGIN
+
+		formatkeyval (.thispointer, curlinedesc);		!format this key
+		IF .col NEQ .keysperline - 1				!If not last key on line, add spaces
+		THEN BEGIN
+		    curlinedesc [dsc$w_length] = .curlinedesc [dsc$w_length] -
+						.blanksbtwncol;
+		    curlinedesc [dsc$a_pointer] = .curlinedesc [dsc$a_pointer] +
+						.blanksbtwncol;
+		    END;
+		keypointer [.col] = .keypointer [.col] + 1;
+		END;
+	    outputline (curlinedesc, linedesc);			!Output the line
+	    IF .keypointer [0] GTR .controlreg [crf$l_entries] ! If no more entries
+		THEN EXITLOOP;
+	    END;						!Of loop on lines per page
+
+	keypointer [0] = .keypointer [.keysperline - 1];	!Set index to next key
+	CH$FILL (0, (.keysperline - 1) * 4, keypointer [1]);	!Zero rest of array
+	linesthispage = .linesucpag;				!Set count of lines per page
+	END;							!of WHILE loop
+
+    END
+
+!
+! Printing at least the refs, so only 1 key per line
+!
+
+ELSE BEGIN
+
+!
+! Determine width of a reference
+!
+
+    refsize = 0;
+
+    IF (fldesc = .controlreg [crf$l_r1fmtbl]) NEQ 0
+	THEN refsize = maxfieldwidth (.fldesc);
+
+    IF (fldesc = .controlreg [crf$l_r2fmtbl]) NEQ 0
+	THEN refsize = .refsize + .fldesc [fld$b_maxlng];
+
+!
+! If printing defs, then update indent to start of references
+!
+
+    IF .printind EQL crf$k_defs_refs
+	THEN refindent = .refindent + .refsize;
+
+    IF .refsize NEQ 0
+    THEN BEGIN
+	refsperline = (.linwid - .refindent) / .refsize;	!Compute no. refs. per line
+	IF .refsperline LEQ 0
+	    THEN RETURN crf$_linelng;
+	END
+    ELSE refsperline = 1;
+
+!
+! Now loop over all the keys
+!
+
+    INCRU i FROM 0 TO .controlreg [crf$l_entries] - 1
+    DO BEGIN
+
+	curkey = .sortedkeys [.i];
+	formatkeyval (.curkey, curlinedesc);			!Format key1/key2/val1/val2
+
+	IF .printind EQL crf$k_defs_refs			!Printing defining reference?
+	THEN BEGIN
+	    IF (fldesc = .controlreg [crf$l_r1fmtbl]) NEQ 0
+		THEN findformat (curlinedesc, .curkey [key$w_defflg], .fldesc);
+	    IF (fldesc = .controlreg [crf$l_r2fmtbl]) NEQ 0
+		THEN formatfield (.fldesc [fld$b_maxlng], curlinedesc,
+				fldesc [fld$b_faodsc],
+				(IF (refdesc = .curkey [key$l_defnam]) NEQ 0	!use definer name if there
+						THEN .refdesc
+						ELSE curkey [key$l_defnam]));	!otherwise point to a zero
+	    END;
+!
+! format the references
+!
+	refdesc = .curkey [key$l_reflist];
+	refcount = .refsperline;
+	curlinedesc [dsc$w_length] = .linwid - .refindent;
+	curlinedesc [dsc$a_pointer] = linebuf + .refindent;
+
+	WHILE .refdesc NEQ 0					!Loop over all references
+	DO BEGIN
+	    IF (fldesc = .controlreg [crf$l_r1fmtbl]) NEQ 0
+		THEN findformat (curlinedesc, .refdesc [ref$w_refflg], .fldesc);
+	    IF (fldesc = .controlreg [crf$l_r2fmtbl]) NEQ 0
+		THEN formatfield (.fldesc [fld$b_maxlng], curlinedesc,
+				fldesc [fld$b_faodsc], refdesc [ref$b_reflng]);
+	    refcount = .refcount - 1;
+	    refdesc = .refdesc [ref$l_next];
+	    IF .refcount EQL 0
+		AND .refdesc NEQ 0
+		THEN BEGIN
+		    outputline (curlinedesc, linedesc);
+		    curlinedesc [dsc$w_length] = .curlinedesc [dsc$w_length] -
+								.refindent;
+		    curlinedesc [dsc$a_pointer] = .curlinedesc [dsc$a_pointer] +
+								.refindent;
+		    refcount = .refsperline;
+		    END;
+	    END;
+!
+! Output the line we've done
+!
+	outputline (curlinedesc, linedesc);
+	linecount = .linecount - 1;
+	IF .linecount EQL 0
+	THEN BEGIN
+	    linecount = .linesucpag;
+	    linesthispage = .linesucpag;
+	    END;
+
+	END;					!Of WHILE loop
+    END;					!Of printing at least refs
+
+!
+! If requested, deallocate the memory we used for the cross-reference
+!
+
+IF .saveind EQL crf$k_delete
+THEN BEGIN
+    LOCAL
+	defnam : REF VECTOR [,BYTE],
+	thisref : REF BBLOCK,
+	lastref : REF BBLOCK;
+
+!
+! Get the addresses of the key def. blocks out of the sorted list
+!
+    INCRU i FROM 0 TO .controlreg [crf$l_entries] - 1
+    DO BEGIN
+	curkey = .sortedkeys [.i];
+	IF (defnam = .curkey [key$l_defnam]) NEQ 0		!Deallocate definer name if present
+	    THEN free_mem (.defnam [0]+1, defnam [0]);
+!
+! Deallocate reference list
+!
+	thisref = .curkey [key$l_reflist];
+	WHILE .thisref NEQ 0
+	DO BEGIN
+	    lastref = .thisref;
+	    thisref = .thisref [ref$l_next];
+	    free_mem (ref$c_fixedsize + .lastref [ref$b_reflng], .lastref);
+	    END;
+!
+! Deallocate key def. entry
+!
+	free_mem (key$c_length, .curkey);
+	END;
+!
+! Deallocate the hash table
+!
+    free_mem (crf$c_hashsize*4, .controlreg [crf$l_hasht]);
+    controlreg [crf$l_hasht] = 0;
+    controlreg [crf$l_entries] = 0;
+    controlreg [crf$l_lastkey] = 0;
+    END;
+
+!
+! Deallocate the sorted list table
+!
+
+free_mem (.controlreg [crf$l_entries] * 4, .sortedkeys);
+
+RETURN true
+
+END;						!Of crf$out
+END
+ELUDOM

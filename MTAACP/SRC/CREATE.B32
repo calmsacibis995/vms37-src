@@ -1,0 +1,576 @@
+
+MODULE CREATE (LANGUAGE (BLISS32) ,
+		IDENT = 'V03-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  MTAACP
+!
+! ABSTRACT:
+!
+!	This module executes the create function
+!
+! ENVIRONMENT:
+!
+!	Starlet operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+
+!
+!
+! AUTHOR:  D. H. GILLESPIE,	 CREATION DATE:  3-JUN-77
+!
+! MODIFIED BY:
+!
+!	V02-012 DMW0019		David Michael Walp	11-Nov-1980
+!		New BLISS compiler, FUNCTION declaration changed from
+!		BBLOCK to BLOCK.  Old compiler use to give a longword
+!		with a declaration of "BBLOCK [1]".
+!
+!	V02-011 MCN0018		Maria del C. Nasr	26-Aug-1980
+!		Implement bug fix described in MCN0017
+!
+!	V02-010	MCN0017		Maria del C. Nasr	29-Jul-1980
+!		Check if EOT was sensed after writing the header labels of the
+!		file being created, instead of waiting for virtual IO to lock
+!		the error.  Also, add a kernel mode routine which will update
+!		the partfile flag in the VCB, to account for cancel IO.  This
+!		fixes a problem in which creating empty files at the end of a
+!		tape will cause a runaway tape situation.
+!
+!	V02-009	REFORMAT	Maria del C. Nasr	30-Jun-1980
+!
+!	V02-008	SPR27361	Maria del C. Nasr	10-Jun-1980
+!		The file should be accessed after the tape is positioned
+!		right before the data starts, to make sure all IO has been
+!		completed.  Also, eliminate user labels code.
+!
+!	A0007	MCN0011		Maria del C. Nasr	04-Feb-1980  9:05
+!		Clear logical end of volume flag after spacing tape mark
+!		back to fix bug.
+!
+!	A0006	MCN0003		Maria del C. Nasr	28-Sep-79   10:27
+!		Add HDR3 processing
+!
+!	A0005	MCN0001		Maria del C. Nasr	21-Sep-79   10:15
+!		Added argument to CHECK_FILE_ACC call to fix bug in
+!		"create if" function.
+!
+!
+!**
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+
+REQUIRE 'SRC$:MTADEF.B32';
+
+FORWARD ROUTINE
+    MTA_CREATE		: NOPRES NOVALUE,	! main routine to create a file
+    ACCESS_NEW_FILE	: COMMON_CALL NOVALUE,	! access a newly created file
+    INIT_NEW_FILE	: COMMON_CALL NOVALUE,	! initialize new file
+    WRITE_HEADERS	: NOVALUE L$WRITE_HEADER,	! write hdr1, hdr2, and hdr3
+    UPD_PARTFILE	: COMMON_CALL NOVALUE;	! update partfile flag in the VCB
+
+EXTERNAL ROUTINE
+    ACCESS_FILE		: COMMON_CALL,		! access file
+    CHECK_ACCESS	: COMMON_CALL,		! check access to volume
+    CHECK_FILE_ACC	: COMMON_CALL,		! check access to file
+    CLOSE_FILE		: L$CLOSE_FILE,		! close file
+    FORMAT_FID		: COMMON_CALL,		! format file identifier
+    FORMAT_HDRS		: COMMON_CALL,		! format headers
+    GET_FIB		: COMMON_CALL,		! get copy of user's fib
+    GET_START_HDR	: L$GET_START_HDR,	! get header to start with
+    MOUNT_VOL		: COMMON_CALL,		! mount a volume
+    NEXT_VOL_WRITE	: L$NEXT_VOL_WRIT,	! get next volume for write
+    POSITION_TO_END	: COMMON_CALL,		! position to end of vol set
+    READ_HDR		: COMMON_CALL,		! read header
+    SPACE		: COMMON_CALL,		! space given number of blocks
+    SPACE_TM		: COMMON_CALL,		! space given number of tape marks
+    START_VIO		: COMMON_CALL,		! start virtual io
+    SYS$FAO		: ADDRESSING_MODE (ABSOLUTE),	! format ascii output
+    UPDVCB_LEOV		: COMMON_CALL,		! to clear logical end of volume bit
+    WRITE_BLOCK		: COMMON_CALL,		! write tape block
+    WRITE_TM		: L$WRITE_TM;		! write tape mark
+
+EXTERNAL
+    CURRENT_WCB		: REF BBLOCK,		! address of current window control block
+    IO_PACKET		: REF BBLOCK,		! address of io request packet
+    IO_STATUS,					! IO status returned
+    HDR1		: REF BBLOCK,		! address of HDR1(EOF1) label
+    HDR2		: REF BBLOCK,		! address of HDR2(EOF2) label
+    HDR3		: REF BBLOCK;		! address of HDR3 label
+
+
+GLOBAL ROUTINE MTA_CREATE : NOPRES NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This is the main processing routine for MTAACP create function
+!
+! CALLING SEQUENCE:
+!	MTA_CREATE()
+!
+! INPUT PARAMETERS:
+!	none
+!
+! IMPLICIT INPUTS:
+!	HDR1	  - address hdr1(eof1) label
+!	HDR2	  - address hdr2(eof2) label
+!	HDR3	  - address hdr3 label
+!	IO_PACKET - address of current io request packet
+!	CURRENT_VCB - address of current vcb
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	The header label set is written and the access to the file made if requested
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	none
+!
+! USER ERRORS:
+!	SS$_BADPARAM	- bad input parameters to create or must ask to write file
+!	SS$_FILALRACC	- only one file at a time open on magnetic tape
+!	SS$_FILENOTEXP	- the file about to be overlayed is not expired
+!	SS$_NOPRIV	- the user does not have necessary privileges
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    LOCAL
+	INC_SEQ_NUM,				! indicator for init_new_file routine
+	PACKET		: REF BBLOCK,		! address of current io request packet
+
+	! address of buffer descriptors
+	!
+	ABD		: REF BBLOCKVECTOR [, ABD$C_LENGTH],
+	FIB		: REF BBLOCK,		! address of copy of user's fib
+	FUNCTION	: BLOCK [1];		! io function
+
+    ! setup pointers to interesting structures
+    !
+    PACKET = .IO_PACKET;
+
+    ! address of buffer descriptors
+    !
+    ABD = .BBLOCK[.PACKET[IRP$L_SVAPTE], AIB$L_DESCRIPT];
+    FIB = GET_FIB(.ABD);	! get copy of user's file information block
+
+    ! get io function code
+    !
+    FUNCTION = .PACKET[IRP$W_FUNC];
+
+    ! is the function requested a valid one?
+    !
+
+    IF .FIB[FIB$V_TRUNC] OR .FUNCTION[IO$V_DELETE]
+	OR ( NOT .FUNCTION[IO$V_CREATE])
+	AND
+	(.FIB[FIB$V_EXTEND] OR .PACKET[IRP$W_BCNT] GTRU ABD$C_ATTRIB
+		OR .FUNCTION[IO$V_ACCESS]) 
+	OR NOT .FIB[FIB$V_WRITE]
+	AND
+	.FUNCTION[IO$V_ACCESS]
+    THEN
+	ERR_EXIT(SS$_BADPARAM);
+
+    ! make sure that a create is not done on a volume set that has an out
+    ! standing access
+    !
+
+    IF .CURRENT_WCB NEQ 0
+	AND
+	.FUNCTION[IO$V_CREATE]
+    THEN
+	ERR_EXIT(SS$_FILALRACC);
+
+    ! now for the create
+    !
+
+    IF .FUNCTION[IO$V_CREATE]
+    THEN
+	BEGIN
+
+	! if there is a partial file then it  is closed.  if the user wants to
+	! access a partial file, the access function io must be used
+	!
+
+	IF .CURRENT_VCB[VCB$V_PARTFILE]
+	THEN
+	    CLOSE_FILE();
+
+	CHECK_ACCESS(1);	! MUST HAVE WRITE PRIVILEGE JUST TO CREATE
+
+	! now position the tape as requested unless this is a create if not
+	! found
+	!
+
+	IF .PACKET[IRP$V_FCODE] EQL IO$_ACCESS	! if create if not found
+	    OR
+	    NOT (.FIB[FIB$V_REWIND]
+	    OR
+	    .FIB[FIB$V_CURPOS])
+	THEN
+	    POSITION_TO_END()
+	ELSE
+	    BEGIN
+
+	    IF .FIB[FIB$V_REWIND]
+	    THEN
+		BEGIN
+		MOUNT_VOL(1, $FIELDMASK(MOU$V_REWIND) + $FIELDMASK(MOU$V_LBLCHECK));
+
+		IF NOT READ_HDR()
+		THEN
+		    ERR_EXIT(SS$_TAPEPOSLOST);
+
+		END
+	    ELSE
+
+		! create function with positioning indicators
+		!
+		GET_START_HDR();
+
+	    END;
+
+	! check expiration on overlayed files and position tape
+	!
+
+	IF NOT .CURRENT_VCB[VCB$V_LOGICEOVS]
+	THEN
+	    BEGIN		! overlaying file if not at end of volume set
+	    INC_SEQ_NUM = 0;	! do not increment file number
+	    CHECK_FILE_ACC(0);	! can file be overlayed? (0)=mta_create
+
+	    ! position to where file is to be written
+	    !
+
+	    IF .CURRENT_VCB[VCB$B_TM] EQL 0
+	    THEN
+
+		IF (.HDR2[HD2$L_HD2LID] EQL 'HDR2')
+		    AND
+		    (.CURRENT_VCB[VCB$V_STARFILE])
+		THEN
+		    SPACE(-3)		! hdr1,hdr2,hdr3 (or user label)
+		ELSE
+		    SPACE(-2)		! no hdr3 read, space hdr1 and hdr2
+	    ELSE
+		BEGIN
+		SPACE_TM(-1);			! backspace tm
+
+		IF .HDR2[HD2$L_HD2LID] EQL 'HDR2'	! check if hdr2 found
+		THEN
+		    SPACE(-2)			! backspace hdr1 and hdr2
+		ELSE
+		    SPACE(-1);			! no hdr2, backspace hdr1 only
+
+		END;
+
+	    END
+	ELSE
+	    BEGIN
+	    SPACE_TM(-1);			! logical end indicated by tape mark
+	    KERNEL_CALL(UPDVCB_LEOV, 0);	! not at end of vol anymore
+	    INC_SEQ_NUM = 1;			! increment file number
+	    END;
+
+	! initialize new file and write headers
+	!
+	FORMAT_HDRS();
+	KERNEL_CALL(INIT_NEW_FILE, .INC_SEQ_NUM);
+	WRITE_HEADERS();			! write hdr1, hdr2, and hdr3
+
+	! return fid to user in fib
+	!
+	FORMAT_FID(FIB[FIB$W_FID_NUM]);
+	FIB[FIB$W_FID_RVN] = .CURRENT_VCB[VCB$B_CUR_RVN];
+
+	! now if newly created file should be accessed do so
+	!
+
+	IF .FUNCTION[IO$V_ACCESS]
+	THEN
+	    ACCESS_NEW_FILE(.FIB, .PACKET, .ABD);
+
+	END;
+
+    END;					! end of routine
+
+
+GLOBAL ROUTINE ACCESS_NEW_FILE (FIB, PACKET, ABD) : COMMON_CALL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	this routine accesses a newly created file
+!
+! CALLING SEQUENCE:
+!	access_new_file(arg1,arg2,arg3)
+!
+! INPUT PARAMETERS:
+!	arg1 - address of copy of user file identification block
+!	arg2 - address of current io request packet
+!	arg3 - address of buffer descriptor vectors
+!
+! IMPLICIT INPUTS:
+!	none
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	Changes made to system data base to allow virtual io.
+!	Tape mark is written.
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	none
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    MAP
+	FIB	: REF BBLOCK,			! file information block
+	PACKET	: REF BBLOCK;			! address of io request block
+
+    ! Write tape mark, create window, setup data base connections, complete io,
+    ! and startup virtual io
+    !
+
+    WRITE_TM();
+
+    ! If EOT is sensed, request a next volume, and clear the partial file flag
+    ! since the end of volume labels will be written.
+
+    IF .IO_STATUS EQL SS$_ENDOFTAPE
+    THEN
+	BEGIN
+	KERNEL_CALL (UPD_PARTFILE, 0);
+	NEXT_VOL_WRITE();
+	END;
+
+    KERNEL_CALL(ACCESS_FILE, .FIB[FIB$L_ACCTL], .PACKET[IRP$L_PID], 0, 1, .ABD);
+    KERNEL_CALL(START_VIO);
+    END;					! end of routine
+
+
+GLOBAL ROUTINE WRITE_HEADERS : L$WRITE_HEADER NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	this routine inserts the file section and sequence number into hdr1,
+!	inserts the header label identifiers, zeroes the block count, and
+!	writes hdr1, hdr2, and hdr3.
+!
+! CALLING SEQUENCE:
+!	write_headers()
+!
+! INPUT PARAMETERS:
+!	none
+!
+! IMPLICIT INPUTS:
+!	hdr1, hdr2, and hdr3 partially formatted
+!
+! OUTPUT PARAMETERS:
+
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	hdr1, hdr2, and hdr3 written
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	none
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    LOCAL
+
+	! descriptor for file section and sequence number
+	!
+	DESCR	: VECTOR [2];
+
+    ! store file section and sequence number
+    !
+    DESCR[0] = HD1$S_FILESECNO + HD1$S_FILESEQNO;
+    DESCR[1] = HDR1[HD1$T_FILESECNO];
+    SYS$FAO(DESCRIPTOR('!4ZW!4ZW'), 
+		0, 
+		DESCR, 
+		.CURRENT_VCB[VCB$W_CUR_SEQ],
+		.CURRENT_VCB[VCB$W_CUR_NUM]);
+
+    ! zero block count
+    !
+    CH$FILL('0', HD1$S_BLOCKCNT, HDR1[HD1$T_BLOCKCNT]);
+
+    ! inserts header label identifiers
+    !
+    HDR1[HD1$L_HD1LID] = 'HDR1';
+    HDR2[HD2$L_HD2LID] = 'HDR2';
+    HDR3[HD3$L_HD3LID] = 'HDR3';
+
+    ! now write headers
+    !
+    WRITE_BLOCK(.HDR1, 80);
+    WRITE_BLOCK(.HDR2, 80);
+
+    ! write hdr3 only if mount switch allows it
+    !
+
+    IF NOT .CURRENT_VCB[VCB$V_NOHDR3]
+    THEN
+	WRITE_BLOCK(.HDR3, 80);
+
+    END;					! end of routine
+
+
+ROUTINE INIT_NEW_FILE (INC_SEQ_NUM) : COMMON_CALL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	this routine initializes the file identifier and sets status
+!	indicators.
+!
+! CALLING SEQUENCE:
+!	INIT_NEW_FILE(ARG1), called in kernel mode
+!
+! INPUT PARAMETERS:
+!	INC_SEQ_NUM - iNDICATES IF THE CURRENT FILE NUMBER IN THE vcb
+!		      should be incremented or not.
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB - address of current volume control block
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	current file id, starlet file indicator updated
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	none
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    ! if end of volume set or dummy file, inc file number
+    !
+
+    IF .INC_SEQ_NUM
+	OR
+	(.CURRENT_VCB[VCB$B_CUR_RVN] EQL 1 AND .CURRENT_VCB[VCB$W_CUR_NUM] EQL 0)
+    THEN
+	CURRENT_VCB[VCB$W_CUR_NUM] = .CURRENT_VCB[VCB$W_CUR_NUM] + 1;
+
+    CURRENT_VCB[VCB$W_CUR_SEQ] = 1;
+    CURRENT_VCB[VCB$V_STARFILE] = 1;
+
+    ! set status indicators to show partial file
+    !
+    CURRENT_VCB[VCB$V_PARTFILE] = 1;
+    END;					! end of routine
+
+
+ROUTINE UPD_PARTFILE (BIT_VALUE) : COMMON_CALL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine clears or sets the partial file flag in the VCB.
+!
+! CALLING SEQUENCE:
+!	UPD_PARTFILE(ARG1), called in kernel mode
+!
+! INPUT PARAMETERS:
+!	Value to which flag should be set to:
+!		0 - clear flag
+!		1 - set flag
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	PARTFILE flag in VCB is updated	
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	none
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    ! Update Partial file flag in the VCB
+    !
+    CURRENT_VCB[VCB$V_PARTFILE] = .BIT_VALUE;
+	
+    END;					! end of routine
+
+END
+
+ELUDOM

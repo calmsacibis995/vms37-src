@@ -1,0 +1,792 @@
+MODULE	OPCOMUTIL	(
+			 LANGUAGE (BLISS32),
+			 IDENT = 'V03-000'
+			) =
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!
+!	OPCOM
+!
+! ABSTRACT:
+!
+!	This module contains all the various and sundry general
+!	purpose utility routines used by OPCOM's request handlers.
+!
+! Environment:
+!
+!	VAX/VMS operating system.
+!
+! Author:
+!
+!	Steven T. Jeffreys
+!
+! Creation date:
+!
+!	March 10, 1981
+!
+! Revision history:
+!
+! V02-004	STJ0159		Steven T. Jeffreys,	08-Feb-1982
+!		Include a 'bell' character in front of each message
+!		that is formatted.  Care must be taken to insure that
+!		the 'bell' is not output to the log file.
+!
+! V02-003	STJ0091		Steven T. Jeffreys,	13-Aug-1981
+!		Suppress facility code for INITAPE and BLANKTAPE.
+!
+! V02-002	STJ0044		Steven T. Jeffreys,	23-May-1981
+!		Modify FORMAT_MESSAGE to suppress facility code for
+!		RQSTCMPLTE, RQSTABORT, and RQSTPEND messages.  This
+!		is necessary to enable existing code to parse the
+!		operator reply messages.
+!
+!--
+
+BEGIN						! Start of OPCOMUTIL
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:OPCOMDEF.REQ';
+
+FORWARD ROUTINE
+	CHECK_REQUEST,			! Common sanity checks
+	FIND_OCD,			! Find an OCD with a given UIC or SCOPE
+	FORMAT_MESSAGE,			! Format an OPCOM message for output
+	INTERPRET_MASK,			! Interpret an attention mask
+	SEND_REPLY;			! Send a reply to a requestor
+
+BUILTIN
+
+	INSQUE,				! Insert entry onto a queue
+	REMQUE;				! Remove entry from a queue
+
+
+GLOBAL ROUTINE CHECK_REQUEST (BUFFER_DESC, BLOCK) =
+
+!++
+! Functional description:
+!
+!	None.
+!
+! Input:
+!
+!	BUFFER_DESC	: Address of a quadword buffer descriptor that
+!			  points to the buffer containing the request
+!			  read from the operator mailbox.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	RQCB		: Address of longword to receive the
+!			  address of an RQCB block.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	The RQCB block is partially filled in.
+!
+! Routine value:
+!
+!	TRUE 		: The request passed the sanity checks
+!	<anything else>	: The request failed a sanity check
+!--
+
+BEGIN						! Start of CHECK_REQUEST
+
+MAP
+	BUFFER_DESC	: REF BBLOCK;		! Buffer descriptor
+
+EXTERNAL ROUTINE
+	ALLOCATE_DS;				! Allocate a data structure
+
+EXTERNAL LITERAL
+	RQCB_K_TYPE,				! RQCB structure type
+	MIN_SCOPE,				! Minimum scope value
+	MAX_SCOPE;				! Maximum scope value
+
+LOCAL
+	RQCB		: REF BBLOCK,		! RQCB structure
+	MSG		: REF BBLOCK,		! Pointer to request
+	STATUS		: LONG;
+
+.BLOCK = 0;					! Assume the request will fail
+!
+! Create a pointer to the request independent data within the message buffer.
+!
+MSG = .BUFFER_DESC [DSC$A_POINTER] + OPC$K_COMHDRSIZ;
+!
+! If the SCOPE is bogus, then ignore the request.
+!
+IF (.MSG [OPC$B_SCOPE] LSS MIN_SCOPE) OR (.MSG [OPC$B_SCOPE] GTR MAX_SCOPE)
+THEN
+    RETURN (SS$_BADPARAM);
+!
+! Allocate an RQCB
+!
+IF NOT (STATUS = ALLOCATE_DS (RQCB_K_TYPE,RQCB))
+THEN
+    RETURN (.STATUS);
+!
+! Copy the request independent data to the RQCB.
+!
+CH$MOVE (($BYTEOFFSET(RQCB_L_MCB) - $BYTEOFFSET(RQCB_W_MSGTYPE)),
+	 .BUFFER_DESC [DSC$A_POINTER],
+	 RQCB [RQCB_W_MSGTYPE]
+	);
+!
+! Default the UIC to the sender's UIC.
+!
+IF .RQCB [RQCB_L_UIC] EQL 0
+THEN
+    RQCB [RQCB_L_UIC] = .RQCB [RQCB_L_SENDERUIC];		! Set UIC
+
+.BLOCK = .RQCB;					! Set RQCB address
+RETURN (TRUE);					! If we get this far, it's ok.
+END;						! End of CHECK_REQUEST
+
+GLOBAL ROUTINE FIND_OCD (SCOPE, UIC, BLOCK) =
+
+!++
+! Functional description:
+!
+!	This routine will scan through the OCD data base and locate the
+!	OCD described by the given SCOPE and UIC.
+!
+! Input:
+!
+!	SCOPE	: The SCOPE of the target OCD.
+!	UIC	: The UIC of the target OCD.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	BLOCK	: Address of a longword to receive the address of the OCD.
+!		  If the OCD is not found, then the address will be zero.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	TRUE	: If the OCD is found
+!	FALSE	: If the OCD is not found
+!--
+
+BEGIN						! Start of FIND_OCD
+
+MAP
+	UIC		  : REF BBLOCK;		! Target UIC
+
+EXTERNAL LITERAL
+	MIN_SCOPE,				! Minimum (most privileged) scope
+	MAX_SCOPE;				! Maximum (least privileged) scope
+
+EXTERNAL
+	OCD_VECTOR	: VECTOR;		! Pointers to OCD list heads
+
+LOCAL
+	OCD		: REF BBLOCK,		! OCd data structure
+	OCD_COUNT	: LONG,			! Count of OCDs in the OCD list
+	FOUND		: LONG;			! Used as loop control and routine value holder
+
+!
+! Seach through the specified list of OCDs to locate
+! an OCD that matches the specified UIC.  The OCD list
+! scanned depends on the SCOPE.
+!
+.BLOCK = 0;					! Zero address
+SELECTONE .SCOPE OF
+    SET
+    [OPC$K_SYSTEM]	: BEGIN
+			  !
+			  ! The SYSTEM OCD list is a special case, as the list
+			  ! length will either be 1 or 0.  Get the address of
+			  ! the OCD list header, and return the list count as
+			  ! the routine value.
+			  !
+			  .BLOCK = .OCD_VECTOR [(.SCOPE - 1)*2];
+			  FOUND = .OCD_VECTOR [(.SCOPE - 1)*2+1];
+			  END;
+
+    [OPC$K_GROUP]	: BEGIN
+			  !
+			  ! Scan through the GROUP OCD list seaching for an OCD
+			  ! with a UIC group field that matched the one specified.
+			  !
+			  OCD = .OCD_VECTOR [(.SCOPE - 1)*2];		! Get address of first OCD in list
+			  OCD_COUNT = .OCD_VECTOR [(.SCOPE - 1)*2+1];	! Get # of OCDs in the list
+			  FOUND = FALSE;				! Assume not found
+			  WHILE (.OCD_COUNT GTR 0) AND (NOT .FOUND) DO
+			      IF .UIC [0,16,16,0] EQL .OCD [$BYTEOFFSET (OCD_L_UIC),16,16,0]
+			      THEN
+				   BEGIN				! We found it
+				  .BLOCK = .OCD;			! Save addres of OCD
+				  FOUND = TRUE;				! Note that we found it
+				  END
+			      ELSE
+				  BEGIN
+				  OCD_COUNT = .OCD_COUNT - 1;		! Decrement OCD count
+				  OCD = .OCD [OCD_L_FLINK];		! Get address of next OCD
+				  END;
+			  END;
+
+    [OPC$K_USER]	: BEGIN
+			  !
+			  ! Scan through the list of USER OCDs looking for an
+			  ! OCD with the SAME UIC as the specified UIC.
+			  !
+			  OCD = .OCD_VECTOR [(.SCOPE - 1)*2];		! Get address of first OCD in list
+			  OCD_COUNT = .OCD_VECTOR [(.SCOPE - 1)*2+1];	! Get # of OCDs in the list
+			  FOUND = FALSE;				! Assume not found
+			  WHILE (.OCD_COUNT GTR 0) AND (NOT .FOUND) DO
+			      IF .UIC EQL .OCD [OCD_L_UIC]
+			      THEN
+				   BEGIN				! We found it
+				  .BLOCK = .OCD;			! Save addres of OCD
+				  FOUND = TRUE;				! Note that we found it
+				  END
+			      ELSE
+				  BEGIN
+				  OCD_COUNT = .OCD_COUNT - 1;		! Decrement OCD count
+				  OCD = .OCD [OCD_L_FLINK];		! Get address of next OCD
+				  END;
+			  END;
+
+    [OTHERWISE]		: FOUND = FALSE;				! Bogus SCOPE
+    TES;
+
+RETURN (.FOUND);
+
+END;						! End of FIND_OCD
+
+GLOBAL ROUTINE FORMAT_MESSAGE (RQCB, MESSAGE_VECTOR) =
+
+!++
+! Functional description:
+!
+!	Given an RQCB address and a message code, this routine will
+!	format the message and build an MCB to describe the message.
+!
+! Input:
+!
+!	RQCB		: Address of an RQCB.
+!	MESSAGE_VECTOR	: Address of a longword vector
+!
+! Implicit Input:
+!
+!	The format of the message vector is as follows:
+!
+!		+--------------------------------+
+!		|	  message number	 |
+!		+--------------------------------+
+!		|         arguement count	 !
+!		+--------------------------------+
+!		|	  first arguement	 |
+!		+--------------------------------+
+!		|		.		 |
+!				.
+!				.
+!		|	   Nth arguement	 |
+!		+--------------------------------+
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	TRUE		: If the message was formatted and an MCB created
+!	<anything else>	: The message could not be formatted and an MCB created.
+!--
+
+BEGIN
+
+MAP
+	MESSAGE_VECTOR	: REF VECTOR,			! Message info
+	RQCB		: REF BBLOCK;			! RQCB data structure
+
+EXTERNAL ROUTINE
+	ALLOCATE_DS,					! Allocate a data structure
+	DEALLOCATE_DS,					! Deallocate a data structure
+	LIB$FREE_VM	: ADDRESSING_MODE (GENERAL),
+	LIB$GET_VM	: ADDRESSING_MODE (GENERAL);
+
+EXTERNAL LITERAL
+	RQCB_K_TYPE,
+	MCB_K_TYPE;
+
+LITERAL
+	ASCII_BELL	= 7,				! ASCII 'bell' character
+	MSG_FLAGS1	= 9,				! Get message facility and text.
+	MSG_FLAGS2	= 1,				! Get message text only.
+	TEXT_LENGTH	= 256,				! Max VMS message text size
+	MESSAGE_LENGTH	= OPC$K_MAXREAD + TEXT_LENGTH;	! Max formatted text size
+
+LOCAL
+	OUT_LENGTH	: LONG,				! Message text length
+	OUT_ARRAY	: LONG,				! Output for $GETMSG
+	TEXT_DESC	: BBLOCK [DSC$K_S_BLN],		! Message text descriptor
+	TEXT_BUFFER	: BBLOCK [TEXT_LENGTH],		! Maximum message size
+	MESSAGE_DESC	: BBLOCK [DSC$K_S_BLN],		! Formatted message descriptor
+	MESSAGE_BUFFER	: BBLOCK [MESSAGE_LENGTH],	! Formatted message buffer
+	BUFFER_POINTER	: LONG,				! Holds address of a VM block
+	MDB		: REF BBLOCK,			! MDB data structure
+	MCB		: REF BBLOCK,			! MCB data structure
+	BLOCK		: REF BBLOCK,			! VM block for message
+	STATUS		: LONG;
+
+!
+! Set up buffer descriptors
+!
+TEXT_DESC [0,0,32,0] = TEXT_LENGTH;		! Set text buffer size
+TEXT_DESC [DSC$A_POINTER] = TEXT_BUFFER;	! Set text buffer address
+MESSAGE_DESC [0,0,32,0] = MESSAGE_LENGTH;	! Clear message size
+MESSAGE_DESC [DSC$A_POINTER] = MESSAGE_BUFFER;	! Set message buffer address
+
+!
+! Get the actual VMS message code from the MDB
+! and get the message text via $GETMSG.
+!
+IF NOT (STATUS = $GETMSG (MSGID  = .MESSAGE_VECTOR [0],
+			  MSGLEN =  OUT_LENGTH,
+			  BUFADR =  TEXT_DESC,
+			  FLAGS  =  (IF .MESSAGE_VECTOR [0] EQL OPC$_RQSTCMPLTE
+				     OR .MESSAGE_VECTOR [0] EQL OPC$_RQSTABORT
+				     OR .MESSAGE_VECTOR [0] EQL OPC$_RQSTPEND
+				     OR .MESSAGE_VECTOR [0] EQL OPC$_BLANKTAPE
+				     OR .MESSAGE_VECTOR [0] EQL OPC$_INITAPE
+				     THEN
+					 MSG_FLAGS2
+				     ELSE
+					 MSG_FLAGS1
+				    ),
+			  OUTADR =  OUT_ARRAY
+			 ))
+THEN
+    RETURN (.STATUS);
+TEXT_DESC [DSC$W_LENGTH] = .OUT_LENGTH;
+
+!
+! Format the message via FAOL.
+!
+OUT_LENGTH = 0;
+IF NOT (STATUS = $FAOL  (CTRSTR = TEXT_DESC,
+			 OUTLEN = OUT_LENGTH,
+			 OUTBUF = MESSAGE_DESC,
+			 PRMLST = MESSAGE_VECTOR [1]
+			))
+THEN
+    RETURN (.STATUS);
+MESSAGE_DESC [DSC$W_LENGTH] = .OUT_LENGTH;
+
+!
+! Allocate a block of memory to hold the formatted message text,
+! and copy the message text to it.  Tack a 'bell' character onto
+! the front of the message.
+!
+OUT_LENGTH = .OUT_LENGTH + 1;
+IF NOT (STATUS = LIB$GET_VM (OUT_LENGTH, BUFFER_POINTER))
+THEN
+    RETURN (.STATUS);
+.BUFFER_POINTER = ASCII_BELL;
+CH$MOVE (.OUT_LENGTH-1, .MESSAGE_DESC [DSC$A_POINTER], .BUFFER_POINTER+1);
+
+!
+! Allocate an MCB for the message.
+! If one is already present on the RQCB, then
+! deallocate it and allocate a new one.
+! Fill in the required MCB fields and attach it
+! to the RQCB.  If the allocate fails, then free
+! the message buffer block that was just allocated.
+!
+IF .RQCB [RQCB_L_MCB] NEQ 0
+THEN
+    DEALLOCATE_DS (.RQCB [RQCB_L_MCB]);
+
+IF NOT (STATUS = ALLOCATE_DS (MCB_K_TYPE, MCB))
+THEN
+    RETURN (.STATUS);
+MCB [MCB_L_MSGID] = .MESSAGE_VECTOR [0];	! Set message code
+MCB [MCB_L_TEXTLEN] = .OUT_LENGTH;		! Set the message length
+MCB [MCB_L_TEXTPTR] = .BUFFER_POINTER;		! Set message address
+MCB [MCB_L_RQCB] = RQCB [HDR_L_FLINK];		! Set RQCB address
+RQCB [RQCB_L_MCB] = .MCB;			! Set MCB address
+
+RETURN (TRUE);
+
+END;						! End of FORMAT_MESSAGE
+
+GLOBAL ROUTINE INTERPRET_MASK (BIT_MASK, STRING_DESC, OUTLEN)  =
+
+!++
+! Functional description:
+!
+!	This routine will take a 64 bit mask, and format an
+!	ASCII string that will name each set bit in the mask.
+!	See module OPCOMDATA for the bit and name definitions.
+!
+! Input:
+!
+!	BIT_MASK	: Address of a 64 element bit vector
+!	STRING_DESC	: Address of a string descriptor to receive the output
+!			  string that names the bits in the mask.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	OUTLEN		: Address of a longword to receive the length of the
+!			  output string.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	TRUE		: Successful completion
+!	<anything else>	: The operation failed
+!--
+
+BEGIN						! Start of INTERPRET_MASK
+
+MAP
+	STRING_DESC	: REF BBLOCK,		! String descriptor
+	BIT_MASK	: REF VECTOR;		! Quadword mask
+
+EXTERNAL
+	NAME_VECTOR	: VECTOR;		! Vector of pointers to bit names
+
+LITERAL
+	CR		= %X'0D',		! ASCII carriage return
+	LF		= %X'0A',		! ASCII line feed
+	MSG_FLAGS	= 1,			! Only get message text
+	MAX_NAM_LEN	= 40,			! Maximum bit name length
+	MAX_LINE	= 70;			! Maximum length of an in
+
+OWN
+	SEPARATOR_DESC	: DESCRIPTOR (', '),	! Name separator
+	NEWLINE_DESC	: DESCRIPTOR (%CHAR (',',CR,LF));
+
+LOCAL
+	K		: LONG,			! Index
+	MASK		: BITVECTOR [32],	! 32 bits of the quadword mask
+	WORK_DESC	: BBLOCK [DSC$K_S_BLN],	! Descriptor of work buffer
+	WORK_BUF	: BBLOCK [OPC$K_MAXREAD],! Work buffer
+	NAME_DESC	: BBLOCK [DSC$K_S_BLN],	! Descriptor for bit name
+	NAME_BUF	: BBLOCK [MAX_NAM_LEN],	! Buffer for bit name
+	PTR		: LONG,			! Pointer to current point in buffer
+	LEN		: LONG,			! Length of current string
+	STATUS		: LONG;
+
+!
+! Return FALSE if the output buffer descriptor is strange.
+! 
+IF (.STRING_DESC [DSC$W_LENGTH] LEQ 0) OR (.STRING_DESC [DSC$A_POINTER] EQL 0)
+THEN
+    RETURN (FALSE);
+!
+! Set up the work buffer descriptor.
+!
+WORK_DESC [0,0,32,0] = 0;
+WORK_DESC [DSC$A_POINTER] = WORK_BUF;
+!
+! If the bit mask is not zero, then for each bit
+! set in the mask get the name of that bit from
+! the message file.  The bit name code (message
+! code) is obtained by using the bit position as
+! an index into the NAME_VECTOR.  Each element in
+! the NAME_VECTOR is a the message code for the
+! associated bit.  Bits that have no name have a
+! zero message code.
+!
+PTR = .WORK_DESC [DSC$A_POINTER];
+LEN = 0;
+INCR I FROM 0 TO 1 DO
+    BEGIN
+    !
+    ! Go through the loop twice, each pass checking 32 bits.
+    ! As an optimization, avoid the loop if the mask is zero.
+    !
+    IF .BIT_MASK [.I] NEQ 0
+    THEN
+	BEGIN
+	MASK = .BIT_MASK [.I];			! Get 32 bits to check
+	INCR J FROM 0 TO 31 DO
+	    BEGIN
+	    IF .MASK [.J]
+	    THEN
+		BEGIN
+		K = (.I * 32) + .J;		! Calculate bit position
+		IF .NAME_VECTOR [.K] NEQ 0
+		THEN
+		    BEGIN
+		    !
+		    ! Get the bit name.
+		    !
+		    NAME_DESC [0,0,32,0] = MAX_NAM_LEN;
+		    NAME_DESC [DSC$A_POINTER] = NAME_BUF;
+		    IF NOT (STATUS = $GETMSG   (MSGID  = .NAME_VECTOR [.K],
+						MSGLEN = NAME_DESC,
+						BUFADR = NAME_DESC,
+						FLAGS  = MSG_FLAGS
+					       ))
+		    THEN
+			RETURN (.STATUS);
+		    !
+		    ! If the name will not fit on the line, start a new line.
+		    ! Allow for the ", " that preceeds each new name.  Allow
+		    ! one space at the end of the line to hold a ",".
+		    !
+		    IF (.LEN + .NAME_DESC [DSC$W_LENGTH] + 2) GTR (MAX_LINE - 1)
+		    THEN
+			BEGIN
+			CH$MOVE (.NEWLINE_DESC [DSC$W_LENGTH], .NEWLINE_DESC [DSC$A_POINTER], .PTR);
+			PTR = .PTR + .NEWLINE_DESC [DSC$W_LENGTH];
+			LEN = 0;
+			END;
+		    !
+		    ! Append the name to the end of the work buffer.  If not at
+		    ! the beginning of a line, preceed the name with ", ".
+		    !
+		    IF .LEN NEQ 0
+		    THEN
+			BEGIN
+			CH$MOVE (.SEPARATOR_DESC [DSC$W_LENGTH], .SEPARATOR_DESC [DSC$A_POINTER], .PTR);
+			PTR = .PTR + .SEPARATOR_DESC [DSC$W_LENGTH];
+			LEN = .LEN + .SEPARATOR_DESC [DSC$W_LENGTH];
+			END;
+		    CH$MOVE (.NAME_DESC [DSC$W_LENGTH], .NAME_DESC [DSC$A_POINTER], .PTR);
+		    PTR = .PTR + .NAME_DESC [DSC$W_LENGTH];
+		    LEN = .LEN + .NAME_DESC [DSC$W_LENGTH];
+		    END;
+		END;
+	    END;
+	END;
+    !
+    ! Determine how much text was copied to the work buffer.
+    !
+    WORK_DESC [DSC$W_LENGTH] = .PTR - .WORK_DESC [DSC$A_POINTER];
+    END;
+!
+! If no bits were named, then return a special message.
+!
+IF .WORK_DESC [DSC$W_LENGTH] EQL 0
+THEN
+    BEGIN
+    WORK_DESC [DSC$W_LENGTH] = OPC$K_MAXREAD;
+    IF NOT (STATUS = $GETMSG (MSGID=OPC$_NOTENABLED, MSGLEN=WORK_DESC, BUFADR=WORK_DESC, FLAGS=MSG_FLAGS))
+    THEN
+	RETURN (.STATUS);
+    END;
+!
+! Copy the work buffer to the output buffer.  If the output
+! buffer is not large enough, fill the output buffer and return
+! SS$_BUFFEROVF to indicate a buffer overflow.
+!
+STATUS = TRUE;					! Assume success
+IF .STRING_DESC [DSC$W_LENGTH] LSS .WORK_DESC [DSC$W_LENGTH]
+THEN
+    BEGIN
+    WORK_DESC [DSC$W_LENGTH] = .STRING_DESC [DSC$W_LENGTH];
+    STATUS = SS$_BUFFEROVF;
+    END;
+CH$MOVE (.WORK_DESC [DSC$W_LENGTH], .WORK_DESC [DSC$A_POINTER], .STRING_DESC [DSC$A_POINTER]);
+.OUTLEN = .WORK_DESC [DSC$W_LENGTH];
+RETURN (.STATUS);
+
+END;						! End of INTERPRET_MASK
+
+GLOBAL ROUTINE SEND_REPLY (RQCB) =
+
+!++
+! Functional description:
+!
+!	This routine will send a reply to a specified mailbox.
+!
+!
+! Input:
+!
+!	RQCB		: Address of an RQCB data structure
+!
+!
+! Implicit Input:
+!
+!	There is an MCB attached to the RQCB.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	A formatted message is sent to the mailbox specified by the RQCB.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+!	TRUE 	: If a reply was sent.
+!	FALSE	: If a reply could not be sent.
+!--
+
+BEGIN						! Start of SEND_REPLY
+
+MAP
+	RQCB		: REF BBLOCK;		! RQCB data structure
+
+EXTERNAL LITERAL
+	MCB_K_TYPE;				! MCB structure type
+
+EXTERNAL
+	MBX_FAO		: BBLOCK;		! FAO control string descriptor
+
+LOCAL
+	MCB		: REF BBLOCK,		! MCB data structure
+	IO_STATUS	: BBLOCK [8],		! I/O status block
+	MSG_SIZE	: WORD,			! Size of reply message
+	MSG_BUF		: BBLOCK [OPC$K_MAXREAD],! Message buffer
+	MBX_CHAN	: WORD,			! Channel to reply mailbox
+	MBX_NAME	: BBLOCK [MAX_DEV_NAM],	! Mailbox device name buffer
+	MBX_DESC	: BBLOCK [DSC$K_S_BLN],	! Mailbox name descriptor
+	DEV_CHAR	: BBLOCK [DIB$K_LENGTH],! Device characteristics buffer
+	DEV_DESC	: BBLOCK [DSC$K_S_BLN],	! Dev. char. buffer descriptor
+	STATUS		: LONG;
+
+!
+! If no reply mailbox is specified, then return success.
+!
+IF .RQCB [RQCB_W_REPLYMBX] EQL 0
+THEN
+    RETURN (FALSE);
+!
+! Check for a valid MCB.  If none, then return false.
+!
+MCB = .RQCB [RQCB_L_MCB];
+IF (.MCB EQL 0) OR (.MCB [MCB_B_TYPE] NEQ MCB_K_TYPE)
+THEN
+    RETURN (FALSE);
+!
+! Format the reply mailbox name.
+!
+MBX_DESC [0,0,32,0] = MAX_DEV_NAM;
+MBX_DESC [DSC$A_POINTER] = MBX_NAME;
+IF NOT $FAO (MBX_FAO, MBX_DESC, MBX_DESC, .RQCB [RQCB_W_REPLYMBX])
+THEN
+    RETURN (FALSE);
+!
+! Create a buffer descriptor for the device characteristics,
+! and call $GETDEV to get the device characteristics.
+!
+DEV_DESC [0,0,32,0] = DIB$K_LENGTH;
+DEV_DESC [DSC$A_POINTER] = DEV_CHAR;
+IF NOT (STATUS = $GETDEV (DEVNAM=MBX_DESC, PRIBUF=DEV_DESC))
+THEN
+    RETURN (.STATUS);
+!
+! Build the reply message.
+!
+MSG_BUF [OPC$B_MS_TYPE] = MSG$_OPREPLY;			! Set message type code
+MSG_BUF [OPC$W_MS_STATUS] = .MCB [MCB_L_MSGID];		! Set reply status
+MSG_BUF	[OPC$L_MS_RPLYID] = .RQCB [RQCB_L_RQSTID];	! Set user request id
+MSG_SIZE = $BYTEOFFSET (OPC$L_MS_TEXT);
+IF (.MCB [MCB_L_TEXTLEN]-1) GTR 0
+THEN
+    BEGIN
+    CH$MOVE (.MCB [MCB_L_TEXTLEN]-1,			! Copy reply text to buffer
+	     .MCB [MCB_L_TEXTPTR]+1,			! but do not copy the
+	     MSG_BUF [OPC$L_MS_TEXT]			! 'bell' character.
+	    );
+    MSG_SIZE = .MSG_SIZE + .MCB [MCB_L_TEXTLEN];
+    END;
+!
+! Check the mailbox size against the reply message size.
+! If the mailbox is too small to accomodate the entire message,
+! truncate the message to the mailbox size.
+!
+IF (.MSG_SIZE GTR .DEV_CHAR [DIB$W_DEVBUFSIZ])
+THEN
+    MSG_SIZE = .DEV_CHAR [DIB$W_DEVBUFSIZ];
+!
+! Assign a channel to the mailbox.
+!
+IF NOT (STATUS = $ASSIGN (DEVNAM=MBX_DESC, CHAN=MBX_CHAN))
+THEN
+    RETURN (.STATUS);
+!
+! Send the message to the mailbox.
+!
+IF (STATUS = $QIOW (FUNC = (IO$_WRITEVBLK OR IO$M_NOW),
+		    CHAN = .MBX_CHAN,
+		    IOSB = IO_STATUS,
+		    P1	 = MSG_BUF,
+		    P2	 = .MSG_SIZE
+		   ))
+THEN
+    STATUS = .IO_STATUS [0,0,16,0];		! Get I/O status
+!
+! Deassign the channel to the mailbox.
+!
+$DASSGN (CHAN = .MBX_CHAN);
+!
+! Return the I/O status as the return value.
+!
+RETURN (.STATUS);
+
+END;						! End of SEND_REPLY
+
+END						! End of OPCOMUTIL
+ELUDOM

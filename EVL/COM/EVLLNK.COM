@@ -1,0 +1,9 @@
+$ !
+$ !	Link the network event logger
+$ !
+$ QUAL := NOTRACE
+$ IF P1 .NES "" THEN QUAL := DEBUG
+$ DELETE EXE$:EVL.EXE;*, MAP$:EVL.MAP;*, LIB$:EVL.STB;*
+$ LINK /EXE=EXE$:EVL /MAP=MAP$:EVL/FULL/CROSS /SYMBOLS=LIB$:EVL -
+	 /'QUAL' -
+	LIB$:EVL/LIBRARY/INCLUDE=EVLMAIN

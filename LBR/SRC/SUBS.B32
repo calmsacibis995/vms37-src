@@ -1,0 +1,665 @@
+MODULE LBR_SUBS (			! General library procedure routines
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-002'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  Library access procedures
+!
+! ABSTRACT:
+!
+!	The VAX/VMS librarian procedures implement a standard access method
+!	to libraries through a shared, common procedure set.
+!
+! ENVIRONMENT:
+!
+!	VAX native, user mode.
+!
+!--
+!
+!
+! AUTHOR:  Tim Halvorsen, Benn Schreiber
+!
+! CREATION DATE: June, 1979
+!
+! MODIFIED BY:
+!
+!	V03-002		BLS0172		Benn Schreiber	19-Apr-1982
+!		Return lbr$_keynotfnd rather than lbr$_invkey in
+!		routine make_upper_case (optimization, since key
+!		won't be there if size bigger than max size in library)
+!
+!	V03-001		BLS0171		Benn Schreiber	14-Apr-1982
+!		Set lbr$gl_rmsstv in read_n_block
+!
+!	V02-004		RPG0004		Bob Grosso	22-Dec-1981
+!		Support removal of keyword trailing blanks.
+!
+!	V02-003		RPG0003		Bob Grosso	19-Nov-1981
+!		Avoid looping when there are no blocks read from
+!		the library file.
+!
+!	V02-002		RPG0002		Bob Grosso	08-Sep-1981
+!		Add moveto_upper_case routine.
+!
+!	V02-001		RPG0009		Bob Grosso	6-Jan-1981
+!		Remove BUILTIN declaration.
+!--
+
+
+
+%SBTTL  'Declarations';
+
+LIBRARY
+	'SYS$LIBRARY:STARLET.L32';	! System macros
+REQUIRE
+	'PREFIX';		! Librarian general definitions
+REQUIRE
+	'LBRDEF';		! Librarian structure definitions
+
+EXTERNAL
+    lbr$gl_maxread,		! Max blocks to read at once
+    lbr$gl_hictl,		! Highest control block allocated
+    lbr$gl_rmsstv,		! Returns STV on RMS errors
+    lbr$gl_control: REF BBLOCK, ! Pointer to current control block
+    lbr$al_ctltab: VECTOR [lbr$c_maxctl]; ! Pointers to control blocks
+
+EXTERNAL ROUTINE
+    remove_cache : JSB_1,	! Remove entry from cache
+    lookup_cache : JSB_2,	! Lookup entry in disk cache
+    add_cache : JSB_2,		! Add entry to cache
+    lbr$get_vm : JSB_2,		! Allocate memory
+    lbr$free_vm: JSB_2;		! Deallocate memory
+
+EXTERNAL LITERAL
+    lbr$_illctl,
+    lbr$_invkey,
+    lbr$_keynotfnd,
+    lbr$_libnotopn;
+
+FORWARD ROUTINE
+    get_mem : JSB_2,		! Allocate dynamic memory
+    dealloc_mem : JSB_2,	! Deallocate dynamic memory
+    get_zmem : JSB_2,		! Allocated zeroed memory
+    validate_ctl : JSB_1,	! Validate control table
+    alloc_block : JSB_2,	! Allocate disk block
+    dealloc_block : JSB_1,	! Deallocate disk block
+    write_block : JSB_2,	! Write disk block
+    read_block : JSB_2,		! Read disk block
+    read_n_block : JSB_2,	! Read multiple disk blocks
+    find_block : JSB_3,		! Read vbn from disk and cache if not there
+    make_upper_case : JSB_3,	! Guarantee name all upper case
+    moveto_upper_case : JSB_3,	! Upcase and move string
+    incr_rfa: JSB_2 NOVALUE;	! Increment RFA by byte count
+
+
+%SBTTL  'MAKE_UPPER_CASE';
+
+GLOBAL ROUTINE make_upper_case (idesc, odesc, upcase) : JSB_3 =
+BEGIN
+!++
+!
+! Upper case the name described by string descriptor idesc
+! Put the name at descriptor found by odesc. Length may be
+! modified if trailing blanks.
+!
+! Inputs:
+!
+!	idesc	string descriptor for the name or address of binary value
+!	odesc	string descriptor for output name or address of binary value
+!	upcase	if true then raise case, else just check length and copy
+!
+! Outputs:
+!
+!	string converted to upper case. trailing blanks eliminated and
+!	odesc [dsc$w_length] modified to reflect this.
+!
+!	If binary keys are passed, the value is merely copied.
+!
+! Return value:
+!
+!	true		name upper cased and length ok
+!	lbr$_invkey	name is 0-length
+!	lbr$_keynotfnd	name is too long
+!--
+MAP
+    idesc : REF BBLOCK,
+    odesc : REF BBLOCK;
+
+BIND
+    namlen = idesc [dsc$w_length] : WORD,
+    iname = idesc [dsc$a_pointer] : REF VECTOR [,BYTE],
+    index_desc = .lbr$gl_control  [lbr$l_hdrptr] + lhd$c_idxdesc
+			+ (.lbr$gl_control [lbr$l_curidx] - 1)
+				* idd$c_length : BBLOCK,	!Point to index desc.
+    oname = .odesc [dsc$a_pointer] : VECTOR [,BYTE];		!Output vector
+
+IF NOT .index_desc [idd$v_ascii]		!If binary keys
+THEN BEGIN
+    .odesc = ..idesc;				! then just copy the value
+    RETURN true;
+    END;
+!
+! Handle ascii keys differently
+!
+IF .namlen EQL 0				!0-length name is illegal
+	THEN RETURN lbr$_invkey;
+!
+! Name length is ok, convert to upper case
+!
+INCRU i FROM 0 TO .namlen-1 DO
+    BEGIN
+    IF .iname [.i] EQL %ASCII ' '		!If character is a space
+      OR .iname [.i] EQL 0			! or a null
+    THEN
+	BEGIN					! then adjust output descriptor and exit
+	odesc [dsc$w_length] = .i;
+	EXITLOOP;
+	END
+    ELSE 
+	IF (.iname [.i] GEQU %ASCII'a'		!copy name and convert to upper case
+	  AND .iname [.i] LEQU %ASCII'z'
+	  AND .upcase)				! if not upcasing then just copy
+	THEN oname [.i] = .iname [.i] - (%ASCII'a' - %ASCII'A')
+	ELSE oname [.i] = .iname [.i];
+    END;
+IF .odesc [dsc$w_length] GTRU .index_desc [idd$w_keylen] !Check for name too long
+    THEN RETURN lbr$_keynotfnd
+    ELSE RETURN true
+END;						!Of make_upper_case
+
+%SBTTL  'MOVETO_UPPER_CASE';
+
+GLOBAL ROUTINE moveto_upper_case (len, instring, outstring) : JSB_3 =
+BEGIN
+LOCAL
+    indesc : BBLOCK [dsc$c_s_bln],
+    outdesc : BBLOCK [dsc$c_s_bln],
+    status;
+
+indesc [dsc$w_length] = .len;
+indesc [dsc$a_pointer] = .instring;
+outdesc [dsc$a_pointer] = .outstring;
+status = make_upper_case (indesc, outdesc, true);
+RETURN .status;
+END;
+
+%SBTTL 'GET_MEM';
+
+GLOBAL ROUTINE get_mem (bytes, retadr) : JSB_2 =
+
+!---
+!
+!	This routine allocates virtual memory for the library access
+!	routines.  The memory will not be zeroed.
+!
+! Inputs:
+!
+!	bytes = number of bytes to allocate
+!	retadr = address to receieve address of memory
+!
+! Routine value:
+!
+!	lib$_insvirmem	insufficient virtual memory
+!	lib$_badblosiz	bad block size
+!	true		success
+!--
+
+LBR$GET_VM (.bytes, .retadr);		! Allocate the memory
+
+%SBTTL 'DEALLOC_MEM';
+
+GLOBAL ROUTINE dealloc_mem (bytes, address) : JSB_2 =
+
+!---
+!
+!	Deallocate dynamic memory.
+!
+! Inputs:
+!
+!	bytes = Number of bytes to deallocate.
+!	address = Starting address to deallocate.
+!
+! Outputs:
+!
+!	None
+!---
+
+LBR$FREE_VM (.bytes, .address);		! Deallocate memory
+
+%SBTTL 'GET_ZMEM';
+
+GLOBAL ROUTINE get_zmem (bytes, retadr) : JSB_2 =
+
+!---
+!
+!	This routine obtains dynamic virtual memory
+!	and zeros the memory as well before returning.
+!
+! Inputs:
+!
+!	bytes = Number of bytes to obtain
+!	retadr = Address to return address of memory
+!
+! Outputs:
+!
+!	The memory is zeroed.
+!---
+
+BEGIN
+
+LOCAL
+    status;
+
+perform (get_mem (.bytes, .retadr));	! Get the memory
+
+CH$FILL (0,.bytes,..retadr);	! Zero the memory
+
+RETURN true
+END;
+
+%SBTTL 'FIND_BLOCK';
+
+GLOBAL ROUTINE find_block (vbn, blockaddr, entry) : JSB_3 =
+BEGIN
+!
+! This routine reads the given VBN from the disk and caches it
+! in memory (if it is not already there).
+!
+
+LOCAL
+    cachentry : REF BBLOCK;
+
+IF lookup_cache (.vbn, cachentry)
+THEN .blockaddr = .cachentry [cache$l_address]
+ELSE BEGIN
+    perform (read_block (.vbn, .blockaddr));
+    perform (add_cache (.vbn, cachentry));
+    cachentry [cache$l_address] = ..blockaddr;
+    END;
+.entry = .cachentry;
+RETURN true
+END;						!Of find_block
+
+%SBTTL 'VALIDATE_CTL';
+
+GLOBAL ROUTINE validate_ctl (index) : JSB_1 =
+
+!---
+!
+!	This routine performs most of the initial checking done
+!	during argument validation for the processing routines.
+!	Its checks a given control table index for validity and
+!	also ensures that the library file has already been opened.
+!
+! Inputs:
+!
+!	index = Control table index
+!
+! Outputs:
+!
+!	lbr$_libnotopn - library not open
+!	lbr$_illctl - illegal control table index
+!---
+
+BEGIN
+
+lbr$gl_rmsstv = 0;			! Preset to no error
+IF .index GEQU lbr$c_maxctl		! If greater than maximum,
+    OR .lbr$al_ctltab [.index-1] EQL 0	! Or if uninitialized slot,
+THEN
+    RETURN lbr$_illctl;			! return with error
+
+lbr$gl_control = .lbr$al_ctltab [.index-1]; ! Set current index
+
+IF NOT .lbr$gl_control [lbr$v_open]	! If library not open,
+THEN
+    RETURN lbr$_libnotopn;		! then return with error
+
+RETURN true;
+
+END;
+
+%SBTTL 'ALLOC_BLOCK';
+
+GLOBAL ROUTINE alloc_block (vbn, address) : JSB_2 =
+
+!---
+!
+!	Allocate an unused disk block in the file and return
+!	the address of the block in memory.
+!
+! Inputs:
+!
+!	vbn = Longword to receive VBN of allocated block
+!	address = Longword to receive address of block in memory
+!
+! Outputs:
+!
+!	vbn = VBN of newly allocated block
+!	address = Address of block in memory
+!---
+
+BEGIN
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr]: BBLOCK,	! Context block
+    header = .lbr$gl_control [lbr$l_hdrptr]: BBLOCK;	! Header block
+
+LOCAL
+    cachentry : REF BBLOCK;
+
+IF .header [lhd$l_freevbn] NEQ 0	! If logically deleted space,
+THEN
+    BEGIN
+    perform (find_block(		! Read 1st free block
+		.header [lhd$l_freevbn], .address, cachentry));
+    .vbn = .header [lhd$l_freevbn];	! Return VBN of block
+    header [lhd$l_freevbn] = ...address;! Dequeue 1st block from chain
+    header [lhd$l_freeblk] = .header [lhd$l_freeblk] -1;
+    perform (remove_cache (..vbn));	! Remove entry from cache so caller may 
+					!  reinsert if desired
+    END
+ELSE
+    BEGIN
+    BIND
+	next_vbn = header [lhd$l_nextvbn];	! End of library
+
+    perform (get_zmem (lbr$c_pagesize,.address));	! Allocate space for block
+    .vbn = .next_vbn;				! Return VBN of block
+    next_vbn = .next_vbn + 1;			!next vbn is next block
+    END;
+
+context [ctx$v_hdrdirty] = true;	! Mark header modified
+
+RETURN true;
+END;
+
+%SBTTL 'DEALLOC_BLOCK';
+
+GLOBAL ROUTINE dealloc_block (vbn) : JSB_1 =
+
+!---
+!
+!	Deallocate a disk block in the file and add the block
+!	to the logically deleted disk block list.
+!
+! Inputs:
+!
+!	vbn = Longword to receive VBN of allocated block
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr]: BBLOCK,	! Context block
+    header = .lbr$gl_control [lbr$l_hdrptr]: BBLOCK;	! Header block
+
+LOCAL
+    blockaddr : REF VECTOR [,LONG],
+    cachentry : REF BBLOCK,
+    thisblock : REF VECTOR [,LONG],
+    thiscache : REF BBLOCK,
+    prevblock : REF VECTOR [,LONG],
+    prevcache : REF BBLOCK,
+    thisvbn,
+    prevbn;
+
+perform (find_block (.vbn, blockaddr, cachentry)); !Find block in memory
+thisvbn = .header [lhd$l_freevbn];	! Get free block listhead
+perform (find_block (.thisvbn, thisblock, thiscache)); !Find first block
+prevbn = 0;
+prevblock = 0;
+prevcache = 0;
+!
+! Loop through the free blocks looking for the place to insert
+! this block.
+!
+WHILE .vbn GTRU .thisvbn
+    AND .thisvbn NEQ 0
+DO BEGIN
+    perform (find_block (.thisvbn, thisblock, thiscache)); ! Locate the block
+    prevbn = .thisvbn;			! Remember previous block
+    thisvbn = .thisblock [0];		! Link to next
+    prevblock = .thisblock;		! Remember the location of it
+    prevcache = .thiscache;
+    END;
+IF .prevbn NEQ 0			! If it goes in the list somewhere
+THEN BEGIN
+    blockaddr [0] = .prevblock [0];	! Copy forward link of previous block
+    prevblock [0] = .vbn;		! And insert into the list
+    cachentry [cache$v_dirty] = true;	! Mark blocks as dirty
+    cachentry [cache$v_data] = false;	! No longer a data block
+    prevcache [cache$v_dirty] = true;
+    END
+ELSE BEGIN
+    blockaddr [0] = .header [lhd$l_freevbn]; ! Insert into free chain
+    header  [lhd$l_freevbn] = .vbn;	! Insert into free chain
+    cachentry [cache$v_dirty] = true;	! Mark the block as dirty
+    cachentry [cache$v_data] = false;	! No longer a data block
+    END;
+
+header [lhd$l_freeblk] = .header [lhd$l_freeblk] +1; ! Count another free block
+
+context [ctx$v_hdrdirty] = true;	! Mark header modified
+
+RETURN true;
+END;
+
+%SBTTL 'WRITE_BLOCK';
+
+GLOBAL ROUTINE write_block (addr, vbn) : JSB_2 =
+
+!---
+!
+!	This routine writes a block in memory to the library
+!	file at the specified block number.
+!
+! Inputs:
+!
+!	addr = Address of block in memory
+!	vbn = disk block number
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr]: BBLOCK,
+    rab   = .context [ctx$l_recrab]: BBLOCK;
+
+LOCAL
+    status;
+
+rab [rab$l_bkt] = .vbn;		! Set block number to write
+rab [rab$l_rbf] = .addr;	!Set address of buffer for write
+rab [rab$w_rsz] = lbr$c_pagesize;	!And its length
+status = $WRITE (RAB=rab);	!Write the record
+IF NOT .status
+THEN lbr$gl_rmsstv = .rab [rab$l_stv];
+RETURN .status;
+
+END;
+
+%SBTTL 'READ_BLOCK';
+
+GLOBAL ROUTINE read_block (vbn, addr) : JSB_2 =
+
+!---
+!
+!	This routine reads a specified block and returns
+!	the address of the block in memory.
+!
+! Inputs:
+!
+!	vbn = block number in file
+!	addr = Longword to receive address of block
+!
+! Outputs:
+!
+!	addr = Address of block read from disk
+!---
+
+BEGIN
+
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr]: BBLOCK,
+    rab   = .context [ctx$l_recrab]: BBLOCK;
+LOCAL
+    status;
+
+perform (get_mem (lbr$c_pagesize,rab [rab$l_ubf]));	! Allocate storage for block
+rab [rab$w_usz] = lbr$c_pagesize;		! Set size of buffer
+rab [rab$l_bkt] = .vbn;		! Set block number to read
+status = $READ (RAB=rab);	! Read the block into memory
+IF NOT .status
+THEN lbr$gl_rmsstv = .rab [rab$l_stv];
+.addr = .rab [rab$l_rbf];		! Return address
+
+RETURN .status;
+
+END;
+
+%SBTTL 'READ_N_BLOCK';
+
+GLOBAL ROUTINE read_n_block (start_block, num_blocks) : JSB_2 =
+BEGIN
+!
+! This routine reads the given number of blocks, starting with start_block,
+! and caches them in the disk block cache.
+!
+BIND
+    context = .lbr$gl_control [lbr$l_ctxptr] : BBLOCK,
+    librab = .context [ctx$l_recrab] : BBLOCK;
+
+LOCAL
+    nblocks,
+    rblocks,
+    blkaddr,
+    cachentry : REF BBLOCK,
+    all_blocks,
+    rmsstv,
+    status;
+!
+! Allocate the memory
+!
+IF .num_blocks EQL 0
+    THEN RETURN true;
+all_blocks = true;
+nblocks = MINU (.lbr$gl_maxread, .num_blocks);
+IF .nblocks LSS .num_blocks
+    THEN all_blocks = false;
+INCRU i FROM 0 TO .nblocks - 1
+DO IF lookup_cache (.start_block+.i, cachentry)
+    THEN BEGIN
+	nblocks = .i;
+	EXITLOOP;
+	END;
+IF .nblocks LEQ 0
+    THEN RETURN true;
+DO  (status = get_mem (.nblocks*lbr$c_pagesize, blkaddr))
+UNTIL .status
+    OR ((nblocks = .nblocks - 1) LEQ 0);
+!
+! Memory is allocated, read the blocks
+!
+IF .nblocks GTR 0
+THEN BEGIN
+    librab [rab$l_bkt] = .start_block;			!Set starting vbn
+    librab [rab$l_ubf] = .blkaddr;			!and buffer address
+    librab [rab$w_usz] = .nblocks*lbr$c_pagesize;	!and byte count
+    status = $READ (RAB=librab);			!Read the blocks
+    rmsstv = .librab[rab$l_stv];			!Save the STV
+    rblocks = .librab [rab$w_rsz]/lbr$c_pagesize; 	!Compute number of blocks read
+    IF .rblocks LSSU .nblocks				! and if we did not fill the buffer
+    THEN dealloc_mem ((.nblocks-.rblocks)*lbr$c_pagesize, !Then deallocate the memory
+			.blkaddr+ (.rblocks*lbr$c_pagesize));
+    IF .rblocks LEQ 0					! No blocks read
+    THEN BEGIN
+	IF NOT .status
+	    THEN lbr$gl_rmsstv = .rmsstv;
+	RETURN .status;
+	END;
+
+    INCRU i FROM 0 TO .rblocks-1			!Loop over all read
+    DO BEGIN
+	IF NOT add_cache (.start_block+.i, cachentry)	!Try to add to cache
+	THEN dealloc_mem (lbr$c_pagesize, .blkaddr)
+	ELSE BEGIN
+	    cachentry [cache$l_address] = .blkaddr;
+	    END;
+	blkaddr = .blkaddr + lbr$c_pagesize;
+	END;
+    IF .nblocks LSSU .num_blocks			!If we did not read all requested
+	AND .status NEQ rms$_eof			! and we did not read to end of file
+	AND NOT .all_blocks		
+	THEN read_n_block (.start_block+.nblocks, .num_blocks-.nblocks);
+    IF .status EQL rms$_eof
+	THEN RETURN true
+	ELSE BEGIN
+	    IF NOT .status
+		THEN lbr$gl_rmsstv = .rmsstv;
+	    RETURN .status;
+	    END;
+    END;
+RETURN .status						!Could not allocate memory
+END;				!Of read_n_block
+
+
+%SBTTL 'INCR_RFA';
+
+GLOBAL ROUTINE incr_rfa (incrmnt, rfadr) : JSB_2 NOVALUE =
+BEGIN
+!
+! This routine updates the specified rfa by incrementing by
+! the given number of bytes.
+!
+!
+MAP
+    rfadr : REF BBLOCK;
+
+LOCAL
+    offset;
+
+offset = (.rfadr [rfa$w_offset] + .incrmnt + 1) AND NOT 1; !Compute total # bytes
+rfadr [rfa$w_offset] = .offset AND (data$c_length - 1); !Compute new offset
+rfadr [rfa$l_vbn] = .rfadr [rfa$l_vbn] +
+		(.offset/data$c_length);
+RETURN
+END;					! Of incr_rfa
+
+END					! Of module
+ELUDOM

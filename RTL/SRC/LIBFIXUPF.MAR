@@ -1,0 +1,918 @@
+	.TITLE	LIB$FIXUP_FLT - Fixup floating reserved operand
+	.IDENT	/2-006/		; File: LIBFIXUPF.MAR Edit: DGP2006
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY: General Utility Library
+;
+; ABSTRACT:
+;
+;	LIB$FIXUP_FLT fixes up floating reserved operands when a
+;	reserved operand fault occurs so that the instruction may
+;	may be continued.  It is designed to be a condition handler
+;	or to be called from a condition handler.
+;
+; ENVIRONMENT: Runs at any access mode, AST Reentrant
+;
+; AUTHOR: Thomas N. Hastings, Version 1, CREATION DATE: 06-AUG-1977
+;	  Steven B. Lionel,   Version 2, CREATION DATE: 02-JAN-1980
+;
+; MODIFIED BY:
+;
+; 2-001 - Adapted from LIB$FIXUP_FLT version 1-004.  Use table lookup for
+;	  opcode and operand selection, remove PROBEs, improve operand
+;	  fixup logic.  SBL 2-JAN-1980
+; 2-002 - MOVAB of a constant isn't PIC, use MOVL instead.  SBL 9-Jan-1980
+; 2-003 - Correct the MOVB at NEXT_OPERAND to a MOVZBL so that there isn't
+;	  garbage in the upper part of R0.  SBL 12-Jan-1981
+; 2-004 - Use local handler so that we only return SS$_ACCVIO and SS$_ROPRAND
+;	  as statuses, all other exceptions (like SS$_OPCDEC) resignal.
+;	  SBL 13-Oct-1981
+; 2-005 - Use LIB$GET_OPCODE if BPT seen.  SBL 4-Jan-1982
+; 2-006 - Defend the PROBE instruction by checking for SF$L_SAVE_REGS greater
+;	  than 512.  DGP 15-Mar-1982
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; LIBRARY MACRO CALLS:
+;
+	$SFDEF			; Stack frame symbols
+	$CHFDEF			; Condition handling facility symbols
+	$STSDEF			; Status value symbols
+	$SSDEF			; System status values
+;
+; EXTERNAL DECLARATIONS:
+;
+	.DSABL	GBL		; Force all external symbols to be declared
+	.EXTRN	LIB$_BADSTA	; Bad stack frame
+	.EXTRN	LIB$SIG_TO_RET	; Convert signals to return status
+	.EXTRN	LIB$GET_OPCODE	; Get debugger-modified opcode
+	.EXTRN	SYS$CALL_HANDL	; System routine that calls handlers
+;
+; MACROS:
+;
+;	NONE
+;
+; EQUATED SYMBOLS:
+;
+	R0_OFF	 = 0*4			; R0 register offset in register image
+	R1_OFF	 = 1*4			; R1 register offset
+	AP_OFF	 = 12*4			; AP register offset
+	FP_OFF	 = 13*4			; FP register offset
+	SP_OFF	 = 14*4			; SP register offset
+	PC_OFF	 = 15*4			; PC register offset
+	PSL_OFF	 = 16*4			; PSL offset 
+
+	K_SAV_IMAGE_SIZ = 4*17		; size of each image vector
+	REG_IMAGE = -K_SAV_IMAGE_SIZ	; FP offset for image vector of registers
+	ADR_IMAGE = -<K_SAV_IMAGE_SIZ>*2 ; FP offset for image vector of addresses
+					; where registers have been saved in stack
+	IMAGE_PSL = -4			; FP offset of PSL image
+	IMAGE_PC = -8			; FP offset of PC image
+
+
+; Define first byte of two byte opcodes for G and H.  G instructions
+; are ffFD where ff is a F floating opcode and H instructions are
+; ddFD where dd is a D floating opcode.  For example, POLYG is 55FD
+; and POLYH is 75FD.
+
+	G_H	= ^XFD			; first G and H opcode byte
+
+	BPT	= ^X03			; Opcode for BPT instruction
+
+; Define field in floating data types to test for reserved operand.
+
+	S_FMZERO = 9			; size for F
+	V_FMZERO = 7			; position for F
+	S_GMZERO = 12			; size for G
+	V_GMZERO = 4			; position  for G
+	S_HMZERO = 16			; size for H
+	V_HMZERO = 0			; position for H
+
+; Define codes used to denote operand types in opcode/operand tables
+; to follow.
+
+	OP_Z	= 0			; No more operands to process
+	OP_B	= 1			; Byte
+	OP_W	= 2			; Word
+	OP_F	= 3			; F_floating
+	OP_D	= 4			; D_floating
+	OP_G	= 5			; G_floating
+	OP_H	= 6			; H_floating
+;
+; OWN STORAGE:
+;
+	.PSECT _LIB$CODE PIC, USR, CON, REL, LCL, SHR, -
+			EXE, RD, NOWRT, LONG
+;
+
+; Tables of opcodes and operand types.  The first byte in each entry
+; is the opcode (or second byte of a 2-byte opcode).  The remaining
+; bytes (up to 3) are OP_x codes defined above that specify what datatype
+; each operand is for that instruction.  If an operand type is 0, then
+; no more operands are processed for that instruction.
+;
+; These tables are binary searched so the opcodes must be in ascending
+; order and the entry addresses must be longword aligned.  This latter
+; requirement is met by having these tables be first in this module.
+
+; Table for single byte opcodes
+SING_TAB:
+	.BYTE	^X40, OP_F, OP_F, 0   	; ADDF2
+	.BYTE	^X41, OP_F, OP_F, 0   	; ADDF3
+	.BYTE	^X42, OP_F, OP_F, 0   	; SUBF2
+	.BYTE	^X43, OP_F, OP_F, 0   	; SUBF3
+	.BYTE	^X44, OP_F, OP_F, 0   	; MULF2
+	.BYTE	^X45, OP_F, OP_F, 0   	; MULF3
+	.BYTE	^X46, OP_F, OP_F, 0   	; DIVF2
+	.BYTE	^X47, OP_F, OP_F, 0   	; DIVF3
+	.BYTE	^X48, OP_F, 0   , 0   	; CVTFB
+	.BYTE	^X49, OP_F, 0   , 0   	; CVTFW
+	.BYTE	^X4A, OP_F, 0   , 0   	; CVTFL
+	.BYTE	^X4B, OP_F, 0   , 0   	; CVTRFL
+	.BYTE	^X4F, OP_F, OP_F, OP_F	; ACBF
+	.BYTE	^X50, OP_F, 0   , 0   	; MOVF
+	.BYTE	^X51, OP_F, OP_F, 0   	; CMPF
+	.BYTE	^X52, OP_F, 0   , 0   	; MNEGF
+	.BYTE	^X53, OP_F, 0   , 0   	; TSTF
+	.BYTE	^X54, OP_F, OP_B, OP_F	; EMODF
+	.BYTE	^X55, OP_F, 0   , 0   	; POLYF
+	.BYTE	^X56, OP_F, 0   , 0   	; CVTFD
+	.BYTE	^X60, OP_D, OP_D, 0   	; ADDD2
+	.BYTE	^X61, OP_D, OP_D, 0   	; ADDD3
+	.BYTE	^X62, OP_D, OP_D, 0   	; SUBD2
+	.BYTE	^X63, OP_D, OP_D, 0   	; SUBD3
+	.BYTE	^X64, OP_D, OP_D, 0   	; MULD2
+	.BYTE	^X65, OP_D, OP_D, 0   	; MULD3
+	.BYTE	^X66, OP_D, OP_D, 0   	; DIVD2
+	.BYTE	^X67, OP_D, OP_D, 0   	; DIVD3
+	.BYTE	^X68, OP_D, 0   , 0   	; CVTDB
+	.BYTE	^X69, OP_D, 0   , 0   	; CVTDW
+	.BYTE	^X6A, OP_D, 0   , 0   	; CVTDL
+	.BYTE	^X6B, OP_D, 0   , 0   	; CVTRDL
+	.BYTE	^X6F, OP_D, OP_D, OP_D	; ACBD
+	.BYTE	^X70, OP_D, 0   , 0   	; MOVD
+	.BYTE	^X71, OP_D, OP_D, 0   	; CMPD
+	.BYTE	^X72, OP_D, 0   , 0   	; MNEGD
+	.BYTE	^X73, OP_D, 0   , 0   	; TSTD
+	.BYTE	^X74, OP_D, OP_B, OP_D	; EMODD
+	.BYTE	^X75, OP_D, 0   , 0   	; POLYD
+	.BYTE	^X76, OP_D, 0   , 0   	; CVTDF
+SING_END:
+
+; Table for 2-byte opcodes.  First byte (^XFD) is omitted.
+
+DOUB_TAB:
+	.BYTE	^X32, OP_D, 0   , 0   	; CVTDH
+	.BYTE	^X33, OP_G, 0   , 0   	; CVTGF
+	.BYTE	^X40, OP_G, OP_G, 0   	; ADDG2
+	.BYTE	^X41, OP_G, OP_G, 0   	; ADDG3
+	.BYTE	^X42, OP_G, OP_G, 0   	; SUBG2
+	.BYTE	^X43, OP_G, OP_G, 0   	; SUBG3
+	.BYTE	^X44, OP_G, OP_G, 0   	; MULG2
+	.BYTE	^X45, OP_G, OP_G, 0   	; MULG3
+	.BYTE	^X46, OP_G, OP_G, 0   	; DIVG2
+	.BYTE	^X47, OP_G, OP_G, 0   	; DIVG3
+	.BYTE	^X48, OP_G, 0   , 0   	; CVTGB
+	.BYTE	^X49, OP_G, 0   , 0   	; CVTGW
+	.BYTE	^X4A, OP_G, 0   , 0   	; CVTGL
+	.BYTE	^X4B, OP_G, 0   , 0   	; CVTRGL
+	.BYTE	^X4F, OP_G, OP_G, OP_G	; ACBG
+	.BYTE	^X50, OP_G, 0   , 0   	; MOVG
+	.BYTE	^X51, OP_G, OP_G, 0   	; CMPG
+	.BYTE	^X52, OP_G, 0   , 0   	; MNEGG
+	.BYTE	^X53, OP_G, 0   , 0   	; TSTG
+	.BYTE	^X54, OP_G, OP_W, OP_G	; EMODG
+	.BYTE	^X55, OP_G, 0   , 0   	; POLYG
+	.BYTE	^X56, OP_G, 0   , 0   	; CVTGH
+	.BYTE	^X60, OP_H, OP_H, 0   	; ADDH2
+	.BYTE	^X61, OP_H, OP_H, 0   	; ADDH3
+	.BYTE	^X62, OP_H, OP_H, 0   	; SUBH2
+	.BYTE	^X63, OP_H, OP_H, 0   	; SUBH3
+	.BYTE	^X64, OP_H, OP_H, 0   	; MULH2
+	.BYTE	^X65, OP_H, OP_H, 0   	; MULH3
+	.BYTE	^X66, OP_H, OP_H, 0   	; DIVH2
+	.BYTE	^X67, OP_H, OP_H, 0   	; DIVH3
+	.BYTE	^X68, OP_H, 0   , 0   	; CVTHB
+	.BYTE	^X69, OP_H, 0   , 0   	; CVTHW
+	.BYTE	^X6A, OP_H, 0   , 0   	; CVTHL
+	.BYTE	^X6B, OP_H, 0   , 0   	; CVTRHL
+	.BYTE	^X6F, OP_H, OP_H, OP_H	; ACBH
+	.BYTE	^X70, OP_H, 0   , 0   	; MOVH
+	.BYTE	^X71, OP_H, OP_H, 0   	; CMPH
+	.BYTE	^X72, OP_H, 0   , 0   	; MNEGH
+	.BYTE	^X73, OP_H, 0   , 0   	; TSTH
+	.BYTE	^X74, OP_H, OP_W, OP_H	; EMODH
+	.BYTE	^X75, OP_H, 0   , 0   	; POLYH
+	.BYTE	^X76, OP_H, 0   , 0   	; CVTHG
+	.BYTE	^X98, OP_F, 0   , 0   	; CVTFH
+	.BYTE	^X99, OP_F, 0   , 0   	; CVTFG
+	.BYTE	^XF6, OP_H, 0   , 0   	; CVTHF
+	.BYTE	^XF7, OP_H, 0   , 0   	; CVTHD
+DOUB_END:
+
+; Table of operand sizes listed in OP_x code order
+
+OP_SIZES:
+	.BYTE	0		; Not used
+	.BYTE	1		; Byte
+	.BYTE	2		; Word
+	.BYTE	4		; F_floating
+	.BYTE	8		; D_floating
+	.BYTE	8		; G_floating
+	.BYTE	16		; H_floating
+
+;
+; PSECT DECLARATIONS:
+;
+	.PSECT _LIB$CODE PIC, USR, CON, REL, LCL, SHR, -
+			EXE, RD, NOWRT, LONG
+
+
+	.SBTTL	LIB$FIXUP_FLT - Fixup floating reserved operand
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+; LIB$FIXUP_FLT finds the reserved operand of any  F,  D,  G  or  H
+; floating  instruction  (with  exceptions  stated  below)  after a
+; reserved operand fault has been signaled.   LIB$FIXUP_FLT changes
+; the  reserved operand from -0.0 to the parameter, new_operand, is
+; present;  or to +0.0 if new_operand is absent.
+;
+;
+;
+; Exceptions:
+;
+; LIB$FIXUP_FLT can not handle the following cases and will  return
+; a status of SS$_RESIGNAL if any of them occur.
+;
+;      1.  The   currently  active  signaled   condition   is   not
+;          SS$_ROPRAND.
+;
+;      2.  The reserved operand's datatype is not  F,  D,  G  or  H
+;          floating.
+;
+;      3.  The  reserved  operand  is  an  element   in   a   POLYx
+;	   table.
+;
+; CALLING SEQUENCE:
+;
+;      ret_status.wlc.v = LIB$FIXUP_FLT (sig_args_adr.rl.ra,
+;                          mch_args_adr.rl.ra [, new_operand.rf.r])
+;
+; FORMAL PARAMETERS:
+;
+  sig_args_adr = 4
+;      Address of signal argument vector.
+  mch_args_adr = 8
+;      Address of mechanism argument vector.
+  new_operand = 12
+;      Optional.  Address of an F_floating  value  to  replace  the
+;      reserved operand.
+;
+; IMPLICIT INPUTS:
+;
+;	The stack frames back to that of the instruction which faulted.
+;	The instruction which faulted and its operands.
+;
+; IMPLICIT OUTPUTS:
+;
+;	The reserved floating operand, if found, is replaced by
+;	"new_operand" or zero.
+;
+; COMPLETION STATUS:
+;
+; SS$_CONTINUE - continue execution at point of condition
+;      Routine successfully completed.  The  reserved  operand  was
+;      found and was fixed up.
+; SS$_ACCVIO - access violation
+;      An argument to LIB$FIXUP_FLT or an operand of  the  faulting
+;      instruction could not be read or written.
+; SS$_RESIGNAL - resignal condition to next handler
+;      The condition signaled  was not SS$_ROPRAND or the  reserved
+;      operand  was not a floating point value or was an element in
+;      a POLYx table.
+; SS$_ROPRAND - reserved operand fault
+;      The optional  argument  new_operand  was  supplied  but  was
+;      itself an F_floating reserved operand.
+; LIB$_BADSTA - bad stack
+;      The stack frame linkage had been corrupted since the time of
+;      the reserved operand exception.
+;
+; Note:  If the status value returned from LIB$FIXUP_FLT is seen by
+; the  condition  handling  facility,  (as  would  be  the  case if
+; LIB$FIXUP_FLT was the handler), any success value  is  equivalent
+; to  SS$_CONTINUE,  which  causes the instruction to be restarted.
+; Any failure value is equivalent to SS$_RESIGNAL, which will cause
+; the  condition  to  be  resignalled to the next handler.  This is
+; because the condition handler (LIB$FIXUP_FLT)  failed  to  handle
+; the condition correctly.
+;
+; SIDE EFFECTS:
+;
+;	If the reserved operand is fixed up, the instruction which
+;	faulted is restarted.
+;
+;--
+
+;+
+; Registers used:
+;
+;	R0 =	scratch
+;	R1 =	scratch
+;	R2 =	pointer into opcode/operand table
+;	R3 =	context index or 0
+;	R4 =	OA1 (operand address) of bits 31:0
+;	R5 =	OA2 (operand address) of bits 63:32 which may not be
+;		OA1+4 since registers not necessarily saved contiguously.
+;	R6 = 	register number of operand specifier
+;	R7 =	scratch
+;	R8 = 	OA3 (operand address) of bits 95:64 (H opcodes only)
+;	R9 =	OA4 (operand address) of bits 127:96 (H opcodes only)
+;-
+
+	.ENTRY LIB$FIXUP_FLT, ^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+					; save all registers so that all will be 
+					; found in stack during back scan.
+					; disable IV (content index multiply)
+	ASSUME	SF$L_SAVE_REGS LE 512	; Assembly time check to be sure that the
+					; PROBEs later will work correctly
+	MOVAB	W^OUR_HANDLER, (FP)	; Enable condition handler
+	MOVL	SIG_ARGS_ADR(AP), R0	; R0 = adr. of signal arg list array
+	CMPZV	#STS$V_COND_ID, -	; position of message identification
+		#STS$S_COND_ID, -	; size of id
+		CHF$L_SIG_NAME(R0), -	; compare 29-bit VAX-11 signal code
+		#<SS$_ROPRAND@-STS$V_COND_ID> ; with reserved operand code
+	BEQL	2$				; It is, continue
+	BRW	RESIGNAL			; Not, so resignal
+2$:	MOVAB	-<K_SAV_IMAGE_SIZ>*2(SP), SP ; allocate two local vectors:
+					; REG_IMAGE - image of registers at time of exception
+					; ADR_IMAGE - image of address where regs are
+					; saved in stack in case they need fixup.
+	BSBW	GET_REGS		; setup the two image vectors in local storage
+					; do not return here if error, instead RET with
+					; error completion status
+
+;+
+; Get instruction opcode.  Determine if this is an instruction which
+; we can handle.  If not, resignal.  If so, load R2 with the address
+; of the operand table entry for that opcode.
+;-
+
+	BSBW	NEXT_BYTE		; Get first opcode byte
+	CMPB	R0, #G_H		; Is this a G or H instruction?
+	BEQL	10$			; Yes
+	CMPB	R0, #BPT		; Is this a BPT instruction?
+	BNEQ	5$			; Skip if not
+	SUBL3	#1, IMAGE_PC(FP), -(SP)	; Push PC on stack
+	CALLS	#1, G^LIB$GET_OPCODE	; See what opcode really is.
+	CMPB	R0, #G_H		; Is it a G or H instruction?
+	BEQL	10$			; Skip if so
+5$:	CLRL	R1			; Binary search low limit
+	MOVL	#<SING_END-SING_TAB>, R7 ; Binary search high limit
+	MOVAB	W^SING_TAB, R3		; Table base
+	BRB	SEARCH
+10$:	BSBW	NEXT_BYTE		; Get second opcode byte
+	CLRL	R1			; Binary search low limit
+	MOVL	#<DOUB_END-DOUB_TAB>, R7 ; Binary search high limit
+	MOVAB	W^DOUB_TAB, R3		; Table base
+
+SEARCH:	CMPL	R1, R7			; Not in table?
+	BEQL	RESIGNAL		; Yes, resignal
+	ADDL3	R1, R7, R2		; Get middle entry
+	ASHL	#-1, R2, R2
+	BICL2	#3, R2			; Longword offset
+	CMPB	(R3)[R2], R0		; Is this the opcode?
+	BGTRU	10$			; No, too high
+	BLSSU	20$			; No, too low
+	ADDL2	R3, R2			; Compute actual address
+	BRW	SCAN			; Now scan the operands
+10$:	MOVL	R2, R7			; New high limit is last try
+	BRB	SEARCH			; Continue search
+20$:	ADDL3	#4, R2, R1		; New low limit is last try + 4
+	BRB	SEARCH			; Continue search
+
+
+;+
+; If we can't handle this exception, return SS$_RESIGNAL.
+;-
+
+RESIGNAL:
+	MOVZWL	#SS$_RESIGNAL, R0	; R0 = RESIGNAL error completion code
+	RET				; error return
+
+;+
+; Now scan the operand list, looking for a reserved operand.
+;-
+
+SCAN:
+	INCL	R2			; Get next operand type byte
+	BITB	#3, R2			; If the low two bits are clear,
+					; then we are at the start of the
+					; next table entry, thus we are
+					; done.  Remember that the tables
+					; are longword aligned.
+	BEQL	RESIGNAL		; No reserved operand found
+	TSTB	(R2)			; No more operands to test?
+	BEQL	RESIGNAL		; Yes, no reserved operand found
+	BSBW	NEXT_OPERAND		; Look at next operand
+	BLBC	R0, SCAN		; If reserved operand not found,
+					; continue looking
+	BRB	FIXUP			; Fixup reserved operand
+
+;+
+; Fixup reserved operand
+;-
+
+FIXUP:
+	CLRL	R0			; default fixup value is zero
+	CMPB	(AP), #<NEW_OPERAND/4>	; is new operand present?
+	BLSSU	10$			; no
+	MOVL	NEW_OPERAND(AP), R0	; yes, get address
+	BEQL	10$			; omitted by reference?
+	MOVL	(R0), R0		; get F_floating fixup value
+10$:	CASEB	(R2), #OP_F, #<OP_H-OP_F>	; select on operand type
+11$:	.WORD	DEST_F-11$		; F_floating
+	.WORD	DEST_D-11$		; D_floating
+	.WORD	DEST_G-11$		; G_floating
+	.WORD	DEST_H-11$		; H_floating
+	HALT				; should never get here
+DEST_F:	MOVF	R0, (R4)		; move F_floating
+	BRB	EXIT
+DEST_D:	CVTFD	R0, -(SP)		; convert F to D and store
+	MOVL	(SP)+, (R4)
+	MOVL	(SP)+, (R5)
+	BRB	EXIT
+DEST_G:	CVTFG	R0, -(SP)		; convert F to G and store
+	MOVL	(SP)+, (R4)
+	MOVL	(SP)+, (R5)
+	BRB	EXIT
+DEST_H:	CVTFH	R0, -(SP)		; convert F to H and store
+	MOVL	(SP)+, (R4)
+	MOVL	(SP)+, (R5)
+	MOVL	(SP)+, (R8)
+	MOVL	(SP)+, (R9)
+
+EXIT:
+	MOVL	#SS$_CONTINUE, R0	; success
+	RET				; return
+
+	.SBTTL NEXT_OPERAND - Get next operand and check for floating opcode
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	NEXT_OPERAND interprets the instruction stream and
+;	gets the next operand. It returns 1 in R0
+;	if operand is floating or double reserved operand, else 0.
+;
+; CALLING SEQUENCE
+;
+;	JSB	NEXT_OPERAND
+;
+; INPUT PARAMETERS:
+;
+;	R2 = address of operand type table
+;
+; IMPLICIT INPUTS:
+;
+;	REG_IMAGE(FP)			; The image of the registers including PC
+;	instruction stream
+;
+; OUTPUT PARAMETERS:
+;
+;	R4 = OA1 (operand address of bits 31:0 of operand)
+;	R5 = OA2 (operand address of bits 63:32 of operand) if R1 = 8
+;	R8 = OA3 (H opcodes only)
+;	R9 = OA4 (H opcodes only)
+;
+; IMPLICIT OUTPUT:
+;
+;	Saved image of PC is updated as operand specific is interpreted
+;
+; COMPLETION STATUS
+;
+;	R0 = 1 if operand is floating or double reserved operand, else 0
+;
+; SIDE EFFECTS:
+;
+;	NONE - uses registers R0:R9 - see LIB$FIXUP_FLT for register usage
+;--
+
+NEXT_OPERAND:
+	CLRL	R3			; R3 = initial context index register
+	MOVZBL	(R2), R0		; Get operand type byte
+	MOVZBL	W^OP_SIZES[R0], R1	; Get operand size
+
+;+
+; Loop to get operand specifier - loop back here (once) if operand specifier is index
+;-
+
+LOOP_OP:
+	BSBW	NEXT_BYTE		; R0 = next I-stream byte (sign extended)
+	EXTZV	#0, #4, R0, R6		; R6 = register field
+	EXTZV	#4, #4, R0, R0		; R0 = operand specifier 7:4
+	CASEB	R0, #4, #15-4		; dispatch on operand specifier code
+					; literal 0-3 falls through
+10$:	.WORD	INDEXED-10$		; 4
+	.WORD	REG-10$			; 5
+	.WORD	REG_DEF-10$		; 6
+	.WORD	AUTO_DECR-10$		; 7
+	.WORD	AUTO_INCR-10$		; 8
+	.WORD	AUTO_INCR_DEF-10$	; 9
+	.WORD	BYTE_DISPL-10$		; 10
+	.WORD	BYTE_DISPL_DEF-10$	; 11
+	.WORD	WORD_DISPL-10$		; 12
+	.WORD	WORD_DISPL_DEF-10$	; 13
+	.WORD	LONG_DISPL-10$		; 14
+	.WORD	LONG_DISPL_DEF-10$	; 15
+
+;+
+; Literal - can't be reserved, just return failure
+;-
+
+	BRW	NOT_RESRV		; return - not reserved operand
+
+;+
+; Indexed - save context index and loop back
+;
+
+INDEXED:
+	MULL3	REG_IMAGE(FP)[R6], R1,- ; R3 = context index
+	R3
+	BRB	LOOP_OP			; go back and get next specifier
+
+;+
+; Register
+;-
+
+REG:	MOVL	ADR_IMAGE(FP)[R6], R4	; R4 = OA1 = adr where Rn  saved in stack
+	MOVL	ADR_IMAGE+4(FP)[R6], R5	; R5 = OA2 = adr where Rn+1 saved in stack
+	MOVL	ADR_IMAGE+8(FP)[R6], R8	; R8 = OA3
+	MOVL	ADR_IMAGE+12(FP)[R6], R9 ; R9 = OA4
+	BRB	CHK_OP_RSB		; check operand for reserved and RSB
+
+;+
+; Register Deferred
+;-
+
+REG_DEF:
+	MOVL	REG_IMAGE(FP)[R6], R4 	; R4 = OA = contents of Rn
+	BRB	SET_OA2			; set OA2, check op and RSB
+
+;+
+; Auto Decrement
+;-
+
+AUTO_DECR:
+	SUBL	R1, REG_IMAGE(FP)[R6]	; decrement Rn by operand size
+	BRB	REG_DEF			; go do register deferred
+
+;+
+; Auto Increment
+;-
+
+AUTO_INCR:
+	MOVL	REG_IMAGE(FP)[R6], R4	; R4 = OA = contents of Rn
+	ADDL	R1, REG_IMAGE(FP)[R6]	; increment Rn by operand size
+	BRB	SET_OA2			; set OA2, check op and RSB
+
+;+
+; Auto Increment Deferred
+;-
+
+AUTO_INCR_DEF:
+	MOVL	REG_IMAGE(FP)[R6], R4	; R4 = contents of Rn
+	MOVL	(R4), R4 		; R4 = OA
+	ADDL	#4, REG_IMAGE(FP)[R6]	; increment Rn by 4 (size of address)
+	BRB	SET_OA2			; set OA2, check op, and RSB
+
+;+
+; Byte Displacement
+;-
+
+BYTE_DISPL:
+	BSBB	NEXT_BYTE		; R0 = next I-stream byte
+	BRB	DISPL			; add to PC
+
+;+
+; Byte Displacement Deferred
+;-
+
+BYTE_DISPL_DEF:
+	BSBB	NEXT_BYTE 		; R0 = next I-stream byte
+	BRB	DISPL_DEF 		; add to PC and defer
+
+;+
+; Word Displacement
+;-
+
+WORD_DISPL:
+	BSBB	NEXT_WORD 		; R0 = next I-stream word
+	BRB	DISPL			; add to PC 
+
+;+
+; Word Displacement Deferred
+;-
+
+WORD_DISPL_DEF:
+	BSBB	NEXT_WORD 		; R0 = next I-stream word
+	BRB	DISPL_DEF 		; add to PC and defer
+
+;+
+; Long displacement
+;-
+
+LONG_DISPL:
+	BSBB	NEXT_LONG 		; R0 = next I-stream longword
+DISPL:	ADDL3	R0, REG_IMAGE(FP)[R6], R4	; R4 = OA = (Rn) + displacement
+	BRB	SET_OA2			; set OA2, check OP, and RSB
+
+;+
+; Long Displacement deferred
+;-
+
+LONG_DISPL_DEF:
+	BSBB	NEXT_LONG 		; R0 = Next I-stream longword
+DISPL_DEF:				; here for displacement deferred
+	ADDL3	R0, REG_IMAGE(FP)[R6], R4 	; R4 = (Rn) + displacement
+	MOVL	(R4), R4		; R4 = OA = (OA) (do defer)
+
+;+
+; add context index or 0
+; Set OA2 (operand address 2)from OA+4 since
+; operand is in memory not a register and therefore is contiguous
+; Also set OA3 and OA4
+;-
+
+SET_OA2:
+	ADDL	R3, R4			; R4 = OA + context index or 0
+	ADDL3	R4, #4, R5		; R5 = OA2 = OA + 4
+	ADDL3	R5, #4, R8		; R8 = OA3
+	ADDL3	R8, #4, R9		; R9 = OA4
+
+;+
+; check for reserved operand
+;-
+
+CHK_OP_RSB:
+	MOVL	#1, R0			; Indicate success, initially
+	CASEB	(R2), #OP_F, #<OP_H-OP_F>	; Case on operand type
+1$:	.WORD	10$-1$			; F_floating
+	.WORD	10$-1$			; D_floating
+	.WORD	20$-1$			; G_floating
+	.WORD	30$-1$			; H_floating
+	BRB	NOT_RESRV		; wrong datatype
+10$:	CMPZV	#V_FMZERO, #S_FMZERO, -	; Check F_floating and D_floating
+		(R4), #^X100
+	BEQL	NEXT_OPERANDX		; Found
+	BRB	NOT_RESRV		; Not found
+20$:	CMPZV	#V_GMZERO, #S_GMZERO, - ; Check G_floating
+		(R4), #^X800
+	BEQL	NEXT_OPERANDX		; Found
+	BRB	NOT_RESRV		; Not found
+30$:	CMPZV	#V_HMZERO, #S_HMZERO, -	; Check H_floating
+		(R4), #^X8000
+	BEQL	NEXT_OPERANDX		; Found
+	BRB	NOT_RESRV		; Not found
+NOT_RESRV:
+	CLRL	R0			; R0 = failure
+NEXT_OPERANDX:
+	RSB				; return R0 indicating success or failure
+
+
+
+;+
+; routines to get next byte, word, or long from I-stream and sign extend
+;-
+
+NEXT_BYTE:
+	CVTBL	@IMAGE_PC(FP), R0	; R0 = next byte
+	INCL	IMAGE_PC(FP)		; update PC
+	RSB				; return
+
+NEXT_WORD:
+	CVTWL	@IMAGE_PC(FP), R0	; R0 = next word
+	ADDL	#2, IMAGE_PC(FP)	; update PC
+	RSB				; return
+
+NEXT_LONG:
+	MOVL	@IMAGE_PC(FP), R0	; R0 = next longword
+	ADDL	#4, IMAGE_PC(FP)	; update PC
+	RSB				; return
+
+
+	.SBTTL GET_REGS Get contents and addresses of all save registers in stack
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	GET_REGS scans the stack and finds all registers saved
+;	in call frames back to the signal facility. Thus it
+;	makes an image of the registers at the time of the
+;	exception or CALL LIB$SIGNAL/STOP. Because a double
+;	operand may be saved in two different places, an image
+;	array of addresses where the registers are saved is also created.
+;	Note: GET_REGS assumes:
+;	caller has saved R2:R11 in frame using its entry mask so all registers
+;	are in memory somewhere. Stack scan is defensive against bad stacks.
+;	Note: to reconstruct contents of SP at time of exception or call LIB$SIGNAL,
+;	Use of the fact that the signal args list is pushed on stack first is made.
+;	That is SP is = adr of last signal arg/ +4. Also depends on saved PC being
+;	SYS$CALL_HANDL+4.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	GET_REGS
+;
+; INPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT INPUTS:
+;
+;	SIG_ARGS_ADR.(AP)		; Adr. of array of signal args
+;	MCH_ARGS_ADR.(AP)		; Adr. of array of mechanism args
+;
+; OUTPUT PARAMETERS:
+;
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;
+;	REG_IMAGE(FP)			; set reg image array R0:PC/PSL
+;	ADR_IMAGE(FP)			; Set adr where reg saved R0:PC/PSL
+;					; except adr. where SP SAVED = 0, since not saved.
+;
+; COMPLETION CODES:
+;
+;	NONE JSB
+;
+; SIDE EFFECTS:
+;
+;	If error, RET with error code
+;--
+
+;+
+; Registers used:
+;
+;	R0 = scratch
+;	R1 = pointer to register image array (REG_IMAGE)
+;	R2 = stack frame pointer
+;	R3 = Adr. of register save area in frame
+;	R4 = Loop count
+;	R5 = pointer to address image array (ADR_IMAGE)
+;	R6 = register save mask
+;-
+
+GET_REGS: 				; get register image
+
+;+
+; Setup loop to scan back through stack
+;-
+
+	MOVAL	REG_IMAGE(FP), R1	; R1 = Adr. reg image vector
+	MOVL	FP, R2			; R2 = Adr. of current frame
+					; where all callers register saved
+	ASHL	#16, #1, R4		; R4 = max loop count = 65K
+	MOVAL	ADR_IMAGE(FP), R5	; R5 = adr. of array of address where
+					; registers are saved.
+;+
+; Loop to scan call stack back to signal exception
+;-
+
+LOOP:	ADDL3	R2, #SF$L_SAVE_REGS, - ; stack frame adr + offset to first reg saved in frame
+		R3			; R3 = adr. of first saved reg.
+	CLRL	R0			; R0 = first possible register # saved
+	EXTZV	#SF$V_SAVE_MASK, -	; position of save mask
+		#SF$S_SAVE_MASK, -	; size of save mask
+		SF$W_SAVE_MASK(R2), R6	; R6 = register save mask
+
+;+
+; loop to copy saved registers R0:R11 from one call stack frame
+; to register image array also set address of register image array.
+;-
+
+LOOP1:	FFS	R0, #12, - 		; find next register in saved bit mask
+		R6, R0			; R0 = register number of next saved reg.
+
+	BEQL	10$			; branch if finished 12-bit reg mask
+	PROBEW	#0, #4, (R3)		; check if stack still writeable
+	BEQL	BAD_STACK1		; branch if stack bad
+	MOVL	R3, (R5)[R0]		; store address of where Rn saved
+	MOVL	(R3)+, (R1)[R0]	        ; copy saved Rn to image + Rn
+	BBSC	R0, R6, LOOP1		; clear bit n for Rn, get next bit
+
+;+
+; check if frame just saved is that of call to handler from signal or exception
+;-
+
+10$:	CMPL	SF$L_SAVE_PC(R2), -	; saved PC the one from call to handler?
+		#SYS$CALL_HANDL+4	; absolute system vector adr
+	BEQL	END_SCAN		; branch if yes
+
+;+
+; step (cautiously) to previous frame
+;-
+
+	PROBEW	#0, #SF$L_SAVE_REGS,-	; check if fixed part of previous frame ok
+		@SF$L_SAVE_FP(R2)	;
+	BEQL	BAD_STACK1		; branch if frame not writeable
+	MOVL	SF$L_SAVE_FP(R2), R2	; R2 = adr. of previous frame
+	SOBGTR	R4, LOOP		; go back if haven't scanned too many frames
+
+;+
+; here if bad stack - return LIB$_BADSTA to caller of LIB$FLT_FIXUP
+;-
+
+BAD_STACK1:
+	MOVL	#LIB$_BADSTA, R0	; R0 = BAD STACK completion code
+	RET				; return to caller of LIB$FIXUP_FLT
+					; not JSB caller of GET_REGS
+
+;+
+; Here when scanned all frames back to call to handler
+; Copy R0:R1 from mechanism vector. Set AP,FP,SP,PC,PSL
+; Also set address where each of these registers is saved
+;-
+
+END_SCAN:
+	MOVL	MCH_ARGS_ADR(AP), R0	; R0 = adr. of signal mechanism arglist
+
+	MOVAL	CHF$L_MCH_SAVR0(R0), -	; adr. where R0 saved
+		R0_OFF(R5)		; to vector of addresses
+	MOVAL	CHF$L_MCH_SAVR1(R0), -	; adr. where R1 saved
+		R1_OFF(R5)		; to image address vector
+	MOVQ	CHF$L_MCH_SAVR0(R0), -	; saved R0/R1
+		R0_OFF(R1)		; to register image vector
+	ADDL	#AP_OFF, R1		; R1 = adr. in image vector of aP/FP
+	ADDL	#AP_OFF, R5		; R5 = adr. in image address vector of AP/FP
+	MOVAL	SF$L_SAVE_AP(R2), -	; adr of saved AP
+		(R5)+			; to image address vector
+	MOVAL	SF$L_SAVE_FP(R2), -	; adr of saved FP
+		(R5)+			; to image address vector
+	MOVQ	SF$L_SAVE_AP(R2), -	; saved AP/FP
+		(R1)+			; to image register vector
+	MOVZBL	@SIG_ARGS_ADR(AP), R0	; R0 = # of signal args
+	MOVAL	@SIG_ARGS_ADR(AP)[R0],- ;
+		R0			; R0 = adr of last signal arg
+	ADDL	#4, R0			; R0 = SP at time of exception or call LIB$SIGNAL
+					; NOTE: this a spec from LIB$SIGNAL and
+					; exception processing of operating system!!!
+	CLRL	(R5)+			; SP not saved anywhere so set IMAGE _ADR TO 0
+	MOVL	R0, (R1)+		; set image SP
+	MOVQ	-(R0), (R1)+ 		; copy PC/PSL to image (always last
+					; 2 signal arguments)
+	MOVAL	(R0)+, (R5)+		; set adr. where PC saved
+	MOVAL	(R0)+, (R5)+ 		; set adr. where PSL saved
+	RSB				; return (to LIB$FIXUP_FLT)
+
+
+;++
+; OUR_HANDLER - Local condition handler
+;
+; 	This condition handler is enabled by LIB$FIXUP_FLT.  If the signal
+;	depth is zero and if the exception is SS$_ACCVIO or SS$_ROPRAND, then
+;	LIB$SIG_TO_RET is called to cause LIB$FIXUP_FLT to return the
+;	exception condition as a status.  All other exceptions are resignalled.
+;--
+
+OUR_HANDLER:
+	.WORD	^M<>			; Save nothing
+	MOVZWL	#SS$_RESIGNAL, R0	; Resignal if nothing else
+	MOVL	CHF$L_MCHARGLST(AP), R1	; Get mechanism args list
+	TSTL	CHF$L_MCH_DEPTH(R1)	; Is depth zero?
+	BNEQ	90$			; If not, resignal
+	MOVL	CHF$L_SIGARGLST(AP), R1	; Get signal args list
+	MOVL	CHF$L_SIG_NAME(R1), R1	; Get signal name
+	CMPL	R1, #SS$_ACCVIO		; Access violation?
+	BEQL	10$			; If so, call LIB$SIG_TO_RET
+	CMPL	R1, #SS$_ROPRAND	; Reserved operand?
+	BNEQ	90$			; If not, resignal
+10$:	CALLG	(AP), G^LIB$SIG_TO_RET	; Unwind to LIB$FIXUP_FLT's caller
+90$:	RET				; Return to CHF
+
+	.END				; end of LIB$FIXUP_FLT

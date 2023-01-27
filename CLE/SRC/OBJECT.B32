@@ -1,0 +1,902 @@
+MODULE object (IDENT='V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:  Command language editor
+!
+! ABSTRACT:
+!
+!	This facility is used to enhance the command language
+!	and allow user-written commands to be available in the
+!	language.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. unprivileged user mode,
+!
+! AUTHOR:  Tim Halvorsen, Feb 1980
+!
+! Modified by:
+!
+!	V008	DWT0021		David Thiel	19-Jan-1982
+!		Fix bug in referencing internal routines
+!		in shareable libraries by making routine
+!		references true pointers rather than
+!		self-relative offsets.
+!
+!	V007	DWT0016		David Thiel	28-Dec-1981
+!		Move user routine offsets from symbols table
+!		to list.
+!		Use longword offsets in generated object language.
+!
+!	V006	TMH0006		Tim Halvorsen	11-Aug-1981
+!		Fix bad definition of tables vector, which caused
+!		incorrect object modules.  When writing routine
+!		references, output GSD external reference records
+!		as well as the TIR needed to make the connection.
+!
+!	V005	TMH0005		Tim Halvorsen	10-Aug-1981
+!		Remove updating of VEC_L_FREE cell, which is
+!		now automatically updated on each allocation,
+!		rather than when all editing is done.
+!
+!	V004	TMH0004		Tim Halvorsen	20-Mar-1981
+!		If no module_name is specified, use the input file name.
+!
+!	V003	TMH0003		Tim Halvorsen	05-Jan-1981
+!		Generate longword offsets to user routines
+!		referred to via ROUTINE attribute.
+!
+!	V002	TMH0002		Tim Halvorsen	23-Dec-1980
+!		Fix /SYMBOLS broken in previous update.
+!
+!	V001	TMH0001		Tim Halvorsen	13-Nov-1980
+!		Produce an object module containing command tables
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';		! VMS common definitions
+
+REQUIRE 'SRC$:CLEDEF';			! Common utility definitions
+
+REQUIRE 'LIB$:SYMDEF';			! Symbol table definitions
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    output_symbols,			! Output symbol table file
+    output_object,			! Output object module file
+    output_mhd,				! Output module header record
+    output_abs_psect,			! Output absolute psect
+    output_psects,			! Output command tables psects
+    output_tables,			! Output command tables
+    output_gsd,				! Output global symbol records
+    output_routine_refs,		! Output references to user routines
+    output_eom,				! Output end of module record
+    set_output,				! Set current output stream
+    put_record,				! Put object record to file
+    start_record,			! Start of GSD/TIR record
+    put_entry,				! Output GSD/TIR entry
+    end_record;				! End of GSD/TIR entries
+
+!
+! Macros
+!
+
+MACRO
+    perform(command) =
+	BEGIN
+	LOCAL status;
+	status = command;
+	IF NOT .status
+	THEN
+	    BEGIN
+	    SIGNAL(.status);
+	    RETURN .status;
+	    END;
+	END%;
+
+!
+! Module storage
+!
+
+OWN
+    current_rab:	REF BBLOCK,	! Pointer to current output RAB
+    record_buffer:	BBLOCK [obj$c_maxrecsiz],	! Record buffer
+    rec_filled;				! Space used in record_buffer so far
+
+!
+! External storage
+!
+
+EXTERNAL
+    symbols_fab:	BBLOCK,		! Symbol table FAB
+    symbols_rab:	BBLOCK,		! Symbol table RAB
+    object_fab:		BBLOCK,		! Object module FAB
+    object_rab:		BBLOCK,		! Object module RAB
+    file_name:		VECTOR,		! Name of last input file name
+    module_name:	VECTOR,		! Name of object module
+    ident_name:		VECTOR,		! Ident of object module
+    tables:		REF BBLOCK,	! Resultant command tables
+    symbol_header:	VECTOR,		! Symbol list head
+    rtn_listhead;			! User routine list
+!
+! Define symbol table numbers
+!
+
+LITERAL
+    globals = 0;			! Global symbols
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    get_file_name,			! Get file name portion of filespec
+    rms_error,				! Signal RMS-type error
+    allocate,				! Allocate dynamic memory
+    find_record,			! lookup record in list
+    delete_list;			! delete list
+
+GLOBAL ROUTINE output_symbols =
+
+!---
+!
+!	This routine generates the object module file from the
+!	global symbol table generated from the input file parse.
+!
+! Inputs:
+!
+!	symbols_fab/rab = FAB/RAB for symbol table file
+!
+! Outputs:
+!
+!	The object module file
+!---
+
+BEGIN
+
+LOCAL
+    status;				! status code
+
+!
+!	Create the object module file
+!
+
+status = $CREATE (FAB = symbols_fab);	! Create the output file
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(openout),symbols_fab);	! then signal the error
+    RETURN .status;			! and return with status
+    END;
+
+status = $CONNECT (RAB = symbols_rab);	! Connect to the object file
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(openout),symbols_fab,symbols_rab);	! then signal it
+    RETURN .status;			! and return with status
+    END;
+
+set_output(symbols_rab);		! Set output stream
+
+!
+!	If module name not yet specified, get it from symbols filespec
+!		or from input filespec
+!
+
+IF .module_name [0] EQL 0		! If no module name yet
+THEN
+    get_file_name(symbols_fab,module_name); ! Then extract from result filespec
+
+IF .module_name [0] EQL 0		! If still no module name,
+THEN
+    BEGIN
+    module_name [0] = .file_name [0];	! then use last file name
+    module_name [1] = .file_name [1];
+    END;
+
+!
+!	Output the module header record
+!
+
+perform(output_mhd());			! Output the module header record
+
+!
+!	Define the psects used for the global symbols.
+!
+
+perform(output_abs_psect());		! Make absolute psect
+
+!
+!	Output the GSD records for the symbols
+!
+
+perform(output_gsd());			! Output the GSD records
+
+!
+!	Output the end-of-module record
+!
+
+perform(output_eom());			! Output the EOM record
+
+!
+!	Close the object module file
+!
+
+status = $CLOSE(FAB = symbols_fab);	! Close the file
+IF NOT .status				! If error,
+THEN
+    BEGIN
+    rms_error(emsg(closedel),symbols_fab); ! signal the error
+    RETURN .status;			! and return with status
+    END;
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE output_object =
+
+!---
+!
+!	This routine generates an object module file from the
+!	newly edited command tables.
+!
+! Inputs:
+!
+!	object_fab/rab = FAB/RAB for object module file
+!
+! Outputs:
+!
+!	The object module file
+!---
+
+BEGIN
+
+LOCAL
+    status;				! status code
+
+!
+!	Create the object module file
+!
+
+status = $CREATE (FAB = object_fab);	! Create the output file
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(openout),object_fab);	! then signal the error
+    RETURN .status;			! and return with status
+    END;
+
+status = $CONNECT (RAB = object_rab);	! Connect to the object file
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(openout),object_fab,object_rab);	! then signal it
+    RETURN .status;			! and return with status
+    END;
+
+set_output(object_rab);			! Set output stream
+
+!
+!	If module name not yet specified, get it from object filespec
+!		or from input filespec
+!
+
+IF .module_name [0] EQL 0		! If no module name yet
+THEN
+    get_file_name(object_fab,module_name); ! Then extract from result filespec
+
+IF .module_name [0] EQL 0		! If still no module name,
+THEN
+    BEGIN
+    module_name [0] = .file_name [0];	! then use last file name
+    module_name [1] = .file_name [1];
+    END;
+
+!
+!	Output the module header record
+!
+
+perform(output_mhd());			! Output the module header record
+
+!
+!	Define the psects used for the global symbols.
+!
+
+perform(output_psects());		! Define 1 psect to hold command tables
+
+!
+!	Output the command tables
+!
+
+perform(output_tables());		! Output command tables
+
+!
+!	Output fixup commands to store longword offsets to user routines
+!
+
+perform(output_routine_refs());		! Output user routine references
+
+!
+!	Output the end-of-module record
+!
+
+perform(output_eom());			! Output the EOM record
+
+!
+!	Close the object module file
+!
+
+status = $CLOSE(FAB = object_fab);	! Close the file
+IF NOT .status				! If error,
+THEN
+    BEGIN
+    rms_error(emsg(closedel),object_fab); ! signal the error
+    RETURN .status;			! and return with status
+    END;
+
+RETURN true;
+
+END;
+
+ROUTINE output_mhd =
+
+!---
+!
+!	Output a module header record.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	Module header record is output.
+!---
+
+BEGIN
+
+BIND
+    lang_name = UPLIT('VAX-11 CLEDITOR V01.00');
+
+LITERAL
+    lang_length = 22;
+
+LOCAL
+    rec:	BBLOCK[128],		! Allocate record buffer
+    offset,				! Offset to current spot in record
+    bufdesc:	VECTOR[2];		! General buffer descriptor
+
+rec [obj$b_rectyp] = obj$c_hdr;		! Set record type = HDR
+rec [mhd$b_hdrtyp] = mhd$c_mhd;		! Main module header record
+rec [mhd$b_strlvl] = 0;			! Structure level 0
+rec [mhd$w_recsiz] = obj$c_maxrecsiz;	! Maximum record size
+
+IF .module_name [0] EQL 0		! If no module name specified,
+THEN
+    BEGIN
+    module_name [0] = 4;		! Then set it to 'MAIN'
+    module_name [1] = UPLIT BYTE('MAIN');
+    END;
+
+rec [mhd$b_namlng] = .module_name [0];	! Length of module name
+CH$MOVE(.module_name [0], .module_name[1], rec [mhd$t_name]);
+offset = $BYTEOFFSET(mhd$t_name) + .module_name [0];
+
+IF .ident_name [0] EQL 0		! If no ident specified,
+THEN
+    BEGIN
+    ident_name [0] = 1;
+    ident_name [1] = UPLIT BYTE('0');	! Set ident = '0'
+    END;
+
+rec [.offset,0,8,0] = .ident_name [0];	! Length of module ident
+CH$MOVE(.ident_name [0], .ident_name [1], rec + .offset + 1);
+offset = .offset + .ident_name [0] + 1;
+
+bufdesc [0] = 17;			! Length of date/time string
+bufdesc [1] = rec + .offset;		! Address to put creation date/time
+$ASCTIM(TIMBUF=bufdesc);		! Put creation date/time into buffer
+offset = .offset + 17;
+
+bufdesc [1] = .bufdesc [1] + 17;	! Address to put last patch date/time
+$ASCTIM(TIMBUF=bufdesc);		! Put time of last patch into buffer
+offset = .offset + 17;
+
+put_record (rec, .offset);		! Output record
+
+rec [mhd$b_hdrtyp] = mhd$c_lnm;		! Language name and version
+CH$MOVE(lang_length, lang_name, rec + $BYTEOFFSET(mhd$b_hdrtyp)+1);
+
+put_record(rec, $BYTEOFFSET(mhd$b_hdrtyp)+1+lang_length);
+
+RETURN true;
+
+END;
+
+ROUTINE output_eom =
+
+!---
+!
+!	Output an end of module record
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	The record is output.
+!---
+
+BEGIN
+
+LOCAL
+    rec:	BBLOCK[128];		! Allocate record buffer
+
+rec [obj$b_rectyp] = obj$c_eom;		! Set record type = EOM
+rec [eom$b_comcod] = eom$c_success;	! Set completion severity
+
+put_record(rec, 2);			! Output record
+
+RETURN true;
+
+END;
+
+ROUTINE output_abs_psect =
+
+!---
+!
+!	This routine outputs an absolute psect definition.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	The records are output.
+!---
+
+BEGIN
+
+LOCAL
+    entry:	BBLOCK[129];		! Entry buffer
+
+start_record(obj$c_gsd);		! Signal start of GSD record
+
+!
+!	Define absolute psect
+!
+
+entry [gps$b_gsdtyp] = gsd$c_psc;	! Psect definition entry
+entry [gps$b_align] = 0;		! Psect alignment (byte)
+entry [gps$w_flags] = gps$m_exe OR gps$m_rd OR gps$m_wrt; ! Psect attributes
+entry [gps$l_alloc] = 0;		! Set size of section
+entry [gps$b_namlng] = 5;		! Length of psect name
+CH$MOVE(5,UPLIT('$ABS$'),entry [gps$t_name]);	! Set psect name
+put_entry(entry, $BYTEOFFSET(gps$t_name)+5);	! Output entry
+
+end_record();				! Flush rest of record buffer
+
+RETURN true;
+
+END;
+
+ROUTINE output_psects =
+
+!---
+!
+!	This routine outputs all the psect definitions
+!	when producing an object module containing the
+!	command tables.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	The records are output.
+!---
+
+BEGIN
+
+LOCAL
+    entry:	BBLOCK [129];		! Entry buffer
+
+start_record(obj$c_gsd);		! Signal start of GSD record
+
+entry [gps$b_gsdtyp] = gsd$c_psc;	! Psect definition entry
+entry [gps$b_align] = 0;		! Set to byte alignment
+entry [gps$w_flags] = gps$m_pic OR gps$m_rel OR gps$m_rd; ! Psect attributes
+entry [gps$l_alloc] = .tables [vec_l_free];	! Set size of section
+entry [gps$b_namlng] = 10;		! Set length of psect name
+CH$MOVE(10,UPLIT BYTE('CLI$TABLES'),entry [gps$t_name]); ! Set psect name
+put_entry(entry, $BYTEOFFSET(gps$t_name)+10);	! Output entry
+
+end_record();				! Flush rest of record buffer
+
+RETURN true;
+
+END;
+
+ROUTINE output_tables =
+
+!---
+!
+!	This routine outputs the TIR records for the
+!	command tables.
+!
+! Inputs:
+!
+!	tables = Address of tables vector area
+!
+! Outputs:
+!
+!	The records are output.
+!---
+
+BEGIN
+
+LOCAL
+    entry:	BBLOCK [129],		! TIR command buffer
+    position,				! Position within command tables
+    bytes_left;				! Bytes left to output
+
+!
+!	Output global symbol which acts as the label for the start
+!	of the command tables.  The module name is used as the label.
+!
+
+start_record(obj$c_gsd);		! Signal start of GSD record
+
+entry [sdf$b_gsdtyp] = gsd$c_sym;	! Global symbol definition
+entry [sdf$b_datyp] = 0;		! Data type undefined
+entry [sdf$w_flags] = gsy$m_def OR gsy$m_rel;	! Relative definition
+entry [sdf$b_psindx] = 0;		! Owning psect number 0 (tables)
+entry [sdf$l_value] = 0;		! Offset within psect
+entry [sdf$b_namlng] = .module_name [0];! Use module name as label for tables
+CH$MOVE(.module_name [0], .module_name [1], entry [sdf$t_name]);
+put_entry(entry, $BYTEOFFSET(sdf$t_name)+.entry [sdf$b_namlng]);
+
+end_record();				! Flush remaining record buffer
+
+!
+!	Output the actual command tables
+!
+
+start_record(obj$c_tir);		! Signal start of TIR record
+
+entry [0,0,8,0] = tir$c_sta_pb;		! Stack psect base
+entry [1,0,8,0] = 0;			! Psect number 0
+entry [2,0,8,0] = 0;			! Offset 0
+entry [3,0,8,0] = tir$c_ctl_setrb;	! Set relocation base
+put_entry(entry,4);			! Output TIR command
+
+position = .tables;			! Start at beginning of tables
+bytes_left = .tables [vec_l_free];	! Bytes left to output
+
+WHILE .bytes_left GTR 0			! While stuff left to output,
+DO
+    BEGIN
+    LOCAL bytes;
+
+    bytes = MINU(.bytes_left,128);	! Max 128 bytes per record
+    entry [0,0,8,0] = -.bytes;		! Number of bytes to output
+    CH$MOVE(.bytes,.position,entry+1);	! Move the bytes
+    put_entry(entry, .bytes+1);		! Output the TIR command
+    position = .position + .bytes;	! Skip past stuff output
+    bytes_left = .bytes_left - .bytes;	! and decrement the count
+    END;
+
+end_record();				! Flush remaining record buffer
+
+RETURN true;
+
+END;
+
+ROUTINE output_gsd =
+
+!---
+!
+!	This routine outputs all the global symbol
+!	definitions to symbolically refer to the
+!	qualifier names, etc.
+!
+! Inputs:
+!
+!	symbol_header [globals] = Listhead for global symbol table
+!
+! Outputs:
+!
+!	The records are output.
+!---
+
+BEGIN
+
+LOCAL
+    entry:	BBLOCK[129],		! Entry buffer
+    ptr:	REF BBLOCK;		! Address of current symbol entry
+
+start_record(obj$c_gsd);		! Signal start of GSD record
+
+entry [sdf$b_gsdtyp] = gsd$c_sym;	! Global symbol definition
+entry [sdf$b_datyp] = 0;		! Data type undefined
+entry [sdf$w_flags] = gsy$m_def;	! Definition rather than reference
+entry [sdf$b_psindx] = 0;		! Owning psect number 0
+
+ptr = .symbol_header [globals];		! Point at first symbol entry
+
+WHILE .ptr NEQ 0			! Until end of list
+DO
+    BEGIN
+    entry [sdf$l_value] = .ptr [sym$l_value];
+    entry [sdf$b_namlng] = .ptr [sym$b_symlen];
+    CH$MOVE(.ptr [sym$b_symlen], ptr [sym$t_symbol], entry [sdf$t_name]);
+    put_entry(entry, $BYTEOFFSET(sdf$t_name)+.entry [sdf$b_namlng]);
+    ptr = .ptr [sym$l_link];		! Skip to next in chain
+    END;
+
+end_record();				! Flush rest of record buffer
+
+RETURN true;
+
+END;
+
+ROUTINE output_routine_refs =
+
+!---
+!
+!	Output the linker commands to store the longword offsets
+!	to user routines referenced via the ROUTINE attribute.
+!
+! Inputs:
+!
+!	rtn_listhead = Address of user routines listhead
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+LOCAL
+    entry:	BBLOCK[129];		! Entry buffer
+
+start_record(obj$c_tir);		! Signal start of TIR record
+
+entry [0,0,8,0] = tir$c_sta_pl;		! Stack address of routine reference
+entry [1,0,8,0] = 0;			! Current psect number
+entry [6,0,8,0] = tir$c_ctl_setrb;	! Set current position to longword cell
+entry [7,0,8,0] = tir$c_sta_gbl;	! Stack location of user routine
+
+INCR i FROM 1 DO
+    BEGIN
+
+    LOCAL
+	buf : REF VECTOR [, BYTE];
+
+    IF NOT find_record  (rtn_listhead, .i, buf)
+    THEN
+	EXITLOOP;
+
+    entry [2,0,32,0] = ..buf;		! Store offset to refing longword
+    CH$MOVE (1+.buf [4], buf [4], entry+8);	! Store ASCIC symbol name
+    entry [9+.buf [4],0,8,0] = tir$c_sto_pidr; ! Store address of routine
+    put_entry(entry, 10+.buf [4]);	! Store TIR record
+    END;
+
+end_record();				! Flush rest of record buffer
+
+start_record(obj$c_gsd);		! Signal start of GSD record
+
+entry [srf$b_gsdtyp] = gsd$c_sym;	! Global symbol definition
+entry [srf$b_datyp] = 0;		! Data type undefined
+entry [srf$w_flags] = 0;		! Reference to symbol
+
+INCR i FROM 1 DO
+    BEGIN
+
+    LOCAL
+	buf : REF VECTOR [, BYTE];
+
+    IF NOT find_record  (rtn_listhead, .i, buf)
+    THEN
+	EXITLOOP;
+
+    entry [srf$b_namlng] = .buf [4];
+    CH$MOVE(.buf [4], buf [5], entry [srf$t_name]);
+    put_entry(entry, $BYTEOFFSET(srf$t_name)+.entry [srf$b_namlng]);
+    END;
+
+end_record();				! Flush rest of record buffer
+
+delete_list (rtn_listhead);
+
+RETURN true;
+
+END;
+
+ROUTINE set_output (rab) =
+
+!---
+!
+!	Set the current output stream for buffered object records.
+!
+! Inputs:
+!
+!	rab = Address of RAB to use for output stream
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+current_rab = .rab;
+
+RETURN true;
+
+END;
+
+ROUTINE put_record (address, length) =
+
+!---
+!
+!	Output a record to the object module file.
+!
+! Inputs:
+!
+!	address = Address of record
+!	length = Length of record
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+LOCAL
+    status;
+
+current_rab [rab$w_rsz] = .length;
+current_rab [rab$l_rbf] = .address;
+
+status = $PUT(RAB = .current_rab);	! Put the record to the file
+IF NOT .status				! If error detected,
+THEN
+    BEGIN
+    rms_error(emsg(writeerr),.current_rab [rab$l_fab],.current_rab);	! signal error
+    RETURN .status;			! and return with status
+    END;
+
+RETURN true;
+
+END;
+
+ROUTINE start_record (type) =
+
+!---
+!
+!	This routine is called when a variable size record
+!	(like GSD or TIR) is about to be output.
+!
+! Inputs:
+!
+!	type = Type of variable record (GSD or TIR)
+!
+! Outputs:
+!
+!	rec_filled = Address of next available byte in record
+!---
+
+BEGIN
+
+record_buffer [obj$b_rectyp] = .type;		! Set record type
+rec_filled = 1;					! Set offset to beginning
+
+RETURN true;
+
+END;
+
+ROUTINE put_entry (address, length) =
+
+!---
+!
+!	This routine outputs a GSD/TIR entry into the current record
+!	buffer.  The record buffer will be output automatically
+!	when full.
+!
+! Inputs:
+!
+!	address = Address of GSD entry buffer
+!	length = Length of entry
+!	rec_filled = Current offset into record buffer
+!
+! Outputs:
+!
+!	rec_filled updated.
+!---
+
+BEGIN
+
+IF (.rec_filled+.length) GTR obj$c_maxrecsiz	! If record too large,
+THEN
+    BEGIN
+    put_record(record_buffer,.rec_filled);	! Output the record
+    rec_filled = 1;				! Start at beginning again
+    END;
+
+CH$MOVE(.length, .address, record_buffer+.rec_filled); ! Move into record buffer
+
+rec_filled = .rec_filled + .length;		! Update buffer position
+
+RETURN true;
+
+END;
+
+ROUTINE end_record =
+
+!---
+!
+!	This routine is called to signal that all entries have
+!	been output for now and to flush the current record buffer.
+!
+! Inputs:
+!
+!	rec_filled = Amount left in buffer
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+IF .rec_filled GTR 1				! If anything in buffer
+THEN
+    put_record(record_buffer, .rec_filled);	! then output record
+
+RETURN true;
+
+END;
+
+END
+ELUDOM

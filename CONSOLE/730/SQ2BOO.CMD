@@ -1,0 +1,10 @@
+I
+D/G/L 0 00A80003
+D/G 1 3
+D/G 2 3FB86
+D/G 3 2
+D/G 4 0
+D/G 5 10
+E SP
+L/P/S:@ VMB.EXE
+S @

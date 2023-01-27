@@ -1,0 +1,1673 @@
+MODULE STAINIVOL(%TITLE	'Disk volume initialization'
+		IDENT = 'V03-001'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	Backup/Restore
+!
+! ABSTRACT:
+!	This module contains the routines to initialize a disk volume.
+!	These routines are adapted from and must track the INIT utility.
+!
+! ENVIRONMENT:
+!	VAX/VMS user mode.
+!--
+!
+! AUTHOR: M. Jack, CREATION DATE: 12-Feb-1980
+!
+! MODIFIED BY:
+!
+!	V03-001	LMP0022		L. Mark Pilant,		 5-Apr-1982  17:10
+!		Add support for multi-header index files.
+!
+!	V02-003	MLJ0081		Martin L. Jack,	26-Feb-1982  15:55
+!		Implement RETAINMIN and RETAINMAX for new home block fields.
+!
+!	V02-002	MLJ0054		Martin L. Jack,	22-Nov-1981  22:46
+!		Integrate GET_VM and FREE_VM jacket routines.
+!
+!	V02-001	ACG0211		Andrew C. Goldstein,	16-Jul-1981  10:47
+!		Add logic to initialize save set disks
+!
+!**
+
+REQUIRE 'SRC$:COMMON';
+LIBRARY 'SYS$LIBRARY:LIB';
+
+
+LINKAGE
+	L_P$=		CALL: GLOBAL(P$=11);
+
+
+MACRO
+	L_DECL=		EXTERNAL REGISTER P$ = 11: REF VECTOR %;
+
+
+FORWARD ROUTINE
+	ALLOCATE:	L_P$ NOVALUE,	! Allocate blocks
+	ALLOCATE_HOME:	L_P$ NOVALUE,	! Allocate on home block sequence
+	INIT_ALLOCATE:	L_P$ NOVALUE,	! Allocate file structure
+	WRITE_BLOCK:	L_P$ NOVALUE,	! Write block by LBN
+	INIT_BITMAP:	L_P$ NOVALUE,	! Initialize bitmap file
+	INIT_INDEX1:	L_P$ NOVALUE,	! Initialize index file (ODS-1)
+	INIT_INDEX:	L_P$ NOVALUE,	! Initialize index file (ODS-2)
+	INIT_MFD:	L_P$ NOVALUE,	! Initialize MFD (ODS-2)
+	WRITE_HOMEBLOCK:L_P$ NOVALUE,	! Write home block (ODS-2)
+	INITIALIZE_VOLUME:
+			NOVALUE;	! Driver for initialization
+
+
+EXTERNAL ROUTINE
+	FREE_VM:	NOVALUE,	! Free virtual memory
+	GET_VM,				! Allocate virtual memory
+	GET_ZERO_VM,			! Allocate and clear virtual memory
+	CHECKSUM,			! Compute header checksum
+	CHECKSUM2,			! Compute block checksum
+	CREATE_WINDOW,			! Create window control block
+	GET_BADBLOCKS,			! Get bad block data
+	MAKE_POINTER1,			! Make map pointer (ODS-1)
+	MAKE_POINTER,			! Make map pointer (ODS-2)
+	STA_ALLOC_LBN,			! Allocate by LBN
+	TO_ODS1_DATE:	NOVALUE;	! Convert 64-bit time to ODS-1 format
+
+
+EXTERNAL LITERAL
+	BACKUP$_ALLOCFAIL,
+	BACKUP$_BLKZERO,
+	BACKUP$_CLUSTER,
+	BACKUP$_LARGECNT,
+	BACKUP$_MAXBAD,
+	BACKUP$_WRITEERR;
+
+
+G$DEFINE();				! Define global area
+
+
+BUILTIN
+	ROT;
+
+LITERAL
+	ALLOC_MAX=	7;		! Size of allocation table
+
+
+MACRO
+	CHANNEL=	P$[0] %,	! Channel number
+	STRUCLEV_1=	P$[1] %,	! True if ODS-1
+	HOMEBLOCK_DELTA=P$[2] %,	! Home block delta factor
+	VOLUME_SIZE=	P$[3] %,	! Size rounded to cluster boundary
+	REAL_HOMEBLOCK=	P$[4] %,	! LBN of actual secondary home block
+	CLUSTER=	P$[5] %,	! Cluster factor
+	_VCB=		P$[6] %,	! Pointer to VCB for the volume
+	_DEVCHAR=	P$[7] %,	! Pointer to device characteristics
+	VCB(O,P,S,E)=		BBLOCK[._VCB,O,P,S,E] %,
+	DEVCHAR(O,P,S,E)=	BBLOCK[._DEVCHAR,O,P,S,E] %,
+
+
+	! Allocation table.  Consists of 2 parallel tables, for size and LBN of
+	! allocated areas.  Each contains an entry for each piece of the disk
+	! that is allocated to something.
+	!
+	_ALLOC_TABLE_CNT=P$[8] %,
+	_ALLOC_TABLE_LBN=P$[8+ALLOC_MAX] %,
+	ALLOC_TABLE_CNT(N)=	VECTOR[_ALLOC_TABLE_CNT,N] %,
+	ALLOC_TABLE_LBN(N)=	VECTOR[_ALLOC_TABLE_LBN,N] %;
+
+
+LITERAL
+	P$SIZE=		8 + ALLOC_MAX + ALLOC_MAX;
+
+
+! Define entries of the allocation table.
+!
+LITERAL
+	BOOTBLOCK_IDX=	0,		! boot block
+	HOMEBLOCK1_IDX=	1,		! primary home block
+	HOMEBLOCK2_IDX=	2,		! alternate home block
+	IDXHDR2_IDX=	3,		! alternate index file header
+	IDXFILE_IDX=	4,		! index file bitmap and file headers
+	BITMAP_IDX=	5,		! storage bitmap
+	MFD_IDX=	6;		! MFD
+
+
+MACRO
+	BOOTBLOCK_CNT=	ALLOC_TABLE_CNT[BOOTBLOCK_IDX] %,
+	BOOTBLOCK_LBN=	ALLOC_TABLE_LBN[BOOTBLOCK_IDX] %,
+	HOMEBLOCK1_CNT=	ALLOC_TABLE_CNT[HOMEBLOCK1_IDX] %,
+	HOMEBLOCK1_LBN=	ALLOC_TABLE_LBN[HOMEBLOCK1_IDX] %,
+	HOMEBLOCK2_CNT=	ALLOC_TABLE_CNT[HOMEBLOCK2_IDX] %,
+	HOMEBLOCK2_LBN=	ALLOC_TABLE_LBN[HOMEBLOCK2_IDX] %,
+	IDXHDR2_CNT=	ALLOC_TABLE_CNT[IDXHDR2_IDX] %,
+	IDXHDR2_LBN=	ALLOC_TABLE_LBN[IDXHDR2_IDX] %,
+	IDXFILE_CNT=	ALLOC_TABLE_CNT[IDXFILE_IDX] %,
+	IDXFILE_LBN=	ALLOC_TABLE_LBN[IDXFILE_IDX] %,
+	BITMAP_CNT=	ALLOC_TABLE_CNT[BITMAP_IDX] %,
+	BITMAP_LBN=	ALLOC_TABLE_LBN[BITMAP_IDX] %,
+	MFD_CNT=	ALLOC_TABLE_CNT[MFD_IDX] %,
+	MFD_LBN=	ALLOC_TABLE_LBN[MFD_IDX] %;
+
+! Boot program.  The following PDP-11 program will type out the attached
+! message when the volume is booted on a PDP-11, informing the user that
+! this is not a system disk.
+!
+BIND
+	BOOT_PROGRAM	= UPLIT WORD (
+
+%O'000240',		     !  BOOTBK:	NOP			; NOP IDENTIFIES BOOT BLOCK
+%O'012706',  %O'001000',     !		MOV	#1000,SP	; SET TEMP STACK
+%O'010700',		     !	 	MOV	PC,R0		; SET ADDRESS
+%O'062700',  %O'000036',     !		ADD	#BOTMSG-.,R0	; OF MESSAGE
+%O'112001',		     !  10$:	MOVB	(R0)+,R1	; GET NEXT CHARACTER
+%O'001403',		     !	 	BEQ	20$		; END
+%O'004767',  %O'000006',     !		CALL	TYPIT		; NO, PRINT IT
+%O'000773',		     !	 	BR	10$		; LOOP FOR NEXT CHARACTER
+%O'000005',		     !  20$:	RESET			;
+%O'000000',		     !	 	HALT			; HALT
+			     !
+			     !
+%O'110137',  %O'177566',     ! 	TYPIT:	MOVB	R1,@#TPB	; PRINT CHARACTER
+%O'105737',  %O'177564',     ! 	10$:	TSTB	@#TPS		; DONE?
+%O'100375',		     !	 	BPL	10$		; NO, WAIT
+%O'000207'		     !		RETURN			;
+			     !
+			     !
+			     !	BOTMSG:
+
+			);
+
+LITERAL
+	BOOT_PROG_LEN	= 38;
+
+
+! Boot message.  Contains the volume label.
+!
+BIND
+	BOOT_MESSAGE	= UPLIT BYTE (13, 10, 10,
+			  '             is not a system disk', 13, 10, 10, 0);
+
+
+LITERAL
+	BOOT_MESG_LEN	= 40;
+
+
+MACRO
+	BTB$T_VOLNAME	= 38, 0, 0, 0%;	! volume label in boot block message
+LITERAL
+	BTB$S_VOLNAME	= 12;
+
+ROUTINE ALLOCATE(INDEX): L_P$ NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine allocates the given table entry in the first available
+!	position after the given start.  If none, it allocates in the first
+!	available position before the given start.  If none, it signals an
+!	error.
+!
+! INPUT PARAMETERS:
+!	INDEX		- Index of table entry to allocate.
+!
+! IMPLICIT INPUTS:
+!	Allocation table.
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	Allocation table.
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	INITIAL_LBN;			! Initial cut at LBN
+L_DECL;
+
+
+! Round the starting LBN and count down and up, respectively, to cluster
+! boundaries.
+!
+ALLOC_TABLE_LBN[.INDEX] = .ALLOC_TABLE_LBN[.INDEX] / .CLUSTER * .CLUSTER;
+ALLOC_TABLE_CNT[.INDEX] = (.ALLOC_TABLE_CNT[.INDEX] + .CLUSTER - 1) / .CLUSTER * .CLUSTER;
+INITIAL_LBN = .ALLOC_TABLE_LBN[.INDEX];
+
+
+! Iterate toward the end of the disk, checking the proposed location
+! of the entry.
+!
+WHILE TRUE DO
+    BEGIN
+
+    ! Try to allocate the entry.  If it succeeds, return.
+    !
+    IF STA_ALLOC_LBN(.ALLOC_TABLE_CNT[.INDEX], .ALLOC_TABLE_LBN[.INDEX])
+    THEN
+	RETURN;
+
+
+    ! Increment to the next cluster.
+    !
+    ALLOC_TABLE_LBN[.INDEX] = .ALLOC_TABLE_LBN[.INDEX] + .CLUSTER;
+
+
+    ! If we have fallen off the end of the volume, exit the loop.
+    !
+    IF .ALLOC_TABLE_LBN[.INDEX] GEQU .VOLUME_SIZE
+    THEN
+	EXITLOOP;
+    END;
+
+
+! Iterate toward the beginning of the disk, checking the proposed location
+! of the entry.
+!
+ALLOC_TABLE_LBN[.INDEX] = .INITIAL_LBN;
+WHILE TRUE DO
+    BEGIN
+
+    ! Try to allocate the entry.  If it succeeds, return.
+    !
+    IF STA_ALLOC_LBN(.ALLOC_TABLE_CNT[.INDEX], .ALLOC_TABLE_LBN[.INDEX])
+    THEN
+	RETURN;
+
+
+    ! If we have fallen off the beginning of the volume, report failure.
+    !
+    IF .ALLOC_TABLE_LBN[.INDEX] EQL 0
+    THEN
+	SIGNAL(BACKUP$_ALLOCFAIL, 1, VCB[VCB_DEVICE]);
+
+
+    ! Decrement to the previous cluster.
+    !
+    ALLOC_TABLE_LBN[.INDEX] = .ALLOC_TABLE_LBN[.INDEX] - .CLUSTER;
+    END;
+END;
+
+ROUTINE ALLOCATE_HOME(INDEX): L_P$ NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine allocates the indicated allocation table entry to
+!	the first available block on the home block search sequence.
+!
+! INPUT PARAMETERS:
+!	INDEX		- Table index of home block cluster.
+!
+! IMPLICIT INPUTS:
+!	Allocation table.
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	Allocation table.
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	DELTA,				! home block search delta
+	BLOCKFACT,			! device blocking factor
+	LBN;				! home block candidate LBN
+L_DECL;
+
+
+! Compute the home block search delta.  For structure level 1, this is simply
+! 256, except that the first slot is on LBN 1 rather than 0.  For level 2,
+! compute the home block search delta from the volume geometry, according to
+! the following rules, where volume geometry is expressed in the order
+! sectors, tracks, cylinders:
+!
+!	n x 1 x 1:	1
+!	1 x n x 1:	1
+!	1 x 1 x n:	1
+!
+!	n x m x 1:	n+1
+!	n x 1 x m:	n+1
+!	1 x n x m:	n+1
+!
+!	s x t x c:	(t+1)*s+1
+!
+IF .STRUCLEV_1
+THEN
+    DELTA = 256
+ELSE
+    BEGIN
+    BLOCKFACT = (.DEVCHAR[DIB$B_SECTORS]
+	       * .DEVCHAR[DIB$B_TRACKS]
+	       * .DEVCHAR[DIB$W_CYLINDERS])
+	       / .DEVCHAR[DIB$L_MAXBLOCK];
+    DELTA = 1;
+    IF
+	.DEVCHAR[DIB$W_CYLINDERS] GTR 1 AND
+	.DEVCHAR[DIB$B_TRACKS] GTR 1
+    THEN
+	DELTA = .DELTA + .DEVCHAR[DIB$B_TRACKS];
+    IF
+	.DEVCHAR[DIB$B_SECTORS] GTR 1 AND
+	(.DEVCHAR[DIB$W_CYLINDERS] GTR 1 OR
+	    .DEVCHAR[DIB$B_TRACKS] GTR 1)
+    THEN
+	DELTA = (.DELTA * .DEVCHAR[DIB$B_SECTORS] + .BLOCKFACT) / .BLOCKFACT;
+    IF
+	.DELTA EQL 0 OR
+	.DELTA GTRU .DEVCHAR[DIB$L_MAXBLOCK] / 10
+    THEN
+	DELTA = 1;
+    END;
+HOMEBLOCK_DELTA = .DELTA;
+
+
+! Now find the first available cluster on the search sequence by starting
+! with LBN 1 and incrementing by the delta for each try.  If none is available,
+! report failure.
+!
+LBN = 1;
+WHILE TRUE DO
+    BEGIN
+    ALLOC_TABLE_LBN[.INDEX] = .LBN / .CLUSTER * .CLUSTER;
+    IF STA_ALLOC_LBN(.CLUSTER, .ALLOC_TABLE_LBN[.INDEX]) THEN EXITLOOP;
+    IF .STRUCLEV_1 THEN LBN = .LBN AND NOT 1;
+    LBN = .LBN + .DELTA;
+    IF .LBN GEQU .VOLUME_SIZE
+    THEN
+	SIGNAL(BACKUP$_ALLOCFAIL, 1, VCB[VCB_DEVICE]);
+    END;
+
+
+! Save the LBN of the actual block.
+!
+REAL_HOMEBLOCK = .LBN;
+END;
+
+ROUTINE INIT_ALLOCATE: L_P$ NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This is the main allocation routine.  It determines the size and
+!	location of each portion of the file structure.  Each allocation is
+!	done by choosing a candidate location for the section and checking
+!	for conflicts.  If a conflict exists, a new location as near as
+!	possible to the desired one is chosen.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	BAD:		REF BBLOCK;	! Pointer to bad block descriptor
+L_DECL;
+
+
+! Allocate the bad blocks to the bad block file.
+!
+BAD = OUTPUT_BAD[BAD_DESC];
+INCR J FROM 0 TO .OUTPUT_BAD[BAD_NUMDESC]-1 DO
+    BEGIN
+    IF NOT STA_ALLOC_LBN(.BAD[BAD_COUNT], .BAD[BAD_LBN])
+    THEN
+	SIGNAL(BACKUP$_ALLOCFAIL, 1, VCB[VCB_DEVICE]);
+    BAD = .BAD + BAD_S_DESC;
+    END;
+
+
+! Allocate the boot block to the first available cluster (usually 0).
+!
+BOOTBLOCK_CNT = .CLUSTER;
+ALLOCATE(BOOTBLOCK_IDX);
+IF .BOOTBLOCK_LBN NEQ 0
+THEN
+    SIGNAL(BACKUP$_BLKZERO, 1, VCB[VCB_DEVICE]);
+
+
+! Next allocate the primary and secondary home blocks.  If the boot block is
+! on LBN 0 and the cluster factor is greater than 1, then the primary home
+! block cluster is a dummy since the real home block is LBN 1.
+!
+HOMEBLOCK1_CNT = .CLUSTER;
+IF .STRUCLEV_1
+THEN
+    ALLOCATE_HOME(HOMEBLOCK1_IDX)
+ELSE
+    BEGIN
+    IF .BOOTBLOCK_LBN EQL 0 AND .CLUSTER GTR 1
+    THEN
+	ALLOCATE(HOMEBLOCK1_IDX)
+    ELSE
+	ALLOCATE_HOME(HOMEBLOCK1_IDX);
+    HOMEBLOCK2_CNT = .CLUSTER;
+    ALLOCATE_HOME(HOMEBLOCK2_IDX);
+    END;
+
+
+! Now allocate the MFD, storage map, index file, and alternate index file
+! header, in that order.  This results in optimal locality of the most
+! frequently referenced portions of the file structure.  We do not allocate
+! the MFD at this time if this is an output disk being restored, since it
+! is allocated when it is encountered in the save set.
+!
+IF .VCB[VCB_SAVESET]
+THEN
+    BEGIN
+    MFD_LBN = .OUTPUT_ATTBUF[VSR_INDEXLBN];
+    MFD_CNT = 1;
+    END;
+
+ALLOCATE(MFD_IDX);
+BITMAP_LBN = .OUTPUT_ATTBUF[VSR_INDEXLBN];
+BITMAP_CNT = ((.VOLUME_SIZE/.CLUSTER + 4095) / 4096) + 1;
+ALLOCATE(BITMAP_IDX);
+VCB[VCB_BITMAP_LBN] = .BITMAP_LBN + 1;
+
+
+IDXFILE_LBN = .OUTPUT_ATTBUF[VSR_INDEXLBN];
+IDXFILE_CNT = .OUTPUT_ATTBUF[VSR_MAXFILNUM] + (.OUTPUT_ATTBUF[VSR_MAXFILES]+4095)/4096;
+ALLOCATE(IDXFILE_IDX);
+
+
+IF NOT .STRUCLEV_1
+THEN
+    BEGIN
+    IDXHDR2_CNT = .CLUSTER;
+    IDXHDR2_LBN = .IDXFILE_LBN + .HOMEBLOCK_DELTA;
+    ALLOCATE(IDXHDR2_IDX);
+    END;
+END;
+
+ROUTINE WRITE_BLOCK(LBN,BUFFER): L_P$ NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine writes a disk block by logical block number.
+!
+! INPUT PARAMETERS:
+!	LBN		- Logical block number.
+!	BUFFER		- Pointer to buffer.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	STATUS,				! System service status
+	IOSB:		VECTOR[4,WORD];	! I/O status block
+L_DECL;
+
+
+STATUS = $QIOW(
+    FUNC=IO$_WRITELBLK,
+    CHAN=.CHANNEL,
+    IOSB=IOSB,
+    P1=.BUFFER,
+    P2=512,
+    P3=.LBN);
+IF .STATUS THEN STATUS = .IOSB[0];
+IF NOT .STATUS
+THEN
+    SIGNAL(BACKUP$_WRITEERR + STS$K_SEVERE, 1, VCB[VCB_DEVICE], .STATUS);
+END;
+
+ROUTINE INIT_BITMAP: L_P$ NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine initializes the contents of the volume storage bitmap.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	BUFFER:		BBLOCK[512];	! Block buffer
+L_DECL;
+
+
+! Build the storage control block and write it out.
+!
+CH$FILL(0, 512, BUFFER);
+IF .STRUCLEV_1
+THEN
+    BEGIN
+    MAP
+	BUFFER:		VECTOR;
+    LOCAL
+	BLOCK_COUNT;		! number of blocks in storage map
+
+    BLOCK_COUNT = .BITMAP_CNT - 1;
+    IF .BLOCK_COUNT GTRU 126 THEN BLOCK_COUNT = 0;
+    (BUFFER+3)<0,8> = .BLOCK_COUNT;
+    DECR J FROM .BLOCK_COUNT TO 1 DO BUFFER[.J] = 4096;
+    BUFFER[.BLOCK_COUNT+1] = ROT(.VOLUME_SIZE, 16);
+    END
+ELSE
+    BEGIN
+    BUFFER[SCB$W_STRUCLEV] = SCB$C_LEVEL2 + 1;
+    BUFFER[SCB$W_CLUSTER] = .CLUSTER;
+    BUFFER[SCB$L_VOLSIZE] = .DEVCHAR[DIB$L_MAXBLOCK];
+    BUFFER[SCB$L_BLKSIZE] = (.DEVCHAR[DIB$B_SECTORS]
+				 * .DEVCHAR[DIB$B_TRACKS]
+				 * .DEVCHAR[DIB$W_CYLINDERS])
+				 / .DEVCHAR[DIB$L_MAXBLOCK];
+    BUFFER[SCB$L_SECTORS] = .DEVCHAR[DIB$B_SECTORS];
+    BUFFER[SCB$L_TRACKS] = .DEVCHAR[DIB$B_TRACKS];
+    BUFFER[SCB$L_CYLINDER] = .DEVCHAR[DIB$W_CYLINDERS];
+    CHECKSUM2(BUFFER, $BYTEOFFSET(SCB$W_CHECKSUM));
+    END;
+WRITE_BLOCK(.BITMAP_LBN, BUFFER);
+
+
+! Now initialize the bitmap to binary zeros.  This will also initialize any
+! extra blocks that may be present due to cluster rounding.  The correct
+! contents of the bitmap will be written at the end of the restore operation.
+!
+CH$FILL(0, 512, BUFFER);
+INCRU LBN FROM .BITMAP_LBN + 1 TO .BITMAP_LBN + .BITMAP_CNT - 1 DO
+    WRITE_BLOCK(.LBN, BUFFER);
+END;
+
+! Initial file header.  The index file is used since it is the first
+! one written.
+!
+BIND
+	INITIAL_HEADER_1 = UPLIT (
+						! HEADER area
+	BYTE (FH1$C_LENGTH / 2),		! ident area offset
+	BYTE ((FH1$C_LENGTH + FI1$C_LENGTH)/2),	! map area offset
+	WORD (FID$C_INDEXF, FID$C_INDEXF),	! file ID
+	BYTE (1, 1),				! structure version and level
+	WORD (0),				! file owner UIC
+	WORD (0),				! file protection
+	WORD (0),				! file characteristics
+	BYTE (0),				! record type
+	BYTE (0),				! record attributes
+	WORD (0),				! record size
+	LONG (0, 0),				! HIBLK and EFBLK
+	WORD (0),				! EOF byte offset
+	BYTE (0, 0),				! bucket size & VFC length
+	WORD (0),				! maximum record length
+	WORD (0),				! default extend size
+	WORD (0, 0, 0, 0, 0, 0),		! unused record attributes
+
+						! IDENT area
+	WORD (%RAD50_11'INDEXF   SYS', 1),	! file name, type and version
+	WORD (1),				! revision number
+	BYTE (REP 34 OF (0)),			! dates
+
+						! MAP area
+	BYTE (0),				! file segment number
+	BYTE (0),				! extension RVN
+	WORD (0, 0),				! extension file ID
+	BYTE (1, 3),				! map pointer count & LBN size
+	BYTE (0),				! map words in use
+	BYTE ((512-2-FH1$C_LENGTH-FI1$C_LENGTH-FM1$C_LENGTH)/2));
+						! map words available
+
+ROUTINE INIT_INDEX1: L_P$ NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine initializes the contents of an ODS-1 index file.
+!	It writes the boot block, the home block, and the initial headers.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	BUFFER:		BBLOCK[512],	! Block buffer
+	ALT_BUFFER:	BBLOCK[512],	! Block buffer
+	LBN,				! Current LBN
+	BAD:		REF BBLOCK,	! Pointer to bad block entry
+	EXTENSION_FID,			! File number for extension headers
+	IDXFILE_EXT_CNT,		! Remaining count for the index file
+	IDXFILE_EXT_LBN,		! Starting block for the remaining count
+	MAP_FULL_STATUS,		! Map area full indicator
+	UNMAPPED;			! Remaining count when header full
+LITERAL
+	IDXFILE_EXT_FID	= 6;		! first index file extension header file number
+BIND
+	IDENT_AREA	= BUFFER + FH1$C_LENGTH : BBLOCK,
+	MAP_AREA	= BUFFER + FH1$C_LENGTH + FI1$C_LENGTH : BBLOCK,
+	ALT_MAP_AREA	= ALT_BUFFER + FH1$C_LENGTH + FI1$C_LENGTH : BBLOCK;
+L_DECL;
+
+
+! First block to write is the boot block.  If a boot block was present on the
+! input volume, write the boot program.  Otherwise, set up the message routine
+! for the -11 and build the message.
+!
+IF .BBLOCK[OUTPUT_ATTBUF[VSR_BOOTBLOCK], DSC$W_LENGTH] NEQ 0
+THEN
+    BEGIN
+    CH$COPY(
+	.BBLOCK[OUTPUT_ATTBUF[VSR_BOOTBLOCK], DSC$W_LENGTH],
+	.BBLOCK[OUTPUT_ATTBUF[VSR_BOOTBLOCK], DSC$A_POINTER],
+	0,
+	512, BUFFER);
+    BUFFER[4,0,32,0] = -1;	! Initialize with invalid LBN
+    END
+ELSE
+    BEGIN
+    CH$COPY(
+	BOOT_PROG_LEN, BOOT_PROGRAM,
+	BOOT_MESG_LEN, BOOT_MESSAGE,
+	0,
+	512, BUFFER);
+    CH$COPY(
+	.BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$W_LENGTH],
+	.BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$A_POINTER],
+	%C' ',
+	BTB$S_VOLNAME, BUFFER[BTB$T_VOLNAME]);
+    END;
+WRITE_BLOCK(.BOOTBLOCK_LBN, BUFFER);
+
+
+! Now construct and write the home block.
+!
+CH$FILL(0, 512, BUFFER);
+BUFFER[HM1$W_IBMAPSIZE] = (.OUTPUT_ATTBUF[VSR_MAXFILES] + 4095) / 4096;
+BUFFER[HM1$L_IBMAPLBN] = ROT(.IDXFILE_LBN, 16);
+BUFFER[HM1$W_MAXFILES] = .OUTPUT_ATTBUF[VSR_MAXFILES];
+BUFFER[HM1$W_CLUSTER] = 1;
+BUFFER[HM1$W_STRUCLEV] = .OUTPUT_ATTBUF[VSR_VOLSTRUCT];
+CH$COPY(
+    .BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$W_LENGTH],
+    .BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$A_POINTER],
+    0,
+    HM1$S_VOLNAME, BUFFER[HM1$T_VOLNAME]);
+(BUFFER[HM1$W_VOLOWNER])<0,8> = .(OUTPUT_ATTBUF[VSR_VOLOWNER])<0,8>;
+(BUFFER[HM1$W_VOLOWNER])<8,8> = .(OUTPUT_ATTBUF[VSR_VOLOWNER])<16,8>;
+BUFFER[HM1$W_PROTECT] = .OUTPUT_ATTBUF[VSR_PROTECT];
+BUFFER[HM1$W_FILEPROT] = .OUTPUT_ATTBUF[VSR_FILEPROT];
+BUFFER[HM1$B_WINDOW] = .OUTPUT_ATTBUF[VSR_WINDOW];
+BUFFER[HM1$B_EXTEND] = .OUTPUT_ATTBUF[VSR_EXTEND];
+BUFFER[HM1$B_LRU_LIM] = .OUTPUT_ATTBUF[VSR_LRU_LIM];
+TO_ODS1_DATE(OUTPUT_ATTBUF[VSR_VOLDATE], BUFFER[HM1$T_CREDATE]);
+BUFFER[HM1$L_SERIALNUM] = .OUTPUT_BAD[BAD_SERIAL];
+CH$COPY(
+    .BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$W_LENGTH],
+    .BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$A_POINTER],
+    %C' ',
+    HM1$S_VOLNAME2, BUFFER[HM1$T_VOLNAME2]);
+CH$COPY(
+    .BBLOCK[OUTPUT_ATTBUF[VSR_OWNERNAME], DSC$W_LENGTH],
+    .BBLOCK[OUTPUT_ATTBUF[VSR_OWNERNAME], DSC$A_POINTER],
+    %C' ',
+    HM1$S_OWNERNAME, BUFFER[HM1$T_OWNERNAME]);
+CH$MOVE(HM1$S_FORMAT, UPLIT BYTE('DECFILE11A  '), BUFFER[HM1$T_FORMAT]);
+CHECKSUM2(BUFFER, $BYTEOFFSET(HM1$W_CHECKSUM1));
+CHECKSUM2(BUFFER, $BYTEOFFSET(HM1$W_CHECKSUM2));
+WRITE_BLOCK(.HOMEBLOCK1_LBN, BUFFER);
+
+
+! Finish initializing the VCB, except for the index file window, which is
+! done after the header is written.
+!
+VCB[VCB_CLUSTER] = 1;
+VCB[VCB_HDR_OFFSET] = 2 + .BUFFER[HM1$W_IBMAPSIZE];
+VCB[VCB_MAXFILIDX] = .BUFFER[HM1$W_IBMAPSIZE] * 4096;
+VCB[VCB_IMAP_LBN] = .IDXFILE_LBN;
+
+
+! Initialize the memory resident index file bitmap.  The first block contains
+! the initially allocated files marked in use; the rest is all zero.
+!
+VCB[VCB_IMAP] = GET_ZERO_VM(.BUFFER[HM1$W_IBMAPSIZE] * 512);
+.VCB[VCB_IMAP] = %B'111';
+
+
+! Construct and write the index file header.
+!
+LBN = .IDXFILE_LBN + .BUFFER[HM1$W_IBMAPSIZE] - 1;
+CH$COPY(
+    FH1$C_LENGTH+FI1$C_LENGTH+FM1$C_LENGTH, INITIAL_HEADER_1,
+    0,
+    512, BUFFER);
+INCR J FROM BOOTBLOCK_IDX TO IDXFILE_IDX-1 DO
+    BEGIN
+    IF .ALLOC_TABLE_CNT[.J] NEQ 0
+    THEN MAKE_POINTER1(BUFFER, .ALLOC_TABLE_CNT[.J], .ALLOC_TABLE_LBN[.J]);
+    END;
+
+! Now that the basic information has been accounted for, account for the
+! space required to keep the index file headers.  This gets interesting
+! if it is necessary to generate extension headers.
+!
+
+IDXFILE_EXT_CNT = .ALLOC_TABLE_CNT[IDXFILE_IDX];
+IDXFILE_EXT_LBN = .ALLOC_TABLE_LBN[IDXFILE_IDX];
+
+IF NOT MAKE_POINTER1 (BUFFER, .IDXFILE_EXT_CNT, .IDXFILE_EXT_LBN, UNMAPPED)
+THEN
+    BEGIN
+    EXTENSION_FID = IDXFILE_EXT_FID;
+    MAP_AREA[FM1$B_EX_RVN] = 0;
+    MAP_AREA[FM1$W_EX_FILNUM] = .EXTENSION_FID;
+    MAP_AREA[FM1$W_EX_FILSEQ] = .EXTENSION_FID;
+    MAP_AREA[FM1$B_EX_SEGNUM] = 0;
+    CHECKSUM (BUFFER);
+    WRITE_BLOCK(.LBN + FID$C_INDEXF, BUFFER);
+
+    CH$MOVE (512, BUFFER, ALT_BUFFER);
+    DO
+	BEGIN
+	ALT_BUFFER[FH1$W_FID_NUM] = .EXTENSION_FID;
+	ALT_BUFFER[FH1$W_FID_SEQ] = .EXTENSION_FID;
+	ALT_MAP_AREA[FM1$B_INUSE] = 0;
+	CH$FILL (0, 512-FH1$C_LENGTH-FI1$C_LENGTH-FM1$C_LENGTH,
+		 ALT_BUFFER+FH1$C_LENGTH+FI1$C_LENGTH+FM1$C_LENGTH);
+	IDXFILE_EXT_LBN = .IDXFILE_EXT_LBN - .UNMAPPED + .IDXFILE_EXT_CNT;
+	IDXFILE_EXT_CNT = .UNMAPPED;
+	MAP_FULL_STATUS = MAKE_POINTER1 (ALT_BUFFER, .IDXFILE_EXT_CNT, .IDXFILE_EXT_LBN, UNMAPPED);
+	ALT_MAP_AREA[FM1$W_EX_FILNUM] = .EXTENSION_FID + 1;
+	ALT_MAP_AREA[FM1$W_EX_FILSEQ] = .EXTENSION_FID + 1;
+	IF .MAP_FULL_STATUS
+	THEN
+	    BEGIN
+	    ALT_MAP_AREA[FM1$W_EX_FILNUM] = 0;
+	    ALT_MAP_AREA[FM1$W_EX_FILSEQ] = 0;
+	    END;
+	ALT_MAP_AREA[FM1$B_EX_SEGNUM] = .ALT_MAP_AREA[FM1$B_EX_SEGNUM] + 1;
+	CHECKSUM (ALT_BUFFER);
+	WRITE_BLOCK (.LBN + .EXTENSION_FID, ALT_BUFFER);
+	EXTENSION_FID = .EXTENSION_FID + 1;
+	END
+    UNTIL .MAP_FULL_STATUS;
+
+! Mark any created index file extension headers as in use
+!
+
+    (.VCB[VCB_IMAP])<IDXFILE_EXT_FID-1,.EXTENSION_FID - IDXFILE_EXT_FID> = -1;
+    END
+ELSE
+    BEGIN
+    CHECKSUM (BUFFER);
+    WRITE_BLOCK (.LBN + FID$C_INDEXF, BUFFER);
+    END;
+
+CREATE_WINDOW(BUFFER, 1, VCB[VCB_INDEXF], 1, 0);
+
+
+! Construct and write the bad block file header.
+!
+CH$FILL(0, 512-FH1$C_LENGTH-FI1$C_LENGTH-FM1$C_LENGTH, BUFFER+FH1$C_LENGTH+FI1$C_LENGTH+FM1$C_LENGTH);
+BUFFER[FH1$W_FID_NUM] = FID$C_BADBLK;
+BUFFER[FH1$W_FID_SEQ] = FID$C_BADBLK;
+MAP_AREA[FM1$W_EX_FILNUM] = 0;
+MAP_AREA[FM1$W_EX_FILSEQ] = 0;
+MAP_AREA[FM1$B_EX_SEGNUM] = 0;
+MAP_AREA[FM1$B_INUSE] = 0;
+(IDENT_AREA[FI1$W_FILENAME])<0,32> = %RAD50_11'BADBLK';
+BAD = OUTPUT_BAD[BAD_DESC];
+INCR J FROM 0 TO .OUTPUT_BAD[BAD_NUMDESC]-1 DO
+    BEGIN
+    IF NOT MAKE_POINTER1(BUFFER, .BAD[BAD_COUNT], .BAD[BAD_LBN])
+    THEN SIGNAL(BACKUP$_MAXBAD, 1, VCB[VCB_DEVICE]);
+    BAD = .BAD + BAD_S_DESC;
+    END;
+CHECKSUM(BUFFER);
+WRITE_BLOCK(.LBN + FID$C_BADBLK, BUFFER);
+
+
+! Construct and write the storage map file header.
+!
+CH$FILL (0, 512-FH1$C_LENGTH-FI1$C_LENGTH-FM1$C_LENGTH, BUFFER+FH1$C_LENGTH+FI1$C_LENGTH+FM1$C_LENGTH);
+BUFFER[FH1$W_FID_NUM] = FID$C_BITMAP;
+BUFFER[FH1$W_FID_SEQ] = FID$C_BITMAP;
+MAP_AREA[FM1$B_INUSE] = 0;
+(IDENT_AREA[FI1$W_FILENAME])<0,32> = %RAD50_11'BITMAP';
+MAKE_POINTER1(BUFFER, 1, .BITMAP_LBN);
+MAKE_POINTER1(BUFFER, .BITMAP_CNT-1, .BITMAP_LBN+1);
+CHECKSUM(BUFFER);
+WRITE_BLOCK(.LBN + FID$C_BITMAP, BUFFER);
+END;
+
+! Initial file header.  The pending bad block log file is used
+! since it is the first one written.
+!
+BIND
+	INITIAL_HEADER	= UPLIT (
+						! HEADER area
+	BYTE (FH2$C_LENGTH / 2),		! ident area offset
+	BYTE ((FH2$C_LENGTH + FI2$C_LENGTH)/2),	! map area offset
+	BYTE ($BYTEOFFSET (FH2$W_CHECKSUM)/2),	! access control list offset
+	BYTE ($BYTEOFFSET (FH2$W_CHECKSUM)/2),	! reserved area offset
+	WORD (0),				! file segment number
+	BYTE (1, 2),				! structure version and level
+	WORD (FID$C_BADLOG, FID$C_BADLOG, 0),	! file ID
+	WORD (0, 0, 0),				! extension file ID
+	BYTE (FAT$C_FIXED),			! fixed length record type
+	BYTE (0),				! no record attributes
+	WORD (16),				! record size
+	LONG (0, 1^16),				! HIBLK and EFBLK
+	WORD (0),				! EOF byte offset
+	BYTE (0, 0),				! bucket size & VFC length
+	WORD (16),				! maximum record length
+	WORD (0),				! default extend size
+	WORD (0, 0, 0, 0, 0, 0),		! unused record attributes
+	LONG (0),				! file characteristics
+	WORD (0),				! record protection
+	BYTE (0, 0),				! mapwords in use & access mode
+	LONG (0),				! file owner UIC
+	WORD (0),				! file protection
+	WORD (FID$C_MFD, FID$C_MFD, 0),		! directory back link
+	WORD (0),				! journal control flags
+	WORD (0),				! spare
+
+						! IDENT area
+	BYTE ('BADLOG.SYS;1        '),		! file name, type and version
+	WORD (1),				! revision number
+	LONG (0, 0, 0, 0, 0, 0, 0, 0));		! dates
+
+ROUTINE INIT_INDEX: L_P$ NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine initializes the contents of an ODS-2 index file.
+!	It writes the boot block, the home blocks, and the initial headers.
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	BUFFER:		BBLOCK[512],	! Block buffer
+	LBN,				! Current LBN
+	MAP_COUNT,			! Count field of map pointer
+	MAP_LBN,			! Start LBN of current map pointer
+	BAD:		REF BBLOCK;	! Pointer to bad block entry
+BIND
+	IDENT_AREA	= BUFFER + FH2$C_LENGTH : BBLOCK;
+L_DECL;
+
+
+! First block to write is the boot block.  If a boot block was present on the
+! input volume, write the boot program.  Otherwise, set up the message routine
+! for the -11 and build the message.
+!
+IF .BBLOCK[OUTPUT_ATTBUF[VSR_BOOTBLOCK], DSC$W_LENGTH] NEQ 0
+THEN
+    BEGIN
+    CH$COPY(
+	.BBLOCK[OUTPUT_ATTBUF[VSR_BOOTBLOCK], DSC$W_LENGTH],
+	.BBLOCK[OUTPUT_ATTBUF[VSR_BOOTBLOCK], DSC$A_POINTER],
+	0,
+	512, BUFFER);
+    BUFFER[4,0,32,0] = -1;	! Initialize with invalid LBN
+    END
+ELSE
+    BEGIN
+    CH$COPY(
+	BOOT_PROG_LEN, BOOT_PROGRAM,
+	BOOT_MESG_LEN, BOOT_MESSAGE,
+	0,
+	512, BUFFER);
+    CH$COPY(
+	.BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$W_LENGTH],
+	.BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$A_POINTER],
+	%C' ',
+	BTB$S_VOLNAME, BUFFER[BTB$T_VOLNAME]);
+    END;
+WRITE_BLOCK(.BOOTBLOCK_LBN, BUFFER);
+
+
+! Now construct the home block and write it to the remainder of the boot
+! block cluster and to the two home block clusters.
+!
+CH$FILL(0, 512, BUFFER);
+BUFFER[HM2$L_HOMELBN] = .BOOTBLOCK_LBN + 1;
+BUFFER[HM2$L_ALHOMELBN] = .REAL_HOMEBLOCK;
+BUFFER[HM2$L_ALTIDXLBN] = .IDXHDR2_LBN;
+BUFFER[HM2$W_STRUCLEV] = .OUTPUT_ATTBUF[VSR_VOLSTRUCT];
+BUFFER[HM2$W_CLUSTER] = .CLUSTER;
+BUFFER[HM2$W_HOMEVBN] = 2;
+BUFFER[HM2$W_ALHOMEVBN] = .REAL_HOMEBLOCK - .HOMEBLOCK2_LBN + .CLUSTER * 2 + 1;
+BUFFER[HM2$W_ALTIDXVBN] = .CLUSTER * 3 + 1;
+BUFFER[HM2$W_IBMAPVBN] = .CLUSTER * 4 + 1;
+BUFFER[HM2$L_IBMAPLBN] = .IDXFILE_LBN;
+BUFFER[HM2$L_MAXFILES] = .OUTPUT_ATTBUF[VSR_MAXFILES];
+BUFFER[HM2$W_IBMAPSIZE] = (.OUTPUT_ATTBUF[VSR_MAXFILES] + 4095) / 4096;
+BUFFER[HM2$W_RESFILES] = 9;
+BUFFER[HM2$W_RVN] = .OUTPUT_ATTBUF[VSR_RVN];
+IF .OUTPUT_ATTBUF[VSR_RVN] EQL 1
+THEN
+    BUFFER[HM2$W_SETCOUNT] = .COM_O_SETCOUNT;
+BUFFER[HM2$W_VOLCHAR] = .OUTPUT_ATTBUF[VSR_VOLCHAR];
+BUFFER[HM2$L_VOLOWNER] = .OUTPUT_ATTBUF[VSR_VOLOWNER];
+BUFFER[HM2$W_PROTECT] = .OUTPUT_ATTBUF[VSR_PROTECT];
+BUFFER[HM2$W_FILEPROT] = .OUTPUT_ATTBUF[VSR_FILEPROT];
+BUFFER[HM2$W_RECPROT] = .OUTPUT_ATTBUF[VSR_RECPROT];
+(BUFFER[HM2$Q_CREDATE]) = .(OUTPUT_ATTBUF[VSR_VOLDATE]);
+(BUFFER[HM2$Q_CREDATE]+4) = .(OUTPUT_ATTBUF[VSR_VOLDATE]+4);
+BUFFER[HM2$B_WINDOW] = .OUTPUT_ATTBUF[VSR_WINDOW];
+BUFFER[HM2$B_LRU_LIM] = .OUTPUT_ATTBUF[VSR_LRU_LIM];
+BUFFER[HM2$W_EXTEND] = .OUTPUT_ATTBUF[VSR_EXTEND];
+(BUFFER[HM2$Q_RETAINMIN]) = .(OUTPUT_ATTBUF[VSR_RETAINMIN]);
+(BUFFER[HM2$Q_RETAINMIN]+4) = .(OUTPUT_ATTBUF[VSR_RETAINMIN]+4);
+(BUFFER[HM2$Q_RETAINMAX]) = .(OUTPUT_ATTBUF[VSR_RETAINMAX]);
+(BUFFER[HM2$Q_RETAINMAX]+4) = .(OUTPUT_ATTBUF[VSR_RETAINMAX]+4);
+BUFFER[HM2$L_SERIALNUM] = .OUTPUT_BAD[BAD_SERIAL];
+CH$FILL(%C' ', HM2$S_STRUCNAME, BUFFER[HM2$T_STRUCNAME]);
+IF .OUTPUT_ATTBUF[VSR_RVN] NEQ 0
+THEN
+    CH$MOVE(HM2$S_STRUCNAME, COM_O_STRUCNAME, BUFFER[HM2$T_STRUCNAME]);
+CH$COPY(
+    .BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$W_LENGTH],
+    .BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$A_POINTER],
+    %C' ',
+    HM2$S_VOLNAME, BUFFER[HM2$T_VOLNAME]);
+CH$COPY(
+    .BBLOCK[OUTPUT_ATTBUF[VSR_OWNERNAME], DSC$W_LENGTH],
+    .BBLOCK[OUTPUT_ATTBUF[VSR_OWNERNAME], DSC$A_POINTER],
+    %C' ',
+    HM2$S_OWNERNAME, BUFFER[HM2$T_OWNERNAME]);
+CH$MOVE(HM2$S_FORMAT, UPLIT BYTE('DECFILE11B  '), BUFFER[HM2$T_FORMAT]);
+DECR J FROM .CLUSTER-1 TO 1 DO
+    WRITE_HOMEBLOCK(BUFFER);
+BUFFER[HM2$L_HOMELBN] = .HOMEBLOCK1_LBN;
+DECR J FROM .CLUSTER TO 1 DO
+    WRITE_HOMEBLOCK(BUFFER);
+BUFFER[HM2$L_HOMELBN] = .HOMEBLOCK2_LBN;
+DECR J FROM .CLUSTER TO 1 DO
+    WRITE_HOMEBLOCK(BUFFER);
+
+
+! Finish initializing the VCB, except for the index file window, which is
+! done after the header is written.
+!
+VCB[VCB_ODS_2] = TRUE;
+VCB[VCB_CLUSTER] = .BUFFER[HM2$W_CLUSTER];
+VCB[VCB_HDR_OFFSET] = .BUFFER[HM2$W_CLUSTER] * 4 + .BUFFER[HM2$W_IBMAPSIZE];
+VCB[VCB_MAXFILIDX] = .BUFFER[HM2$W_IBMAPSIZE] * 4096;
+VCB[VCB_IMAP_LBN] = .IDXFILE_LBN;
+
+
+! Initialize the memory resident index file bitmap.  The first block contains
+! the initially allocated files marked in use; the rest is all zero.
+!
+VCB[VCB_IMAP] = GET_ZERO_VM(.BUFFER[HM2$W_IBMAPSIZE] * 512);
+IF .VCB[VCB_SAVESET]
+THEN .VCB[VCB_IMAP] = %B'111111111'
+ELSE .VCB[VCB_IMAP] = %B'100000111';
+
+
+! Construct and write the pending bad block log file header.
+!
+LBN = .IDXFILE_LBN + .BUFFER[HM2$W_IBMAPSIZE] - 1;
+CH$COPY(
+    FH2$C_LENGTH+FI2$C_LENGTH, INITIAL_HEADER,
+    0,
+    512, BUFFER);
+BUFFER[FH2$L_FILEOWNER] = .OUTPUT_ATTBUF[VSR_VOLOWNER];
+BUFFER[FH2$W_FILEPROT] = .OUTPUT_ATTBUF[VSR_FILEPROT];
+BUFFER[FH2$W_RECPROT] = .OUTPUT_ATTBUF[VSR_RECPROT];
+(IDENT_AREA[FI2$Q_CREDATE]) = .(OUTPUT_ATTBUF[VSR_VOLDATE]);
+(IDENT_AREA[FI2$Q_CREDATE]+4) = .(OUTPUT_ATTBUF[VSR_VOLDATE]+4);
+(IDENT_AREA[FI2$Q_REVDATE]) = .(OUTPUT_ATTBUF[VSR_VOLDATE]);
+(IDENT_AREA[FI2$Q_REVDATE]+4) = .(OUTPUT_ATTBUF[VSR_VOLDATE]+4);
+CHECKSUM(BUFFER);
+WRITE_BLOCK(.LBN + FID$C_BADLOG, BUFFER);
+
+
+! Construct and write the index file header.
+!
+BUFFER[FH2$W_FID_NUM] = FID$C_INDEXF;
+BUFFER[FH2$W_FID_SEQ] = FID$C_INDEXF;
+BBLOCK [BUFFER[FH2$W_RECATTR], FAT$W_RSIZE] = 512;
+BBLOCK [BUFFER[FH2$W_RECATTR], FAT$W_MAXREC] = 512;
+BBLOCK[BUFFER[FH2$W_RECATTR], FAT$L_HIBLK] =
+    ROT(.CLUSTER*4 + .IDXFILE_CNT, 16);
+BBLOCK[BUFFER[FH2$W_RECATTR], FAT$L_EFBLK] =
+    ROT(.CLUSTER*4 + (.OUTPUT_ATTBUF[VSR_MAXFILNUM]+4095)/4096 + 9 + 1, 16);
+CH$MOVE(6, UPLIT BYTE('INDEXF'), IDENT_AREA[FI2$T_FILENAME]);
+MAP_COUNT = .BOOTBLOCK_CNT;
+MAP_LBN = .BOOTBLOCK_LBN;
+INCR J FROM BOOTBLOCK_IDX + 1 TO IDXFILE_IDX DO
+    BEGIN
+    IF .MAP_COUNT + .MAP_LBN EQL .ALLOC_TABLE_LBN[.J]
+    THEN
+	MAP_COUNT = .MAP_COUNT + .ALLOC_TABLE_CNT[.J]
+    ELSE
+	BEGIN
+	MAKE_POINTER(BUFFER, .MAP_COUNT, .MAP_LBN);
+	MAP_COUNT = .ALLOC_TABLE_CNT[.J];
+	MAP_LBN = .ALLOC_TABLE_LBN[.J];
+	END;
+    END;
+MAKE_POINTER(BUFFER, .MAP_COUNT, .MAP_LBN);
+CHECKSUM(BUFFER);
+WRITE_BLOCK(.LBN + FID$C_INDEXF, BUFFER);
+WRITE_BLOCK(.IDXHDR2_LBN, BUFFER);
+CREATE_WINDOW(BUFFER, .VCB[VCB_RVN], VCB[VCB_INDEXF], 1, 0);
+
+
+! Construct and write the bad block file header.
+!
+CH$FILL(0, 512-FH2$C_LENGTH-FI2$C_LENGTH, BUFFER+FH2$C_LENGTH+FI2$C_LENGTH);
+BUFFER[FH2$B_MAP_INUSE] = 0;
+BUFFER[FH2$W_FID_NUM] = FID$C_BADBLK;
+BUFFER[FH2$W_FID_SEQ] = FID$C_BADBLK;
+CH$MOVE(6, UPLIT BYTE('BADBLK'), IDENT_AREA[FI2$T_FILENAME]);
+MAP_COUNT = 0;
+BAD = OUTPUT_BAD[BAD_DESC];
+INCR J FROM 0 TO .OUTPUT_BAD[BAD_NUMDESC]-1 DO
+    BEGIN
+    MAP_COUNT = .MAP_COUNT + .BAD[BAD_COUNT];
+    IF NOT MAKE_POINTER(BUFFER, .BAD[BAD_COUNT], .BAD[BAD_LBN])
+    THEN SIGNAL(BACKUP$_MAXBAD, 1, VCB[VCB_DEVICE]);
+    BAD = .BAD + BAD_S_DESC;
+    END;
+BBLOCK[BUFFER[FH2$W_RECATTR], FAT$L_HIBLK] = ROT(.MAP_COUNT, 16);
+BBLOCK[BUFFER[FH2$W_RECATTR], FAT$L_EFBLK] = ROT(.MAP_COUNT+1, 16);
+CHECKSUM(BUFFER);
+WRITE_BLOCK(.LBN + FID$C_BADBLK, BUFFER);
+
+
+! Construct and write the storage map file header.
+!
+CH$FILL(0, 512-FH2$C_LENGTH-FI2$C_LENGTH, BUFFER+FH2$C_LENGTH+FI2$C_LENGTH);
+BUFFER[FH2$B_MAP_INUSE] = 0;
+BUFFER[FH2$W_FID_NUM] = FID$C_BITMAP;
+BUFFER[FH2$W_FID_SEQ] = FID$C_BITMAP;
+BUFFER[FH2$V_CONTIG] = TRUE;
+BBLOCK[BUFFER[FH2$W_RECATTR], FAT$L_HIBLK] = ROT(.BITMAP_CNT, 16);
+BBLOCK[BUFFER[FH2$W_RECATTR], FAT$L_EFBLK] = ROT((.VOLUME_SIZE/.CLUSTER+4095)/4096 + 2, 16);
+CH$MOVE(6, UPLIT BYTE('BITMAP'), IDENT_AREA[FI2$T_FILENAME]);
+MAKE_POINTER(BUFFER, .BITMAP_CNT, .BITMAP_LBN);
+CHECKSUM(BUFFER);
+WRITE_BLOCK(.LBN + FID$C_BITMAP, BUFFER);
+
+! If this is a save set volume we are initializing, also set up the headers
+! of the miscellaneous reserved files. If the volume is being restored to,
+! then the restore process will create these files.
+!
+
+IF .VCB[VCB_SAVESET]
+THEN
+    BEGIN
+
+! Turn the header into the continuation file header and write it.
+!
+
+    CH$FILL (0, 512-FH2$C_LENGTH-FI2$C_LENGTH, BUFFER+FH2$C_LENGTH+FI2$C_LENGTH);
+    BUFFER[FH2$B_MAP_INUSE] = 0;
+    BUFFER[FH2$V_CONTIG] = FALSE;
+    BBLOCK[BUFFER[FH2$W_RECATTR], FAT$L_HIBLK] = 0;
+    BBLOCK[BUFFER[FH2$W_RECATTR], FAT$L_EFBLK] = 1^16;
+    BUFFER[FH2$W_FID_NUM] = FID$C_CONTIN;
+    BUFFER[FH2$W_FID_SEQ] = FID$C_CONTIN;
+    CH$MOVE (6, UPLIT BYTE ('CONTIN'), IDENT_AREA[FI2$T_FILENAME]);
+    CHECKSUM2 (BUFFER, $BYTEOFFSET (FH2$W_CHECKSUM));
+    WRITE_BLOCK (.LBN + FID$C_CONTIN, BUFFER);
+
+! Turn the file header into the core image file header and write it.
+!
+
+    BUFFER[FH2$W_FID_NUM] = FID$C_CORIMG;
+    BUFFER[FH2$W_FID_SEQ] = FID$C_CORIMG;
+    CH$MOVE (6, UPLIT BYTE ('CORIMG'), IDENT_AREA[FI2$T_FILENAME]);
+    CHECKSUM2 (BUFFER, $BYTEOFFSET (FH2$W_CHECKSUM));
+    WRITE_BLOCK (.LBN + FID$C_CORIMG, BUFFER);
+
+! Turn the header into the volume set list file header and write it.
+!
+
+    BUFFER[FH2$W_FID_NUM] = FID$C_VOLSET;
+    BUFFER[FH2$W_FID_SEQ] = FID$C_VOLSET;
+    BBLOCK [BUFFER[FH2$W_RECATTR], FAT$W_RSIZE] = 64;
+    BBLOCK [BUFFER[FH2$W_RECATTR], FAT$W_MAXREC] = 64;
+    CH$MOVE (6, UPLIT BYTE ('VOLSET'), IDENT_AREA[FI2$T_FILENAME]);
+    CHECKSUM2 (BUFFER, $BYTEOFFSET (FH2$W_CHECKSUM));
+    WRITE_BLOCK (.LBN + FID$C_VOLSET, BUFFER);
+
+! Turn the header into the backup journal file header and write it.
+!
+
+    BUFFER[FH2$W_FID_NUM] = FID$C_BACKUP;
+    BUFFER[FH2$W_FID_SEQ] = FID$C_BACKUP;
+    BBLOCK [BUFFER[FH2$W_RECATTR], FAT$W_RSIZE] = 512;
+    BBLOCK [BUFFER[FH2$W_RECATTR], FAT$W_MAXREC] = 512;
+    CH$MOVE (6, UPLIT BYTE ('BACKUP'), IDENT_AREA[FI2$T_FILENAME]);
+    CHECKSUM2 (BUFFER, $BYTEOFFSET (FH2$W_CHECKSUM));
+    WRITE_BLOCK (.LBN + FID$C_BACKUP, BUFFER);
+
+! Turn the file header into the MFD header and write it.
+!
+
+    BUFFER[FH2$W_FID_NUM] = FID$C_MFD;
+    BUFFER[FH2$W_FID_SEQ] = FID$C_MFD;
+    BUFFER[FH2$V_CONTIG] = TRUE;
+    BUFFER[FH2$V_DIRECTORY] = 1;
+    BBLOCK [BUFFER[FH2$W_RECATTR], FAT$L_EFBLK] = ROT (2, 16);
+    BBLOCK [BUFFER[FH2$W_RECATTR], FAT$L_HIBLK] = ROT (.MFD_CNT, 16);
+    BBLOCK [BUFFER[FH2$W_RECATTR], FAT$B_RTYPE] = FAT$C_VARIABLE;
+    BBLOCK [BUFFER[FH2$W_RECATTR], FAT$B_RATTRIB] = FAT$M_NOSPAN;
+
+    CH$MOVE (10, UPLIT BYTE ('000000.DIR'), IDENT_AREA[FI2$T_FILENAME]);
+    MAKE_POINTER (BUFFER, .MFD_CNT, .MFD_LBN);
+    CHECKSUM2 (BUFFER, $BYTEOFFSET (FH2$W_CHECKSUM));
+    WRITE_BLOCK (.LBN + FID$C_MFD, BUFFER);
+    END;
+
+END;
+
+ROUTINE WRITE_HOMEBLOCK(BUFFER): L_P$ NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine computes the checksums in the home block currently
+!	in the buffer, writes it, and then increments the block numbers
+!	in the home block for the next write.
+!
+! INPUT PARAMETERS:
+!	BUFFER		- Pointer to buffer.
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+MAP
+	BUFFER:		REF BBLOCK;		! Pointer to buffer
+L_DECL;
+
+
+! Compute the two checksums and then write the block.
+!
+CHECKSUM2(.BUFFER, $BYTEOFFSET(HM2$W_CHECKSUM1));
+CHECKSUM2(.BUFFER, $BYTEOFFSET(HM2$W_CHECKSUM2));
+WRITE_BLOCK(.BUFFER[HM2$L_HOMELBN], .BUFFER);
+
+
+! Advance the block numbers to those of the next home block.
+!
+BUFFER[HM2$L_HOMELBN] = .BUFFER[HM2$L_HOMELBN] + 1;
+BUFFER[HM2$W_HOMEVBN] = .BUFFER[HM2$W_HOMEVBN] + 1;
+END;
+
+!+
+!
+! The following are the records of the initial MFD for structure level 2.
+!
+!-
+
+BIND
+	INITIAL_MFD = PLIT (
+					! MFD (itself)
+	WORD (22),			! record byte count
+	WORD (1),			! version limit
+	BYTE (0),			! flags
+	BYTE (10),			! name byte count
+	BYTE ('000000.DIR'),		! name string
+	WORD (1),			! version number
+	WORD (4, 4, 0),			! file ID
+
+					! backup journal file
+	WORD (22),			! record byte count
+	WORD (1),			! version limit
+	BYTE (0),			! flags
+	BYTE (10),			! name byte count
+	BYTE ('BACKUP.SYS'),		! name string
+	WORD (1),			! version number
+	WORD (8, 8, 0),			! file ID
+
+					! bad block file
+	WORD (22),			! record byte count
+	WORD (1),			! version limit
+	BYTE (0),			! flags
+	BYTE (10),			! name byte count
+	BYTE ('BADBLK.SYS'),		! name string
+	WORD (1),			! version number
+	WORD (3, 3, 0),			! file ID
+
+					! pending bad block log
+	WORD (22),			! record byte count
+	WORD (1),			! version limit
+	BYTE (0),			! flags
+	BYTE (10),			! name byte count
+	BYTE ('BADLOG.SYS'),		! name string
+	WORD (1),			! version number
+	WORD (9, 9, 0),			! file ID
+
+					! storage bitmap file
+	WORD (22),			! record byte couþt
+	WORD (1),			! version limit
+	BYTE (0),			! flags
+	BYTE (10),			! name byte count
+	BYTE ('BITMAP.SYS'),		! name string
+	WORD (1),			! version .umber
+	WORD (2, 2, 0),			! file ID
+
+					! standard continuation file
+	WORD (22),			! record byte count
+	WORD (1),			! v%rsion limit
+	BYTE (0),			! flags
+	BYTE (10),			! name byte count
+	BYTE ('CONTIN.SYS'),		! name string
+	WORD (1),			! version number
+	WORD (7, 7, 0),			! file ID
+
+					! core image file
+	WORD (22),			! record byte count
+	WORD (1),			! version limit
+	BYTE (0),			! flags
+	BYTE (10),			! name byte count
+	BYTE ('CORIMG.SYS'),		! name string
+	WORD (1),			! version number
+	WORD (5, 5, 0),			! file ID
+
+					! index file
+	WORD (22),			! record byte count
+	WORD (1),			! version limit
+	BYTE (0),			! flags
+	BYTE (10),			! name byte count
+	BYTE ('INDEXF.SYS'),		! name string
+	WORD (1),			! version number
+	WORD (1, 1, 0),			! file ID
+
+					! volume set list file
+	WORD (22),			! record byte count
+	WORD (1),			! version limit
+	BYTE (0),			! flags
+	BYTE (10),			! name byte count
+	BYTE ('VOLSET.SYS'),		! name string
+	WORD (1),			! version number
+	WORD (6, 6, 0),			! file ID
+
+	WORD (-1)			! end marker
+
+	);
+
+ROUTINE INIT_MFD : L_P$ NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine writes the initial master file directory.
+!
+!
+! CALLING SEQUENCE:
+!	INIT_MFD ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	allocation table
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	initial MFD written
+!
+!--
+
+BEGIN
+
+LOCAL
+	BUFFER		: BBLOCK [512];	! I/O buffer
+
+L_DECL;
+
+
+! Simply copy the MFD records into the buffer, zero filled and write it.
+!
+
+CH$COPY (.(INITIAL_MFD-4)*4, INITIAL_MFD,
+	 0, 512, BUFFER);
+
+WRITE_BLOCK (.MFD_LBN, BUFFER);
+
+END;					! end of routine INIT_MFD
+
+GLOBAL ROUTINE INITIALIZE_VOLUME(PVCB,PDEVCHAR): NOVALUE=
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine initializes an output disk volume during an image restore.
+!
+! INPUT PARAMETERS:
+!	PVCB		- Pointer to VCB for output volume.
+!	PDEVCHAR	- Pointer to device characteristics for output volume.
+!
+! IMPLICIT INPUTS:
+!	OUTPUT_ATTBUF	- Contains volume summary attributes.
+!	VCB[VCB_CHAN]	- Contains channel number assigned to volume.
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+LOCAL
+	P$AREA:		VECTOR[P$SIZE],		! Impure area
+	ACB:		REF BBLOCK,		! Pointer to ACB
+	C;					! Temp
+GLOBAL REGISTER
+	P$ = 11:	REF VECTOR;		! Impure area base register
+
+
+! Initialize.
+!
+P$ = P$AREA;
+CH$FILL(0, 2*ALLOC_MAX*4, _ALLOC_TABLE_CNT);
+_VCB = .PVCB;
+_DEVCHAR = .PDEVCHAR;
+CLUSTER = .OUTPUT_ATTBUF[VSR_CLUSTER];
+STRUCLEV_1 = (.OUTPUT_ATTBUF[VSR_STRUCLEV] EQL 1);
+
+
+! Strip trailing spaces from the volume name.  This is necessary so that it can
+! be zero-filled for an ODS-1 header.
+!
+DECR J FROM .BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$W_LENGTH]-1 TO 0 DO
+    BEGIN
+    IF .VECTOR[.BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$A_POINTER], .J ;,BYTE] EQL %C' '
+    THEN
+	BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$W_LENGTH] =
+	    .BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$W_LENGTH] - 1;
+    END;
+
+
+! Get the channel number assigned to the device.
+!
+CHANNEL = .VCB[VCB_CHAN];
+
+
+! Get the bad block information.
+!
+OUTPUT_BAD = GET_BADBLOCKS(.VCB[VCB_FAB], .CHANNEL, ._DEVCHAR, .CLUSTER);
+
+
+! Compute volume size, rounded up to next cluster boundary.
+!
+VOLUME_SIZE = (.DEVCHAR[DIB$L_MAXBLOCK] + .CLUSTER - 1) / .CLUSTER * .CLUSTER;
+
+
+! Allocate ACB to describe entire volume.
+!
+ACB = GET_VM(ACB_S_ENTRY);
+VCB[VCB_ACB_FLINK] = .ACB;
+VCB[VCB_ACB_BLINK] = .ACB;
+ACB[ACB_FLINK] = VCB[VCB_ACB_FLINK];
+ACB[ACB_BLINK] = VCB[VCB_ACB_FLINK];
+ACB[ACB_COUNT] = .VOLUME_SIZE;
+ACB[ACB_LBN] = 0;
+
+
+! Unless the user has preinitialized the volume, increase the maximum number
+! of files if warranted by the output volume size.
+!
+IF
+    .QUAL[QUAL_INIT] AND
+    .OUTPUT_ATTBUF[VSR_MAXFILES] LSSU
+	.DEVCHAR[DIB$L_MAXBLOCK] / ((.CLUSTER + 1) * 2)
+THEN
+    OUTPUT_ATTBUF[VSR_MAXFILES] =
+	.DEVCHAR[DIB$L_MAXBLOCK] / ((.CLUSTER + 1) * 2);
+
+
+! Now verify the parameters against the volume size and characteristics.
+!
+IF .STRUCLEV_1
+THEN
+    BEGIN
+    IF .DEVCHAR[DIB$L_MAXBLOCK] GTRU 255^12
+    THEN
+	SIGNAL(BACKUP$_LARGECNT, 1, VCB[VCB_DEVICE]);
+    IF .OUTPUT_ATTBUF[VSR_MAXFILES] GTRU 65500
+    THEN OUTPUT_ATTBUF[VSR_MAXFILES] = 65500;
+    END;
+
+
+! Check the cluster factor against its lower bound such that the storage map
+! does not exceed 255 blocks.  Also check for a reasonable minimum number of
+! clusters.
+!
+IF
+    .VOLUME_SIZE / .CLUSTER GTRU 255^12 OR
+    .VOLUME_SIZE / .CLUSTER LSS 50
+THEN
+    SIGNAL(BACKUP$_CLUSTER, 1, VCB[VCB_DEVICE]);
+
+
+! Increase maximum number of files if necessary to be input index file size.
+!
+IF .OUTPUT_ATTBUF[VSR_MAXFILNUM] GTRU .OUTPUT_ATTBUF[VSR_MAXFILES]
+THEN
+    OUTPUT_ATTBUF[VSR_MAXFILES] = .OUTPUT_ATTBUF[VSR_MAXFILNUM];
+
+
+! Check maximum number of files against number of clusters.
+!
+C = .VOLUME_SIZE / (.CLUSTER+1);
+IF .OUTPUT_ATTBUF[VSR_MAXFILNUM] GTR .C
+THEN
+    SIGNAL(BACKUP$_CLUSTER, 1, VCB[VCB_DEVICE]);
+
+IF .OUTPUT_ATTBUF[VSR_MAXFILES] GTR .C
+THEN
+    OUTPUT_ATTBUF[VSR_MAXFILES] = .C;
+
+
+! Establish the position of the index file.  If /INITIALIZE is specified, or
+! the original volume is not the same size, place it in the middle.  Otherwise,
+! propagate the original position.
+!
+! For middle placement, apply a bias factor equal to the size of a default
+! initial MFD so that in the usual case the file structure will be allocated
+! as INIT would allocate it.
+!
+! For propagated placement, subtract out the size of the storage bitmap to
+! place the index file bitmap on the same LBN.
+!
+IF
+    .OUTPUT_ATTBUF[VSR_INDEXLBN] EQL 0 OR
+    .OUTPUT_ATTBUF[VSR_VOLSIZE] NEQ .DEVCHAR[DIB$L_MAXBLOCK]
+THEN
+    BEGIN
+    OUTPUT_ATTBUF[VSR_INDEXLBN] =
+	.DEVCHAR[DIB$L_MAXBLOCK] / 2 + MAXU(2, .CLUSTER);
+    END
+ELSE
+    BEGIN
+    LOCAL
+	T;
+
+    T = (((.VOLUME_SIZE/.CLUSTER + 4095) / 4096) + .CLUSTER) / .CLUSTER * .CLUSTER;
+    IF .T LEQU .OUTPUT_ATTBUF[VSR_INDEXLBN]
+	THEN OUTPUT_ATTBUF[VSR_INDEXLBN] = .OUTPUT_ATTBUF[VSR_INDEXLBN] - .T
+	ELSE OUTPUT_ATTBUF[VSR_INDEXLBN] = 0;
+    END;
+
+
+! Now call the routines that do the work of initializing.
+!
+INIT_ALLOCATE();
+INIT_BITMAP();
+IF .STRUCLEV_1 THEN INIT_INDEX1() ELSE INIT_INDEX();
+IF .VCB[VCB_SAVESET] THEN INIT_MFD();
+
+
+! Note that the initialization is complete.  Record the volume label.
+!
+VCB[VCB_INIT_HDRS] = ..VCB[VCB_IMAP];
+VCB[VCB_INIT_DONE] = TRUE;
+CH$COPY(
+    .BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$W_LENGTH],
+    .BBLOCK[OUTPUT_ATTBUF[VSR_VOLNAME], DSC$A_POINTER],
+    %C' ',
+    HM2$S_VOLNAME,
+    VCB[VCB_VOLNAME]);
+
+
+! Release the bad block descriptor.
+!
+FREE_VM(BAD_S_HEADER + .OUTPUT_BAD[BAD_NUMDESC] * BAD_S_DESC, .OUTPUT_BAD);
+OUTPUT_BAD = 0;
+END;
+
+END
+ELUDOM

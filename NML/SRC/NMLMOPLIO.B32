@@ -1,0 +1,556 @@
+%TITLE 'NML MOP line I/O modules'
+MODULE NML$MOPLIO (
+		LANGUAGE (BLISS32),
+		ADDRESSING_MODE (NONEXTERNAL=LONG_RELATIVE),
+		ADDRESSING_MODE (EXTERNAL=LONG_RELATIVE),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:  DECnet-VAX V2.0 Network Management Listener
+!
+! ABSTRACT:
+!
+!	This module contains routines to handle I/O for MOP line
+!	access functions.
+!
+! ENVIRONMENT:  VAX/VMS Operating System
+!
+! AUTHOR:  Distributed Systems Software Engineering
+!
+! CREATION DATE:  21-JUL-1980
+!
+! MODIFIED BY:
+!
+!	V03-005	MKP0003		Kathy Perko		5-Jan_1982
+!		Redo NML$MOPSNDRCV so that the transmits are done with
+!		a QIOW, and a timer is set only on the receive.
+!
+!	V03-004	MKP0002		Kathy Perko		16-Dec-1981
+!		If NML$MOPSNDRCV receives a zero length MOP message from
+!		the target node, resend the MOP message this node is trying
+!		to send.  Add debug logging to report the QIO completion
+!		status for MOP messages.
+!
+!	V03-003 MKP0001		Kathy Perko		03-Oct-1981
+!		Add retries to IO$_ACCESS function to get control
+!		of the circuit over which a service function is to be
+!		performed.
+!
+!	V03-002	LMK0001		Len Kawell		02-Sep-1981
+!		Change NETACP interface.
+!		Modify for new MOP/NETACP interface.
+!--
+
+
+%SBTTL 'Declarations'
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+    NML$MOPOPEN,
+    NML$MOPSETSUBSTATE,
+    NML$MOPSNDRCV,
+    NML$MOPSEND,
+    NML$MOPCLOSE,
+    NML_MOPTIMEIO,
+    NML_MAPMOPERRORS;
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'LIB$:NMLLIB.L32';
+LIBRARY 'SHRLIB$:NMALIBRY.L32';
+LIBRARY 'SYS$LIBRARY:STARLET.L32';
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+    NML$K_MOPRCVEFN = 1,		! MOP receive event flag
+    NML$M_MOPRCVEFN = 1 ^ NML$K_MOPRCVEFN,
+    NML$K_MOPSNDEFN = 2,		! MOP send event flag
+    NML$M_MOPSNDEFN = 1 ^ NML$K_MOPSNDEFN,
+    NML$K_MOPTIMEFN = 3,		! MOP I/O timer event flag
+    NML$M_MOPTIMEFN = 1 ^ NML$K_MOPTIMEFN;
+
+!
+! OWN STORAGE:
+!
+
+OWN
+    NML$Q_MOPTIMER  : VECTOR [2]	! MOP I/O timer (delta)
+		      INITIAL (0, -1),
+    NML$W_MOP_CHAN  : WORD;		! MOP direct I/O channel
+
+!
+! EXTERNAL REFERENCES:
+!
+
+$NML_EXTDEF;
+$NML_SRVDEF;
+
+EXTERNAL ROUTINE
+    NML$BLD_REPLY,
+    NML$DEBUG_MSG,
+    NML$DEBUG_QIO,
+    NML$DEBUG_TXT,
+    NML$ERROR_1,
+    NML$SEND;
+
+
+%SBTTL 'NML$MOPOPEN  Open a circuit for MOP mode access'
+GLOBAL ROUTINE NML$MOPOPEN (CIRCUIT_DSC_ADR, SRVTIM) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine opens a channel to a circuit for service operations
+!	via a request to NETACP.
+!
+! INPUTS:
+!
+!	CIRCUIT_DSC_ADR	Address of circuit name descriptor.
+!	SRVTIM		Circuit service timer word.
+!
+! OUTPUTS:
+!
+!	Success/failure of operation.
+!
+!	NML$Q_MOPTIMER	Timer for MOP I/O has been set up.
+!	NML$W_MOP_CHAN 	Channel for all MOP I/O is initialized.
+!--
+
+BEGIN
+
+LOCAL
+    RETRY_COUNT,
+    IOSB	: $IOSB,
+    STATUS;
+
+!
+! Save the service timer (specified in Msec).
+!
+NML$Q_MOPTIMER [0] = -10 * 1000 * .SRVTIM;
+!
+! Assign a channel to NET for use in controlling and accessing the circuit.
+!
+STATUS = $ASSIGN (CHAN = NML$W_MOP_CHAN,
+	          DEVNAM = NML$GQ_NETNAMDSC);
+IF NOT .STATUS
+THEN
+    RETURN NML_MAPMOPERRORS (.STATUS, 0);
+
+!
+! Get NETACP to put the service device into a state where NML can
+! issue QIOs to it.  Issue the QIO to tell NETACP the circuit is needed
+! for a service function.  Do 3 retries.
+!
+RETRY_COUNT = 3;
+WHILE TRUE DO
+    BEGIN
+    RETRY_COUNT = .RETRY_COUNT - 1;
+    STATUS = $QIOW (CHAN = .NML$W_MOP_CHAN,
+			FUNC = IO$_ACCESS,
+			IOSB = IOSB,
+			P2 = .CIRCUIT_DSC_ADR);
+    NML$DEBUG_QIO (DBG$C_MOPIO, .STATUS, IOSB, 0, .CIRCUIT_DSC_ADR, 0, 0,
+			$ASCID ('IO$_ACCESS QIO on MOP channel'));
+    IF (NOT .STATUS) OR (NOT .IOSB [IOS$W_STATUS])
+    THEN
+	BEGIN
+	IF .RETRY_COUNT LEQ 0 THEN
+	    RETURN NML_MAPMOPERRORS (.STATUS, IOSB);
+	END
+    ELSE
+	EXITLOOP;
+    END;
+!
+! Set the circuit substate.
+!
+IF .STATUS THEN    
+    STATUS = NML$MOPSETSUBSTATE (NMA$C_LINSS_STA);
+RETURN .STATUS
+
+END;				! End of NML$MOPOPEN
+
+%SBTTL 'NML$MOPSETSUBSTATE  Set the circuit substate'
+GLOBAL ROUTINE NML$MOPSETSUBSTATE (SUBSTATE) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine modifies the substate of a circuit that has been opened
+!	for service operations.
+!
+! INPUTS:
+!
+!	SUBSTATE	New circuit substate code.
+!
+!	NML$W_MOP_CHAN	Channel for MOP circuit control has been initialized.
+!
+! OUTPUTS:
+!
+!	Success/failure of operation.
+!--
+
+    BEGIN
+
+    LOCAL
+	IOSB   : $IOSB,
+	STATUS;
+
+
+    STATUS = $QIOW (CHAN = .NML$W_MOP_CHAN, ! Channel
+		    FUNC = IO$_SETMODE,     ! Modify substate function
+		    IOSB = IOSB,	    ! Address of I/O status block
+		    P3   = .SUBSTATE);	    ! New substate value
+    NML$DEBUG_QIO (DBG$C_MOPIO, .STATUS, IOSB, 0, 0, SUBSTATE, 0,
+			$ASCID ('Set circuit substate'));
+
+    RETURN NML_MAPMOPERRORS (.STATUS, IOSB)
+
+    END;				! End of NML$MOPSETSUBSTATE
+
+%SBTTL 'NML$MOPSNDRCV  Send and receive a MOP mode message'
+GLOBAL ROUTINE NML$MOPSNDRCV (SNDDSC, RCVDSC, RCVLEN,
+				RETRY_FLAG) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs a transmit operation followed by a receive
+!	operation.  Actually, the receive is issued before the transmit
+!	to insure that a buffer is available for the receive.
+!
+! INPUTS:
+!
+!	SNDDSC		Address of descriptor of data to be transmitted.
+!	RCVDSC		Address of descriptor of receive buffer.
+!	RCVLEN		Address of word to contain length of received data.
+!	RETRY_FLAG	Flag indicating whether I/O should be retried.
+!
+! IMPLICIT INPUTS:
+!
+!	NML$Q_MOPTIMER	Timer for MOP I/O has been set up.
+!	NML$W_MOP_CHAN	Channel for MOP I/O has been initialized.
+!
+! OUTPUTS:
+!
+!	Success/failure of operation.
+!--
+
+BEGIN
+
+MAP
+    SNDDSC : REF DESCRIPTOR,
+    RCVDSC : REF DESCRIPTOR;
+
+LOCAL
+    IOSB   : $IOSB,
+    RETRY,
+    STATUS,
+    RSTATUS;
+!
+! Post a receive for the response MOP message before sending the MOP message
+! which the response will be for.
+!
+RETRY = 3;
+WHILE .RETRY GTR 0 DO
+    BEGIN
+    RSTATUS = $QIO (EFN  = NML$K_MOPRCVEFN,
+		   CHAN = .NML$W_MOP_CHAN,
+		   FUNC = IO$_READVBLK,
+		   IOSB = IOSB,
+		   P1   = .RCVDSC [DSC$A_POINTER],
+		   P2   = .RCVDSC [DSC$W_LENGTH]);
+    IF NOT .RSTATUS THEN
+	NML$DEBUG_QIO (DBG$C_MOPIO, .RSTATUS, 0, 0, 0, 0, 0,
+		   $ASCID ('MOP receive completion status'))
+    ELSE
+	EXITLOOP;
+    RETRY = .RETRY - 1;
+    END;
+IF .RETRY EQL 0 THEN
+    RETURN .STATUS;
+
+RETRY = 5;
+
+WHILE .RETRY GTR 0 DO
+    BEGIN
+!
+! Transmit the MOP message to the target load, loop, or dump node.
+!
+    STATUS = NML$MOPSEND (.SNDDSC [DSC$A_POINTER],
+			      .SNDDSC [DSC$W_LENGTH]);
+    IF .STATUS THEN
+	BEGIN
+!
+! The response MOP message must come back within a specified time.
+! Start the receive timer 
+!
+	STATUS = NML_MOPTIMEIO (NML$K_MOPRCVEFN);
+!
+! If the receive did not time out, check to see if it completed with an
+! error.
+!
+	IF .STATUS THEN
+	    BEGIN
+	    NML$DEBUG_QIO (DBG$C_MOPIO, .RSTATUS, IOSB, 0, 0, 0, 0,
+			   $ASCID ('MOP receive completion status'));
+	    STATUS = .IOSB [IOS$W_STATUS];
+	    (.RCVLEN)<0,16> = .IOSB [IOS$W_COUNT];
+
+	    IF .STATUS
+	    THEN
+		BEGIN
+		NML$DEBUG_MSG (	DBG$C_MOPIO,
+				.RCVDSC [DSC$A_POINTER],
+			        .(.RCVLEN)<0,16>,
+			        $ASCID ('MOP message received'));
+	    !
+	    ! If the received MOP message was zero bytes long, retransmit
+	    ! the send MOP message.
+	    !
+		IF .(.RCVLEN)<0,16> GTR 0 THEN
+		    EXITLOOP;
+		END;
+	    END;
+	END;
+!
+! If retries are allowed, decrement the retry count and retry the I/O.
+!
+    IF NOT .RETRY_FLAG THEN EXITLOOP;
+    RETRY = .RETRY - 1;
+    END;
+!
+! If no response was received from the target node, cancel the receive
+! on the MOP channel.
+!
+IF .RETRY LEQ 0 THEN
+    $CANCEL (CHAN = .NML$W_MOP_CHAN);
+RETURN NML_MAPMOPERRORS (.STATUS, 0)
+
+END;				! End of NML$MOPSNDRCV
+
+%SBTTL 'NML$MOPSEND  Send a MOP mode message'
+GLOBAL ROUTINE NML$MOPSEND (ADR, LEN) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine transmits a single MOP message.
+!
+! INPUTS:
+!
+!	ADR		Address of data to be transmitted.
+!	LEN		Length in bytes of data to be transmitted.
+!
+!	NML$W_MOP_CHAN	Channel for MOP I/O has been initialized.
+!
+! OUTPUTS:
+!
+!	Success/failure of operation.
+!--
+
+BEGIN
+
+LOCAL
+    IOSB   : $IOSB,
+    WSTATUS;
+
+NML$DEBUG_MSG (	DBG$C_MOPIO,
+		.ADR,
+		.LEN,
+		$ASCID ('Transmitting MOP message'));
+WSTATUS = $QIOW (EFN  = NML$K_MOPSNDEFN,
+		   CHAN = .NML$W_MOP_CHAN,
+		   FUNC = IO$_WRITEVBLK,
+		   IOSB = IOSB,
+		   P1   = .ADR,
+		   P2   = .LEN);
+
+!
+! Dump the transmit's completion status to the debug log.  
+!
+NML$DEBUG_QIO (DBG$C_MOPIO, .WSTATUS, IOSB, 0, 0, 0, 0,
+		$ASCID ('MOP transmit completion status'));
+RETURN NML_MAPMOPERRORS (.WSTATUS, IOSB)
+
+END;				! End of NML$MOPSEND
+
+%SBTTL 'NML_MOPTIMEIO  Time MOP I/O operation'
+ROUTINE NML_MOPTIMEIO (IOEFN) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine times a MOP I/O operation.
+!
+! INPUTS:
+!
+!	IOEFN		I/O event flag number.
+!
+! OUTPUTS:
+!
+!	Success/failure.
+!--
+
+    BEGIN
+
+    LOCAL
+	EFLAGS,
+	STATUS,
+	IOSB:	$IOSB;
+
+!
+! Start the timer.
+!
+    $SETIMR (EFN    = NML$K_MOPTIMEFN,
+	     DAYTIM = NML$Q_MOPTIMER);
+!
+! Wait for the I/O operation to complete or the timer to expire.
+!
+    $WFLOR (EFN  = 0,
+	    MASK = NML$M_MOPTIMEFN OR (1 ^ .IOEFN));
+!
+! If the timer expired then return an error.  If the I/O operation completed
+! then return success.
+!
+    $READEF (EFN   = 0,
+	     STATE = EFLAGS);
+
+    IF (.EFLAGS AND (1 ^ .IOEFN)) EQL 0
+    THEN
+	BEGIN
+	NML$DEBUG_TXT (DBG$C_MOPIO,
+			$ASCID ('QIO to MOP channel has timed out'));
+	STATUS = SS$_TIMEOUT;
+
+	END
+    ELSE
+!
+! The I/O operation completed so cancel the timer.
+!
+	$CANTIM ();
+
+    RETURN .STATUS
+
+    END;				! End of NML_MOPTIMEIO
+
+%SBTTL 'NML$MOPCLOSE  Take a circuit out of MOP mode'
+GLOBAL ROUTINE NML$MOPCLOSE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine takes a circuit out of service mode and makes it available
+!	for normal use.
+!
+! INPUTS:
+!
+!	NML$W_MOP_CHAN	Channel for MOP I/O has been assigned.
+!
+! OUTPUTS:
+!
+!	Success.
+!--
+
+    BEGIN
+
+    $DASSGN (CHAN = .NML$W_MOP_CHAN);
+
+    RETURN NML$_STS_SUC
+
+    END;				! End of NML$MOPCLOSE
+
+%SBTTL 'NML_MAPMOPERRORS  Map MOP error codes'
+ROUTINE NML_MAPMOPERRORS (CODE, IOSB) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine sets up the message block information for MOP errors.
+!
+! INPUTS:
+!
+!	CODE		QIO status code.
+!	IOSB		Address of I/O status block.
+!
+! OUTPUTS:
+!
+!	If an error is indicated, the appropriate NICE message information
+!	is stored in the message block (NML$AB_MSGBLOCK).
+!
+!	The actual status of the operation is returned.  The status
+!	comes from either the value in R0 or the value in the I/O status
+!	block.
+!--
+
+    BEGIN
+
+    MAP
+	IOSB : REF $IOSB;
+
+    LOCAL
+	STATUS;
+
+    STATUS = .CODE;
+
+    IF .CODE
+    THEN
+	IF .IOSB NEQA 0
+	THEN
+	    STATUS = .IOSB [IOS$W_STATUS];
+
+    IF NOT .STATUS
+    THEN
+	SELECTONEU .STATUS OF
+	    SET
+	    [OTHERWISE]:
+		BEGIN
+
+		NML$AB_MSGBLOCK [MSB$L_FLAGS] = MSB$M_MSG_FLD OR
+						MSB$M_SYSM_FLD;
+		NML$AB_MSGBLOCK [MSB$B_CODE] = NMA$C_STS_LCO;
+		NML$AB_MSGBLOCK [MSB$L_TEXT] = .STATUS;
+
+		END;
+	    TES;
+
+    RETURN .STATUS
+
+    END;				! End of NML_MAPMOPERRORS
+
+END					! End of module
+
+ELUDOM

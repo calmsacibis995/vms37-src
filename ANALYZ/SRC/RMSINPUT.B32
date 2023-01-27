@@ -1,0 +1,703 @@
+%title 'RMSINPUT - Handle RMS File Input'
+	module rmsinput	(
+			ident='V03-002') = begin
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! Facility:	VAX/VMS Analyze Facility, Handle RMS File Input
+!
+! Abstract:	This module is responsible for handling file specs from
+!		the ANALYZE/RMS_FILE command line, and reading data from
+!		file headers and RMS files.
+!
+!
+! Environment:
+!
+! Author: Paul C. Anagnostopoulos, Creation Date: 16 February 1981
+!
+! Modified By:
+!
+!	V03-002	PCA0030		Paul Anagnostopoulos	24-Mar-1982
+!		Fix error messages so they use the correct STV value.
+!
+!	V03-001	PCA0009		Paul Anagnostopoulos	16-Mar-1982
+!		If LIB$FIND_FILE returns a bad status, used the resultant
+!		spec in the error message, rather than the wildcard spec.
+!--
+
+%sbttl 'Module Declarations'
+!
+! Libraries and Requires:
+!
+
+library 'lib';
+require 'rmsreq';
+
+!
+! Table of Contents:
+!
+
+forward routine
+	anl$open_next_rms_file,
+	anl$prolog_info: novalue,
+	anl$bucket: novalue,
+	anl$format_file_header: novalue,
+	anl$fdl_file: novalue;
+
+!
+! External References:
+!
+
+external routine
+	anl$format_error,
+	anl$format_line,
+	anl$format_protection_mask,
+	anl$format_skip,
+	cli$get_value: addressing_mode(general),
+	lib$find_file: addressing_mode(general),
+	lib$free_vm: addressing_mode(general),
+	lib$get_vm: addressing_mode(general),
+	str$trim: addressing_mode(general);
+
+!
+! Global Variables:
+!
+! The following variable is set to point at the file attribute (FAT)
+! structure for the file being analyzed.
+
+global
+	anl$gl_fat: ref block[,byte],
+
+! The following variable contains the prolog version number.
+
+	anl$gw_prolog: word;
+
+!
+! Own Variables:
+!
+
+! The following data structures are used to access and read records from
+! a file we are to analyze.
+
+own
+	own_described_buffer(resultant_spec,nam$c_maxrss);
+own
+	rms_xabfhc: $xabfhc(nxt=0),
+
+	rms_xabpro: $xabpro(nxt=rms_xabfhc),
+
+	rms_xabdat: $xabdat(nxt=rms_xabpro),
+
+	rms_nam: $nam(),
+
+	rms_fab: $fab(fac=<bio,get>,
+		      nam=rms_nam,
+		      shr=get,
+		      xab=rms_xabdat),
+
+	rms_rab: $rab(fab=rms_fab);
+
+	
+%sbttl 'ANL$OPEN_NEXT_RMS_FILE - Right'
+!++
+! Functional Description:
+!	This routine is called to open the next RMS file we are to analyze.
+!	It handles multiple file specs and wildcarding.
+!
+! Formal Parameters:
+!	opened_spec	Address of descriptor of buffer in which to return
+!			the spec of the file we open.  We set the length.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	True if there is another file, false otherwise.
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$open_next_rms_file(opened_spec) = begin
+
+bind
+	opened_spec_dsc = .opened_spec: descriptor;
+
+own
+	own_described_buffer(wildcard_spec,nam$c_maxrss),
+	wildcard_context: long initial(0);
+
+local
+	status: long;
+
+
+! If the wildcard context is zero, it means this is the first call, or
+! we finished with a file spec on the previous call.  So we must obtain
+! the next file spec from the command line.
+
+if .wildcard_context eqlu 0 then (
+	wildcard_spec[len] = nam$c_maxrss;
+	status = cli$get_value(describe('file_specs'),wildcard_spec);
+
+	! If there are no more specs, we are all done.
+
+	if not .status then
+		return false;
+	str$trim(wildcard_spec,wildcard_spec,wildcard_spec);
+);
+
+! On the other hand, if the wildcard context is non-zero, we may have just
+! finished processing a file.  Better close it.
+
+if .wildcard_context nequ 0 and .rms_fab[fab$w_ifi] nequ 0 then (
+	status = $close(fab=rms_fab);
+	check (.status, anl$_closein,1,resultant_spec,.status,.rms_fab[fab$l_stv]);
+
+	! We also better flush the bucket cache, in case we cancelled the
+	! analysis of this file in the middle.
+
+	anl$bucket();
+);
+
+! We have obtained a wildcard spec from the file parameter.
+
+! Now we need to find the next file that matches the current wildcard spec.
+
+resultant_spec[len] = nam$c_maxrss;
+status = lib$find_file(wildcard_spec,resultant_spec,wildcard_context,describe('.DAT'));
+str$trim(resultant_spec,resultant_spec,resultant_spec);
+
+! If we failed to find a file, then reset the wildcard context and call
+! ourselves recursively to process the next file spec.  Also give an
+! error, unless we just plain ran out of files.
+
+if not .status then (
+	if .status nequ rms$_nmf then
+		signal (anl$_openin,1,resultant_spec,.status);
+	wildcard_context = 0;
+	return anl$open_next_rms_file(opened_spec_dsc);
+);
+
+! Hey, we got a file spec.  Open the file and connect the RAB.
+
+rms_fab[fab$b_fns] = .resultant_spec[len];
+rms_fab[fab$l_fna] = .resultant_spec[ptr];
+status = $open(fab=rms_fab);
+check (.status, anl$_openin,1,resultant_spec,.status,.rms_fab[fab$l_stv]);
+if .status then (
+	status = $connect(rab=rms_rab);
+	check (.status, anl$_openin,1,resultant_spec,.status,.rms_rab[rab$l_stv]);
+);
+
+! If the open failed, then we need to recurse to try the next file.
+
+if not .status then
+	return anl$open_next_rms_file(opened_spec_dsc);
+
+! There are some ODS-I crocks in the RMS attribute structure returned in the
+! File Header Characteristics XAB.  Let's fix them here so that everyone else
+! can just assume they're OK.  They are the following:
+!	A VFC header size of zero is the same as two.
+!	A bucket size of zero is the same as one.
+
+if .rms_fab[fab$b_rfm] eqlu fab$c_vfc and .rms_xabfhc[xab$b_hsz] eqlu 0 then
+	rms_xabfhc[xab$b_hsz] = 2;
+rms_xabfhc[xab$b_bkz] = maxu(.rms_xabfhc[xab$b_bkz],1);
+
+! Set up a global pointer to the attribute structure.  We can now use the
+! FAT$ symbols to reference the information.  This assumes that the
+! information in the XAB is in the same order as it is in the file header.
+
+anl$gl_fat = rms_xabfhc[xab$b_rfo];
+
+! There is some information in the prolog that should be global because
+! it is used a lot.  Set up that information.
+
+anl$prolog_info();
+
+! The preceeding hackery has set up the XAB so that information can
+! be easily retrieved.  This is a design flaw.  I should have designed
+! my own structure to contain all this info, along with the prolog
+! version and any other global info about the file.
+
+! Finally, we have to return the resultant file spec to the caller.
+
+opened_spec_dsc[len] = .resultant_spec[len];
+ch$move(.resultant_spec[len],.resultant_spec[ptr], .opened_spec_dsc[ptr]);
+
+return true;
+
+end;
+
+%sbttl 'ANL$PROLOG_INFO - Set Up Global Information from Prolog'
+!++
+! Functional Description:
+!	This routine is responsible for obtaining information from the
+!	prolog of a file and setting it up in global places.  We do this
+!	because the information is used a lot all over the place.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$prolog_info: novalue = begin
+
+local
+	p: bsd,
+	pp: ref block[,byte];
+
+
+! We want to set up a global variable with the prolog version.  If it's
+! a sequential file, the version is 1.  Otherwise we have to get the
+! file's first prolog block.
+
+if .anl$gl_fat[fat$v_fileorg] eqlu fat$c_sequential then
+	anl$gw_prolog = 1
+else (
+
+	! Set up a BSD to read in the prolog of the file.  Get it.
+
+	init_bsd(p);
+	p[bsd$w_size] = 1;
+	p[bsd$l_vbn] = 1;
+	anl$bucket(p,0);
+
+	! Put the prolog version in our global variable.
+
+	pp = .p[bsd$l_bufptr];
+	anl$gw_prolog = .pp[plg$w_ver_no];
+
+	! If this in a relative file, then the prolog block contains the
+	! end-of-file VBN.  It should have been in the damn file header,
+	! as it is for sequential files.  Let's put it there.
+
+	anl$gl_fat[fat$l_efblk] = .pp[plg$l_eof];
+
+	anl$bucket(p,-1);
+);
+
+return;
+
+end;
+
+%sbttl 'ANL$BUCKET - Handle Acquire & Release of Buckets'
+!++
+! Functional Description:
+!	This routine is called to acquire and/or release buckets from
+!	the file being analyzed.  It handles reading and caching of
+!	buckets when they are acquired, and freeing of buffers when
+!	they are released.
+!
+!	Caching enhances performance when the same bucket is acquired
+!	by multiple routines around the same time (as in /INTERACTIVE mode).
+!
+!	This routine also handles a special call, indicated by no
+!	arguments, that causes us to flush the cache.
+!
+! Formal Parameters:
+!	the_bsd		Address of a BSD describing the buckets to be
+!			acquired and/or released.
+!	operation	positive:	If the BSD points to a bucket buffer,
+!					it is to be released.  Then the
+!					bucket described by the BSD size/VBN
+!					is to be acquired.  The positive value
+!					is the VBN of the parent of the new
+!					structure.
+!			zero:		Same as positive, except that there is
+!					no parent or it is unknown.
+!			-1:		If the BSD points to a bucket buffer,
+!					it is to be released.  No new bucket
+!					is acquired.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$bucket(the_bsd,operation): novalue = begin
+
+bind
+	b = .the_bsd: bsd;
+
+literal
+	slot_count = 32;
+own
+	high_slot:	signed long initial(-1),
+	cached_size:	vector[slot_count,byte],
+	cached_vbn:	vector[slot_count,long],
+	cached_bufptr:	vector[slot_count,long] initial(rep slot_count of long (0)),
+	cached_refs:	vector[slot_count,byte] initial(rep slot_count of byte (0));
+
+local
+	status: long,
+	i: long,
+	available: signed long, release: signed long, acquire: signed long;
+
+builtin
+	nullparameter;
+
+
+! If we are called with no parameters, then we are to flush the cache.
+! This is done between files, in case a drastic structure error causes
+! us to quit in the middle of an analysis.
+
+if nullparameter(1) then (
+	high_slot = -1;
+	return;
+);
+
+! To begin with, we have to locate three slots in the valid cached vectors:
+!	available:	The index of the first available slot.
+!	release:	The index of the slot describing the buffer to be
+!			released (if the BSD references a buffer).
+!	acquire:	The index of the slot describing the buffer to be
+!			acquired (if the new bucket is indeed cached).
+
+available = release = acquire = -1;
+incr i from 0 to .high_slot do (
+
+	if .cached_refs[.i] eqlu 0 then
+		available = minu(.available,.i)
+	else
+		if .b[bsd$l_bufptr] eqla .cached_bufptr[.i] then
+			release = .i;
+
+	if .b[bsd$w_size] eqlu .cached_size[.i] and .b[bsd$l_vbn] eqlu .cached_vbn[.i] then
+		acquire = .i;
+);
+
+! Alright, now we may need to release a buffer.
+
+if .release neq -1 then (
+
+	! We have a buffer to release.  Decrement its reference count.
+
+	decrement (cached_refs[.release]);
+
+	! Clear the buffer pointer in the BSD as a positive statement
+	! that it no longer references a buffer.
+
+	b[bsd$l_bufptr] = 0;
+
+) else
+	if .b[bsd$l_bufptr] neqa 0 then
+
+		! Oops.  The BSD references a buffer, but we didn't find it
+		! in the cache.  This is a logic error.
+
+		signal(anl$_cacherelfail);
+
+! Now the caller may want us to acquire a new bucket.  We allow buckets
+! to be of size zero, which is useful when the BSD describes something
+! that isn't actually within the virtual blocks of the file (e.g., the
+! file header).
+
+if .operation neq -1 and .b[bsd$w_size] nequ 0 then (
+
+	! If the desired bucket is already cached, then we can just return
+	! a reference to the extant buffer.  We must increment the reference
+	! count to record this new reference.
+
+	if .acquire neq -1 then (
+		b[bsd$l_bufptr] = .cached_bufptr[.acquire];
+		increment (cached_refs[.acquire]);
+
+	) else (
+
+		! We know the desired bucket must be read.  Use the first
+		! unused slot if any; otherwise use the available slot found
+		! above.  If we have run out of slots, that's trouble.
+
+		if .high_slot lss slot_count-1 then
+			available = increment (high_slot)
+		else
+			if .available eql -1 then
+				signal (anl$_cachefull);
+
+		! If the slot we are going to use for this new bucket still
+		! describes an old buffer, free up the buffer.
+
+		if .cached_bufptr[.available] neqa 0 then (
+			status = lib$free_vm(%ref(.cached_size[.available]*512),
+					     cached_bufptr[.available]);
+			check (.status, .status);
+		);
+
+		! Allocate a buffer for the bucket and read it in.
+		! We force reads of VBN 0 to fail rather than read the next
+		! stupid block.
+
+		status = lib$get_vm(%ref(.b[bsd$w_size]*512),rms_rab[rab$l_ubf]);
+		check (.status, .status);
+		rms_rab[rab$w_usz] = .b[bsd$w_size]*512;
+		rms_rab[rab$l_bkt] = .b[bsd$l_vbn];
+		status =	(if .b[bsd$l_vbn] eqlu 0 then
+					false
+				else
+					$read(rab=rms_rab));
+
+		! If the read failed, we have to generate and error message
+		! and treat it as a drastic structure error.  A read fails
+		! if the status is bad, or if it didn't read in the number
+		! of blocks we asked for.  If we know the parent VBN, it is
+		! included in the message.
+
+		if not .status or (.rms_rab[rab$w_rsz]+511)/512 nequ .b[bsd$w_size] then (
+			lib$free_vm(%ref(.b[bsd$w_size]*512),rms_rab[rab$l_ubf]);
+			if .operation neq 0 then
+				anl$format_error(anl$_badreadpar,.operation,.b[bsd$l_vbn])
+			else
+				anl$format_error(anl$_badreadnopar,.b[bsd$l_vbn]);
+			signal (anl$_unwind);
+		);
+
+		! Now we can fill in the cached vectors with a description of
+		! the bucket we just read.
+
+		cached_size[.available] =	.b[bsd$w_size];
+		cached_vbn[.available] =	.b[bsd$l_vbn];
+		cached_bufptr[.available] =	.rms_rab[rab$l_ubf];
+		cached_refs[.available] =	1;
+
+		! Finally, reference the buffer in the BSD.
+
+		b[bsd$l_bufptr] = .rms_rab[rab$l_ubf];
+	);
+
+	! As a friendly gesture, set the end pointer in the BSD to point
+	! at the byte following the buffer.
+
+	b[bsd$l_endptr] = .b[bsd$l_bufptr] + .b[bsd$w_size]*512;
+);
+
+return;
+
+end;
+
+%sbttl 'ANL$FORMAT_FILE_HEADER - Print Nice File Header'
+!++
+! Functional Description:
+!	This routine is called to print a nicely formatted file header.
+!	This does NOT include the information in the user file attribute
+!	area.  We assume that the file header is valid, since it's
+!	ANALYZE/DISK_STRUCTURE's business to verify it.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$format_file_header: novalue = begin
+
+
+! Start by putting out a little heading line.
+
+anl$format_line(3,0,anl$_filehdr);
+anl$format_skip(0);
+
+! We will begin with the complete file specification.
+
+anl$format_line(0,1,anl$_filespec,resultant_spec);
+
+! Now we include the file ID.
+
+anl$format_line(0,1,anl$_fileid,.rms_nam[nam$w_fid_num],.rms_nam[nam$w_fid_seq],.rms_nam[nam$w_fid_rvn]);
+
+! Now the owner UIC.
+
+anl$format_line(0,1,anl$_owneruic,.rms_xabpro[xab$w_grp],.rms_xabpro[xab$w_mbm]);
+
+! Now the file protection mask.
+
+anl$format_protection_mask(1,anl$_prot,.rms_xabpro[xab$w_pro]);
+
+! Now the creation, revision, expiration, and backup dates.  We also include
+! the revision number.  Some dates might not be present.
+
+anl$format_line(0,1,anl$_creation,rms_xabdat[xab$q_cdt]);
+anl$format_line(0,1,anl$_revision,rms_xabdat[xab$q_rdt],.rms_xabdat[xab$w_rvn]);
+if .rms_xabdat[xab$l_edt0] eqlu 0 and .rms_xabdat[xab$l_edt4] eqlu 0 then
+	anl$format_line(0,1,anl$_noexpiration)
+else
+	anl$format_line(0,1,anl$_expiration,rms_xabdat[xab$q_edt]);
+if .rms_xabdat[xab$l_bdt0] eqlu 0 and .rms_xabdat[xab$l_bdt4] eqlu 0 then
+	anl$format_line(0,1,anl$_nobackup)
+else
+	anl$format_line(0,1,anl$_backup,rms_xabdat[xab$q_bdt]);
+
+! Now the contiguity options, performance options, and reliability options.
+
+selectoneu true of set
+[.rms_fab[fab$v_cbt]]:	anl$format_line(0,1,anl$_contig,uplit byte(%ascic 'contiguous-best-try'));
+
+[.rms_fab[fab$v_ctg]]:	anl$format_line(0,1,anl$_contig,uplit byte(%ascic 'contiguous'));
+
+[otherwise]:		anl$format_line(0,1,anl$_contig,uplit byte(%ascic 'none'));
+tes;
+
+if .rms_fab[fab$v_dfw] then
+	anl$format_line(0,1,anl$_perform,uplit byte(%ascic 'deferred-write'))
+else
+	anl$format_line(0,1,anl$_perform,uplit byte(%ascic 'none'));
+
+if .rms_fab[fab$v_rck] then
+	if .rms_fab[fab$v_wck] then
+		anl$format_line(0,1,anl$_reliab,uplit byte(%ascic 'read-check, write-check'))
+	else
+		anl$format_line(0,1,anl$_reliab,uplit byte(%ascic 'read-check'))
+else
+	if .rms_fab[fab$v_wck] then
+		anl$format_line(0,1,anl$_reliab,uplit byte(%ascic 'write-check'))
+	else
+		anl$format_line(0,1,anl$_reliab,uplit byte(%ascic 'none'));
+
+return;
+
+end;
+
+%sbttl 'ANL$FDL_FILE - Generate FILE Primary for FDL'
+!++
+! Functional Description:
+!	This routine is responsible for generating the file primary of an
+!	FDL spec.  The file primary describes the attributes of the file.
+!	The rest of the FDL routines are in module RMSFDL.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine anl$fdl_file: novalue = begin
+
+own
+	yes_no: vector[2,long] initial(
+			uplit byte (%ascic 'no'),
+			uplit byte (%ascic 'yes')
+			);
+
+local
+	p: bsd,
+	pp: ref block[,byte];
+
+
+! All we have to do is put out a line for each item in the file primary.
+! We cannot, of course, put out lines for items which are not stored in
+! the file header or RMS attribute area.
+
+anl$format_line(0,0,anl$_fdlfile);
+anl$format_line(0,1,anl$_fdlalloc,.anl$gl_fat[fat$l_hiblk]);
+anl$format_line(0,1,anl$_fdlbesttry,.yes_no[.rms_fab[fab$v_cbt] and 1]);
+if .anl$gl_fat[fat$v_fileorg] eqlu fat$c_relative or
+   .anl$gl_fat[fat$v_fileorg] eqlu fat$c_indexed	then
+	anl$format_line(0,1,anl$_fdlbucketsize,.anl$gl_fat[fat$b_bktsize]);
+anl$format_line(0,1,anl$_fdlcontig,
+		.yes_no[not .rms_fab[fab$v_cbt] and .rms_fab[fab$v_ctg] and 1]);
+anl$format_line(0,1,anl$_fdlextension,.anl$gl_fat[fat$w_defext]);
+if .anl$gl_fat[fat$v_fileorg] eqlu fat$c_relative or
+   .anl$gl_fat[fat$v_fileorg] eqlu fat$c_indexed	then
+	anl$format_line(0,1,anl$_fdlglobalbufs,.rms_fab[fab$w_gbc]);
+
+! To put out the maximum record number for relative files, we have to get
+! the prolog block.  Set up a BSD, read it, and put out the line.
+
+if .anl$gl_fat[fat$v_fileorg] eqlu fat$c_relative then (
+	init_bsd(p);
+	p[bsd$w_size] = 1;
+	p[bsd$l_vbn] = 1;
+	anl$bucket(p,0);
+	pp = .p[bsd$l_bufptr];
+	anl$format_line(0,1,anl$_fdlmaxrecord,.pp[plg$l_mrn]);
+	anl$bucket(p,-1);
+);
+
+anl$format_line(0,1,anl$_fdlfilename,resultant_spec);
+anl$format_line(0,1,anl$_fdlorg,
+		(selectoneu .anl$gl_fat[fat$v_fileorg] of set
+		[fat$c_sequential]:	uplit byte (%ascic 'sequential');
+		[fat$c_relative]:	uplit byte (%ascic 'relative');
+		[fat$c_indexed]:	uplit byte (%ascic 'indexed');
+		tes));
+anl$format_line(0,1,anl$_fdlowner,.rms_xabpro[xab$w_grp],.rms_xabpro[xab$w_mbm]);
+anl$format_protection_mask(1,anl$_fdlprotection,.rms_xabpro[xab$w_pro]);
+anl$format_line(0,1,anl$_fdlreadcheck,.yes_no[.rms_fab[fab$v_rck] and 1]);
+anl$format_line(0,1,anl$_fdlwritecheck,.yes_no[.rms_fab[fab$v_wck] and 1]);
+
+return;
+
+end;
+
+end eludom

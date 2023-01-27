@@ -1,0 +1,577 @@
+MODULE listing (IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  Message compiler
+!
+! ABSTRACT:
+!
+!	This compiler translated message definition language
+!	into object modules
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. unprivileged user mode,
+!
+! AUTHOR:  Tim Halvorsen, Nov 1979
+!
+! Modified by:
+!
+! 	001	PCG0001		Peter George		29-Dec-1980
+!		Alter format of syntax errors.  Put indicator and
+!		message on separate lines.
+!
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';		! VAX/VMS common definitions
+
+LIBRARY 'SYS$LIBRARY:TPAMAC';		! TPARSE definitions
+
+REQUIRE 'SRC$:MSG.REQ';			! Command definitions
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    line_with_value,			! Output a line with a hex value
+    echo_record,			! Echo the input record on one line
+    syntax_error,			! Signal a syntax error
+    set_line_number,			! Set line number into buffer
+    new_page,				! Start a new page
+    put_line,				! Output a listing record
+    error_summary,			! Give error summary
+    end_listing;			! Cleanup listing
+
+!
+! Macros
+!
+
+MACRO
+    descriptor (string) =		! Create descriptor of static string
+	UPLIT(%CHARCOUNT(string),UPLIT BYTE (string))%;
+
+!
+! Literals
+!
+
+LITERAL
+    code_offset = 25,			! Column where message code starts
+    linenum_offset = 35,		! Column where line number starts
+    record_offset = 40,			! Column where record starts
+    line_size = 133;			! Length of output record buffer
+
+!
+! Storage definitions
+!
+
+OWN
+    page_number:	INITIAL(0),	! Current page number
+    line_number:	INITIAL(9999),	! Current line number (force new page)
+    lines_per_page:	INITIAL(60),	! Maximum lines per page
+    last_echoed:	INITIAL(0),	! Last input record echoed
+    errors:		INITIAL(0),	! # errors detected
+    warnings:		INITIAL(0),	! # warnings detected
+    infos:		INITIAL(0);	! # informational msgs issued
+
+!
+! External storage
+!
+
+EXTERNAL
+    cli_flags:		BITVECTOR,	! CLI qualifier bits
+    worst_error:	BBLOCK,		! Worst error encountered
+    title_text:		VECTOR,		! Title text string
+    module_name:	VECTOR,		! Descriptor of module name string
+    input_record:	VECTOR,		! Descriptor of record into tparse
+    input_linenum,			! Input line number
+    listing_fab:	BBLOCK,		! Listing file FAB
+    listing_rab:	BBLOCK,		! Listing file RAB
+    output_fab:		BBLOCK,		! Output file FAB
+    output_rab:		BBLOCK,		! Output file RAB
+    input_fab:		BBLOCK,		! Input file FAB
+    input_rab:		BBLOCK;		! Input file RAB
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    lib$lp_lines,			! Determine physical lines/page
+    rms_error;				! Signal RMS-type error
+
+GLOBAL ROUTINE line_with_value (value) =
+
+!---
+!
+!	This routine outputs a listing line for a successfully
+!	parsed input record.
+!
+! Inputs:
+!
+!	value = Value to be output as hex value on line
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+LOCAL
+    input_length,			! Length of input line
+    buffer:	VECTOR [line_size,BYTE],	! Output buffer
+    tmpdesc:	VECTOR [2],		! Temporary FAO descriptor
+    bufdesc:	VECTOR [2];		! Descriptor of buffer
+
+IF NOT .cli_flags [qual_listing]	! If not /LISTING
+THEN
+    RETURN true;			! then do nothing
+
+CH$FILL(' ',record_offset,buffer);	! Clear beginning of line
+
+set_line_number (buffer);		! Set line number into buffer
+
+input_length = MINU(.input_rab [rab$w_rsz], line_size-record_offset);
+
+bufdesc [0] = .input_length + record_offset; ! Actual length of line
+bufdesc [1] = buffer;			! Set buffer address
+
+CH$MOVE(.input_length, .input_rab [rab$l_rbf], buffer+record_offset);
+
+tmpdesc [0] = 8;			! Length of FAO output
+tmpdesc [1] = buffer + code_offset;	! Address to put FAO output
+$FAO(descriptor('!XL'),0, tmpdesc, .value);
+
+!
+!	Output the completed line
+!
+
+put_line(bufdesc);			! Output the line
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE syntax_error (tparse, message, faoargs) =
+
+!---
+!
+!	This routine reports a syntax error to the listing
+!	file when an error is detected in the input stream.
+!
+! Inputs:
+!
+!	message = Message code describing error
+!	tparse = Address of TPARSE block
+!
+! Outputs:
+!
+!	r0 = message code given (so that it can be returned)
+!---
+
+BEGIN
+
+BUILTIN
+    ACTUALCOUNT;			! Number of actual arguments
+
+MAP
+    message:	BBLOCK,			! Get at fields of message
+    tparse:	REF BBLOCK;		! Address of TPARSE parameter block
+
+LOCAL
+    bufdesc:	VECTOR [2],		! Buffer descriptor
+    buffer: VECTOR [line_size,BYTE],	! Line buffer
+    pos,				! Position to put indicator on line
+    status;				! Status code
+
+!
+!	Increment the number of messages for each type of severity
+!
+
+IF .message [sts$v_severity] EQL sts$k_warning
+THEN
+    warnings = .warnings + 1
+ELSE
+    IF .message [sts$v_severity] EQL sts$k_info
+THEN
+    infos = .infos + 1
+ELSE
+    errors = .errors + 1;
+
+!
+!	Save worst error encountered during compile
+!
+
+IF .message [sts$v_severity] GEQ .worst_error [sts$v_severity]
+THEN
+    worst_error = .message OR sts$m_inhib_msg;
+
+!
+!	Echo the input record first
+!
+
+IF .cli_flags [qual_listing]		! If /LISTING specified,
+THEN
+    BEGIN
+    LOCAL save;
+    save = .last_echoed;		! Save line number last echoed
+    echo_record();			! Echo the input record on one line
+    last_echoed = .save;		! Restore so call below will not no-op
+    END;
+
+echo_record(output_rab);		! also to sys$output as well
+
+!
+!	Figure out the position to put the indicator marker and output indicator
+!
+
+pos = 1;				! Set column to 1
+INCR i FROM 0 TO .tparse [tpa$l_tokenptr] - 1 - .input_record [1]
+DO
+    IF .(.input_record [1] + .i)<0,8> EQL '	' ! If TAB detected,
+    THEN
+	pos = .pos + 9 - (.pos MOD 8)	! Increment column to tab stop
+    ELSE
+	pos = .pos + 1;			! Else, increment column by one
+
+pos = record_offset + .pos-1;		! Figure column in output listing
+
+IF (.pos GTRU line_size) OR 		! If off end of line
+   (.tparse [tpa$l_stringcnt] EQLU 0)	! or end or record,
+THEN
+    pos = record_offset;		! then just put at start of line
+
+bufdesc [0] = .pos + 1;			! Size of buffer
+bufdesc [1] = buffer;			! Address of buffer
+
+CH$FILL (' ', .pos, buffer);		! Clear buffer
+
+buffer [.pos] = '!';			! Insert indicator
+
+put_line (bufdesc);			! Output indicator
+
+!
+!	Get text of error message
+!
+
+bufdesc [0] = line_size;		! Size of buffer
+
+$GETMSG (MSGID=.message,BUFADR=bufdesc,MSGLEN=bufdesc);
+
+IF ACTUALCOUNT() GTR 2			! If FAO arguments specified,
+THEN
+    BEGIN
+    LOCAL
+	ctrbuffer: VECTOR [line_size,BYTE],	! Control string
+	ctrdesc: VECTOR [2];		! Control string descriptor
+
+    ctrdesc [0] = .bufdesc [0];		! Copy FAO string descriptor
+    ctrdesc [1] = ctrbuffer;
+    CH$MOVE(.bufdesc [0], .bufdesc [1], ctrbuffer); ! Save string
+    bufdesc [0] = line_size;		! Reset output buffer size
+    $FAOL(CTRSTR=ctrdesc,OUTLEN=bufdesc,OUTBUF=bufdesc,PRMLST=faoargs);
+    END;
+
+!
+!	Output the message
+!
+
+put_line (bufdesc);			! Output message buffer
+put_line (bufdesc, output_rab);		! and also to sys$output as well
+
+RETURN .message OR sts$m_inhib_msg;	! return with input status
+					! and mark already signaled
+
+END;
+
+GLOBAL ROUTINE echo_record (rab) =
+
+!---
+!
+!	This routine simply outputs the input record at the
+!	correct position on the output listing.
+!
+! Inputs:
+!
+!	rab = Address of RAB to use (if not specified, use listing_rab)
+!	input_rab = Address of input file RAB
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+BUILTIN
+    NULLPARAMETER;			! True if not specified
+
+LOCAL
+    input_length,			! Length of input line
+    buffer:	VECTOR [line_size,BYTE],	! Line buffer
+    bufdesc:	VECTOR [2];			! Buffer descriptor
+
+IF .input_linenum EQL .last_echoed	! If already echoed,
+THEN
+    RETURN true;			! then skip it
+last_echoed = .input_linenum;		! Remember last line echoed
+
+CH$FILL(' ',record_offset,buffer);	! Clear beginning of line
+set_line_number (buffer);		! Set line number into buffer
+
+input_length = MINU(.input_rab [rab$w_rsz], line_size-record_offset);
+
+bufdesc [0] = .input_length + record_offset; ! Actual length of line
+bufdesc [1] = buffer;			! Set buffer address
+
+CH$MOVE(.input_length, .input_rab [rab$l_rbf], buffer+record_offset);
+
+IF NULLPARAMETER(1)			! If FAB not specified,
+THEN
+    put_line(bufdesc)			! Output the line
+ELSE
+    put_line(bufdesc,.rab);		! else output on specified rab
+
+RETURN true;
+
+END;
+
+ROUTINE set_line_number (buffer) =
+
+!---
+!
+!	This routine increments the current line number
+!	and sets the line number into the output buffer
+!	at the correct position.
+!
+! Inputs:
+!
+!	buffer = Address of buffer (line_size bytes)
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+MAP
+    buffer:	REF VECTOR [,BYTE];	! Address of buffer
+
+LOCAL
+    bufdesc:	VECTOR [2];		! Descriptor of above string
+
+bufdesc [0] = 4;			! Set length of buffer
+bufdesc [1] = .buffer + linenum_offset;	! Set address of buffer
+
+$FAO(descriptor('!4UL'),0, bufdesc, .input_linenum);
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE new_page =
+
+!---
+!
+!	This routine outputs the heading lines at the
+!	start of each page.  A page eject is issued here.
+!
+! Inputs:
+!
+!	None
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+BIND
+    input_nam = .input_fab [fab$l_nam]: BBLOCK,		! Address of NAM block
+    input_xabdat = .input_fab [fab$l_xab]: BBLOCK;	! Address of XABDAT
+
+LOCAL
+    buffer:	VECTOR [line_size,BYTE],	! Output buffer
+    bufdesc:	VECTOR [2];		! Buffer descriptor
+
+IF .page_number EQL 0			! If first page in output file,
+THEN
+    lines_per_page = LIB$LP_LINES()-6;	! then initialize lines per page
+
+line_number = 0;			! Reset line number to 0
+page_number = .page_number + 1;		! and increment page number
+
+bufdesc [0] = line_size;		! Length of buffer
+bufdesc [1] = buffer;			! Address of buffer
+
+$FAO(descriptor(
+'!^!31AS !28AS !20%D  VAX-11 Message V03.00                   Page!4UL'),
+	bufdesc,bufdesc,module_name,title_text,0,.page_number);
+
+put_line(bufdesc);			! Output line
+
+bufdesc [0] = line_size;		! Reset length of buffer
+
+$FAO(descriptor('!61* !20%D  !44AD'),
+	bufdesc,bufdesc,input_xabdat [xab$q_cdt],
+	.input_nam [nam$b_rsl], .input_nam [nam$l_rsa]);
+
+put_line(bufdesc);			! Output line
+
+bufdesc [0] = 1;			! Reset to null line
+put_line(bufdesc);			! Output a blank line
+
+RETURN true;
+
+END;
+
+ROUTINE put_line (line_desc, rab) =
+
+!---
+!
+!	This routine outputs a given record to the listing
+!	file.
+!
+! Inputs:
+!
+!	line_desc = Address of record descriptor
+!	rab = Address of output rab to use (if not specified, use listing_rab)
+!
+! Outputs:
+!
+!	None, errors are signaled
+!---
+
+BEGIN
+
+BUILTIN
+    NULLPARAMETER;			! True if not specified
+
+MAP
+    line_desc:	REF VECTOR;		! Address of a descriptor
+
+LOCAL
+    outfab:	REF BBLOCK,		! Output FAB
+    outrab:	REF BBLOCK,		! Output RAB
+    status;				! Status code
+
+IF NULLPARAMETER(2)			! If RAB not specified,
+THEN
+    outrab = listing_rab		! then use listing file rab
+ELSE
+    outrab = .rab;			! else, use RAB address
+outfab = .outrab [rab$l_fab];		! and get FAB address
+
+IF .outfab [fab$w_ifi] EQL 0		! If file not opened
+THEN
+    RETURN true;			! then do nothing
+
+line_number = .line_number + 1;		! Increment line number
+
+IF .line_number GEQ .lines_per_page	! If exceeded lines per page,
+THEN
+    new_page();				! then cause page eject
+
+outrab [rab$w_rsz] = .line_desc [0];	! Set length of record
+outrab [rab$l_rbf] = .line_desc [1];	! Set address of record
+
+status = $PUT(RAB=.outrab);		! Output line
+
+IF NOT .status				! If error detected,
+THEN
+    rms_error(emsg(writeerr),.outfab,.outrab);	! report error
+
+RETURN .status;				! return with status
+
+END;
+
+GLOBAL ROUTINE error_summary (rab) =
+
+!---
+!
+!	This routine outputs a summary of the errors detected.
+!
+! Inputs:
+!
+!	rab = Address of RAB to use
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+LOCAL
+    bufdesc:	VECTOR [2];		! Buffer descriptor
+
+bufdesc [0] = 0;			! Null line
+put_line(bufdesc, .rab);		! Output a blank line
+
+bufdesc [0] = line_size;
+$FAO(descriptor('There were !UL error!%S, !UL warning!%S, and !UL informational message!%S issued.'),
+	bufdesc,bufdesc,.errors,.warnings,.infos);
+
+put_line(bufdesc, .rab);		! Output error summary
+
+RETURN true;
+
+END;
+
+GLOBAL ROUTINE end_listing (rab) =
+
+!---
+!
+!	This routine is called to output the compile run
+!	statistics collected during execution.
+!
+! Inputs:
+!
+!	rab = Address of RAB to use
+!
+! Outputs:
+!
+!	None
+!---
+
+BEGIN
+
+error_summary(.rab);			! Output error summary
+
+RETURN true;
+
+END;
+
+END
+ELUDOM

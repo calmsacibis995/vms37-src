@@ -1,0 +1,373 @@
+MODULE LIB_FILEIO (			! Routines to read/write files
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-002'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  Library command processor
+!
+! ABSTRACT:
+!
+!	The VAX/VMS librarian is invoked by DCL to process the LIBRARY
+!	command.  It utilizes the librarian procedure set to perform
+!	the actual modifications to the library.
+!
+! ENVIRONMENT:
+!
+!	VAX native, user mode.
+!
+!--
+!
+!
+! AUTHOR:  Benn Schreiber,	 CREATION DATE:  20-June-1979
+!
+! MODIFIED BY:
+!
+!	V03-002	MLJ0086		Martin L. Jack,	6-Apr-1982  13:19
+!		Fix V02-011 to work for shareable image libraries.
+!
+!	V02-011		RPG0011		Bob Grosso	30-Mar-1982
+!		Use SQO (sequential only) option in FAB FOP to gain
+!		network performance enhancement by restricting file
+!		to sequential processing.
+!
+!	V02-003		RPG0003		Bob Grosso	07-Jan-1982
+!		Return error when input file locked.
+!
+!	V02-002		RPG002		Bob Grosso	7-Aug-1981
+!		lib$gl_ctlmsk now a quadword
+!
+!	V02-001	BLS0029		Benn Schreiber		23-Dec-1980
+!		Convert messages to message compiler.  Libraries of shareable
+!		image symbol tables.
+!
+!--
+
+
+
+LIBRARY
+	'SYS$LIBRARY:STARLET.L32';	!System data structures
+REQUIRE
+	'PREFIX';			!Librarian macros
+REQUIRE
+	'LIBDEF';			!Librarian data structures
+REQUIRE
+	'LBRDEF';			!Library processor definitions
+
+EXTERNAL
+    lbr$gl_rmsstv : ADDRESSING_MODE (GENERAL), !RMS STV from librarian
+    lib$gl_ctlmsk : BLOCK [2],		!Library control mask
+    lib$gl_libctl,			!Library control index
+    lib$gl_inpfdb : REF BBLOCK,		!Pointer to input FDB
+    lib$al_rab : BBLOCK,		!Pointer to input RAB
+    lib$gl_type,			!Type of library opened
+    lib$gl_inplist : REF BBLOCK;	!Listhead for input files
+
+EXTERNAL ROUTINE
+    find_list_width,			!Determine listing width
+    getfilnamdesc,			!Get string descriptor for file name
+    lib_get_mem,			!Get memory
+    lib_free_mem,			!and give it back
+    lib_get_zmem;			!Get zeroed memory
+
+EXTERNAL LITERAL
+    lib$_initerr;			!Error initializing library
+
+GLOBAL ROUTINE next_input_file =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine opens the next input file and returns success or failure.
+!
+! IMPLICIT INPUTS:
+!
+!	The list of input files is pointed to by lib$gl_inplist.
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	The file is opened, and lib$gl_inpfdb points to the current FDB.
+!
+!--
+
+LOCAL
+    inpfab : BBLOCK [fab$c_bln];	!FAB to open file
+
+IF .lib$gl_inpfdb EQL 0			!If fdb not set up yet
+THEN BEGIN
+    lib$gl_inpfdb = lib$gl_inplist;	!Then point at listhead to get first
+    $RAB_INIT (				! and initialize the RAB
+		RAB = lib$al_rab,
+		FAB = inpfab,
+		ROP = LOC		! use locate mode
+		);
+    END
+ELSE BEGIN				!Otherwise close open library
+    LOCAL
+	status;
+    BIND
+	inpdesc = lib$gl_inpfdb [fdb$l_namdesc] : BBLOCK;
+
+    $FAB_INIT (FAB = inpfab);		!Initialize FAB as a FAB
+    inpfab [fab$w_ifi] = .lib$gl_inpfdb [fdb$w_ifi]; !Set the IFI for CLOSE
+    rms_perform ($DISCONNECT (RAB = lib$al_rab),
+		lib$_closein,
+		.lib$al_rab [rab$l_stv], 1, inpdesc);
+    rms_perform ($CLOSE (FAB = inpfab),	!Close the library
+		lib$_closein,
+		.inpfab [fab$l_stv], 1, inpdesc);
+    END;
+lib$gl_inpfdb = .lib$gl_inpfdb [fdb$l_nxtfdb]; !Link to next FDB
+if .lib$gl_inpfdb EQL 0			!And if no more
+THEN BEGIN
+    IF .lib$al_rab [rab$l_ubf] NEQ 0
+    THEN lib_free_mem (lbr$c_maxrecsiz, .lib$al_rab [rab$l_ubf]);
+    RETURN false
+    END;
+
+BEGIN
+    LOCAL
+	open_status;
+
+    BIND
+	inpdesc = lib$gl_inpfdb [fdb$l_namdesc] : BBLOCK, !Descriptor for filename
+	inpnam = lib$gl_inpfdb [fdb$t_nam] : BBLOCK; 	!Name NAM block
+
+    $FAB_INIT (					!Init the FAB
+		FAB = inpfab,
+		FAC = GET,			!For gets
+		MRS = lbr$c_maxrecsiz,		!Max record size
+		RFM = VAR,			!Variable format records
+		FOP = <NAM,SQO>,		!Open by NAM block
+						!Restrict to sequential access for network performance gain
+		NAM = inpnam,			!Point to the nam block
+		FNS = .inpdesc [dsc$w_length],	!Pass name also in case network open
+		FNA = .inpdesc [dsc$a_pointer]	
+		);
+    IF .lib$gl_type EQL lbr$c_typ_shstb		!If a shareable image being opened
+    THEN
+	BEGIN
+	inpfab [fab$v_bro] = true;		! then set bro also
+	inpfab [fab$v_sqo] = false;		! and clear SQO
+	END;
+    open_status = $OPEN (FAB = inpfab);
+    IF NOT .open_status
+    THEN
+	BEGIN
+	SIGNAL (lib$_openin,
+		1, inpdesc,
+!		.inpfab [fab$l_stv],
+		.open_status );
+	RETURN .open_status;
+	END;
+    lib$gl_inpfdb [fdb$w_ifi] = .inpfab [fab$w_ifi];	!Save IFI for close
+    IF .lib$al_rab [rab$l_ubf] EQL 0			!If no user buffer allocated
+    THEN BEGIN
+	perform (lib_get_mem (lbr$c_maxrecsiz, lib$al_rab [rab$l_ubf]), !Allocate buffer
+			lib$_initerr, 1, inpdesc);
+	lib$al_rab [rab$w_usz] = lbr$c_maxrecsiz;	!and set size in RAB
+	END;
+    rms_perform ($CONNECT (RAB = lib$al_rab),		!Connect for record I/O
+		lib$_openin,
+		.lib$al_rab [rab$l_stv], 1, inpdesc);
+    IF .lib$gl_type EQL lbr$c_typ_shstb		!If opening a shareable image
+    THEN BEGIN
+	inpfab [fab$v_esc] = true;		!Set the majik bit
+	inpfab [fab$l_ctx] = rme$c_setrfm;	!Function to set record format
+	inpfab [fab$b_rfm] = fab$c_var;		!Set variable length records for $gets
+	rms_perform ($MODIFY (FAB = inpfab),	!Tell RMS to think differently
+		lib$_openin,			! this should not fail
+		inpfab [fab$l_stv], 1, inpdesc);!  but if it does report the error
+	END;
+    END;
+RETURN ss$_normal
+END;					! Of next_input_file
+
+GLOBAL ROUTINE get_record (record_desc) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads the next record from the current input file
+!
+! Inputs:
+!
+!	NONE
+!
+! Implicit inputs:
+!
+!	Input file must be open
+!
+! Outputs:
+!
+!	record_desc	is a string descriptor for the record
+!
+!--
+LOCAL
+    status;
+
+MAP
+    record_desc : REF BBLOCK;
+
+BIND
+    inpdesc = lib$gl_inpfdb [fdb$l_namdesc] : BBLOCK;
+
+status = $GET (RAB = lib$al_rab);	!Read the record
+IF NOT .status AND (.status NEQ rms$_eof)
+THEN SIGNAL (lib$_readerr,
+	1, inpdesc, .status, .lib$al_rab [rab$l_stv]);
+record_desc [dsc$w_length] = .lib$al_rab [rab$w_rsz]; !Return length
+record_desc [dsc$a_pointer]   = .lib$al_rab [rab$l_rbf]; !and address of record
+RETURN .status
+END;					! Of get_record
+
+GLOBAL ROUTINE lib_open_out (fdb, relnam, carriage_cntrl, listingwidth) =
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine opens the output file specified by fdb.
+!
+! INPUTS:
+!
+!	fdb		address of the file descriptor block
+!	relnam		Address of related NAM block
+!	carriage_cntrl	true if fab$v_cr, false if not
+!	listingwidth	optional address of place to store width of device
+!
+! OUTPUTS:
+!
+!	fdb[fdb$w_ifi]	ifi of open file
+!
+!--
+
+MAP
+    fdb : REF BBLOCK;
+
+LOCAL
+    status,
+    ofab : BBLOCK [fab$c_bln];
+
+BIND
+    namblk = fdb [fdb$t_nam] : BBLOCK,	!Name the NAM block
+    filedefdesc = fdb [fdb$l_defext] : BBLOCK,	!String descriptor for default filename
+    filenamedesc = fdb [fdb$l_namdesc] : BBLOCK; !String descriptor for filename
+
+BUILTIN
+    NULLPARAMETER;
+
+$FAB_INIT (					!Initialize the FAB
+	FAB = ofab,
+	RFM = VAR,
+	FNS = .filenamedesc [dsc$w_length],
+	FNA = .filenamedesc [dsc$a_pointer],
+	DNS = .filedefdesc  [dsc$w_length],
+	DNA = .filedefdesc  [dsc$a_pointer],
+	FAC = PUT,
+	NAM = namblk,
+	FOP = <OFP, SQO>			!Restrict to sequential access for network performance gain
+	);
+
+IF .carriage_cntrl				!If carriage control desired
+    THEN ofab [fab$v_cr] = true;
+
+$RAB_INIT (					!Initialize the RAB
+	RAB = lib$al_rab,
+	FAB = ofab
+	);
+namblk [nam$l_rlf] = .relnam;			!Set address of related NAM block
+!
+! Create the file
+!
+status = $CREATE (FAB = ofab);			!Create the file
+IF NOT .status					!If error
+THEN BEGIN
+    getfilnamdesc (ofab, filenamedesc);		!Get string descriptor for name
+    SIGNAL_STOP (				!Signal error and stop
+		lib$_openout,
+		1, filenamedesc, .status, .ofab [fab$l_stv]);
+    END;
+getfilnamdesc (ofab, filenamedesc);
+rms_perform ($CONNECT (RAB = lib$al_rab),		!Connect the record stream
+	lib$_openout,
+	.lib$al_rab [rab$l_stv], 1, filenamedesc);
+!
+! Set IFI into fdb and return
+!
+fdb [fdb$w_ifi] = .ofab [fab$w_ifi];
+IF NOT NULLPARAMETER (4)
+THEN perform (find_list_width (ofab, .listingwidth));
+RETURN true
+END;					!Of lib_open_out
+
+GLOBAL ROUTINE lib_close_out (fdb, delete) =
+BEGIN
+!++
+! Close the open output file
+!
+! Inputs:
+!
+!	fdb	Address of the fdb for the file
+!	delete	True to delete file
+!
+! Outputs:
+!
+!	file is closed
+!
+!--
+
+MAP
+   fdb : REF BBLOCK;
+
+BIND
+    namblk = fdb [fdb$t_nam] : BBLOCK;
+
+LOCAL
+    ofab : BBLOCK [fab$c_bln];
+
+$FAB_INIT (FAB = ofab);			!Make a FAB
+ofab [fab$v_dlt] = .delete;		!Set delete flag true/false
+ofab [fab$w_ifi] = .fdb [fdb$w_ifi];	!Set IFI for close
+ofab [fab$l_nam] = namblk;
+lib$al_rab [rab$l_fab] = ofab;
+rms_perform ($DISCONNECT (RAB = lib$al_rab), !Disconnect record stream
+	lib$_closeout,
+	.lib$al_rab [rab$l_stv], 1, fdb [fdb$l_namdesc]);
+rms_perform ($CLOSE (FAB = ofab),	!Close the file
+	lib$_closeout,
+	.ofab [fab$l_stv], 1, fdb [fdb$l_namdesc]);
+RETURN true
+END;					!
+END					! Of module
+ELUDOM

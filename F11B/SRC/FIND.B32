@@ -1,0 +1,351 @@
+MODULE FIND (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This routine performs a find operation on the indicated directory.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  3-Jan-1978  13:37
+!
+! MODIFIED BY:
+!
+!	V02-006	ACG0259		Andrew C. Goldstein,	26-Jan-1982  19:13
+!		Add mode arg to REMOVE
+!
+!	V02-005	ACG0228		Andrew C. Goldstein,	25-Nov-1981  19:16
+!		Support execute protection on directories
+!
+!	V02-004	ACG0223		Andrew C. Goldstein,	17-Nov-1981  21:52
+!		Support modification of version limit
+!
+!	V02-003	ACG0208		Andrew C. Goldstein,	12-Nov-1981  11:32
+!		Add segmented directory record support
+!
+!	V02-002	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:26
+!		Previous revision history moved to F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+GLOBAL ROUTINE FIND (ABD, FIB, FIND_MODE) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs a FIND operation on the indicated directory.
+!
+! CALLING SEQUENCE:
+!	FIND (ARG1, ARG2, ARG3)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of descriptor list in buffer packet
+!	ARG2: address of FIB
+!	ARG3: 0 to just do a find
+!	      1 to remove the found entry
+!	      2 to set version limit in entry
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	ARG2: file ID and context returned in FIB
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	Directory LRU may be altered
+!	directory blocks read
+!	resultant string written into buffer packet
+!
+!--
+
+BEGIN
+
+MAP
+	ABD		: REF BBLOCKVECTOR [,ABD$C_LENGTH],
+					! descriptor list arg
+	FIB		: REF BBLOCK;	! FIB argument
+
+LOCAL
+	COUNT,				! count of name string
+	NAME_DESC	: BBLOCK [FND_LENGTH], ! file name descriptor
+	PREV_DESC	: BBLOCK [FND_LENGTH], ! previous name descriptor
+	NAME_BUFFER	: VECTOR [FILENAME_LENGTH, BYTE],
+					! buffer to hold parsed file name string
+	PREV_BUFFER	: VECTOR [FILENAME_LENGTH, BYTE],
+					! buffer to hold predecessor name string
+	RESULT_STRING	: VECTOR [FILENAME_LENGTH+6, BYTE],
+					! buffer to build result name string
+	RESULT_LENGTH,			! length of above
+	START_BLOCK,			! block number to start search
+	START_REC,			! record number to start search
+	START_VER,			! version entry to start search
+	P		: REF BBLOCK,	! pointer to directory record
+	VBN;				! VBN of directory block processed
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	DIR_RECORD,			! record number of directory entry
+	DIR_CONTEXT	: BBLOCK,	! directory context block
+	CURRENT_VCB	: REF BBLOCK;	! VCB of volume in process
+
+DIR_CONTEXT_DEF;
+
+EXTERNAL ROUTINE
+	PMS_START_SUB,			! start subfunction metering
+	PMS_END_SUB,			! end subfunction metering
+	COPY_NAME,			! copy file name to result string
+	DIR_ACCESS,			! access the directory
+	PARSE_NAME,			! parse file name string
+	DIR_SCAN,			! search the directory
+	NEXT_REC,			! get next directory record
+	APPLY_RVN,			! default RVN to current
+	DEFAULT_RVN,			! convert current RVN to 0
+	RETURN_DIR,			! return file name to user
+	MARK_DIRTY,			! mark buffer for write-back
+	NEXT_DIR_REC,			! read next directory record
+	REMOVE;				! remove directory entry
+
+
+! Start metering for this subfunction.
+!
+
+PMS_START_SUB (PMS_FIND);
+
+! If this is an operation on a spooled device, noop it and return a file ID
+! of -2, -2 with success.
+!
+
+IF .CLEANUP_FLAGS[CLF_SPOOLFILE]
+THEN
+    BEGIN
+    FIB[FIB$W_FID_NUM] = -2;
+    FIB[FIB$W_FID_SEQ] = -2;
+    FIB[FIB$W_FID_RVN] = 0;
+    FIB[FIB$B_FID_NMX] = -1;
+    KERNEL_CALL (COPY_NAME, .ABD);
+    RETURN;
+    END;
+
+! Parse the file name.
+!
+
+PARSE_NAME (NAME_DESC, NAME_BUFFER, .ABD[ABD$C_NAME, ABD$W_COUNT],
+	    ABD[ABD$C_NAME, ABD$W_TEXT] + .ABD[ABD$C_NAME, ABD$W_TEXT] + 1, .FIB[FIB$W_NMCTL]);
+
+! Access the directory. We need write access if this is a remove or set
+! version operation, read access if there are any wild cards, and
+! execute access if just a simple lookup.
+!
+
+DIR_ACCESS (.FIB,
+	    (IF  .FIND_MODE NEQ 0
+	     THEN WRITE_ACCESS
+	     ELSE IF .NAME_DESC[FND_WILD]
+	     THEN READ_ACCESS
+	     ELSE EXEC_ACCESS));
+START_BLOCK = 0;			! assume search from start
+START_REC = 0;
+START_VER = 0;
+DIR_RECORD = 0;
+DIR_PRED = 0;
+LAST_ENTRY[0] = 0;
+
+! Default the RVN of the supplied file ID to 0 if current volume, to
+! allow the search for file ID to work.
+!
+
+DEFAULT_RVN (FIB[FIB$W_FID_RVN]);
+
+! If this is a wild card operation (i.e., if the wild card context is
+! nonzero), position to the indicated record. This is done with the
+! positional context and the supplied resultant name string, if any.
+!
+
+IF .FIB[FIB$L_WCC] NEQ 0
+THEN
+    BEGIN
+    START_BLOCK = .(FIB[FIB$L_WCC])<6,10>;
+    START_REC = .(FIB[FIB$L_WCC])<0,6> - 1;
+    COUNT = MINU (.ABD[ABD$C_RES, ABD$W_COUNT],
+		  IF .ABD[ABD$C_RESL, ABD$W_COUNT] GEQU 2
+		  THEN .(ABD[ABD$C_RESL, ABD$W_TEXT] +
+			.ABD[ABD$C_RESL, ABD$W_TEXT] + 1)<0,16>
+		  ELSE 0
+		 );
+    PARSE_NAME (PREV_DESC, PREV_BUFFER, .COUNT, ABD[ABD$C_RES, ABD$W_TEXT]
+		+ .ABD[ABD$C_RES, ABD$W_TEXT] + 1, 0);
+    IF .PREV_DESC[FND_WILD]
+    THEN ERR_EXIT (SS$_BADFILENAME);
+
+! If no resultant string is supplied (noted by a 0 count), position by
+! scanning over the indicated number of records in the indicated block.
+! Then, if there are no wild cards in the version, scan to the last version.
+!
+
+    IF .COUNT EQL 0
+    THEN
+	BEGIN
+	PREV_DESC[FND_FIND_FID] = 1;
+	DIR_SCAN (PREV_DESC, UPLIT WORD (-1, -1, -1), .START_BLOCK, 0, 0, 0, .START_REC);
+	IF NOT .NAME_DESC[FND_WILD_VER]
+	THEN
+	    BEGIN
+	    PREV_DESC[FND_FLAGS] = FIB$M_WILD;
+	    PREV_DESC[FND_COUNT] = 3;
+	    PREV_DESC[FND_STRING] = UPLIT BYTE ('*.*');
+	    PREV_DESC[FND_VERSION] = -32768;
+	    DIR_SCAN (PREV_DESC, 0, .DIR_VBN-1, .DIR_ENTRY, .DIR_VERSION, .DIR_PRED, -1);
+	    END;
+	START_VER = .DIR_VERSION + DIR$C_VERSION;
+	DIR_RECORD = .DIR_RECORD + 1;
+	END
+
+! If a resultant string is supplied, search the indicated block for the
+! given entry. If the search fails immediately (no records are
+! traversed), search again from the start. If the version is not wild,
+! we search for the oldest version so we are positioned at the start of the
+! next name. Thus we are left positioned at the record, or where it
+! used to be.
+!
+
+    ELSE
+	BEGIN
+	IF NOT .NAME_DESC[FND_WILD_VER]
+	THEN PREV_DESC[FND_VERSION] = -32768;
+	IF DIR_SCAN (PREV_DESC, 0, .START_BLOCK, 0, 0, 0, -1)
+	THEN
+	    BEGIN
+	    START_VER = .DIR_VERSION + DIR$C_VERSION;
+	    DIR_RECORD = .DIR_RECORD + 1;
+	    END
+	ELSE IF
+	    (
+	    IF .DIR_VBN - 1 LEQU .START_BLOCK
+	    AND .DIR_RECORD EQL 0
+	    THEN DIR_SCAN (PREV_DESC, 0, 0, 0, 0, 0, -1)
+	    ELSE 0
+	    )
+	THEN
+	    BEGIN
+	    START_VER = .DIR_VERSION + DIR$C_VERSION;
+	    DIR_RECORD = .DIR_RECORD + 1;
+	    END
+	ELSE START_VER = .DIR_VERSION;
+	END;
+
+    START_REC = .DIR_ENTRY;
+    START_BLOCK = .DIR_VBN - 1;
+    END;
+
+! Now actually search for the desired directory entry.
+!
+
+IF NOT DIR_SCAN (NAME_DESC, FIB[FIB$W_FID], .START_BLOCK, .START_REC, .START_VER, .DIR_PRED, -1)
+THEN
+    IF .FIB[FIB$L_WCC] EQL 0
+    THEN ERR_EXIT (SS$_NOSUCHFILE)
+    ELSE
+	BEGIN
+	FIB[FIB$L_WCC] = 0;
+	ERR_EXIT (SS$_NOMOREFILES);
+	END;
+
+! Extract the file ID and context of the found entry and return the resultant
+! string.
+!
+
+CH$MOVE (FID$C_LENGTH, DIR_VERSION[DIR$W_FID], FIB[FIB$W_FID]);
+APPLY_RVN (FIB[FIB$W_FID_RVN]);
+IF .NAME_DESC[FND_WILD]
+OR .NAME_DESC[FND_WILD_VER]
+OR .FIB[FIB$V_WILD]
+THEN
+    FIB[FIB$L_WCC] = (.DIR_VBN-1) ^ 6 + .DIR_RECORD + 1
+ELSE
+    FIB[FIB$L_WCC] = 0;
+
+KERNEL_CALL (RETURN_DIR, RESULT_LENGTH, RESULT_STRING, .ABD);
+
+! If we are asked to set the version limit, do so. We iterate through
+! multiple directory records if necessary. Then return the version
+! limit, regardless.
+!
+
+IF .FIND_MODE EQL 2
+AND .VERSION_COUNT EQL 0
+THEN
+    BEGIN
+    P = .DIR_ENTRY;
+    VBN = .DIR_VBN;
+    DO
+	BEGIN
+	P[DIR$W_VERLIMIT] = .FIB[FIB$W_VERLIMIT];
+	MARK_DIRTY (.P);
+	P = NEXT_DIR_REC (.P, VBN);
+	END
+    UNTIL .P EQL 0;
+    END;
+FIB[FIB$W_VERLIMIT] = .VERSION_LIMIT;
+
+! If this is a REMOVE function, do so.
+!
+
+IF .FIND_MODE
+THEN REMOVE (0);
+
+! Stop metering of this subfunction.
+!
+
+PMS_END_SUB ();
+
+END;					! end of routine FIND
+
+END
+ELUDOM

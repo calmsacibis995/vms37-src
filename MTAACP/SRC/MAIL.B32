@@ -1,0 +1,282 @@
+
+MODULE MAIL (LANGUAGE (BLISS32) ,
+		IDENT = 'V03-000'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  MTAACP
+!
+! ABSTRACT:
+!	This module handles reading from the mailbox and enabling mailbox ast's.
+!
+!
+! ENVIRONMENT:
+!
+!	Starlet operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+
+!
+!
+! AUTHOR:  D. H. GILLESPIE,	 CREATION DATE:  31-OCT-77
+!
+! MODIFIED BY:
+!
+!	V02-004	DMW00019	David Michael Walp	26-May-1981
+!		Calculate correct size of mailbox message.  Change in
+!		meassage format from OPCOM.
+!
+!	V02-003	REFORMAT	Maria del C. Nasr	30-Jun-1980
+!
+!**
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+
+REQUIRE 'SRC$:MTADEF.B32';
+
+FORWARD ROUTINE
+
+    CHECK_MAIL		: COMMON_CALL NOVALUE,  ! Check mailbox for reply
+						!   from operator
+    ENABLE_MAIL_AST	: COMMON_CALL NOVALUE;	! enable ast's from mailbox
+
+EXTERNAL ROUTINE
+    DO_CANCEL		: COMMON_CALL,		! cancel all outstanding IO
+    REQUEST_UNBLOCK	: COMMON_CALL,		! request unblock unless
+						!   cancel requested
+    SYS$QIOW		: ADDRESSING_MODE (ABSOLUTE);
+						! queue IO request and wait
+
+EXTERNAL
+    MAIL_CHANNEL,				! mailbox channel number
+    IO_STATUS,					! status of IO
+    WORK_AREA;					! work area defined in OPRCOM
+
+BIND
+    MAIL   = WORK_AREA : BBLOCK [MSGSIZE],
+    MAILSZ = WORK_AREA + MSGSIZE;
+
+
+GLOBAL ROUTINE CHECK_MAIL : COMMON_CALL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine checks for reply from operator in mailbox.
+!
+! CALLING SEQUENCE:
+!	CHECK_MAIL(), called either as an AST routine or before hibernating
+!
+! INPUT PARAMETERS:
+!	none
+!
+! IMPLICIT INPUTS:
+!	mailbox input
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	Depending on the reply, the blocked request is either canceled,
+!	aborted, or continued.
+!	mailsz - size of operator text
+!	mail - contains mailbox message with operator text
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	none
+!
+! USER ERRORS:
+!	none
+!
+!--
+
+    BEGIN
+
+    LITERAL
+	CR	    = 13,		! carriage return
+	LF	    = 10,		! linefeed
+	CR_LF_LEN   = 2;		! lenght of <CRLF>
+
+    BIND
+	CR_LF	    = UPLIT BYTE ( CR, LF );
+					! <CRLF> string
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    LOCAL
+	STATUS	    : LONG,		! system service status
+	VCB	    : REF BBLOCK,	! address of volume control block
+	START_TEXT  : LONG,		! pointer to start of oper reply text
+	POINTER	    : LONG;		! pointer into the operator reply
+
+    ! Read the mailbox and if nothing there exit immediately
+    ! 
+    STATUS = $QIOW( EFN = EFN,
+		CHAN = .MAIL_CHANNEL,
+		FUNC = 	IO$_READLBLK OR	IO$M_NOW,	! don't wait for reply
+		IOSB = IO_STATUS,
+		P1 = MAIL,
+		P2 = MSGSIZE );
+    IF NOT .STATUS THEN	IO_STATUS = .STATUS;
+
+    IF .IO_STATUS EQL SS$_ENDOFFILE THEN RETURN;
+
+    ! The other errors that can show up are programming problems:
+    ! SS$_NOPRIV,SS$_ACCVIO,SS$_MBTOOSML
+    !
+    IF NOT .IO_STATUS THEN BUG_CHECK(ACPMBFAIL);
+
+    ! Setup size of operator text.  The operator's typed in text starts 8 
+    ! bytes ( request ID and other reply info ) from the start of the message.
+    ! The operator text ends with a <CRLF>.  The rest of the message is the
+    ! %OPCOM line.
+    !
+    START_TEXT  = MAIL + $BYTEOFFSET(OPC$L_MS_TEXT);
+    POINTER	= CH$FIND_SUB ( .IO_STATUS<16,16> - $BYTEOFFSET(OPC$L_MS_TEXT),
+				.START_TEXT, CR_LF_LEN, CR_LF );
+    MAILSZ	= ( IF CH$FAIL ( .POINTER )
+			THEN 0
+			ELSE ( .POINTER - .START_TEXT )
+		  );
+
+    ! Now since all AST's are delivered at once upon receipt to one reply
+    ! reenable AST's on this mailbox
+    !
+    ENABLE_MAIL_AST();
+
+    ! The reply id is the VCB address, if not VCB block then ignore message
+    !
+    VCB = .MAIL[OPC$L_MS_RPLYID];
+    IF .VCB[VCB$B_TYPE] NEQ DYN$C_VCB THEN RETURN;
+
+    ! Now examine message to see what the reply contains if request is pending
+    ! then ignore operator reply.
+    !
+    STATUS = OPC$_RQSTPEND;
+
+    IF .STATUS<0,16> EQL .MAIL[OPC$W_MS_STATUS] THEN RETURN;
+
+    ! If this volume is not waiting for volume mount then there is the
+    ! possibility that a CANCEL_OP_REPLY failed and the cancel was completed
+    ! before receipt of either a completion or cancel reply
+    !
+    IF NOT .VCB[VCB$V_WAIMOUVOL] THEN RETURN;
+
+    ! If the request was successful or canceled then unblock the process
+    ! checking that the cancel of IO takes place if requested
+    !
+    IF .MAIL[OPC$W_MS_STATUS] OR .VCB[VCB$V_CANCELIO]
+    THEN
+	BEGIN
+	REQUEST_UNBLOCK(.VCB);
+	RETURN;					! returns only if cancel done
+	END;
+
+    ! The only case left is that the operator aborted the request
+    !
+    CURRENT_VCB = .VCB;
+    ERROR(SS$_ABORT);
+    KERNEL_CALL(DO_CANCEL);
+    END;					! end of routine
+
+GLOBAL ROUTINE ENABLE_MAIL_AST : COMMON_CALL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!	This routine enables AST's on the mailbox channel
+!
+! CALLING SEQUENCE:
+!	ENABLE_MAIL_AST()
+!
+! INPUT PARAMETERS:
+!	none
+!
+! IMPLICIT INPUTS:
+!	none
+!
+! OUTPUT PARAMETERS:
+!	none
+!
+! IMPLICIT OUTPUTS:
+!	AST declaration for mailbox enabled
+!
+! ROUTINE VALUE:
+!	none
+!
+! SIDE EFFECTS:
+!	none
+!
+! USER ERRORS:
+!	none
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	COMMON_REG;
+
+    BIND
+	SECONDS = UPLIT (-70000000, -1);
+
+    LOCAL
+	STATUS;
+
+    ! This enables an AST when mail is placed in the operator communication
+    ! mailbox
+    !
+    WHILE 1 DO
+	BEGIN
+
+	STATUS = $QIOW( CHAN = .MAIL_CHANNEL,
+			FUNC = IO$_SETMODE,
+			IOSB = IO_STATUS,
+			P1 = CHECK_MAIL,
+			P3 = EXEC_MODE );
+
+	IF NOT .STATUS THEN IO_STATUS = .STATUS;
+
+	IF .IO_STATUS NEQ SS$_INSFMEM THEN EXITLOOP;
+
+	IF $SETIMR(EFN = TIMEFN, DAYTIM = SECONDS)
+	THEN
+	    $WAITFR(EFN = TIMEFN);
+
+	END;
+
+    END;					! end of routine
+
+END
+
+ELUDOM

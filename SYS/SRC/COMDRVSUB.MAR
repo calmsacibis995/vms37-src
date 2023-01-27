@@ -1,0 +1,760 @@
+	.TITLE	COMDRVSUB - COMMUNUCATION DRIVERS SUBROUTINES
+	.IDENT	'V03-001'
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; FACILITY:
+;
+;	VAX/VMS I/O DRIVERS
+;
+; ABSTRACT:
+;
+;	THIS MODULE CONTAINS SUBROUTINES FOR THE TERMINAL,MAILBOX AND DMC11 DRIVERS.
+;
+; AUTHOR:
+;
+;	R.HEINEN 8-SEPT-1977
+;
+; REVISION HISTORY:
+;
+;	V03-001	ROW0072		Ralph O. Weber		19-MAR-1982
+;		Rework COM$SETCTRLAST, COM$BLDCTRLAST, and COM$FILLCTRLAST to 
+;		eliminate reuse without probe of addresses which the user 
+;		could corrupt.  Also perform general cleanup of these 
+;		routines.  Change flaging of "lost" TAST blocks in 
+;		COM$FLUSHCTRLS to guarantee that such blocks are not 
+;		prematurely deallocated.  Enhance piggy-back kernel mode AST 
+;		routine in COM$DELCTRLAST to perform AST quota accounting on 
+;		"lost" TAST blocks which it also deallocates.
+;
+;	V02-009	RKS0009		RISK SPITZ		11-JAN-1982
+;		CHANGE DELETE TAST LOGIC IN THE CASE WHERE THE
+;		BLOCK IS BUSY WHEN A FLUSH IS DONE.
+;
+;	V02-008	RKS0008		RICK SPITZ		11-DEC-1981
+;		ADD OUT OF BAND ROUTINES FOR THE TERMINAL SERVICES.
+;
+;	V02-007	LJK0076		Lawrence J. Kenah	3-Nov-1981
+;		Remove check for "queue previously not empty" when making
+;		software interrupt request. The request is always made.
+;
+;
+;--
+;
+; EXTERNAL SYMBOLS
+;
+	$ACBDEF				; DEFINE AST CONTROL BLOCK
+	$CCBDEF				; DEFINE CCB
+	$DYNDEF				; DEFINE DYNAMIC MEMORY BLOCKS
+	$IPLDEF				; DEFINE IPL LEVELS
+	$IRPDEF				; DEFINE I/O PACKET
+	$PCBDEF				; DEFINE PCB
+	$PRDEF				; DEFINE PROCESSOR REGISTERS
+	$PRIDEF				; DEFINE NEW PRIORITIES
+	$PRVDEF				; DEFINE PRIVELEGE BITS
+	$PSLDEF				; DEFINE PSL
+	$RSNDEF				; DEFINE RESOURCES
+	$TASTDEF			; DEFINE TERMINAL AST BLOCK
+	$UCBDEF				; DEFINE UCB
+;
+; LOCAL DEFINITIONS
+;
+P1= 0
+P2= 4
+P3= 8
+P4= 12
+P5= 16
+P6= 20
+ 
+	.PSECT	WIONONPAGED
+
+	.SBTTL	COM$DELATTNAST - DELIVER ATTENTION ASTS
+;++
+; COM$DELATTNAST - DELIVER ATTENION ASTS
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; THIS ROUTINE IS USED BY THE TERMINAL AND MAILBOX DRIVERS TO DELIVER 
+; ALL OF THE ASTS AWAITING ATTENTION. THE CONTROL BLOCKS ARE USED AS FORK BLOCKS
+; TO IPL$_QUEUEAST.
+;
+; INPUTS:
+;
+;	R4 = ADDRESS OF LIST HEAD OF AST CONTROL BLOCKS
+;	R5 = UCB OF UNIT
+;
+; OUTPUTS:
+;
+;	R2,R3,R4,R5 ARE PRESERVED.
+;--
+COM$DELATTNAST::			; DELIVER ATTENTION ASTS
+	PUSHR	#^M<R3,R4,R5>		;
+10$:	MOVL	@4(SP),R5		; GET NEXT ENTRY
+	BEQL	50$			; IF EQL THEN NONE
+	MOVL	(R5),@4(SP)		; CLOSE LIST
+	PUSHAB	B^10$			; SET UP RETURN ADDRESS
+	FORK				; CREATE FORK PROCESS
+;
+; AST QUEUE FORK PROCESS
+;
+	MOVQ	ACB$L_KAST(R5),ACB$L_AST(R5); REARRANGE ENTRIES
+	MOVB	ACB$L_KAST+8(R5),ACB$B_RMOD(R5);
+	MOVL	ACB$L_KAST+12(R5),ACB$L_PID(R5);
+	CLRL	ACB$L_KAST(R5)		;
+	MOVZBL	#PRI$_IOCOM,R2		; SET UP PRIORITY INCREMENT
+	JMP	G^SCH$QAST		; QUEUE THE AST
+50$:	POPR	#^M<R3,R4,R5>		;
+	RSB
+
+	.SBTTL	COM$FLUSHATTNS - FLUSH ATTENTION AST LIST
+;++
+; COM$FLUSHATTNS - FLUNS ATTENTION AST LIST
+;
+; THIS ROUTINE IS USED BY THE TERMINAL AND MAILBOX DRIVERS TO FLUSH
+; AN ATTENTION AST LIST. THIS IS DONE AT CANCEL I/O TIME AND WHEN A
+; QIO SPECIFIES A 0 AST ADDRESS ON A SET ATTENTION AST FUNCTION.
+; IF THE AST CONTROL BLOCK OWNER IS NO LONGER IN THE SYSTEM THE AST IS ALSO
+; FLUSHED.
+;
+;
+; INPUTS:
+;
+;	R4 = PCB ADDRESS 
+;	R5 = UCB ADDRESS OF RELATED UNIT
+;	R6 = CHANNEL NUMBER
+;	R7 = LIST HEAD
+;
+; OUTPUTS:
+;
+;	R0 = SS$_NORMAL
+;	R1,R2,R7 ARE DISTROYED.
+;
+;--
+COM$FLUSHATTNS::			; FLUSH ATTENTION AST LIST
+	DSBINT	UCB$B_DIPL(R5)		; DISABLE INTERRUPTS
+10$:	MOVL	(R7),R0			; GET LIST ENTRY
+	BEQL	50$			; IF EQL THEN DONE
+	CMPL	PCB$L_PID(R4),ACB$L_KAST+12(R0); PID MATCH?
+	BNEQ	40$			; IF NEQ THEN NO
+	CMPW	R6,ACB$L_KAST+10(R0)	; CHANNEL MATCH?
+	BNEQ	40$			; IF NEQ THEN NO
+	MOVL	(R0),(R7)		; CLOSE UP LIST TO REMOVE ENTRY
+	ENBINT				; REENABLE INTERRUPTS
+	INCW	PCB$W_ASTCNT(R4)	; RESTORE AST QUOTA
+	BSBB	COM$DRVDEALMEM		; DEALLOCATE THE BLOCK
+	BRB	COM$FLUSHATTNS		; CONTINUE
+40$:	MOVL	R0,R7			; LOOK TO NEXT ENTRY
+	BRB	10$			; CONTINUE
+50$:	ENBINT				; REENABLE INTERRUPTS
+	MOVZBL	#SS$_NORMAL,R0		; SET NORMAL RETURN
+	RSB
+
+	.SBTTL	COM$POST - POST I.O COMPLETION INDEPENDENT OF UNIT STATUS
+;++
+; COM$POST - POST I/O COMPLETION INDEPENDENT OF UNIT STATUS
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; THIS ROUTINE IS USED BY THE TERMINAL, MAILBOX AND DMC DRIVER TO COMPLETE
+; I/O OPERATIONS INDEPENDENT OF THE STATUS OF THE UNIT. NO ATTEMPT IS MADE
+; TO DE-QUEUE ANOTHER PACKET OR CHANGE THE BUSY STATUS OF THE UNIT.
+;
+; INPUTS:
+;
+;	R3 = I/O PACKET ADDRESS
+;	R5 = UCB ADDRESS
+;
+; IMPLICIT INPUTS:
+;
+;	CALLER AT DRIVER FORK IPL OR GREATER.
+;	IRP$L_MEDIA AND IRP$L_MEDIA+4 ARE THE IOSB QUAD WORD.
+;
+; OUTPUTS:
+;
+;	R0,R1 ARE DISTROYED.
+;--
+COM$POST::				; COMPLETE I/O
+	INCL	UCB$L_OPCNT(R5)		; INCREMENT OPERATION COUNT
+	INSQUE	(R3),@IOC$GL_PSBL	; INSERT PACKET ON QUEUE
+	SOFTINT	#IPL$_IOPOST		; REQUEST FORK
+	RSB				; RETURN
+
+	.SBTTL	COM$DRVDEALMEM - DEALLOCATE DRIVER MEMORY
+;++
+; COM$DRVDEALMEM - DEALLOCATE DRIVER MEMORY
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; THIS ROUTINE IS USED BY DRIVERS TO DEALLOCATE SYSTEM DYNAMIC MEMORY.
+;
+; IT CAN BE CALLED AT ANY IPL.
+;
+; INPUTS:
+;
+;	R0 = ADDRESS OF THE BLOCK TO DEALLOCATE
+;
+;******************************************************
+;
+; THE BUFFER MUST BE AT LEAST 24 BYTES LONG!
+;
+;******************************************************
+;
+; OUTPUTS:
+;
+;	R0-R5 ARE PRESERVED.
+;--
+COM$DRVDEALMEM::			; DEALLOCATE DRIVER MEMORY
+	CMPW	#24,8(R0)		; BIG ENOUGH BUFFER TO DEALLOCATE?
+	BGTRU	30$			; IF GTRU THEN NO - ERROR
+	PUSHR	#^M<R3,R4,R5>		; SAVE FORKING REGS
+	MOVB	#IPL$_QUEUEAST,11(R0)	; INSERT PROPER IPL
+	MOVL	R0,R5			; COPY ADDRESS
+	PUSHAB	B^20$			; SET UP RETURN ADDRESS
+	JSB	G^EXE$FORK		; CREATE FORK
+;
+; IPL$_QUEUEAST FORK ROUTINE
+;
+	MOVL	R5,R0			; DEALLOCATE THE BLOCK
+	JMP	G^EXE$DEANONPAGED	;
+20$:	POPR	#^M<R3,R4,R5>		;
+	RSB				;
+;
+; BUGCHECK ON TOO SMALL A BUFFER
+;
+30$:	BUG_CHECK BADDALRQSZ		; BUGCHECK
+	RSB				; CONTINUE
+
+	.SBTTL	COM$SETATTNAST - SET UP ATTENTION AST
+;++
+; COM$SETATTNAST - SET UP ATTENTION AST
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; THIS ROUTINE IS A SUBROUTINE USED BY THE TERMINAL AND MAILBOX DRIVERS
+; TO PROCESS REQUESTS FOR ENABLE OR DISABLE OF ATTENTION ASTS.
+; P1 IS THE ADDRESS OF THE AST SERVICE FOR ENABLES. P1 = 0 FOR DISABLE.
+; FOR DISABLES, THE SPECIFIED LIST IS SEARCHED AND THE ENTRY EXTRACTED AND
+; DEALLOCATED.
+; FOR ENABLES, A CONTROL BLOCK IS SET UP THAT WILL DOUBLE AS THE AST CONTROL
+; BLOCK WHEN THE AST IS DELIVERED. THE BLOCK IS FORMATTED AS FOLLOWS:
+;
+;	ACB$B_RMOD = IPR$_QUEUEAST
+;	ACB$L_KAST = AST PC
+;	ACB$L_KAST+4 = AST PARAMETER (P2)
+;	ACB$L_KAST+8 = ACCESS MODE OF REQUEST
+;	ACB$L_KAST+10 = CHANNEL NUMBER
+;	ACB$L_KAST+12 = PID OF REQUEST
+;
+; THE NEW BLOCK IS PLACED AT THE HEAD OF THE CURRENT LIST.
+;
+; IN BOTH CASES THE I/O IS COMPLETED.
+;
+; INPUTS:
+;
+;	R3 = I/O PACKET ADDRESS
+;	R4 = CURRENT PCB
+;	R5 = UCB ADDRESS
+;	R6 = ASSIGNED CCB
+;	R7 = ADDRESS OF THE CONTROL AST LIST HEAD TO CHANGE
+;	AP = ADDRESS OF THE QIO ARGLIST
+;
+; OUTPUTS:
+;
+;	R0 = STATUS OF THE I/O
+;	R3 = PACKET ADDRESS
+;	R5 = UCB ADDRESS
+;
+;	NO OTHER REGISTERS ARE PRESERVED.
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL
+;	SS$_EXQUOTA  -- BUFFERED I/O OR AST QUOTA FAILURE
+;	SS$_INSUFMEM -- DYNAMIC MEMORY FAILURE
+;--
+COM$SETATTNAST::			; SET UP ATTENTION AST
+	MOVZWL	IRP$W_CHAN(R3),R6	; GET PACKET CHANNEL NUMBER
+	MOVL	P1(AP),R8		; GET USER AST ADDRESS
+	BEQL	COM$FLUSHATTNS		; IF EQL THEN DISABLE FUNCTION
+;
+; REQUEST TO ENABLE AST
+;
+; SET UP AST BLOCK
+;
+	MOVZWL	#SS$_EXQUOTA,R0		; ASSUME AST QUOTA EXCEEDED
+	TSTW	PCB$W_ASTCNT(R4)	; AST QUOTA ALLOW CONTINUE?
+	BLEQ	20$			; IF LEQ THEN NO
+	DECW	PCB$W_ASTCNT(R4)	; ADJUST QUOTA
+	MOVZBL	#ACB$L_KAST+16,R1	; SET SIZE OF NEEDED BLOCK
+	PUSHL	R3			; SAVE PACKET ADDRESS
+	JSB	G^EXE$ALLOCBUF		; ALLOCATE THE BUFFERED BLOCK
+	POPL	R3			; RESTORE PACKET ADDRESS
+	BLBC	R0,20$			; IF LOW SET THEN ALLOCATED
+	MOVB	#IPL$_QUEUEAST,ACB$B_RMOD(R2); INSERT FORK IPL
+	MOVL	R8,ACB$L_KAST(R2)	; INSERT AST ROUTINE ADDRESS
+	MOVL	P2(AP),ACB$L_KAST+4(R2)	; INSERT PARAMETER FOR AST
+	EXTZV	#0,#2,P3(AP),R0		; GET REQUEST ACCESS MODE
+	JSB	G^EXE$MAXACMODE		; MAXIMIZE ACCESS MODE
+	MOVZBL	R0,ACB$L_KAST+8(R2)	; INSERT IN CONTROL BLOCK
+	BISB	#ACB$M_QUOTA,ACB$L_KAST+8(R2); INSERT TARGET ACCESS MODE
+	MOVW	R6,ACB$L_KAST+10(R2)	; SAVE CHANNEL
+	MOVL	PCB$L_PID(R4),ACB$L_KAST+12(R2); INSERT PID ADDRESS OF REQUESTOR
+;
+; LOCK OUT INTERRUPTS TO ENTER BLOCK ON UCB
+;
+	DSBINT	UCB$B_DIPL(R5)		; LOCK OUT INTERRUPTS
+	MOVL	(R7),(R2)		;  MERGE WITH CURRENT ENTRY
+	MOVL	R2,(R7)			; INSERT NEW ENTRY VALUE
+	ENBINT				; LOWER IPL
+	MOVZBL	#SS$_NORMAL,R0		; SET NORMAL RETURN
+	RSB				; RETURN VIA CALLER
+20$:	JMP	G^EXE$ABORTIO		; ABORT THE I/O
+
+	.SBTTL	COM$DELCTRLAST - DELIVER CONTROL ASTS
+;++
+;COM$DELCTRLAST - DELIVER CONTROL ASTS
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; THIS ROUTINE IS USED BY THE TERMINAL  SERVICES TO DELIVER 
+; ALL OF THE ASTS AWAITING ATTENTION WHICH MATCH THE CONDITION.
+; THE AST BLOCK IS NOT DELETED AND IS REUSED.
+;
+; INPUTS:
+;
+;	R3 = MATCH CHARACTER
+;	R4 = ADDRESS OF LIST HEAD OF AST CONTROL BLOCKS
+;	R5 = UCB OF UNIT
+;
+; OUTPUTS:
+;
+;	R3 = CHARACTER TO INCLUDE IN DATA STREAM 
+;	     OR NULL (FLAGGED BY BIT 15)
+;
+;	R1,R4 DESTROYED
+;--
+
+COM$DELCTRLAST::			; DELIVER CONTROL ASTS
+	PUSHR	#^M<R2,R3,R5>		;
+	CLRL	R2			; INIT RETURN CHARACTER
+	MOVL	R4,R1			; LIST HEAD ADDRESS
+10$:
+	MOVL	(R1),R1			; ADDRESS FIRST BLOCK
+	BEQL	50$			; NO MORE
+	SUBL3	#TAST$L_FLINK,R1,R5		; ADDRESS START OF BLOCK
+	BBC	4(SP),TAST$L_MASK(R5),10$	; SKIP IF CHARACTER NOT IN MASK
+	BBC	#TAST$V_INCLUDE,TAST$B_CTRL(R5),15$; SKIP IF STRIP CHARACTER
+	MOVZBL	4(SP),R2			; CHARACTER NOT STRIPPED
+	BBSS	#15,R2,15$			; MARK CHARACTER PRESENT
+15$:
+	BBSS	#TAST$V_BUSY,TAST$B_CTRL(R5),10$; SKIP IF IN USE/ MARK IN USE
+	MOVZBL	4(SP),TAST$L_ASTPRM(R5)		; RETURN CHARACTER TO USER
+20$:
+	MOVB	#IPL$_QUEUEAST,ACB$B_RMOD(R5)	; INSERT FORK IPL,TO ALLOW USE AS
+						; FORK BLOCK
+	PUSHAB	B^10$			; SET UP RETURN ADDRESS
+	FORK				; CREATE FORK PROCESS
+;
+; AST QUEUE FORK PROCESS
+;
+	ASSUME	TAST$L_ASTPRM EQ <TAST$L_AST + 4>
+	ASSUME	ACB$L_ASTPRM EQ <ACB$L_AST + 4>
+22$:	MOVQ	TAST$L_AST(R5),ACB$L_AST(R5); REARRANGE ENTRIES
+	BISB	#<ACB$M_NODELETE!ACB$M_PKAST>,-
+		TAST$B_RMOD(R5)		; PK AST, NODELETE
+	MOVB	TAST$B_RMOD(R5),ACB$B_RMOD(R5);
+	MOVL	TAST$L_PID(R5),ACB$L_PID(R5);
+	MOVAL	ASTACNTNG,ACB$L_KAST(R5) ; ADDRESS OF PIGGY-BACK KERNEL ROUTINE
+	MOVZBL	#PRI$_IOCOM,R2		; SET UP PRIORITY INCREMENT
+	JMP	G^SCH$QAST		; QUEUE THE AST
+50$:
+	MOVL	R2,4(SP)		; RETURN  ANY CHARACTER
+	POPR	#^M<R2,R3,R5>		;
+	RSB
+;
+; PIGGY-BACK KERNEL MODE ROUTINE TO:
+;	1. MARK TAST AVAILABLE FOR USE
+;	2. DEALLOCATE "LOST" BLOCK(S) AND RETURN THEIR QUOTA
+;
+
+ASTACNTNG:
+	BICB	#TAST$M_BUSY, TAST$B_CTRL(R5) ; Mark block available.
+	BBC	#TAST$V_LOST, -		; Branch if still using this block.
+		TAST$B_CTRL(R5), 150$	; Otherwise,
+	MOVZWL	TAST$L_PID(R5), R0	;  use PID index to locate PCB for
+	MOVL	@L^SCH$GL_PCBVEC[R0], R0 ; this process.
+	INCW	PCB$W_ASTCNT(R0)	;  Then return AST quota for and
+	MOVL	R5,R0			;  deallocate this block.
+	BSBW	EXE$DEANONPAGED
+150$:	RSB				; That completes piggy-back accounting.
+
+	.SBTTL	COM$FLUSHCTRLS - FLUSH CONTROL AST LIST
+;++
+; COM$FLUSHCTRLS - FLUSH CONTROL AST LIST
+;
+; THIS ROUTINE IS USED BY THE TERMINAL SERVICES TO FLUSH
+; THE CONTROL AST LIST. THIS IS DONE AT CANCEL I/O TIME AND WHEN A
+; QIO SPECIFIES A 0 AST ADDRESS ON A SET AST FUNCTION.
+; THE SUMMARY MASK POINTED TO BY R2 IS UPDATED.
+;
+; INPUTS:
+;
+;	R2 = ADDRESS OF SUMMARY MASK 
+;	R4 = PCB ADDRESS 
+;	R5 = UCB ADDRESS OF RELATED UNIT
+;	R6 = CHANNEL NUMBER
+;	R7 = LIST HEAD
+;
+; OUTPUTS:
+;
+;	R0 = SS$_NORMAL
+;	R1 AND R7 ARE DESTROYED.
+;
+;--
+COM$FLUSHCTRLS::			; FLUSH CONTROL AST LIST
+	DSBINT	UCB$B_DIPL(R5)		; DISABLE INTERRUPTS
+	CLRL	R1			; INIT RETURN MASK
+5$:	MOVL	(R7),R0			; GET LIST ENTRY
+	BEQL	50$			; IF EQL THEN DONE
+	SUBL	#TAST$L_FLINK,R0	; COMPUTE START OF BLOCK
+	CMPL	PCB$L_PID(R4),TAST$L_PID(R0); PID MATCH?
+	BNEQ	40$			; IF NEQ THEN NO
+	CMPW	R6,TAST$W_CHAN(R0)	; CHANNEL MATCH?
+	BNEQ	40$			; IF NEQ THEN NO
+	MOVL	TAST$L_FLINK(R0),(R7)	; CLOSE UP LIST TO REMOVE ENTRY
+
+	BBC	#TAST$V_BUSY,TAST$B_CTRL(R0),20$; BLOCK CAN BE DELETED NOW?
+	BISB	#TAST$M_LOST,TAST$B_CTRL(R0) ; NO, FLAG IT FOR LATER DELETION
+	BRB	5$			; THAT'S ALL WE CAN DO RIGHT NOW
+	
+20$:	JSB	G^COM$DRVDEALMEM	; DEALLOCATE THE BLOCK
+	INCW	PCB$W_ASTCNT(R4)	; RESTORE AST QUOTA
+	BRB	5$			; CONTINUE
+
+40$:	BISL	TAST$L_MASK(R0),R1	; OR IN ACTIVE CONTROL CHARACTERS
+	MOVAL	TAST$L_FLINK(R0),R7	; LOOK TO NEXT ENTRY
+	BRB	5$			; CONTINUE
+
+50$:	MOVL	R1,(R2)			; UPDATE SUMMARY MASK
+	ENBINT				; REENABLE INTERRUPTS
+	MOVZBL	#SS$_NORMAL,R0		; SET NORMAL RETURN
+	RSB
+
+	.SBTTL	COM$SETCTRLAST - SET UP CONTROL AST
+;++
+; COM$SETCTRLAST - SET CONTROL AST
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is used by the terminal services FDT routines during the 
+; processing of requests to enable out-of-band ASTs.  The current list is 
+; scanned for a block with a requestor matching that of the request being 
+; processed.  If a match is found, the specified mask and AST routine address 
+; in the matching block are replaced.  If no match is found, COM$BLDCTRLAST is 
+; called to create a new block.  The summary mask pointed to by R2 is updated 
+; to be the inclusive or of all masks in the control AST list pointed to by R7.
+;
+; If either the AST routine address or the out-of-band enable mask --
+; @<P2(AP)+4> -- is zero, all out-of-band AST requests entered by this 
+; requestor are flushed from queue pointed to by R7.
+;
+; INPUTS:
+;
+;	R2 = CURRENT SUMMARY MASK ADDRESS
+;	R3 = I/O PACKET ADDRESS
+;	R4 = CURRENT PCB
+;	R5 = UCB ADDRESS
+;	R7 = ADDRESS OF THE CONTROL AST LIST HEAD TO CHANGE
+;	AP = ADDRESS OF THE QIO ARGLIST
+;
+;	P1(AP) = ADDRESS OF AST ROUTINE TO CALL WHEN OUT-OF-BAND CHARATER IS 
+;		 TYPED (0 ==> FLUSH QUEUE)
+;	P2(AP) = ADDRESS OF SHORT FORM TERMINATOR MASK GIVING WHICH OUT-OF-
+;		 BAND CHARACTERS WILL PRECIPATATE DELIVERY OF AN AST
+;		 (0 MASK VALUE ==> FLUSH QUEUE:  This address will be passed 
+;		 as the AST parameter when the AST is delivered)
+;	P3(AP) = ACCESS MODE IN WHICH THE AST IS TO BE DELIVERED
+;		 (This is maximized against the caller's access mode)
+;
+;	IPL at entry is assumed to be IPL$_ASTDEL.
+;
+; OUTPUTS:
+;
+;	R0 = STATUS OF THE I/O
+;	     (SS$_NORMAL only; all others return via EXE$ABORTIO)
+;	R3 = I/O PACKET ADDRESS
+;	R4 = CURRENT PCB ADDRESS
+;	R5 = UCB ADDRESS
+;	NO OTHER REGISTERS ARE PRESERVED.
+;
+;	IPL at exit is the same as IPL at entry.
+;
+;	The summary mask pointed to by R2 is updated to be the inclusive or of 
+;	all masks in the control AST list pointed to by R7.
+;
+;	The control AST list pointed to by R7 is flushed, extended, or an 
+;	entry in the list is updated.
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL
+;
+;     The following return codes are reported by a JMP to EXE$ABORTIO:
+;	SS$_ACCVIO   -- specified mask not accessable
+;	SS$_EXQUOTA  -- buffered I/O or AST quota failure
+;	SS$_INSUFMEM -- dynamic memory failure
+;--
+
+; COM$SETCTRLAST, COM$BLDCTRLAST, and COM$FILLCTRLAST build and use the 
+; following information block.  COM$SETCTRLAST builds the block on the stack 
+; and points R11 to it.  COM$BLDCTRLAST and COM$FILLCTRLAST use infomation 
+; stored to build or update a TAST control block.
+
+	$OFFSET	0,POSITIVE,<-
+		ASTROUT,-		; User's AST routine address
+		ASTPARM,-		; AST routine parameter
+		USRMSKADR,-		; Pointer to user's OOB mask
+		CURMSKADR,-		; Pointer to current summary mask
+		<TINFOSIZE,0>-		; Size of the block
+		>
+
+
+COM$SETCTRLAST::			; SET UP  CONTROL AST
+
+	MOVZWL	IRP$W_CHAN(R3), R6	; Get packet channel number.
+	MOVL	P1(AP), R8		; Get user AST address.
+	BEQL	COM$FLUSHCTRLS		; If its zero, flush OOB requests.
+	MOVL	P2(AP), R9		; Get address of user OOB mask.
+	IFRD	#8, (R9), 1$		; Probe for read access.
+	MOVZWL	#SS$_ACCVIO, R0		; If no access, signal access
+	JMP	G^EXE$ABORTIO		; violation.
+1$:	TSTL	(R9)			; Verify short form terminator
+	BEQL	3$			; mask format.
+	MOVZWL	#SS$_BADPARAM, R0	; If invalid mask format, signal
+	JMP	G^EXE$ABORTIO		; bad parameter.
+3$:	TSTL	4(R9) 			; Any OOB characters specified?
+	BNEQ	7$			; If there are some, proceed.
+	BRW	COM$FLUSHCTRLS		; Otherwise, flush OOB requests.
+7$:
+
+;
+; We are now holding a valid request of enable an out-of-band character AST
+;
+
+	ASSUME	ASTPARM EQ <ASTROUT + 4>
+	MOVAB	-TINFOSIZE(SP), SP	; Allocate info. block on the stack.
+	MOVL	SP, R11			; Save info. block address.
+	MOVQ	R8, ASTROUT(R11)	; Save AST routine and parameter info.
+	MOVAL	4(R9), USRMSKADR(R11)	; Save address of user OOB mask.
+	MOVL	R2, CURMSKADR(R11)	; Save current summary mask address.
+	CLRQ	R8			; Clear accumulation summary mask and
+					; a local flags longword.
+	DSBINT	UCB$B_DIPL(R5)		; Interlock queue access.
+
+10$:	MOVL	(R7), R2		; Get list entry.
+	BEQL	20$			; Branch if no more entries in list.
+	MOVAB	-TAST$L_FLINK(R2), R2	; Compute start of block.
+	CMPL	PCB$L_PID(R4), TAST$L_PID(R2) ; Do the PIDs match?
+	BNEQ	15$			; Branch if PIDs don't match.
+	CMPW	R6, TAST$W_CHAN(R2)	; Is the channel right?
+	BNEQ	15$			; Branch if not the right channel.
+
+	BSBW	COM$FILLCTRLAST		; Update matching TAST control block.
+	BISL	#1, R9			; Indicate that an update was done.
+
+15$:	BISL	TAST$L_MASK(R2), R8	; Accumulate OOB mask data for queue.
+	MOVAL	TAST$L_FLINK(R2), R7	; Advance to next queue entry.
+	BRB	10$			; Loop until entire queue processed.
+
+20$:	MOVL	R8, @CURMSKADR(R11)	; Make accumulated OOB mask for queue
+					; the current OOB mask for the queue.
+	ENBINT				; Return to caller's IPL.
+	MOVZWL	#SS$_NORMAL, R0		; Assume work completed successfully.
+	BLBS	R9, 30$			; If no blocks in the queue were
+	BSBB	COM$BLDCTRLAST		; updated, build a new block.
+30$:	MOVAB	TINFOSIZE(SP), SP	; Restore stack.
+	BLBS	R0, 40$			; Was COM$BLDCTRLAST successful?
+	JMP	G^EXE$ABORTIO		; If it failed, abort I/O request.
+40$:	RSB				; Otherwise, return to caller.
+
+	.SBTTL	COM$BLDCTRLAST - BUILD CONTROL AST
+;++
+; COM$BLDCTRLAST - BUILD NEW CONTROL AST PACKET
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine builds a new terminal AST control block and inserts it after 
+; the TAST entry pointed to by R7.  The control block will double as an AST 
+; control block when a AST is delivered.  The block will be reused until the 
+; out-of-band AST request is canceled.  The summary mask pointed to by 
+; CURMSKADR(R11) is inclusively or'ed with the user out-of-band mask pointed 
+; to by USRMSKADR(R11).
+;
+; INPUTS:
+;
+;	R3 = I/O PACKET ADDRESS
+;	R4 = CURRENT PCB
+;	R5 = UCB ADDRESS
+;	R6 = CHANNEL ON WHICH OOB REQUEST IS BEING MADE
+;	R7 = ADDRESS OF THE CONTROL AST LIST ENTRY PRECEDING THE POINT WHERE 
+;	     THE NEW ENTRY IS TO BE ADDED.
+;	R11= THE ADDRESS OF A TAST INFORMATION LIST (SEE COM$SETCTRLAST)
+;	AP = ADDRESS OF THE QIO ARGLIST
+;
+;	P3(AP) = ACCESS MODE IN WHICH THE AST IS TO BE DELIVERED
+;		 (This is maximized against the caller's access mode)
+;
+;	ASTROUT(R11)  = ADDRESS OF AST ROUTINE TO CALL WHEN OUT-OF-BAND
+;			CHARACTER IS TYPED
+;	ASTPARM(R11)  = AST PARAMETER VALUE TO BE PASSED TO AST ROUTINE WHEN
+;			OUT-OF-BAND AST IS DELIVERED
+;	CURMSKADR(R11)= ADDRESS OF THE CURRENT OUT-OF-BAND SUMMARY MASK
+;	USRMSKADR(R11)= ADDRESS OF OUT-OF-BAND MASK SPECIFIED BY USER FOR
+;			THIS AST ENABLE
+;
+;	IPL at entry is assumed to be IPL$_ASTDEL.
+;
+; OUTPUTS:
+;
+;	R0 = STATUS OF THE I/O
+;	R1 & R2 DESTROYED
+;	ALL OTHER REGISTERS PRESERVED
+;
+;	IPL at entry is assumed to be IPL$_ASTDEL.
+;
+;	A TAST control block is allocated, filled in, and linked after the 
+;	entry pointed to by R7.
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL
+;	SS$_EXQUOTA  -- BUFFERED I/O OR AST QUOTA FAILURE
+;	SS$_INSUFMEM -- DYNAMIC MEMORY FAILURE
+;--
+
+COM$BLDCTRLAST:
+
+	TSTW	PCB$W_ASTCNT(R4)	; Is there enough AST quota?
+	BLEQ	91$			; Branch if insufficient AST quota.
+	DECW	PCB$W_ASTCNT(R4)	; Deduct from AST quota.
+	PUSHL	R3			; Save reg. destroyed by EXE$ALLOCBUF.
+	MOVZBL	#TAST$C_LENGTH, R1	; Set size of TAST block.
+	JSB	G^EXE$ALLOCBUF		; Allocate for the TAST control block.
+	POPL	R3			; Restore saved register.
+	BLBC	R0, 93$			; Branch if allocation failed.
+	BSBB	COM$FILLCTRLAST		; Fill in newly allocated block.
+
+;
+; INSERT NEWLY BUILD TAST CONTROL BLOCK
+;
+
+	DSBINT	UCB$B_DIPL(R5)		; Interlock access to queue links.
+	MOVL	(R7), TAST$L_FLINK(R2)	; Move list for. pointer to new entry.
+	MOVAL	TAST$L_FLINK(R2), (R7)	; Link new entry to current list.
+	BISL	TAST$L_MASK(R2), @CURMSKADR(R11) ; Update summary mask.
+	ENBINT				; Restore previous IPL.
+	MOVZWL	#SS$_NORMAL, R0		; Indicate that build succeeded.
+	RSB				; Return to caller.
+
+;
+; ERROR RETURNS:
+;
+
+91$:	MOVZWL	#SS$_EXQUOTA, R0	; AST quota exceeded.
+	RSB
+
+93$:	MOVZWL	#SS$_INSFMEM, R0	; Insufficient dynamic memory.
+	RSB
+
+	.SBTTL	COM$FILLCTRLAST - FILLIN A CONTROL AST CONTROL BLOCK
+;++
+; COM$FILLCTRLAST - FILLIN A CONTROL AST CONTROL BLOCK
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine fills in the terminal AST control block pointed to by R2.  The 
+; block may be either a previously allocated block which is already linked to 
+; a control AST queue, or a newly allocated block which is being filled in for 
+; the first time.
+;
+; INPUTS:
+;
+;	R2 = ADDRESS OF TAST CONTROL BLOCK TO BE FILLED IN
+;	R3 = I/O PACKET ADDRESS
+;	R4 = CURRENT PCB
+;	R6 = CHANNEL ON WHICH OOB AST REQUEST IS BEING MADE
+;	R11= THE ADDRESS OF A TAST INFORMATION LIST (SEE COM$SETCTRLAST)
+;	AP = ADDRESS OF THE QIO ARGLIST
+;
+;	P3(AP) = ACCESS MODE IN WHICH THE AST IS TO BE DELIVERED
+;		 (This is maximized against the caller's access mode)
+;
+;	ASTROUT(R11)  = ADDRESS OF AST ROUTINE TO CALL WHEN OUT-OF-BAND
+;			CHARACTER IS TYPED
+;	ASTPARM(R11)  = AST PARAMETER VALUE TO BE PASSED TO AST ROUTINE WHEN
+;			OUT-OF-BAND AST IS DELIVERED
+;	USRMSKADR(R11)= ADDRESS OF OUT-OF-BAND MASK SPECIFIED BY USER FOR
+;			THIS AST ENABLE
+;
+;	If this routine is called to operate on a TAST block which is already 
+;	linked to a control queue, it should be called at device IPL.  
+;	Otherwise, it can be called at IPL$_ASTDEL.
+;
+; OUTPUTS:
+;
+;	R0 & R1 ARE DESTROYED.
+;	ALL OTHER REGISTERS ARE PRESERVED.
+;
+;	IPL at exit is the same as IPL at entry.
+;
+;	The TAST control block pointed to by R2 is filled in.
+;
+; COMPLETION CODES:
+;
+;	There is no completion status.  This routine is always successful.
+;--
+
+COM$FILLCTRLAST:
+
+	ASSUME	TAST$L_ASTPRM EQ <TAST$L_AST + 4>
+	ASSUME	ASTPARM EQ <ASTROUT + 4>
+	MOVQ	ASTROUT(R11), -		; Plant AST routine and
+		TAST$L_AST(R2) 		; parameter addresses.
+	MOVL	@USRMSKADR(R11), TAST$L_MASK(R2) ; Plant OOB mask.
+	CLRB	TAST$B_CTRL(R2)		; Initialize TAST control field.
+	BBC	#IO$V_INCLUDE, IRP$W_FUNC(R3), 10$ ; BR if striping OOB chars. 
+	BISB	#TAST$M_INCLUDE, TAST$B_CTRL(R2) ; Else set no-strip flag.
+10$:	EXTZV	#0, #2, P3(AP), R0	; Get requested delivery  access mode.
+	MOVPSL	R1			; Get access mode of requestor.
+	EXTZV	#PSL$V_PRVMOD, #PSL$S_PRVMOD, R1, R1 ; If requestor's access
+	CMPB	R0, R1			; mode is bigger than delivery access
+	BGEQ	20$			; mode, then delivery AST in
+	MOVB	R1, R0			; requestor's access mode.
+20$:	MOVB	R0, TAST$B_RMOD(R2)	; Plant delivery access mode.
+	MOVW	R6, TAST$W_CHAN(R2)	; Plant requestor's channel.
+	MOVL	PCB$L_PID(R4), TAST$L_PID(R2) ; Plant requestor's PID.
+	RSB				; Return to caller.
+
+	.END

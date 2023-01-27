@@ -1,0 +1,945 @@
+ 	.TITLE	NETEVTLOG - Process Event logging needs
+	.IDENT	'V03-005'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;
+; FACILITY:	NETWORK ACP
+;
+; ABSTRACT:
+;
+;	This module performs the bulk of processing required to
+;	take care of network event logging needs.
+;
+; ENVIRONMENT:
+;
+;	MODE = KERNEL
+;
+; AUTHOR:	Scott G. Davis, CREATION DATE: 03-JUL-1980
+;
+; MODIFIED BY:
+;
+;	V005	TMH0005		Tim Halvorsen	21-Apr-1982
+;		Fix STARTUP_EVL to queue a WQE to do the job, since
+;		STARTUP_OBJ calls CNF action routines, some of which
+;		allocate the CNF static temporary buffer.  Unfortunately,
+;		this is required because we may be logging counters while
+;		having the static temporary buffer allocated (CNT does this).
+;
+;	V03-04	ADE0025		A.Eldridge	01-Feb-1981
+;		Remove parameter count in front of counter block.
+;		Fix database determination while processing the counter timer.
+;
+;	V03-03	ADE0024		A.Eldridge	19-Jan-1981
+;		Include the "packet beginning" and not the "packet header"
+;		as part of the event data for circuit initialization failure
+;		events.
+;
+;	V03-02	ADE0023		Al Eldridge	30-Nov-1981
+;		Added zero counter event.
+;
+;	V03-01			Al Eldridge	01-Nov-1981
+;		Udgrade to V3.0.0 Network management.  The changes are
+;		primarily related to the change to the new Circuit/Line
+;		model of the datalink layer.
+;
+;	V022	ADE0022		Al Eldridge	05-Sep-1980
+;		Further fixes to counter logging.
+;
+;	V021	TMH0021		Tim Halvorsen	04-Sep-1980
+;		Pass null string as SYS$NET to EVL process.  Preserve all 
+;		registers in NET$DBC_EFI,ESI.  Remove temporary definition of 
+;		EVC$C_VMS_DBC (was decimal 2000, should be hex 2000) and use 
+;		$EVCDEF.
+;
+;	V020	ADE0020		Al Eldridge	20-Aug-1980
+;		Log internally detected events. Log counters.
+;
+
+	.SBTTL	DECLARATIONS
+;
+; MACROS
+;
+	$LPDDEF
+	$MSGDEF
+	$NETSYMDEF
+	$NETUPDDEF
+	$NFBDEF
+	$CNFDEF
+	$CNRDEF
+	$PRVDEF
+	$RCBDEF
+	$EVCDEF
+	$RAWDEF
+	$WQEDEF
+
+;
+; EQUATED SYMBOLS:
+;
+
+	$VIELD	EVT,0,-			; Define some flags
+	<-
+	    <EVTAVL,1,M>,-		; Flag implies MSG$_EVTAVL can be sent
+	    <LOSTEVENT,1,M>,-		; Flag implies "lost event" event occurred
+	    <DBCEVENT,1,M>,-		; Database change event logged
+	    <MOREVENTS,1,M>,-		; Set if there are events left in buffer
+	>
+
+EVL_OBJ		= 26			; Event logger object number
+NET$C_EVTTHRESH	= 5			; Event threshold
+NET$C_EVTTIMER	= 10*1000*1000*5	; Timer constant
+NET$C_EVTBUFLTH	= 1000			; Length of event buffer
+NET$C_LSTEVTLTH	= 32			; Length of "lost event" event
+
+
+FMTTYP_AI6	=  64			; Define NICE protocol symbols
+FMTTYP_HXI	=  32
+FMTTYP_HX1	=  32      + 1
+FMTTYP_DU1	=   0      + 1
+FMTTYP_DU2	=   0      + 2
+FMTTYP_CD1	= 128      + 1
+FMTTYP_CM2	= 128 + 64 + 2
+FMTTYP_CM3	= 128 + 64 + 3
+FMTTYP_CM4	= 128 + 64 + 4
+;
+; temporary mailbox message definitions
+;
+
+;&needed?
+
+MBX$V_EVTAVL	= 1			; Mask bit for MSG$_EVTAVL
+MBX$V_EVTRCVCHG	= 2			; Mask bit for MSG$_EVTRCVCHG
+MBX$V_EVTXMTCHG	= 3			; Mask bit for MSG$_EVTXMTCHG
+
+;
+; OWN STORAGE:
+;
+	.PSECT	NET_IMPURE,WRT,NOEXE,LONG
+
+CNX_PLI_OLDTIM:	.LONG	0			; Old CNF timer for PLI's
+CNX_CRI_OLDTIM:	.LONG	0			; Old CNF timer for CRI's
+CNX_NDI_OLDTIM:	.LONG	0			; Old CNF timer for NDI's
+
+BASE_TIME:	.LONG	 0			; Base time for counter logging
+EVT_B_FLAGS:	.BYTE	 EVT$M_EVTAVL		; Allow immediate event message
+EVT_W_THRESH:	.BLKW	 1			; No. of events available
+
+EVT_W_LTH_LEFT:	.WORD	 NET$C_EVTBUFLTH -	;
+			 - <2*NET$C_LSTEVTLTH> 	; Available bfr space
+
+EVT_L_BUFPTR:	.ADDRESS EVENT_BUFFER		; Ptr to next buffer location
+EVENT_BUFFER:	.BLKB	 NET$C_EVTBUFLTH	; Event buffer
+
+LOST_EVENT:					; Block to hold "lost event" 
+		.WORD	END_LOST_EVENT-LOST_EVENT ; Length of event
+		.BLKQ	1			; For time-stamp
+		.WORD	EVC$C_NMA_LOS		; Event code
+		.BYTE	-1			; No source for this event
+		.BLKB	17			;! No event-ID
+END_LOST_EVENT = .
+
+DBC_EVENT:					; Block containing "DBC event"
+		.WORD	END_DBC_EVENT-DBC_EVENT ; Length of event
+		.BLKQ	1			; For time-stamp
+		.WORD	EVC$C_VMS_DBC		; Event code
+		.BYTE	-1			; No source for this event
+		.BLKB	17			;! No event-ID
+END_DBC_EVENT = .
+
+
+NET$AB_EVT_WQE::.BYTE	0[WQE$C_LENGTH]		; Common WQE for event reporting
+
+
+	.PSECT	NET_PURE,LONG,NOWRT,NOEXE
+
+
+	CNX$B_SPARE	=  0	; Spare, reserved for future use
+	CNX$B_TIM_SUP	=  1	; RCB suppression timer bit i.d.
+	CNX$W_ID_CTM	=  2	; WQE timer REQIDT field and database i.d.
+	CNX$L_COUNTER	=  4	; CNF field i.d. of counter string
+	CNX$L_DEL_TIME	=  8	; CNF field i.d. of delta timer value
+	CNX$L_ABS_TIME	= 12	; CNF field i.d. of absolute timer value
+	CNX$L_OLD_TIME  = 16	; Ptr to oldest CNF absolute due time value
+	CNX$L_CNR_PTR	= 20	; Ptr to CNR pointer
+	CNX$C_LENGTH	= 24
+
+;&CNX_PLI:			; PLI CNX
+;	.BYTE	0		; Spare
+;	.BYTE	rcb$v_sts_???	; Log datalink counter suppression timer id
+;	.WORD	evc$c_src_lin	; WQE REQIDT value for datalinks
+;	.CNFFLD	pli,s,cnt	; Datalink counter string field i.d.
+;	.CNFFLD	pli,l,lct	; Datalink counter timer field i.d.
+;	.CNFFLD	pli,l,cta	; Datelink absolute timer field i.d.
+;	.LONG	cnx_pli_oldtim	; Due time of oldest CNFs
+;	.LONG	net$gl_cnr_pli	; Address of CRI CNR pointer
+
+CNX_CRI:			; CRI CNX
+	.BYTE	0		; Spare
+	.BYTE	rcb$v_sts_lcs	; Log datalink counter suppression timer id
+	.WORD	evc$c_src_cir	; WQE REQIDT value for datalinks
+	.CNFFLD	cri,s,cnt	; Datalink counter string field i.d.
+	.CNFFLD	cri,l,lct	; Datalink counter timer field i.d.
+	.CNFFLD	cri,l,cta	; Datelink absolute timer field i.d.
+	.LONG	cnx_cri_oldtim	; Due time of oldest CNFs
+	.LONG	net$gl_cnr_cri	; Address of CRI CNR pointer
+
+CNX_NDI:			; NDI CNX
+	.BYTE	0		; Spare
+	.BYTE	rcb$v_sts_ncs	; Log node counter suppression timer id
+	.WORD	evc$c_src_nod	; WQE REQIDT value for nodes
+	.CNFFLD	ndi,s,cnt	; Node counter string field i.d.
+	.CNFFLD	ndi,l,cti	; Node counter timer field i.d.
+	.CNFFLD	ndi,l,cta	; Node absolute timer field i.d.
+	.LONG	cnx_ndi_oldtim	; Due time of oldest CNFs
+	.LONG	net$gl_cnr_ndi	; Address of NDI CNR pointer
+
+
+	.PSECT	NET_CODE,NOWRT,LONG,EXE
+
+	.SBTTL	Event timer action routine
+;+
+; EVT_TIMER - This routine is called when the event timer threshold expires.
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; Set the EVENT AVAILABLE flag (NET$V_EVTAVL)
+;
+;-
+EVT_TIMER:
+	PUSHL	R5			; Save timer block address
+	BISB2	#EVT$M_EVTAVL,-		; Set the flag
+		     W^EVT_B_FLAGS	;
+	TSTW	W^EVT_W_THRESH		; Any events?
+	BEQL	10$			; If EQL no msgs, yet
+	BSBW	SEND_EVT_MSG		; Send MBX MSG
+10$:	POPL	R0			; Recover timer block
+	BSBW	WQE$DEALLOCATE		; Deallocate it
+	RSB				; Done
+
+	.SBTTL	Internal inbound raw event processing
+;+
+; NET$EVT_INTRAW - Process raw event detected internally
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; A raw event is passed internally via a WQE.  It is formatted and put into
+; the event buffer.
+;
+; INPUTS:	R11	CNR pointer as appropriate
+;		R10	CNF pointer as appropriate
+;		R9-R7	Scratch
+;		R6	LPD pointer if datalink event
+;			XWB pointer if logical link event
+;			else srcatch
+;		R5	WQE pointer if approriate
+;
+; OUTPUTS:	All registers are preserved
+;
+;-
+NET$EVT_INTRAW::			; Process internal raw event
+	BSBW	NET$GETUTLBUF		; Get permission to use the utility 
+					; buffer (co-routine call)
+
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	MOVAB	NET$AB_UTLBUF+2,R3	; Setup output pointer
+	MOVQ	G^EXE$GQ_SYSTIME,(R3)+	; Enter standard quadword time
+	MOVZWL	WQE$W_EVL_CODE(R5),R0	; Get the raw event code
+	MOVW	R0,(R3)+		; Enter the code
+	BSBB	50$			; Dispatch to complete building the
+					; event
+	BLBC	R0,40$			; If LBC then abort logging
+	MOVAB	W^NET$AB_UTLBUF,R8	; Get original output pointer
+	SUBL3	R8,R3,R7		; Calculate the data length
+	MOVW	R7,(R8)			; Store as the length field
+	BSBW	INTERNAL_EVENT		; Stuff it into the event buffer
+
+40$:	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	RSB
+
+50$:	;
+	;  Dispatch to finish building the event.  The $DISPATCH skip chain is
+	;  used instead of one large $DISPATCH since the index codes are closely
+	;  packed within a class but widely separated from one class to another.
+	;
+	$DISPATCH  R0,-
+	<-
+	    <EVC$C_TPL_APL,  NON_PKT>,	-; Aged packet loss
+	    <EVC$C_TPL_UPL,  CIR_PKT>,	-; Unreachable packet loss
+	    <EVC$C_TPL_RPL,  CIR_PKT>,	-; Out-of-range packet loss
+	    <EVC$C_TPL_OPL,  CIR_PKT>,	-; Oversized packet loss
+	    <EVC$C_TPL_PFM,  CIR_BEG>,	-; Packet format error
+	    <EVC$C_TPL_VFR,  CIR_NOD>,	-; Verification reject
+	    <EVC$C_TPL_LDO,  LDO>,	-; Circuit down, operator fault
+	    <EVC$C_TPL_LDS,  LDS>,	-; Circuit down, software fault
+	    <EVC$C_TPL_LDF,  LDF>,	-; Circuit down, Circuit fault
+	    <EVC$C_TPL_LUP,  CIR_NOD>,	-; Circuit up
+	    <EVC$C_TPL_IOF,  IOF>,	-; Init failed, operator fault
+	    <EVC$C_TPL_ISF,  ISF>,	-; Init failed, software fault
+	    <EVC$C_TPL_ILF,  ILF>,	-; Init failed, Circuit fault
+	    <EVC$C_TPL_RCH,  RCH>	-; Node reachability change
+	    <EVC$C_TPL_PRU,  PRU>	-; Partial routing update loss
+	>
+
+	$DISPATCH  R0,-
+	<-
+	    <EVC$C_NMA_CTR,  COUNTER>,	-; Automatic counter timer
+	    <EVC$C_NMA_ZER,  COUNTER>,	-; NCP ZERO counters command
+	>
+	CLRL	R0			; Event unknown
+	RSB				; Done
+
+COUNTER:
+	MOVZBL	WQE$B_EVL_DT1(R5),R0	; Get counter database i.d.
+	$DISPATCH  R0,-			; Dispatch on database type
+	<-
+	    <EVC$C_SRC_NOD,  NOD_COU>,-	; Log and clear node counters
+	    <EVC$C_SRC_CIR,  CIR_COU>,-	; Log and clear circuit counters
+	>
+	CLRL	R0			; Database unknown
+	RSB				; Done
+
+NOD_COU:				; Node counters
+	BSBW	ENTER_SRCNOD		; Enter source node i.d.
+	BRB	COU			; Enter the counters
+CIR_COU:				; Circuit counters
+	BSBW	ENTER_SRCCIR		; Enter Circuit i.d.
+COU:					; Log and clear the counters
+	PUSHL	R5			; Save reg
+	MOVZBL	WQE$B_EVL_DT2(R5),R0	; Get length of counter block
+	MOVC3	R0,-			;
+		@WQE$L_EVL_PKT(R5),(R3)	; Move the counter block
+	MOVL	#1,R0			; Indicate success
+	POPL	R5			; Recover WQE pointer
+	RSB
+	
+NON_PKT:				; No source, packet header
+	BSBW	ENTER_NO_SRC		; Enter null source field
+	BRW	ENTER_PKTHDR		; Enter the packet header
+CIR_PKT:				; Circuit source, packet header
+	BSBW	ENTER_SRCCIR		; Enter the source Circuit
+	BRW	ENTER_PKTHDR		; Enter the packet header
+CIR_BEG:				; Circuit source, packet begining
+	BSBW	ENTER_SRCCIR		; Enter the source Circuit
+	BSBW	ENTER_PPKB		; Enter packet begining
+PRU:					; Partial routing update loss
+	BSBW	ENTER_SRCCIR		; Enter source Circuit
+	BSBW	ENTER_PKTHDR		; Enter the packet header
+	MOVW	#EVC$C_TPL_PHIA,(R3)+	; Identify next field
+	MOVB	#FMTTYP_DU2,(R3)+	; Identify field format
+
+	ASSUME	WQE$B_EVL_DT2-WQE$B_EVL_DT1 EQ 1
+
+	MOVW	WQE$B_EVL_DT1(R5),(R3)+	; Enter partner's highest 
+					; reachable node address
+	MOVB	#1,R0			; Success
+	RSB
+CIR_NOD:				; Circuit source, partner node
+	BSBW	ENTER_SRCCIR		; Enter the source Circuit
+	MOVW	#EVC$C_TPL_PNOD,(R3)+	; Identify next field
+	BRW	PNA_NODE		; Enter partner node id
+LDO:					; Circuit down, operator fault
+	BSBW	CIR_REA_PKTHDR		; Enter circuit id, reason, packet hdr
+	MOVW	#EVC$C_TPL_PEXP,(R3)+	; Identify next field
+	BRW	PNA_NODE		; Enter expected partner node id
+	
+IOF:					; Init failure, operator fault
+	BSBW	CIR_REA_PPKB		; Enter circuit id, reason, packet beg.
+	MOVW	#EVC$C_TPL_PVRS,(R3)+	; Identify next field (version)
+	MOVB	#FMTTYP_CM3,(R3)+	; Enter format type
+	MOVB	#FMTTYP_DU1,(R3)+	; Enter format type
+	MOVB	W^NET$GL_INITVER,(R3)+	; Enter version number
+	MOVB	#FMTTYP_DU1,(R3)+	; Enter format type
+	MOVB	W^NET$GL_INITVER+1,(R3)+; Enter ECO number
+	MOVB	#FMTTYP_DU1,(R3)+	; Enter format type
+	MOVB	W^NET$GL_INITVER+2,(R3)+; Enter user ECO number
+	MOVB	#1,R0			; Success
+	RSB
+ISF:					; Init failure, software fault
+CIR_REA_PPKB:				; Enter circuit id, reason, pkt begining
+	BSBB	CIR_REASON		; Enter circuit id, reason
+	BRW	ENTER_PPKB		; Enter packet begining
+LDS:					; Circuit failure, software fault
+CIR_REA_PKTHDR:				; Enter circuit id, reason, packet hdr
+	BSBB	CIR_REASON		; Enter common header
+	BRW	ENTER_PKTHDR		; Enter packet header
+ILF:					; Init failure, circuit fault
+LDF:					; Circuit failure, Circuit fault
+CIR_REASON:				; Enter circuit id, reason code
+	BSBW	ENTER_SRCCIR		; Enter source Circuit id
+	MOVW	#EVC$C_TPL_PRSN,(R3)+	; Identify next field
+	BRB	CD1			; Enter field's value
+RCH:					; Node reachability change
+	BSBW	ENTER_SRCNOD		; Enter the source node
+	MOVW	#EVC$C_TPL_PSTS,(R3)+	; Identify next field
+CD1:	MOVB	#FMTTYP_CD1,(R3)+	; Enter field format type
+	MOVB	WQE$B_EVL_DT1(R5),(R3)+	; Enter qualifying data byte
+	MOVB	#1,R0			; Signal success
+	RSB
+
+ENTER_NO_SRC:				; Enter null source field
+	MOVB	#EVC$C_SRC_NON,(R3)+	; No source
+	CLRL	R7			; Init count field
+	BRB	ENT_17			; Zero the source field
+
+ENTER_SRCNOD:				; Enter source node
+	MOVB	#EVC$C_SRC_NOD,(R3)+	; Enter source type
+	MOVW	WQE$W_REQIDT(R5),(R3)+	; Enter the node address
+	BNEQ	10$			; If NEQ then not the local node
+	MOVL	NET$GL_PTR_VCB,R0	; Get the RCB address
+	MOVW	RCB$W_ADDR(R0),-2(R3)	; Enter the local node address
+10$:	$CNFFLD	ndi,s,nna,R9		; Identify the node name field
+	BSBB	ENT_SRC			; Enter padded node name
+	TSTW	-(R3)			; Backup two bytes to account for
+	RSB				; node address at begining in order
+					; to keep a total of 17 bytes
+
+ENTER_SRCCIR:				; Enter source Circuit id
+	MOVB	#EVC$C_SRC_CIR,(R3)+	; Enter source type
+	$CNFFLD	cri,s,nam,r9		; Get the Circuitname field i.d.
+ENT_SRC:BSBW	CNF$GET_FIELD		; Get the source i.d. name
+ENT_17:	PUSHL	R5			; Save critical reg
+	MOVB	R7,(R3)+		; Enter length of name
+	MOVC5	R7,(R8),#0,#16,(R3)	; Enter the name
+	POPL	R5			; Restore reg
+	MOVB	#1,R0			; Success
+	RSB
+
+ENTER_PKTHDR:
+	MOVL	WQE$L_EVL_PKT(R5),R0	; Get msg pointer
+	MOVW	#EVC$C_TPL_PPKH,(R3)+	; Enter field i.d.
+	MOVB	#FMTTYP_CM4,(R3)+	; Format type for mulitple field
+	MOVB	#FMTTYP_HX1,(R3)+	; Format type for message flags
+	MOVB	(R0)+,(R3)+		; Enter message flags
+	MOVB	#FMTTYP_DU2,(R3)+	; Format type for dst node
+	MOVW	(R0)+,(R3)+		; Enter dst node address
+	MOVB	#FMTTYP_DU2,(R3)+	; Format type for src node
+	MOVW	(R0)+,(R3)+		; Enter src node address
+	MOVB	#FMTTYP_HX1,(R3)+	; Format type for visits field
+	MOVB	(R0)+,(R3)+		; Enter visits field
+	MOVB	#1,R0			; Success
+	RSB
+
+ENTER_PPKB:				; Enter packet begining
+	MOVW	#EVC$C_TPL_PPKB,(R3)+	; Identify next field
+	MOVB	#FMTTYP_HXI,(R3)+	; Enter format type
+	MOVB	#16,(R3)+		; Number of bytes to be entered
+	MOVL	WQE$L_EVL_PKT(R5),R0	; Get packet header pointer
+	MOVQ	(R0)+,(R3)+		; Enter first 8 bytes
+	MOVQ	(R0)+,(R3)+		; Enter final 8 bytes
+	MOVB	#1,R0			; Success
+	RSB
+
+PNA_NODE:
+	MOVZWL	WQE$W_REQIDT(R5),R8	; Get path i.d.
+	BSBW	NET$FIND_LPD		; Find the associated LPD
+	BLBC	R0,50$			; If LBC then none found
+	MOVZWL	LPD$W_PNA(R6),R2	; Get the node address
+	BSBB	GET_NDI			; Find the NDI block
+	TSTB	R7			; Is there a node name ?
+	BEQL	30$			; If EQL then no
+	MOVB	#FMTTYP_CM2,(R3)+	; Enter the complex format type
+	BSBB	30$			; Enter the node address
+	MOVB	#FMTTYP_AI6,(R3)+	; Enter the node name format type
+	MOVB	R7,(R3)+		; Enter the count field
+10$:	MOVB	(R8)+,(R3)+		; Enter the text field
+	SOBGTR	R7,10$			;
+	BRB	40$			; Take common exit
+30$:	MOVB	#FMTTYP_DU2,(R3)+	; Enter the address format type
+	MOVW	R2,(R3)+		; Enter the address
+40$:	MOVL	#1,R0			; Indicate success
+50$:	RSB
+
+GET_NDI:
+	PUSHR	#^M<R10,R11>		; Save regs
+	MOVL	R2,R8			; Copy node address
+	MOVL	W^NET$GL_CNR_NDI,R11	; Get NDI CNR
+	BSBW	NET$NDI_BY_ADD		; Find the NDI by address in R8
+	CLRQ	R7			; Nullify R7,R8
+	BLBC	R0,10$			; No NDI CNF if LBC
+	$GETFLD	ndi,s,nna		; Get the node name -- returns
+					; R7,R8 = 0 if LBC in R0
+10$:	POPR	#^M<R10,R11>		; Restore regs
+	MOVL	#1,R0			; Report success (null node name is 
+	RSB				; okay)
+
+	.SBTTL	Inbound raw event processing
+;+
+; NET$LOG_EVENT - Put a raw event into the event buffer
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; A raw event is passed to NETACP.  If a "lost event" event is already in
+; the raw event buffer, then the operation is ignored.  If there is no more
+; room for events, the "lost event" event is placed in the buffer and the
+; flag is set to so indicate.  If an event is placed in the buffer, and the
+; EVTAVL flag is set, then a mailbox message (MSG$_EVTAVL) is broadcast.
+; Events put into the buffer are time-stamped.
+;
+; INPUTS:	NET$GL_SIZ_P2 - size of input event
+;		NET$GL_PTR_P2 - address of input event
+;
+; OUTPUTS:	MBX message may be broadcast (MSG$_EVTAVL)
+;		R0 - Status
+;
+;-
+	.ENABL	LSB
+
+NET$LOG_EVENT::				; Entry point
+	MOVL	W^NET$GL_SIZ_P2,R7	; Get no. of bytes in event
+	MOVL	W^NET$GL_PTR_P2,R8	; Get address of event data
+
+INTERNAL_EVENT:				; Local entry point
+	CMPW	R7,(R8)			; Counts must match
+	BEQL	10$			; If EQL OK
+	MOVL	S^#SS$_BADPARAM,R0	; Set error code
+	BRW	200$			; Take common exit
+	;
+	;   Ignore event if EFI database is empty (no events get transmitted)
+	;
+10$:	CMPW	RAW$W_EVTCODE(R8),#EVC$C_VMS_DBC ; EFI database change
+	BEQL	11$			; If so, buffer regardless of EFI list
+	MOVL	W^NET$GL_CNR_EFI,R0	; Get address of EFI listhead
+	CMPL	R0,(R0)			; Is list empty?
+	BEQL	14$			; If so, exit ignoring the event
+	;
+	;   If "lost event" already reported, allow 1 data base change event
+	;   to get thru
+	;
+11$:	BBC	#EVT$V_LOSTEVENT,-	; If BC then try to buffer event
+		W^EVT_B_FLAGS,20$	;
+	CMPW	RAW$W_EVTCODE(R8),-	; No space - see if database change
+		#EVC$C_VMS_DBC		;
+	BNEQ	12$			; If NEQ no - ignore event
+	BBCS	#EVT$V_DBCEVENT,-	; If BC, database change not yet logged
+		W^EVT_B_FLAGS,15$	;
+12$:	BSBW	STARTUP_EVL		; Start EVL process (if possible) in
+					; case it died and left our buffer full
+14$:	BRW	100$			; Nothing to do
+15$:	MOVAB	W^DBC_EVENT,R8		; Put in "DBC event" event
+	BRB	25$			; Log the database change
+	;
+	;   If only room for one more event in buffer, insert "lost event"
+	;
+20$:	CMPW	R7,W^EVT_W_LTH_LEFT	; Enough space for this event?
+	BLEQU	30$			; If LEQU yes
+	BISB2	#EVT$M_LOSTEVENT,-	; Show that an event has been lost
+		W^EVT_B_FLAGS		;
+	MOVAB	W^LOST_EVENT,R8		; Put in "lost event" event
+25$:	MOVZWL	(R8),R7			; Get the length of the event
+	;
+	;   Insert event into buffer
+	;
+30$:	SUBW2	R7,W^EVT_W_LTH_LEFT	; Update remaining space
+	MOVQ	G^EXE$GQ_SYSTIME,-	; Time-stamp the event
+		RAW$T_SYSTIM(R8)	;
+	MOVC3	R7,(R8),@W^EVT_L_BUFPTR	; Move event into the buffer
+	MOVL	R3,W^EVT_L_BUFPTR	; Update the pointer
+	INCW	W^EVT_W_THRESH		; Another event in buffer
+	;
+	;   If the event threshold has been reached, broadcast "events available" message
+	;
+	CMPW	#NET$C_EVTTHRESH,-	; Has the threshold been reached?
+		W^EVT_W_THRESH		;
+	BGEQU	90$			; If GEQU no
+	BISB2	#EVT$M_EVTAVL,-		; Set the flag
+		W^EVT_B_FLAGS		;
+
+	ASSUME	EVT$V_EVTAVL EQ 0
+
+90$:	BLBC	W^EVT_B_FLAGS,100$	; If LBC can't send mbx msg yet
+
+;
+;  It's OK to inform the world that the event buffer should be read
+;
+SEND_EVT_MSG:
+	;
+	;   Startup EVL process if not already running
+	;
+	BSBB	STARTUP_EVL		; Startup EVL process if needed
+	;
+	;   Reset the threshold timer
+	;
+	CLRL	R1			; Set up REQIDT for canceling timer
+	MOVAB	EVT_TIMER,R2		; Get action routine address for timer
+	MOVQ	#NET$C_EVTTIMER,R3	; Let this much time elapse 
+	BSBW	WQE$RESET_TIM		; Cancel previous timer, set new one
+	;
+	;   Now send the mailbox message
+	;
+	MOVL	#<1@MBX$V_EVTAVL>,R3	; Set mask
+	MOVZWL	#MSG$_EVTAVL,R2		; Set mbx msg code
+	BSBB	BROADCAST		; Broadcast the message
+100$:	MOVZWL	S^#SS$_NORMAL,R0	; Indicate success
+200$:	RSB
+
+	.DSABL	LSB
+
+	.SBTTL	STARTUP_EVL - Start EVL process
+;+
+; STARTUP_EVL - Start EVL process
+;
+; Start EVL process (if possible).  This is done by queueing a WQE
+; to do the job, since STARTUP_OBJ calls CNF action routines, some
+; of which allocate the CNF static temporary buffer.  Unfortunately,
+; this is required because we may be logging counters while having
+; the static temporary buffer allocated (specifically, CNT does this).
+;
+; Inputs:
+;
+;	None
+;
+; Outputs:
+;
+;	None
+;
+;	R0 destroyed.
+;-
+
+STARTUP_EVL:
+	BSBW	WQE$FORK		; Fork to work queue level
+	CLRQ	R2			; Pass nothing as SYS$NET to EVL
+	CLRQ	R4			; Use default process name
+	MOVZBL	#EVL_OBJ,R8		; Object number of EVL
+	BSBW	NET$STARTUP_OBJ		; Create EVL process
+					; ....ignore any errors
+	RSB
+
+	.SBTTL	WQE$FORK - Switch to work queue level
+;+
+; WQE$FORK - Switch to work queue level
+;
+; This routine is called to cause a code sequence to be executed
+; at "work level", which is a serial queue of tasks which are executed
+; at the ACP main dispatch routine.  This can be used to defer execution
+; of a code sequence to serialize access to a resource or eliminate stack
+; overflow due to excessive call frames.
+;
+; Inputs:
+;
+;	4(SP) = Address of caller's caller
+;	(SP) = Address of routine to execute
+;	R1/R2 = Arguments passed to routine
+;
+;	Only R1 and R2 are "passed" to the routine.  All other registers
+;	will not be available at the time the routine executes.  If more
+;	context needs to be passed, a longer WQE must be allocated to
+;	handle such needs.
+;
+; Outputs:
+;
+;	R0 = success
+;
+;	The WQE is queued and control is returned to the
+;	caller's caller.
+;-
+
+WQE$FORK::
+	PUSHR	#^M<R1,R2,R3>		; Save regs
+	CLRL	R1			; Indicate no extra space needed
+	MOVL	#WQE$C_SUB_ACP,R0	; Set WQE subtype
+	BSBW	WQE$ALLOCATE		; Allocate a WQE
+	MOVL	R2,R0			; Transfer address of WQE
+	MOVQ	(SP),WQE$L_PM1(R0)	; Store routine arguments
+	MOVL	12(SP),WQE$L_EVL_PKT(R0); Set address of user's routine
+	MOVAB	B^50$,WQE$L_ACTION(R0)	; Set action routine address
+	BSBW	WQE$INSQUE		; Queue the work
+	POPR	#^M<R1,R2,R3>		; Restore regs
+	MOVL	#1,R0			; Set successful
+	ADDL	#4,SP			; Return to caller's caller
+	RSB
+
+;
+; Come here when the work element is triggered.  R1/R2 already setup.
+;
+
+50$:	PUSHL	R5			; Save WQE address
+	JSB	@WQE$L_EVL_PKT(R5)	; Call user's routine at work level
+					; All registers may be clobbered
+	POPL	R0			; Restore WQE address
+	BSBW	WQE$DEALLOCATE		; Deallocate the WQE
+	RSB
+
+	.SBTTL	Event logging database changes
+;+
+; NET$DBC_ESI - note the receiver database changed
+; NET$DBC_EFI - note the xmitter database changed
+;
+; INPUTS:	NONE
+;
+; OUTPUTS:	R0	Low bit set
+;
+;		All other registers are preserved
+;
+;-
+NET$DBC_EFI::
+	PUSHR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	BSBB	STARTUP_EVL		; Startup EVL if needed
+	MOVAB	W^DBC_EVENT,R8		; Point to event buffer
+	MOVZWL	(R8),R7			; Get length of item
+	BSBW	INTERNAL_EVENT		; Inform EVL of EFI database change
+	MOVZWL	#MSG$_EVTXMTCHG,R2	; This is the mailbox message code
+	MOVL	#<1@MBX$V_EVTXMTCHG>,R3	; Set mask
+	BRB	DBC_COMMON		; Finish in common code
+
+NET$DBC_ESI::
+	PUSHR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	BSBB	STARTUP_EVL		; Startup EVL if needed
+	MOVZWL	#MSG$_EVTRCVCHG,R2	; This is the mailbox message code
+	MOVL	#<1@MBX$V_EVTRCVCHG>,R3	; Set mask
+
+DBC_COMMON:
+	BSBB	BROADCAST		; Broadcast the message
+	POPR	#^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	MOVL	#1,R0			; Always successful
+	RSB				; Done
+;+
+;
+; BROADCAST - broadcast event related message
+;
+; INPUTS:
+;		R2 - MSG$ code
+;		R3 - mask bit for mailbox filtering   !*** not yet used
+;
+;-
+BROADCAST:
+	MOVL	W^NET$GL_PTR_UCB0,R5	; Point to a NET UCB address
+	CLRL	R4			; No message text
+	MOVL	#NETUPD$_BRDCST,R0	; Function is "broadcast"
+	JSB	@W^NET$GL_PTR_ACR	; Call driver comm routine
+	RSB				; Done
+
+	.SBTTL	Outbound raw event processing
+;+
+; NET$READ_EVENT - Read out event buffer
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine places the event buffer into the specified result (P4)
+;	buffer. Flags, pointers, and thresholds are reset for more logging.
+;
+; INPUTS:	NET$GL_PTR_P3 - Address of result length word
+;		NET$GL_PTR_P4 - Address of result buffer
+;		NET$GL_SIZ_P4 - Size of result buffer
+;
+; OUTPUTS:	P3, P4 have length of result buffer and result buffer
+;		R0 - low word has status (NORMAL); high word has byte count
+;
+;-
+NET$READ_EVENT::			; Entry
+	MOVAB	W^EVENT_BUFFER,R0	; Get address of event buffer
+	SUBL3	R0,W^EVT_L_BUFPTR,R0	; Compute no. of bytes in buffer
+	MOVL	R0,R6			; Save bfr lth
+	MOVL	W^NET$GL_SIZ_P4,R7	; Get size of result buffer
+	CMPL	R7,R6			; Is there room in the result bfr?
+	BGEQU	10$			; If GEQU yes
+	MOVL	R7,R0			; Not enough room - use what you can
+	BISB2	#EVT$M_MOREVENTS,-	; There are more events to post
+		W^EVT_B_FLAGS
+10$:	MOVL	W^NET$GL_PTR_P3,R1	; Get address of result length
+	BEQL	20$			; If EQL there is none
+	MOVW	R0,(R1)			; Store the result length
+20$:	ROTL	#16,R0,-(SP)		; Byte count to high word
+	MOVW	S^#SS$_NORMAL,(SP)	; Store I/O status in low word
+	MOVL	R0,R6			; Save no. of bytes going out
+	BEQL	100$			; If EQL this is really a NOP
+	MOVC3	R0,W^EVENT_BUFFER,-	; Move event buffer to result bfr
+		@W^NET$GL_PTR_P4	;
+	BICB	#EVT$M_LOSTEVENT,-	; There's now room in the buffer
+		W^EVT_B_FLAGS		;
+	BBCC	#EVT$V_MOREVENTS,-	; If BC then no more stuff in buffer
+		W^EVT_B_FLAGS,50$	;
+	SUBL3	R7,R6,R0		; Compute no. of bytes to shift
+	MOVC3	R0,(R1),W^EVENT_BUFFER	; Move remaining evts to bfr top
+	BISB2	#EVT$M_EVTAVL,-		; Set the flag
+		W^EVT_B_FLAGS		;
+	BRB	60$			; Proceed
+50$:	CLRB	W^EVT_B_FLAGS		; Reset the flags
+60$:	MOVAB	W^EVENT_BUFFER,-	; Reset pointer for storing next event
+		W^EVT_L_BUFPTR
+	CLRW	W^EVT_W_THRESH		; Reset the event threshold
+100$:	POPL	R0			; Get 1st IOSB longword
+	ADDW2	R6,W^EVT_W_LTH_LEFT	; Reset buffer space left
+	RSB				; Done
+
+;+
+; NET$LOG_COUNTERS	-  Log Node or Circuit counters
+;
+; FUNCTIONAL DESCRIPTION
+;
+; This routine is called whenever the NDI or CRI data bases are updated.  It
+; resets the logging counter timer as necessary.  When the counter timer fires,
+; this routine is called at an internal entry point to log the counters of
+; whichever CNFs are due.  The timer is then reset to the next earliest due
+; time.
+;
+; INPUTS:	*** TBS ***
+; OUTPUTS:	*** TBS ***
+;
+NET$LOG_COUNTERS::			; Reset logging counter timer
+	MOVL	W^NET$GL_PTR_VCB,R2	; Get RCB pointer
+	MOVAB	CNX_CRI,R6		; Assume CRI data base
+	CMPL	R11,W^NET$GL_CNR_CRI	; Is it ?
+	BEQL	10$			; If EQL then yes
+	MOVAB	CNX_NDI,R6		; Assume NDI data base
+	CMPL	R11,W^NET$GL_CNR_NDI	; Is it the NDI data base
+	BEQL	10$			; If EQL then yes
+	RSB
+
+	;
+	;   Since it is common for many CNF blocks to be updated by the
+	;   network manager at the same time, it is possible to reduce the
+	;   total amount of work to be done somewhat by waiting a short time,
+	;   the so called "suppression interval", before running the timer
+	;   update algorithm after any given CNF block is updated.  This has
+	;   the effect of batching the requests and reduces the work by making
+	;   better use of each scan of the data base.
+	;
+	;   The suppression timer interval is 2 seconds.  This is long enough
+	;   for a typical  NCP>SET KNOWN NODES ALL  command to complete, and
+	;   short enough not to be noticed by the issuer of the command.
+	;
+10$:	MOVL	CNX$L_DEL_TIME(R6),R9	; Get the counter timer field i.d.
+	BSBW	CNF$GET_FIELD		; Get its value
+	BLBC	R0,15$			; If LBC then its not set
+	ADDL	G^EXE$GL_ABSTIM,R8	; Convert to absolute time
+	MOVL	CNX$L_ABS_TIME(R6),R9	; Get field i.d.
+	BSBW	CNF$PUT_FIELD		; Store it
+	MOVZBL	CNX$B_TIM_SUP(R6),R0	; Get the suppression timer bit no.
+	BBSS	R0,RCB$B_STATUS(R2),15$	; If BS then update suppression timer
+					; is ticking
+	MOVL	#2,R8			; Suppress processing request for 2 sec
+	BRB	40$		 	; Set the timer
+15$:	BRW	50$			; Continue
+20$:	;
+	;   Entry point called when timer fires.
+	;
+	;   Determine database
+	;
+	MOVL	R5,R0			; Get the timer WQE for deallocation
+	EXTZV	#16,#16,R1,R5		; Get timer database i.d.
+	BSBW	NET$DEALLOCATE		; Deallocate WQE
+	MOVAB	W^CNX_CRI,R6		; Assume CRI timer
+	CMPW	R5,#EVC$C_SRC_CIR	; Is it?
+	BEQL	25$			; If EQL yes
+	MOVAB	W^CNX_NDI,R6		; Assume NDI timer
+	CMPW	R5,#EVC$C_SRC_NOD	; Is it?
+	BEQL	25$			; If EQL yes
+
+	BUG_CHECK  NETNOSTATE,FATAL	; Timer i.d. unknown
+
+25$:	MOVL	@CNX$L_CNR_PTR(R6),R11	; Get the CNR pointer
+	MOVZBL	CNX$B_TIM_SUP(R6),R0	; Get the suppression timer bit no.
+	MOVL	W^NET$GL_PTR_VCB,R2	; Get the RCB pointer
+	BBCC	R0,RCB$B_STATUS(R2),30$	; Suppression timer no longer ticking
+30$:	BSBB	TICK			; Process CNF timers
+	; 
+	;   Determine the next earliest CNF due time
+	;
+	CLRL	R10			; Start from the head of the CNF list
+	MOVL	CNX$L_ABS_TIME(R6),R9	; Get absolute time field i.d.
+	MNEGL	#1,R8			; Set timer to maximum value
+	MOVL	S^#NFB$C_OP_FNDMIN,R1	; Fct is "find minimum value"
+	BSBW	CNF$KEY_SEARCH		; Find minimum value
+	CMPL	#-1,R8			; Still at maximum?
+	BEQL	50$			; If EQL then no timers are set
+	MOVL	R8,@CNX$L_OLD_TIME(R6)	; Store it
+	CMPL	G^EXE$GL_ABSTIM,R8	; Have we passed that time yet?
+					; (this could happen if the event
+					;  buffer is full)
+	BLSSU	35$			; If LSSU then no
+	MOVL	#2,R8			; Try again in 2 seconds
+	BRB	40$			; Continue
+35$:	SUBL	G^EXE$GL_ABSTIM,R8	; Convert to delta time
+	ADDL	#2,R8			; CNF timers are grouped into 2 second
+					; buckets to batch the work
+40$:	;
+	;   Reset the timer
+	;
+	EMUL	R8,#10*1000*1000,#0,R3	; Get quadword timer interval
+	MOVAB	20$,R2			; Setup timer routine address
+	MOVL	CNX$W_ID_CTM-2(R6),R1	; Setup timer i.d. in high order word
+	MOVW	#WQE$C_QUAL_CTM@8,R1	; Setup timer qualifier
+	BSBW	WQE$RESET_TIM		; Reset the counter timer
+50$:	RSB
+
+
+
+
+TICK:	MOVL	G^EXE$GL_ABSTIM,-	; Get seconds since boot to be used
+		W^BASE_TIME		; as the common base for updating timers
+	CLRL	R10			; Start from the head of the CNF list
+10$:	;
+	;   Find the next CNF whose timer is due.   Must first check for
+	;   CNF entries whose time is past due to prevent finding the same
+	;   CNFs over and over again when there are more entries than can fit
+	;   in the event buffer.
+	;
+	CMPW	#100,W^EVT_W_LTH_LEFT	;&Enough room in buffer?
+	BGTRU	40$			; If GTRU then no	
+	MOVL	CNX$L_ABS_TIME(R6),R9	; Get field i.d
+	ADDL3	#4,@CNX$L_OLD_TIME(R6),R8 ; Get due time of oldest CNFs 
+	CMPL	R8,G^EXE$GL_ABSTIM	; Use 4 second interval but don't
+	BGTRU	13$			; exceed the current time
+	MOVL	S^#NFB$C_OP_GTRU,R1	; Match on key value GTRU CNF field
+	BSBW	CNF$KEY_SEARCH		; Find Appropriate CNF
+	BLBS	R0,15$			; If LBS then found one
+	CLRL	R10			; Start next scan from head of CNF list
+13$:	ADDL3	#1,G^EXE$GL_ABSTIM,R8	; Bias current time.  The "+1" is used
+					; to help smooth the coarseness of the
+					; timer and to amortize the timer over-
+					; head across a number of CNFs.
+	MOVL	S^#NFB$C_OP_GTRU,R1	; Match on key value GTRU CNF field
+	BSBW	CNF$KEY_SEARCH		; Find Appropriate CNF
+	BLBC	R0,40$			; If LBC then no such CNF
+15$:	REMQUE	@W^NET$GQ_TMP_BUF,R0	; Drain temp buffer queue since
+					; the search below could fill it
+	BVS	17$			; If VS then none
+	BSBW	NET$DEALLOCATE		; Deallocate the block
+	BRB	15$			; Loop
+17$:	;
+	;   Snapshot the counters
+	;
+	PUSHL	W^NET$GL_FLAGS		; Save current flags
+	BISW	#NET$M_CLRCNT,W^NET$GL_FLAGS	; Counters are to be cleared
+	MOVL	CNX$L_COUNTER(R6),R9	; Get counter field i.d.
+	BSBW	CNF$GET_FIELD		; Read/clear the counters
+	POPL	W^NET$GL_FLAGS		; Restore flags
+	;
+	;   Calculate its next due time and store it in the CNF
+	;
+	MOVL	CNX$L_DEL_TIME(R6),R9	; Get delta time field i.d.
+	BSBW	CNF$GET_FIELD		; Fetch it
+	MOVL	CNX$L_ABS_TIME(R6),R9	; Get absolute time field i.d.
+	BLBS	R0,20$			; If LBS then delta time was valid
+	BSBW	CNF$CLR_FIELD		; Else the timer has been cancelled
+	BRB	30$			; Continue
+20$:	ADDL	W^BASE_TIME,R8		; Determine when timer should fire next
+	BSBW	CNF$PUT_FIELD		; Store it
+30$:	BRW	10$			; Loop
+40$:	RSB
+
+
+.END
+

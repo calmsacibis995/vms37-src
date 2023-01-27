@@ -1,0 +1,1555 @@
+MODULE setfile	(
+		IDENT = 'V03-003',
+    		ADDRESSING_MODE(EXTERNAL=GENERAL,
+    				NONEXTERNAL=LONG_RELATIVE)
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	Set File Command
+!
+! ABSTRACT:
+!
+!	This module processes the Set File command.
+!
+! ENVIRONMENT:
+!
+!	Vax native, privileged user mode
+!
+!--
+!
+! AUTHOR:	Gerry Smith	 	CREATION DATE: 04-Aug-1981
+!
+! MODIFIED BY: 
+!
+!	V03-003	GAS0071		Gerry Smith		 8-Apr-1982
+!		If the writer count for a file is non-zero, don't allow
+!		modification.  If /END is attempted on INDEXF.SYS, don't
+!		allow it.
+!
+!	V03-002	GAS0068		Gerry Smith		31-Mar-1982
+!		If a truncate is attempted on an indexed file, signal
+!		an error.
+!
+!	V03-001	GAS0064		Gerry Smith		19-Mar-1982
+!		Change check of qualifiers to include /GLOBAL_BUFFERS.
+!
+!	V03-005	GAS0050		Gerry Smith		22-Feb-1982
+!		Only access the file header for something besides
+!		/ENTER or /REMOVE.  Make the error messages for /ENTER
+!		and /REMOVE more meaningful.  Change the /ENTER check for
+!		same devices to use the DVI fields of the NAM blocks.
+!
+!	V03-004	GAS0047		Gerry Smith		15-Feb-1982
+!		For SET FILE/ENTER, parse the new file name here, after
+!		the old file name is available, so that stickiness can
+!		be applied.
+!
+!	V03-003	GAS0038		Gerry Smith		 2-Feb-1982
+!		Add /GLOBAL_BUFFERS, the global buffer count for a 
+!		file.  Also, if the file is ODS1, then move the record
+!		attributes to the location occupied in an ODS2 file.
+!		This allows the BIND in routine SET_ATTRIBUTES to apply
+!		to both kinds of file headers.
+!
+!	V03-002 GAS0026		Gerry Smith		18-Dec-1981
+!		Use shared message file, and lower fatal messages to
+!		simple error messages.
+!
+!	V03-001	GAS0024		Gerry Smith		14-Dec-1981
+!		Fix /LOG logic for /ENTER and /REMOVE
+!
+!	V03-001 MSH0001		Maryann Hinden		02-Dec-1981
+!		Change references to FIB$C_SIZE to FIB$C_LENGTH.
+!
+!	V03-001	GAS0021		Gerry Smith		30-Nov-1981
+!		Fix /VERSION, making FIB larger
+!
+!	V03-001	GAS0018		Gerry Smith		16-Nov-1981
+!		Split SET FILE into separate modules
+!
+!	V03-001	GAS0011		Gerry Smith		22-Sep-1981
+!		Fix wildcarding for /ENTER.  Add /END_OF_FILE
+!
+!	V03-002	GAS0012		Gerry Smith		30-Sep-1981
+!		Add /LOG and /CONFIRM
+!
+!**
+
+LIBRARY	'SYS$LIBRARY:LIB';
+LIBRARY 'SYS$LIBRARY:CLIMAC';
+
+STRUCTURE
+    BBLOCK [O, P, S, E; N] =
+    	[N]
+    	(BBLOCK + O)<P,S,E>;
+
+FORWARD ROUTINE
+    set$file,				! Main routine for file
+    set_attributes,			! Routine to set file attributes
+    get_file,				! Routine to get each file
+    					! Common routines:
+    confirm_action,			! Routine to ask for confirmation
+    handler,				! Condition handler
+    check_privilege : NOVALUE,		! Routine to check for privilege
+    search_error,			! Where to go if file search fails
+    file_error,				! Where to go if file error occurs
+    cli_error;				! Where to go if CLI error
+
+EXTERNAL ROUTINE
+    					! Action routines for:
+    back_act,				! /BACKUP
+    noback_act,				! /NOBACKUP
+    data_act,				! /DATA_CHECK
+    enter_act,				! /ENTER
+    erase_act,				! /ERASE_ON_DELETE
+    noerase_act,			! /NOERASE_ON_DELETE
+    exp_act,				! /EXPIRATION_DATE
+    noexp_act,				! /NOEXPIRATION_DATE
+    ext_act,				! /EXTENSION
+    gbuf_act,				! /GLOBAL_BUFFERS
+    journal_act,			! /JOURNAL
+    owner_act,				! /OWNER_UIC
+    vrsn_act,				! /VERSION_LIMIT
+    					!
+    lib$file_scan,			! Routine to find next file
+    sys$fao,				! Formatted ASCII Output
+    lib$get_command;			! Prompter for confirmation
+
+!
+! External data references
+!
+EXTERNAL
+    set$l_status,			! Status return for SET dispatcher
+    set$a_cliwork;			! CLI work area in SET dispatcher
+
+!
+! Literal data definitions
+!
+LITERAL
+    true = 1,
+    false = 0;
+
+
+!
+! Define the data that is used by SET FILE
+!
+GLOBAL
+    setfile$flags : BITVECTOR[32] INITIAL(0),	! Qualifier bits word
+    setfile$dflags : BITVECTOR[32] INITIAL(0),	! DATA_CHECK options word
+    setfile$jflags : BITVECTOR[32] INITIAL(0),	! JOURNAL options word
+    exp_value : BBLOCK[8],			! Expiration date
+    exte_value,					! Extension quantity
+    gbuf_value,					! Global buffer value
+    uic_value,					! Owner uic
+    group,					! Group number
+    member,					! Member number
+    vrsn_value,					! Version limit
+    rename_buf : VECTOR[nam$c_maxrss,BYTE],	! Name buffer for /ENTER
+    file_name : VECTOR[2],			! ENTER/REMOVE descriptor 
+
+    worst_error : BBLOCK[4] INITIAL(ss$_normal),! Worst error reported
+!
+! RMS storage
+!
+    file_result : VECTOR[nam$c_maxrss,BYTE],	! Resultant name string
+    file_expanded : VECTOR[nam$c_maxrss,BYTE],	! Expanded name string
+    file_rlf : $NAM(),				! Related file name block
+    file_nam : $NAM(				! File name block
+    	RLF = file_rlf,				! Point to related file block
+    	ESA = file_expanded,
+    	ESS = nam$c_maxrss,
+    	RSA = file_result,			! File name after open
+    	RSS = nam$c_maxrss),
+    file_fab : $FAB(				! FAB for file
+    	NAM = file_nam);			! Specify name block
+
+!
+! Declare the qualifier flag bits used by SET FILE
+!
+EXTERNAL LITERAL
+    qual_access,
+    qual_backup,
+    qual_nobackup,
+    qual_confirm,
+    qual_data,
+    qual_enter,
+    qual_eof,
+    qual_erase,
+    qual_noerase,
+    qual_expi,
+    qual_exte,
+    qual_gbuf,
+    qual_journal,
+    qual_log,
+    qual_nodi,
+    qual_owner,
+    qual_parent,
+    qual_remove,
+    qual_trunc,
+    qual_vrsn,
+!
+! Declare the DATA_CHECK option bits
+!
+    data_read,
+    data_write,
+    data_noread,
+    data_nowrite,
+!
+! Declare the JOURNAL option bits
+!
+    jrnl_ai,
+    jrnl_at,
+    jrnl_bi,
+    jrnl_ru,
+    jrnl_rum,
+    jrnl_noai,
+    jrnl_noat,
+    jrnl_nobi,
+    jrnl_noru,
+    jrnl_norum,
+!
+! Declare the error messages
+!
+    set$_facility,			! SET facility code
+    set$_closeerr,			! Could not close file
+    set$_entered,			! File entered in a directory
+    set$_enterr,			! Error entering file
+    set$_modified,			! File/directory modified
+    set$_nonode,			! Node specification not allowed
+    set$_notdir,			! Not a directory
+    set$_notods2,			! Not an ODS2 structure
+    set$_opendir,			! Could not open parent directory
+    set$_readerr,			! Error reading the file
+    set$_remerr,			! Could not remove file
+    set$_removed,			! Directory entry removed
+    set$_writeerr;			! Error modifying file
+!
+! Define messages from the shared message facility
+!
+$SHR_MSGDEF (set, 119, global,
+	    (confqual, error),		! Conflicting qualifiers
+	    (delver, error),		! Explicit version number required
+	    (notrunc, error),		! Truncation not allowed
+	    (openin, error),		! Error opening a file
+	    (searchfail, error));	! Error searching for a file
+
+!
+! Define the CLI commands for SET FILE
+!
+$CLIQUALCODES (stfl,
+    		backup,
+		confirm,
+	    	data_check,
+		end_of_file,
+		enter,
+	    	erase_on_delete,
+	    	expiration_date,
+	    	extension,
+		global_buffers,
+    		journal,
+		log,
+	    	nodirectory,
+	    	owner_uic,
+		record_protection,
+		truncate,
+		remove,
+	    	version_limit);
+
+
+!
+! Command qualifier list
+!
+OWN
+    backup_desc:				! [NO]BACKUP
+	$CLIQUALDESC(QDCODE = backup,
+		     TRUACT = back_act,
+		     FLSACT = noback_act,
+		     QDFLGS = qdexpa),
+    confirm_desc:				! CONFIRM
+	$CLIQUALDESC(QDCODE = confirm,
+		     SETLST = qual_confirm),
+    dcwt_desc:					! DATA_CHECK
+	$CLIQUALDESC(QDCODE = data_check,
+		     TRUACT = data_act,
+		     SETLST = qual_data,
+		     QDFLGS = qdexpa),
+    eof_desc:
+	$CLIQUALDESC(QDCODE = end_of_file,	! END_OF_FILE
+		     SETLST = qual_eof,
+		     QDFLGS = qdexpa),
+    enter_desc:					! ENTER
+	$CLIQUALDESC(QDCODE = enter,
+		     TRUACT = enter_act,
+		     SETLST = qual_enter,
+		     QDFLGS = qdexpa),
+    erase_desc:					! [NO]ERASE_ON_DELETE
+	$CLIQUALDESC(QDCODE = erase_on_delete,
+		     TRUACT = erase_act,
+		     FLSACT = noerase_act,
+		     QDFLGS = qdexpa),
+    expi_desc:					! EXPIRATION
+	$CLIQUALDESC(QDCODE = expiration_date,
+		     TRUACT = exp_act,
+		     FLSACT = noexp_act,
+		     SETLST = qual_expi,
+		     QDFLGS = qdexpa),
+    exte_desc:					! EXTENSION
+	$CLIQUALDESC(QDCODE = extension,
+		     TRUACT = ext_act,
+		     SETLST = qual_exte,
+		     QDFLGS = qdexpa),
+    gbuf_desc:					! GLOBAL_BUFFERS
+	$CLIQUALDESC(QDCODE = global_buffers,
+		     TRUACT = gbuf_act,
+		     SETLST = qual_gbuf,
+		     QDFLGS = qdexpa),
+    journal_desc:				! JOURNAL
+	$CLIQUALDESC(QDCODE = journal,
+		     TRUACT = journal_act,
+		     SETLST = qual_journal,
+		     QDFLGS = qdexpa),
+    log_desc:					! LOG
+	$CLIQUALDESC(QDCODE = log,
+		     SETLST = qual_log),
+    nodir_desc:					! NODIRECTORY
+	$CLIQUALDESC(QDCODE = nodirectory,
+		     SETLST = qual_nodi,
+		     QDFLGS = qdexpa),
+    owner_desc:					! OWNER_UIC
+	$CLIQUALDESC(QDCODE = owner_uic,
+		     TRUACT = owner_act,
+		     SETLST = qual_owner,
+		     QDFLGS = qdexpa),
+    remove_desc:				! REMOVE
+	$CLIQUALDESC(QDCODE = remove,
+		     SETLST = qual_remove,
+		     QDFLGS = qdexpa),
+    trunc_desc:					! TRUNCATE
+	$CLIQUALDESC(QDCODE = truncate,
+		     SETLST = qual_trunc,
+		     QDFLGS = qdexpa),
+    vrsn_desc:					! VERSION_LIMIT
+	$CLIQUALDESC(QDCODE = version_limit,
+		     TRUACT = vrsn_act,
+		     SETLST = qual_vrsn,
+		     QDFLGS = qdexpa),
+    end_qual_desc:
+    	$CLIQUALEND,
+
+!
+! File list
+!
+    file_desc:
+	$CLIREQDESC(RQTYPE = input1,
+		    RQFLGS = absadr,
+		    ERRACT = cli_error),
+!
+! Qualifier list
+!
+    qual_desc:
+	$CLIREQDESC(RQTYPE = getqual,
+		    RQFLGS = absadr,
+		    QUALST = backup_desc,
+		    ERRACT = cli_error);
+
+GLOBAL ROUTINE set$file (option_block,callback) =
+
+!++
+!
+! Functional description
+!
+!	This is the main control module.  It calls LIB$FILE_SCAN to perform
+!	the necessary functions on the file(s) specified in the call to SET.
+!
+! Calling sequence
+!
+!	CALL set$file(option_block,callback)
+!
+! Input parameters
+!
+!	option_block = option descriptor block from the CLI
+!	callback = address of CLI callback routine
+!
+! Output parameters
+!	none
+!
+! Implicit outputs
+!	none
+!
+! Routine value
+!	none
+!
+! Side effects
+!	none
+!
+!--
+
+BEGIN
+
+LOCAL
+    status;
+
+!
+! Establish a condition handler, that will remember the most severe
+! error, so that it can be returned to the SET command dispatcher
+!
+ENABLE handler;
+
+!
+! Check to make sure that the image is running with correct privilege.
+!
+check_privilege();
+
+!
+! Now to get all the command qualifiers.  By calling the CLI, the appropriate
+! action routines for each qualifier present will be called, and the 
+! appropriate bits will be set in SETFILE$FLAGS.
+
+IF NOT (status = (.callback)(qual_desc,
+    		  set$a_cliwork,setfile$flags))
+THEN SIGNAL_STOP(.status);
+
+!
+! Check to make sure that conflicting qualifiers were not specified.  If 
+! they were, signal an error and stop.
+!
+
+IF .setfile$flags[qual_data]
+THEN
+    IF .setfile$dflags[data_read] AND .setfile$dflags[data_noread]
+    OR .setfile$dflags[data_write] AND .setfile$dflags[data_nowrite]
+    THEN SIGNAL_STOP(set$_confqual);
+
+IF .setfile$flags[qual_journal]
+THEN
+    IF .setfile$jflags[jrnl_ai] AND .setfile$jflags[jrnl_noai]
+    OR .setfile$jflags[jrnl_bi] AND .setfile$jflags[jrnl_nobi]
+    OR .setfile$jflags[jrnl_at] AND .setfile$jflags[jrnl_noat]
+    OR .setfile$jflags[jrnl_ru] AND .setfile$jflags[jrnl_noru]
+    OR .setfile$jflags[jrnl_rum] AND .setfile$jflags[jrnl_norum]
+    THEN SIGNAL_STOP(set$_confqual);
+
+!
+! Next, for each file specified, find the file and perform the operations
+! requested.
+!
+
+file_desc[cli$v_concatinp] = true;	! Initialize for get_file routine
+
+WHILE get_file(.callback) DO		! Get next filename from command line
+    BEGIN
+    lib$file_scan(			! For each file found,
+	file_fab,			! Use this fab
+	set_attributes,			! Go here if file found
+	search_error)			! Go here if error
+    END;
+set$l_status = .worst_error OR sts$m_inhib_msg;		! Return worst status to SET
+RETURN true;
+END;					! End of routine set$file
+
+ROUTINE set_attributes (fab) =
+!++
+!
+! This is the routine that actually accesses the file, and sets the
+! specified attributes.  If an error occurs while attempting to set
+! the attributes, a message telling the user is issued, and any other
+! files are processed.
+!
+!--
+BEGIN
+
+MAP
+    fab : REF BBLOCK;			! Define the fab
+
+
+
+LOCAL
+    atr : BLOCKVECTOR[6,8,BYTE],	! Attribute control block
+    ptr,				! Pointer to attribute block
+    status,				! Status return
+    channel : WORD,			! Channel number
+    desc : BBLOCK[dsc$c_s_bln],		! General descriptor
+    conf_desc : BBLOCK[dsc$c_s_bln],	! Descriptor for /LOG/CONFIRM
+    fib : BBLOCK[fib$c_length],		! A FIB for the QIO 
+    header : BBLOCK[512],		! The file header
+    statblk : BBLOCK[atr$s_statblk],	! The statistics block
+    iosb : VECTOR[4,WORD];		! I/O status block
+
+BIND
+    recattr = header[fh2$w_recattr] : BBLOCK[atr$s_recattr],
+
+    nam = .fab[fab$l_nam] : BBLOCK;	! Define the name block
+
+OWN
+    old_did_num : WORD,			! Old directory id
+    old_did_seq : WORD,
+    old_did_rvn : WORD;
+
+!
+! Assign a channel to the file's device
+!
+desc[dsc$w_length] = .nam[nam$b_dev];	! Set up the descriptor
+desc[dsc$a_pointer] = .nam[nam$l_dev];	! to point to the device name
+
+IF NOT (status = $ASSIGN(
+    			DEVNAM = desc,
+    			CHAN = channel))
+THEN 
+    BEGIN
+    file_error( set$_openin,
+		.status, .fab);		! Tell user why the assign failed
+    RETURN true;			! And continue with other files
+    END;
+
+!
+! Access the file, reading the file's header
+!
+desc[dsc$w_length] = fib$c_length;	! Re-use descriptor to point to FIB
+desc[dsc$a_pointer] = fib;
+
+CH$FILL(0,fib$c_length,fib);		! Zero out the FIB
+
+fib[fib$l_acctl] = fib$m_write OR	! Set up the FIB
+    		   fib$m_noread OR
+    		   fib$m_nowrite;
+
+fib[fib$w_fid_num] = .nam[nam$w_fid_num];	! Put in the file id
+fib[fib$w_fid_seq] = .nam[nam$w_fid_seq];
+fib[fib$w_fid_rvn] = .nam[nam$w_fid_rvn];
+
+!
+! Get the name of the file that is being modified, so that it can be 
+! referenced later.
+!
+    conf_desc[dsc$a_pointer] = .nam[nam$l_rsa];
+    conf_desc[dsc$w_length] = .nam[nam$b_rsl];
+
+!
+! Unless some option was specified that requires the file header, don't
+! bother to get it.
+!
+
+IF .setfile$flags[qual_access]
+OR .setfile$flags[qual_backup]
+OR .setfile$flags[qual_nobackup]
+OR .setfile$flags[qual_data]
+OR .setfile$flags[qual_eof]
+OR .setfile$flags[qual_erase]
+OR .setfile$flags[qual_noerase]
+OR .setfile$flags[qual_expi]
+OR .setfile$flags[qual_exte]
+OR .setfile$flags[qual_gbuf]
+OR .setfile$flags[qual_journal]
+OR .setfile$flags[qual_nodi]
+OR .setfile$flags[qual_owner]
+OR .setfile$flags[qual_trunc]
+OR .setfile$flags[qual_vrsn]
+THEN
+BEGIN
+
+atr[0,atr$w_type] = atr$c_header;		! Get the file header
+atr[0,atr$w_size] = atr$s_header;
+atr[0,atr$l_addr] = header;
+atr[1,atr$w_type] = atr$c_statblk;		! Get the statistics block
+atr[1,atr$w_size] = atr$s_statblk;
+atr[1,atr$l_addr] = statblk;
+atr[2,0,0,32,0] = 0;
+
+status = $QIOW(	CHAN = .channel,
+		FUNC = IO$_ACCESS,
+		IOSB = iosb,
+		P1 = desc,
+		P5 = atr);
+IF .status THEN status = .iosb[0];
+IF NOT .status 
+THEN file_error(set$_readerr,.status,.fab)
+ELSE
+IF .statblk[sbk$w_wcnt] NEQ 0			! If anyone is writing to the file
+THEN SIGNAL(set$_writeerr,1,conf_desc,ss$_acconflict)	! then signal an error
+ELSE
+    BEGIN
+!
+! Check to see whether this is an ODS1 or an ODS2 file.  If ODS1,
+! copy the record attributes into the ODS2 location.
+!
+    IF .header[fh2$b_struclev] EQL 1
+    THEN CH$MOVE(fat$c_length, header[fh1$w_recattr], header[fh2$w_recattr]);
+
+!
+! Initialize the pointer to the attribute control block.  The block
+! will be built as we go, and the pointer shows where the next attribute
+! should go in the block.
+!
+    ptr = 0;
+
+!
+! Change the file characteristics
+!
+    status = 0;			! Show that nothing has changed
+
+    IF .setfile$flags[qual_backup]		! /BACKUP
+    THEN
+	BEGIN
+	header[fh2$v_nobackup] = 0;
+	status = 1;
+	END;
+    IF .setfile$flags[qual_nobackup]		! /NOBACKUP
+    THEN
+	BEGIN
+	header[fh2$v_nobackup] = 1;
+	status = 1;
+	END;
+
+    IF .setfile$flags[qual_erase]		! /ERASE
+    THEN
+	BEGIN
+	IF .header[fh2$b_struclev] EQL 1 	! If not ODS2
+	THEN SIGNAL(set$_notods2,		! tell the user
+		    1,
+		    $DESCRIPTOR('/ERASE'))
+	ELSE
+	    BEGIN
+	    header[fh2$v_erase] = 1;
+	    status = 1;
+	    END;
+	END;
+    IF .setfile$flags[qual_noerase]		! /NOERASE
+    THEN
+	BEGIN
+	IF .header[fh2$b_struclev] EQL 1 	! If not ODS2
+	THEN SIGNAL(set$_notods2,		! tell the user
+		    1,
+		    $DESCRIPTOR('/NOERASE'))
+	ELSE
+	    BEGIN
+	    header[fh2$v_erase] = 0;
+	    status = 1;
+	    END;
+	END;
+
+    IF .setfile$flags[qual_data]		! /DATA_CHECK
+    THEN
+        BEGIN
+        IF .setfile$dflags[data_read] THEN header[fh2$v_readcheck] = 1;
+        IF .setfile$dflags[data_noread] THEN header[fh2$v_readcheck] = 0;
+        IF .setfile$dflags[data_write] THEN header[fh2$v_writcheck]= 1;
+        IF .setfile$dflags[data_nowrite] THEN header[fh2$v_writcheck] =0;
+	status = 1;
+        END;
+
+    IF .setfile$flags[qual_nodi]		! /NODIRECTORY
+    THEN
+	BEGIN
+	IF .header[fh2$b_struclev] EQL 1	! If not ODS2
+	THEN SIGNAL (set$_notods2,		! tell the user
+		     1,
+		     $DESCRIPTOR('/NODIRECTORY'))
+	ELSE
+	    BEGIN
+	    header[fh2$v_directory] = 0;
+	    status = 1;
+	    END;
+	END;
+
+!
+! If something in the file characteristics was changed, show it.
+!
+    IF .status
+    THEN
+    	BEGIN
+	atr[.ptr,atr$w_type] = atr$c_uchar;
+	atr[.ptr,atr$w_size] = atr$s_uchar;
+	atr[.ptr,atr$l_addr] = header[fh2$l_filechar];
+	ptr = .ptr + 1;
+	status = 0;			! Reset the change indicator
+	END;
+
+!
+! Modify the record attributes
+!
+
+    IF .setfile$flags[qual_exte]		! /EXTENSION
+    THEN 
+	BEGIN
+	recattr[fat$w_defext] = .exte_value;
+	status = 1;
+	END;
+!
+! IF /END_OF_FILE was specified, set the eof_block equal to the
+! highest block allocated, and the first free byte in that block
+! to 512, indicating that the entire allocated space is used.
+!
+    IF .setfile$flags[qual_eof]
+    THEN
+	BEGIN
+    	IF  .nam[nam$w_fid_num] EQL 1			! If INDEXF.SYS
+	AND .nam[nam$w_fid_seq] EQL 1
+	AND .nam[nam$b_fid_nmx] EQL 0
+	THEN SIGNAL (set$_writeerr,			! Signal an error
+		     1,					! modifying it
+		     conf_desc,				! because of an
+		     ss$_acconflict)
+	ELSE
+	    BEGIN
+	    recattr[fat$l_efblk] = .recattr[fat$l_hiblk];
+	    recattr[fat$w_ffbyte] = 512;
+	    status = 1;
+	    END;
+	END;
+!
+! If /GLOBAL_BUFFERS was specified, set the global buffer count to
+! the value specified.
+!
+    IF .setfile$flags[qual_gbuf]
+    THEN
+	BEGIN
+	recattr[fat$w_gbc] = .gbuf_value;
+	status = 1;
+	END;
+!
+! If something in the user attributes was changed, show it.
+!
+    IF .status
+    THEN
+	BEGIN
+	atr[.ptr,atr$w_type] = atr$c_recattr;
+	atr[.ptr,atr$w_size] = atr$s_recattr;
+	atr[.ptr,atr$l_addr] = header[fh2$w_recattr];
+	ptr = .ptr + 1;
+	END;
+
+!
+! Expiration date
+!
+    IF .setfile$flags[qual_expi]
+    THEN
+	BEGIN
+	CH$MOVE(8,exp_value,header[fi2$q_expdate]);
+	atr[.ptr,atr$w_type] = atr$c_expdate;
+	atr[.ptr,atr$w_size] = atr$s_expdate;
+	atr[.ptr,atr$l_addr] = header[fi2$q_expdate];
+	ptr = .ptr + 1;
+	END;
+
+!
+! Owner UIC
+!
+    IF .setfile$flags[qual_owner]
+    THEN
+	BEGIN
+!
+! If the qualifier OWNER=PARENT was specified, then the UIC of the owner 
+! directory must be found.  Rather than accessing the directory every time, a 
+! test is made to determine if the directory's UIC has already been found.  If 
+! so, then the current value of UIC_VALUE is used.  Otherwise, a new value is 
+! found.
+!
+	IF .setfile$flags[qual_parent]
+	THEN
+	    BEGIN
+	    IF NOT ((.nam[nam$w_did_num] EQL .old_did_num) AND
+		    (.nam[nam$w_did_seq] EQL .old_did_seq) AND
+		    (.nam[nam$w_did_rvn] EQL .old_did_rvn))
+	    THEN
+		BEGIN
+		LOCAL
+		    temp_atr : BLOCKVECTOR[2,8,BYTE],
+		    temp_desc : BBLOCK[dsc$c_s_bln],
+		    temp_fib : BBLOCK[fib$c_extdata],
+		    temp_chan;
+
+		temp_desc[dsc$w_length] = .nam[nam$b_dev];
+		temp_desc[dsc$a_pointer] = .nam[nam$l_dev];
+		IF NOT (status = $ASSIGN(DEVNAM = temp_desc,
+					 CHAN =temp_chan))
+		THEN
+		    BEGIN
+		    SIGNAL(set$_opendir, 1, conf_desc, .status);
+		    RETURN true;
+		    END;
+
+		CH$FILL(0, fib$c_extdata, temp_fib);
+
+		temp_fib[fib$l_acctl] = fib$m_noread OR fib$m_nowrite;
+		temp_fib[fib$w_fid_num] = .nam[nam$w_did_num];
+		temp_fib[fib$w_fid_seq] = .nam[nam$w_did_seq];
+		temp_fib[fib$w_fid_rvn] = .nam[nam$w_did_rvn];
+
+		temp_atr[0,atr$w_type] = atr$c_uic;
+		temp_atr[0,atr$w_size] = atr$s_uic;
+		temp_atr[0,atr$l_addr] = uic_value;
+		temp_atr[1,0,0,32,0] = 0;
+
+		temp_desc[dsc$w_length] = fib$c_extdata;
+		temp_desc[dsc$a_pointer] = temp_fib;
+
+		status = $QIOW( CHAN = .temp_chan,
+				FUNC = IO$_ACCESS,
+				IOSB = iosb,
+				P1 = temp_desc,
+				p5 = temp_atr);
+		IF .status THEN status = .iosb[0];
+		IF NOT .status 
+		THEN SIGNAL_STOP(set$_opendir, 1, conf_desc, .status);
+		$DASSGN (CHAN = .temp_chan);
+		END;
+	    END;
+		
+	header[fh2$l_fileowner] = .uic_value;
+	atr[.ptr,atr$w_type] = atr$c_uic;
+	atr[.ptr,atr$w_size] = atr$s_uic;
+	atr[.ptr,atr$l_addr] = header[fh2$l_fileowner];
+	ptr = .ptr + 1;
+	END;
+
+!
+! If /TRUNCATE was specified, find the block containing the EOF.  If
+! the EOF occurred somewhere in that block, then truncate to the next
+! block.
+!
+    IF .setfile$flags[qual_trunc] THEN
+	BEGIN
+	IF .recattr[fat$v_fileorg] EQL fat$c_indexed
+	THEN
+	    SIGNAL(set$_writeerr, 1, conf_desc, set$_notrunc)
+	ELSE
+	    BEGIN
+	    fib[fib$v_trunc] = 1;
+	    fib[fib$l_exvbn] = .recattr[fat$w_efblkh]^16
+				 + .recattr[fat$w_efblkl];
+	    IF .recattr[fat$w_ffbyte] GTR 0
+	    THEN fib[fib$l_exvbn] = .fib[fib$l_exvbn] + 1;
+	    END;
+	END;
+!
+! Set the version limit for a particular file
+!
+    IF .setfile$flags[qual_vrsn]
+    THEN
+	BEGIN
+	fib[fib$w_did_num] = .nam[nam$w_did_num];	! Specify the directory
+	fib[fib$w_did_seq] = .nam[nam$w_did_seq];
+	fib[fib$w_did_rvn] = .nam[nam$w_did_rvn];
+
+	fib[fib$v_findfid] = true;			! Set the findfid bit
+
+	fib[fib$w_verlimit] = .vrsn_value;		! And the version limit
+	END;
+
+!
+! If any journaling was requested, make those modifications
+!
+
+    status = 0;
+
+    IF .setfile$flags[qual_journal]		! /JOURNAL
+    THEN
+	BEGIN
+	IF .header[fh2$b_struclev] EQL 1	! If not ODS2
+	THEN SIGNAL(set$_notods2,		! tell the user
+		    1,
+		    $DESCRIPTOR('/JOURNAL'))
+	ELSE
+	    BEGIN
+	    IF .setfile$jflags[jrnl_ru]		! RU journaling
+	    THEN
+		BEGIN
+		header[fh2$v_norujnl] = 0;
+		status = 1;
+		END;
+	    IF .setfile$jflags[jrnl_noru]	! NORU
+	    THEN
+	    	BEGIN
+	    	header[fh2$v_norujnl] = 1;
+	    	status = 1;
+	    	END;
+	    IF .setfile$jflags[jrnl_rum]	! RUM journaling
+	    THEN
+	    	BEGIN
+	    	header[fh2$v_ruaccess] = 1;
+	    	status = 1;
+	    	END;
+	    IF .setfile$jflags[jrnl_norum]	! NORUM
+	    THEN
+	    	BEGIN
+	    	header[fh2$v_ruaccess] = 0;
+	    	status = 1;
+	    	END;
+	    IF .setfile$jflags[jrnl_ai]		! AI journaling
+	    THEN
+	    	BEGIN
+	    	header[fh2$v_aijnl] = 1;
+	    	status = 1;
+	    	END;
+	    IF .setfile$jflags[jrnl_noai]	! NOAI
+	    THEN
+	    	BEGIN
+	    	header[fh2$v_aijnl] = 1;
+	    	status = 1;
+	    	END;
+	    IF .setfile$jflags[jrnl_at]		! AT journaling
+	    THEN
+	    	BEGIN
+	    	header[fh2$v_atjnl] = 1;
+	    	status = 1;
+	    	END;
+	    IF .setfile$jflags[jrnl_noat]	! NOAT
+	    THEN
+	    	BEGIN
+	    	header[fh2$v_atjnl] = 0;
+	    	status = 1;
+	    	END;
+	    IF .setfile$jflags[jrnl_bi]		! BI journaling
+	    THEN
+	    	BEGIN
+	    	header[fh2$v_bijnl] = 1;
+	    	status = 1;
+	    	END;
+	    IF .setfile$jflags[jrnl_nobi]	! NOBI
+	    THEN
+	    	BEGIN
+	    	header[fh2$v_bijnl] = 0;
+	    	status = 1;
+	    	END;
+	    END;
+	END;
+
+!
+! If there were any journal bits set, show it.
+!
+
+    IF (.status EQL 1) 
+    THEN
+	BEGIN
+	atr[.ptr,atr$w_type] = atr$c_journal;
+	atr[.ptr,atr$w_size] = atr$s_journal;
+	atr[.ptr,atr$l_addr] = header[fh2$w_journal];
+	ptr = .ptr + 1;
+	END;
+
+!
+! Write the modifications out to the file header.
+!
+
+    atr[.ptr,0,0,32,0] = 0;		! Put a zero at end of attribute list
+
+    IF (   .ptr NEQ 0  			! If an attribute was changed
+	OR .setfile$flags[qual_trunc] 	! Or the file should be truncated
+	OR .setfile$flags[qual_vrsn])	! Or the version_limit set
+    THEN
+!
+! If /CONFIRM was set by the user, then interrogate him to see
+! if the file is to be modified.
+!
+    IF
+	BEGIN
+	IF .setfile$flags[qual_confirm]
+	THEN confirm_action($descriptor('modify file'),
+    			    conf_desc)
+	ELSE true
+	END
+    THEN 
+    	BEGIN
+	status = $QIOW( CHAN = .channel,	! Make the modifications
+			FUNC = IO$_MODIFY,
+			IOSB = iosb,
+			P1 = desc,
+			P5 = atr);
+	IF .status THEN status = .iosb[0];
+	IF NOT .status
+	THEN file_error(set$_writeerr,.status,.fab)	! If the modify failed, tell user
+	ELSE
+	    IF .setfile$flags[qual_log]		! If /LOG, tell user
+	    THEN SIGNAL(set$_modified,1,conf_desc);
+    	END;
+    END;
+END;
+
+!
+! If /REMOVE or /ENTER was specified, process it
+!
+IF (.setfile$flags[qual_remove] OR .setfile$flags[qual_enter])
+THEN
+    BEGIN
+
+!
+! Set up the FIB appropriately
+!
+
+    fib[fib$w_did_num] = .nam[nam$w_did_num];	! Put in the directory ID
+    fib[fib$w_did_seq] = .nam[nam$w_did_seq];
+    fib[fib$w_did_rvn] = .nam[nam$w_did_rvn];
+
+!
+! If /REMOVE was specified, remove the directory entry 
+!
+    IF .setfile$flags[qual_remove]
+    THEN
+	BEGIN
+!
+! Check to see if an explicit or wild version number was specified.
+! If not, exit with an error.
+!
+	IF NOT (.nam[nam$v_exp_ver] OR
+		.nam[nam$v_wild_ver])
+	THEN SIGNAL(set$_remerr,
+			 1,
+			 conf_desc,
+			 set$_delver)
+!
+! If /CONFIRM was set by the user, then interrogate him to see
+! if the directory entry is to be removed.
+!
+	ELSE
+	IF
+	    BEGIN
+	    IF  .setfile$flags[qual_confirm]
+	    THEN confirm_action($descriptor('remove directory entry for'),
+				conf_desc)
+	    ELSE true
+	    END
+	THEN
+	    BEGIN
+
+	    fib[fib$w_fid_num] = 0;			! Clear the File ID
+	    fib[fib$w_fid_seq] = 0;
+	    fib[fib$w_fid_rvn] = 0;
+
+
+    !
+    ! Isolate the file portion of the resultant file string
+    !
+	    file_name[0] = .nam[nam$b_name]
+			   + .nam[nam$b_type]
+			   + .nam[nam$b_ver];
+	    file_name[1] = .nam[nam$l_name];
+
+    !
+    ! Issue the QIO to remove the directory entry
+    !
+	    status = $QIOW( CHAN = .channel,
+			    FUNC = IO$_DELETE,
+			    IOSB = iosb,
+			    P1 = desc,
+			    P2 = file_name);
+	    IF .status THEN status = .iosb[0];
+	    IF NOT .status
+	    THEN SIGNAL(set$_writeerr,		! Error writing
+			1,
+			file_name,			! to this file
+			.status)			! for this reason
+	    ELSE
+		IF .setfile$flags[qual_log]		! If /LOG, tell user
+		THEN SIGNAL(set$_removed,1,conf_desc);
+	    END;
+    	END
+!
+! IF /ENTER, enter the name in the directory
+!
+    ELSE
+	BEGIN
+	LOCAL
+	    new_name : VECTOR[2],		! Place to put new filespec
+	    new_fab : BBLOCK[fab$c_bln],	! Temp output fab
+	    new_nam : BBLOCK[nam$c_bln],	! Temp output name block
+	    new_desc : BBLOCK[dsc$c_s_bln],	! Descriptor for new name
+	    new_nam_exp : VECTOR[nam$c_maxrss,BYTE], ! Expanded string
+	    new_nam_exp2 : VECTOR[nam$c_maxrss,BYTE];! Expanded string2
+!
+! Initialize the fab and name block, using the original file name block
+! as the related file.
+!
+	$FAB_INIT ( FAB = new_fab,
+		    NAM = new_nam,
+		    FNA = .file_name[1],
+		    FNS = .file_name[0]);
+	$NAM_INIT ( NAM = new_nam,
+		    RLF = nam,
+		    ESA = new_nam_exp,
+		    ESS = nam$c_maxrss);
+!
+! If the original file specification had a wildcard version number, then
+! use one here.
+!
+	IF (.nam[nam$v_wild_ver])
+	THEN
+	    BEGIN
+	    new_fab[fab$l_dna] = UPLIT(';*');
+	    new_fab[fab$b_dns] = %CHARCOUNT(';*');
+	    END
+	ELSE
+	    BEGIN
+	    new_fab[fab$l_dna] = 0;
+	    new_fab[fab$b_dns] = 0;
+	    END;
+!
+! Parse once, with the OFP bit off, to fill in all the fields
+! from the original name block
+!
+	IF NOT (status = $PARSE (FAB = new_fab))
+	THEN SIGNAL_STOP(.status);
+
+!
+! Now parse with OFP set, to obtain the final file name
+!
+	$FAB_INIT(  FAB = new_fab,
+		    NAM = new_nam,
+		    FNA = .new_nam[nam$l_esa],
+		    FNS = .new_nam[nam$b_esl],
+		    FOP = ofp);
+	$NAM_INIT(  NAM = new_nam,
+		    RLF = nam,
+		    ESA = new_nam_exp2,
+		    ESS = nam$c_maxrss);
+
+	IF NOT (status = $PARSE (FAB = new_fab))
+	THEN SIGNAL_STOP(.status);
+
+!
+! Get the full file name
+!
+	new_name[0] = .new_nam[nam$b_esl];
+	new_name[1] = .new_nam[nam$l_esa];
+
+!
+! Find the actual file name
+!
+	new_desc[dsc$w_length] = .new_nam[nam$b_name]
+				 + .new_nam[nam$b_type]
+				 + .new_nam[nam$b_ver];
+	new_desc[dsc$a_pointer] = .new_nam[nam$l_name];
+
+!
+! Put in the file ID of the target directory
+!
+	fib[fib$w_did_num] = .new_nam[nam$w_did_num];
+	fib[fib$w_did_seq] = .new_nam[nam$w_did_seq];
+	fib[fib$w_did_rvn] = .new_nam[nam$w_did_rvn];
+!
+! Check to see that the enter request is for the same device.  If not,
+! signal an error.  This is done by comparing the DVI field of the RMS 
+! name blocks.
+!
+
+	IF CH$NEQ( .(nam[nam$t_dvi])<0,8>, nam[nam$t_dvi]+1,
+		   .(new_nam[nam$t_dvi])<0,8>, new_nam[nam$t_dvi]+1, 0)
+	THEN SIGNAL(set$_enterr,			! Error entering
+		    2,
+		    conf_desc,				! This file
+		    new_name,				! as this file
+		    RMS$_DEV)				! Not on same device
+	ELSE
+!
+! If /CONFIRM was set by the user, then interrogate him to see
+! if the file is to be entered in a directory.
+!
+    	IF
+	    BEGIN
+	    IF .setfile$flags[qual_confirm]
+	    THEN confirm_action($descriptor('enter a synonym for'),
+	    			conf_desc)
+	    ELSE true
+	    END
+	THEN
+	    BEGIN
+!
+! Issue the QIO
+!			
+
+	    status = $QIOW( CHAN = .channel,	! Enter the new name
+			    FUNC = IO$_CREATE,
+			    IOSB = iosb,
+			    P1 = desc,
+			    P2 = new_desc);
+	    IF .status THEN status = .iosb[0];
+	    IF NOT .status
+	    THEN SIGNAL(set$_enterr,		! Error enterring
+			2,
+			conf_desc,		! this file
+		    	new_name,		! as this file
+			.status)		! for this reason
+	    ELSE
+		IF .setfile$flags[qual_log]	! If /LOG, tell user
+		THEN SIGNAL(set$_entered,2,conf_desc,new_name);
+	    END;
+	END;					! End of /ENTER block
+    END;					! End of modify block
+!
+! Deassign the channel
+!
+IF NOT (status = $DASSGN(CHAN = .channel))
+THEN file_error(set$_closeerr,.status,.fab);		! If deassign failed, say so
+
+RETURN true;				! Continue processing other files
+END;
+
+ROUTINE get_file (callback) =
+!++
+!
+! This routine is called to get each file spec from the command line.
+! When there are no more files, a value of FALSE is returned.
+!
+!--
+BEGIN
+
+!
+! Check to see if there are any more file specs
+!
+IF NOT .file_desc[cli$v_concatinp]
+THEN RETURN false;
+
+!
+! Get the next file spec, and stuff it into the fab
+!
+(.callback)(file_desc,
+	    set$a_cliwork,
+	    setfile$flags);
+
+file_fab[fab$b_fns] = .file_desc[cli$w_rqsize];
+file_fab[fab$l_fna] = .file_desc[cli$a_rqaddr];
+
+RETURN true;
+END;
+
+GLOBAL ROUTINE file_error (status1,status2,fab) =
+!++
+!
+! This routine is called if an error occured while trying to access
+! a file.  The kind of error is signalled, along with the file name.
+!
+!--
+BEGIN
+
+MAP
+    fab : REF BBLOCK;			! Define the fab
+
+BIND
+    status = status2 : BBLOCK,
+    nam = .fab[fab$l_nam] : BBLOCK;	! Define the name block
+
+
+LOCAL
+    desc : VECTOR[2];			! A temporary descriptor
+
+!
+! Check to see if there's a name in the resultant string field.
+! If there is, use it.
+!
+IF .nam[nam$b_rsl] NEQ 0
+THEN
+    BEGIN
+    desc[0] = .nam[nam$b_rsl];
+    desc[1] = .nam[nam$l_rsa];
+    END
+
+!
+! If no resultant name, try the expanded name
+!
+ELSE IF .nam[nam$b_esl] NEQ 0
+THEN
+    BEGIN
+    desc[0] = .nam[nam$b_esl];
+    desc[1] = .nam[nam$l_esa];
+    END
+
+!
+! If no expanded name, use the original name in the fab
+!
+ELSE
+    BEGIN
+    desc[0] = .fab[fab$b_fns];
+    desc[1] = .fab[fab$l_fna];
+    END;
+
+!
+! Make sure the secondary error is not severe
+!
+IF .status[sts$v_severity] GTRU sts$k_error	! If severity too high,
+THEN status[sts$v_severity] = sts$k_error;	! Lessen it
+!
+! Signal the error
+!
+SIGNAL(.status1,			! Report error
+	1,				! One FAO argument
+	desc,				! Which is the file name
+	.status);			! Plus original error
+RETURN true;
+END;
+
+
+GLOBAL ROUTINE check_privilege : NOVALUE =
+!++
+! 
+! This routine checks that the image has the correct privilege.
+!
+!---
+BEGIN
+
+LOCAL
+    status,
+    oldpriv : BBLOCK[8];		! Permanent privileges go here
+
+OWN
+    newpriv : BBLOCK[8]			! Mask to disable SYSPRV
+    	      PRESET([prv$v_sysprv]=true);
+
+!
+! The image SET is installed with SYSPRV privilege, but we don't want the user 
+! to have that much power unless s/he already has it.  So, first check to 
+! see if the process has the privilege, and if not, then remove it for the
+! duration of this image.
+!
+IF NOT (status = $SETPRV(ENBFLG = 1,		! Enable
+    			 PRVADR = 0,		! No new privileges
+    			 PRMFLG = 1,		! Permanent privs
+    			 PRVPRV = oldpriv))	! Store current ones here
+THEN SIGNAL_STOP(.status);
+!
+! Check to see if privilege there.  If not, then remove it from current
+! privileges.
+!
+IF NOT .oldpriv[prv$v_sysprv]			! If SYSPRV not permanent
+THEN 
+    BEGIN
+    IF NOT (status = $SETPRV(ENBFLG = 0,	! Disable
+    			     PRVADR = newpriv,	! this privilege
+    			     PRMFLG = 0,	! for the duration of this image
+    			     PRVPRV = 0))
+    THEN SIGNAL_STOP(.status)
+    END;
+
+RETURN;
+END;
+
+GLOBAL ROUTINE handler(sigargs, mechargs) =
+!++
+!
+! This is the condition handler.  It is called anytime a SIGNAL
+! is invoked by SETFILE.  It simply remembers the most severe 
+! error for an exit status.
+!
+!--
+BEGIN
+
+MAP
+    sigargs : REF BBLOCK,
+    mechargs : REF BBLOCK;
+
+BIND
+    signame = sigargs [chf$l_sig_name] : BBLOCK;
+
+
+IF NOT .signame				! If this is an error
+    AND
+    ((.signame[sts$v_severity]		! and severity is worse than it was
+    GEQU .worst_error[sts$v_severity])
+    OR
+    .worst_error[sts$v_severity])	! or we haven't had any errors
+THEN worst_error = .signame;		! then remember it.
+
+RETURN ss$_resignal;			! Resignal to get the error printed
+END;
+
+GLOBAL ROUTINE search_error (fab) =
+!++
+!
+! This routine is called when lib$file_scan detects an error while
+! searching for a file specified in the command line.
+!
+!--
+BEGIN
+
+MAP
+    fab : REF BBLOCK;			! Define FAB format
+
+BIND
+    nam = .fab[fab$l_nam] : BBLOCK;	! Define NAM block
+
+LOCAL
+    desc : VECTOR[2];			! A temporary descriptor
+
+!
+! Check to see if there's a name in the resultant string field.
+! If there is, use it.
+!
+IF .nam[nam$b_rsl] NEQ 0
+THEN
+    BEGIN
+    desc[0] = .nam[nam$b_rsl];
+    desc[1] = .nam[nam$l_rsa];
+    END
+
+!
+! If no resultant name, try the expanded name
+!
+ELSE IF .nam[nam$b_esl] NEQ 0
+THEN
+    BEGIN
+    desc[0] = .nam[nam$b_esl];
+    desc[1] = .nam[nam$l_esa];
+    END
+
+!
+! If no expanded name, use the original name in the fab
+!
+ELSE
+    BEGIN
+    desc[0] = .fab[fab$b_fns];
+    desc[1] = .fab[fab$l_fna];
+    END;
+
+!
+! Signal the error
+!
+SIGNAL_STOP(set$_searchfail,
+	    1,				! One FAO argument
+	    desc,			! Which is the file name
+	    .fab[fab$l_sts],		! Show RMS error code
+	    .fab[fab$l_stv]);		! And secondary error code
+RETURN true;
+END;
+
+GLOBAL ROUTINE cli_error (cli_block,error) =
+!++
+!
+! This routine is called as an error handler for CLI errors.
+!
+! Inputs:
+!	cli_block = address of CLI request block
+!	error = CLI error message
+!
+! Outputs:
+!
+!	Expanded error message to user.
+!	CLI error is returned.
+!
+!--
+BEGIN
+
+MAP
+    cli_block : REF BBLOCK;			! Define CLI request block
+
+SIGNAL_STOP(.error);				! Signal the error
+
+RETURN .error;
+END;
+
+GLOBAL ROUTINE confirm_action (verb, object) =
+!++
+!
+! Functional description
+!
+!	This routine is called from the main loop whenever
+!	confirmation is requested.
+!
+! Input parameters
+!
+!	verb = address of descriptor describing action to be performed
+!	object = address of descriptor describing target of action
+!
+! Output parameters
+!
+!		TRUE	--> Action should be taken
+!		FALSE	--> Action should be cancelled
+!
+!--
+
+BEGIN
+
+LOCAL
+    fao_desc : BBLOCK[dsc$c_s_bln],	! FAO work area descriptor
+    reply_desc : BBLOCK[dsc$c_s_bln],	! Buffer desc. for reply
+    fao_buffer : VECTOR[512,BYTE],	! FAO work area
+    status : BLOCK[1],			! Status return
+    char : BYTE;			! Place to put a character
+
+!
+! Initialize FAO descriptor
+!
+CH$FILL(0,dsc$c_s_bln,fao_desc);
+fao_desc[dsc$w_length] = 512;			! FAO work area size
+fao_desc[dsc$a_pointer] = fao_buffer;		! FAO work area address
+
+!
+! Call SYS$FAO to expand message
+!
+IF NOT (status = SYS$FAO($descriptor('Do you want to !AS !AS ? (Y or N): '),
+    			 fao_desc[dsc$w_length],
+    			 fao_desc,
+    			 .verb,
+    			 .object))
+THEN
+    BEGIN
+    SIGNAL (.status);		! Tell the user
+    return (.status);		! Return to the caller
+    END;
+
+!
+! Now question user by calling LIB$GET_COMMAND using the result
+! of the FAO call as a prompt string
+!
+
+CH$FILL(0,dsc$c_s_bln,reply_desc);	! Initialize the reply descriptor
+reply_desc[dsc$b_class] = dsc$k_class_d;	! Make it dynamic
+reply_desc[dsc$b_dtype] = dsc$k_dtype_t;	! and ASCII
+
+IF NOT (status = LIB$GET_COMMAND (	! Call library routine with
+		reply_desc,		!  -reply buffer desc. addr.
+		fao_desc))		!  -prompt string desc. addr.
+THEN
+    BEGIN
+    IF (.status EQL rms$_eof)	! If this was end of file then
+    THEN status[sts$v_severity] =	!  make it a severe (i.e. non-
+	    sts$k_severe;		!  returnable) error
+    SIGNAL (.status);		! Tell the user
+    RETURN (.status);		! Return to the caller
+    END;
+
+
+!
+! Look at first character of the buffer and set the return 
+! status depending on its value
+!
+
+IF (.reply_desc[dsc$w_length] EQL 0)	! Did user hit <CR>?
+THEN RETURN false;			! Yes, return false
+
+char = ..reply_desc[dsc$a_pointer];	! Get first character
+
+IF (.char EQL 'Y' OR			! If user responded 'Y'
+    .char EQL 'y' OR			!    or 'y'
+    .char EQL 'T' OR			!    or 'T' (TRUE)
+    .char EQL 't')			!    or 't'
+THEN RETURN true			! Return 'TAKE ACTION'
+ELSE RETURN false;			! Return 'CANCEL ACTION'
+
+END;
+
+END
+ELUDOM

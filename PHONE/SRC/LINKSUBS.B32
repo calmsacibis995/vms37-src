@@ -1,0 +1,887 @@
+%title 'LINKSUBS - Phone Link Subroutines'
+	module linksubs (
+			ident='V03-001') = begin
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! Facility:	VAX/VMS Telephone Facility, Phone Link Subroutines
+!
+! Abstract:	This module contains the subroutines necessary to support
+!		the establishment and use of phone links, both local
+!		and remote.
+!
+!
+! Environment:
+!
+! Author: Paul C. Anagnostopoulos, Creation Date: 17 November 1980
+!
+! Modified By:
+!
+!	V03-001	PCA0041		Paul Anagnostopoulos	26-Mar-1982
+!		Major changes to convert from process name to user name.
+!--
+
+%sbttl 'Module Declarations'
+!
+! Libraries and Requires:
+!
+
+library 'sys$library:starlet.l32';
+require 'phonereq';
+
+!
+! Table of Contents:
+!
+
+forward routine
+	phn$mbx_enable: novalue,
+	phn$estab_link,
+	phn$mbx_name: novalue,
+	phn$break_link: novalue,
+	phn$break_call: novalue,
+	phn$send_smb: novalue,
+	phn$force_links: novalue,
+	phn$forced_link: novalue;
+
+!
+! External References:
+!
+
+external routine
+	phn$term_characteristic,
+	phn$cmp_target,
+	phn$fresh_screen,
+	phn$inform,
+	phn$kill_pub,
+	phn$make_pub,
+	phn$make_tsb,
+	phn$queue_smb,
+	phn$read_slave,
+	str$upcase: addressing_mode(general);
+
+!
+! Own Variables:
+!
+
+%sbttl 'PHN$MBX_ENABLE - Enable Mailbox ASTs'
+!++
+! Functional Description:
+!	This routine is called to enable an AST for our receive mailbox.
+!	This allows us to be notified when some other process puts a
+!	steering message into our mailbox.  The AST itself just creates
+!	a standard steering message block from the message.  The message
+!	has the following three parts:
+!
+!		1.	The 1-byte message type code.
+!
+!		2.	The complete node/user name string of the sender,
+!			followed by an eofrom character.
+!
+!		3.	Any additional message text, if required.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$mbx_enable: novalue = begin
+
+own
+	mbx_iosb: block[8,byte],
+	mbx_buf: vector[phn$k_mbxsize,byte];
+
+local
+	status: long,
+	op: ref pub;			! Pointer to our PUB.
+
+
+! This internal routine is the AST handler.  We have to build a standard
+! steering message block from the mailbox data.
+
+routine mbx_ast: novalue = begin
+
+local
+	status: long,
+	mbx_buf_dsc: descriptor;
+
+! First we have to check the IOSB from the mailbox read.
+
+check (.mbx_iosb[0,0,16,0]);
+
+! Now we build a descriptor for the message text portion of the steering
+! message.  We can then queue an SMB with the message type and text.
+
+mbx_buf_dsc[len] = .mbx_iosb[2,0,16,0] - 1;
+mbx_buf_dsc[ptr] = mbx_buf[1];
+phn$queue_smb(.mbx_buf[0],mbx_buf_dsc);
+
+! Finally, we have to enable another read from our mailbox.
+
+phn$mbx_enable();
+return;
+
+end;
+
+! To actually enable a read from our mailbox, we just do the appropriate
+! mailbox $qio.
+
+op = .phn$gq_pubhead[0];
+status = $qio(efn=phn$k_ourmbxefn,
+	      chan=.op[pub_w_channel],
+	      func=io$_readvblk,
+	      iosb=mbx_iosb,
+	      astadr=mbx_ast,
+	      p1=mbx_buf,
+	      p2=phn$k_mbxsize);
+check (.status);
+return;
+
+end;
+
+%sbttl 'PHN$ESTAB_LINK - Establish a Link'
+!++
+! Functional Description:
+!	This routine is called to establish a link between us and some other
+!	place in the world.  There are four possible cases:
+!		1.	A link between us and ourselves.
+!		2.	A link between us and some other local user.
+!		3.	A link between us and a remote node (for information).
+!		4.	A link between us and some other remote user.
+!
+! Formal Parameters:
+!	target_spec	Address of descriptor of complete node/user name spec
+!			of the target.
+!	pub_address	Address of longword in which to return address of PUB
+!			describing established link.  The PUB is marked 
+!			temporary.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	phn$_badspec	Target spec syntax was invalid.
+!	phn$_cantreach	Cannot reach the target right now.
+!	phn$_needuser	Tried to establish link to home node w/o user name
+!	phn$_nopriv	Do not have the necessary privileges.
+!	phn$_noproc	No process owned by the user is available.
+!	phn$_remoteerror Some sort of error during remote I/O.
+!	phn$_targterm	None of the user's terminals are usable by PHONE.
+!	DECnet status	Problem with remote link.
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$estab_link(target_spec,pub_address) = begin
+
+bind
+	target_spec_dsc = .target_spec: descriptor;
+
+own
+	own_described_buffer(user_name,12),
+	parent_pid: long,
+	own_described_buffer(term_number,7);
+bind
+	get_proc = uplit(word(12),word(jpi$_username),
+			 long(user_name+8),
+			 long(user_name),
+			 word(4),word(jpi$_owner),
+			 long(parent_pid),
+			 long(0),
+			 word(7),word(jpi$_terminal),
+			 long(term_number+8),
+			 long(term_number),
+			 long(0));
+
+local
+	status: long,
+	tp: ref pub,			! Pointer to new target PUB.
+	op: ref pub,			! Pointer to our PUB.
+	wild_pid: long,
+	potential: long, usable: long,
+	iosb: block[8,byte];
+
+
+! We begin by making a PUB for this link.  If we can't, just return a status.
+
+status = phn$make_pub(.target_spec,.pub_address);
+if .status eqlu phn$_badspec then
+	return phn$_badspec;
+check (.status);
+tp = ..pub_address;
+
+! Now we split up depending upon whether it is a local or remote link.
+
+begin
+bind
+	target_tsb = tp[pub_b_tsb]: tsb,
+	target_name = target_tsb[tsb_q_tkndsc,.target_tsb[tsb_w_tkncount]]: descriptor;
+
+if not .target_tsb[tsb_v_remote] then (
+
+	! We have a local link.  Make sure a user name was specified
+	! in the spec.  We can't make a link just to our own node.
+
+	if not .target_tsb[tsb_v_user] then (
+		phn$kill_pub(.tp);
+		return phn$_needuser;
+	);
+
+	! Now we split up depending upon whether we are linking to ourselves
+	! or another local user.
+
+	op = .phn$gq_pubhead[0];
+	if phn$cmp_target(tp[pub_b_tsb],op[pub_b_tsb]) then
+
+		! We are linking to ourselves.  Just get the channel from
+		! our PUB and fill it into the new PUB.  If there isn't one
+		! we didn't have sufficient privilege.
+
+		if .op[pub_w_channel] nequ 0 then (
+			tp[pub_w_channel] = .op[pub_w_channel];
+			return phn$_ok;
+		) else (
+			phn$kill_pub(.tp);
+			return phn$_nopriv;
+		);
+
+	! We are linking to another local user.  We must determine if
+	! anyone who is logged in fits the bill.
+
+	potential = usable = 0;
+	wild_pid = -1;
+	loop (
+
+		! Get information on the next process.  If there aren't
+		! any more, then we're done.
+
+		status = $getjpi(efn=phn$k_getjpiefn,
+				 pidadr=wild_pid,
+				 itmlst=get_proc);
+
+	exitif (.status eqlu ss$_nomoreproc);
+
+		! If we got a process, then determine if it is a detached
+		! interactive process owned by the target.
+
+		if .status eqlu ss$_normal then (
+			status = $waitfr(efn=phn$k_getjpiefn);
+			check (.status);
+
+			if ch$eql(.target_name[len],.target_name[ptr], .user_name[len],.user_name[ptr],' ') and
+			   .parent_pid eqlu 0 and
+			   .term_number[len] nequ 0 then (
+
+				! We got a potential candidate.  Make sure that
+				! their terminal is usable by PHONE.
+
+				inc (potential);
+				if phn$term_characteristic(term_number,tt$m_scope) then
+					inc (usable);
+			);
+		);
+	);
+
+	! If there are no potential processes, or there are but no usable
+	! terminals, then return an appropriate status and flush the link.
+
+	if .potential eqlu 0 then (
+		phn$kill_pub(.tp);
+		return phn$_noproc;
+	);
+	if .usable eqlu 0 then (
+		phn$kill_pub(.tp);
+		return phn$_targterm;
+	);
+
+	! Now we must create a receive mailbox for the target.  We begin by
+	! building a name for the mailbox and trying to assign to it, in
+	! case someone else has already created it.
+
+	begin
+	local
+		local_described_buffer(mbx_name,4+16);
+
+	phn$mbx_name(target_name,mbx_name);
+	status = $assign(devnam=mbx_name,
+			 chan=tp[pub_w_channel]);
+	if .status nequ ss$_ivdevnam then (
+		check (.status);
+		return phn$_ok;
+	);
+
+	! Nope, mailbox doesn't already exist.  Create a permanent one with
+	! the name and mark it for deletion so we don't leave crud around.
+
+	status = $crembx(prmflg=1,
+			 chan=tp[pub_w_channel],
+			 maxmsg=phn$k_mbxsize,
+			 lognam=mbx_name);
+	if .status eqlu ss$_nopriv then (
+		phn$kill_pub(.tp);
+		return phn$_nopriv;
+	);
+	check (.status);
+	status = $delmbx(chan=.tp[pub_w_channel]);
+	check (.status);
+	return phn$_ok;
+
+	end;
+);
+
+! We are to establish a link to a remote node or user.  This requires
+! us to make a logical link to the remote node.  The so-called task specifier
+! is built as follows:
+! 	normal case:	node::"phone="
+!	debugging:	{whatever is in PHN$SLAVE_TASK_SPECIFIER}
+
+phn$inform(phn$_decnetlink);
+
+begin
+bind
+	home_node_dsc = target_tsb[tsb_q_tkndsc,
+				   .target_tsb[tsb_w_tkncount]-1]: descriptor;
+local
+	local_described_buffer(specifier_buf,52);
+
+status = $trnlog(lognam=describe('PHN$SLAVE_TASK_SPECIFIER'),
+		 rsllen=specifier_buf,
+		 rslbuf=specifier_buf,
+		 dsbmsk=%b'011');
+if .status nequ ss$_normal then (
+	ch$copy(.home_node_dsc[len],.home_node_dsc[ptr],
+		8,uplit byte('"phone="'), ' ',52,.specifier_buf[ptr]);
+	specifier_buf[len] = .home_node_dsc[len] + 8;
+);
+
+! Now we can actually create the logical link to the remote node.  This is
+! done "by hand", speaking directly to the ACP, so that the user can
+! CTRL/Y in case of timeouts.  If we can't make the link, return the reason.
+
+status = $assign(devnam=describe('_NET:'),
+		 chan=tp[pub_w_channel]);
+if .status then (
+	status = $qiow(efn=phn$k_decnetefn,
+		       func=io$_access,
+		       chan=.tp[pub_w_channel],
+		       iosb=iosb,
+		       p2=specifier_buf);
+	if .status then
+		status = .iosb[0,0,16,0];
+);
+if not .status then (
+	phn$kill_pub(.tp);
+	return .status;
+);
+end;
+
+! Now we have to do some more work if it's a link to a remote user.
+
+if .target_tsb[tsb_v_user] then (
+
+	! Now we send a special steering message to the network slave,
+	! asking it to verify the existence of the target user.
+	! It will send us back a status from that verification.
+
+	local
+		local_described_buffer(verify_status,4);
+
+	phn$send_smb(.tp,smb__slave_verify,target_tsb[tsb_q_tkndsc,0]);
+	status = phn$read_slave(.tp[pub_w_channel],verify_status,true);
+	if .status nequ phn$_ok then (
+		phn$break_link(.tp,smb__slave_done);
+		return .status;
+	);
+	if ..verify_status[ptr] nequ phn$_ok then (
+		phn$break_link(.tp,smb__slave_done);
+		return ..verify_status[ptr];
+	);
+
+);
+
+phn$inform(0);
+return phn$_ok;
+end;
+
+end;
+
+%sbttl 'PHN$MBX_NAME - Build Mailbox Name'
+!++
+! Functional Description:
+!	This routine is called to build a mialbox name for use in creating
+!	a communication link mailbox.  The name consists of a user
+!	name prefixed with "PHN$".
+!
+! Formal Parameters:
+!	user_name	Address of descriptor of user name.
+!	name_buf	A descriptor for buffer to hold mailbox name.
+!			We set the length.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$mbx_name(user_name,name_buf): novalue = begin
+
+bind
+	user_name_dsc = .user_name: descriptor,
+	name_buf_dsc = .name_buf: descriptor;
+
+bind
+	name_table = ch$transtable(
+			rep 36 of ('_'),
+			'$',
+			rep 11 of ('_'),
+			'0','1','2','3','4','5','6','7','8','9',
+			rep 7 of ('_'),
+			'A','B','C','D','E','F','G','H','I','J','K','L','M',
+			'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
+			rep 6 of ('_'),
+			'A','B','C','D','E','F','G','H','I','J','K','L','M',
+			'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
+			rep 5 of ('_'));
+
+
+! To build the mailbox name, we concatenate the prefix and the user name.
+! Then we run it through the translation table, converting any illegal
+! characters to underscores.
+
+ch$copy(4,uplit byte('PHN$'), .user_name_dsc[len],.user_name_dsc[ptr],
+	' ',.name_buf_dsc[len],.name_buf_dsc[ptr]);
+name_buf_dsc[len] = 4 + .user_name_dsc[len];
+
+ch$translate(name_table,.name_buf_dsc[len],.name_buf_dsc[ptr],' ',
+			.name_buf_dsc[len],.name_buf_dsc[ptr]);
+return;
+
+end;
+
+%sbttl 'PHN$BREAK_LINK - Break a Link'
+!++
+! Functional Description:
+!	This routine is called to break a link between us and some other
+!	person or node.
+!
+! Formal Parameters:
+!	target_pub	The address of the PUB describing the link.
+!	smb_type	The type code of the steering message to be sent
+!			as a reason for breaking the link.
+!	smb_msg		An optional message text for the steering message.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$break_link(target_pub,smb_type,smb_msg): novalue = begin
+
+bind
+	tp = .target_pub: pub,
+	target_tsb = tp[pub_b_tsb]: tsb;
+
+local
+	status: long;
+
+builtin
+	argptr;
+
+
+! First we send a message with the reason for breaking the link.
+
+callg(argptr(),phn$send_smb);
+
+! If this is a remote link, we have to send the slave a special steering
+! message to tell it to go away.  If this message wasn't sent above, then
+! do it now.  Then we can clear away the network logical link.
+
+if .target_tsb[tsb_v_remote] then (
+	if .smb_type nequ smb__slave_done then
+		phn$send_smb(tp,smb__slave_done);
+	status = $dassgn(chan=.tp[pub_w_channel]);
+	check (.status);
+);
+
+! Finally we can kill the PUB representing the link we have broken.
+
+phn$kill_pub(tp);
+return;
+
+end;
+
+%sbttl 'PHN$BREAK_CALL - Break Link to Person We Are Calling'
+!++
+! Functional Description:
+!	This routine is called to break the link to someone we are
+!	currently trying to call.  It was made a seperate routine because
+!	it is done in a lot of places.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$break_call: novalue = begin
+
+local
+	op: ref pub;			! Pointer to our PUB.
+
+
+! We have to clear the calling flag and busylink in our PUB because we
+! will no longer be calling the person.  PHN$BREAK_LINK is then called to
+! do its usual link-breaking stuff.  Finally, we better cancel any outstanding
+! timer requests, in case there is one waiting to ring the person's phone.
+
+op = .phn$gq_pubhead[0];
+op[pub_v_calling] = false;
+phn$break_link(.op[pub_l_busylink],smb__hungup);
+op[pub_l_busylink] = 0;
+$cantim();
+return;
+
+end;
+
+%sbttl 'PHN$SEND_SMB - Send Steering Message'
+!++
+! Functional Description:
+!	This routine is called to send a steering message to another person
+!	or node represented by a PUB.  The message that is sent consists of
+!	up to three parts, as follows:
+!
+!		1.	The 1-byte steering message code.
+!
+!		2.	Our own node string, representing the sender of
+!			the message, followed by an eofrom character.
+!
+!		3.	The optional message text.
+!
+! Formal Parameters:
+!	target_pub	Address of the PUB representing the destination.
+!	smb_type	The steering message type code.
+!	smb_msg		Address of descriptor of optional message text.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$send_smb(target_pub,smb_type,smb_msg): novalue = begin
+
+bind
+	tp = .target_pub: pub,
+	target_tsb = tp[pub_b_tsb]: tsb,
+	smb_msg_dsc = .smb_msg: descriptor;
+
+local
+	status: long,
+	op: ref pub,				! Pointer to our PUB.
+	msg_buf: vector[phn$k_mbxsize,byte],
+	buf_i: long,
+	iosb: block[8,byte];
+
+builtin
+	nullparameter;
+
+
+! First we have to build the message that we are going to send.  Begin
+! with the message type code.
+
+buf_i = 0;
+
+msg_buf[.buf_i] = .smb_type<0,8,0>;
+inc (buf_i);
+
+! Now include our spec, representing the sender of the message.
+
+op = .phn$gq_pubhead[0];
+begin
+bind
+	our_tsb = op[pub_b_tsb]: tsb,
+	our_spec_dsc = our_tsb[tsb_q_tkndsc,0]: descriptor;
+
+ch$move(.our_spec_dsc[len],.our_spec_dsc[ptr],msg_buf[.buf_i]);
+buf_i = .buf_i + .our_spec_dsc[len];
+msg_buf[.buf_i] = eofrom;
+inc (buf_i);
+end;
+
+! Finally, if there is optional message text, we have to move it into
+! the buffer.  Make sure we don't go off the end of the buffer.
+
+if not nullparameter(3) then (
+	local
+		length: long;
+
+	length = minu(.smb_msg_dsc[len],phn$k_mbxsize-.buf_i);
+	ch$move(.length,.smb_msg_dsc[ptr],msg_buf[.buf_i]);
+	buf_i = .buf_i + .length;
+);
+
+! Now we split up depending upon whether it's a local or remote message.
+! If it's local, we can just send the message to the user's receive
+! mailbox.  If we get an error doing so, tell the user.
+
+if not .target_tsb[tsb_v_remote] then (
+	status = $qiow(chan=.tp[pub_w_channel],
+		       func=io$_writevblk + io$m_now,
+		       iosb=iosb,
+		       p1=msg_buf,
+		       p2=.buf_i);
+	if .status nequ ss$_normal or .iosb[0,0,16,0] nequ ss$_normal then
+		phn$inform(phn$_linkerror,target_tsb[tsb_q_tkndsc,0]);
+) else (
+
+	! It is a remote send.  All we have to do is send the message over the
+	! logical link.  If we get an error, tell the user.
+
+	status = $qiow(efn=phn$k_decnetefn,
+		       chan=.tp[pub_w_channel],
+		       func=io$_writevblk,
+		       iosb=iosb,
+		       p1=msg_buf,
+		       p2=.buf_i);
+	if .status nequ ss$_normal or .iosb[0,0,16,0] nequ ss$_normal then
+		phn$inform(phn$_linkerror,target_tsb[tsb_q_tkndsc,0]);
+);
+
+return;
+
+end;
+
+%sbttl 'PHN$FORCE_LINKS - Force Links to New Person'
+!++
+! Functional Description:
+!	This routine is called when a new person enters the conversation
+!	as a result of answering our call.  We need to inform everyone
+!	else in the conversation about the new person, and also inform
+!	the new person about them.  This routine is the principle vehicle
+!	for setting up conference calls.
+!
+! Formal Parameters:
+!	new_pub		Address of new person's PUB.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$force_links(new_pub): novalue = begin
+
+bind
+	np = .new_pub: pub,
+	new_tsb = np[pub_b_tsb]: tsb;
+
+local
+	p: ref pub;
+
+
+! We scan the PUB chain (but not our own), looking for people in the
+! current conversation.  Make sure not to find the new person's PUB.
+
+p = ..phn$gq_pubhead[0];
+until .p eqla phn$gq_pubhead do (
+	if not .p[pub_v_temporary] and
+	   not .p[pub_v_uhaveheld] and
+	   (.p neqa np)			then (
+
+		! We found a PUB.  Tell this person about the new guy.
+		! Tell the new guy about this person.
+
+		bind
+			person_tsb = p[pub_b_tsb]: tsb;
+
+		phn$send_smb(.p,smb__forced_link,new_tsb   [tsb_q_tkndsc,0]);
+		phn$send_smb(np,smb__forced_link,person_tsb[tsb_q_tkndsc,0]);
+	);
+
+	p = .p[pub_l_flink];
+);
+
+return;
+			
+end;
+
+%sbttl 'PHN$FORCED_LINK - Handle Forced Link Message'
+!++
+! Functional Description:
+!	This steering message routine handles the forced_link message,
+!	which someone sends us when they want to force us to establish
+!	a link to a third party.  This is done by the person responsible
+!	for setting up a conference call.
+!
+! Formal Parameters:
+!	from_msg	The address of a descriptor of the message.  It
+!			consists, as usual, of the sender's node/user name
+!			spec followed by an eofrom character.  Following this
+!			is the node/user name spec of the person we are being
+!			forced to link to.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$forced_link(from_msg): novalue = begin
+
+bind
+	from_msg_dsc = .from_msg: descriptor;
+
+local
+	status: long,
+	third_party_dsc: descriptor,
+	sender_tsb: tsb,
+	third_party_tsb: tsb,
+	tp: ref pub,				! Pointer to third party's PUB.
+	p: ref pub;
+
+
+! We begin by rebuilding the from_msg descriptor so that it only describes
+! the sender's spec.  We build a new descriptor, third_party_dsc, to describe
+! the spec of the third party.
+
+third_party_dsc[ptr] = ch$find_ch(.from_msg_dsc[len],.from_msg_dsc[ptr],
+				  eofrom) + 1;
+third_party_dsc[len] = .from_msg_dsc[len] - (.third_party_dsc[ptr] - 
+					     .from_msg_dsc[ptr]);
+from_msg_dsc[len] = .from_msg_dsc[len] - .third_party_dsc[len] - 1;
+
+! Now we make TSBs for both the sender and the third party, because we need
+! to parse both of their specs.
+
+status = phn$make_tsb(from_msg_dsc,sender_tsb);
+check (.status);
+status = phn$make_tsb(third_party_dsc,third_party_tsb);
+check (.status);
+
+! Now we have to scan the PUB chain and make sure that we do not already
+! have a link to the third party.  If so, just ignore the message.
+
+p = .phn$gq_pubhead[0];
+until .p eqla phn$gq_pubhead do (
+	if phn$cmp_target(p[pub_b_tsb],third_party_tsb) then
+		return;
+	p = .p[pub_l_flink];
+);
+
+! Now we establish a link to the third party.  We have to remember to
+! make their PUB permanent, and to assign them a viewport.  If anything
+! prevents this, just bag the link.
+
+status = phn$estab_link(third_party_tsb[tsb_q_tkndsc,0],tp);
+if .status nequ phn$_ok then
+	return;
+tp[pub_v_temporary] = false;
+status = phn$fresh_screen(false);
+if .status nequ phn$_ok then (
+	phn$break_link(.tp,smb__hungup);
+	return;
+);
+
+! Finally, inform the user about the third party, including the sender's
+! name and the third party's name.
+
+phn$inform(phn$_confcall,
+		sender_tsb[tsb_q_tkndsc,.sender_tsb     [tsb_w_tkncount]],
+	   third_party_tsb[tsb_q_tkndsc,.third_party_tsb[tsb_w_tkncount]]);
+return;
+
+end;
+
+end eludom

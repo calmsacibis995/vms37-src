@@ -1,0 +1,4100 @@
+	.TITLE UETMA7800 VAX/VMS UETP DEVICE TEST FOR MA780
+	.IDENT	'V03-004'
+	.ENABLE SUPPRESSION
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY:
+;	This module will be distributed with VAX/VMS under the [SYSTEST]
+;	account.
+;
+; ABSTRACT:
+;	This program tests shared memory unit(s) (MA780) connected to one or
+;	more VAX processors.  Should any other processors be running the same
+;	test concurrently, the program takes advantage of that to use the
+;	shared memory to communicate between them.  IT IS NOT THE INTENTION OF
+;	THIS PROGRAM TO BE SELF DOCUMENTING, ALTHOUGH CONSIDERABLE EFFORT HAS
+;	BEEN MADE TO PROVIDE USEFUL COMMENTS.  FOR AN EXPLANATION OF why THINGS
+;	ARE DONE THE WAY THAT THEY ARE AND HOW VARIOUS DATA STRUCTURES AND
+;	CODE INTERACT, PLEASE READ THE FUNCTIONAL SPEC.
+;
+; ENVIRONMENT:
+; 	This program will run in user access mode with the exception of two
+;	routines which run in kernal mode.  The first routine finds memory
+;	parameters associated with a given shared memory and the second returns
+;	the operating system version and hardware ECO levels.  ASTs are
+;	enabled except during error processing.  This program requires the
+;	following privileges and quotas:
+;		CMKRNL (to read shared memory parameters)
+;		SHMEM
+;		SYSGBL
+;		PRMGBL
+;		PSWAPM (during debugging only; gets around ucode bug in REMQTI)
+;	This module has one conditional assembly, FT_NO_INTERACT, which is
+;	described where it is defined (or left undefined).
+;
+;--
+;
+; AUTHOR: Richard N. Holstein,	CREATION DATE: August, 1981
+;
+; MODIFIED BY:
+;
+;	V03-004	LDJ0004		Larry D. Jones,		15-Apr-1982
+;		Turn off interprocessor interaction - include definition of
+;		FT_NO_INTERACT.
+;
+;	V03-003	RNH0003		Richard N. Holstein,	29-Mar-1982
+;		Turn on interprocessor interaction - remove definition of
+;		FT_NO_INTERACT.
+;
+;	V03-002	RNH0002		Richard N. Holstein,	05-Feb-1982
+;		Don't let RCVMB_AST blithely continue if it sees a mailbox
+;		before we're ready for one.  Don't $CMKRNL to do a $SETPRV,
+;		SYSTEST now has SETPRV privilege.
+;
+;	V03-001	RNH0001		Richard N. Holstein,	28-Aug-1981
+;		Final development for Edition A, Field Test 1.
+;
+;**
+
+	.SBTTL	Declarations
+;
+; INCLUDE FILES:
+;
+;	SYS$LIBRARY:LIB.MLB	for general definitions
+;	SHRLIB$:UETP.MLB	for UETP definitions
+
+;
+; MACROS:
+;
+	$ADPDEF				; Adapter control block
+	$CHFDEF				; Condition handler frame definitions
+	$DEVDEF				; Device definitions
+	$DIBDEF				; Device Information Block
+	$FABDEF				; File Access Block
+	$MPMDEF				; Multiport memory adapter reg. offsets
+	$PRDEF				; Internal processor registers
+	$PRVDEF				; Privileges
+	$RABDEF				; Record Access Block
+	$SFDEF				; Stack frame fixed fields
+	$SHBDEF				; Shared memory control block
+	$SHDDEF				; Shared memory datapage
+	$SHRDEF				; Shared messages
+	$STSDEF				; Status return
+	$UETUNTDEF			; UETP unit block offset definitions
+	$UETPDEF			; UETP
+
+.MACRO	MAILBOX_MSG_TYPES		; Define interprocessor mailbox codes
+	X	HELLO,5			; Announce me to another processor
+	X	ICU_UCME,5		; I see you, do you see me?
+	X	BYEFORNOW		; We see each other
+	X	BADCODE			; You need glasses to see me
+	X	DOSET,3			; Please set a common event flag
+	X	ISSET			; I set the requested common event flag
+	X	DOCLEAR,3		; Please clear a common event flag
+	X	ISCLEAR			; I cleared the requested CEF
+	X	INTERLOCK		; Start memory interlock test
+	X	ME2ME,1			; I'm trying to talk to myself
+	X	ME2MEDONE		; I can talk to myself
+	X	ILOSTU			; I think you went away
+	X	BYEBYE			; I've gone away, this is my last action
+.ENDM	MAILBOX_MSG_TYPES
+
+;
+; EQUATED SYMBOLS:
+;
+;   Facility number definitions:
+	UETP_K = 116
+	RMS_K = 1
+
+;   SHR message definitions:
+	UETP = UETP_K@STS$V_FAC_NO	; Define the UETP facility code
+;
+	UETP$_ABENDD = UETP!SHR$_ABENDD	; Define the UETP message codes
+	UETP$_BEGIND = UETP!SHR$_BEGIND
+	UETP$_ENDEDD = UETP!SHR$_ENDEDD
+	UETP$_OPENIN = UETP!SHR$_OPENIN
+	UETP$_TEXT   = UETP!SHR$_TEXT
+
+;   Internal flag bits...:
+	TEST_OVERV   = 1		; Set when test is over
+	SAFE_TO_UPDV = 2		; Set when it's safe to update UETINIDEV
+	BEGIN_MSGV   = 3		; Set when "begin" msg has been output
+	ONE_SHOTV    = 4		; Set if running in one shot mode
+;   ...and corresponding masks:
+	TEST_OVERM   = 1@TEST_OVERV
+	SAFE_TO_UPDM = 1@SAFE_TO_UPDV
+	BEGIN_MSGM   = 1@BEGIN_MSGV	
+	ONE_SHOTM    = 1@ONE_SHOTV
+
+;   Miscellany:
+	LC_BITM       = ^X20		; Mask to convert lower case to upper
+	REC_SIZE      = 20		; UETINIDEV.DAT record size
+	TEXT_BUFFER   = 200		; Internal text buffer size
+	EFN2          = 4		; EFN used for three minute timer
+	MAX_PROC_NAME = 15		; Longest possible process name
+	MAX_DEV_DESIG = 8		; Longest possible controller name
+	MAX_UNIT_DESIG= 5		; Longest possible unit number
+;
+; To make life simpler should we ever wish to disable interprocessor use of
+; the same global section and common event flag (i.e., prevent interprocessor
+; interaction), we always will include the port number by which the shared
+; memory sees our processor in the names of those interprocessor objects.
+; That is, the .ASCII string which is their name will have a digit at the
+; end which will make it unique across all processors and all memories.
+; However, the "length" of the .ASCII string will be set by the FT_NO_INTERACT
+; assembly switch.  If the switch is defined, include that last digit and
+; prevent interaction.  If it's not defined, don't count the last digit and
+; create names which will allow objects to be shared by different processors.
+;
+	FT_NO_INTERACT= 0		; If defined, assemble code which...
+					; ...blocks interprocessor testing...
+					; ...by creating unique GS and CEF
+.IF NDF FT_NO_INTERACT			; Preventing interprocessor knowledge?
+	OTHER_CHARS   = 2		; No, GS and CEF names are short
+.IFF
+	OTHER_CHARS   = 3		; Yes, names include MPM port number
+.ENDC	; FT_NO_INTERACT
+
+;    Multiport memory specific definitions:
+	PROCESSOR_MAX   = 4		; Max of processors connected to memory
+	COMGS_VERSION   = 12345		; GS version for consistency (16 bits)
+	CONSIS_CHECK    = COMGS_VERSION@16!PROCESSOR_MAX
+	COMGS_NAME_LEN  = 15+1		; Space in interprocessor GS for ASCIC name
+	COMGS_QUEUE_MAX = 100		; Queue entries in interlock tests
+.IIF GE COMGS_QUEUE_MAX-65536, .ERROR 0 ; COMGS_QUEUE_MAX must fit into word
+	COMGS_PVT_AREA  = 512		; Size of each processor's private area
+	COMGS_PVT_CODE  = COMGS_PVT_AREA-8 ; Space at end reserved for "mycode"
+	ADAWI_LIMIT	= 200000	; How high ADAWI interlock test counts
+	QUEUE_LIMIT	= 200		; How many times queues are emptied and filled
+	INTERLOCK_LIMIT = 6		; How many seconds we'll stall until...
+					; ...all processors have finished...
+					; ...the interlock test
+	;COMGS_SIZE	= <GS_K_END+511>/512 ; Size of interprocessor GS, blocks
+					     ; (defined after GS_K_END defined)
+	WRITE_SIZE      = 8192		; Single processor GS size in bytes
+	SPRGS_SIZE      = <WRITE_SIZE+511>/512 ; Single processor GS size, blocks
+	COMGS_EFN	= 62		; Flag whilst $UPDSEC interprocessor GS
+	SPRGS_EFN	= 63		; Flag to indicate that $UPDSEC of...
+					; ...the single proc GS is !NOT!...
+					; ...in progress.  This must be...
+					; ...set constantly except during...
+					; ...$UPDSEC to ensure that we don't...
+					; ...hang in CLEANUP.  It must also...
+					; ...be in a local cluster
+	SPREF_EFN       = 64		; Bit 0 of single processor CEF cluster
+	COMEF_EFN       = 96		; Bit 0 of interprocessor CEF cluster
+
+;
+; Exactly one of the mailbox message codes must be in each mailbox sent for
+; interprocessor communication.  Codes are defined sequentially via the mailbox
+; message macro, starting with 1, so that one may neatly dispatch in the
+; mailbox receipt routine and catch some errors if one gets a bogus mailbox.
+; Associated with some mailbox types are timeouts.  For those where they exist,
+; define a number of seconds equal to that timeout.
+;
+.MACRO	X	MBCODE,SECONDS		; Define mailbox type codes and timeouts
+	MSG_'MBCODE = XX
+	MAX_MSG_TYPE = XX-1		; Limiting value for CASE instructions
+	XX = XX+1
+	.IF NB SECONDS
+		MBCODE'_TIMEOUT = SECONDS * -10000000
+	.ENDC	; NB SECONDS
+.ENDM	X
+	XX = 1
+	MAILBOX_MSG_TYPES		; Define mailbox type codes and timeouts
+
+;
+; For each memory, there will be a data structure set up, called a node.
+; These nodes will be linked together in a self-relative queue whose header is
+; UNIT_LIST.  The first part of each node will be the standard definition from
+; $UETUNTDEF.  Following that will come the device test dependent stuff,
+; defined below.  NOTE THAT THIS DEFINITION IS DONE WITH AN ABSOLUTE PSECT.
+; This means that what look like declarations are really definitions and the
+; labels are really just offsets into a given node on the queue.  (A not
+; necessarily obvious consequence of using an ABS PSECT is that space must be
+; reserved with .BLKx operations, since .BYTE, etc., attempt to store data.
+;
+	.PSECT	DEVDEP_STR_DEF,ABS,NOEXE,NOWRT,PAGE ; Note ABS attribute!
+
+	.BLKB	UETUNT$C_DEVDEP		; Skip over standard UETUNT block
+
+MA_Q_DAYTIME:				; Code used to ensure interprocessor...
+	.BLKQ	1			; ...communication
+
+MA_B_MYPORT:				; My port number on this memory
+	.BLKB	1			; Since BB%%I needs a longword, allow...
+	.BLKB	3			; ...filler to save much code later on
+
+; The following all denote error conditions and may be accessed as a single
+; block; hence there is a reliance on their being contiguous.  There is no
+; restriction on their ordering.
+MA_L_ERRBLK:				; Start of contiguous area
+
+MA_L_SILOSTU:				; Bit mask. Bit lit if memory port...
+	.BLKL	1			; ...was sent an ILOSTU mailbox
+
+MA_L_RILOSTU:				; Bit mask. Bit lit if memory port...
+	.BLKL	1			; ...sent me an ILOSTU mailbox
+
+MA_L_RBADCODE:				; Bit mask. Bit lit if memory port...
+	.BLKL	1			; ...sent me a BADCODE mailbox
+
+MA_L_SBADCODE:				; Bit mask. Bit lit if memory port...
+	.BLKL	1			; ...was sent a BADCODE mailbox
+
+MA_L_DOSETFAIL:				; Bit mask. Bit lit if memory port...
+	.BLKL	1			; ...failed to set requested bit
+
+MA_L_DOCLEARFAIL:			; Bit mask. Bit lit if memory port...
+	.BLKL	1			; ...failed to clear requested bit
+
+MA_L_NOCAUSE:				; Bit mask. Bit lit if memory port...
+	.BLKL	1			; ...sent me a mailbox for no cause
+
+MA_L_OLDSTUFF:				; Bit mask. Bit lit if memory port...
+	.BLKL	1			; ...sent me a mailbox before I was ready
+
+MA_K_ERRLEN = .-MA_L_ERRBLK		; End of items which must be contiguous
+
+MA_L_HELLO:				; Bit mask. Bit lit if memory port...
+	.BLKL	1			; ...was sent HELLO mailbox, need reply
+
+MA_L_ICU_UCME:				; Bit mask. Bit lit if memory port...
+	.BLKL	1			; ...was sent ICU_UCME MB, need reply
+
+MA_L_DOSET:				; Bit mask. Bit lit if memory port...
+	.BLKL	1			; ...was sent DOSET MB, need reply
+
+MA_L_DOCLEAR:				; Bit mask. Bit lit if memory port...
+	.BLKL	1			; ...was sent DOCLEAR MB, need reply
+
+MA_W_UNIT:				; Unit number of this memory
+	.BLKW	1			; To parallel code in the exec, a word
+	.BLKW	1			; is allocated, but really only a byte
+					; is used.  Another word is allocated
+					; to allow PUSHL for system service calls
+
+MA_T_UNIT:				; Holds ASCII equivalent of hex unit
+	.BLKB	1
+
+MA_Q_MEMNAM:				; Descriptor for...
+	.BLKQ	1
+MA_T_MEMNAM:				; ...memory name from SYSGEN
+	.BLKB	15
+
+MA_Q_COMGSNAM:				; Descriptor for...
+	.BLKQ	1
+MA_T_COMGSNAM:				; ...interprocessor global section name
+	.BLKB	15+1+15			; shared-mem-name:global-sec-name
+
+MA_Q_COMEFNAM:				; Descriptor for...
+	.BLKQ	1
+MA_T_COMEFNAM:				; ...interprocessor common EF cluster
+	.BLKB	15+1+15			; shared-mem-name:cluster-name
+
+MA_W_COMMBCHN:				; Channel for another processor's MB
+	.BLKW	1
+
+MA_Q_COMMBNAM:				; Skeleton of descriptor for...
+	.BLKQ	1
+MA_T_COMMBNAM:				; ...another processor's mailbox
+	.BLKB	15+1+15			; shared-mem-name:mailbox-name
+
+MA_Q_SPRGSNAM:				; Descriptor for...
+	.BLKQ	1
+MA_T_SPRGSNAM:				; ...my single processor global section
+	.BLKB	15+1+15			; shared-mem-name:global-sec-name
+
+MA_Q_SPREFNAM:				; Descriptor for...
+	.BLKQ	1
+MA_T_SPREFNAM:				; ...Single processor CEF cluster
+	.BLKB	15+1+15			; shared-mem-name:cluster-name
+
+MA_L_SPREFSTATE:			; Single processor CEF state vector
+	.BLKL	1
+
+MA_W_SPRMBCHN:				; Channel for this processor's MB
+	.BLKW	1
+	.BLKW	1			; Filler allows easier use in SS calls
+
+MA_Q_SPRMBNAM:				; Descriptor for...
+	.BLKQ	1
+MA_T_SPRMBNAM:				; ...this processor's mailbox
+	.BLKB	15+1+15			; shared-mem-name:mailbox-name
+
+MA_T_COMFAB = UETUNT$T_FILSPC		; Define these symbols as the...
+MA_K_COMFAB = UETUNT$K_FAB		; ...standard UETUNT symbols...
+MA_K_COMRAB = UETUNT$K_RAB		; ...just so all structures look alike
+
+MA_T_SPRFAB:				; .ASCII filespec for single processor GS
+	.BLKB	128
+
+	.ALIGN	LONG
+MA_K_SPRFAB:				; Space for single processor section FAB
+	.BLKB	FAB$K_BLN		; See note where COMGSFAB is defined
+
+MA_K_SPRRAB:				; Space for single processor section RAB
+	.BLKB	RAB$K_BLN		; See note where COMGSFAB is defined
+
+MA_T_CHKFAB:				; .ASCII filespec to check single proc GS
+	.BLKB	128
+
+	.ALIGN	LONG
+MA_K_CHKFAB:				; Space for single proc section check FAB
+	.BLKB	FAB$K_BLN		; See note where COMGSFAB is defined
+
+MA_K_CHKRAB:				; Space for single proc section check RAB
+	.BLKB	RAB$K_BLN		; See note where COMGSFAB is defined
+
+MA_Q_COMGSIAD:				; Suggested starting address for interproc GS
+	.BLKL	2
+
+MA_Q_COMGSRAD:				; Actual starting address for interproc GS
+	.BLKL	2
+
+MA_Q_SPRGSIAD:				; Suggested starting addr for single proc GS
+	.BLKL	2
+
+MA_Q_SPRGSRAD:				; Actual starting addr for single proc GS
+	.BLKL	2
+
+MA_Q_SPRGSISB:				; IOSB for $UPDSEC of single processor GS
+	.BLKQ	1
+
+	DEVDEP_SIZE   = .-UETUNT$C_DEVDEP ; Device dependent part of UETUNT
+
+MA_K_SPRBUF:				; Buffer to store single processor GS data
+	.BLKB	WRITE_SIZE
+
+MA_K_CHKBUF:				; Buffer to read check single processor GS
+	.BLKB	WRITE_SIZE
+
+	PAGES = <<UETUNT$C_INDSIZ+-	; Add together all of the pieces...
+		  DEVDEP_SIZE+-		; ...which make up a UETP unit block...
+		  WRITE_SIZE+-		; ...to give to the $EXPREG service...
+		  WRITE_SIZE+-		; ...below
+		  511>/512>
+
+;
+; There is a standard format for messages passed via interprocessor mailboxes.
+; See the functional spec and the mailbox AST routine for summaries of what
+; is actually passed.
+;
+	.PSECT	INTER_PROC_MB,ABS,NOEXE,NOWRT,PAGE ; Note ABS attribute!
+
+MB_B_SENDER:				; Port number of sender
+	.BLKB	1
+
+MB_B_RECEIVER:				; Port number of receiver
+	.BLKB	1
+
+MB_B_UNIT:				; Shared memory unit number
+	.BLKB	1
+
+MB_W_WHY:				; Why sent (one of MSG_* codes)
+	.BLKW	1
+
+MB_K_MISC:				; Other misc info, dependent on MB_W_WHY
+	.BLKB	26
+
+MB_K_END:				; End of mailbox
+
+
+
+
+;
+; Whenever a timer is associated with a mailbox, the REQIDT parameter is
+; defined as:
+;
+;	.BYTE	shared-memory-unit-number (MA_W_UNIT)
+;	.BYTE	receiver's-port-number (MB_B_RECEIVER)
+;	.WORD	reason-for-sending-mail (MB_W_WHY)
+;
+
+;
+; There will be an interprocessor global section accessed by all processors
+; attached to a shared memory.  To get a good description of how the section
+; is used, see the functional spec for this test.
+;
+	.PSECT	INTERPROC_GS_DEF,ABS,NOEXE,NOWRT,PAGE ; Note ABS attribute!
+
+GS_T_SECT_NAME:				; ASCIC global section name
+	.BLKB	COMGS_NAME_LEN		; Use this for consistency checking
+
+GS_L_VERSION:				; UETMA7800 GS version, max ports
+	.BLKL	1			; (Interprocessor consistency check)
+
+GS_Q_SYSGQVERSION:			; VMS .ASCII version number
+	.BLKQ	1
+
+GS_L_ECOLEVEL:				; Hardware ECO level of owner CPU
+	.BLKL	1
+
+GS_L_OWNER:				; Port number of creating processor
+	.BLKL	1
+
+GS_L_AVAILABLE:				; Bit mask.  Bit lit if memory port...
+	.BLKL	1			; ...has cooperating processor
+
+GS_L_CEF_FLAG:				; Flag which marks interprocessor...
+	.BLKL	1			; CEF test in progress (flag and port)
+
+GS_L_PARTICIPATING:			; Bit mask of procs starting interlock test
+	.BLKL	1			; Must immediately preceed GS_L_FINISHED
+
+GS_L_FINISHED:				; Bit mask of procs finishing interlock test
+	.BLKL	1			; Must immediately follow GS_L_PARTICIPATING
+
+GS_L_INTLK_FLAG:			; Flag which marks interlocking...
+	.BLKL	1			; ...test in progress (flag and port)
+
+	.ALIGN	WORD			; ADAWI must be word aligned
+GS_L_ADAWI_COM:				; Common ADAWI count word - grand total
+	.BLKW	1+1			; Includes overflow word, as well
+
+GS_K_ADAWI_PVT:				; Private ADAWI count per processor
+	.BLKW	PROCESSOR_MAX*<1+1>	; ADAWI, overflow. Adjacent to ADAWI_COM
+
+GS_K_Q_COUNT:				; Per processor count of "busy"...
+	.BLKW	PROCESSOR_MAX		; ...queue entries
+
+	.ALIGN	QUAD
+GS_Q_FREE:				; "Free" queue header
+	.BLKQ	1			; Keep adjacent to "busy" queue header
+
+GS_Q_BUSY:				; "Busy" queue header
+	.BLKQ	1			; Keep adjacent to queue entries
+
+GS_K_Q_ENTRIES:				; Busy and free queue entries
+	.BLKL	COMGS_QUEUE_MAX*<1+1+1+1> ; Flink, blink, port number, filler
+
+GS_K_PVT_AREAS:				; Private areas for each processor. Each...
+	.BLKB	PROCESSOR_MAX*COMGS_PVT_AREA ; ...last quadword gets MA_Q_DAYTIME
+
+GS_K_END:				; End of global section
+COMGS_SIZE = <GS_K_END+511>/512		; Size of interprocessor GS, blocks
+
+	.SBTTL	Read-Only Data
+	.PSECT	RODATA,NOEXE,NOWRT,PAGE
+
+ACNT_NAME:				; Process name on exit
+	.ASCID	/SYSTEST/
+
+TEST_NAME:				; This test name
+	.ASCID	/UETMA7800/
+
+SUPDEV_GBLSEC:				; How we access UETSUPDEV.DAT
+	.ASCID	/UETSUPDEV/
+
+CONTROLLER:				; Logical name of controller
+	.ASCID	/CTRLNAME/
+
+MODE:					; Run mode logical name
+	.ASCID	/MODE/
+
+TTNAME_ROPTR:				; Descriptor for recursive...
+	.WORD	63,0			; ...translation of TTNAME
+	.ADDRESS TTNAME
+
+CNTRLCMSG:
+	.ASCID	\Aborted via a user CTRL/C\
+
+NO_CTRLNAME:
+	.ASCID	/No controller specified./
+
+DEAD_CTRLNAME:
+	.ASCID	/Can't test controller !AS, marked as unusable in UETINIDEV.DAT./
+
+NOUNIT_SELECTED:
+	.ASCID	/No units selected for testing./
+
+ILLEGAL_REC:
+	.ASCID	/Illegal record format in file UETINIDEV.DAT!/
+
+PASS_MSG:
+	.ASCID	/End of pass !UL with !UL iterations at !%D./
+
+THREEMIN:				; 3 minute delta time
+	.LONG	-10*1000*1000*180,-1
+
+UNIT_DESC:				; Descriptor used to convert unit #
+	.LONG	5
+	.ADDRESS BUFFER+6
+
+CONT_DESC:				; Descriptor used to convert controller...
+	.WORD	REC_SIZE,0		; ...from lowercase to uppercase
+	.ADDRESS BUFFER
+
+FILE:					; Fills in RMS_ERR_STRING
+	.ASCID	/file/
+
+RECORD:					; Fills in RMS_ERR_STRING
+	.ASCID	/record/
+
+RMS_ERR_STRING:				; Announces an RMS error
+	.ASCID	/RMS !AS error in file !AD/
+
+PROMPT:
+	.ASCII	/Controller designation?: /
+	PMTSIZ = .-PROMPT
+
+NEEDED_PRIVS:				; Arglist for $SETPRV
+	.LONG	<1@PRV$V_SHMEM>!<1@PRV$V_PRMGBL>!<1@PRV$V_SYSGBL>
+	.LONG	0
+
+SYS_INFO_ARGS:				; Arglist for $CMKRNL SYS_INFO
+	.LONG	2
+	.ADDRESS COMGS_BUF+GS_Q_SYSGQVERSION
+	.ADDRESS COMGS_BUF+GS_L_ECOLEVEL
+
+MPM_LITERAL:				; Literal string needed to check that...
+	.ASCID	/MPM/			; ...we're really given a shared memory
+
+CS2:					; No device type, any device class...
+	.ASCID	/   ** /		; ...to check UETSUPDEV.DAT
+
+UETCOMGS:				; Constant part of interproc GS name
+	.ASCID	/UETCOMGS/		; Must be able to accomodate unit
+
+UETSPRGS:				; Constant part of single processor GS name
+	.ASCID	/UETSPRGS/		; Must be able to accomodate unit
+
+UETMB:					; Constant part of mailbox names
+	.ASCID	/UETMB/			; Must be able to accomodate unit and port
+
+UETCOMEF:				; Constant part of interproc common EF
+	.ASCID	/UETCOMEF/		; Must be able to accomodate unit
+
+UETSPREF:				; Constant part of single processor EF
+	.ASCID	/UETSPREF/		; Must be able to accomodate unit
+
+SYS$TEST:				; Logical name for [SYSTEST] on system disk
+	.ASCID	/SYS$TEST:/
+
+DOTDAT:					; File type of files used for disk sections
+	.ASCID	/.DAT/
+
+ONE_SECOND:				; 1-second delta time
+	.LONG	-10000000*1,-1
+
+ALREADY_HERE:				; Possible consistency error message
+	.ASCID	\Indications are that this processor was already connected\-
+		\!/	to the interprocessor global section for !AS, MPM!ZB.\
+
+INCONSISTENCY:				; We got the wrong interprocessor GS
+	.ASCID	/Mapped to wrong interprocessor global section for !AS, MPM!ZB./
+
+OLD_ONEPROC:				; We found an existing single processor GS
+	.ASCID	\Mapped to an existing single processor global section\-
+		\!/	for !AS, MPM!ZB.\
+
+BAD_MOVC3:				; Couldn't write to single processor GS
+	.ASCID	\Writing to single processor global section in memory\-
+		<13><10>\	got incorrect results.\
+
+BAD_UPDATE:				; Couldn't update single processor GS
+	.ASCID	\Updating single processor global section to disk\-
+		<13><10>\	got incorrect results.\
+
+UPDSEC_HWE:				; Hardware write error during $UPDSEC
+	.ASCID	/Hardware write error during $UPDSEC./
+
+UPDSEC_FAILED:				; Miscellaneous error during $UPDSEC
+	.ASCID	\$UPDSEC failed for !AS, MPM!ZB.\-
+		\!/	Virtual address of first page not written was: !XL.\
+
+ME2ME_FAILED:				; Could not send myself some mail
+	.ASCID	\Could not send mail to myself for !AS, MPM!ZB.\
+
+BAD_CEF:				; Wrong results with common event flags
+	.ASCID	\Single processor common event flag failed for !AS, MPM!ZB:\-
+		\!/	Expected flags = !XL, returned flags = !XL, XOR = !XL.\
+
+BAD_MSG_TYPE:				; Inconsistent interprocessor mailbox
+	.ASCID	\Inconsistent or otherwise obviously wrong information in\-
+		\!/	interprocessor mailbox for !AS, MPM!ZB.\
+
+BAD_MB_QIO:				; IOSB tells the story of $QIO gone bad
+	.ASCID	/Error reading from or writing to an interprocessor mailbox./
+
+BAD_REQIDT:				; Timeout for MB got phoney AST
+	.ASCID	/Timer request for a mailbox resulted in an inconsistent/-
+		/ AST REQIDT./
+
+BAD_ECO:				; My CPU differs from yours
+	.ASCID	/CPU ECO level differs from another processor's for !AS, MPM!ZB./
+
+WRONG_VERSION:				; My VMS differs from yours
+	.ASCID	/Version of VMS differs from another processor's for !AS, MPM!ZB./
+
+INTLK_TIMEOUT:				; GS_L_FINISHED .NE. GS_L_PARTICIPATING
+	.ASCID	\Processor(s) on port(s) !#(3UB) did not indicate that they\-
+		\!/	finished the memory interlock test for !AS, MPM!ZB.\
+
+IADAWI:					; Sum of individual ADAWIs # common ADAWI
+	.ASCID	\Inconsistent sums found for interprocessor use of ADAWI\-
+		\!/	instruction on !AS, MPM!ZB.\
+
+IQUEUE:					; "Free" and "busy" queues inconsistent
+	.ASCID	\Interlocked queue instructions and/or ADAWI counts of their\-
+		\!/	use produced inconsistent results on !AS, MPM!ZB.\
+
+SUMMARY_HEADER:				; First line when summarizing errors
+	.ASCID	\Summary of recoverable errors on !AS, MPM!ZB\
+
+RILOSTU_MSG:				; Processors who think we went away
+	.ASCID	\	CPU(s) on port(s) !#(3UB) timed out before this\-
+		\!/		processor could send a reply mailbox\
+
+SILOSTU_MSG:				; Processors we think went away
+	.ASCID	\	CPU(s) on port(s) !#(3UB) didn't reply to some\-
+		\!/		mailbox this processor sent\
+
+RBADCODE_MSG:				; Processors whose date-time we read wrong
+	.ASCID	\	CPU(s) on port(s) !#(3UB) wrote different info to\-
+		\!/		the interprocessor global section from what we read\
+
+SBADCODE_MSG:				; Processors who read our date-time wrong
+	.ASCID	\	CPU(s) on port(s) !#(3UB) couldn't read what this\-
+		\!/		processor wrote to the interprocessor global\-
+		\ section\
+
+DOSET_MSG:				; Processors which didn't set a CEF
+	.ASCID	\	CPU(s) on port(s) !#(3UB) weren't able to set a\-
+		\ common event flag\
+
+DOCLEAR_MSG:				; Processors which didn't clear a CEF
+	.ASCID	\	CPU(s) on port(s) !#(3UB) weren't able to clear a\-
+		\ common event flag\
+
+NOCAUSE_MSG:				; Processors who sent us msg for no cause
+	.ASCID	\	CPU(s) on port(s) !#(3UB) sent this processor a\-
+		\!/		mailbox message which should have gone\-
+		\ somewhere else\
+
+OLDSTUFF_MSG:				; Processors who sent us msg before we were ready
+	.ASCID	\	CPU(s) on port(s) !#(3UB) sent this processor a\-
+		\!/		mailbox message before we announced we were\-
+		\ ready!/		to receive it.\
+
+	.SBTTL	Read/Write Data
+	.PSECT	RWDATA,WRT,NOEXE,PAGE
+
+TTCHAN:					; Channel associated with ctrl. term.
+	.WORD	0
+
+TTNAME_RWPTR:				; Descriptor for recursive...
+	.WORD	TTNAME_LEN,0		; ...translation of TTNAME
+	.ADDRESS TTNAME
+TTNAME:
+	.ASCII	/SYS$INPUT/
+	TTNAME_LEN=.-TTNAME
+	.BLKB	63-TTNAME_LEN
+
+FLAG:					; Miscellaneous flag bits
+	.WORD	0			; (See Equated Symbols for definitions)
+
+FAO_BUF:				; FAO output string descriptor
+	.WORD	TEXT_BUFFER,0
+	.ADDRESS BUFFER
+
+BUFFER_PTR:				; Fake .ASCID buffer for misc. strings
+	.WORD	TEXT_BUFFER,0		; A word for length, a word for desc.
+	.ADDRESS BUFFER
+
+BUFFER:					; FAO output and other misc. buffer
+	.BLKB	TEXT_BUFFER
+
+DEVDSC:					; Device name descriptor
+	.WORD	MAX_DEV_DESIG,0
+	.ADDRESS DEV_NAME
+
+
+; NOTE THAT THE CODE DEPENDS ON THE FOLLOWING TWO ITEMS BEING TOGETHER.
+PROCESS_NAME:				; Process name
+	.ASCID	/UETMA7800_/
+DEV_NAME:				; Device name buffer
+	.BLKB	MAX_DEV_DESIG+MAX_UNIT_DESIG
+	NAME_LEN = .-DEV_NAME
+; END OF ITEMS WHICH CODE DEPENDS ON BEING TOGETHER.
+
+
+DIB:					; Device Information Block
+	.WORD	DIB$K_LENGTH,0
+	.ADDRESS DIBBUF
+DIBBUF:
+	.BLKB	DIB$K_LENGTH
+
+ERROR_COUNT:				; Cumulative error count at runtime
+	.LONG	0
+
+STATUS:					; Status value on program exit
+	.LONG	0
+
+STAT:					; IO status block
+	.QUAD	0
+
+AST_MODE:				; Prior setting of AST delivery
+	.LONG	0
+
+SS_FAIL_MODE:				; Prior setting of SS failure mode
+	.LONG	0
+
+INADDRESS:				; $CRMPSC address storage
+	.LONG	0,0
+OUTADDRESS:
+	.LONG	0,0
+
+UNIT_NUMBER:				; Current dev unit number for GET_LINE
+	.WORD	0
+
+DEVNAM_LEN:				; Current device name length
+	.WORD	0
+
+RANDOM1:				; Random word #1
+	.LONG	^XAAAAAAAA
+
+RANDOM2:				; Random word #2
+	.LONG	^XA72EA72E
+
+ITERATION:				; # of times all tests were executed
+	.LONG	0
+
+PASS:					; Pass count
+	.LONG	0
+
+MSG_BLOCK:				; Auxiliary $GETMSG info
+	.BLKB	4
+
+EXIT_DESC:				; Exit handler descriptor
+	.LONG	0
+	.ADDRESS EXIT_HANDLER
+	.LONG	1
+	.ADDRESS STATUS
+
+ARG_COUNT:				; Argument counter used by ERROR_EXIT
+	.LONG	0
+
+	.ALIGN QUAD			; Self-relative queue must be aligned
+UNIT_LIST:				; Head of unit block circular list
+	.QUAD	0
+
+SHM_INFO_ARGS:				; Arg list for $CMKRNL SHM_INFO
+	.LONG	4
+	.ADDRESS UNIT_NUMBER
+	.BLKL	3
+
+NEW_NODE:				; Newly acquired node address
+	.QUAD	0
+
+	.ALIGN	QUAD			; Needed for interlocked queue stuff
+COMGS_BUF:				; Buffer for creating interprocessor GS
+	.BLKB	GS_K_END
+
+SYNCH_MBBUF:				; Buffer to create/receive MB during...
+	.BLKB	MB_K_END		; ...synchronous operations
+
+SYNCH_MBCHN:				; Channel to access random MB during...
+	.BLKW	1			; ...synchronous operations
+	.BLKW	1			; Filler to make SS calls easier
+
+SYNCH_MBISB:				; IOSB for synchronous QIO's to MBs
+	.BLKQ	1
+
+SYNCH_MBPTR:				; String descriptor for...
+	.BLKQ	1
+
+SYNCH_MBNAM:				; ...buffer to form logical name for...
+	.BLKB	15+1+15			; ...MB during synchronous operations
+
+SYNCH_MBDAY:				; DAYTIM parameter if reply timer set
+	.BLKQ	1
+
+AST_MBBUF:				; Buffer to create/receive MB during...
+	.BLKB	MB_K_END		; ...AST operations
+
+AST_MBCHN:				; Channel to access random MB during...
+	.BLKW	1			; ...AST operations
+	.BLKW	1			; Filler to make SS calls easier
+
+AST_MBISB:				; IOSB for AST level QIO's to MBs
+	.BLKQ	1
+
+AST_MBPTR:				; String descriptor for...
+	.BLKQ	1
+
+AST_MBNAM:				; ...buffer to form logical name for...
+	.BLKB	15+1+15			; ...MB during AST operations
+
+AST_MBDAY:				; DAYTIM parameter if reply timer set
+	.BLKQ	1
+
+INTERLOCK_SAVED_R6:			; Save R6 here during interlocking...
+	.BLKL	1			; ...instructions test
+
+INTERLOCK_SAVED_PC:			; Save PC here during interlocking...
+	.BLKL	1			; ...instructions test
+
+INTERLOCK_SAVED_PSW:			; Save PSW here during interlocking...
+	.BLKW	1			; ...instructions test
+
+	.SBTTL	RMS-32 Data Structures
+	.ALIGN	LONG
+
+SYSIN_FAB:				; Allocate FAB for SYS$INPUT
+	$FAB-
+	FNM = <SYS$INPUT:>
+
+SYSIN_RAB:				; Allocate RAB for SYS$INPUT
+	$RAB-
+	FAB = SYSIN_FAB,-
+	ROP = PMT,-
+	PBF = PROMPT,-
+	PSZ = PMTSIZ,-
+	UBF = DEV_NAME,-
+	USZ = NAME_LEN
+
+INI_FAB:				; Allocate FAB for UETINIDEV
+	$FAB-
+	FAC = <GET,PUT,UPD>,-
+	RAT = CR,-
+	SHR = <GET,PUT,UPI>,-
+	FNM = <UETINIDEV.DAT>
+
+INI_RAB:				; Allocate RAB for UETINIDEV
+	$RAB-
+	FAB = INI_FAB,-
+	RBF = BUFFER,-
+	UBF = BUFFER,-
+	USZ = REC_SIZE
+
+DDB_RFA:				; RFA storage for INI_RAB
+	.BLKB	6
+
+	.ALIGN	LONG
+SUP_FAB:				; Allocate FAB for UETSUPDEV
+	$FAB-
+	FAC = GET,-
+	SHR = <UPI,GET>,-
+	RAT = CR,-
+	FOP = UFO,-
+	FNM = <UETSUPDEV.DAT>
+
+;
+; The dummy FABs and RABs defined below will be copied into their respective
+; areas in the node set up for a particular shared memory.  A single MOVC is
+; used for each FAB/RAB set, so the sets must remain with the RAB immediately
+; following the FAB.
+;
+COMGSFAB:				; Dummy FAB used for interproc GS
+	$FAB-				; FAB for interproc GS is in MA_K_COMFAB
+	ALQ = COMGS_SIZE,-
+	FAC = <BIO,PUT>,-
+	FOP = SUP,-
+	MRS = GS_K_END,-
+	RFM = FIX
+
+COMGSRAB:				; Dummy RAB used for interproc GS
+	$RAB-				; RAB for interproc GS is in MA_K_COMRAB
+	RAC = SEQ,-
+	RBF = COMGS_BUF,-
+	ROP = BIO,-
+	RSZ = GS_K_END
+
+SPRGSFAB:				; Dummy FAB used for single processor GS
+	$FAB-				; FAB for single proc GS is MA_K_SPRFAB
+	ALQ = SPRGS_SIZE,-
+	FAC = <BIO,PUT>,-
+	FOP = SUP,-
+	MRS = WRITE_SIZE,-
+	RFM = FIX
+
+SPRGSRAB:				; Dummy RAB used for single processor GS
+	$RAB-				; RAB for single proc GS is MA_K_SPRRAB
+	RAC = SEQ,-
+	ROP = BIO,-
+	RSZ = WRITE_SIZE
+
+CHKGSFAB:				; Dummy FAB used to check single proc GS
+	$FAB-				; FAB to check single proc GS is MA_K_CHKFAB
+	ALQ = SPRGS_SIZE,-
+	FAC = <BIO,GET>,-
+	FOP = SUP,-
+	MRS = WRITE_SIZE,-
+	RFM = FIX
+
+CHKGSRAB:				; Dummy RAB used to check single proc GS
+	$RAB-				; RAB to check single proc GS is MA_K_CHKRAB
+	RAC = SEQ,-
+	ROP = BIO,-
+	USZ = WRITE_SIZE
+
+	.SBTTL	Test and Device Initialization
+	.PSECT	MA780,EXE,NOWRT,PAGE
+
+	.DEFAULT DISPLACEMENT,WORD
+
+;+
+;	Start up the multiport memory test.  This entails some overhead
+;	necessary to cope with both expected and unforseen conditions, figuring
+;	out just what devices are to be tested, making sure we can test the
+;	indicated devices and setting up writeable space for each device to
+;	be tested.
+;-
+
+.ENTRY UETMA7800,^M<>			; Entry mask
+
+	MOVAL	SSERROR,(FP)		; Declare exception handler
+	$SETSFM_S ENBFLG = #1		; Enable system service failure mode
+	$SETEF_S EFN = #SPRGS_EFN	; (see note where SPRGS_EFN defined)
+	$DCLEXH_S DESBLK = EXIT_DESC	; Declare an exit handler
+	$TRNLOG_S LOGNAM = TTNAME_RWPTR,- ; See if there is some SYS$INPUT
+		  RSLBUF = BUFFER_PTR
+	CMPL	R0,#SS$_NOTRAN		; Is there some translation?
+	BEQL	20$			; BR if no SYS$INPUT assigned
+	$OPEN	FAB = SYSIN_FAB,-	; Open SYS$INPUT
+		ERR = RMS_ERROR
+	$CONNECT RAB = SYSIN_RAB,-	; Connect RAB to SYS$INPUT
+		 ERR = RMS_ERROR
+	BBC	#DEV$V_TRM,-		; BR if SYS$INPUT is NOT a terminal
+		SYSIN_FAB+FAB$L_DEV,10$
+ 	$TRNLOG_S LOGNAM = CONTROLLER,-	; Get the name of our memory
+		  RSLLEN = DEVNAM_LEN,-
+		  RSLBUF = DEVDSC
+	CMPL	R0,#SS$_NORMAL		; Was a controller specified?
+	BEQL	PROC_CONT_NAME		; BR if it was - go process it
+10$:
+	$GET	RAB = SYSIN_RAB,-	; Read SYS$INPUT for controller name
+		ERR = RMS_ERROR
+	MOVW	SYSIN_RAB+RAB$W_RSZ,-	; Save the name length
+		DEVNAM_LEN
+	BNEQ	PROC_CONT_NAME		; BR if we got something
+20$:
+	MOVL	#SS$_BADPARAM,STATUS	; Save the exit status
+	PUSHAL	NO_CTRLNAME		; Prepare for message...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR ; ...
+	PUSHL	#3			; ...
+	BRW	ERROR_EXIT		; ...to tell of bad setup
+
+PROC_CONT_NAME:
+	MOVW	DEVNAM_LEN,DEVDSC	; Set the device name length
+	PUSHAL	DEVDSC			; Make sure...
+	PUSHAL	DEVDSC			; ...that the specified controller...
+	CALLS	#2,G^STR$UPCASE		; ...is all uppercase for later comaparison
+	ADDW2	DEVNAM_LEN,PROCESS_NAME	; Get true process name length
+	CMPW	PROCESS_NAME,#MAX_PROC_NAME ; Is the result too long for VMS?
+	BLEQ	10$			; BR if not
+	MOVW	#MAX_PROC_NAME,PROCESS_NAME ; Make it as long as you can
+10$:
+	CLRL	-(SP)			; Set the time stamp flag
+	PUSHAL	PROCESS_NAME		; Set the test name
+	PUSHL	#2			; Push the argument count
+	PUSHL	#UETP$_BEGIND!STS$K_SUCCESS ; Set the message code
+	CALLS	#4,G^LIB$SIGNAL		; Print the startup message
+	BISW2	#BEGIN_MSGM,FLAG	; Set flag so we don't output it again
+	$SETPRN_S PRCNAM = PROCESS_NAME	; Set the process name to UETMA7800_yyn
+	BBS	#DEV$V_TRM,-		; BR if SYS$INPUT is a terminal
+		SYSIN_FAB+FAB$L_DEV,20$
+	BRW	40$
+20$:
+	$TRNLOG_S LOGNAM = TTNAME_RWPTR,- ; Recursively translate the name...
+		  RSLLEN = TTNAME_RWPTR,- ; ...of our controlling terminal
+		  RSLBUF = TTNAME_ROPTR
+	MOVAL	TTNAME,TTNAME_RWPTR+4	; Undo possible previous PPF fixup
+	CMPL	R0,#SS$_NOTRAN		; Have we reached the end yet?
+	BEQL	30$			; BR if we have
+	CMPW	#^X001B,TTNAME		; Is this a Process Permanent File?
+	BNEQ	20$			; Recursively translate if not
+	SUBW	#4,TTNAME_RWPTR		; Remove RMS overhead from PPF name...
+	ADDL2	#4,TTNAME_RWPTR+4	; ...
+	BRB	20$			; Now it's safe to retranslate
+30$:
+	$ASSIGN_S DEVNAM = TTNAME_RWPTR,- ; We always need to assign a channel
+		  CHAN   = TTCHAN	  ; Returned channel number
+	$QIOW_S	CHAN     = TTCHAN,-	; Enable CTRL/C AST's...
+		FUNC     = #IO$_SETMODE!IO$M_CTRLCAST,-
+		P1       = CCASTHAND
+	PUSHAL	TEST_NAME		; ...and tell the user...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_ABORTC!STS$K_SUCCESS ; ...how to abort gracefully...
+	CALLS	#3,G^LIB$SIGNAL		; ...
+40$:
+	$TRNLOG_S LOGNAM = MODE,-	; Get the run mode
+		  RSLLEN = BUFFER_PTR,-
+		  RSLBUF = FAO_BUF
+	BICB2	#LC_BITM,BUFFER		; Convert to upper case
+	CMPB	#^A/O/,BUFFER		; Is this a one shot?
+	BNEQ	45$			; BR if not
+	BISW2	#ONE_SHOTM!TEST_OVERM,FLAG ; Set flags for one-shot mode
+45$:
+
+;
+; From UETINIDEV.DAT and UETSUPDEV.DAT, get information which gives controller
+; and unit configuration and lets us know if the setup to run this test was
+; done correctly.
+;
+	$OPEN	FAB = INI_FAB,-		; Open file "UETINIDEV.DAT"
+		ERR = RMS_ERROR
+	$CONNECT RAB = INI_RAB,-	; Connect the RAB and FAB
+		 ERR = RMS_ERROR
+	$MGBLSC_S  INADR = INADDRESS,-	; Connect to UETSUPDEV global section
+		  RETADR = OUTADDRESS,-
+		  GSDNAM = SUPDEV_GBLSEC,-
+		   FLAGS = #SEC$M_EXPREG
+	CMPL	R0,#SS$_NOSUCHSEC	; Was the section already there?
+	BNEQ	50$			; BR if it was...
+	$OPEN	FAB = SUP_FAB,-		; ...else open "UETSUPDEV.DAT"
+		ERR = RMS_ERROR
+	$CRMPSC_S CHAN = SUP_FAB+FAB$L_STV,- ; Create the global section
+		 INADR = INADDRESS,-
+		RETADR = OUTADDRESS,-
+		GSDNAM = SUPDEV_GBLSEC,-
+		 FLAGS = #SEC$M_EXPREG!SEC$M_GBL
+50$:
+	SUBL3	OUTADDRESS,OUTADDRESS+4,R6 ; Create global section length
+
+FIND_IT:
+	$GET	RAB = INI_RAB,-		; Get the first record
+		ERR = RMS_ERROR
+	PUSHAL	CONT_DESC		; Make sure...
+	PUSHAL	CONT_DESC		; ...that the controller name...
+	CALLS	#2,G^STR$UPCASE		; ...is all uppercase letters
+	CMPB	#^A/D/,BUFFER		; Is this a DDB?
+	BEQL	10$			; Go on if not
+	CMPB	#^A/E/,BUFFER		; Is this the end of the file?
+	BNEQ	FIND_IT			; Continue on if not
+	BRB	30$			; Use common error message if it is
+10$:
+	CMPC	DEVNAM_LEN,BUFFER+6,DEV_NAME ; Is this the right controller?
+	BNEQ	FIND_IT			; BR if not
+	MOVC3	#6,INI_RAB+RAB$W_RFA,DDB_RFA ; Save the Record File Address
+	CMPB	#^A/T/,BUFFER+4		; Can we test this controller?
+	BEQL	20$			; BR if we can...
+	$FAO_S	CTRSTR = DEAD_CTRLNAME,- ; ...and yell at user if we can't
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = #DEVDSC
+	MOVL	#SS$_BADPARAM,STATUS	; Set return status
+	PUSHAL	BUFFER_PTR		; ...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; ...
+	PUSHL	#3			; ...
+	BRW	ERROR_EXIT		; We can't test what we can't test
+
+;
+; Check here (only once) to see if we're the correct test for the
+; device we were given to check.
+;
+20$:
+	CMPC5	DEVDSC,DEV_NAME,#0,-	; Match controller name vs. "MPM"
+		MPM_LITERAL,MPM_LITERAL+8
+	BNEQ	30$			; BR if another device was given
+	MATCHC	CS2,CS2+8,R6,@OUTADDRESS ; Find our line in UETSUPDEV.DAT
+	BNEQ	30$			; BR if we're not there
+	MOVZBL	TEST_NAME,R5		; Get the test name length
+	CMPC3	R5,(R3),TEST_NAME+8	; Are we the right test?
+	BEQL	FOUND_IT		; BR if we are
+30$:
+	PUSHAL	DEVDSC			; Push device not supported message
+	PUSHAL	PROCESS_NAME		; Parameters on the stack
+	PUSHL	#2			; Push the argument count
+	PUSHL	#UETP$_DENOSU
+	INSV	#STS$K_ERROR,-
+		#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,(SP)	; Set the severity code...
+	MOVL	(SP),STATUS		; ...and save it as the exit status
+	PUSHL	#4			; Push the partial arg count...
+	BRW	ERROR_EXIT		; ...and split this scene
+
+FOUND_IT:
+	$GET	RAB = INI_RAB,-		; Get a record
+		ERR = RMS_ERROR
+	PUSHAL	CONT_DESC		; Make sure...
+	PUSHAL	CONT_DESC		; ...that this line...
+	CALLS	#2,G^STR$UPCASE		; ...is all uppercase letters
+	CMPB	#^A/U/,BUFFER		; Is this a UCB?
+	BEQL	20$			; BR if it is
+	CMPB	#^A/D/,BUFFER		; Is this a DDB?
+	BEQL	10$			; BR if yes
+	CMPB	#^A/E/,BUFFER		; Is this the end?
+	BEQL	10$			; BR if yes
+	PUSHAL	ILLEGAL_REC		; Then this is an error in the record
+	PUSHL	#1			; Push the error message
+	PUSHL	#UETP$_TEXT!STS$K_ERROR ; Push the signal name
+	PUSHL	#3			; Push the temp arg count
+	BRW	ERROR_EXIT		; Finish for good
+10$:
+	BRW	ALL_SET			; Found DDB or END
+20$:
+	CMPB	#^A/T/,BUFFER+4		; Is the unit testable?
+	BNEQ	FOUND_IT		; BR if not
+	PUSHL	#1			; Flag to ignore blanks when converting
+	PUSHL	#2			; Set byte size of results
+	PUSHAL	UNIT_NUMBER		; Set address to receive word
+	PUSHAL	UNIT_DESC		; Push string address
+	CALLS	#4,G^OTS$CVT_TZ_L	; Convert ASCII unit # to hex
+	;BRB	50$			; Sh. mems have no device chars, so...
+					; ...skip usual $GETDEV/UETSUPDEV check
+
+;
+; We've found a valid memory to test.  Allocate space to store unit-specific
+; information and initialize the information.  Interprocessor data structures
+; are unique between memories; single processor data structures are unique
+; both between memories and within a shared memory.  See the FT_NO_INTERACT
+; definition for a discussion of the use of OTHER_CHARS.
+;
+50$:
+	$EXPREG_S PAGCNT = #PAGES,-	; Get a new node of demand zero memory
+		  RETADR = NEW_NODE
+	INSQTI	@NEW_NODE,UNIT_LIST	; Put the new node in the unit list
+	MOVL	NEW_NODE,R6		; Save a copy of its address
+	MOVB	#1,UETUNT$B_TYPE(R6)	; Set the structure type
+	MOVW	#UETUNT$C_INDSIZ+DEVDEP_SIZE,-
+		UETUNT$W_SIZE(R6)	; Set the structure size
+	$GETTIM_S TIMADR = MA_Q_DAYTIME(R6) ; Save time as interprocessor code
+	MOVW	UNIT_NUMBER,MA_W_UNIT(R6) ; Given a memory unit number...
+	MOVAB	MA_B_MYPORT(R6),SHM_INFO_ARGS+08 ; ...find my port on it,...
+	MOVAB	MA_T_MEMNAM(R6),SHM_INFO_ARGS+12 ; ...the memory name...
+	MOVAQ	MA_Q_MEMNAM(R6),SHM_INFO_ARGS+16 ; ...and the name length...
+	$CMKRNL_S ROUTIN = SHM_INFO,-	; ...
+		  ARGLST = SHM_INFO_ARGS
+	MOVAB	MA_T_MEMNAM(R6),-	; Finish .ASCID pointer to memory name
+		MA_Q_MEMNAM+4(R6)
+	BISB2	#UETUNT$M_TESTABLE,-	; Assume for now that MPM is testable
+		UETUNT$B_FLAGS(R6)
+	; Note that the unit number is treated as a word above, but as a byte
+	; forevermore.  (The current hardware uses a 2-bit unit number.)
+	MOVB	MA_W_UNIT(R6),R0	; Get hex ASCII unit number...
+	BSBW	HEXUNIT			; ...
+	MOVB	R0,MA_T_UNIT(R6)	; Put it away for safekeeping...
+	MOVB	R0,R9			; ...and for convenience
+
+
+	MOVC3	MA_Q_MEMNAM(R6),-	 ; Interproc GS name is memory-name...
+		MA_T_MEMNAM(R6),MA_T_COMGSNAM(R6)
+	MOVB	#^A/:/,(R3)+		 ; ...colon...
+	MOVC3	UETCOMGS,UETCOMGS+8,(R3) ; ...section-name...
+	MOVB	R9,(R3)+		 ; ...and unit to make it unique
+	ADDB3	#^A/0/,MA_B_MYPORT(R6),(R3) ; Append port in case FT_NO_INTERACT
+	ADDB3	MA_Q_MEMNAM(R6),UETCOMGS,R7 ; Figure total name length...
+	ADDB3	#OTHER_CHARS,R7,-	    ; ...
+		MA_Q_COMGSNAM(R6)
+	MOVAL	MA_T_COMGSNAM(R6),-	; Finish .ASCID pointer
+		MA_Q_COMGSNAM+4(R6)
+
+
+	MOVC3	MA_Q_MEMNAM(R6),-	    ; Single proc GS name is memory-name...
+		MA_T_MEMNAM(R6),MA_T_SPRGSNAM(R6)
+	MOVB	#^A/:/,(R3)+		    ; ...colon...
+	MOVC3	UETSPRGS,UETSPRGS+8,(R3)    ; ...section-name...
+	MOVB	R9,(R3)+		    ; ...unit...
+	ADDB3	#^A/0/,MA_B_MYPORT(R6),(R3) ; ...and port to make it unique
+	ADDB3	MA_Q_MEMNAM(R6),UETSPRGS,R7 ; Figure total name length...
+	ADDB3	#3,R7,MA_Q_SPRGSNAM(R6)	    ; ...
+	MOVAL	MA_T_SPRGSNAM(R6),-	; Finish .ASCID pointer
+		MA_Q_SPRGSNAM+4(R6)
+
+	MOVC3	MA_Q_MEMNAM(R6),-	 ; Interproc CEF name is memory-name...
+		MA_T_MEMNAM(R6),MA_T_COMEFNAM(R6)
+	MOVB	#^A/:/,(R3)+		 ; ...colon...
+	MOVC3	UETCOMEF,UETCOMEF+8,(R3) ; ...cluster-name...
+	MOVB	R9,(R3)+		 ; ...and unit to make it unique
+	ADDB3	#^A/0/,MA_B_MYPORT(R6),(R3) ; Append port in case FT_NO_INTERACT
+	ADDB3	MA_Q_MEMNAM(R6),UETCOMEF,R7 ; Figure total name length...
+	ADDB3	#OTHER_CHARS,R7,-	    ; ...
+		MA_Q_COMEFNAM(R6)
+	MOVAL	MA_T_COMEFNAM(R6),-	; Finish .ASCID pointer
+		MA_Q_COMEFNAM+4(R6)
+
+
+	MOVC3	MA_Q_MEMNAM(R6),-	    ; Single proc CEF name is memory-name...
+		MA_T_MEMNAM(R6),MA_T_SPREFNAM(R6)
+	MOVB	#^A/:/,(R3)+		    ; ...colon...
+	MOVC3	UETSPREF,UETSPREF+8,(R3)    ; ...cluster-name...
+	MOVB	R9,(R3)+		    ; ...unit...
+	ADDB3	#^A/0/,MA_B_MYPORT(R6),(R3) ; ...and port to make it unique
+	ADDB3	MA_Q_MEMNAM(R6),UETSPREF,R7 ; Figure total name length...
+	ADDB3	#3,R7,MA_Q_SPREFNAM(R6)	    ; ...
+	MOVAL	MA_T_SPREFNAM(R6),-	; Finish .ASCID pointer
+		MA_Q_SPREFNAM+4(R6)
+
+
+	MOVC3	MA_Q_MEMNAM(R6),-	; Other CPU's MB name is memory-name...
+		MA_T_MEMNAM(R6),MA_T_COMMBNAM(R6)
+	MOVB	#^A/:/,(R3)+		; ...colon...
+	MOVC3	UETMB,UETMB+8,(R3)	; ...mailbox-name...
+	MOVB	R9,(R3)			; ...and unit, to form skeleton of name
+	ADDB3	MA_Q_MEMNAM(R6),UETMB,R7 ; Figure total name length...
+	ADDB3	#3,R7,MA_Q_COMMBNAM(R6)	 ; ...(include extra char for port)
+	;MOVAL	MA_T_COMMBNAM(R6),-	; Don't bother finishing skeleton
+	;	MA_Q_COMMBNAM+4(R6)
+
+
+	MOVC3	MA_Q_MEMNAM(R6),-	    ; My CPU's MB name's memory-name...
+		MA_T_MEMNAM(R6),MA_T_SPRMBNAM(R6)
+	MOVB	#^A/:/,(R3)+		    ; ...colon...
+	MOVC3	UETMB,UETMB+8,(R3)	    ; ...mailbox-name...
+	MOVB	R9,(R3)+		    ; ...unit...
+	ADDB3	#^A/0/,MA_B_MYPORT(R6),(R3) ; ...and port to make it unique
+	ADDB3	MA_Q_MEMNAM(R6),UETMB,R7 ; Figure total name length...
+	ADDB3	#3,R7,MA_Q_SPRMBNAM(R6)	 ; ...
+	MOVAL	MA_T_SPRMBNAM(R6),-	; Finish .ASCID pointer
+		MA_Q_SPRMBNAM+4(R6)
+
+	MOVAL	MA_K_COMFAB(R6),R7	; Point to interprocessor GS FAB
+	MOVC3	#FAB$K_BLN+RAB$K_BLN,-	; Set up interproc GS skeleton FAB & RAB
+		COMGSFAB,(R7)
+	MOVL	R7,MA_K_COMRAB+RAB$L_FAB(R6) ; Set the FAB address in the RAB
+	MOVC3	SYS$TEST,SYS$TEST+8,-	; Set up constant part of name...
+		MA_T_COMFAB(R6)
+	MOVC3	UETCOMGS,UETCOMGS+8,(R3) ; ...
+	MOVB	R9,(R3)+		; Append the unit number for uniqueness
+	MOVC3	DOTDAT,DOTDAT+8,(R3)	; Give the file a .DAT type
+	ADDB3	#1,UETCOMGS,R8		; Set the FNS field in the FAB...
+	ADDB2	SYS$TEST,R8		; ...
+	ADDB3	R8,DOTDAT,FAB$B_FNS(R7)	; ...
+	MOVAL	MA_T_COMFAB(R6),-	; Set the FNA field in the FAB
+		FAB$L_FNA(R7)
+
+
+	MOVAL	MA_K_SPRFAB(R6),R7	; Point to single processor GS FAB
+	MOVC3	#FAB$K_BLN+RAB$K_BLN,-	; Set up skeleton FAB and RAB
+		SPRGSFAB,(R7)
+	MOVL	R7,MA_K_SPRRAB+RAB$L_FAB(R6) ; Have the RAB point to the FAB
+	MOVC3	SYS$TEST,SYS$TEST+8,-	; Set up constant part of name...
+		MA_T_SPRFAB(R6)
+	MOVC3	UETSPRGS,UETSPRGS+8,(R3) ; ...
+	MOVB	R9,(R3)+		; Append the unit number for uniqueness
+	MOVC3	DOTDAT,DOTDAT+8,(R3)	; Give the file a .DAT type
+	ADDB3	#1,UETSPRGS,R8		; Set the FNS field in the FAB...
+	ADDB2	SYS$TEST,R8		; ...
+	ADDB3	R8,DOTDAT,FAB$B_FNS(R7)	; ...
+	MOVAL	MA_T_SPRFAB(R6),-	; Set the FNA field in the FAB
+		FAB$L_FNA(R7)
+	MOVAL	MA_K_SPRBUF(R6),-	; Set RBF field
+		MA_K_SPRRAB+RAB$L_RBF(R6)
+
+
+	MOVAL	MA_K_CHKFAB(R6),R7	; Point to single processor GS check FAB
+	MOVC3	#FAB$K_BLN+RAB$K_BLN,-	; Set up skeleton FAB and RAB
+		CHKGSFAB,(R7)
+	MOVL	R7,MA_K_CHKRAB+RAB$L_FAB(R6) ; Have the RAB point to the FAB
+	MOVC3	SYS$TEST,SYS$TEST+8,-	 ; Set up constant part of name...
+		MA_T_CHKFAB(R6)
+	MOVC3	UETSPRGS,UETSPRGS+8,(R3) ; ...
+	MOVB	R9,(R3)+		; Append the unit number for uniqueness
+	MOVC3	DOTDAT,DOTDAT+8,(R3)	; Give the file a .DAT type
+	ADDB3	#1,UETSPRGS,R8		; Set the FNS field in the FAB...
+	ADDB2	SYS$TEST,R8		; ...
+	ADDB3	R8,DOTDAT,FAB$B_FNS(R7)	; ...
+	MOVAL	MA_T_CHKFAB(R6),-	; Set the FNA field in the FAB
+		FAB$L_FNA(R7)
+	MOVAL	MA_K_CHKBUF(R6),-	; Set UBF field
+		MA_K_CHKRAB+RAB$L_UBF(R6)
+
+
+	BRW	FOUND_IT		; Do the next UCB
+
+;+
+;	Arrive here when we have the device configuration.  Set up those things
+;	which need to be done before actual testing begins (file creation).
+;	In normal or loop forever mode, set a timer far enough in the future
+;	such that we can do a reasonable set of tests before the timer expires,
+;	but if our device gets hung, the program won't waste too much time
+;	before noticing.  Let one-shot mode be a special case.
+;-
+
+ALL_SET:
+	TSTL	UNIT_LIST		; Anything to test?
+	BNEQ	10$			; BR if yes
+	PUSHAL	NOUNIT_SELECTED		; Else set up the error message...
+	PUSHL	#1			; ...argument count...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; ...signal name...
+	PUSHL	#3			; ...and parameter count
+	MOVL	#SS$_BADPARAM,STATUS	; Set return status
+	BRW	ERROR_EXIT		; ...and give up, complaining
+10$:
+	BISW2	#SAFE_TO_UPDM,FLAG	; OK safe to update UETINIDEV.DAT now
+	$SETPRV_S ENBFLG = #1,-		; Set up needed privileges
+		  PRVADR = NEEDED_PRIVS
+
+;
+; There are some fields in the interprocessor global section which will be the
+; same for each shared memory, whatever port we're connected to.  Set those
+; up first.
+;
+	MOVC3	UETCOMGS,UETCOMGS+8,-	 ; Set up those things in the...
+		COMGS_BUF+GS_T_SECT_NAME+1 ; (section name)
+	ADDB3	#1,UETCOMGS,-		 ; ...interproc GS buffer which are...
+		COMGS_BUF+GS_T_SECT_NAME ; (section name length)
+	MOVL	#CONSIS_CHECK,-		 ; ...the same for all memories
+		COMGS_BUF+GS_L_VERSION	 ; (version consistency)
+	$CMKRNL_S ROUTIN = SYS_INFO,-	 ; Get the version of VMS...
+		  ARGLST = SYS_INFO_ARGS ; ...and the CPU ECO level
+
+;
+; For each memory that we're to test, fill in the fields in the interprocessor
+; global section that are memory and port specific.  Create the data structures
+; that will always be present, regardless of the presence of other cooperating
+; processors on that memory.
+;
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6	; R6 points to node for current memory
+20$:
+	MOVZBL	COMGS_BUF+GS_T_SECT_NAME,R7 ; Tack on the last byte...
+	MOVB	MA_T_UNIT(R6),-		    ; ...to the global section name
+		COMGS_BUF+GS_T_SECT_NAME(R7)
+	MOVZBL	MA_B_MYPORT(R6),-	; Indicate which processor created...
+		COMGS_BUF+GS_L_OWNER	; ...this section in this memory
+	ASHL	COMGS_BUF+GS_L_OWNER,#1,- ; Set the bit which says that...
+		COMGS_BUF+GS_L_AVAILABLE  ; ...we're a cooperating processor
+	EMUL	#COMGS_PVT_AREA,-	; Point to start of my private area...
+		COMGS_BUF+GS_L_OWNER,-
+		#COMGS_BUF+GS_K_PVT_AREAS,R7
+	MOVL	R7,R1
+	MOVL	#COMGS_PVT_CODE/4,R0	; ...and fill it...
+	BSBW	RANDOM_FILL		; ...with random trash
+	MOVQ	MA_Q_DAYTIME(R6),-	; Set the special message, used as...
+		COMGS_PVT_CODE(R7)	; ...a code to identify my processor
+
+	$CREATE	 FAB = MA_K_COMFAB(R6),- ; Set up file for interprocessor GS
+		 ERR = RMS_ERROR
+	$CONNECT RAB = MA_K_COMRAB(R6),-
+		 ERR = RMS_ERROR
+	$WRITE	 RAB = MA_K_COMRAB(R6),-
+		 ERR = RMS_ERROR
+	$CLOSE	 FAB = MA_K_COMFAB(R6),-
+		 ERR = RMS_ERROR
+	BISL2	#FAB$M_UFO,-		; Turn on the UFO bit...
+		MA_K_COMFAB+FAB$L_FOP(R6) ; ...so RMS sets us up OK later
+
+	$CREATE	 FAB = MA_K_SPRFAB(R6),- ; Set up file for single processor GS
+		 ERR = RMS_ERROR
+	$CONNECT RAB = MA_K_SPRRAB(R6),-
+		 ERR = RMS_ERROR
+	$WRITE	 RAB = MA_K_SPRRAB(R6),-
+		 ERR = RMS_ERROR
+	$CLOSE	 FAB = MA_K_SPRFAB(R6),-
+		 ERR = RMS_ERROR
+	BISL2	#FAB$M_UFO,-		; Turn on the UFO bit...
+		MA_K_SPRFAB+FAB$L_FOP(R6) ; ...so RMS sets us up OK later
+
+	$CREMBX_S CHAN   = MA_W_SPRMBCHN(R6),- ; Create my mailbox
+		  LOGNAM = MA_Q_SPRMBNAM(R6)
+	$QIO_S	CHAN   = MA_W_SPRMBCHN(R6),- ; Be ready to read if...
+		FUNC   = #IO$_READVBLK,-     ; ...someone writes...
+		IOSB   = AST_MBISB,-	     ; ...to my mailbox
+		ASTADR = RCVMB_AST,-	
+		ASTPRM = R6,-
+		P1     = AST_MBBUF,-
+		P2     = #MB_K_END
+
+	ADDL2	(R6),R6			; Point to node for next memory
+	CMPL	#UNIT_LIST,R6		; Back at the start of the queue?
+	BEQL	30$			; BR if we are - we're finished
+	BRW	20$			; More to go so loop
+30$:
+	BBS	#ONE_SHOTV,FLAG,RESTART	; In one-shot mode start testing now...
+					; ...else fall into TIME_IT
+TIME_IT:
+	$SETIMR_S DAYTIM = THREEMIN,-	; Set timer AST to 3 minutes
+		  ASTADR = TIME_OUT,-
+		  EFN    = #EFN2
+
+	.SBTTL	Test the Multiport Memory
+
+RESTART:
+;+
+;	Start the normal test by mapping to the interprocessor global section
+;	and announcing our presence.
+;-
+
+	BBC	#ONE_SHOTV,FLAG,10$	; Skip all interprocessor stuff...
+	BRW	ONEPROC_GS		; ...if we are in one-shot mode
+10$:
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6	; R6 points to node for current memory
+20$:
+;
+; Map to the interprocessor global section for this memory.  If it turns out we
+; also create it, we're ready to handle messages from other processors which
+; may subsequently map to it.
+;
+	$OPEN	FAB = MA_K_COMFAB(R6),-	; Reopen its interprocessor GS file
+		ERR = RMS_ERROR
+	MOVL	#1,MA_Q_COMGSIAD(R6)	; Say that file maps to P0 space
+	$CRMPSC_S INADR = MA_Q_COMGSIAD(R6),- ; Map that file to a GS
+		 RETADR = MA_Q_COMGSRAD(R6),-
+		 FLAGS  = #SEC$M_GBL!SEC$M_EXPREG!SEC$M_WRT!SEC$M_PERM,-
+		 PAGCNT = #<GS_K_END+511>/512,-
+		 GSDNAM = MA_Q_COMGSNAM(R6),-
+		 CHAN   = MA_K_COMFAB+FAB$L_STV(R6)
+	MOVL	MA_Q_COMGSRAD(R6),R7	; Save GS's starting address in our P0
+	CMPL	#SS$_CREATED,R0		; Did we create-and-map or just map?
+	BNEQ	30$
+	BRW	90$			; BR if we created
+30$:
+;
+; We've mapped to an existing section.  Check that we don't already appear in
+; the mask of cooperating processors.  Consistency check that we've got a good
+; section.  Check for matching ECO levels of our CPU versus the CPU which
+; created the global section.  Set up our private area and announce us to the
+; world.
+;
+	BBCCI	MA_B_MYPORT(R6),-	; BR if we're not already here
+		GS_L_AVAILABLE(R7),40$
+	MOVAL	ALREADY_HERE,R0
+	BSBW	DO_FAO_SIGNAL		; Warn of possible consistency problems
+40$:
+	CMPC3	UETCOMGS,UETCOMGS+8,-	; Did we find the correct...
+		GS_T_SECT_NAME+1(R7)	; ...global section name?
+	BNEQ	50$			; BR if not
+	CMPB	MA_T_UNIT(R6),(R3)	; More checking of GS name
+	BNEQ	50$			; Again, BR if not as expected
+	CMPL	#CONSIS_CHECK,GS_L_VERSION(R7) ; Version and max ports match?
+	BEQL	60$			; BR if they do - we're consistent
+50$:
+	MOVAL	INCONSISTENCY,R0
+	BSBW	DO_FAO_EXIT		; We got the wrong GS - die
+60$:
+	CMPL	COMGS_BUF+GS_L_ECOLEVEL,- ; Do we have the same CPU...
+		GS_L_ECOLEVEL(R7)	  ; ...as the CPU which created GS?
+	BEQL	70$			; BR if we do
+	MOVAL	BAD_ECO,R0
+	BSBW	DO_FAO_EXIT		; Die if we don't
+70$:
+	CMPC3	#8,COMGS_BUF+GS_Q_SYSGQVERSION,-
+		GS_Q_SYSGQVERSION(R7)	; Do we match on VAX/VMS, too?
+	BEQL	80$			; BR if we do
+	MOVAL	WRONG_VERSION,R0
+	BSBW	DO_FAO_EXIT		; Die if we don't
+80$:
+	MOVAL	GS_K_PVT_AREAS(R7),R8
+	EMUL	#COMGS_PVT_AREA,-	; Point to start of my private area...
+		MA_B_MYPORT(R6),R8,R8
+	MOVL	R8,R1
+	MOVL	#COMGS_PVT_CODE/4,R0	; ...and fill it...
+	BSBW	RANDOM_FILL		; ...with random trash
+	MOVQ	MA_Q_DAYTIME(R6),-	; Set the special message, used as...
+		COMGS_PVT_CODE(R8)	; ...a code to identify my processor
+	BBSSI	MA_B_MYPORT(R6),-	; Let other processors know of us!
+		GS_L_AVAILABLE(R7),90$
+90$:
+	ADDL2	(R6),R6			; Point to node for next memory
+	CMPL	#UNIT_LIST,R6		; Back at the start of the queue?
+	BEQL	100$			; BR if we are - we're finished
+	BRW	20$			; More to go so loop
+100$:
+
+ONEPROC_GS:
+;+
+;	Play with the single processor global section.  Create and map to a
+;	global section in each shared memory which is used exclusively by our
+;	processor.  Modify the contents and update each section back to disk.
+;	At AST level, confirm that the updates succeeded and delete each
+;	section and its address space.
+;-
+
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6	; R6 points to node for current memory
+10$:
+;
+; Map to the single processor global section in this memory.  If we only map,
+; but not create it, give a warning.  To prevent possible conflicts with
+; previous passes through this code, make sure that the $UPDSEC-in-progress
+; flag is set to allow us to preceed.
+;
+	$WAITFR_S EFN = #SPRGS_EFN	; Allow possible $UPDSEC to finish
+	$OPEN	FAB = MA_K_SPRFAB(R6),- ; Reopen single processor GS file
+		ERR = RMS_ERROR
+	MOVL	#1,MA_Q_SPRGSIAD(R6)	; Say that file maps to P0 space
+	$CRMPSC_S INADR = MA_Q_SPRGSIAD(R6),- ; Map that file to a GS
+		 RETADR = MA_Q_SPRGSRAD(R6),-
+		 FLAGS  = #SEC$M_GBL!SEC$M_EXPREG!SEC$M_WRT!SEC$M_PERM,-
+		 PAGCNT = #SPRGS_SIZE,-
+		 GSDNAM = MA_Q_SPRGSNAM(R6),-
+		 CHAN   = MA_K_SPRFAB+FAB$L_STV(R6)
+	MOVL	MA_Q_SPRGSRAD(R6),R7	; Save GS's starting address in our P0
+	CMPL	#SS$_CREATED,R0		; Did we create-and-map or just map?
+	BEQL	20$			; BR if we created
+	MOVAL	OLD_ONEPROC,R0
+	BSBW	DO_FAO_SIGNAL		; We've a rusty old single proc GS - warn
+20$:
+;
+; Use a bufferful of pseudo-random data as a means to verify that the section
+; can be written to correctly and then updated correctly to disk.  Only issue
+; the $UPDSEC here; the actual verification will take place at AST level.  That
+; will allow us to test the next memory or otherwise proceed with the test.
+;
+	MOVAL	MA_K_SPRBUF(R6),R1	; Fill a buffer...
+	MOVL	#SPRGS_SIZE*128,R0	; ...of longwords...
+	BSBW	RANDOM_FILL		; ...with random trash
+	MOVC3	#SPRGS_SIZE*512,-	; Move that trash to the...
+		MA_K_SPRBUF(R6),(R7)	; ...single processor global section
+	CMPC3	#SPRGS_SIZE*512,-	; Make sure that the pages...
+		MA_K_SPRBUF(R6),(R7)	; ...all get updated
+	BEQL	30$			; BR if all data transferred
+	BICB2	#UETUNT$M_TESTABLE,-	; The MPM is not testable...
+		UETUNT$B_FLAGS(R6)	; ...(as far as one-shot mode thinks)
+	MOVZBL	(R3),-(SP)		; Not written OK. Save the bad byte...
+	MOVZBL	(R1),-(SP)		; ...the corresponding good byte...
+	SUBL3	R7,R3,-(SP)		; ...where in the buffer it was...
+	PUSHL	MA_W_UNIT(R6)		; ...the memory unit number...
+	PUSHAL	DEVDSC			; ...the controller...
+	PUSHL	#5			; ...the argument count...
+	PUSHL	#UETP$_DATAER!STS$K_ERROR ; ...and the error type
+	PUSHAL	BAD_MOVC3		; Tell what the error was from
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	INCL	ERROR_COUNT		; Keep a running count...
+	PUSHL	ERROR_COUNT		; ...of the errors we've gotten
+	PUSHL	#1
+	PUSHL	#UETP$_ERBOX!STS$K_ERROR ; Have the error stand out
+	CALLS	#13,G^LIB$SIGNAL
+30$:
+	$UPDSEC_S INADR = MA_Q_SPRGSRAD(R6),- ; Update the section to disk
+		 UPDFLG = #1,-
+		 EFN    = #SPRGS_EFN,-	      ; (see note where SPRGS_EFN defined)
+		 IOSB   = MA_Q_SPRGSISB(R6),-
+		 ASTADR = SPRGS_AST,-
+		 ASTPRM = R6
+	ADDL2	(R6),R6			; Point to node for next memory
+	CMPL	#UNIT_LIST,R6		; Back at the start of the queue?
+	BEQL	40$			; BR if we are - we're finished
+	BRW	10$			; More to go so loop
+40$:
+
+ONEPROC_MB:
+;+
+;	Send mail to my own processor.  Synchronize to ensure that it gets
+;	received properly.
+;-
+
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6	; R6 points to node for current memory
+10$:
+	MOVB	MA_B_MYPORT(R6),R10	      ; Start filling in message...
+	MOVB	R10,SYNCH_MBBUF+MB_B_SENDER   ; ...sender's port number...
+	MOVB	R10,SYNCH_MBBUF+MB_B_RECEIVER ; ...receiver's port number...
+	MOVB	MA_W_UNIT(R6),-		      ; ...unit no. of shared memory...
+		SYNCH_MBBUF+MB_B_UNIT
+	MOVW	#MSG_ME2ME,-		      ; ...reason for the message
+		SYNCH_MBBUF+MB_W_WHY
+	$CREMBX_S CHAN = SYNCH_MBCHN,-	; Establish another link to my MB
+		LOGNAM = MA_Q_SPRMBNAM(R6)
+	MOVL	#ME2ME_TIMEOUT,SYNCH_MBDAY ; $SETIMR parameters - DAYTIM...
+	MCOML	#0,SYNCH_MBDAY+4	   ; ...
+	INSV	#MSG_ME2ME,#16,#16,R4	   ; ...REQIDT...
+	INSV	R10,#8,#8,R4		   ; ...
+	MOVB	MA_W_UNIT(R6),R4	   ; ...
+	$SETIMR_S DAYTIM = SYNCH_MBDAY,-    ; A timer will let us know...
+		  ASTADR = MB_TIMEOUT_AST,- ; ...if my processor...
+		  REQIDT = R4		    ; ...doesn't reply to the following
+	$QIO_S	CHAN = SYNCH_MBCHN,-	; Talk to myself
+		FUNC = #IO$_WRITEVBLK,-
+		IOSB = SYNCH_MBISB,-
+		P1   = SYNCH_MBBUF,-
+		P2   = #MB_K_END
+	BLBS	SYNCH_MBISB,20$		; BR if mail was sent correctly
+	MOVZWL	SYNCH_MBISB,R0
+	BSBW	MB_QIO_ERROR		; Warn of the error
+20$:
+	$DASSGN_S CHAN = SYNCH_MBCHN	; We no longer need the MB
+;
+; In order to make sure that we have time to receive the mail, we'll hibernate
+; for a while.  If the mail is received correctly, the mailbox receipt routine
+; will change the MB_W_WHY field to say so.  If the buffer is unchanged,
+; assume the transfer failed and we timed out.
+;
+	$HIBER_S			; Wait for mailbox AST or time out
+	CMPW	#MSG_ME2MEDONE,-	; Message acknowledged?
+		SYNCH_MBBUF+MB_W_WHY
+	BEQL	30$			; BR if it was
+	MOVAL	ME2ME_FAILED,R0
+	BSBW	DO_FAO_EXIT		; Die if it wasn't
+30$:
+	ADDL2	(R6),R6			; Point to node for next memory
+	CMPL	#UNIT_LIST,R6		; Back at the start of the queue?
+	BEQL	40$			; BR if we are - we're finished
+	BRW	10$			; More to go so loop
+40$:
+
+ONEPROC_EF:
+;+
+;	Play with the single processor common event flag cluster.  Associate
+;	with a cluster in each shared memory and test to see that all bits in
+;	each can be set and cleared when used exclusively by our processor.
+;	Disassociate from the clusters.
+;-
+
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6	; R6 points to node for current memory
+10$:
+	$ASCEFC_S EFN = #SPREF_EFN,-	; Associate with a CEF cluster
+		 NAME = MA_Q_SPREFNAM(R6)
+;
+; Set and clear each flag in sequence.
+;
+	MOVL	#SPREF_EFN,R7		; Initialize EF position counter
+	MOVL	#1,R8			; Initialize EF mask
+20$:
+	$SETEF_S  EFN   = R7		; Set a common event flag
+	$READEF_S EFN   = R7,-		; Read back the cluster
+		  STATE = MA_L_SPREFSTATE(R6)
+	BSBW	100$			; Check that exactly our flags are set
+	$CLREF_S  EFN   = R7		; Clear what we just set
+	$READEF_S EFN   = R7,-		; Read back the cluster
+		  STATE = MA_L_SPREFSTATE(R6)
+	BSBW	200$			; Check that our flag is clear
+	INCL	R7			; Point to the next flag in the cluster
+	ASHL	#1,R8,R8		; Mask the next flag in the cluster
+	BNEQ	20$			; BR if there are more bits to test
+;
+; Set each flag, one at a time, until the entire cluster is set.
+;
+	MOVL	#SPREF_EFN,R7		; Initialize EF position counter
+	CLRL	R8			; Initialize total EF mask
+	MOVL	#1,R9			; Initialize individual EF mask
+30$:
+	BISL2	R9,R8			; Mask next flag to set in the cluster
+	$SETEF_S  EFN   = R7		; Set a common event flag
+	$READEF_S EFN   = R7,-		; Read back the cluster
+		  STATE = MA_L_SPREFSTATE(R6)
+	BSBW	100$			; Check that exactly our flags are set
+	INCL	R7			; Point to the next flag in the cluster
+	ASHL	#1,R9,R9		; Mask the next flag in the cluster
+	BNEQ	30$			; BR if there are more bits to test
+;
+; Clear each flag, one at a time, until the entire cluster is clear.
+;
+	MOVL	#SPREF_EFN,R7		; Initialize EF position counter
+	MOVL	#^XFFFFFFFF,R8		; Initialize total EF mask
+	MOVL	#1,R9			; Initialize individual EF mask
+40$:
+	BICL2	R9,R8			; Mask all flags set in the cluster
+	$CLREF_S  EFN   = R7		; Clear a common event flag
+	$READEF_S EFN   = R7,-		; Read back the cluster
+		  STATE = MA_L_SPREFSTATE(R6)
+	BSBW	100$			; Check that exactly our flags are clear
+	INCL	R7			; Point to the next flag in the cluster
+	ASHL	#1,R9,R9		; Mask the next flag in the cluster
+	BNEQ	40$			; BR if there are more bits to test
+
+	$DACEFC_S EFN = #SPREF_EFN	; Disassociate (and delete) our CEF cluster
+	ADDL2	(R6),R6			; Point to node for next memory
+	CMPL	#UNIT_LIST,R6		; Back at the start of the queue?
+	BEQL	50$			; BR if we are - we're finished
+	BRW	10$			; More to go so loop
+50$:
+	BBS	#ONE_SHOTV,FLAG,60$	; BR if in one-shot mode
+	BRW	INTERPROC_GS		; Skip over local subroutines to next test
+60$:
+	BRW	SUC_EXIT		; Only test single proc stuff if one-shot
+
+;
+; Subroutine to check that R8 matches exactly the common event flags in our
+; cluster.
+;
+100$:
+	MOVL	R8,R4			; Set up if error message needed
+	XORL3	MA_L_SPREFSTATE(R6),R8,R10 ; Exact match?
+	BNEQ	300$			; BR if not - issue error message
+	RSB
+
+
+;
+; Subroutine to check that the flags masked in R8 are clear.
+;
+200$:
+	CLRL	R4			; Set up if error message needed...
+	XORL3	MA_L_SPREFSTATE(R6),R8,R10 ; ...
+	BITL	R8,MA_L_SPREFSTATE(R6)	; Is requested bit clear?
+	BNEQ	300$			; BR if not - issue error message
+	RSB
+
+
+;
+; Subroutine which, given expected flags to be set in R4, actual flags set in
+; MA_L_SPREFSTATE(R6) and the difference between the two in R10, prints an
+; error message.
+;
+300$:
+	BICB2	#UETUNT$M_TESTABLE,-	; The MPM is not testable...
+		UETUNT$B_FLAGS(R6)	; ...(as far as one-shot mode thinks)
+	MOVAL	MA_Q_MEMNAM(R6),R5	; Form $FAO parameter
+	$FAO_S	CTRSTR = BAD_CEF,-	; Form an error message
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R5,-
+		P2     = MA_W_UNIT(R6),-
+		P3     = R4,-
+		P4     = MA_L_SPREFSTATE(R6),-
+		P5     = R10
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	CALLS	#3,G^LIB$SIGNAL
+	RSB
+
+INTERPROC_GS:
+;+
+;	Start the interprocessor communications part of the shared memory test.
+;	Mail to each processor which appears in the "available" mask in the
+;	interprocessor global section, a message which includes the date-time
+;	quadword at the end of that section's private area in the
+;	interprocessor global section.  We will expect a reply to our mailbox,
+;	to be received at AST level.  Set a timer to catch the case where
+;	another processor doesn't reply.
+;-
+
+; NOTE WELL!  Within the following loop, registers R6 through R10 are set and
+; assumed to remain unchanged.
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6	; R6 points to node for current memory
+10$:
+	MOVL	MA_Q_COMGSRAD(R6),R7	; R7 will point into the interproc GS
+	CLRL	R8			; R8 is STRTPOS for FFS operations
+	MOVL	#PROCESSOR_MAX,R9	; R9 is SIZE for FFS operations
+20$:
+	FFS	R8,R9,GS_L_AVAILABLE(R7),R10 ; Search for a willing processor
+	BNEQ	30$			; BR if we found one
+	BRW	50$			; BR if there are none left
+30$:
+	MOVB	MA_B_MYPORT(R6),-	; Start filling in message...
+		SYNCH_MBBUF+MB_B_SENDER	; ...sender's port number...
+	MOVB	R10,SYNCH_MBBUF+MB_B_RECEIVER ; ...receiver's port number...
+	MOVB	MA_W_UNIT(R6),-		; ...unit no. of the memory we share...
+		SYNCH_MBBUF+MB_B_UNIT
+	MOVW	#MSG_HELLO,-		; ...reason for the message...
+		SYNCH_MBBUF+MB_W_WHY
+	MOVAL	GS_K_PVT_AREAS(R7),R11
+	EMUL	#COMGS_PVT_AREA,R10,R11,R11 ; ...(point to)...
+	MOVQ	COMGS_PVT_CODE(R11),-	; ...and the other processor's date/time
+		SYNCH_MBBUF+MB_K_MISC
+	MOVC3	MA_Q_COMMBNAM(R6),-	; Form the logical name...
+		MA_T_COMMBNAM(R6),SYNCH_MBNAM ; ...of other processor's MB
+	MOVL	MA_Q_COMMBNAM(R6),SYNCH_MBPTR ; Form descriptor to...
+	MOVAL	SYNCH_MBNAM,SYNCH_MBPTR+4 ; ...the logical name
+	MOVL	R10,R0			; Include the port number...
+	BSBW	HEXUNIT			; ...
+	MOVB	R0,-1(R3)		; ...in the name
+	$CREMBX_S CHAN = SYNCH_MBCHN,-	; Establish a link to other proc's MB
+		LOGNAM = SYNCH_MBPTR
+	MOVL	#HELLO_TIMEOUT,SYNCH_MBDAY ; $SETIMR parameters - DAYTIM...
+	MCOML	#0,SYNCH_MBDAY+4	   ; ...
+	INSV	#MSG_HELLO,#16,#16,R4	   ; ...REQIDT...
+	INSV	R10,#8,#8,R4		   ; ...
+	MOVB	MA_W_UNIT(R6),R4	   ; ...
+	$SETIMR_S DAYTIM = SYNCH_MBDAY,-    ; A timer will let us know...
+		  ASTADR = MB_TIMEOUT_AST,- ; ...if the other processor...
+		  REQIDT = R4		    ; ...doesn't reply to the following
+	ROTL	R10,#1,R0		; We're sending some mail...
+	BISL2	R0,MA_L_HELLO(R6)	; ...so log that we expect a reply
+	$QIO_S	CHAN = SYNCH_MBCHN,-	; Say "Hi!" to the other processor
+		FUNC = #IO$_WRITEVBLK,-
+		IOSB = SYNCH_MBISB,-
+		P1   = SYNCH_MBBUF,-
+		P2   = #MB_K_END
+	BLBS	SYNCH_MBISB,40$		; BR if mail was sent correctly
+	MOVZWL	SYNCH_MBISB,R0
+	BSBW	MB_QIO_ERROR		; Warn of the error
+40$:
+	$DASSGN_S CHAN = SYNCH_MBCHN	; We no longer need the MB
+	SUBL3	R8,R10,R11		; Get number of bits we searched
+	INCL	R11			; Correct off-by-one (inclusive search)
+	SUBL2	R11,R9			; Adjust number of bits left to search
+	ADDL3	#1,R10,R8		; Point to new first bit to search
+	BRW	20$			; Loop thru all procs on this memory
+50$:
+	ADDL2	(R6),R6			; Point to node for next memory
+	CMPL	#UNIT_LIST,R6		; Back at the start of the queue?
+	BEQL	60$			; BR if we are - we're finished
+	BRW	10$			; More to go so loop
+60$:
+
+INTERPROC_EF:
+;+
+;	Start the shared common event flag test.  For this test to work, one
+;	processor must have control of the test across all processors.  To
+;	ensure that, there is a lock in the interprocessor global section which
+;	can be owned by only one process.  For each shared memory, try to grab
+;	the lock.  If that fails, try to grab the next memory's lock or proceed
+;	to the next part of the test.  If we do grab a lock, associate with a
+;	common event flag cluster in that memory.  For each processor connected
+;	to the memory, choose a flag in that cluster and send the process a
+;	mailbox message requesting the processor to set that bit in the
+;	cluster.  Allow a reasonable timeout for that to occur.  If the
+;	processor responds by setting the bit, pick another processor to clear
+;	the bit, again, allowing a reasonable timeout for that action.  Verify
+;	that the bits get set and cleared.  Release the lock in the shared
+;	memory.
+;-
+
+; NOTE WELL!  Within the following loop, registers R6 through R10 are set and
+; assumed to remain unchanged.
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6	; R6 points to node for current memory
+10$:
+	MOVL	MA_Q_COMGSRAD(R6),R7	; R7 will point into the interproc GS
+	BBSSI	#0,GS_L_CEF_FLAG(R7),20$ ; Try to grab the interlock
+	MOVB	MA_B_MYPORT(R6),-	; Bit was clear...
+		GS_L_CEF_FLAG+3(R7)
+	BRB	30$			; ...my port has the interlock
+20$:
+	BRW	150$			; Bit was set - someone else has it
+30$:
+	$ASCEFC_S EFN = #COMEF_EFN,-	; Associate with interprocessor cluster
+		 NAME = MA_Q_COMEFNAM(R6)
+	CLRL	R8			; R8 is STRTPOS for FFS operations
+	MOVL	#PROCESSOR_MAX,R9	; R9 is SIZE for FFS operations
+40$:
+	FFS	R8,R9,GS_L_AVAILABLE(R7),R10 ; Search for a willing processor
+	BNEQ	50$			; BR if we found one
+	BRW	140$			; BR if there are none left
+50$:
+	MOVB	MA_B_MYPORT(R6),-	      ; Start filling in message...
+		SYNCH_MBBUF+MB_B_SENDER	      ; ...sender's port number...
+	MOVB	R10,SYNCH_MBBUF+MB_B_RECEIVER ; ...receiver's port number...
+	MOVB	MA_W_UNIT(R6),-		      ; ...unit no. of shared memory...
+		SYNCH_MBBUF+MB_B_UNIT
+	MOVW	#MSG_DOSET,-		      ; ...reason for the message...
+		SYNCH_MBBUF+MB_W_WHY
+	ADDL2	RANDOM2,RANDOM1		      ; ...
+	EXTZV	#6,#5,RANDOM1,-		      ; ...and a random bit to set
+		SYNCH_MBBUF+MB_K_MISC
+	MOVC3	MA_Q_COMMBNAM(R6),-	      ; Form the logical name...
+		MA_T_COMMBNAM(R6),SYNCH_MBNAM ; ...of other processor's MB
+	MOVL	MA_Q_COMMBNAM(R6),SYNCH_MBPTR ; Form descriptor to...
+	MOVAL	SYNCH_MBNAM,SYNCH_MBPTR+4     ; ...the logical name
+	MOVL	R10,R0			; Include the port number...
+	BSBW	HEXUNIT			; ...
+	MOVB	R0,-1(R3)		; ...in the name
+
+	$CREMBX_S CHAN = SYNCH_MBCHN,-	; Establish a link to other proc's MB
+		LOGNAM = SYNCH_MBPTR
+	MOVL	#DOSET_TIMEOUT,SYNCH_MBDAY ; $SETIMR parameters - DAYTIM...
+	MCOML	#0,SYNCH_MBDAY+4	   ; ...
+	INSV	#MSG_DOSET,#16,#16,R4	   ; ...REQIDT...
+	INSV	R10,#8,#8,R4		   ; ...
+	MOVB	MA_W_UNIT(R6),R4	   ; ...
+	$SETIMR_S DAYTIM = SYNCH_MBDAY,-    ; A timer will let us know...
+		  ASTADR = MB_TIMEOUT_AST,- ; ...if the other processor...
+		  REQIDT = R4		    ; ...doesn't reply to the following
+	ROTL	R10,#1,R0		; We're sending some mail...
+	BISL2	R0,MA_L_DOSET(R6)	; ...so log that we expect a reply
+	$QIO_S	CHAN = SYNCH_MBCHN,-	; Tell the other processor to set a bit
+		FUNC = #IO$_WRITEVBLK,-
+		IOSB = SYNCH_MBISB,-
+		P1   = SYNCH_MBBUF,-
+		P2   = #MB_K_END
+	BLBS	SYNCH_MBISB,60$		; BR if mail was sent correctly
+	MOVZWL	SYNCH_MBISB,R0
+	BSBW	MB_QIO_ERROR		; Warn of the error
+60$:
+	$DASSGN_S CHAN = SYNCH_MBCHN	; We no longer need the MB
+;
+; Now we must wait.  The logic of the interprocessor CEF test dictates that we
+; know for sure that either the other processor successfully set the bit or we
+; know for sure that it did not.  We will wait for either the receipt of a
+; mailbox in reply (must happen at AST level) or the expiration of the timer.
+; Note that on return, we cannot assume the contents of the mailbox received
+; at AST level because another mailbox may have been received as well, however
+; the mailbox receipt routine is smart enough to realize this and will move
+; the contents of the reply we want into the synchronous mailbox buffer.  If
+; the buffer is unchanged, assume the transfer failed and we timed out.
+;
+	$HIBER_S			; Wait for mailbox AST or time out
+	CMPW	#MSG_ISSET,-		; Message acknowledged?
+		SYNCH_MBBUF+MB_W_WHY
+	BEQL	70$			; BR if it was
+	ADDL3	#COMEF_EFN,-		 ; Timed out. Event already logged,...
+		SYNCH_MBBUF+MB_K_MISC,R0 ; ...
+	$SETEF_S EFN = R0		 ; ...so just recover
+70$:
+	$READEF_S EFN = #COMEF_EFN,-	    ; Check to see...
+		STATE = SYNCH_MBBUF+MB_K_MISC+4
+	ROTL	SYNCH_MBBUF+MB_K_MISC,-	    ; ...if the bit we wanted...
+		#1,R11
+	CMPL	SYNCH_MBBUF+MB_K_MISC+4,R11 ; ...got set
+	BEQL	80$			; BR if it did
+	ROTL	SYNCH_MBBUF+MB_B_RECEIVER,- ; Bit wasn't set, log the error...
+		#1,R0
+	BISL2	R0,MA_L_DOSETFAIL(R6)	    ; ...
+	ADDL3	#COMEF_EFN,-		 ; Event is now logged,...
+		SYNCH_MBBUF+MB_K_MISC,R0 ; ...
+	$SETEF_S EFN = R0		 ; ...so just recover
+80$:
+
+;
+; We're going through the available processors one-by-one to set random bits
+; in the common event flag.  Now use the flag bit in a function to determine
+; a random processor to clear that bit.
+;
+	ROTL	SYNCH_MBBUF+MB_K_MISC,-	      ; This nonsense...
+		GS_L_AVAILABLE(R7),R11
+	FFS	#0,#32,R11,R11		      ; ...allows us...
+	BNEQ	90$			      ; (Catch pathological case -)
+	ADDL3	SYNCH_MBBUF+MB_K_MISC,-	      ; ( - prevent hassles )
+		MA_B_MYPORT(R6),R11	      ; ( if no one can send mail!)
+90$:
+	SUBL2	SYNCH_MBBUF+MB_K_MISC,R11     ; ...to pick...
+	BGEQ	100$			      ; ...a random processor...
+	ADDL2	#32,R11			      ; ...to...
+100$:
+	MOVB	R11,SYNCH_MBBUF+MB_B_RECEIVER ; ...
+	MOVW	#MSG_DOCLEAR,-		      ; ...clear the bit just set
+		SYNCH_MBBUF+MB_W_WHY
+	MOVL	R11,R0			; Include the port number...
+	BSBW	HEXUNIT			; ...
+	MOVZWL	SYNCH_MBPTR,R4		; ...
+	MOVB	R0,SYNCH_MBNAM-1(R4)	; ...in the mailbox name
+	$CREMBX_S CHAN = SYNCH_MBCHN,-	; Establish a link to other proc's MB
+		LOGNAM = SYNCH_MBPTR
+	MOVL	#DOCLEAR_TIMEOUT,SYNCH_MBDAY ; $SETIMR parameters - DAYTIM...
+	MCOML	#0,SYNCH_MBDAY+4	     ; ...
+	INSV	#MSG_DOCLEAR,#16,#16,R4	     ; ...REQIDT...
+	INSV	SYNCH_MBBUF+MB_B_RECEIVER,-  ; ...
+		#8,#8,R4
+	MOVB	MA_W_UNIT(R6),R4	     ; ...
+	$SETIMR_S DAYTIM = SYNCH_MBDAY,-    ; A timer will let us know...
+		  ASTADR = MB_TIMEOUT_AST,- ; ...if the other processor...
+		  REQIDT = R4		    ; ...doesn't reply to the following
+	ROTL	SYNCH_MBBUF+MB_B_RECEIVER,- ; We're sending some mail...
+		#1,R0
+	BISL2	R0,MA_L_DOCLEAR(R6)	; ...so log that we expect a reply
+	$QIO_S	CHAN = SYNCH_MBCHN,-	; Tell another processor to clear a bit
+		FUNC = #IO$_WRITEVBLK,-
+		IOSB = SYNCH_MBISB,-
+		P1   = SYNCH_MBBUF,-
+		P2   = #MB_K_END
+	BLBS	SYNCH_MBISB,110$	; BR if mail was sent correctly
+	MOVZWL	SYNCH_MBISB,R0
+	BSBW	MB_QIO_ERROR		; Warn of the error
+110$:
+	$DASSGN_S CHAN = SYNCH_MBCHN	; We no longer need the MB
+
+;
+; Again, for the same reasons as above, we must wait.  Likewise, the mailbox
+; AST routine and the mailbox timeout routine will act on our buffer as they
+; did before.
+;
+	$HIBER_S			; Wait for mailbox AST or time out
+	CMPW	#MSG_ISCLEAR,-		; Message acknowledged?
+		SYNCH_MBBUF+MB_W_WHY
+	BEQL	120$			; BR if it was
+	ADDL3	#COMEF_EFN,-		 ; Timed out. Event already logged,...
+		SYNCH_MBBUF+MB_K_MISC,R0 ; ...
+	$CLREF_S EFN = R0		 ; ...so just recover
+120$:
+	$READEF_S EFN = #COMEF_EFN,-	; Check to see if the bit we wanted...
+		STATE = SYNCH_MBBUF+MB_K_MISC+4
+	TSTL	SYNCH_MBBUF+MB_K_MISC+4	; ...got cleared
+	BEQL	130$			; BR if it did
+	ROTL	SYNCH_MBBUF+MB_B_RECEIVER,- ; Bit wasn't cleared,...
+		#1,R0
+	BISL2	R0,MA_L_DOCLEARFAIL(R6)	    ; ...log the error
+	ADDL3	#COMEF_EFN,-		 ; Event is now logged,...
+		SYNCH_MBBUF+MB_K_MISC,R0 ; ...
+	$CLREF_S EFN = R0		 ; ...so just recover
+130$:
+	SUBL3	R8,R10,R11		; Get number of bits we searched
+	INCL	R11			; Correct off-by-one (inclusive search)
+	SUBL2	R11,R9			; Adjust number of bits left to search
+	ADDL3	#1,R10,R8		; Point to new first bit to search
+	BRW	40$			; Loop thru all procs on this memory
+140$:
+	$DACEFC_S EFN = #COMEF_EFN	; Disassociate from shared CEF cluster
+	CLRL	GS_L_CEF_FLAG(R7)	; Release the interlock
+150$:
+	ADDL2	(R6),R6			; Point to node for next memory
+	CMPL	#UNIT_LIST,R6		; Back at the start of the queue?
+	BEQL	160$			; BR if we are - we're finished
+	BRW	10$			; More to go so loop
+160$:
+
+MEM_INTERLOCK:
+;+
+;	Start the part of the test which tests use of interlocking instructions
+;	in the shared memory.  There is an interlock (please forgive the
+;	overloading of the word "interlock") longword in the interprocessor
+;	global section for this part of the test.  If we can't get that lock
+;	for a given memory, try to get it for the next memory or proceed to the
+;	next part of the test.  If we do get it, send mail to each processor
+;	connected to the memory instructing the processor to drop everything
+;	else that it is doing and begin the interlocking test.
+;-
+
+; NOTE WELL!  Within the following loop, registers R6 through R10 are set and
+; assumed to remain unchanged.
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6	; R6 points to node for current memory
+10$:
+	MOVL	MA_Q_COMGSRAD(R6),R7	; Point to the start of interproc GS
+	BBSSI	#0,GS_L_INTLK_FLAG(R7),20$ ; Try to grab interlock
+	MOVB	MA_B_MYPORT(R6),-	; Bit was clear...
+		GS_L_INTLK_FLAG+3(R7)
+	BRB	30$			; ...my port has the interlock
+20$:
+	BRW	210$			; Bit was set, someone else has it
+30$:
+	CLRQ	GS_L_PARTICIPATING(R7)	; Clear participating and finished masks
+	MOVC5	#0,(R7),#0,-		; Clear the common ADAWI words...
+		#<PROCESSOR_MAX+1>*4,-	; ...and the private ADAWI words
+		GS_L_ADAWI_COM(R7)
+	CLRQ	GS_Q_BUSY(R7)		; Set up the busy queue...
+	CLRQ	GS_Q_FREE(R7)		; ...clear out the free queue...
+	MOVL	#COMGS_QUEUE_MAX,R11	; ...and then set it up...
+	MOVAL	GS_K_Q_ENTRIES(R7),R5	; ...
+40$:
+	INSQHI	(R5),GS_Q_FREE(R7)	; Put an entry on the free queue
+	ADDL2	#16,R5			; Skip flink, blink, port, filler
+	SOBGTR	R11,40$
+	MOVC5	#0,(R7),#0,#PROCESSOR_MAX*2,- ; Clear out the counters...
+		GS_K_Q_COUNT(R7)	      ; ...for each processor's entries
+
+	CLRL	R8			; R8 is STRTPOS for FFS operations
+	MOVL	#PROCESSOR_MAX,R9	; R9 is SIZE for FFS operations
+50$:
+	FFS	R8,R9,GS_L_AVAILABLE(R7),R10 ; Search for a willing processor
+	BNEQ	60$			; BR if we found one
+	BRW	100$			; BR if there are none left
+60$:
+
+;
+; If, as in the other sections, the current processor were treated just like
+; any other, it, too, would get mail, drop everything, and proceed to the
+; code which did the actual testing.  That would cause a problem unless the
+; current processor were the last one to receive the mail, an unlikely
+; circumstance.  Make the current processor a special case, then, and don't
+; send it mail.  Instead, after all the other mail is sent, simulate the
+; necessary portions of the other processors' code when the mail is received
+; and go to the code which does the actual testing.
+;
+	CMPB	MA_B_MYPORT(R6),R10	; Did I pick my processor?
+	BNEQ	70$
+	BRW	90$			; BR if so - I don't get my own mail
+70$:
+	MOVB	MA_B_MYPORT(R6),-	      ; Start filling in message...
+		SYNCH_MBBUF+MB_B_SENDER	      ; ...sender's port number...
+	MOVB	R10,SYNCH_MBBUF+MB_B_RECEIVER ; ...receiver's port number...
+	MOVB	MA_W_UNIT(R6),-		      ; ...unit no. of shared memory...
+		SYNCH_MBBUF+MB_B_UNIT
+	MOVW	#MSG_INTERLOCK,-	      ; ...reason for message
+		SYNCH_MBBUF+MB_W_WHY
+	MOVC3	MA_Q_COMMBNAM(R6),-	      ; Form the logical name...
+		MA_T_COMMBNAM(R6),SYNCH_MBNAM ; ...of other processor's MB
+	MOVL	MA_Q_COMMBNAM(R6),SYNCH_MBPTR ; Form descriptor to...
+	MOVAL	SYNCH_MBNAM,SYNCH_MBPTR+4     ; ...the logical name
+	MOVL	R10,R0			; Include the port number...
+	BSBW	HEXUNIT			; ...
+	MOVB	R0,-1(R3)		; ...in the name
+	$CREMBX_S CHAN = SYNCH_MBCHN,-	; Establish a link to other proc's MB
+		LOGNAM = SYNCH_MBPTR
+; Note that no timer is set - we assume any processor which will start will do
+; so as soon as possible.
+	$QIO_S	CHAN = SYNCH_MBCHN,-	; Tell the other processor to...
+		FUNC = #IO$_WRITEVBLK,-	; ...test memory interlocking
+		IOSB = SYNCH_MBISB,-
+		P1   = SYNCH_MBBUF,-
+		P2   = #MB_K_END
+	BLBS	SYNCH_MBISB,80$		; BR if mail was sent correctly
+	MOVZWL	SYNCH_MBISB,R0
+	BSBW	MB_QIO_ERROR		; Warn of the error
+80$:
+	$DASSGN_S CHAN = SYNCH_MBCHN	; We no longer need the MB
+90$:
+	SUBL3	R8,R10,R11		; Get number of bits we searched
+	INCL	R11			; Correct off-by-one (inclusive search)
+	SUBL2	R11,R9			; Adjust number of bits left to search
+	ADDL3	#1,R10,R8		; Point to new first bit to search
+	BRW	50$			; Loop thru all procs on this memory
+100$:
+	MOVAL	110$,INTERLOCK_SAVED_PC	; Set up pseudo return address
+	MOVL	R6,INTERLOCK_SAVED_R6	; Leave vital register where expected
+	CLRW	INTERLOCK_SAVED_PSW	; Define a PSW
+	BRW	INTERLOCKING_TEST	; Go thrash memory interlock feature
+
+;
+; We return here by way of a JMP at the end of the interlocking test code.
+; We've finished our portion of the test; it's a fair guess to say that other
+; processors are probably close to finishing also.  However, to be on the safe
+; side, allow some extra time for them to finish.  We'll know they're finished
+; because the mask of processors which have finished will be the same as the
+; mask as those which started.
+; 
+110$:
+	CLRL	R11			; Clear out our counter
+120$:
+	CMPL	GS_L_PARTICIPATING(R7),- ; Has everyone finished yet?
+		GS_L_FINISHED(R7)
+	BEQL	130$			; BR if they have
+	$SCHDWK_S DAYTIM = ONE_SECOND	; Wait a second...
+	$HIBER_S			; ...if they haven't
+	AOBLSS	#INTERLOCK_LIMIT,R11,120$ ; Loop a reasonable number of times
+	MOVL	SP,R11			; We timed out. R11 will cleanup stack
+	PUSHL	MA_W_UNIT(R6)		; Set up for $FAOL - PRMLST on stack
+	PUSHAL	MA_Q_MEMNAM(R6)
+	XORL3	GS_L_PARTICIPATING(R7),- ; Figure which processors didn't finish
+		GS_L_FINISHED(R7),R0
+	BSBW	MASK_2_ARGLST		; Enter their port numbers for $FAOL
+	MOVL	SP,R10			
+	$FAOL_S	CTRSTR = INTLK_TIMEOUT,- ; Form message to warn of the error
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		PRMLST = (R10)
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_WARNING
+	CALLS	#3,G^LIB$SIGNAL
+	MOVL	R11,SP			; Remove $FAOL arg list from stack
+	BRW	200$			; Consistency checking is useless
+130$:
+
+;
+; To see if the memory interlocking worked correctly, we check the results of
+; the two tests performed.  For the ADAWI test, the common longword should
+; equal the sum of the private longwords.  For the queue test, the busy queue
+; should be empty, all entries should be on the free queue and no processor
+; should have any queue entries outstanding.
+;
+	CLRL	R11			; Initialize sum
+	CLRL	R5			; Initialize counter and pointer
+140$:
+	ADDL2	GS_K_ADAWI_PVT(R7)[R5],R11 ; Add in this processor's count
+	AOBLSS	#PROCESSOR_MAX,R5,140$	; Loop through all count longwords
+	CMPL	GS_L_ADAWI_COM(R7),R11	; Expected sum equal actual sum?
+	BEQL	150$			; BR if it is
+	MOVAL	IADAWI,R0
+	BSBW	DO_FAO_SIGNAL		; Inconsistent ADAWI sums
+150$:
+
+	TSTL	GS_Q_BUSY(R7)		; Is the busy queue empty?
+	BNEQ	190$			; BR if it isn't
+	TSTL	GS_Q_BUSY+4(R7)		; Same question
+	BNEQ	190$			; BR if it isn't
+
+	CLRL	R5			; Initialize counter and pointer
+160$:
+	TSTW	GS_K_Q_COUNT(R7)[R5]	; Any entries for this processor?
+	BNEQ	190$			; BR if there are - we're screwed up
+	AOBLSS	#PROCESSOR_MAX,R5,160$	; Loop to check all processors
+
+ 	TSTL	GS_Q_FREE(R7)		; Anything on free queue?
+	BEQL	190$			; BR if not - all screwed up
+	MOVAL	GS_Q_FREE(R7),R11	; Point to header of free queue
+	MOVL	R11,R4			; Set up a constant to compare with
+	MOVL	#COMGS_QUEUE_MAX,R5	; Initialize counter
+170$:
+	ADDL2	(R11),R11		; Point to the next queue entry
+	DECL	R5			; Count down entries in queue
+	BLSS	180$			; BR if we've examined all entries
+	CMPL	R4,R11			; Pointing back at the header now?
+	BEQL	190$			; Shouldn't be!  BR if we are
+	BRB	170$			; See where the next entry points us
+180$:
+	CMPL	R4,R11			; All entries counted, back at header?
+	BEQL	200$			; We're OK - go clean up
+190$:
+	MOVAL	IQUEUE,R0
+	BSBW	DO_FAO_SIGNAL		; Queues or queue counts screwed up
+200$:
+	CLRL	GS_L_INTLK_FLAG(R7)	; Release the interlock
+210$:
+	ADDL2	(R6),R6			; Point to node for next memory
+	CMPL	#UNIT_LIST,R6		; Back at the start of the queue?
+	BEQL	220$			; BR if we are - we're finished
+	BRW	10$			; More to go so loop
+220$:
+	BRW	NEXT_ITERATION		; Pass over INTERLOCKING_TEST
+
+INTERLOCKING_TEST:
+;+
+;	We reach this point by two routes.  The simple one is a branch from the
+;	code at MEM_INTERLOCK.  In that case, this processor owns the lock for
+;	this memory and executes the test synchronously.  Other processors have
+;	been sent mailboxes and will join in the testing as soon as they can.
+;	If, on the other hand, we are one of the processors which was off in
+;	some other part of the test and suddenly got a mailbox AST, this code
+;	is being executed asynchronously as the result of changing the return
+;	address in some call frame.  In either case, two longwords have been
+;	set up with necessary information:  the value of R6 (the address of
+;	the node for the memory in which the interlocking will be tested) and
+;	the "real" return address, to which we branch when finished testing.
+;-
+
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,-	; ALL registers must be saved
+		R6,R7,R8,R9,R10,R11>
+	MOVL	INTERLOCK_SAVED_R6,R6	; Set up vital registers - node...
+	MOVL	MA_Q_COMGSRAD(R6),R7	; ...and base of interprocessor GS
+	MOVZBL	MA_B_MYPORT(R6),R8	      ; Set up to say that...
+	BBSSI	R8,GS_L_PARTICIPATING(R7),10$ ; ...we're participating
+10$:
+
+;
+; For the first test of memory interlocking, we will try to force collisions
+; using the add-aligned-word-interlocked instruction.  Each processor
+; increments in parallel a longword reserved to that processor and a longword
+; accessed in common.  The sum of the private longwords should equal the value
+; in the common longword.
+;
+	MOVAL	GS_K_ADAWI_PVT(R7)[R8],R8 ; Set up pointer to my own counter...
+	CLRL	R9			  ; ...and a loop counter
+20$:
+	ADAWI	#1,GS_L_ADAWI_COM(R7)	; Increment the common word
+	BCC	30$			; BR if no carry
+	ADAWI	#1,GS_L_ADAWI_COM+2(R7)	; Increment common overflow word
+30$:
+	ADAWI	#1,(R8)			; Increment my private word
+	BCC	40$			; BR if no carry
+	ADAWI	#1,2(R8)		; Increment my private overflow word
+40$:
+	AOBLSS	#ADAWI_LIMIT,R9,20$	; Loop until counter is exhausted
+
+;
+; For the second test of memory interlocking, processors will take an entry
+; from a "free" queue and add it to a "busy" queue.  They will keep count in
+; a per processor area of the number of entries they have in the busy queue.
+; When the free queue is exhausted, processors will start to remove queue
+; entries (anyone's) from the busy queue and replace them in the free queue,
+; decrementing the appropriate count.  The sequence repeats a specified number
+; of times.  When the dust dies down, each processor's count should be zero,
+; the busy queue empty and the free queue full (the same as our initial state).
+;
+	MOVZBL	MA_B_MYPORT(R6),R8	; Set up a pointer to...
+	MOVAW	GS_K_Q_COUNT(R7)[R8],R8	; ...my counter
+	CLRL	R9			; Clear loop counter
+110$:
+	REMQHI	GS_Q_FREE(R7),R10	; Pick off a "free" queue entry
+	BVC	120$			; BR if we got one from the queue
+	BCS	110$			; BR if secondary interlock failed
+	BRB	140$			; Queue is empty, start refilling it
+120$:
+	MOVZBL	MA_B_MYPORT(R6),8(R10)	; Mark the entry as mine
+130$:
+	INSQHI	(R10),GS_Q_BUSY(R7)	; Put the entry in the "busy" queue
+	BCS	130$			; BR if secondary interlock failed
+	ADAWI	#1,(R8)			; Count my entries in the busy queue
+	BRB	110$			; Loop until free queue is exhausted
+140$:
+	REMQTI	GS_Q_BUSY(R7),R10	; Pick off a "busy" queue entry
+	BVC	150$			; BR if we got one from the queue
+	BCS	140$			; BR if secondary interlock failed
+	BRB	170$			; Queue is empty, count an iteration
+150$:
+	MOVL	8(R10),R11		; Who owned this entry?
+	ADAWI	#-1,GS_K_Q_COUNT(R7)[R11] ; Decrement the owner's count
+160$:
+	INSQTI	(R10),GS_Q_FREE(R7)	; Replace the entry in the free queue
+	BCS	160$			; BR if secondary interlock failed
+	BRB	140$			; Loop until busy queue is empty
+170$:
+	AOBLSS	#QUEUE_LIMIT,R9,110$	; Loop until counter is exhausted
+
+;
+; This processor has finished its share of the memory interlock test.  However
+; the success or failure of the test can be checked only by the initiating
+; processor and then only when all processors which indicated that they were
+; participating have indicated that they finished.  So for now, just indicate
+; that we're done.
+;
+	BBSSI	MA_B_MYPORT(R6),-	; Say that we've finished
+		GS_L_FINISHED(R7),200$
+200$:
+	POPR	#^M<R0,R1,R2,R3,R4,R5,-	; ALL registers must be restored
+		R6,R7,R8,R9,R10,R11>
+; Although the following instructions leave open a small window, the ordering
+; is necessary so that the PSW value be retained.  The window may be hit if
+; this processor was so slow that the processor owning the interprocessor
+; interlock timed out waiting for it, released the lock, had another processor
+; grab the lock and the second owning processor sent mail to this
+; processor for the interlock test.  In that case, INTERLOCK_SAVED_PC will be
+; overwritten with the address of one of the three instructions following.
+	CLRL	INTERLOCK_SAVED_R6	; Clear my internal interlock
+	BICPSW	#<SF$M_C!SF$M_V!SF$M_Z!SF$M_N> ; Reset...
+	BISPSW	INTERLOCK_SAVED_PSW	       ; ...the PSW
+	JMP	@INTERLOCK_SAVED_PC	; Return to synchronous testing
+
+NEXT_ITERATION:
+	INCL	ITERATION		; Increment iteration count
+	BITW	#TEST_OVERM,FLAG	; Is the test over?
+	BNEQ	SUC_EXIT		; BR if yes
+	BRW	ONEPROC_GS		; Loop until the test is over
+
+SUC_EXIT:
+	CALLS	#0,ERROR_SUMMARY	; Print any error statistics
+	$TRNLOG_S LOGNAM = MODE,-
+		  RSLLEN = BUFFER_PTR,-
+		  RSLBUF = FAO_BUF	; Get the run mode
+	BICB2	#LC_BITM,BUFFER		; Convert to upper case
+	CMPB	#^A/L/,BUFFER		; Is this a loop for ever?
+	BNEQ	10$			; BR if not
+	BICW2	#TEST_OVERM,FLAG	; Reset the termination flag
+	INCL	PASS			; Bump the pass count
+	$FAO_S	CTRSTR = PASS_MSG,-
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = PASS,-
+		P2     = ITERATION,-
+		P3     = #0		; Make the end of pass message
+	PUSHAL	BUFFER_PTR		; Push the string desc.
+	PUSHL	#1			; Push arg count
+	PUSHL	#UETP$_TEXT!STS$K_INFO	; Push the signal name
+	CALLS	#3,G^LIB$SIGNAL		; Print the end of pass message
+	CLRL	ITERATION		; Reset the iteration count
+	$SETIMR_S DAYTIM = THREEMIN,-	; Set a new timer AST for 3 minutes
+		  ASTADR = TIME_OUT,-
+		  EFN    = #EFN2
+	BRW	ONEPROC_GS		; Start next pass, avoiding re-init
+10$:
+	BBC	#ONE_SHOTV,FLAG,20$	; Skip following unless one-shot mode
+	$WAITFR_S EFN = #SPRGS_EFN	; Allow $UPDSEC to finish - otherwise...
+					; ...we exit, turn off ASTs and never...
+					; ...check data validity
+20$:
+	MOVL	#SS$_NORMAL!STS$M_INHIB_MSG,- ; Set successful exit status
+		STATUS
+	$EXIT_S STATUS			; Exit with the status
+
+	.SBTTL	Quickie Subroutines
+;++
+; FUNCTIONAL DESCRIPTION:
+;	...being a set of short subroutines not worthy of much comment.
+;
+; TYPICAL CALLING SEQUENCE:
+;	MOVx	arg,R0
+;	BSBW	subroutine
+;	result returned in R0
+;
+; INPUT PARAMETERS:
+;	defined for each routine
+;
+; OUTPUT PARAMETERS:
+;	defined for each routine
+;
+;--
+
+;
+; Given the unit number of a multiport memory (one byte), return its
+; ASCII equivalent.  Routine is very trusting.
+;
+HEXUNIT:
+	CMPB	#9,R0			; Is unit within decimal digits?
+	BGEQ	10$			; BR if it is
+	ADDB2	#<^A/A/-10>,R0		; Add a kludge factor if it isn't
+10$:
+	ADDB2	#^A/0/,R0		; Convert hex to ASCII
+	RSB
+
+
+;
+; Given the address of a buffer of longwords in R1 and the buffer size in
+; longwords in R0, fill the buffer with pseudo-random data.
+;
+RANDOM_FILL:
+	ADDL2	RANDOM2,RANDOM1		; Create a "random" longword
+	MOVL	RANDOM1,(R1)+		; Stuff it in our buffer...
+	SOBGTR	R0,RANDOM_FILL		; ...until the buffer is full
+	RSB
+
+
+;
+; Given an IOSB from a $QIO which tried to send mail, print a useful error
+; message.  R0 has the status from the IOSB.
+; NOTE:  THIS ROUTINE EXECUTES BOTH SYNCHRONOUSLY AND AT AST LEVEL!
+;
+MB_QIO_ERROR:
+	TSTW	R0			; Do we have a real error?
+	BEQL	10$			; BR if not - I/O not complete
+	MOVZWL	R0,-(SP)
+	PUSHAL	BAD_MB_QIO
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_WARNING
+	CALLS	#4,G^LIB$SIGNAL
+10$:
+	RSB
+
+;
+; Take a bit mask in R0 and from it produce a list on the stack of those bit
+; positions in R0 which have a 1 in them.  The list is suitable for use with
+; the !#() $FAO directive.  R0 returns the number of items in the list and R1
+; is trashed.
+;
+MASK_2_ARGLST:
+	POPR	#^M<R1>			; Save our return address
+	PUSHL	#0			; Set up counter on stack
+10$:
+	TSTL	R0			; Will FFS find any bits?
+	BEQL	20$			; BR if it won't
+	ADDL3	#1,(SP),-(SP)		; Count one it will find into new counter
+	FFS	#0,#32,R0,4(SP)		; Find a lit bit, save its position
+	BBSC	4(SP),R0,10$		; Ensure we find it only once. Look for next
+20$:
+	MOVL	(SP),R0			; Return subroutine value
+	JMP	(R1)			; RSB, a la kludge
+
+
+;
+; Given the address of an $FAO control string in R0, do a "typical" call to the
+; $FAO system service - a call which includes only the shared memory name and
+; its unit number.  Registers are the result of the $FAO.  Assumes that we are
+; "typical" in that R6 contains the address of the unit block of the current
+; memory.
+;
+DO_FAO:
+	PUSHR	#^M<R11>		; Save register
+	MOVAL	MA_Q_MEMNAM(R6),R11	; Set up $FAO parameter
+	$FAO_S	CTRSTR = (R0),-
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R11,-
+		P2     = MA_W_UNIT(R6)
+	POPR	#^M<R11>		; Restore used register
+	RSB
+
+
+;
+; With the same inputs as the DO_FAO subroutine, do the $FAO and follow it
+; by a call to LIB$SIGNAL which treats the result of the $FAO as a warning
+; message.  Registers are the result of the LIB$SIGNAL.
+;
+DO_FAO_SIGNAL:
+	BSBB	DO_FAO			; Get the $FAO over with
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_WARNING
+	CALLS	#3,G^LIB$SIGNAL
+	RSB
+
+;
+; Similar to DO_FAO_SIGNAL, but instead of printing a warning prints an info
+; message.
+;
+DO_FAO_INFO:
+	BSBB	DO_FAO			; Get the $FAO over with
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_INFO
+	CALLS	#3,G^LIB$SIGNAL
+	RSB
+
+
+;
+; Similar to DO_FAO_SIGNAL, but instead of doing the call to LIB$SIGNAL, die
+; by way of ERROR_EXIT, which does its own call to LIB$SIGNAL.  No return.
+;
+DO_FAO_EXIT:
+	BSBB	DO_FAO			; Get the $FAO over with
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHL	#3
+	BRW	ERROR_EXIT
+
+	.SBTTL	Routine to Get System and Processor Version Info
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Return the internal version number of VAX/VMS on our CPU and the
+;	hardware ECO level of our CPU.
+;
+; CALLING SEQUENCE:
+;	$CMKRNL_S ROUTIN = SYS_INFO,-
+;		  ARGLST = argument-list-as-described-below
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	@04(AP) - Address of quadword VMS version number and ASCII string
+;	@08(AP) - Address of londword with CPU ECO level
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	SS$_NORMAL
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+SYS_INFO:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	MOVQ	G^SYS$GQ_VERSION,@04(AP) ; Return the VAX/VMS version
+	MFPR	#PR$_SID,R0		; Get ECO level and other misc stuff
+; NOTE:  When this test was written, only 11/780 CPUs had shared memory.  Since
+; the format of the contents of this register is processor dependent, the test
+; must be modified to return the proper information should other CPUs
+; eventually run the test.  Known formats for PR$_SID are:
+;	11/780	<31:24>	1
+;		<23:15>	ECO level
+;		<14:00>	plant number and serial number
+;	11/750	<31:24>	2
+;		<23:16>	0
+;		<15:08>	microcode revision level
+;		<07:00>	hardware revision level
+	EXTZV	#15,#9,R0,@08(AP)	; Return ECO level, only
+	MOVL	#SS$_NORMAL,R0		; We're always successful
+	RET
+
+	.SBTTL	Shared Memory Name Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Given the unit number of a shared memory, extract from the SHD and ADP
+;	the corresponding memory name and name length and the port to which our
+;	CPU is connected.
+;
+; CALLING SEQUENCE:
+;	$CMKRNL_S ROUTIN = SHM_INFO,-
+;		  ARGLST = argument-list-as-described-below
+;
+; INPUT PARAMETERS:
+;	@04(AP) - Unit number of multiport memory
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	@08(AP) - Byte address for shared memory port connected to our CPU
+;	@12(AP) - Character address for name of this multiport memory
+;	@16(AP) - Word address for length of memory name
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	SS$_NORMAL
+;	UETP$_DENOSU if no arglist supplied or can't find specified unit
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+SHM_INFO:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	TSTL	AP			; Were we supplied an argument list?
+	BEQL	30$			; BR if not
+	MOVL	G^EXE$GL_SHBLIST,R6	; Point to SHB list
+	BEQL	30$			; BR if none - can't find ours
+10$:
+	MOVL	SHB$L_ADP(R6),R7	; Get ADP pointer
+	BEQL	30$			; BR if there is none - we've goofed
+	CMPB	SHB$B_NEXUS(R6),-	; Does ADP match our SHB?
+		ADP$W_TR(R7)
+	BNEQ	30$			; BR if not - someone goofed
+	MOVL	ADP$L_CSR(R7),R7	; Get CSR of adapter
+	BEQL	30$			; BR if something is screwey
+	MOVL	MPM$L_MR(R7),R7		; (I/O space reference restriction)
+	EXTZV	#MPM$V_MR_UNIT,-	; Get the unit number of our memory
+		#MPM$S_MR_UNIT,R7,R7
+	CMPW	@04(AP),R7		; Got the right memory unit?
+	BNEQ	20$			; BR if not
+	MOVL	SHB$L_DATAPAGE(R6),R7	; Got correct memory. Get its SHD
+	MOVZBW	SHD$T_NAME(R7),@16(AP)	; Get the length of the memory name...
+	MOVC3	@16(AP),-		; ...and the name itself
+		SHD$T_NAME+1(R7),@12(AP)
+	MOVB	SHB$B_PORT(R6),@08(AP)	; Return the port connected to our CPU
+	MOVL	#SS$_NORMAL,R0		; We've succeeded
+	RET
+20$:
+	MOVL	SHB$L_LINK(R6),R6	; Check the next SHB
+	BNEQ	10$			; BR if there is one...
+					; ...else fall into error return
+30$:
+	MOVL	#<UETP$_DENOSU&^C7!STS$K_ERROR>,R0 ; Something is awry
+	RET
+
+	.SBTTL	$UPDSEC AST Routine for Single Processor Section
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine gets called at AST level whenever the $UPDSEC finishes
+;	for a single processor global section.  It takes care of verifying the
+;	data and cleaning up the section.
+;
+; CALLING SEQUENCE:
+;	Called as an AST in user mode
+;
+; INPUT PARAMETERS:
+;	ASTPRM is the address of the node for the memory with the section.
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Section is verified, virtual addresses deleted, section deleted and
+;	channel deassigned.
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+SPRGS_AST:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	MOVL	4(AP),R6		; Fetch pointer to node
+	BLBS	MA_Q_SPRGSISB(R6),20$	; BR if the $UPDSEC went well
+	CLRL	R7			; It bombed. Clear err msg arg counter
+	MOVZWL	MA_Q_SPRGSISB(R6),-(SP)	; Save the main reason for the error
+	BLBC	MA_Q_SPRGSISB+2(R6),10$	; BR if hardware was not a factor
+	PUSHAL	UPDSEC_HWE		; Hardware write error. Let user know
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	MOVL	#3,R7			; Save count of args for HWE
+10$:
+	BICB2	#UETUNT$M_TESTABLE,-	; The MPM is not testable...
+		UETUNT$B_FLAGS(R6)	; ...(as far as one-shot thinks)
+	MOVAL	MA_Q_MEMNAM(R6),R5	; Form $FAO parameter
+	$FAO_S	CTRSTR = UPDSEC_FAILED,- ; Form msg to say where error occurred
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R5,-
+		P2     = MA_W_UNIT(R6),-
+		P3     = MA_Q_SPRGSISB+4(R6)
+	PUSHAL	BUFFER_PTR		; NOTE: Although we use BUFFER and...
+	PUSHL	#1			; ...BUFFER_PTR here and synchronously...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; ...we should be safe because we exit
+	ADDL3	#4,R7,-(SP)		; Get total of args
+	BRW	ERROR_EXIT
+20$:
+	$DELTVA_S INADR = MA_Q_SPRGSRAD(R6) ; We don't need section any more...
+	$DGBLSC_S GSDNAM = MA_Q_SPRGSNAM(R6) ; ...
+	$DASSGN_S CHAN = MA_K_SPRFAB+FAB$L_STV(R6) ; ...
+	$OPEN	FAB = MA_K_CHKFAB(R6),-	; Reopen the file for the section
+		ERR = RMS_ERROR
+	BLBC	R0,40$			; Exit quickly if RMS file error
+	$CONNECT RAB = MA_K_CHKRAB(R6),-
+		 ERR = RMS_ERROR
+	$READ	RAB = MA_K_CHKRAB(R6),- ; Read the entire file
+		 ERR = RMS_ERROR
+	MOVAL	MA_K_CHKBUF(R6),R7	; Save address of check buffer
+	CMPC3	#WRITE_SIZE,-		; Did the file get updated OK?
+		MA_K_SPRBUF(R6),(R7)
+	BEQL	30$			; BR if it did
+	$CLOSE	FAB = MA_K_CHKFAB(R6)	; Allow us to delete file, later
+					; (ERR = is useless, ERROR_EXIT does $SETAST 0)
+	BICB2	#UETUNT$M_TESTABLE,-	; The MPM is not testable...
+		UETUNT$B_FLAGS(R6)	; ...(as far as one-shot thinks)
+	MOVZBL	(R3),-(SP)		; Bad update.  Save the bad byte...
+	MOVZBL	(R1),-(SP)		; ...the corresponding good byte...
+	SUBL3	R7,R3,-(SP)		; ...where in the buffer it was...
+	PUSHL	MA_W_UNIT(R6)		; ...the memory unit number...
+	PUSHAL	DEVDSC			; ...the controller...
+	PUSHL	#5			; ...the argument count...
+	PUSHL	#UETP$_DATAER!STS$K_ERROR ; ...and the error type
+	PUSHAL	BAD_UPDATE		; Tell what the error was from
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_ERROR
+	PUSHL	#10			; Count the args we pushed
+	BRW	ERROR_EXIT
+30$:
+	$CLOSE	FAB = MA_K_CHKFAB(R6),-	; We're finished with the file for now
+		ERR = RMS_ERROR
+40$:
+	RET				; In fact, we're quite finished
+
+	.SBTTL	Mailbox Received AST Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Interprocessor mailbox messages are received here.  Based on the
+;	MB_W_WHY field, dispatch to a section which will process the message.
+;
+; CALLING SEQUENCE:
+;	Called via AST upon receipt of a message to this processor's mailbox.
+;
+; INPUT PARAMETERS:
+;	04(AP) = address of the node for the shared memory through which the
+;		 message was sent
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+RCVMB_AST:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	MOVL	04(AP),R6		; Get the pointer to node for this MB
+	BLBS	AST_MBISB,10$		; BR if mail was sent correctly
+	MOVZWL	AST_MBISB,R0
+	BSBW	MB_QIO_ERROR		; Warn of the error
+10$:
+	CMPB	AST_MBBUF+MB_B_RECEIVER,- ; Do a minimal consistency check...
+		MA_B_MYPORT(R6)		  ; ...to see if message is for me
+	BNEQ	40$			; BR if it wasn't
+	CMPB	AST_MBBUF+MB_B_UNIT,-	; More consistency checking
+		MA_W_UNIT(R6)
+	BNEQ	40$			; BR if wrong unit
+	CMPW	#MSG_ME2ME,-		; I can legitimately send myself...
+		AST_MBBUF+MB_W_WHY	; ...mail anytime...
+	BEQL	20$			; ...so BR if I, in fact, did...
+	TSTL	MA_Q_COMGSRAD(R6)	; ...but other mail needs interproc GS
+	BNEQ	20$			; BR if interproc GS was set up
+	ROTL	AST_MBBUF+MB_B_SENDER,-	; It wasn't. Log that I...
+		#1,R0			; ...probably got mail...
+	BISL2	R0,MA_L_OLDSTUFF(R6)	; ...which was intended for...
+					; ...an image which died suddenly
+	BRB	EXIT_FROM_RCV		; Aside from that, ignore the mailbox
+
+20$:
+	CASEW	AST_MBBUF+MB_W_WHY,#1,-	; Dispatch based on message type
+		#MAX_MSG_TYPE
+	.MACRO	X	MBCODE,DUMMY	; A macro will define dispatch address
+		.WORD	RCV_'MBCODE-30$
+	.ENDM	X
+30$:
+	.SHOW	MEB
+	MAILBOX_MSG_TYPES		; Generate dispatch table
+	.NOSHOW	MEB
+
+40$:
+RCV_ME2MEDONE:				; Should never get mail with this code
+	MOVZWL	BUFFER_PTR,-(SP)	; Save stuff...
+	MOVL	SP,R7			; ...that DO_FAO_SIGNAL...
+	SUBL2	(SP),SP			; ...will overwrite at AST level...
+	MOVC3	(R7),BUFFER,(SP)	; ...which could be in progress
+	MOVAL	BAD_MSG_TYPE,R0
+	BSBW	DO_FAO_SIGNAL		; Warn that we have junk in our mailbox
+	MOVC3	(R7),(SP),BUFFER	; Restore possible old message
+	MOVL	R7,SP			; That done, restore the stack...
+	POPR	#^M<R7>			; ...and...
+	MOVW	R7,BUFFER_PTR		; ...other stuff which was clobbered
+	;BRW	EXIT_FROM_RCV		; Fall into common routine for exit
+
+;
+; All the routines dispatched via the above CASEW will exit through this little
+; routine.
+;
+EXIT_FROM_RCV:
+	$QIO_S	CHAN   = MA_W_SPRMBCHN(R6),- ; Read my mailbox...
+		FUNC   = #IO$_READVBLK,-     ; ...whenever someone writes to it
+		IOSB   = AST_MBISB,-
+		ASTADR = RCVMB_AST,-
+		ASTPRM = R6,-
+		P1     = AST_MBBUF,-
+		P2     = #MB_K_END
+	RET
+
+RCV_HELLO:
+;
+; Some processor is (re-)starting the test and wants to say hi.  It's sent
+; the date-time quadword that appears at the end of my private area in the
+; interprocessor global section.  If that turns out to be incorrect, let the
+; processor know by way of a return mailbox.  If the date-time is correct,
+; reply with a different message so saying and expect the processor to
+; acknowledge my message.  There is some code which will be common to either
+; path; get that out of the way first.  The code paths rejoin later.
+;
+	MOVB	AST_MBBUF+MB_B_SENDER,-	; The proc which sent now will receive
+		AST_MBBUF+MB_B_RECEIVER
+	MOVB	MA_B_MYPORT(R6),-	; I am the sender
+		AST_MBBUF+MB_B_SENDER
+	MOVC3	MA_Q_COMMBNAM(R6),-	    ; Form the logical name...
+		MA_T_COMMBNAM(R6),AST_MBNAM ; ...of the other processor's MB
+	MOVL	MA_Q_COMMBNAM(R6),AST_MBPTR ; Form descriptor of...
+	MOVAL	AST_MBNAM,AST_MBPTR+4	    ; ...the logical name
+	MOVL	AST_MBBUF+MB_B_RECEIVER,R0 ; Include the port number...
+	BSBW	HEXUNIT			   ; ...
+	MOVB	R0,-1(R3)		   ; ...in the mailbox name
+	$CREMBX_S CHAN = AST_MBCHN,-	; Establish a link to other proc's MB
+		LOGNAM = AST_MBPTR
+	; End of common code
+
+	CMPC3	#8,MA_Q_DAYTIME(R6),-	; Did I get passed my date-time?
+		AST_MBBUF+MB_K_MISC
+	BEQL	10$			; BR if I did
+	ROTL	AST_MBBUF+MB_B_RECEIVER,- ; I got passed trash, so...
+		#1,R0
+	BISL2	R0,MA_L_SBADCODE(R6)	  ; ...log the error
+	MOVW	#MSG_BADCODE,-		; Set up the reason for the mailbox
+		AST_MBBUF+MB_W_WHY
+	BRB	20$			; Rejoin common code
+10$:
+	MOVW	#MSG_ICU_UCME,-		; The reason for the mailbox
+		AST_MBBUF+MB_W_WHY
+	MOVL	#ICU_UCME_TIMEOUT,AST_MBDAY ; $SETIMR parameters - DAYTIM...
+	MCOML	#0,AST_MBDAY+4		    ; ...
+	INSV	AST_MBBUF+MB_B_RECEIVER,-   ; ...REQIDT...
+		#8,#8,R7
+	MOVB	MA_W_UNIT(R6),R7	    ; ...
+	INSV	#MSG_ICU_UCME,#16,#16,R7    ; ...
+	$SETIMR_S DAYTIM = AST_MBDAY,-	; We'll need a reply for this one
+		  ASTADR = MB_TIMEOUT_AST,-
+		  REQIDT = R7
+	ROTL	AST_MBBUF+MB_B_RECEIVER,- ; We're going to reply...
+		#1,R0
+	BISL2	R0,MA_L_ICU_UCME(R6)	  ; ...so log that we expect a return
+	;BRB	20$			; Rejoin common code
+20$:
+	$QIO_S	CHAN = AST_MBCHN,-	; Reply to the hello
+		FUNC = #IO$_WRITEVBLK,-
+		IOSB = AST_MBISB,-
+		P1   = AST_MBBUF,-
+		P2   = #MB_K_END
+	BLBS	AST_MBISB,30$		; BR if mail was sent correctly
+	MOVZWL	AST_MBISB,R0
+	BSBW	MB_QIO_ERROR		; Warn of the error
+30$:
+	$DASSGN_S CHAN = AST_MBCHN	; Free our hold on the mailbox
+	BRW	EXIT_FROM_RCV		; Exit via common routine
+
+RCV_ICU_UCME:
+;
+; A processor to which we've sent a hello message liked what we sent and is
+; trying to tell us so.  If we did indeed send the message, let the other
+; processor know that we received its mail.
+;
+	MOVZBL	AST_MBBUF+MB_B_SENDER,R0 ; Find out who sent us a message
+	BBSC	R0,MA_L_HELLO(R6),10$	; BR if we expected it...
+	ROTL	R0,#1,R0		; ...else...
+	BISL2	R0,MA_L_NOCAUSE(R6)	; ...log the error
+10$:
+	INSV	#MSG_HELLO,#16,#16,R7	; We've a reply to our hello...
+	INSV	AST_MBBUF+MB_B_SENDER,#8,#8,R7 ; ...
+	MOVB	MA_W_UNIT(R6),R7	; ...
+	$CANTIM_S REQIDT = R7		; ...so we need not worry time out
+
+	MOVB	AST_MBBUF+MB_B_SENDER,-	; The proc which sent now will receive
+		AST_MBBUF+MB_B_RECEIVER
+	MOVB	MA_B_MYPORT(R6),-	; I am the sender
+		AST_MBBUF+MB_B_SENDER
+	MOVC3	MA_Q_COMMBNAM(R6),-	    ; Form the logical name...
+		MA_T_COMMBNAM(R6),AST_MBNAM ; ...of the other processor's MB
+	MOVL	MA_Q_COMMBNAM(R6),AST_MBPTR ; Form descriptor of...
+	MOVAL	AST_MBNAM,AST_MBPTR+4	    ; ...the logical name
+	MOVL	AST_MBBUF+MB_B_RECEIVER,R0 ; Include the port number...
+	BSBW	HEXUNIT			   ; ...
+	MOVB	R0,-1(R3)		   ; ...in the mailbox name
+	$CREMBX_S CHAN = AST_MBCHN,-	; Establish a link to other proc's MB
+		LOGNAM = AST_MBPTR
+	MOVW	#MSG_BYEFORNOW,-	; The reason for the mailbox
+		AST_MBBUF+MB_W_WHY
+	$QIO_S	CHAN = AST_MBCHN,-	; Reply to the hello
+		FUNC = #IO$_WRITEVBLK,-
+		IOSB = AST_MBISB,-
+		P1   = AST_MBBUF,-
+		P2   = #MB_K_END
+	BLBS	AST_MBISB,20$		; BR if mail was sent correctly
+	MOVZWL	AST_MBISB,R0
+	BSBW	MB_QIO_ERROR		; Warn of the error
+20$:
+	$DASSGN_S CHAN = AST_MBCHN	; Free our hold on the mailbox
+	BRW	EXIT_FROM_RCV		; Exit via common routine
+
+RCV_BYEFORNOW:
+;
+; We've exchanged messages with a processor to say that we can see each other
+; and trade data via the interprocessor global section.  Clean up.
+;
+	MOVZBL	AST_MBBUF+MB_B_SENDER,R0 ; Find out who sent us a message
+	BBSC	R0,MA_L_ICU_UCME(R6),10$; BR if we expected it...
+	ROTL	R0,#1,R0		; ...else...
+	BISL2	R0,MA_L_NOCAUSE(R6)	; ...log the error
+10$:
+	INSV	#MSG_ICU_UCME,#16,#16,R7 ; We've gotten a reply to our reply...
+	INSV	AST_MBBUF+MB_B_SENDER,#8,#8,R7 ; ...
+	MOVB	MA_W_UNIT(R6),R7	; ...
+	$CANTIM_S REQIDT = R7		; ...so we need not worry time out
+
+	BRW	EXIT_FROM_RCV		; Exit via common routine
+
+RCV_BADCODE:
+;
+; Some processor thinks we sent it a bum messsage.  Log the error.
+;
+	INSV	#MSG_HELLO,#16,#16,R7	; We've a reply to our hello...
+	INSV	AST_MBBUF+MB_B_SENDER,#8,#8,R7 ; ...
+	MOVB	MA_W_UNIT(R6),R7	; ...
+	$CANTIM_S REQIDT = R7		; ...so we need not worry time out
+
+	MOVZBL	AST_MBBUF+MB_B_SENDER,R0 ; Find out who sent us a message
+	BBSC	R0,MA_L_HELLO(R6),10$	; BR if we expected it...
+	ROTL	R0,#1,R0		; ...else...
+	BISL2	R0,MA_L_NOCAUSE(R6)	; ...log the error
+	BRB	20$			; No need to log BADCODE if not our fault
+10$:
+	ROTL	AST_MBBUF+MB_B_SENDER,-	; We sent trash...
+		#1,R0
+	BISL2	R0,MA_L_RBADCODE(R6)	; ...so log the error
+20$:
+	BRW	EXIT_FROM_RCV		; Exit via common routine
+
+RCV_DOSET:
+;
+; Some processor wants us to set a bit in the shared common event flag cluster.
+; Set the bit and reply.
+;
+	$ASCEFC_S EFN = #COMEF_EFN,-	; Associate with interprocessor cluster
+		 NAME = MA_Q_COMEFNAM(R6)
+	ADDL3	#COMEF_EFN,-		; Figure which bit to set in it
+		AST_MBBUF+MB_K_MISC,R7
+	$SETEF_S EFN = R7		; Set the requested bit
+	CMPB	AST_MBBUF+MB_B_SENDER,-	; Did I ask myself to set the bit?
+		MA_B_MYPORT(R6)
+	BEQL	10$			; BR if so - I'll expect cluster on return
+	$DACEFC_S EFN = #COMEF_EFN	; Release the cluster
+10$:
+
+	MOVB	AST_MBBUF+MB_B_SENDER,-	; The proc which sent now will receive
+		AST_MBBUF+MB_B_RECEIVER
+	MOVB	MA_B_MYPORT(R6),-	; I am the sender
+		AST_MBBUF+MB_B_SENDER
+	MOVW	#MSG_ISSET,AST_MBBUF+MB_W_WHY ; Say that we've set the bit
+	MOVC3	MA_Q_COMMBNAM(R6),-	    ; Form the logical name...
+		MA_T_COMMBNAM(R6),AST_MBNAM ; ...of the other processor's MB
+	MOVL	MA_Q_COMMBNAM(R6),AST_MBPTR ; Form descriptor of...
+	MOVAL	AST_MBNAM,AST_MBPTR+4	    ; ...the logical name
+	MOVL	AST_MBBUF+MB_B_RECEIVER,R0 ; Include the port number...
+	BSBW	HEXUNIT			   ; ...
+	MOVB	R0,-1(R3)		   ; ...in the mailbox name
+	$CREMBX_S CHAN = AST_MBCHN,-	; Establish a link to other proc's MB
+		LOGNAM = AST_MBPTR
+	$QIO_S	CHAN = AST_MBCHN,-	; Let the other proc know...
+		FUNC = #IO$_WRITEVBLK,-	; ...that we've set the bit
+		IOSB = AST_MBISB,-
+		P1   = AST_MBBUF,-
+		P2   = #MB_K_END
+	BLBS	AST_MBISB,20$		; BR if mail was sent correctly
+	MOVZWL	AST_MBISB,R0
+	BSBW	MB_QIO_ERROR		; Warn of the error
+20$:
+	$DASSGN_S CHAN = AST_MBCHN	; Free our hold on the mailbox
+	BRW	EXIT_FROM_RCV		; Exit via common routine
+
+RCV_ISSET:
+;
+; A processor has let us know that a bit which we wanted to be set has been
+; set.  We really don't need to do anything about that here, but the
+; synchronous code testing the shared common event flag cluster needs to know
+; and is hibernating while waiting to be told.  Let the synchronous code know
+; that the bit has been set by modifying the synchronous mailbox buffer to the
+; extent of changing the reason for the mailbox.  Awaken the synchronous code.
+;
+	MOVZBL	AST_MBBUF+MB_B_SENDER,R0 ; Find out who sent us a message
+	BBSC	R0,MA_L_DOSET(R6),10$	; BR if we expected it...
+	ROTL	R0,#1,R0		; ...else...
+	BISL2	R0,MA_L_NOCAUSE(R6)	; ...log the error
+	BRW	EXIT_FROM_RCV		; Doing the rest could screw us up!
+10$:
+	INSV	#MSG_DOSET,#16,#16,R7	; We've gotten a reply to our...
+	INSV	AST_MBBUF+MB_B_SENDER,#8,#8,R7 ; ...request for setting an EF
+	MOVB	MA_W_UNIT(R6),R7	; ...
+	$CANTIM_S REQIDT = R7		; ...so we need not worry time out
+
+	MOVW	#MSG_ISSET,-		; Change the reason for the mailbox...
+		SYNCH_MBBUF+MB_W_WHY	; ...in the synchronous buffer
+	$WAKE_S				; Get the synchronous code moving again
+	BRW	EXIT_FROM_RCV		; Exit via common routine
+
+RCV_DOCLEAR:
+;
+; Some processor has requested that we clear a bit in the common event flag
+; cluster.  Clear the bit and reply.
+;
+	$ASCEFC_S EFN = #COMEF_EFN,-	; Associate with interprocessor cluster
+		 NAME = MA_Q_COMEFNAM(R6)
+	ADDL3	#COMEF_EFN,-		; Figure which bit to clear in it
+		AST_MBBUF+MB_K_MISC,R7
+	$CLREF_S EFN = R7		; Clear the requested bit
+	CMPB	AST_MBBUF+MB_B_SENDER,-	; Did I ask myself to clear the bit?
+		MA_B_MYPORT(R6)
+	BEQL	10$			; BR if so - I'll expect cluster on return
+	$DACEFC_S EFN = #COMEF_EFN	; Release the cluster
+10$:
+
+	MOVB	AST_MBBUF+MB_B_SENDER,-	; The proc which sent now will receive
+		AST_MBBUF+MB_B_RECEIVER
+	MOVB	MA_B_MYPORT(R6),-	; I am the sender
+		AST_MBBUF+MB_B_SENDER
+	MOVW	#MSG_ISCLEAR,-		; Say that the bit is cleared
+		AST_MBBUF+MB_W_WHY
+	MOVC3	MA_Q_COMMBNAM(R6),-	    ; Form the logical name...
+		MA_T_COMMBNAM(R6),AST_MBNAM ; ...of the other processor's MB
+	MOVL	MA_Q_COMMBNAM(R6),AST_MBPTR ; Form descriptor of...
+	MOVAL	AST_MBNAM,AST_MBPTR+4	    ; ...the logical name
+	MOVL	AST_MBBUF+MB_B_RECEIVER,R0 ; Include the port number...
+	BSBW	HEXUNIT			   ; ...
+	MOVB	R0,-1(R3)		   ; ...in the mailbox name
+	$CREMBX_S CHAN = AST_MBCHN,-	; Establish a link to other proc's MB
+		LOGNAM = AST_MBPTR
+	$QIO_S	CHAN = AST_MBCHN,-	; Let the other proc know...
+		FUNC = #IO$_WRITEVBLK,-	; ...that the bit is cleared 
+		IOSB = AST_MBISB,-
+		P1   = AST_MBBUF,-
+		P2   = #MB_K_END
+	BLBS	AST_MBISB,20$		; BR if mail was sent correctly
+	MOVZWL	AST_MBISB,R0
+	BSBW	MB_QIO_ERROR		; Warn of the error
+20$:
+	$DASSGN_S CHAN = AST_MBCHN	; Free our hold on the mailbox
+	BRW	EXIT_FROM_RCV		; Exit via common routine
+
+RCV_ISCLEAR:
+;
+; A processor has let us know that a bit which we wanted to be cleared has been
+; cleared.  We really don't need to do anything about that here, but the
+; synchronous code testing the shared common event flag cluster needs to know
+; and is hibernating while waiting to be told.  Let the synchronous code know
+; that the bit has been cleared by modifying the synchronous mailbox buffer to
+; the extent of changing the reason for the mailbox.  Awaken the synchronous
+; code.
+;
+	MOVZBL	AST_MBBUF+MB_B_SENDER,R0 ; Find out who sent us a message
+	BBSC	R0,MA_L_DOCLEAR(R6),10$	; BR if we expected it...
+	ROTL	R0,#1,R0		; ...else...
+	BISL2	R0,MA_L_NOCAUSE(R6)	; ...log the error
+	BRW	EXIT_FROM_RCV		; Doing the rest could screw us up!
+10$:
+	INSV	#MSG_DOCLEAR,#16,#16,R7	; We've gotten a reply to our...
+	INSV	AST_MBBUF+MB_B_SENDER,#8,#8,R7 ; ...request for clearing an EF
+	MOVB	MA_W_UNIT(R6),R7	; ...
+	$CANTIM_S REQIDT = R7		; ...so we need not worry time out
+
+	MOVW	#MSG_ISCLEAR,-		; Change the reason for the mailbox...
+		SYNCH_MBBUF+MB_W_WHY	; ...in the synchronous buffer
+	$WAKE_S				; Get the synchronous code moving again
+	BRW	EXIT_FROM_RCV		; Exit via common routine
+
+RCV_INTERLOCK:
+;
+; Some processor wants to test memory interlocking instructions.  A valid test
+; depends on all processors cooperating in real time, in order that there be a
+; chance that there will be a conflict in accessing a memory location.  When
+; we receive an interlock request mailbox, we assume that the requesting
+; processor has already begun the test.  In order to synchronize, we have to
+; begin the test on this processor as soon as possible.  This means
+; interrupting whatever else is going on synchronously and starting this part
+; of the test.  AST delivery of the mailbox does the first part.  However,
+; the interlocking test runs for several real seconds and we'd have troubles
+; with staying at AST level that long because it effectively disables ASTs
+; which might come from processors connected to other shared memories.  To
+; allow interruption of synchronous testing, but not stay at AST level, we
+; cheat somewhat:  we change the return address in the call frame which
+; specifies our synchronous testing.  However, one of those interruptions
+; could be from a processor on another memory wanting to start this test on
+; that memory!  That would be pointless; the first test would be stopped dead
+; while the second ran and then the first test could run with no competition.
+; To prevent that sort of thing and to pass and save vital information, R6
+; is saved in a location which is accessed by the PC and not by indexing
+; through UNIT_LIST or in a interprocessor global section.  This location is
+; used as a lock.  The value which was changed in the synchronous testing call
+; frame is also saved in such a location.
+;
+; Note that in order to find the stack frame that was interrupted, we must go
+; one beyond our "true" frame which holds the interrupted PC, etc.  Use
+; R8 as a lagging stack frame pointer.  (First time through, R8 is invalid,
+; but that's our current call frame, guaranteed to not be the one we want.)
+;
+	TSTL	INTERLOCK_SAVED_R6	; Are we being called recursively?
+	BEQL	10$			; BR if not
+	BRW	EXIT_FROM_RCV		; Don't play ball if we are
+10$:
+	MOVL	R6,INTERLOCK_SAVED_R6	; Prevent recursion and save info
+	MOVL	FP,R7			; R7 points to successive call frames
+20$:
+	CMPL	#SSERROR,SF$A_HANDLER(R7) ; Is call frame for synchronous test?
+	BEQL	30$			; BR if it is
+	MOVL	R7,R8			; Have R8 lag one frame behind R7
+	MOVL	SF$L_SAVE_FP(R7),R7	; Point one frame further down
+	BRB	20$			; Loop until we find what we want
+30$:
+	MOVL	SF$L_SAVE_PC(R8),-	; Save the PC from synchronous test
+		INTERLOCK_SAVED_PC
+	MOVW	SF$W_SAVE_PSW(R8),-	; Save interrupted PSW
+		INTERLOCK_SAVED_PSW
+	MOVAL	INTERLOCKING_TEST,-	; Substitute the address we want...
+		SF$L_SAVE_PC(R8)
+	BRW	EXIT_FROM_RCV		 ; ...and "return" from the AST
+
+RCV_ME2ME:
+;
+; We've tested that it's possible to send mail to our own processor.  To let
+; the synchronous code know that we've been successful, change the reason for
+; the mailbox (MB_W_WHY) in the synchronous mailbox buffer and wake up the
+; synchronous code, which has been waiting for us to do exactly that.
+;
+	INSV	#MSG_ME2ME,#16,#16,R7	 ; We've gotten our own mailbox..
+	INSV	MA_B_MYPORT(R6),#8,#8,R7 ; ...
+	MOVB	MA_W_UNIT(R6),R7	 ; ...
+	$CANTIM_S REQIDT = R7		 ; ...so we need not worry time out
+
+	MOVW	#MSG_ME2MEDONE,-	; Change the reason for the mailbox...
+		SYNCH_MBBUF+MB_W_WHY	; ...in the synchronous buffer
+	$WAKE_S				; Get the synchronous code moving again
+	BRW	EXIT_FROM_RCV		; Exit via common routine
+
+RCV_ILOSTU:
+;
+; For some reason, a processor with which we were communicating thinks we
+; went away.  Our entry in the interprocessor global section bit mask of
+; available processors has been cleared!  Log the error and reset the bit.
+;
+	ROTL	AST_MBBUF+MB_B_SENDER,-	; We were too slow...
+		#1,R0
+	BISL2	R0,MA_L_RILOSTU(R6)	; ...so log the error
+	MOVL	MA_Q_COMGSRAD(R6),R7	; Point to start of interprocessor GS
+	BBSSI	MA_B_MYPORT(R6),-	; We may have just been too slow...
+		GS_L_AVAILABLE(R7),10$	; ...tell others we're really here
+10$:
+	BRW	EXIT_FROM_RCV		; Exit via common routine
+
+RCV_BYEBYE:
+;
+; Some processor is terminating execution.  We'd like to get consistent so that
+; there is minimal impact due to its going away.  In particular, we no longer
+; expect any mailbox messages from that processor.
+;
+	ROTL	AST_MBBUF+MB_B_SENDER,-	; Figure out who's going away
+		#1,R0
+	BICL2	R0,MA_L_HELLO(R6)	; We no longer expect any replies...
+	BICL2	R0,MA_L_ICU_UCME(R6)	; ...
+	INSV	AST_MBBUF+MB_B_SENDER,#8,#8,R7 ; Insert stuff that...
+	MOVB	MA_W_UNIT(R6),R7	; ...will be the same for all $CANTIMs
+
+	INSV	#MSG_HELLO,#16,#16,R7	; Cancel all possible timer requests...
+	$CANTIM_S REQIDT = R7		; ...for this processor
+
+	INSV	#MSG_ICU_UCME,#16,#16,R7
+	$CANTIM_S REQIDT = R7
+
+	INSV	#MSG_DOSET,#16,#16,R7
+	$CANTIM_S REQIDT = R7
+
+	INSV	#MSG_DOCLEAR,#16,#16,R7
+	$CANTIM_S REQIDT = R7
+
+	BRW	EXIT_FROM_RCV		; Exit via common routine
+
+	.SBTTL	Mailbox Timer Expiration Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine runs when the timer goes off to indicate that another
+;	processor hasn't replied to a mailbox.
+;
+; CALLING SEQUENCE:
+;	Called via AST at $SETIMR expiration.
+;
+; INPUT PARAMETERS:
+;	04(AP) = .BYTE	shared memory unit number (MA_W_UNIT)
+;		 .BYTE	other processor's port on that memory (MB_B_RECEIVER)
+;		 .WORD	reason for sending mail (MB_W_WHY)
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+MB_TIMEOUT_AST:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6	; Must search for correct node
+10$:
+	CMPB	04(AP),MA_W_UNIT(R6)	; Match correct memory?
+	BEQL	20$			; BR if we have
+	ADDL2	(R6),R6			; Point to the next one if we haven't
+	CMPL	#UNIT_LIST,R6		; Searched all possibilities yet?
+	BNEQ	10$			; BR if not - we're OK
+	BRW	40$			; BR because of bad REQIDT
+20$:
+	ROTL	05(AP),#1,R0		; Supply a mask for those timeouts...
+					; ...which need to clear a bit...
+					; ...in an event expected longword
+
+	CASEW	06(AP),#1,#MAX_MSG_TYPE	; Dispatch based on message type
+	.MACRO	X	MBCODE,DUMMY	; A macro will define dispatch address
+		.WORD	TMO_'MBCODE-30$
+	.ENDM	X
+30$:
+	.SHOW	MEB
+	MAILBOX_MSG_TYPES		; Generate dispatch table
+	.NOSHOW	MEB
+40$:
+	.MACRO	X	MBCODE,SECONDS	; A macro to define unused labels
+		.IF B SECONDS
+			TMO_'MBCODE = 40$
+		.ENDC ; B SECONDS
+	.ENDM	X
+	MAILBOX_MSG_TYPES		; Generate labels
+	PUSHAL	BAD_REQIDT		; If we reach here...
+	PUSHL	#1			; ...we got a phoney AST
+	PUSHL	#UETP$_TEXT!STS$K_WARNING
+	CALLS	#3,G^LIB$SIGNAL
+	;BRW	EXIT_FROM_TMO		; Fall into common routine for exit
+
+;
+; All the routines dispatched via the above CASEW will exit through this little
+; routine.
+;
+EXIT_FROM_TMO:
+	CMPW	#MSG_ME2ME,06(AP)	; Was this a single processor message?
+	BEQL	10$			; BR if so - GS may not be there
+	CMPW	#MSG_ME2MEDONE,06(AP)	; Catch pathological case
+	BEQL	10$			; BR if so - again GS may not be there
+	MOVL	MA_Q_COMGSRAD(R6),R7	; Point to start of global section
+	MOVZBL	05(AP),R8
+	BBCCI	R8,GS_L_AVAILABLE(R7),10$ ; Assume receiver processor went away
+10$:
+	MOVB	MA_B_MYPORT(R6),-	; Send a MB so saying - sender...
+		AST_MBBUF+MB_B_SENDER
+	MOVB	05(AP),-		; ...receiver...
+		AST_MBBUF+MB_B_RECEIVER	; ...(the one we think is gone)...
+	MOVB	MA_W_UNIT(R6),-		; ...the shared memory involved...
+		AST_MBBUF+MB_B_UNIT
+	MOVW	#MSG_ILOSTU,-		; ...the reason for the mailbox...
+		AST_MBBUF+MB_W_WHY
+	MOVW	06(AP),-		; ...and what we originally sent
+		AST_MBBUF+MB_K_MISC
+	MOVC3	MA_Q_COMMBNAM(R6),-	    ; Form the logical name...
+		MA_T_COMMBNAM(R6),AST_MBNAM ; ...of the other processor's MB
+	MOVL	MA_Q_COMMBNAM(R6),AST_MBPTR ; Form descriptor of...
+	MOVAL	AST_MBNAM,AST_MBPTR+4	    ; ...the logical name
+	MOVZBL	05(AP),R0		; Include the port number...
+	BSBW	HEXUNIT			; ...
+	MOVB	R0,-1(R3)		; ...in the mailbox name
+	$CREMBX_S CHAN = AST_MBCHN,-	; Establish a link to other proc's MB
+		LOGNAM = AST_MBPTR
+	$QIO_S	CHAN = AST_MBCHN,-	; Let the other proc know...
+		FUNC = #IO$_WRITEVBLK,-	; ...that its bit is cleared 
+		IOSB = AST_MBISB,-
+		P1   = AST_MBBUF,-
+		P2   = #MB_K_END
+	BLBS	AST_MBISB,20$		; BR if mail was sent correctly
+	MOVZWL	AST_MBISB,R0
+	BSBW	MB_QIO_ERROR		; Warn of the error
+20$:
+	$DASSGN_S CHAN = AST_MBCHN	; Free our hold on the mailbox
+	ROTL	AST_MBBUF+MB_B_RECEIVER,- ; Processor didn't respond...
+		#1,R0
+	BISL2	R0,MA_L_SILOSTU(R6)	  ; ...so log the error
+	RET
+
+;
+; Save some code on this page by taking advantage of the simplicity of these
+; routines.  DOSET, DOCLEAR and ME2ME need to awaken us from hibernation.
+; The others need only say that certain events are no longer expected;
+; everything else that needs to be done is handled by the common exit routine.
+;
+
+
+TMO_DOSET:
+;
+; Some processor didn't set a bit in the shared common event flag.
+;
+	BICL2	R0,MA_L_DOSET(R6)	; Don't expect flag to be set
+	BRB	COMMON_WAKE_TMO
+
+
+TMO_DOCLEAR:
+;
+; Some processor didn't clear a bit in the shared common event flag.
+;
+	BICL2	R0,MA_L_DOCLEAR(R6)	; Don't expect flag to be cleared
+	;BRB	COMMON_WAKE_TMO
+
+
+TMO_ME2ME:
+;
+; I couldn't send mail to myself.
+;
+
+COMMON_WAKE_TMO:
+	$WAKE_S				; Get the test going again
+	BRW	EXIT_FROM_TMO
+
+
+TMO_HELLO:
+;
+; Some processor didn't respond to our friendly hello.
+;
+	BICL2	R0,MA_L_HELLO(R6)	; No longer expect other processor
+	BRW	EXIT_FROM_TMO
+
+
+TMO_ICU_UCME:
+;
+; Some processor didn't let us know that we could see it, too.
+;
+	BICL2	R0,MA_L_ICU_UCME(R6)	; No longer expect other processor
+	BRW	EXIT_FROM_TMO
+
+	.SBTTL	Print Error Summary Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine is called at the end of a thre-minute test iteration or
+;	one shot pass to print whatever information we may have stored
+;	regarding errors during the test.
+;
+; CALLING SEQUENCE:
+;	CALLS	#0,ERROR_SUMMARY
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	UNIT_LIST points to the list of nodes, one for each memory.  Within
+;	each node, there are several mask words, each of which corresponds to
+;	a particular condition.  The bits in each mask correspond to the ports
+;	of the shared memory attached to processors.  A bit is lit if the
+;	condition applies to that processor.
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Messages to SYS$OUTPUT.  Masks described above are cleared out.
+;
+;--
+
+ERROR_SUMMARY:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6	; R6 points to node for current memory
+10$:
+	SKPC	#0,#MA_K_ERRLEN,-	; See if we have...
+		MA_L_ERRBLK(R6)		; ...anything to report for this memory
+	BNEQ	20$			; BR if we found a problem
+	BRW	100$			; BR if it's clean
+20$:
+	MOVAL	SUMMARY_HEADER,R0	; We've some error, print a header
+	BSBW	DO_FAO_INFO
+
+	MOVL	MA_L_RILOSTU(R6),R0	; Did someone think we went away?
+	BEQL	30$			; BR if not
+	MOVAL	RILOSTU_MSG,R7		; Yes, print appropriate message
+	BSBW	200$
+30$:
+	MOVL	MA_L_SILOSTU(R6),R0	; Did we think someone else went away?
+	BEQL	40$			; BR if not
+	MOVAL	SILOSTU_MSG,R7		; Yes, print appropriate message
+	BSBB	200$
+40$:
+	MOVL	MA_L_RBADCODE(R6),R0	; Did we send someone a trashy HELLO?
+	BEQL	50$			; BR if not
+	MOVAL	RBADCODE_MSG,R7		; Yes, print appropriate message
+	BSBB	200$
+50$:
+	MOVL	MA_L_SBADCODE(R6),R0	; Did someone send us a trashy HELLO?
+	BEQL	60$			; BR if not
+	MOVAL	SBADCODE_MSG,R7		; Yes, print appropriate message
+	BSBB	200$
+60$:
+	MOVL	MA_L_DOSETFAIL(R6),R0	; Did someone fail to set a bit?
+	BEQL	70$			; BR if not
+	MOVAL	DOSET_MSG,R7		; Yes, print appropriate message
+	BSBB	200$
+70$:
+	MOVL	MA_L_DOCLEARFAIL(R6),R0	; Did someone fail to clear a bit?
+	BEQL	80$			; BR if not
+	MOVAL	DOCLEAR_MSG,R7		; Yes, print appropriate message
+	BSBB	200$
+80$:
+	MOVL	MA_L_NOCAUSE(R6),R0	; Did we get an unexpected message?
+	BEQL	90$			; BR if not
+	MOVAL	NOCAUSE_MSG,R7		; Yes, print appropriate message
+	BSBB	200$
+90$:
+	MOVL	MA_L_OLDSTUFF(R6),R0	; Did we get msg before we were ready?
+	BEQL	100$			; BR if not
+	MOVAL	OLDSTUFF_MSG,R7		; Yes, print appropriate message
+	BSBB	200$
+100$:
+	MOVC5	#0,0,#0,#MA_K_ERRLEN,-	; Clear out this run's errors
+		MA_L_ERRBLK(R6)
+	ADDL2	(R6),R6			; Point to node for next memory
+	CMPL	#UNIT_LIST,R6		; Back at the start of the queue?
+	BEQL	150$			; BR if we are - we're finished
+	BRW	10$			; More to go so loop
+150$:
+	RET				; Error summary finished printing
+
+200$:
+	BSBW	MASK_2_ARGLST		; Convert R0 mask to $FAO arg list
+	MOVL	SP,R8			; Save pointer to arg list
+	$FAOL_S	CTRSTR = (R7),-		; Format message with errant procs
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		PRMLST = (R8)
+	PUSHAL	BUFFER_PTR
+	PUSHL	#1
+	PUSHL	#UETP$_TEXT!STS$K_INFO
+	CALLS	#3,G^LIB$SIGNAL
+	EMUL	#4,(R8),#4,R8		; Remove MASK_2_ARGLST results...
+	ADDL2	R8,SP			; ...from the stack
+	RSB
+
+	.SBTTL	Test Cleanup Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine is called by the exit handler to ensure that all objects
+;	which use system resources (e.g., global sections in shared memory)
+;	are all properly disposed of and that we are consistent with respect to
+;	other processors.
+;
+; CALLING SEQUENCE:
+;	CALLS	#0,CLEANUP
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	UNIT_LIST points to the list of nodes, one for each memory.  Within
+;	node, there is a pointer to the interprocessor global section for that
+;	memory as well as miscellaneous status info.
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Remove as many traces as possible of our existence.
+;
+;--
+
+CLEANUP:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+;+
+;	The following objects (using system resources) are created during the
+;	execution of the shared memory test:  one global section per memory
+;	accessed by all processors connected to that memory, one global section
+;	per memory accessed only by the current processor, the files associated
+;	with those global sections, one mailbox per memory associated with the
+;	current processor, other mailboxes in each memory associated with
+;	processors connected to that memory, one common event flag cluster
+;	per memory accessed by all processors connected to that memory, and one
+;	common event flag cluster per memory accessed only by the current
+;	processor.  Of those items, only the global sections and the associated
+;	files are not automatically deleted or marked for deletion during image
+;	rundown; the others have a "temporary" existence.
+;
+;	The interprocessor global section may not have actually been created by
+;	this processor.  In that case, we cannot delete it, but only delete its
+;	address space.  The file that was created in our attempt to create the
+;	section still must be deleted, however.
+;
+;	Even though we may be able to try to delete the interprocess global
+;	section, it may only be marked for deletion because other processors
+;	are still using it.  Because there are data structures within the
+;	section and expectations on the part of other processors as to how we
+;	will access those structures, we will attempt to keep things consistent
+;	within the section and between processors regardless of whether or not
+;	we can delete the section.
+;-
+
+	MOVAL	UNIT_LIST,R6		; R6 will point to node for each memory
+10$:
+	ADDL2	(R6),R6			; Point to next node on list
+	CMPL	#UNIT_LIST,R6		; Check now for back at start of queue...
+	BNEQ	20$			; ...and exit if empty, because we...
+	BRW	200$			; ...can be called before queue is set
+20$:
+;
+; Before we can get rid of the interprocessor global section, we must do all
+; the things which will keep us consistent with any processors which may still
+; be using it.  This involves removing us from any masks in the global section
+; which say we are present and releasing any locks we may own.  Note that we
+; are ignoring any entries we may have on the free queue and the busy queue
+; and the count of such, and that we also ignore anything we may have done with
+; the ADAWI count in the interprocessor global section.  To try to fix these 
+; would probably cause more trouble than leaving them, since there is an
+; excellent chance that they are consistent anyway.  When everything needed for
+; consistency is done, we have to tell any other processors that we're going
+; away.  We needn't bother cancelling timers for any other messages we may have
+; to those processors; that is one of the functions of image rundown.
+;
+	MOVL	MA_Q_COMGSRAD(R6),R7	; Point to start of interprocessor GS
+	BNEQ	30$
+	BRW	140$			; Skip all this is we haven't mapped it
+30$:
+	MOVZBL	MA_B_MYPORT(R6),R8	; Set up for bit clear instructions
+	BBCCI	R8,GS_L_AVAILABLE(R7),40$ ; We're no longer playing ball
+40$:
+	BBCCI	R8,GS_L_PARTICIPATING(R7),50$ ; We're not interlocking...
+50$:
+	BBCCI	R8,GS_L_FINISHED(R7),60$      ; ...
+60$:
+	CMPB	MA_B_MYPORT(R6),-	; Do I own the lock?
+		GS_L_CEF_FLAG+3(R7)
+	BNEQ	70$			; BR if not - it will get cleared
+	CLRL	GS_L_CEF_FLAG(R7)	; Unlock interprocessor CEF test
+70$:
+	CMPB	MA_B_MYPORT(R6),-	; Do I own the lock?
+		GS_L_INTLK_FLAG+3(R7)
+	BNEQ	80$			; BR if not - it will get cleared
+	CLRL	GS_L_INTLK_FLAG(R7)	; Unlock memory interlocking test
+80$:
+
+	CLRL	R8			; R8 is STRTPOS for FFS operations
+	MOVL	#PROCESSOR_MAX,R9	; R9 is SIZE for FFS operations
+90$:
+	FFS	R8,R9,GS_L_AVAILABLE(R7),R10 ; Search for a willing processor
+	BNEQ	100$			; BR if we found one
+	BRW	110$			; BR if there are none left
+100$:
+	MOVB	MA_B_MYPORT(R6),-	    ; Start filling in message...
+		AST_MBBUF+MB_B_SENDER	    ; ...sender's port number...
+	MOVB	R10,AST_MBBUF+MB_B_RECEIVER ; ...receiver's port number...
+	MOVB	MA_W_UNIT(R6),-		    ; ...unit of the memory we share...
+		AST_MBBUF+MB_B_UNIT
+	MOVW	#MSG_BYEBYE,-		    ; ...reason for the message
+		AST_MBBUF+MB_W_WHY
+	MOVC3	MA_Q_COMMBNAM(R6),-	    ; Form the logical name...
+		MA_T_COMMBNAM(R6),AST_MBNAM ; ...of other processor's MB
+	MOVL	MA_Q_COMMBNAM(R6),AST_MBPTR ; Form descriptor to...
+	MOVAL	AST_MBNAM,AST_MBPTR+4	    ; ...the logical name
+	MOVL	R10,R0			; Include the port number...
+	BSBW	HEXUNIT			; ...
+	MOVB	R0,-1(R3)		; ...in the name
+	$CREMBX_S CHAN = AST_MBCHN,-	; Establish a link to other proc's MB
+		LOGNAM = AST_MBPTR
+	$QIO_S	CHAN = AST_MBCHN,-	; Say bye to the other processor
+		FUNC = #IO$_WRITEVBLK,-	; NOTE: We ignore errors!
+		IOSB = AST_MBISB,-
+		P1   = AST_MBBUF,-
+		P2   = #MB_K_END
+	$DASSGN_S CHAN = SYNCH_MBCHN	; We no longer need the MB
+	SUBL3	R8,R10,R11		; Get number of bits we searched
+	INCL	R11			; Correct off-by-one (inclusive search)
+	SUBL2	R11,R9			; Adjust number of bits left to search
+	ADDL3	#1,R10,R8		; Point to new first bit to search
+	BRW	90$			; Loop thru all procs on this memory
+110$:
+;
+; Only update or delete the interprocessor global section if we were the
+; processor which created it.  Delete the file regardless.
+;
+	MOVB	GS_L_OWNER(R7),R8	; Save a copy of the GS creator's port
+	CMPB	R8,MA_B_MYPORT(R6)	; Did we create the section?
+	BNEQ	120$			; BR if not - can't update it
+	$UPDSEC_S INADR = MA_Q_COMGSRAD(R6),- ; Updating the section now...
+		  EFN   = #COMGS_EFN	      ; ...means we avoid implicit update
+	$WAITFR_S EFN = #COMGS_EFN	; Let the $UPDSEC finish in peace
+120$:
+	$DELTVA_S INADR = MA_Q_COMGSRAD(R6) ; Remove GS virtual address space
+	CMPB	R8,MA_B_MYPORT(R6)	; Did we create the section?
+	BNEQ	130$			; BR if not - can't delete it
+	$DGBLSC_S GSDNAM = MA_Q_COMGSNAM(R6) ; Delete the section...
+130$:
+	$DASSGN_S CHAN = MA_K_COMFAB+FAB$L_STV(R6) ; ...and unhook RMS
+140$:
+	TSTW	MA_K_COMFAB+FAB$W_IFI(R6) ; Is the file still open?
+	BEQL	150$			; BR if not
+	$CLOSE	FAB = MA_K_COMFAB(R6)	; Close it if it is
+150$:
+	$ERASE	FAB = MA_K_COMFAB(R6)	; Get rid of the associated file
+					; (We can swallow RMS-W-IFI errors)
+;
+; We can just blindly get rid of the single processor global section because no
+; one else knows of it.  We must, however, wait to catch the situation where we
+; reach this point but an $UPDSEC is still in progress.  See the note where
+; SPRGS_EFN is defined.  If the section is already removed, there should be
+; no problem.
+;
+	TSTL	MA_Q_SPRGSRAD(R6)	; Did we ever map the section?
+	BEQL	160$			; BR if not
+	$WAITFR_S EFN = #SPRGS_EFN	; Prevent prob if $UPDSEC in progress
+	$DELTVA_S INADR = MA_Q_SPRGSRAD(R6) ; Remove virtual address space...
+	$DGBLSC_S GSDNAM = MA_Q_SPRGSNAM(R6) ; ...delete the section...
+	$DASSGN_S CHAN = MA_K_SPRFAB+FAB$L_STV(R6) ; ...and unhook RMS
+160$:
+	TSTW	MA_K_SPRFAB+FAB$W_IFI(R6) ; Is the file still open?
+	BEQL	170$			; BR if not
+	$CLOSE	FAB = MA_K_SPRFAB(R6)	; Close it if it is
+170$:
+	$ERASE	FAB = MA_K_SPRFAB(R6)	; Get rid of the associated file
+					; (We can swallow RMS-W-IFI errors)
+
+	BRW	10$			; Loop for the next memory
+200$:
+	RET
+
+	.SBTTL	Test Timer Expiration Routine
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine runs when the timer to mark the end of the test goes off.
+;
+; CALLING SEQUENCE:
+;	Called via AST at $SETIMR expiration.
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+TIME_OUT:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	BISW2	#TEST_OVERM,FLAG	; Indicate that the test is over
+	RET
+
+	.SBTTL	System Service Exception Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine is executed if a software or hardware exception occurs or
+;	if a LIB$SIGNAL system service is used to output a message.
+;	Information about this method of handling messages and errors can be
+;	found in the VMS COMMON RUN-TIME manual and in the VMS SYSTEM SERVICE
+;	manual.
+;
+; CALLING SEQUENCE:
+;	Entered via an exception from the system
+;
+; INPUT PARAMETERS:
+;	ERROR_COUNT   = previous cumulative error count
+;	                -----------------
+;	   AP ---->     !       2       !
+;			!---------------!
+;			! SIGNL ARY PNT !
+;			!---------------!
+;			! MECH  ARY PNT !
+;			!---------------! ---------
+;			!       4       !         ^
+;			!---------------!         !
+;			! ESTABLISH FP  !         !
+;			!---------------!         !
+;			!    DEPTH      ! Mechanism Array
+;			!---------------!         !
+;			!      R0       !         !
+;			!---------------!         !
+;			!      R1       !         v
+;			!---------------! ---------
+;			!       N       !         ^
+;			!---------------!         !
+;			! CONDITION NAME!         !
+;			!---------------!         !
+;			! N-3 ADDITIONAL!    Signal Array
+;			! LONG WORD ARGS!         !
+;			!---------------!         !
+;			!      PC       !         !
+;			!---------------!         !
+;			!      PSL      !         v
+;			!---------------! ---------
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	May branch to ERROR_EXIT
+;--
+
+SSERROR:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	$SETAST_S ENBFLG = #0		; Disable AST delivery
+	CLRL	AST_MODE		; Assume it was disabled
+	CMPL	R0,#SS$_WASSET		; Were AST's enabled?
+	BNEQ	10$			; BR if not enabled
+	MOVL	#1,AST_MODE		; Set it to be reenabled
+10$:	$SETSFM_S ENBFLG = #0		; Disable SS failure mode for PUTMSG
+	CLRL	SS_FAIL_MODE		; Assume it was disabled
+	CMPL	R0,#SS$_WASSET		; Was SS failure mode enabled?
+	BNEQ	20$			; BR if not enabled
+	MOVL	#1,SS_FAIL_MODE		; Set it to be reenabled
+20$:	MOVL	CHF$L_SIGARGLST(AP),R6	; Get the signal array pointer
+	CMPZV	#STS$V_FAC_NO,#STS$S_FAC_NO,- ; Is this a message from LIB$SIGNAL?
+		CHF$L_SIG_NAME(R6),#UETP_K
+	BNEQ	30$			; BR if this is a system exception
+	SUBL2	#2,CHF$L_SIG_ARGS(R6)	; Drop the PC and PSL
+	$PUTMSG_S MSGVEC = CHF$L_SIG_ARGS(R6) ; Print the message
+	$SETSFM_S ENBFLG = SS_FAIL_MODE	; Set to previous state
+	$SETAST_S ENBFLG = AST_MODE	; Set to previous state
+	RET				; Return to the program
+30$:
+	CMPZV	#STS$V_FAC_NO,#STS$S_FAC_NO,- ; Is it an RMS failure?
+		CHF$L_SIG_ARG1(R6),#RMS_K
+	BNEQ	40$			; BR if not
+	$SETSFM_S ENBFLG = SS_FAIL_MODE	; Set to previous state
+	$SETAST_S ENBFLG = AST_MODE	; Set to previous state
+	RET				; Yes, RMS_ERROR gets to handle them
+40$:
+	MOVL	CHF$L_SIG_NAME(R6),STATUS ; Save the status
+	CLRL	R8			; Assume for now it's not SS failure
+	CMPL	#SS$_SSFAIL,STATUS	; But is it a System Service failure?
+	BNEQ	60$			; BR if not - no special case message
+	$GETMSG_S MSGID = CHF$L_SIG_ARG1(R6),- ; Get SS failure code associated text
+		 MSGLEN = BUFFER_PTR,-
+		 BUFADR = FAO_BUF,-
+		 FLAGS  = #14,-
+		 OUTADR = MSG_BLOCK
+	TSTB	MSG_BLOCK+1		; Get FAO arg count for SS failure code
+	BEQL	50$			; Don't use $GETMSG if no $FAO args...
+	PUSHAL	BUFFER_PTR		; ...else build up...
+	PUSHL	#1			; ...a message describing...
+	PUSHL	#UETP$_TEXT		; ...why the System Service failed
+	INSV	CHF$L_SIG_ARG1(R6),-	; Give the message...
+		#STS$V_SEVERITY,-	; ...the correct severity code
+		#STS$S_SEVERITY,(SP)
+	MOVL	#3,R8			; Count the number of args we pushed
+	BRB	60$
+50$:
+	PUSHL	CHF$L_SIG_ARG1(R6)	; Save SS failure code
+	MOVL	#1,R8			; Count the number of args we pushed
+60$:
+	MULL3	#4,CHF$L_SIG_ARGS(R6),R7 ; Convert longwords to bytes
+	SUBL2	R7,SP			; Save the current signal array...
+	MOVC3	R7,CHF$L_SIG_NAME(R6),(SP) ; ...on the stack
+	ADDL3	R8,CHF$L_SIG_ARGS(R6),-(SP) ; Push the current arg count
+	BRW	ERROR_EXIT
+
+	.SBTTL	RMS Error Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles error returns from RMS calls.
+;
+; CALLING SEQUENCE:
+;	Called by RMS when a file processing error is found.
+;
+; INPUT PARAMETERS:
+;	Address of the FAB or RAB associated with the RMS call.
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Program may exit, depending on severity of the error.
+;
+;--
+
+RMS_ERROR:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	MOVL	4(AP),R6		; See whether we're dealing with...
+	CMPB	#FAB$C_BID,FAB$B_BID(R6) ; ...a FAB or a RAB
+	BNEQ	10$			; BR if it's a RAB
+	MOVAL	FILE,R7			; FAB-specific code:  text string...
+	MOVL	R6,R8			; ...address of FAB...
+	PUSHL	FAB$L_STV(R6)		; ...STV field for error...
+	PUSHL	FAB$L_STS(R6)		; ...STS field for error...
+	MOVL	FAB$L_STS(R6),STATUS	; ...and save the error code
+	BRB	COMMON			; FAB and RAB share other code
+10$:
+	MOVAL	RECORD,R7		; RAB-specific code:  text string...
+	MOVL	RAB$L_FAB(R6),R8	; ...address of associated FAB...
+	PUSHL	RAB$L_STV(R6)		; ...STV field for error...
+	PUSHL	RAB$L_STS(R6)		; ...STS field for error...
+	MOVL	RAB$L_STS(R6),STATUS	; ...and save the error code
+COMMON:
+	MOVZBL	FAB$B_FNS(R8),R10	; Get the file name size
+	$FAO_S	CTRSTR = RMS_ERR_STRING,- ; Common code, prepare error message...
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R7,-
+		P2     = R10,-
+		P3     = FAB$L_FNA(R8)
+	PUSHAL	BUFFER_PTR		; ...and arguments for ERROR_EXIT...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT		; ...
+	EXTZV	#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,-
+		STATUS,R9 		; ...get the severity code...
+	BISB2	R9,(SP)			; ...and add it into the signal name
+	PUSHL	#5			; Current arg count
+	BRW	ERROR_EXIT
+
+	.SBTTL	CTRL/C Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles CTRL/C AST's
+;
+; CALLING SEQUENCE:
+;	Called via AST
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+CCASTHAND:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	PUSHAL	CNTRLCMSG		; Set message pointer
+	PUSHL	#1			; Set arg count
+	PUSHL	#UETP$_TEXT!STS$K_WARNING ; Set signal name
+	PUSHL	#0			; Indicate an abnormal termination
+	PUSHAL	PROCESS_NAME		; ...
+	PUSHL	#2			; ...
+	PUSHL	#UETP$_ABENDD!STS$K_WARNING ; ...
+	CALLS	#7,G^LIB$SIGNAL		; Output the message
+	MOVL	#<SS$_CONTROLC-STS$K_SUCCESS+STS$K_WARNING>,-
+		STATUS			; Set the exit status
+	$EXIT_S	STATUS			; Terminate program cleanly
+
+	.SBTTL	Error Exit
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine prints an error message and exits.
+;
+; CALLING SEQUENCE:
+;	MOVx  error status value,STATUS
+;	PUSHx error specific information on the stack
+;	PUSHL current argument count
+;	BRW   ERROR_EXIT
+;
+; INPUT PARAMETERS:
+;	Arguments to LIB$SIGNAL, as above
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	Message to SYS$OUTPUT and SYS$ERROR
+;
+; IMPLICIT OUTPUTS:
+;	Program exit
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+ERROR_EXIT:
+
+	$SETAST_S ENBFLG = #0		; ASTs can play havoc with messages
+	BBS	#BEGIN_MSGV,FLAG,10$	; BR if "begin" msg has already been output
+	CLRL	-(SP)			; Set the time stamp flag
+	PUSHAL	PROCESS_NAME		; Set the test name
+	PUSHL	#2			; Push the argument count
+	PUSHL	#UETP$_BEGIND!STS$K_SUCCESS ; Set the message code
+	CALLS	#4,G^LIB$SIGNAL		; Print the startup message
+10$:
+	ADDL3	(SP)+,#7,ARG_COUNT	; Get total # args, pop partial count
+	INCL	ERROR_COUNT		; Keep running error count
+	PUSHL	#0			; Push the time parameter
+	PUSHAL	PROCESS_NAME		; Push test name...
+	PUSHL	#2			; ...arg count...
+	PUSHL	#UETP$_ABENDD!STS$K_ERROR ; ...and signal name
+	PUSHL	ERROR_COUNT		; Finish off arg list...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_ERBOX!STS$K_ERROR ; ...for error box message
+	CALLS	ARG_COUNT,G^LIB$SIGNAL	; Truly bitch
+
+	CALLS	#0,ERROR_SUMMARY	; Print recoverable error statistics
+	TSTL	STATUS			; Did we exit with an error code?
+	BNEQ	20$			; BR if we did
+	MOVL	#UETP$_ABENDD!STS$K_ERROR,- ; Supply a generic one otherwise
+		STATUS
+20$:
+	BISL	#STS$M_INHIB_MSG,STATUS	; Don't print messages twice!
+	$EXIT_S STATUS			; Exit in error
+
+	.SBTTL	Exit Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles cleanup at exit.  If the MODE logical name is
+;	equated to "ONE", the routine will update the test flag in the
+;	UETINIDEV.DAT file depending on the UETUNT$M_TESTABLE flag state in the
+;	UETUNT$B_FLAGS field of the unit block for each unit for the device
+;	under test.
+;
+; CALLING SEQUENCE:
+;	Invoked automatically by $EXIT System Service.
+;
+; INPUT PARAMETERS:
+;	STATUS  contains the exit status.
+;	FLAG    has synchronizing bits.
+;	DDB_RFA contains the RFA of the DDB record for this device in UETINIDEV.
+;
+; IMPLICIT INPUTS:
+;	UNIT_LIST points to the head of a doubly linked circular list of unit
+;		  blocks for the device under test.
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Various files are de-accessed, the process name is reset, and any
+;	necessary synchronization with UETPDEV01 is carried out.
+;	If the MODE logical name is equated to "ONE", the routine will update
+;	the test flag in the UETINIDEV.DAT file depending on the 
+;	UETUNT$M_TESTABLE flag state in the UETUNT$B_FLAGS field of the unit
+;	block for each unit for the device under test.
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+EXIT_HANDLER:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	$SETSFM_S ENBFLG = #0		; Turn off System Service failure mode
+	$SETAST_S ENBFLG = #0		; We're finished - no more ASTs
+	BBS	#ONE_SHOTV,FLAG,10$	; If one-shot, update testability...
+	BRW	END_UPDATE		; ...else don't update UETINIDEV.DAT
+10$:
+	BBS	#SAFE_TO_UPDV,FLAG,20$	; Only update if it's safe
+	BRW	END_UPDATE		; Else forget it
+20$:
+	MOVAL	INI_RAB,R10		; Set the RAB address
+	MOVB	#RAB$C_RFA,RAB$B_RAC(R10) ; Set RFA mode
+	MOVC3	#6,DDB_RFA,RAB$W_RFA(R10) ; Set RFA to DDB line
+	$GET	RAB = (R10)		; Go back to the DDB record
+	BLBC	R0,END_UPDATE		; If failure then forget it
+	MOVB	#RAB$C_SEQ,RAB$B_RAC(R10) ; Set back to sequential mode
+	ADDL3	#UNIT_LIST,UNIT_LIST,R11 ; Set the unit block list header
+	CLRL	R9			; Init an index
+UNIT_LOOP:
+	BITB	#UETUNT$M_TESTABLE,-
+		UETUNT$B_FLAGS(R11)	; Is this unit testable?
+	BEQL	10$			; BR if not
+	INCL	R9			; Another unit that's testable
+10$:
+	ADDL2	(R11),R11		; Next unit block
+	CMPL	R11,#UNIT_LIST		; Are we full circle in the list?
+	BNEQ	UNIT_LOOP		; BR if not
+	TSTL	R9			; Any testable units?
+	BNEQ	20$			; BR if yes...
+	MOVB	#^A/N/,BUFFER+4		; ...else disable the DDB record...
+	$UPDATE RAB = (R10)		; ...here
+	BLBC	R0,END_UPDATE		; If error then forget it
+20$:
+	ADDL2	(R11),R11		; Next unit block
+	CMPL	R11,#UNIT_LIST		; Are we full circle in the list?
+	BEQL	END_UPDATE		; BR if yes
+	$GET	RAB = (R10)		; Get a record
+	BLBC	R0,END_UPDATE		; If error then forget it
+	BICB2	#LC_BITM,BUFFER		; Convert to uppercase
+	CMPB	#^A/U/,BUFFER		; Is it a UCB record?
+	BNEQ	END_UPDATE		; BR if not
+	BITB	#UETUNT$M_TESTABLE,-
+		UETUNT$B_FLAGS(R11)	; Is this unit testable?
+	BNEQ	20$			; BR if yes...
+	MOVB	#^A/N/,BUFFER+4		; ...else disable the UCB record...
+	$UPDATE RAB = (R10)		; ...here
+	BLBC	R0,END_UPDATE		; If error then forget it
+	BRB	20$			; Look at the next record
+END_UPDATE:
+	CALLS	#0,CLEANUP		; Get rid of test specific leftovers
+	PUSHL	#0			; Set the time flag
+	PUSHAL	PROCESS_NAME		; Push the test name
+	PUSHL	#2			; Push arg count
+	PUSHL	#UETP$_ENDEDD!STS$K_SUCCESS ; Push signal name
+	EXTZV	#STS$V_SEVERITY,-	; Get the proper exit severity
+		#STS$S_SEVERITY,-
+		STATUS,R0
+	INSV	R0,#STS$V_SEVERITY,-	; Set the end message severity
+		#STS$S_SEVERITY,(SP)
+	CALLS	#4,G^LIB$SIGNAL		; Output the message
+	$DISCONNECT  RAB = INI_RAB	; Disconnect the RAB from the FAB
+	$CLOSE	     FAB = INI_FAB	; Close the file
+	$SETPRN_S PRCNAM = ACNT_NAME	; Reset the process name
+	RET				; That's all folks!
+
+	.END	UETMA7800

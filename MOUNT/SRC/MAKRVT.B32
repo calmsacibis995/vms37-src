@@ -1,0 +1,335 @@
+MODULE MAKRVT (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  MOUNT Utility Structure Level 2
+!
+! ABSTRACT:
+!
+!	This module creates the relative volume table for a disk volume set.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  23-Oct-1978  11:12
+!
+! MODIFIED BY:
+!
+!	V02-003	ACG0229		Andrew C. Goldstein,	4-Jan-1982  15:04
+!		Add volume set name to RVT
+!
+!	V02-002	ACG0178		Andrew C. Goldstein,	9-Jun-1980  13:35
+!		Skip magtapes and foreign volumes in mounted volume set search
+!
+!	V02-001	ACG0175		Andrew C. Goldstein,	23-May-1980  14:44
+!		Add I/O database lock cleanup, tie off RVT extension
+!
+!	V02-000	ACG0167		Andrew C. Goldstein,	18-Apr-1980  13:38
+!		Previous revision history moved to MOUNT.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:MOUDEF.B32';
+REQUIRE 'LIBD$:[VMSLIB.OBJ]MOUNTMSG.B32';
+
+GLOBAL ROUTINE ENTER_RVT (NAME, NEW_UCB) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine finds the relative volume table of the volume set of this
+!	volume, if it exists, and enters the volume in the table. If the RVT
+!	does not exist, it creates it. This routine also does the initial
+!	binding of a new volume into a set. This routine must be called in kernel
+!	mode.
+!
+!
+! CALLING SEQUENCE:
+!	ENTER_RVT (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of descriptor of volume set name
+!	ARG2: UCB address of volume being mounted
+!
+! IMPLICIT INPUTS:
+!	HOME_BLOCK: home block of volume being mounted
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	REAL_RVT: address of RVT found or created
+!
+! ROUTINE VALUE:
+!	address of RVT
+!
+! SIDE EFFECTS:
+!	RVT may be created or modified
+!	HOME_BLOCK altered if /BIND performed
+!
+!--
+
+BEGIN
+
+MAP
+	NAME		: REF VECTOR;	! volume name string descriptor
+
+LABEL
+	SEARCH_LOOP;			! outer device search loop
+
+LOCAL
+	ENTRY_COUNT,			! number of entries needed in RVT
+	SIZE,				! size of new RVT
+	DDB		: REF BBLOCK,	! pointer to current DDB
+	UCB		: REF BBLOCK,	! pointer to current UCB
+	VCB		: REF BBLOCK,	! pointer to current VCB
+	RVT		: REF BBLOCK,	! pointer to current RVT
+	RVX		: REF BBLOCK,	! pointer to current RVX
+	NEW_RVT		: REF BBLOCK,	! pointer to newly created RVT
+	FCB		: REF BBLOCK,	! pointer to current FCB
+	WINDOW		: REF BBLOCK;	! pointer to current window
+
+EXTERNAL
+	MOUNT_OPTIONS	: BITVECTOR,	! MOUNT command options
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	REAL_VCB	: REF BBLOCK,	! address of VCB allocated
+	REAL_RVT	: REF BBLOCK,	! address of newly allocated RVT
+	HOME_BLOCK	: BBLOCK,	! volume home block buffer
+	SCH$GL_CURPCB	: REF BBLOCK ADDRESSING_MODE (ABSOLUTE),
+					! address of process PCB
+	IOC$GL_DEVLIST	: ADDRESSING_MODE (ABSOLUTE);
+					! I/O database listhead
+
+EXTERNAL ROUTINE
+	LOCK_IODB,			! lock I/O database mutex
+	UNLOCK_IODB,			! unlock I/O database mutex
+	ALLOCATE_MEM,			! allocate dynamic memory
+	DEALLOCATE_MEM;			! deallocate dynamic memory
+
+
+! Needless to say, the search must be done with the I/O database locked to
+! prevent list perturbations. We run down the DDB list, following the UCB
+! list off each one, looking for file structured devices that are mounted
+! but not allocated.
+!
+
+LOCK_IODB ();
+CLEANUP_FLAGS[CLF_UNLOCKDB] = 1;
+DDB = .IOC$GL_DEVLIST;
+
+SEARCH_LOOP:
+BEGIN
+DO
+    BEGIN
+    IF .DDB[DDB$B_TYPE] NEQ DYN$C_DDB
+    THEN BUG_CHECK (NOTDDBDDB, FATAL, 'Corrupted DDB list');
+    UCB = .DDB[DDB$L_UCB];
+
+    UNTIL .UCB EQL 0 DO
+	BEGIN
+	IF .UCB[UCB$B_TYPE] NEQ DYN$C_UCB
+	THEN BUG_CHECK (NOTUCBUCB, FATAL, 'Corrupted UCB list');
+
+	IF  .BBLOCK[UCB[UCB$L_DEVCHAR], DEV$V_FOD]
+	AND .BBLOCK[UCB[UCB$L_DEVCHAR], DEV$V_MNT]
+	AND NOT .BBLOCK[UCB[UCB$L_DEVCHAR], DEV$V_FOR]
+	AND NOT .BBLOCK[UCB[UCB$L_DEVCHAR], DEV$V_SQD]
+	AND (IF .MOUNT_OPTIONS[OPT_NOSHARE]
+	     THEN (.BBLOCK[UCB[UCB$L_DEVCHAR], DEV$V_ALL]
+		   AND .UCB[UCB$L_PID] EQL .SCH$GL_CURPCB[PCB$L_PID])
+	     ELSE NOT .BBLOCK[UCB[UCB$L_DEVCHAR], DEV$V_ALL]
+	    )
+	THEN
+	    BEGIN
+	    VCB = .UCB[UCB$L_VCB];
+	    IF .VCB[VCB$B_TYPE] NEQ DYN$C_VCB
+	    THEN BUG_CHECK (NOTVCBUCB, FATAL, 'Not VCB pointer in UCB');
+
+	    RVT = .VCB[VCB$L_RVT];
+	    IF .RVT NEQ 0
+	    THEN IF .RVT[RVT$B_TYPE] NEQ DYN$C_UCB
+	    THEN
+		BEGIN
+		IF .RVT[RVT$B_TYPE] NEQ DYN$C_RVT
+		THEN BUG_CHECK (NOTRVTVCB, FATAL, 'Not RVT pointer in VCB');
+		IF CH$EQL (.NAME[0], .NAME[1],
+			   RVT$S_STRUCNAME, RVT[RVT$T_STRUCNAME], ' ')
+		THEN LEAVE SEARCH_LOOP;
+		END;
+	    END;
+	UCB = .UCB[UCB$L_LINK];
+	END;				! end of UCB scan loop
+    DDB = .DDB[DDB$L_LINK];
+    END					! end of DDB scan loop
+UNTIL .DDB EQL 0;
+
+END;					! end of block SEARCH_LOOP
+
+! Compute the size RVT needed. If none was found, create one. If the volume
+! has a zero RVN, we are creating a new volume set (since we didn't find the
+! RVT).
+!
+
+ENTRY_COUNT = MAXU (.HOME_BLOCK[HM2$W_RVN], .HOME_BLOCK[HM2$W_SETCOUNT]);
+
+IF .DDB EQL 0
+THEN
+    BEGIN
+    IF .ENTRY_COUNT EQL 0
+    THEN
+	BEGIN
+	ENTRY_COUNT = 1;
+	HOME_BLOCK[HM2$W_RVN] = 1;
+	HOME_BLOCK[HM2$W_SETCOUNT] = 1;
+	REAL_VCB[VCB$W_RVN] = 1;
+	END;
+
+    RVT = ALLOCATE_MEM (MAXU (.ENTRY_COUNT+4, RVT$C_MINSIZE) * 4 + RVT$C_LENGTH, 0);
+    RVT[RVT$L_RVX] = RVX = ALLOCATE_MEM (RVX$C_LENGTH, 0);
+    RVT[RVT$B_TYPE] = DYN$C_RVT;
+    RVT[RVT$B_NVOLS] = .ENTRY_COUNT;
+    RVX[RVX$B_TYPE] = DYN$C_RVX;
+    CH$COPY (.NAME[0], .NAME[1], ' ', RVX$S_STRUCNAME, RVX[RVX$T_STRUCNAME]);
+    CH$COPY (.NAME[0], .NAME[1], ' ', RVT$S_STRUCNAME, RVT[RVT$T_STRUCNAME]);
+    END
+
+! If we found an RVT, see if it is big enough. If not, allocate a new one,
+! copy the contents of the old to the new, fix up all pointers, and dispose
+! of the old one. If the volume was not in a set, do the initial bind,
+! assigning the next higher RVN. Note that RVN 1 must be mounted for later
+! use (also assuring that RVT$B_NVOLS contains the size of the set).
+!
+
+ELSE
+    BEGIN
+    IF .ENTRY_COUNT EQL 0
+    THEN
+	BEGIN
+	IF .RVT[RVT$L_UCBLST] EQL 0
+	THEN
+	    BEGIN
+	    UNLOCK_IODB ();
+	    ERR_EXIT (MOUN$_RVN1NOTMT);
+	    END;
+	ENTRY_COUNT = .RVT[RVT$B_NVOLS] + 1;
+	IF .ENTRY_COUNT GEQU 256
+	THEN
+	    BEGIN
+	    UNLOCK_IODB ();
+	    ERR_EXIT (MOUN$_SETLIMIT);
+	    END;
+	HOME_BLOCK[HM2$W_RVN] = .ENTRY_COUNT;
+	REAL_VCB[VCB$W_RVN] = .ENTRY_COUNT;
+	END;
+
+    IF .RVT[RVT$W_SIZE] LSSU .ENTRY_COUNT * 4 + RVT$C_LENGTH
+    THEN
+	BEGIN
+
+! ***** The RVT extend/copy code is tied off because the ACP uses RVT
+! addresses in its cache descriptors. This results in the operational
+! restriction of having to dismount and remount the volume set for each
+! fourth volume added after the minimum RVT size (17). Volume sets of
+! this size are at present of low probability.
+!
+
+	UNLOCK_IODB ();
+	ERR_EXIT (MOUN$_SETLIMIT);
+
+! ***** End of tie-off.
+
+	NEW_RVT = ALLOCATE_MEM (.ENTRY_COUNT * 4 + RVT$C_LENGTH, 0);
+	SIZE = .NEW_RVT[RVT$W_SIZE];
+	CH$COPY (.RVT[RVT$W_SIZE], .RVT, 0, .SIZE, .NEW_RVT);
+	NEW_RVT[RVT$W_SIZE] = .SIZE;
+
+	INCR J FROM 1 TO .RVT[RVT$B_NVOLS]
+	DO
+	    BEGIN
+	    UCB = .VECTOR [NEW_RVT[RVT$L_UCBLST], .J-1];
+	    IF .UCB NEQ 0
+	    THEN
+		BEGIN
+		VCB = .UCB[UCB$L_VCB];
+		VCB[VCB$L_RVT] = .NEW_RVT;
+
+		FCB = .VCB[VCB$L_FCBFL];
+		UNTIL .FCB EQL VCB[VCB$L_FCBFL]
+		DO
+		    BEGIN
+		    WINDOW = .FCB[FCB$L_WLFL];
+		    UNTIL .WINDOW EQL FCB[FCB$L_WLFL]
+		    DO
+			BEGIN
+			WINDOW[WCB$L_RVT] = .NEW_RVT;
+			WINDOW = .WINDOW[WCB$L_WLFL];
+			END;
+		    END;
+		    FCB = .FCB[FCB$L_FCBFL];
+		END;
+	    END;
+	DEALLOCATE_MEM (.RVT, 0);
+	RVT = .NEW_RVT;
+	END;
+    END;
+
+! Check the UCB pointer we are about to store into. If it is non-zero,
+! a volume with the same RVN is already mounted.
+! Finally fix up the entry count in the RVT and store the new UCB pointer.
+!
+
+IF .VECTOR [RVT[RVT$L_UCBLST], .HOME_BLOCK[HM2$W_RVN]-1] NEQ 0
+THEN
+    BEGIN
+    UNLOCK_IODB ();
+    ERR_EXIT (MOUN$_DUPRVN);
+    END;
+
+RVT[RVT$W_REFC] = .RVT[RVT$W_REFC] + 1;
+RVT[RVT$B_NVOLS] = MAXU (.RVT[RVT$B_NVOLS], .ENTRY_COUNT);
+VECTOR [RVT[RVT$L_UCBLST], .HOME_BLOCK[HM2$W_RVN]-1] = .NEW_UCB;
+
+UNLOCK_IODB ();
+CLEANUP_FLAGS[CLF_UNLOCKDB] = 0;
+REAL_RVT = .RVT;
+RETURN .RVT;
+
+END;					! end of routine ENTER_RVT
+
+END
+ELUDOM

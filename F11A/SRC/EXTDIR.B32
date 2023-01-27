@@ -1,0 +1,340 @@
+MODULE EXTDIR (
+		NOSAFE,
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This routine extends a directory file.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  15-Apr-1977  13:25
+!
+! MODIFIED BY:
+!
+!	A0101	ACG0121		Andrew C. Goldstein,	16-Jan-1980  22:57
+!		Make context save and restore into subroutines
+!
+!	A0100	ACG00001	Andrew C. Goldstein,  10-Oct-1978  20:02
+!	Previous revision history moved to F11A.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	EXTEND_DIR,			! extend directory file
+	HANDLER;			! local condition handler
+
+GLOBAL ROUTINE EXTEND_DIR =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine extends a directory file. If allocated but unused space is
+!	present, this means simply pushing back the EOF and materializing a
+!	block of zeroes. If the file is to be physically extended, it is
+!	copied to a new location on the disk to keep it contiguous. Note
+!	this routine will not do a non-contiguous extend if the above fails,
+!	nor does it implement the automatic conversion of non-contiguous
+!	directories found in RSX-11. The frequency of use of these is deemed
+!	too low to be worthwhile.
+!
+! CALLING SEQUENCE:
+!	EXTEND_DIR ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	DIR_FCB: FCB of directory file
+!	DIR_WINDOW: window of directory
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	DIR_RECORD: record number of first available record created
+!
+! ROUTINE VALUE:
+!	address of next directory record to use
+!
+! SIDE EFFECTS:
+!	directory extended, storage map altered, directory FCB & windows altered
+!
+!--
+
+BEGIN
+
+BUILTIN
+	FP;
+
+LOCAL
+	FIB		: REF BBLOCK,	! address of FIB for this operation
+	FCB		: REF BBLOCK,	! address of FCB for directory
+	HEADER		: REF BBLOCK,	! address of directory file header
+	NEXT_VBN,			! next directory VBN to use
+	NEW_SIZE,			! size to extend directory to
+	NEW_LBN,			! starting LBN of new space
+	LBN,				! current LBN in copy
+	BUFFER,				! buffer address of current directory block
+	MAP_AREA	: REF BBLOCK,	! address of file header map area
+	MAP_POINTER	: REF BBLOCK,	! pointer to current retrieval pointer
+	NEXT_LBN;			! LBN of next block to use
+
+EXTERNAL
+	LOCAL_FIB	: BBLOCK,	! FIB for main file operation
+	SECOND_FIB	: BBLOCK,	! FIB for secondary operations
+	DIR_FCB		: REF BBLOCK,	! address of directory FCB
+	DIR_WINDOW	: REF BBLOCK,	! address of directory window
+	PRIMARY_FCB	: REF BBLOCK,	! FCB of file in process
+	UNREC_COUNT,			! count of unrecorded blocks
+	UNREC_LBN,			! starting LBN of unrecorded blocks
+	DIR_RECORD;			! record number of directory entry
+
+EXTERNAL ROUTINE
+	SAVE_CONTEXT,			! save reentrant context area
+	RESTORE_CONTEXT,		! restore reentrant context area
+	READ_HEADER,			! read file header
+	ALLOC_BLOCKS,			! allocate blocks from storage map
+	RETURN_BLOCKS,			! return blocks to storage map
+	MAP_VBN,			! map virtual to logical
+	READ_BLOCK,			! read a disk block
+	RESET_LBN,			! assign new LBN to buffer
+	WRITE_BLOCK,			! write block to disk
+	CREATE_BLOCK,			! fabricate a block buffer
+	INVALIDATE,			! invalidate a buffer
+	TRUNCATE_HEADER,		! truncate file header
+	CHECKSUM,			! compute file header checksum
+	WRITE_HEADER,			! write file header
+	INIT_FCB,			! update file control block
+	ZERO_WINDOWS;			! invalidate related file windows
+
+
+! First save the current context, since this is a secondary file operation.
+! Set up the secondary context pointers. Then read the directory file header.
+!
+
+SAVE_CONTEXT ();
+PRIMARY_FCB = FCB = .DIR_FCB;
+FIB = SECOND_FIB;
+CH$MOVE (FIB$S_FID, LOCAL_FIB[FIB$W_DID], FIB[FIB$W_FID]);
+
+HEADER = READ_HEADER (0, .FCB);
+
+! The next VBN to use is the current directory eof block number. If the block
+! is not present in the file, the directory must be physically extended.
+!
+
+NEXT_VBN = .FCB[FCB$L_EFBLK] + 1;
+
+IF .NEXT_VBN GTRU .FCB[FCB$L_FILESIZE]
+THEN
+    BEGIN
+
+! Compute the number of blocks needed (50% of the current directory size)
+! and allocate the new space contiguously. Limit the number of blocks
+! allocated to what will fit in the map area of the header.
+!
+
+    MAP_AREA = .HEADER + .HEADER[FH1$B_MPOFFSET]*2;
+    NEW_SIZE = .FCB[FCB$L_FILESIZE] + MAXU (.FCB[FCB$L_FILESIZE]/2, 1);
+    IF .FCB[FCB$L_FILESIZE] GEQU 2048 THEN ERR_EXIT (SS$_DIRFULL);
+    IF .NEW_SIZE GTRU 2048 THEN NEW_SIZE = 2048;
+
+    FIB[FIB$V_ALCON] = 1;
+    FIB[FIB$V_FILCON] = 1;
+    ALLOC_BLOCKS (.FIB, .NEW_SIZE, NEW_LBN, NEW_SIZE);
+    UNREC_COUNT = .NEW_SIZE;
+    UNREC_LBN = .NEW_LBN;
+
+! Now copy the directory data from the old directory file to the newly
+! allocated space.
+!
+
+    INCR VBN FROM 1 TO .FCB[FCB$L_FILESIZE] DO
+	BEGIN
+	IF .FCB[FCB$L_STLBN] NEQ 0
+	THEN LBN = .VBN + .FCB[FCB$L_STLBN] - 1
+	ELSE LBN = MAP_VBN (.VBN, .DIR_WINDOW);
+
+	BUFFER = READ_BLOCK (.LBN, 1, DIRECTORY_TYPE);
+	RESET_LBN (.BUFFER, .VBN + .NEW_LBN - 1);
+	WRITE_BLOCK (.BUFFER);
+	END;
+
+! Now deallocate the old directory blocks. Then build retrieval pointers
+! for the new blocks in the file header. Do the truncation with a local
+! condition handler enabled for special error recovery.
+!
+
+    .FP = HANDLER;
+    TRUNCATE_HEADER (.FIB, .HEADER, DEALLOC_BLOCKS);
+    .FP = 0;
+
+    MAP_POINTER = .MAP_AREA + FM1$C_POINTERS;
+
+    DO
+	BEGIN
+	MAP_AREA[FM1$B_INUSE] = .MAP_AREA[FM1$B_INUSE] + 2;
+
+	MAP_POINTER[FM1$B_HIGHLBN] = .NEW_LBN<16,8>;
+	MAP_POINTER[FM1$B_COUNT] = MIN (.NEW_SIZE, 256) - 1;
+	MAP_POINTER[FM1$W_LOWLBN] = .NEW_LBN<0,16>;
+	MAP_POINTER = .MAP_POINTER + 4;
+
+	NEW_LBN = .NEW_LBN + MIN (.NEW_SIZE, 256);
+	NEW_SIZE = .NEW_SIZE - MIN (.NEW_SIZE, 256);
+	END
+    UNTIL .NEW_SIZE EQL 0;
+
+    UNREC_COUNT = 0;
+    HEADER[FH1$V_CONTIG] = 1;		! mark file contiguous
+    KERNEL_CALL (ZERO_WINDOWS, .FCB);
+    END;				! end of directory extension
+
+! Now that we have enough space in the directory, push the end of file
+! mark back one block and materialize the new block in memory. Also
+! update the FCB and flush any windows on it.
+!
+
+BBLOCK [HEADER[FH1$W_RECATTR], FAT$W_EFBLKL] = .NEXT_VBN + 1;
+BBLOCK [HEADER[FH1$W_RECATTR], FAT$W_FFBYTE] = 0;
+KERNEL_CALL (INIT_FCB, .FCB, .HEADER);
+BBLOCK [HEADER[FH1$W_RECATTR], FAT$W_HIBLKL] = .FCB[FCB$L_FILESIZE];
+CHECKSUM (.HEADER);
+WRITE_HEADER ();
+
+NEXT_LBN = (
+    IF .FCB[FCB$L_STLBN] NEQ 0
+    THEN .FCB[FCB$L_STLBN] + .NEXT_VBN - 1
+    ELSE MAP_VBN (.NEXT_VBN, .DIR_WINDOW)
+    );
+BUFFER = CREATE_BLOCK (.NEXT_LBN, 1, DIRECTORY_TYPE);
+DIR_RECORD = (.NEXT_VBN - 1) * 32 + 1;
+
+! Finally switch back to primary context.
+!
+
+RESTORE_CONTEXT ();
+
+RETURN .BUFFER;
+
+END;					! end of routine EXTEND_DIR
+
+ROUTINE HANDLER (SIGNAL, MECHANISM) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is the condition handler for directory extension. It is
+!	enabled only during the truncate call (deallocating the old directory
+!	blocks). Normal error handling would cause the entire directory to
+!	be dropped on the floor. Since we already have a new good copy, we
+!	should forge ahead. Note that no error status is returned to the user,
+!	although we will log a system error.
+!
+!
+! CALLING SEQUENCE:
+!	HANDLER (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of signal array
+!	ARG2: address of mechanism array
+!
+! IMPLICIT INPUTS:
+!	FILE_HEADER: address of directory file header
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	SS$_RESIGNAL or none if unwind
+!
+! SIDE EFFECTS:
+!	file header map area cleaned out
+!
+!--
+
+BEGIN
+
+MAP
+	SIGNAL		: REF BBLOCK,	! signal array arg
+	MECHANISM	: REF BBLOCK;	! mechanism array arg
+
+LOCAL
+	MAP_AREA	: REF BBLOCK;	! address of header map area
+
+EXTERNAL
+	FILE_HEADER	: REF BBLOCK;	! address of directory file header
+
+EXTERNAL ROUTINE
+	SYS$UNWIND	: ADDRESSING_MODE (ABSOLUTE);
+					! system unwind service
+
+
+! Check the condition code for FCP error exit and check that it is not a
+! write error. Then initialize the header's map area and unwind. On other
+! signals we simply resignal.
+!
+
+IF .SIGNAL[CHF$L_SIG_NAME] EQL SS$_CMODUSER
+THEN
+    BEGIN
+    MAP_AREA = .FILE_HEADER + .FILE_HEADER[FH1$B_MPOFFSET]*2;
+    MAP_AREA[FM1$B_INUSE] = 0;
+    CH$FILL (0, .MAP_AREA[FM1$B_AVAIL]*2, .MAP_AREA + FM1$C_POINTERS);
+
+    SYS$UNWIND (MECHANISM[CHF$L_MCH_DEPTH], 0);
+    END;
+
+RETURN SS$_RESIGNAL;			! status is irrelevant if unwind
+
+END;					! end of routine handler
+
+END
+ELUDOM

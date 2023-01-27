@@ -1,0 +1,1065 @@
+MODULE DUMP$MAIN (				! File dump program
+	IDENT='V03-000',
+	MAIN=dump$start,
+	ADDRESSING_MODE(EXTERNAL=GENERAL,
+		NONEXTERNAL=LONG_RELATIVE)
+	) =
+BEGIN
+!
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!
+!++
+!
+! FACILITY:  File dump utility
+!
+! ABSTRACT:
+!	This module contains the command processing and driver routines.
+!
+! ENVIRONMENT:
+!	VAX native, user mode.
+!
+! AUTHOR:  Benn Schreiber, Stephen Zalewski	 CREATION DATE:  22-Jun-1981
+!
+! MODIFIED BY:
+!
+!	V03-006	MLJ0081		Martin L. Jack,	24-Feb-1982  17:35
+!		Lengthen DUMP$GQ_TIME to avoid overwriting EXIT_STATUS.
+!
+!	V03-005	MLJ0059		Martin L. Jack,	6-Nov-1981  14:13
+!		Properly handle EFBLK of 0.
+!
+!	V03-004	MLJ0056		Martin L. Jack,	18-Oct-1981  23:31
+!		Special case reading from terminals to allow ^Z to function.
+!
+!	V03-003	MLJ0046		Martin L. Jack,	21-Sep-1981  18:27
+!		Allow for device name change between $PARSE and $OPEN.
+!
+!	V03-002	MLJ0045		Martin L. Jack,	10-Sep-1981  15:27
+!		Set SQO bit where appropriate.  Allow record mode dump of
+!		network device.  Allow DUMP/HEADER on tape.
+!
+!	V03-001	MLJ0033		Martin L. Jack,	23-Aug-1981  9:48
+!		Extensive rewriting to finish implementation.
+!
+!--
+
+LIBRARY 'SYS$LIBRARY:STARLET';
+LIBRARY 'SYS$LIBRARY:TPAMAC';
+REQUIRE	'SRC$:DUMPRE';
+
+
+FORWARD ROUTINE
+    dump$handler,			! Top-level condition handler
+    dump$start,				! Main routine
+    dump$tparse,			! Call TPARSE
+    dump$store_num,			! Store numeric qualifier value
+    dump$open_input,			! Open input file
+    dump$open_output,			! Open output file
+    dump$read,				! Read from input file
+    dump$write:		NOVALUE,	! Write to output file
+    dump$close_input:	NOVALUE,	! Close input file
+    dump$close_output:	NOVALUE,	! Close output file
+    dump$list_width:	NOVALUE,	! Get listing device width
+    dump$file_error:	NOVALUE;	! Signal file-related error
+
+
+EXTERNAL ROUTINE
+    cli$get_value,			! Get qualifier value
+    cli$present,			! Test if qualifier present
+    cli$end_parse,			! Terminate parse/error check
+    dump$blank_line,			! Write blank line
+    dump$dump_file,			! Dump the file
+    dump$output_getmsg,			! Output a message
+    lib$free_vm,			! Free virtual memory
+    lib$get_vm,				! Allocate virtual memory
+    lib$find_file,			! Search for wild card files
+    lib$lp_lines,			! Number of lines on printer
+    lib$tparse,				! Table-driven parser
+    str$copy_dx;			! Copy a string
+
+
+EXTERNAL LITERAL
+    dump$_facility,
+    dump$_badrange,
+    dump$_confqual,
+    dump$_devquals,
+    dump$_devspec,
+    dump$_getchn,
+    dump$_endoffile,
+    dump$_novirmem;
+
+
+GLOBAL
+    dump$gl_ifab : REF BBLOCK,			! Pointer to input FAB
+    dump$gl_inam : REF BBLOCK,			! Pointer to input NAM block
+    dump$gl_irab : $RAB_DECL,			! Input RAB
+    dump$gl_orab : $RAB_DECL,			! Output RAB
+    dump$gl_ofab : $FAB_DECL,			! Output FAB
+    dump$gl_onam : $NAM_DECL,			! Output NAM block
+    dump$gl_orss : BBLOCK[nam$c_maxrss],	! Output resultant string
+    dump$gl_idesc : BBLOCK[dsc$c_s_bln],	! Descriptor for input RSA
+    dump$gl_odesc : BBLOCK[dsc$c_s_bln],	! Descriptor for output RSA
+    dump$ab_outbuf : BBLOCK[dump$c_maxlisiz],	! Output buffer
+    dump$gl_outdesc : BBLOCK[dsc$c_s_bln],	! Descriptor for output buffer
+    dump$gl_channel,				! Input channel
+    dump$gl_width,				! Width of listing
+    dump$gl_lpp,				! Lines per page
+    dump$gl_buffer : BBLOCK[dsc$c_s_bln],	! Descriptor for input buffer
+    dump$gl_flags : BBLOCK[4],			! General flags
+    dump$gl_start_qual,				! Value of START qualifier
+    dump$gl_end_qual,				! Value of END qualifier
+    dump$gl_count_qual,				! Value of COUNT qualifier
+    dump$gl_number_qual,			! Value of NUMBER qualifier
+    dump$gl_number,				! Local byte offset for NUMBER
+    dump$gl_cur_block,				! Current block number
+    dump$gl_max_block,				! Highest block to be dumped
+    dump$gl_file_efblk,				! End of file block
+    dump$gl_file_hiblk,				! Highest allocated block
+    dump$gl_record,				! Current block/record number
+    dump$gq_time : VECTOR[2];			! Time at beginning of dump
+
+
+OWN
+    exit_status : BBLOCK[4] INITIAL(ss$_normal),! Most severe error status
+    tpa_block : BBLOCK[tpa$k_length0];		! TPARSE block
+
+LITERAL
+	dump$m_tpa_start=	$fieldmask(dump$v_tpa_start),
+	dump$m_tpa_count=	$fieldmask(dump$v_tpa_count),
+	dump$m_tpa_end=		$fieldmask(dump$v_tpa_end);
+
+
+! TPARSE tables to parse /BLOCK and /RECORD qualifier values.
+!
+$INIT_STATE(blkrec_states, blkrec_keys);
+$STATE(,
+	('START',,,dump$m_tpa_start,dump$gl_flags),
+	('END'  ,,,dump$m_tpa_end,  dump$gl_flags),
+	('COUNT',,,dump$m_tpa_count,dump$gl_flags));
+$STATE(,
+	('='),
+	(':'));
+$STATE(parse_number,
+	(tpa$_decimal,eos,dump$store_num),	! Decimal number
+	('%'));					! Base prefix
+$STATE(,
+	('X'),					! Hex base designator
+	('O',octnum),				! Octal base designator
+	('D',decnum));				! Decimal base designator
+$STATE(,
+	(tpa$_hex,eos,dump$store_num));		! Introduced hex number
+$STATE(octnum,
+	(tpa$_octal,eos,dump$store_num));	! Introduced octal number
+$STATE(decnum,
+	(tpa$_decimal,,dump$store_num));	! Introduced decimal number
+$STATE(eos,
+	(tpa$_eos,tpa$_exit));			! End of string
+
+
+! TPARSE table to parse /NUMBER qualifier.
+!
+$INIT_STATE(number_states, number_keys);
+$STATE(,
+	((parse_number),tpa$_exit));		! /NUMBER=
+
+ROUTINE dump$handler(sigargs, mechargs)=
+BEGIN
+!
+! This routine is a condition handler established by the main
+! routine.  It saves the most severe condition for the exit status.
+!
+MAP
+    sigargs : REF BBLOCK,
+    mechargs : REF BBLOCK;
+BIND
+    signame = sigargs[chf$l_sig_name] : BBLOCK;	! Name of signal
+
+
+IF NOT .signame					! If an error signal
+    AND ((.signame[sts$v_severity]		! and severity is worse
+	GTRU .exit_status[sts$v_severity])
+	OR .exit_status[sts$v_severity])	! or no errors yet
+THEN
+    exit_status = .signame;			! then save it for exit
+
+
+RETURN ss$_resignal;				! Resignal to get message
+END;						! Of dump$handler
+
+ROUTINE dump$start=
+BEGIN
+!
+! This is the main program.  It gathers all the command inputs, and then
+! dumps the requested files.
+!
+LOCAL
+    find_context : REF BBLOCK,			! Context for lib$find_file
+    find_result : BBLOCK[dsc$c_s_bln],		! Result of lib$find_file
+    find_related : BBLOCK[dsc$c_s_bln],		! Related file for find_file
+    find_default : BBLOCK[dsc$c_s_bln],		! Default file
+    value_desc : BBLOCK[dsc$c_s_bln],		! Qualifier value descriptor
+    status,					! Status variable
+    output_desc : BBLOCK[dsc$c_s_bln],		! Output file specification
+    input_desc : BBLOCK[dsc$c_s_bln];		! Input file specification
+BUILTIN
+    fp;
+
+
+.fp = dump$handler;				! Enable the condition handler
+
+
+CH$FILL(0, dsc$c_s_bln, input_desc);
+input_desc[dsc$b_class] = dsc$k_class_d;	! Make descriptors dynamic
+CH$MOVE(dsc$c_s_bln, input_desc, output_desc);
+CH$MOVE(dsc$c_s_bln, input_desc, find_result);
+CH$MOVE(dsc$c_s_bln, input_desc, find_related);
+CH$MOVE(dsc$c_s_bln, input_desc, find_default);
+CH$MOVE(dsc$c_s_bln, input_desc, value_desc);
+
+
+! Get parameters and qualifiers.
+!
+cli$get_value($descriptor('INPUT'), input_desc);	! Get input file spec
+cli$get_value($descriptor('OUTPUT'), output_desc);	! Get output file spec
+dump$gl_flags[dump$v_allocated] =	cli$present($descriptor('ALLOCATED'));
+					cli$present($descriptor('ASCII'));
+dump$gl_flags[dump$v_blocks] =		cli$present($descriptor('BLOCKS'));
+dump$gl_flags[dump$v_byte] =		cli$present($descriptor('BYTE'));
+dump$gl_flags[dump$v_decimal] =		cli$present($descriptor('DECIMAL'));
+dump$gl_flags[dump$v_file_header] =	cli$present($descriptor('FILE_HEADER'));
+dump$gl_flags[dump$v_formatted] =	cli$present($descriptor('FORMATTED'));
+dump$gl_flags[dump$v_header] =		cli$present($descriptor('HEADER'));
+dump$gl_flags[dump$v_hex] =		cli$present($descriptor('HEXADECIMAL'));
+dump$gl_flags[dump$v_longword] =	cli$present($descriptor('LONGWORD'));
+dump$gl_flags[dump$v_number] =		cli$present($descriptor('NUMBER'));
+dump$gl_flags[dump$v_octal] =		cli$present($descriptor('OCTAL'));
+dump$gl_flags[dump$v_output] =		cli$present($descriptor('OUTPUT'));
+dump$gl_flags[dump$v_printer] =		cli$present($descriptor('PRINTER'));
+dump$gl_flags[dump$v_records] =		cli$present($descriptor('RECORDS'));
+dump$gl_flags[dump$v_word] =		cli$present($descriptor('WORD'));
+
+
+! Check for conflicting OCTAL/DECIMAL/HEX, BYTE/WORD/LONGWORD, RECORDS/BLOCKS,
+! PRINTER/OUTPUT, RECORDS/ALLOCATED.
+!
+IF (.dump$gl_flags[dump$v_hex] AND .dump$gl_flags[dump$v_octal])
+OR (.dump$gl_flags[dump$v_hex] AND .dump$gl_flags[dump$v_decimal])
+OR (.dump$gl_flags[dump$v_octal] AND .dump$gl_flags[dump$v_decimal])
+OR (.dump$gl_flags[dump$v_byte] AND .dump$gl_flags[dump$v_word])
+OR (.dump$gl_flags[dump$v_byte] AND .dump$gl_flags[dump$v_longword])
+OR (.dump$gl_flags[dump$v_word] AND .dump$gl_flags[dump$v_longword])
+OR (.dump$gl_flags[dump$v_records] AND .dump$gl_flags[dump$v_blocks])
+OR (.dump$gl_flags[dump$v_records] AND .dump$gl_flags[dump$v_allocated])
+OR (.dump$gl_flags[dump$v_printer] AND .dump$gl_flags[dump$v_output])
+THEN
+    SIGNAL_STOP(dump$_confqual);
+
+
+! If /NUMBER qualifier is present, get the value.
+!
+IF .dump$gl_flags[dump$v_number]			! /NUMBER present
+THEN
+    BEGIN
+    IF cli$get_value($descriptor('NUMBER'), value_desc)
+    THEN
+	BEGIN
+	dump$gl_flags[dump$v_tpa_number] = true;	! Note parsing /NUMBER
+	IF NOT dump$tparse(value_desc, number_states, number_keys)
+	THEN
+	    SIGNAL_STOP(
+		dump$_facility^16 + shr$_syntax + sts$k_severe,
+		1, value_desc);
+	END;
+    END;
+
+
+! If /BLOCK qualifier is present, get the value(s).
+!
+IF .dump$gl_flags[dump$v_blocks]			! /BLOCKS present
+THEN
+    BEGIN
+    WHILE cli$get_value($descriptor('BLOCKS'), value_desc) DO
+	BEGIN
+	IF NOT dump$tparse(value_desc, blkrec_states, blkrec_keys)
+	THEN
+	    SIGNAL_STOP(
+		dump$_facility^16 + shr$_syntax + sts$k_severe,
+		1, value_desc);
+	END;
+    END;
+
+
+! If /RECORD qualifier is present, get the value(s).
+!
+IF .dump$gl_flags[dump$v_records]			! /RECORDS present
+THEN
+    BEGIN
+    WHILE cli$get_value($descriptor('RECORDS'), value_desc) DO
+	BEGIN
+        IF NOT dump$tparse(value_desc, blkrec_states, blkrec_keys)
+	THEN
+	    SIGNAL_STOP(
+		dump$_facility^16 + shr$_syntax + sts$k_severe,
+		1, value_desc);
+	END;
+    END;
+
+
+! Check for conflicting END and COUNT.
+!
+IF .dump$gl_flags[dump$v_count] AND .dump$gl_flags[dump$v_end]
+THEN
+    SIGNAL_STOP(dump$_confqual);
+
+
+! Check range of START and END if both were specified, to ensure that START
+! is less than END.
+!
+IF .dump$gl_flags[dump$v_start] AND .dump$gl_flags[dump$v_end]
+AND .dump$gl_start_qual GTRU .dump$gl_end_qual
+THEN
+    SIGNAL_STOP(dump$_badrange);
+
+
+! Get number of lines on output page.
+!
+dump$gl_lpp = lib$lp_lines() - 6;
+
+
+! Signal end of parsing.
+!
+cli$end_parse();
+
+
+! Loop, calling LIB$FIND_FILE to get files matching the input spec.
+!
+find_context = 0;					! Initialize context
+UNTIL
+    BEGIN
+    status = lib$find_file(
+	input_desc,
+	find_result,
+	find_context,
+	find_default,
+	find_related);
+    .status EQL rms$_nmf
+    END
+DO
+    BEGIN
+    IF NOT .status					! Report error
+    THEN
+	BEGIN
+	SIGNAL(
+	    dump$_facility^16 + shr$_openin + sts$k_error,
+	    1, find_result,
+	    .find_context[fab$l_sts], .find_context[fab$l_stv]);
+	END
+    ELSE
+	BEGIN
+	IF dump$open_input(.find_context, find_result)
+	AND dump$open_output(output_desc, .find_context)
+	THEN
+	    BEGIN
+	    dump$list_width(dump$gl_ofab);		! Get width of listing
+	    $GETTIM(timadr=dump$gq_time);		! Get current time
+	    dump$gl_number = .dump$gl_number_qual;	! Set initial /NUMBER
+	    dump$dump_file();				! Dump the file
+	    dump$close_input(.find_context);
+	    dump$close_output();
+	    END;
+	str$copy_dx(find_related, find_result);		! Propagate related
+	END;
+    END;						! Of LIB$FIND_FILE loop
+
+
+RETURN .exit_status OR sts$m_inhib_msg; 		! Exit with no message
+END;
+
+ROUTINE dump$tparse(string, states, keys)=
+BEGIN
+!
+! This routine calls TPARSE given the string, states and keys.
+!
+! Inputs:
+!
+!	string		address of descriptor for string
+!	states		address of TPARSE states table
+!	keys		address of TPARSE keys table
+!
+MAP
+    string : REF BBLOCK;
+
+
+CH$FILL(0, tpa$k_length0, tpa_block);			! Initialize block
+tpa_block[tpa$l_count] = tpa$k_count0;
+tpa_block[tpa$l_options] = tpa$m_abbrev;
+tpa_block[tpa$l_stringcnt] = .string[dsc$w_length];
+tpa_block[tpa$l_stringptr] = .string[dsc$a_pointer];
+RETURN lib$tparse(tpa_block, .states, .keys);		! Call TPARSE
+END;
+
+ROUTINE dump$store_num=
+BEGIN
+!
+! This routine is called when the /BLOCKS, /RECORDS, or /NUMBER qualifier
+! is used.  It interrogates flags set by TPARSE to determine which numeric
+! value has been parsed and stores it in the appropriate result cell.
+!
+IF .dump$gl_flags[dump$v_tpa_start]		! Parsing START
+THEN
+    BEGIN
+    dump$gl_start_qual = .tpa_block[tpa$l_number];
+    dump$gl_flags[dump$v_start] = true;		! Note START was present
+    END
+ELSE IF .dump$gl_flags[dump$v_tpa_end]		! Parsing END
+THEN
+    BEGIN
+    dump$gl_end_qual = .tpa_block[tpa$l_number];
+    dump$gl_flags[dump$v_end] = true;		! Note END was present
+    END
+ELSE IF .dump$gl_flags[dump$v_tpa_count]	! Parsing COUNT
+THEN
+    BEGIN
+    dump$gl_count_qual = .tpa_block[tpa$l_number];
+    dump$gl_flags[dump$v_count] = true;		! Note COUNT was present
+    END
+ELSE IF .dump$gl_flags[dump$v_tpa_number]	! Parsing NUMBER
+THEN
+    dump$gl_number_qual = .tpa_block[tpa$l_number]
+ELSE
+    SIGNAL_STOP(dump$_facility^16 + shr$_badlogic + sts$k_severe);
+
+
+dump$gl_flags[dump$v_tpa_start] = false;	! Clear flags for next call
+dump$gl_flags[dump$v_tpa_end] = false;
+dump$gl_flags[dump$v_tpa_count] = false;
+dump$gl_flags[dump$v_tpa_number] = false;
+
+
+RETURN true					! Return success to TPARSE
+END;
+
+ROUTINE dump$open_input(fab, filedesc)=
+BEGIN
+!
+! This routine opens the input file
+!
+! Inputs:
+!
+!	fab	pointer to an already initialized fab complete with NAM block
+!	filedesc pointer to string descriptor of resultant string from $parse
+!
+! Outputs:
+!
+!	File is opened
+!
+! Routine value:
+!
+!	true	successful
+!	false	error, signal already done
+!
+MAP
+    fab : REF BBLOCK,
+    filedesc : REF BBLOCK;
+LOCAL
+    ixab : $XABFHC_DECL,
+    dib : BBLOCK[dib$c_length],
+    dibdesc : BBLOCK[dsc$c_s_bln],
+    status;
+
+
+dump$gl_ifab = .fab;				! Set pointer to FAB
+dump$gl_inam = .fab[fab$l_nam];			! and NAM block
+
+
+IF .BBLOCK[fab[fab$l_dev], dev$v_net]		! If network device
+THEN
+    BEGIN
+    IF .dump$gl_flags[dump$v_allocated]		! Ensure no conflicting
+    OR .dump$gl_flags[dump$v_blocks]		! qualifiers
+    OR .dump$gl_flags[dump$v_header]
+    THEN
+	SIGNAL_STOP(dump$_devquals);
+
+
+    dump$gl_flags[dump$v_records] = true;	! Force record mode
+    END;
+
+
+IF .BBLOCK[fab[fab$l_dev], dev$v_for]		! If foreign device
+OR (NOT .BBLOCK[fab[fab$l_dev], dev$v_fod]	! or not disk, tape, or network
+AND NOT .BBLOCK[fab[fab$l_dev], dev$v_net])
+THEN
+    BEGIN
+    IF .dump$gl_flags[dump$v_allocated]		! Ensure no file-oriented
+    OR .dump$gl_flags[dump$v_records]		! qualifiers
+    OR .dump$gl_flags[dump$v_header]
+    THEN
+	SIGNAL_STOP(dump$_devquals);
+
+
+    IF (.dump$gl_inam[nam$l_fnb] AND		! Ensure nothing except device
+	(nam$m_exp_dir OR
+	 nam$m_exp_name OR
+	 nam$m_exp_type OR
+	 nam$m_exp_ver OR
+	 nam$m_wildcard)) NEQ 0
+    THEN
+	SIGNAL_STOP(dump$_devspec);
+    END
+ELSE
+    BEGIN
+    IF NOT .BBLOCK[fab[fab$l_dev], dev$v_rnd]	! Ensure no disk-oriented
+    AND .dump$gl_flags[dump$v_allocated]	! qualifiers on tape
+    THEN
+	SIGNAL_STOP(dump$_devquals);
+
+
+    $XABFHC_INIT(xab=ixab,			! Initialize XAB
+	nxt=0);
+    fab[fab$l_xab] = ixab;			! Set pointer to XAB
+    END;
+
+
+IF NOT .dump$gl_flags[dump$v_records]
+THEN
+    fab[fab$v_ufo] = true			! Open file only
+ELSE
+    fab[fab$v_get] = fab[fab$v_sqo] = true;	! Allow GETs, sequential op
+
+
+IF NOT $OPEN(fab=.fab)				! Open the input file
+THEN
+    BEGIN
+    dump$file_error(
+	dump$_facility^16 + shr$_openin + sts$k_error,
+	.fab,
+	.fab[fab$l_sts], .fab[fab$l_stv]);
+    RETURN false;
+    END;
+
+
+IF .BBLOCK[fab[fab$l_dev], dev$v_for]		! If foreign device
+OR (NOT .BBLOCK[fab[fab$l_dev], dev$v_fod]	! or not disk, tape, or network
+AND NOT .BBLOCK[fab[fab$l_dev], dev$v_net])
+THEN
+    BEGIN
+    dump$gl_idesc[dsc$w_length] = .dump$gl_inam[nam$b_dev];	! Prune to
+    dump$gl_idesc[dsc$a_pointer] = .dump$gl_inam[nam$l_dev];	! device only
+    END
+ELSE
+    BEGIN
+    dump$gl_idesc[dsc$w_length] = .dump$gl_inam[nam$b_rsl];
+    dump$gl_idesc[dsc$a_pointer] = .dump$gl_inam[nam$l_rsa];
+    END;
+
+
+IF NOT .dump$gl_flags[dump$v_records]
+THEN
+    dump$gl_channel = .fab[fab$l_stv]		! Save the channel
+ELSE
+    BEGIN
+    $RAB_INIT(rab=dump$gl_irab,			! Initialize input RAB
+	fab=.fab);
+    IF NOT $CONNECT(rab=dump$gl_irab)		! Connect RAB
+    THEN
+	BEGIN
+	dump$file_error(
+	    dump$_facility^16 + shr$_openin + sts$k_error,
+	    .fab,
+	    .dump$gl_irab[rab$l_sts], .dump$gl_irab[rab$l_stv]);
+	RETURN false;
+	END;
+    END;
+
+
+dump$gl_cur_block = 1;
+dump$gl_max_block = -1;
+
+IF .BBLOCK[fab[fab$l_dev], dev$v_rnd]			! Disk device
+THEN
+    IF .BBLOCK[fab[fab$l_dev], dev$v_for]		! If foreign disk
+    THEN
+	BEGIN
+	dibdesc[dsc$w_length] = dib$c_length;		! Set up to get device
+	dibdesc[dsc$a_pointer] = dib;			! characteristics
+	status = $GETCHN(CHAN=.dump$gl_channel, PRIBUF=dibdesc);
+	IF NOT .status
+	THEN
+	    SIGNAL_STOP(dump$_getchn, 0, .status);
+	dump$gl_cur_block = 0;
+	dump$gl_max_block = .dib[dib$l_maxblock] - 1;
+	END
+    ELSE
+	BEGIN						! Files-11 disk
+
+	! Save FHC information for page heading.
+	!
+	dump$gl_file_efblk = .ixab[xab$l_ebk];
+	IF .dump$gl_file_efblk NEQ 0 AND .ixab[xab$w_ffb] EQL 0
+	THEN
+	    dump$gl_file_efblk = .dump$gl_file_efblk - 1;
+	dump$gl_file_hiblk = .fab[fab$l_alq];
+	IF NOT .dump$gl_flags[dump$v_records]		! Not record mode
+	THEN
+	    BEGIN
+	    dump$gl_max_block = .dump$gl_file_efblk;
+	    IF .dump$gl_flags[dump$v_allocated]
+		THEN dump$gl_max_block = .dump$gl_file_hiblk;
+	    END;
+	END;
+
+fab[fab$l_xab] = 0;					! Disconnect XAB
+
+IF .dump$gl_flags[dump$v_start]
+THEN
+    dump$gl_cur_block = MAXU(.dump$gl_cur_block, .dump$gl_start_qual);
+
+IF .dump$gl_flags[dump$v_end]
+THEN
+    dump$gl_max_block = MINU(.dump$gl_max_block, .dump$gl_end_qual);
+
+IF .dump$gl_flags[dump$v_count]
+THEN
+    IF .dump$gl_flags[dump$v_start]
+    THEN
+	dump$gl_max_block = MINU(.dump$gl_max_block,
+	    .dump$gl_start_qual + .dump$gl_count_qual - 1)
+    ELSE
+	dump$gl_max_block = MINU(.dump$gl_max_block,
+	    .dump$gl_cur_block + .dump$gl_count_qual - 1);
+
+
+dump$gl_record = 0;
+IF NOT .dump$gl_flags[dump$v_records]
+AND .BBLOCK[fab[fab$l_dev], dev$v_rnd]
+THEN
+    dump$gl_record = .dump$gl_cur_block - 1;
+
+
+! Allocate input buffer. 
+!
+IF .dump$gl_flags[dump$v_records]			! If record dump
+THEN
+    dump$gl_buffer[dsc$w_length] = dump$c_rmsbufsz	! Largest RMS record
+ELSE
+    IF .BBLOCK[fab[fab$l_dev], dev$v_sqd]
+    THEN
+	dump$gl_buffer[dsc$w_length] = dump$c_tapbufsz	! Largest tape QIO
+    ELSE
+	dump$gl_buffer[dsc$w_length] = dump$c_qiobufsz;	! Largest non-tape QIO
+
+
+status = lib$get_vm(					! Get memory
+    dump$gl_buffer[dsc$w_length],
+    dump$gl_buffer[dsc$a_pointer]);
+IF NOT .status THEN SIGNAL_STOP(dump$_novirmem, 0, .status);
+
+
+dump$gl_irab[rab$w_usz] = .dump$gl_buffer[dsc$w_length];
+dump$gl_irab[rab$l_ubf] = .dump$gl_buffer[dsc$a_pointer];
+RETURN true
+END;
+
+ROUTINE dump$open_output(output_desc, ifab)=
+BEGIN
+!
+! Open output file
+!
+! Inputs:
+!
+!	output_desc	pointer to string descriptor for output file
+!	ifab		pointer to input fab
+!
+MAP
+    output_desc : REF BBLOCK,
+    ifab : REF BBLOCK;
+
+
+$FAB_INIT(fab=dump$gl_ofab,			! Initialize output FAB
+    dna=UPLIT BYTE('.DMP'),			! Default /OUTPUT type
+    dns=%CHARCOUNT('.DMP'),
+    nam=dump$gl_onam,
+    fop=<ofp,sqo>,
+    rat=cr,
+    fac=put);
+
+
+$NAM_INIT(nam=dump$gl_onam,			! Initialize output NAM block
+    rlf=.ifab[fab$l_nam],
+    rss=nam$c_maxrss,
+    rsa=dump$gl_orss,
+    ess=nam$c_maxrss,
+    esa=dump$gl_orss);
+
+
+$RAB_INIT(rab=dump$gl_orab,			! Initialize output RAB
+    fab=dump$gl_ofab);
+
+
+! Create the output file and connect record stream.
+!
+IF .dump$gl_flags[dump$v_printer]		! If /PRINTER requested,
+THEN
+    BEGIN
+    dump$gl_ofab[fab$v_spl] = true;		! Spool listing
+    dump$gl_ofab[fab$v_dlt] = true;		! Delete after printing
+    END
+ELSE
+    IF .dump$gl_flags[dump$v_output]		! If /OUTPUT requested
+    THEN
+	BEGIN
+	IF .output_desc[dsc$w_length] NEQ 0	! If /OUTPUT has a value
+	THEN
+	    BEGIN
+	    dump$gl_ofab[fab$l_fna] = .output_desc[dsc$a_pointer];
+	    dump$gl_ofab[fab$b_fns] = .output_desc[dsc$w_length];
+	    END
+	END
+    ELSE
+	BEGIN					! Else, default to SYS$OUTPUT
+	dump$gl_ofab[fab$l_fna] = UPLIT BYTE('SYS$OUTPUT');
+	dump$gl_ofab[fab$b_fns] = %CHARCOUNT('SYS$OUTPUT');
+	END;
+
+
+IF NOT $CREATE(fab=dump$gl_ofab)
+THEN
+    BEGIN
+    dump$file_error(
+	dump$_facility^16 + shr$_openout + sts$k_error,
+	dump$gl_ofab,
+	.dump$gl_ofab[fab$l_sts], .dump$gl_ofab[fab$l_stv]);
+    RETURN false;
+    END;
+
+IF NOT $CONNECT(rab=dump$gl_orab)
+THEN
+    BEGIN
+    dump$file_error(
+	dump$_facility^16 + shr$_openout + sts$k_error,
+	dump$gl_ofab,
+	.dump$gl_orab[rab$l_sts], .dump$gl_orab[rab$l_stv]);
+    RETURN false;
+    END;
+
+
+dump$gl_odesc[dsc$w_length] = .dump$gl_onam[nam$b_rsl];
+dump$gl_odesc[dsc$a_pointer] = .dump$gl_onam[nam$l_rsa];
+RETURN true
+END;
+
+GLOBAL ROUTINE dump$read(bufdesc)=
+BEGIN
+!
+! This routine reads from the input file.
+!
+MAP
+    bufdesc : REF BBLOCK;
+LOCAL
+    iosb : VECTOR[4,WORD],
+    status;
+
+
+IF NOT .dump$gl_flags[dump$v_records]			! If reading with QIO
+THEN
+    BEGIN
+    IF NOT .BBLOCK[dump$gl_ifab[fab$l_dev], dev$v_rnd]
+    THEN
+	BEGIN						! One QIO = one block
+	DECR i FROM 1 TO 0 DO
+	    BEGIN
+	    status = $QIOW(
+		CHAN=.dump$gl_channel,
+		FUNC=(IF .BBLOCK[dump$gl_ifab[fab$l_dev], dev$v_for]
+		    THEN io$_readlblk
+		    ELSE io$_readvblk),
+		IOSB=iosb,
+		P1=.dump$gl_buffer[dsc$a_pointer],
+		P2=.dump$gl_buffer[dsc$w_length]);
+	    bufdesc[dsc$w_length] = .iosb[1];	! Bytes actually read
+	    bufdesc[dsc$a_pointer] = .dump$gl_buffer[dsc$a_pointer];
+	    IF .status THEN status = .iosb[0];
+
+	    IF .BBLOCK[dump$gl_ifab[fab$l_dev], dev$v_trm]	! Handle ^Z
+	    AND .iosb[2] EQL %O'032'				! from terminal
+	    THEN
+		status = ss$_endoffile;
+
+	    IF .status EQL ss$_endoffile	! Print message if end of file
+	    AND .BBLOCK[dump$gl_ifab[fab$l_dev], dev$v_sqd]
+	    AND .BBLOCK[dump$gl_ifab[fab$l_dev], dev$v_for]
+	    THEN
+		BEGIN
+		dump$blank_line();
+		dump$output_getmsg(dump$_endoffile, %B'0001');
+		IF .i EQL 0 THEN EXITLOOP;
+		END
+	    ELSE
+		EXITLOOP;
+	    END;
+	END
+    ELSE
+	BEGIN
+	IF .dump$gl_cur_block GTRU .dump$gl_max_block
+	THEN
+	    RETURN ss$_endoffile;			! Return EOF status
+	status = $QIOW(
+	    CHAN=.dump$gl_channel,
+	    FUNC=(IF .BBLOCK[dump$gl_ifab[fab$l_dev], dev$v_for]
+		THEN io$_readlblk
+		ELSE io$_readvblk),
+	    IOSB=iosb,
+	    P1=.dump$gl_buffer[dsc$a_pointer],
+	    P2=512,
+	    P3=.dump$gl_cur_block);
+	IF .status THEN status = .iosb[0];
+	bufdesc[dsc$w_length] = 512;
+	bufdesc[dsc$a_pointer] = .dump$gl_buffer[dsc$a_pointer];
+	dump$gl_cur_block = .dump$gl_cur_block + 1;	! Advance pointer
+	END;
+    IF NOT .status
+    AND .status NEQ ss$_endoffile
+    AND .status NEQ ss$_parity
+    AND .status NEQ ss$_datacheck
+    AND .status NEQ ss$_endoftape
+    AND .status NEQ ss$_illblknum
+    THEN
+	BEGIN
+	SIGNAL(
+	    dump$_facility^16 + shr$_readerr + sts$k_error,
+	    1, dump$gl_idesc,
+	    .status);
+	status = ss$_endoffile;
+	END
+    END
+ELSE
+    BEGIN
+    status = $GET(rab=dump$gl_irab);			! Get record
+    bufdesc[dsc$w_length] = .dump$gl_irab[rab$w_rsz];
+    bufdesc[dsc$a_pointer] = .dump$gl_irab[rab$l_rbf];
+    IF NOT .status
+    THEN
+	BEGIN
+	IF .status NEQ rms$_eof
+	THEN
+	    SIGNAL(
+		dump$_facility^16 + shr$_readerr + sts$k_error,
+		1, dump$gl_idesc,
+		.dump$gl_irab[rab$l_sts], .dump$gl_irab[rab$l_stv]);
+	status = ss$_endoffile;
+	END;
+    END;
+
+
+RETURN .status
+END;
+
+GLOBAL ROUTINE dump$write(recdesc): NOVALUE=
+BEGIN
+!
+! Write a record to the output file
+!
+! Inputs:
+!
+!	recdesc	pointer to string descriptor for record
+!
+MAP
+    recdesc : REF BBLOCK;
+
+
+dump$gl_orab[rab$w_rsz] = .recdesc[dsc$w_length];
+dump$gl_orab[rab$l_rbf] = .recdesc[dsc$a_pointer];
+IF NOT $PUT(rab=dump$gl_orab)
+THEN
+    SIGNAL(
+	dump$_facility^16 + shr$_writeerr + sts$k_severe,
+	1, dump$gl_odesc,
+	.dump$gl_orab[rab$l_sts], .dump$gl_orab[rab$l_stv]);
+END;
+
+ROUTINE dump$close_input(fab): NOVALUE=
+BEGIN
+!
+! Close the input file
+!
+! Inputs:
+!
+!	fab	Address of fab
+!
+MAP
+    fab : REF BBLOCK;
+LOCAL
+    status;
+
+
+IF .dump$gl_flags[dump$v_records]			! If RMS dump
+THEN
+    BEGIN
+    IF NOT $CLOSE(fab=.fab)				! Close fab
+    THEN
+	SIGNAL(
+	    dump$_facility^16 + shr$_closein + sts$k_error,
+	    1, dump$gl_idesc,
+	    .fab[fab$l_sts], .fab[fab$l_stv]);
+    END
+ELSE
+    BEGIN
+    status = $DASSGN(CHAN=.dump$gl_channel);		! Else deassign channel
+    IF NOT .status
+    THEN
+	SIGNAL(
+	    dump$_facility^16 + shr$_closein + sts$k_error,
+	    1, dump$gl_idesc,
+	    .status);
+    END;
+
+
+! Free input buffer.
+!
+IF .dump$gl_buffer[dsc$a_pointer] NEQ 0
+THEN
+    lib$free_vm(dump$gl_buffer[dsc$w_length], dump$gl_buffer[dsc$a_pointer]);
+END;
+
+ROUTINE dump$close_output: NOVALUE=
+BEGIN
+!
+! Close the output file
+!
+! Inputs:
+!
+!
+IF NOT $CLOSE(fab=dump$gl_ofab)
+THEN
+    SIGNAL(
+	dump$_facility^16 + shr$_closeout + sts$k_error,
+	1, dump$gl_odesc,
+	.dump$gl_ofab[fab$l_sts], .dump$gl_ofab[fab$l_stv]);
+END;
+
+ROUTINE dump$list_width(fab): NOVALUE=
+BEGIN
+!
+! Determine the width of the listing line
+! FAB is the fab of the open file, width returned in dump$gl_width,
+! and dump$gl_outdesc set up as string descriptor for output buffer
+!
+MAP
+    fab : REF BBLOCK;
+BIND
+    nam = .fab[fab$l_nam] : BBLOCK;
+LOCAL
+    devnamdesc : BBLOCK[dsc$c_s_bln],
+    devnambuf : VECTOR[nam$c_maxrss, BYTE],
+    devnambufdesc : BBLOCK[dsc$c_s_bln],
+    devinfobuf : BBLOCK[dib$k_length],
+    devinfodesc : BBLOCK[dsc$c_s_bln];
+LITERAL
+    ch_escape = %O'033';			! ASCII <ESC>
+
+
+dump$gl_width = dump$c_deflisiz;		! Assume default
+
+devnamdesc[dsc$a_pointer] = .nam[nam$l_dev];
+devnamdesc[dsc$w_length] =
+    CH$FIND_CH(.nam[nam$b_dev], .nam[nam$l_dev], %C':')
+    - .nam[nam$l_dev];
+devnambufdesc[dsc$w_length] = nam$c_maxrss;
+devnambufdesc[dsc$a_pointer] = devnambuf;
+$TRNLOG(LOGNAM=devnamdesc, RSLLEN=devnambufdesc, RSLBUF=devnambufdesc);
+IF .devnambuf[0] EQL ch_escape			! If process permanent file
+THEN
+    BEGIN
+    devnambufdesc[dsc$w_length] = .devnambufdesc[dsc$w_length] - 4;
+    devnambufdesc[dsc$a_pointer] = .devnambufdesc[dsc$a_pointer] + 4;
+    END;
+
+
+! Do a $GETDEV to get the width.
+!
+devinfodesc[dsc$w_length] = dib$k_length;	! Set up descriptor for $GETDEV
+devinfodesc[dsc$a_pointer] = devinfobuf;
+IF $GETDEV(DEVNAM=devnambufdesc, SCDBUF=devinfodesc)
+THEN
+    dump$gl_width = MINU(.devinfobuf[dib$w_devbufsiz], dump$c_maxlisiz);
+
+
+! Set up output buffer descriptor.
+!
+dump$gl_outdesc[dsc$w_length] = .dump$gl_width;
+dump$gl_outdesc[dsc$a_pointer] = dump$ab_outbuf;
+END;						! Of dump$list_width
+
+ROUTINE dump$file_error(message,fab,sts,stv): NOVALUE=
+BEGIN
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine signals an error for a file.
+!
+! Inputs:
+!
+!	message		Message
+!	fab		Address of the fab
+!	sts, stv	STS and STV values
+!
+!--
+
+MAP
+    fab : REF BBLOCK;
+BIND
+    nam = .fab[fab$l_nam] : BBLOCK;
+LOCAL
+    filedesc : BBLOCK[dsc$c_s_bln];
+
+
+CH$FILL(0, dsc$c_s_bln, filedesc);
+
+IF .nam[nam$b_rsl] NEQ 0			! If resultant name present
+THEN
+    BEGIN
+    filedesc[dsc$w_length] = .nam[nam$b_rsl];
+    filedesc[dsc$a_pointer] = .nam[nam$l_rsa];
+    END
+ELSE IF .nam[nam$b_esl] NEQ 0 			! If expanded name present
+THEN
+    BEGIN
+    filedesc[dsc$w_length] = .nam[nam$b_esl];
+    filedesc[dsc$a_pointer] = .nam[nam$l_esa]
+    END
+ELSE
+    BEGIN
+    filedesc[dsc$w_length] = .fab[fab$b_fns];	! Use filename string
+    filedesc[dsc$a_pointer] = .fab[fab$l_fna];	! if all else fails
+    END;
+
+
+SIGNAL(.message, 1, filedesc, .sts, .stv);
+END;						! Of dump$file_error
+
+END
+ELUDOM

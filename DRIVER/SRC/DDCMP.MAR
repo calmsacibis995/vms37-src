@@ -1,0 +1,3121 @@
+	.TITLE DDCMP - Software DDCMP
+	.IDENT 'V03-002'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+;
+; FACILITY:	Software DDCMP
+;
+; ABSTRACT:
+;
+; This is an implementation of DDCMP in software. It performs a subset
+; of the functions described in the DDCMP specification version 4.0.
+; It is called as a subroutine from the sync line driver.
+;
+; COMMON INPUTS:
+;		R5 = Tributary fields block address
+;		R6 = Command from the driver to DDCMP
+;		R7 = Different codes associated with each command
+;		R8 = Contains the address of the buffer to process
+;		R9 = Contains the second data field
+;
+; COMMON OUTPUTS:
+;		R6 = Command from DDCMP to driver
+;		R7 = Associated codes
+;		R8 = Address of the requested buffer
+;		R9 = Second data field 
+;
+;	All other registers are destroyed.
+;
+;
+; ENVIRONMENT:
+;
+;	I/O driver, Kernel mode, driver fork IPL.
+;
+;--
+;
+; AUTHOR: Meg Dumont, 		CREATION DATE: 1-Apr-1981
+;
+; MODIFIED BY:
+;
+;	V03-002	MMD0002		Meg Dumont,	23-Apr-1982  13:54
+;		Change to send the select flag in message if no other message
+;		to transmit. Also change when to check the max message
+;		counter to be before sending the next message.
+;
+;	V03-001	MMD0001		Meg Dumont,	15-APR-1982	16:28
+;		Bugfixes for multipoint Trib support
+;
+;**
+
+
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+	$DLKDEF
+	$DDCMPDEF
+	$GFDEF
+	$MFDDEF
+	$NMADEF
+	$TFDEF
+	$TQEDEF
+	$XMTQDEF
+
+
+
+;
+; Macros
+;
+
+;
+; Bit definitions
+;
+.MACRO	BITDEF	BLK,SYM,BITVAL
+
+	'BLK'$V_'SYM' = BITVAL
+	'BLK'$M_'SYM' = 1@<BITVAL>
+.ENDM
+
+;
+; Constant definitions
+;
+.MACRO	CONSTDEF	BLK,SYM,CONSTVAL
+
+	'BLK'$C_'SYM' = CONSTVAL
+
+.ENDM
+
+
+
+;
+; Define events
+;
+.MACRO	DDCMPEVDEF	EV
+
+	.IF	B,'EV'
+		_$PHASE = _$PHASE + 1
+	.IFF
+		_$EVCOD = _$EVCOD + 1
+		DDCMP$C_EV_'EV' = _$EVCOD
+	.ENDC
+.ENDM
+
+;
+; Calculate the size of the tables
+;
+.MACRO	CALC	EV
+
+	.IF	NB,'EV'
+		DDCMP$C_MAX_EV = DDCMP$C_MAX_EV + 1
+	.ENDC
+.ENDM
+
+
+;
+; Macro to build DDCMP tables
+;
+.MACRO	DDCMPTABLES	VECTOR,?SS
+
+	DDCMP$C_MAX_EV 	= -1		; Total number of events
+	_$EVCOD		= -1		; Dummy variables
+	_$PHASE		=  0
+
+	.IRP	A,<VECTOR>		; Determine the table size
+		CALC A
+	.ENDR
+	_$PHASE		=  0
+SS:
+	.IRP	A,<VECTOR>		; Fill the tables
+		DDCMPEVDEF A
+	.ENDR
+.=SS
+.ENDM
+
+
+
+;
+; Macro to initialize DDCMP state tables
+;
+
+.MACRO 	STTAB	DFLT_STA,DFLT_ACT	;Init the state transition table
+
+	DDCMP$C_NUMEVT	= DDCMP$C_MAX_EV + 1
+	_$ACT_NDX	= 0		; Init the action routine index
+
+	.IF	NDF,ACT$_'DFLT_ACT'
+		ACT$_'DFLT_ACT'	= _$ACT_NDX
+		_$ACT_NDX	= _$ACT_NDX + 1
+	.ENDC
+
+DDCMP$AB_STTAB:	.REPT	DDCMP$C_NUMSTA * DDCMP$C_NUMEVT
+	.BYTE	<DDCMP$C_STA_'DFLT_STA'@DDCMP$C_ACTBITS> + ACT$_'DFLT_ACT'
+	.ENDR
+
+DDCMP$ENDTABLES=.
+
+.ENDM
+
+
+
+;
+; Macro to move the current position just past the table area
+;
+
+.MACRO	ENDSTTAB
+	.=DDCMP$ENDTABLES
+.ENDM
+
+;
+; Macro to move current position to the proper event area
+;
+
+.MACRO	EVENT EV			; Move PC to proper event
+
+	.=DDCMP$AB_STTAB + <EV * DDCMP$C_NUMSTA>
+
+.ENDM
+
+;
+; Macro to fill the build and enter the state transition table element
+;
+.MACRO	STATE	CURSTA,NXSTA,ACTION,?LL	; Make table entry
+
+LL:
+	.=.+DDCMP$C_STA_'CURSTA'
+	.IF	NDF,ACT$_'ACTION'
+		ACT$_'ACTION'	= _$ACT_NDX
+		_$ACT_NDX	= _$ACT_NDX + 1
+	.ENDC
+
+	.BYTE	<DDCMP$C_STA_'NXSTA' @DDCMP$C_ACTBITS> + ACT$_'ACTION'
+
+.=LL
+.ENDM
+
+
+
+;
+; This macro translates into the CASEx instruction.  It calculates the
+; "base" and "limit" parameters from the <index,displacement> list
+; specfied in the 'vector' parameter.  The dispatch table is set up
+; such that any unspecified index value within the bounds of the
+; transfer vector is associated with a diplacement which transfers 
+; control to the first location after the CASE statement, i.e., behaves
+; as if the index were out of bounds.
+;
+; Example:
+;	$DISPATCH	R0,<-			; Message type in R0
+;
+;		;index	displacement
+;
+;		<CI,	NSP$RCV_CI>,-		; Process CI message
+;		<CC,	NSP$RCV_CC>,-		; Process CC message
+;		<DI,	NSP$RCV_DI>,-		; Process DI message
+;		<DC,	NSP$RCV_DI>,-		; Process DC message
+;	>
+;	BRW	NSP$RCV_ILLMSG			; Message type unknown
+;
+.MACRO	$DISPATCH,	INDX,VECTOR,TYPE=W,NMODE=S^#,?MN,?MX,?S,?SS,?ZZ
+SS:
+
+	.MACRO	$DSP1,$DSP1_1
+		.IRP	$DSP1_2,$DSP1_1
+			$DSP2	$DSP1_2
+		.ENDR
+	.ENDM
+
+	.MACRO	$DSP2,$DSP2_1,$DSP2_2
+		.=<$DSP2_1-MN>*2 + S
+		.WORD	$DSP2_2-S
+	.ENDM
+
+
+	.MACRO	$BND1,$BND1_1,$BND1_2,$BND1_3
+		$BND2	$BND1_1,$BND1_2
+	.ENDM
+
+	.MACRO	$BND2,$BND2_1,$BND2_2
+		.IIF	$BND2_1,$BND2_2-.,	.=$BND2_2
+	.ENDM
+
+	.MACRO	$BND	$BND_1,$BND_2
+		.IRP	$BND_3,<$BND_2>
+			$BND1	$BND_1,$BND_3
+		.ENDR
+	.ENDM
+
+	.=0
+ZZ:
+	$BND	GT,<VECTOR>
+MX:
+	$BND	LT,<VECTOR>
+MN:
+	.=SS
+
+CASE'TYPE	INDX,#<MN-ZZ>,NMODE'<MX-MN>
+S:
+	.REPT	MX-MN+1
+	.WORD	<MX-MN>*2 + 2
+	.ENDR
+
+	.=S
+
+	$DSP1	<<VECTOR>>
+
+	.=<MX-MN>*2 + S + 2
+
+.ENDM
+
+
+
+; This macro sets up the network management definitions for the 
+; count fields
+;
+	.MACRO	COUNT	TYPE,BITMAP=NO,WIDTH=8,LOC
+	$$$TYP = TYPE & NMA$M_CNT_TYP
+	.IIF IDN <BITMAP><YES>, $$$TYP = $$$TYP!<NMA$M_CNT_MAP>
+	$$$WID = 0			; Set reserved mask width
+	.IIF IDN <WIDTH><8>, $$$WID = <1@NMA$V_CNT_WID>
+	.IIF IDN <WIDTH><16>, $$$WID = <2@NMA$V_CNT_WID>
+	.IIF IDN <WIDTH><32>, $$$WID = <3@NMA$V_CNT_WID>
+	.IIF EQ $$$WID, .ERROR		; Invalid bit width value
+	MOVW	#<NMA$M_CNT_COU!$$$WID!$$$TYP>,LOC
+	.ENDM	COUNT
+
+
+;
+; DDCMP constants 
+;
+
+;
+; Message fields with constant values
+;
+
+CONSTDEF	DDCMP,ACK,1		; Acknowledge control message
+CONSTDEF	DDCMP,NAK,2		; Negative acknowledge control message
+CONSTDEF	DDCMP,REP,3		; Reply to msg number control message
+CONSTDEF	DDCMP,STRT,6		; Start protocol control message
+CONSTDEF	DDCMP,STACK,7		; Start acknowledged control message
+
+CONSTDEF	DDCMP,ENQ,5		; Control message identifier
+CONSTDEF	DDCMP,SOH,129		; Data message identifier
+CONSTDEF	DDCMP,DLE,144		; Maintenance message identifier
+CONSTDEF	DDCMP,SYN,150		; SYN byte identifier
+CONSTDEF	DDCMP,DEL,255		; DEL byte identifier
+
+;
+; NAK reason codes
+;
+
+CONSTDEF	DDCMP,NAK1,1		; Header CRC
+CONSTDEF	DDCMP,NAK2,2		; Data CRC
+CONSTDEF	DDCMP,NAK3,3		; REP response NUM field in REP # R
+CONSTDEF	DDCMP,NAK8,8		; Buffer for incoming data unavailable
+CONSTDEF	DDCMP,NAK9,9		; Receive overrun
+CONSTDEF	DDCMP,NAK16,16		; RCV'd data message (COUNT) was too 
+					; long for buffer
+CONSTDEF	DDCMP,NAK17,17		; Message header format error
+
+;
+; Misc constants
+;
+
+CONSTDEF	DDCMP,MSGCNT_LIMIT,7	; Maximum msgs that one can send in
+					; a selection field the default
+					; for the MSGCNT field is normally 4
+CONSTDEF	DDCMP,MODULO,127	; Mod for modulo arithmetic
+
+;
+; Reply timer handling
+;
+
+CONSTDEF	DDCMP,REALCLOCK,1	; Use a real time clock
+CONSTDEF	DDCMP,EOINTVL,2		; Use end of selection interval
+CONSTDEF	DDCMP,NXTINTVL,3	; Use next selection interval
+CONSTDEF	DDCMP,MILLI,1000	; Set size of a millisecond
+CONSTDEF	DDCMP,RUNTQE,5*1000*1000 ; Delta for running protocol
+					 ; 1 tick / .5 seconds
+CONSTDEF	DDCMP,STPTQE,30*1000*1000 ; Delta for stopped protocol
+					  ; 1 tick / 3 seconds
+
+
+;
+; Threshold error constant fields
+;
+
+CONSTDEF	DDCMP,XMT_THRS,0	; Start of the XMT threshold field
+CONSTDEF	DDCMP,RCV_THRS,3	; Start of the RCV threshold field
+CONSTDEF	DDCMP,SEL_THRS,6	; Start of the SEL threshold field
+CONSTDEF	DDCMP,THR_SIZE,3	; Size of threshold field
+CONSTDEF	DDCMP,THR_MAX,7		; Threshold maximum
+
+;
+; Bit fields used
+;
+
+BITDEF		DDCMP,BIT8,8		; Bit eight of the longword
+BITDEF		DDCMP,BIT16,16		; Bit sixteen of the longword
+BITDEF		DDCMP,BIT24,24		; Bit twenty-four of the longword
+
+
+
+;
+; STORAGE
+;
+; The following table lists the events that can occur in the protocol
+; all input from the driver must map into these events.
+;
+
+DDCMPTABLES<-
+	<RCV>,-				; Receive a data message or an ACK
+	-				; NAK, or REP control message
+	<STI>,-				; Receive a start initiate
+	<STA>,-				; Receive a start acknowledge
+	<RMM>,-				; Receive a maintenance message
+	<XMT>,-				; Transmit a message
+	<REP>,-				; Message to set up for reply timeout
+	<SRT>,-				; User initiate start protocol
+	<STP>,-				; User initiate stop protocol
+	<QMT>,-				; User informs protocol that its XMTQ
+	-				; is empty
+	<MNT>,-				; User initiate set maintenance mode
+	<ERR>,-				; User requests error buffers
+	<CHR>,-				; Set line and station characteristics
+	<LNK>,-				; The link was lost
+	<LER>,-				; Error on msg RCV'd
+	>
+
+;
+; Define DDCMP protocol states
+
+		DDCMP$C_STA_HLT = 0	; DDCMP is halted
+		DDCMP$C_STA_RUN = 1	; DDCMP is running
+		DDCMP$C_STA_IST = 2	; Start initiated
+		DDCMP$C_STA_AST = 3	; Start acknowledged
+		DDCMP$C_STA_MNT = 4 	; DDCMP is in maintenance mode
+		DDCMP$C_STA_FR1 = 5	; There are three free states to
+		DDCMP$C_STA_FR2 = 6	; keep the tables quadword
+		DDCMP$C_STA_FR3 = 7	; aligned
+
+		DDCMP$C_NUMSTA = 8	; This value allows a quadword
+					; entry per event will be difficult
+					; to change
+
+		DDCMP$C_ACTBITS = 5	; Number of action bits per entry
+		DDCMP$C_STABITS = 3	; Number of state bits per entry
+		DDCMP$C_STAMSK	= <7>@5	; State bit mask
+
+;
+; Initialize the state transition table with default state and action
+;
+
+STTAB	HLT,BUG
+
+EVENT	DDCMP$C_EV_RCV			; RCV a data message or an ACK, NAK
+					; or REP control mesage
+
+	STATE	HLT,	HLT,	IGNORE		; Protocol in wrong state
+	STATE	RUN,	RUN,	RCVMSG		; Message was received
+	STATE	IST,	IST,	SENDSTRT	; Send the STRT request
+	STATE	AST,	RUN,	RCVMSG		; Start may be acknowledged
+	STATE	MNT,	MNT,	IGNORE		; Protocol in worng state
+	STATE	FR1,	FR1,	BUG		; Protocol should never be
+	STATE	FR2,	FR2,	BUG		; be in any of these states
+	STATE	FR3,	FR3,	BUG
+
+EVENT	DDCMP$C_EV_STI			; RCV a STRT message
+
+	STATE	HLT,	HLT,	IGNORE		; User must start protocol
+	STATE	RUN,	HLT,	HALT		; Halt the protocol
+	STATE	IST,	AST,	STARTACK	; Wait for a start ack'd
+	STATE	AST,	AST,	STARTACK	; Wait for start ack'd
+	STATE	MNT,	HLT,	HALT		; Halt the protocol
+	STATE	FR1,	FR1,	BUG		; Protocol should never
+	STATE	FR2,	FR2,	BUG		; be in any of these
+	STATE	FR3,	FR3,	BUG		; states
+
+EVENT	DDCMP$C_EV_STA			; RCV a STACK message
+
+	STATE	HLT,	HLT,	MAINT		; Protocol must be running
+	STATE	RUN,	RUN,	RCVMSG		; Receive the msg
+	STATE	IST,	RUN,	RCVMSG		; Receive the message
+	STATE	AST,	RUN,	RCVMSG		; Receive the message
+	STATE	MNT,	MNT,	IGNORE		; Ignore message
+	STATE	FR1,	FR1,	BUG
+	STATE	FR2,	FR2,	BUG
+	STATE	FR3,	FR3,	BUG
+
+EVENT	DDCMP$C_EV_RMM			; RCV maintenance message
+
+	STATE	HLT,	HLT,	IGNORE		; Protocol is in wrong state
+	STATE	RUN,	HLT,	HALT		; Protocol is on wrong state
+	STATE	IST,	MNT,	MAINT		; Receive a maintenance message
+	STATE	AST,	MNT,	MAINT		; Receive a maintenance message
+	STATE	MNT,	MNT,	MAINT		; Receive a maintenance message
+	STATE	FR1,	FR1,	BUG
+	STATE	FR2,	FR2,	BUG
+	STATE	FR3,	FR3,	BUG
+
+EVENT	DDCMP$C_EV_XMT			; Transmit a message
+
+	STATE	HLT,	HLT,	IGNORE		; Protocol is in wrong state
+	STATE	RUN,	RUN,	XMTMSG		; XMT a data or control msg
+	STATE	IST,	IST,	STARTING	; Protocol is in wrong state
+	STATE	AST,	AST,	STARTING	; Protocol is in wrong state
+	STATE	MNT,	MNT,	MAINT		; XMT a maint mg
+	STATE	FR1,	FR1,	BUG
+	STATE	FR2,	FR2,	BUG
+	STATE	FR3,	FR3,	BUG
+
+EVENT	DDCMP$C_EV_REP			; Message to reply timeout
+
+	STATE	HLT,	HLT,	IGNORE		; Protocol is in wrong state
+	STATE	RUN,	RUN,	REPTIM		; Reply timeout the message
+	STATE	IST,	IST,	IGNORE		; Protocol is in wrong state
+	STATE	AST,	AST,	IGNORE		; Protocol is in wrong state
+	STATE	MNT,	MNT,	CMPMNT		; Complete the maint message
+	STATE	FR1,	FR1,	BUG
+	STATE	FR2,	FR2,	BUG
+	STATE	FR3,	FR3,	BUG
+
+EVENT	DDCMP$C_EV_SRT			; Start the protocol
+
+	STATE	HLT,	IST,	STARTINT	; Enter to init the protocol
+	STATE	RUN,	RUN,	IGNORE		; Set wrong state for action
+	STATE	IST,	IST,	IGNORE		; Set wrong state for action
+	STATE	AST,	AST,	IGNORE		; Set wrong state for action
+	STATE	MNT,	MNT,	IGNORE		; Set wrong state for action
+	STATE	FR1,	FR1,	BUG
+	STATE	FR2,	FR2,	BUG
+	STATE	FR3,	FR3,	BUG
+
+EVENT	DDCMP$C_EV_STP			; Stop the protocol
+
+	STATE	HLT,	HLT,	HALT		; Enter to stop the protocol
+	STATE	RUN,	HLT,	HALT		; Enter to stop the protocol
+	STATE	IST,	HLT,	HALT		; Enter to stop the protocol
+	STATE	AST,	HLT,	HALT		; Enter to stop the protocol
+	STATE	MNT,	HLT,	HALT		; Enter to stop the protocol
+	STATE	FR1,	FR1,	BUG
+	STATE	FR2,	FR2,	BUG
+	STATE	FR3,	FR3,	BUG
+
+EVENT	DDCMP$C_EV_QMT			; XMTQ is empty
+
+	STATE	HLT,	HLT,	IGNORE		; Protocol is in wrong state
+	STATE	RUN,	RUN,	QEMPTY		; Does protocol have work
+	STATE	IST,	IST,	IGNORE		; Protocol is in wrong state
+	STATE	AST,	AST,	QEMPTY		; Does protocol have work
+	STATE	MNT,	MNT,	IGNORE		; Protocol is in wrong state
+	STATE	FR1,	FR1,	BUG
+	STATE	FR2,	FR2,	BUG
+	STATE	FR3,	FR3,	BUG
+
+EVENT	DDCMP$C_EV_MNT			; Enter maintenance mode
+
+	STATE	HLT,	MNT,	STARTMNT	; Set protocol to maint mode
+	STATE	RUN,	MNT,	STARTMNT	; Set protocol to maint mode
+	STATE	IST,	MNT,	STARTMNT	; Set protocol to maint mode
+	STATE	AST,	MNT,	STARTMNT	; Set protocol to maint mode
+	STATE	MNT,	MNT,	STARTMNT	; Set protocol to maint mode
+	STATE	FR1,	FR1,	BUG
+	STATE	FR2,	FR2,	BUG
+	STATE	FR3,	FR3,	BUG
+
+EVENT	DDCMP$C_EV_ERR			; User requests error buffers
+
+	STATE	HLT,	HLT,	RETERR		; Return error bfrs requested
+	STATE	RUN,	RUN,	RETERR		; Return error bfrs requested
+	STATE	IST,	IST,	RETERR		; Return error bfrs requested
+	STATE	AST,	AST,	RETERR		; Return error bfrs requested
+	STATE	MNT,	MNT,	RETERR		; Return error bfrs requested
+	STATE	FR1,	FR1,	BUG
+	STATE	FR2,	FR2,	BUG
+	STATE	FR3,	FR3,	BUG
+
+EVENT	DDCMP$C_EV_CHR			; Set line and station char
+
+	STATE	HLT,	HLT,	SETCHAR		; Set char only when halted
+	STATE	RUN,	RUN,	IGNORE		; At any other time ignore
+	STATE	IST,	IST,	IGNORE		; At any other time ignore
+	STATE	AST,	AST,	IGNORE		; At any other time ignore
+	STATE	MNT,	MNT,	IGNORE		; At any other time ignore
+	STATE	FR1,	FR1,	BUG
+	STATE	FR2,	FR2,	BUG
+	STATE	FR3,	FR3,	BUG
+
+EVENT	DDCMP$C_EV_LNK			; Link was lost
+
+	STATE	HLT,	HLT,	IGNORE		; Protocol was in wrong state
+	STATE	RUN,	IST,	STARTINT	; Will have to reinit
+	STATE	IST,	IST,	STARTINT	; Will have to reinit
+	STATE	AST,	IST,	STARTINT	; Will have to reinit
+	STATE	MNT,	MNT,	IGNORE		
+	STATE	FR1,	FR1,	BUG
+	STATE	FR2,	FR2,	BUG
+	STATE	FR3,	FR3,	BUG
+
+EVENT	DDCMP$C_EV_LER			; An error was detected on the
+					; RVC'd message such that a NAK
+					; must be sent
+
+	STATE	HLT,	HLT,	IGNORE
+	STATE	RUN,	RUN,	SENDNAK		; Send a NAK
+	STATE	IST,	IST,	SENDNAK		; Send a NAK
+	STATE	AST,	AST,	SENDNAK		; Send a NAK
+	STATE	MNT,	MNT,	IGNORE
+	STATE	FR1,	FR1,	BUG
+	STATE	FR2,	FR2,	BUG
+	STATE	FR3,	FR3,	BUG
+
+ENDSTTAB
+
+
+; Local storage for CRC table
+
+POLY:		.LONG	^O12001
+CRCTABLE:	.LONG	0
+		.LONG	^X00001981
+		.LONG	^X00001B01
+		.LONG	^X00000280
+		.LONG	^X00001E01
+		.LONG	^X00000780
+		.LONG	^X00000500
+		.LONG	^X00001C81
+		.LONG	^X00001401
+		.LONG	^X00000D80
+		.LONG	^X00000F00
+		.LONG	^X00001681
+		.LONG	^X00000A00
+		.LONG	^X00001381
+		.LONG	^X00001101
+		.LONG	^X00000880
+
+
+
+	.SBTTL	Command Interrupter
+
+;
+; The following routine acts as an interrupter between the commands that
+; the driver sends to DDCMP and the dispatch routine in this subroutine.
+; It takes the information passed to DDCMP via the register and decides
+; which event DDCMP is to perform.
+;
+;**********************************************************************
+;	MUST LIST THE INTERFACE MEANINGS
+;	AND WHAT FMT ETC... STAND FOR
+;**********************************************************************
+;
+;	INPUTS:
+;		R5 = Contain the address of the TF block
+;		R6 = Contains the command to DDCMP
+;		R7 = Contains the code pertaining to the command
+;		R8 = Address of the buffer to process
+;		R9 = Zero on input
+;		IPL = FIPL
+;
+;	OUTPUTS:
+;		R4 = Contain the event code
+;		R5 = Contain the address of the TF block
+;		R6, R7 & R9 must be preserved
+;		R8 = Address of the header if this is a receive msg
+;		     else it contains the addr of the buffer
+
+DDCMP::	
+	MOVL	TF$A_GFB(R5),R3			; Get the global block address
+
+	CLRL	R4				; Clear the register
+	CASE	R6,<-
+		DMP$RCVMSG,-			; Receive a message
+		DMP$XMTMSG,-			; Transmit a message
+		DMP$REQEBA,-			; Request the error block
+		DMP$USRINT,-			; User initiates a state
+		DMP$CHAR,-			; Set trib char
+		>,LIMIT=#DLK$C_RCVMSG
+
+	MOVZWL	#DLK$M_CMDERR,R7		; If all else fails then
+						; set the error condition
+10$:	BRW	DDCMP$REPORT			; Branch to report the bug
+
+
+
+DMP$XMTMSG:
+	BBS	#DLK$V_QEMPTY,R7,10$		; If BS then XMTQ empty detectd
+	BBS	#DLK$V_MSGSENT,R7,20$		; If BS msg to reply T/O
+	MOVB	#DDCMP$C_EV_XMT,R4		; Set event to XMT a msg and
+5$:	BRW	DDCMP$EVENT			; jump to dispatch the event
+10$:	MOVB	#DDCMP$C_EV_QMT,R4		; Q empty
+	BRB	5$
+20$:	MOVB	#DDCMP$C_EV_REP,R4		; Message to reply timeout
+	BRB	5$
+
+DMP$CHAR:
+	MOVW	#DDCMP$C_EV_CHR,R4		; Set event to set line char
+	BRW	DDCMP$EVENT			; jump to dispatch the event
+
+DMP$REQEBA:
+	MOVW	#DDCMP$C_EV_ERR,R4		; Set event to retrieve err blk
+	BRW	DDCMP$EVENT			; jump to dispatch the event
+
+DMP$USRINT:
+	TSTB	R7				; If no char were set then
+	BEQL	220$				; branch
+
+; Else test to determine which state the user wants
+
+	BBC	#DLK$V_MAINT,R7,200$		; If set then maint mode
+	MOVB	#DDCMP$C_EV_MNT,R4		; set event and
+	BRW	DDCMP$EVENT			; jump to dispatch the event
+200$:	BBC	#DLK$V_START,R7,210$		; If not BC then START protocl
+	MOVB	#DDCMP$C_EV_SRT,R4		; set event and
+	BRW	DDCMP$EVENT			; jump to dispatch the event
+210$:	BBC	#DLK$V_STOP,R7,220$		; If not BC then STOP protocol
+	MOVB	#DDCMP$C_EV_STP,R4		; set event and
+	BRW	DDCMP$EVENT			; jump to dispatch the event
+220$:
+	MOVZWL	#DLK$M_BADSTATE,R7		; set the error
+	BRW	DDCMP$REPORT			; branch to report the error
+
+
+
+
+DMP$RCVMSG:
+	BISB2	#TF$M_RCVDET,-			; Set that a message was 
+		TF$B_SELTIM(R5)			; RCV'd
+	TSTB	R7				; If not eql error on RCV
+	BNEQ	130$
+	CMPB	MFD$B_MSGID(R8),#DDCMP$C_ENQ	; Is the msg a control msg
+	BEQL	110$				; Branch if it is
+	CMPB	MFD$B_MSGID(R8),#DDCMP$C_SOH	; Is the msg a data msg
+	BEQL	120$				; Branch if it is
+	CMPB	MFD$B_MSGID(R8),#DDCMP$C_DLE	; Is the msg a maintenance msg
+	BEQL	100$				; Branch if it is
+	TSTB	MFD$B_MSGID(R8)			; It is possible that no msg 
+						; was passed
+	BEQL	108$				; Branch if that is the case
+	MOVZWL	#DLK$M_RCVERR,R7		; Set the bit saying that an
+						; unrecognized msg was received
+	BRW	DDCMP$REPORT			; Branch to report the bug
+
+;
+; Handle maintenance messages
+;
+100$:	MOVB	#DDCMP$C_EV_RMM,R4		; Set maint msg received
+	BRB	DDCMP$EVENT			; jump to dispatch the event
+
+;
+; Handle when no message was received
+;
+108$:
+	MOVZWL	#DLK$M_CMDERR,R7		; a null command hence
+	BRW	DDCMP$REPORT			; branch to report the error
+
+;
+; Get the type of control field
+;
+
+
+110$:	MOVZBL	MFD$W_TYPFLG(R8),R2		; Mov the msg subtype field
+						; into R2
+	CMPB	R2,#DDCMP$C_STRT		; If the msg was not a STRT
+	BNEQ	115$				; Branch to next check else,
+	MOVB	#DDCMP$C_EV_STI,R4		; set the reg. with the event
+	BRB	DDCMP$EVENT			; & jump to dispatch the event
+;
+115$:	CMPB	R2,#DDCMP$C_STACK		; If the msg was not a STACK
+	BNEQ	120$				; Branch to next check else,
+	MOVB	#DDCMP$C_EV_STA,R4		; set the event and
+	BRW	DDCMP$EVENT			; jump to dispatch the event
+
+120$:	MOVB	#DDCMP$C_EV_RCV,R4		; For ACK, NAK, REP and all
+	BRB	DDCMP$EVENT			; data msg set event and jump
+
+;
+; If any errors were found then set which error and jump to record via
+; the dispathcer.
+;
+
+130$:	CMPB	#DDCMP$C_DLE,MFD$B_MSGID(R8)	; If EQL DLE message
+	BEQL	135$
+	BBC	#DLK$V_LNKLOST,R7,140$		; If BS then the link was lost
+	MOVW	#DDCMP$C_EV_LNK,R4		; set event 
+	BRW	DDCMP$EVENT			; jump to dispatch the event
+
+135$:	INCB	GF$B_MDF_CRC(R3)
+140$:	MOVB	#DDCMP$C_EV_LER,R4		; Assume for all other cases
+						; an NAK needs to be sent
+						; althougth not always
+	BRW	DDCMP$EVENT
+
+
+	.SBTTL	Common event dispatcher
+
+;
+; DDCMP$EVENT - Common event dispatcher
+;
+; FUNCTIONAL DESCRIPTION
+;
+; This is the common state table event dispatcher used to determine what
+; is to be done and what state DDCMP is to enter next. An event only has
+; meaning within the context of DDCMP.
+;
+;	INPUTS:
+;		R9 = Data area for interface with driver
+;		R8 = Contains the address of the rcv msg or it
+;		     contains the address of the transmit buffer
+;		R7 = Contains codes pertinent to the routine to call.
+;		R6 = Commands from the driver
+;		R5 = Must contain the address of the TF block
+;		R4 = Event code to be processed
+;		R3 = Global field block address
+;		R2 = Available for dispatcher's exclusive use
+;		R1 = scratch
+;		R0 = scratch
+;
+;
+;	OUTPUTS:
+;		R6,R7 and R9 = Contain information for interface
+;		R5,R8 are preserved
+;		R0 = Contains status code from action routine
+;
+;
+
+	ASSUME DDCMP$C_NUMSTA EQ 8		; Assume quadword per event
+
+DDCMP$EVENT:
+	MOVZBL	GF$B_STATE(R3),R2		; Get state of protocol
+	MOVL	R8,TF$A_BUFPTR(R5)		; Save the addr of the buffer
+	MOVAQ	DDCMP$AB_STTAB[R4],R1		; Get event block address
+	MOVB	(R1)[R2],R2			; Get table entry
+	BICB3	#DDCMP$C_STAMSK,R2,R1		; Get action routine index
+	PUSHL	R2
+;
+;
+; Dispatch to the event code. The routine can assume the following
+;
+;	R9 = Data from the interface
+;	R8 = Address of received message header
+;	R7 = Must be cleared
+;	R5 = TF block address
+;	R4 = Event code
+;	R3 = Global field block address
+;	(SP) = Return address
+;	4(SP) = R2 which contains the state inforamtion for the dispatch
+;
+; Returned values
+;	R9 - R6 = Information to pass to driver on RSB
+;
+;
+
+	PUSHAL	CHANGE_STA			; Setup return address
+	$DISPATCH	R1,TYPE=B,-
+	<-	;index	   	   action
+
+		<ACT$_IGNORE	   DDCMP$IGNORE>-	; Ignore event
+		<ACT$_SENDSTRT     DDCMP$SENDSTRT>-	; Send STRT message
+		<ACT$_BUG	   DDCMP$BUG>-  	; State transtion bug
+		<ACT$_SETCHAR	   DDCMP$SETCHAR>-	; Set lne & staton char
+		<ACT$_STARTINT	   DDCMP$STARTINT>-	; Init a start on prot
+		<ACT$_STARTACK	   DDCMP$STARTACK>-	; Ack a start on prot
+		<ACT$_STARTMNT	   DDCMP$STARTMNT>-	; Enter maint mode
+		<ACT$_RCVMSG	   DDCMP$RCVMSG>-	; Rcv a message
+		<ACT$_XMTMSG	   DDCMP$XMTMSG>-	; Xmt a message
+		<ACT$_REPTIM	   DDCMP$REPTIM>-	; Reply T/O the message
+		<ACT$_QEMPTY	   DDCMP$QEMPTY>-	; XMTQ is empty
+		<ACT$_SENDNAK	   DDCMP$SENDNAK>-	; Send a NAK
+		<ACT$_HALT	   DDCMP$HALT>-		; Stop the protocol
+		<ACT$_MAINT	   DDCMP$MAINT>-	; Run in maint mode
+		<ACT$_CMPMNT	   DDCMP$CMPMNT>-	; Comp maint message
+		<ACT$_RETERR	   DDCMP$RETERR>-	; Return error buffer
+		<ACT$_STARTING     DDCMP$STARTING>-	; Protocol is starting
+		>
+	MOVZWL	S^#DLK$C_ACTNOTCOM,R6		; Set up return status for err
+	MOVZWL	#DLK$M_BADACTION,R7
+	BRB	DDCMP$ERROR
+
+CHANGE_STA:
+	POPL	R2
+	MOVL	TF$A_BUFPTR(R5),R8		; Restore the buffer address
+	EXTZV	#DDCMP$C_ACTBITS,-
+		#DDCMP$C_STABITS,R2,R1		; Get next state
+	CMPB	R1,GF$B_STATE(R3)		; New state?
+	BEQL	10$
+	MOVB	R1,GF$B_STATE(R3)		; Change state
+
+	ASSUME	DDCMP$C_STA_RUN EQ 1
+	ASSUME	DDCMP$C_STA_IST EQ 2 
+	ASSUME	DDCMP$C_STA_AST EQ 3
+
+	CMPB	R1,S^#DDCMP$C_STA_AST		; If not one a change to RUN,
+	BLEQ	20$				; IST or AST then fall thru
+
+10$:	RSB					; Return to driver
+
+; Clear error counters
+20$:	INSV	#0,#DDCMP$C_XMT_THRS,-		; Clear XMT thrs cnter
+		#DDCMP$C_THR_SIZE,-
+		TF$W_THRES(R5)
+	INSV	#0,#DDCMP$C_RCV_THRS,-		; Clear RCV thrs cnter
+		#DDCMP$C_THR_SIZE,-
+		TF$W_THRES(R5)
+	RSB
+
+
+
+
+	.SBTTL	Error
+
+;DDCMP$ERROR
+; This routine clears DDCMP$EVENT return address from the stack
+; so that control will immediately return to the driver. This is
+; done when header or data errors are found in a message. It
+; is also called when the protocol finds that it has received
+; a ENQ other then what it expected so as not to change the state 
+; of the protocol.
+;
+;	INPUTS		R5-R9 set up with error status to driver.
+;			(SP)  = Address of CHANGE_STA
+;			4(SP) = R2
+;			8(SP) = The return address to the driver
+;
+;
+DDCMP$ERROR:
+	PUSHAB	B^CHANGE_STA			; Save the address expected
+	CMPL	(SP)+,(SP)+			; If NEQ then bugcheck
+	BNEQ	10$
+	POPL	R2				; Clear the register from stack
+	RSB					; Return to driver 
+
+10$:	BUG_CHECK	NOBUFPCKT,FATAL
+
+
+
+	.SBTTL	Command error handling routines
+; IGNORE 
+;
+; This routine is called when a request is made to the protocol, but the
+; protocol is in the wrong state to complete the action.
+;
+;	INPUTS		none
+;
+;	OUTPUTS		R6 = Contains the status code to return to the driver
+;			R7 = Contains the reason for the abort
+;
+DDCMP$IGNORE:
+	MOVZWL	S^#DLK$C_ACTNOTCOM,R6		; Set the abort status
+	MOVZWL	#DLK$M_BADSTATE,R7		; Set the reason for the abort
+	RSB
+
+
+; STARTING
+;
+; This routine is called when a request to transmit a message is made and
+; the protocol has not finished its start up sequence. It fakes a queue
+; full error and puts the transmit on the overflow queue.
+;
+;	INPUTS		R8 = Address of data message
+;
+;	OUTPUTS		R6 = Contains the status code to driver
+;			R7 = Contains the reason code
+;
+DDCMP$STARTING:
+	MOVZWL	S^#DLK$C_RETINFO,R6		; Return status
+	MOVZWL	#DLK$M_QFULERR,R7		; Fake a queue full error
+	TSTL	R8				; If eql then no message
+	BEQL	10$
+	CMPB	XMTQ$B_BUFTYP(R8),S^#DYN$C_BUFIO ; If NEQ then not correct buf
+	BNEQ	20$
+	INSQUE	(R8),@TF$Q_XMTOVF+4(R5)		; Insert at the end of queue
+10$:	RSB
+
+20$:	BUG_CHECK	NOBUFPCKT,FATAL
+
+
+
+; BUG and REPORT
+;
+; This routine is caled when the state driven portion of the protocol is
+; requested to do an action that is doesn't know or isn't allowed to do.
+;
+;	INPUTS		REPORT - R7 contains the reason for the abort
+;
+;	OUTPUTS		R6 = Return code to driver - Action not complete
+;			R7 = Reason that the action wasn't completed
+;
+DDCMP$BUG:
+	MOVZWL	#DLK$M_BADACTION,R7		; Set up reason for incomp act
+	BUG_CHECK NOBUFPCKT,FATAL
+
+DDCMP$REPORT:
+	MOVZWL	S^#DLK$C_ACTNOTCOM,R6		; Set up reg with status for
+						; return to driver
+	RSB
+
+
+
+	.SBTTL	Set charateristics
+
+; DDCMP$SETCHAR - Set Charateristics
+;
+; This routine sets up charateristics for the protocol.  This should be 
+; called as least once by the driver to set up default characteristics on
+; the station. 
+;
+; The routine works as follows. It is called by the driver only when the
+; protocol is in halt state. Which means at Unit init time or after the
+; protocol has been put in HALT state for whatever reason. If the set
+; default bit is set then the characteristics byte is cleared and the
+; protocol is set up for DDCMP point to point full duplex mode. If it is
+; not clear then the protocol assumes that the user wishes to set some
+; parameters and those parameters are set. This routine must be called
+; at least once to set defaults for all settable DDCMP parameters. Defaults
+; for the paramters are determined by the driver using this protocol.
+;
+;	Example defaults:
+;
+;			TF$B_ADDR  = 1
+;			TF$B_XADDR = 1
+;			TF$B_RADDR = 1
+;			GF$W_SELWAI = 3 seconds
+;			GF$B_MAXSEL = 2 tries
+;			TF$W_REPWAI = 3 seconds
+;			TF$B_MAXRTO = 4 tries
+;			TF$B_MSGCNT = 4 per selection interval
+;			GF$B_STRTIM = 1 second
+;			GF$B_BABTIM = 1 second
+;
+;	INPUTS		R5 = Address of TF block
+;			R6 = Command from driver
+;			R7 = Fields to set
+; 			R8 = Address of block containing parameters
+;
+;	OUPUTS		R5 = Address of the TF block
+;			R6 = Contain return status to driver.
+;			R7 = Normal return
+;			R8,R9 are destroyed
+;
+DDCMP$SETCHAR:
+	BBSC	#DLK$V_SETDEF,R7,2$		; If BS defaults to set
+	BRW	5$				; Else branch to set parameters
+2$:	CLRB	TF$B_CHAR(R5)			; Set defaults of zero	
+	
+	ASSUME	TF$B_XADDR EQ TF$B_ADDR+1
+	ASSUME	TF$B_RADDR EQ TF$B_XADDR+1
+
+	MOVL	#65793,TF$B_ADDR(R5)		; Set all default addr to 1
+	MOVB	#DDCMP$C_REALCLOCK,-		; Set the default for reply T/O
+		TF$B_REPTIM(R5)			; to be the real time clock
+
+	CLRB	TF$B_CURRTO(R5)			; Clear reply timeout and sel't
+	CLRB	GF$B_CURSEL(R3)			; fields only once per protocol
+						; startup
+; Set up the NMA def's for counters
+;
+; Global counters
+;
+
+	COUNT	NMA$C_CTLIN_LPE,-
+		BITMAP=YES,-
+		WIDTH=8,-
+		LOC=GF$W_LSETYP(R3)
+
+	COUNT	NMA$C_CTLIN_RPE,-
+		BITMAP=YES,-
+		WIDTH=8,-
+		LOC=GF$W_RSETYP(R3)
+
+;
+; Tributary counters
+;
+
+	COUNT	NMA$C_CTCIR_DEO,-
+		BITMAP=YES,-
+		WIDTH=8,-
+		LOC=TF$W_DEOTYP(R5)
+
+	COUNT	NMA$C_CTCIR_DEI,-
+		BITMAP=YES,-
+		WIDTH=8,-
+		LOC=TF$W_DEITYP(R5)
+
+	COUNT	NMA$C_CTCIR_LRT,-
+		WIDTH=8,-
+		LOC=TF$W_LRTOTYP(R5)
+
+	COUNT	NMA$C_CTCIR_RRT,-
+		WIDTH=8,-
+		LOC=TF$W_RRTOTYP(R5)
+
+	COUNT	NMA$C_CTCIR_SLT,-
+		BITMAP=YES,-
+		WIDTH=8,-
+		LOC=TF$W_STOTYP(R5)
+
+	COUNT	NMA$C_CTCIR_LBE,-
+		BITMAP=YES,-
+		WIDTH=8,-
+		LOC=TF$W_LBETYP(R5)
+
+	COUNT	NMA$C_CTCIR_RBE,-
+		BITMAP=YES,-
+		WIDTH=8,-
+		LOC=TF$W_RBETYP(R5)
+
+	COUNT	NMA$C_CTCIR_SIE,-
+		WIDTH=16,-
+		LOC=TF$W_SELTYP(R5)
+
+	COUNT	NMA$C_CTCIR_DBS,-
+		WIDTH=32,-
+		LOC=TF$W_DMXTYP(R5)
+
+	COUNT	NMA$C_CTCIR_DBR,-
+		WIDTH=32,-
+		LOC=TF$W_DMRTYP(R5)
+
+	COUNT	NMA$C_CTCIR_BSN,-
+		WIDTH=32,-
+		LOC=TF$W_DBXTYP(R5)
+
+	COUNT	NMA$C_CTCIR_BRC,-
+		WIDTH=32,-
+		LOC=TF$W_DBRTYP(R5)
+
+; Set up the size for the counter blocks
+
+	SUBW3	#TF$K_ERRSTRT,#TF$K_ERREND,TF$W_TEB(R5)
+	SUBW3	#GF$K_ERRSRT,#GF$K_ERREND,GF$W_GEB(R3)
+
+	ASSUME	DLK$V_STATYP EQ 0
+	ASSUME 	DLK$V_POINT EQ 1
+	ASSUME	DLK$V_DUPLEX EQ 2
+	ASSUME	DLK$V_LNTYP EQ 3
+	ASSUME	DLK$V_MSGCNT EQ	4
+	ASSUME	DLK$V_SELTIM EQ 5
+	ASSUME	DLK$V_SELWAIT EQ 6
+	ASSUME	DLK$V_REPTIM EQ 7
+	ASSUME	DLK$V_REPWAIT EQ 8
+	ASSUME	DLK$V_STREAM EQ 9
+	ASSUME	DLK$V_BABBLE EQ 10
+
+5$:	CLRL	R0				; Clear the counter field
+	BLBC	R7,10$				; If BC then first bit not set
+	PUSHAL	10$				; Push this address to loop
+						; thru the case to test all
+						; bits that may be set
+	BRB	15$				; Branch to CASE
+10$:	CMPB	R0,#DLK$V_BABBLE		; Have all setable bits been
+	BGTR	15$				; set. If GTR then yes they
+						; Have branch to fall thru CASE
+	ASHL	#-1,R7,R7			; Get next bit
+	INCB	R0
+	BLBC	R7,10$				; If BC bit not set
+	PUSHAL	10$				; Push return address
+						; Fall thru to the CASE
+15$:	CASE	R0,<-				; Test to see which bit is set 
+		SET$STATYP,-			; jump to the routine to handle
+		SET$POINT,-			; that value
+		SET$DUPLEX,-
+		SET$LNTYP,-
+		SET$MSGCNT,-
+		SET$SELTIM,-
+		SET$SELWAIT,-
+		SET$REPTIM,-
+		SET$REPWAIT,-
+		>,LIMIT=#DLK$V_STATYP
+
+	TSTB	TF$B_CHAR(R5)			; If NEQ then not FPC, branch
+	BNEQ	20$
+	MOVB	S^#DDCMP$C_REALCLOCK,-		; Move in type of reply timeout
+		TF$B_REPTIM(R5)			; clock - real time for FPC
+20$:	MOVZWL	S^#DLK$C_RETINFO,R6		; Set normal return status
+	CLRQ	R8
+	RSB
+
+; Start of routines to branch to via the CASE on R0
+
+
+SET$STATYP:
+	BISB2	#<-				; Set that this is a Tributary
+		TF$M_STATYP!-			; station and that it is multi-
+		TF$M_POINT-			; point
+		>,TF$B_CHAR(R5)
+	MOVB	DLK$B_TRIB(R8),TF$B_ADDR(R5)	; Set the trib address
+	MOVB	DLK$B_TRIB(R8),TF$B_XADDR(R5)	; Set the trib address for XMTS
+	MOVB	DLK$B_TRIB(R8),TF$B_RADDR(R5)	; Set the trib address for RCVS
+	MOVB	S^#DDCMP$C_NXTINTVL,-		; Move in type of reply timer
+		TF$B_REPTIM(R5)			; Next selection interval
+	RSB
+
+;
+; Assume if gotten here then the station is a control station
+;
+SET$POINT:
+	BISB2	#TF$M_POINT,-			; Set that the station is
+		TF$B_CHAR(R5)			; multipoint
+	MOVB	S^#DDCMP$C_EOINTVL,-		; Set the reply timer to be the
+		TF$B_REPTIM(R5)			; end of the next selection
+						; interval
+	RSB
+
+SET$DUPLEX:
+	BISB2	#TF$M_DUPLEX,-			; Set that the line is half
+		TF$B_CHAR(R5)			; duplex
+	BBS	#TF$V_STATYP,-			; Branch if BS station is a
+		TF$B_CHAR(R5),5$		; trib station
+	MOVB	S^#DDCMP$C_NXTINTVL,-		; Set reply timer to be the
+		TF$B_REPTIM(R5)			; next selection interval
+5$:	RSB
+
+SET$LNTYP:
+	BISB2	#TF$M_LNTYP,-			; Set that the station has an
+		TF$B_CHAR(R5)			; async line
+	RSB
+
+SET$MSGCNT:
+	MOVB	DLK$B_MSGCNT(R8),-		; Set no msg per selection
+		TF$B_MSGCNT(R5)
+5$:	RSB
+
+SET$SELTIM:
+	ADDB3	DLK$B_MAXSEL(R8),#1,-		; Move in the # of times
+		GF$B_MAXSEL(R3)
+						; the select will T/O field
+	RSB
+
+SET$SELWAIT:
+	PUSHL	R2
+	MOVZWL	#DDCMP$C_MILLI,R2		; Get the size to div by
+	DECW	R2				; Sub 1 from it
+	ADDW	DLK$W_SELWAIT(R8),R2		; Ensure time is at least 1 sec
+	DIVW3	#DDCMP$C_MILLI,R2,GF$W_SELWAI(R3) ; Set the timer in seconds
+	POPL	R2
+	RSB
+
+SET$REPTIM:
+	ADDB3	DLK$B_MAXREP(R8),-		; Set max reply T/O
+		#1,TF$B_MAXRTO(R5)
+	RSB
+
+SET$REPWAIT:
+	PUSHL	R2
+	MOVZWL	#DDCMP$C_MILLI,R2		; Get the size to div by
+	DECW	R2				; Sub 1 from it
+	ADDW	DLK$W_REPWAIT(R8),R2		; Ensure time is at least 1 sec
+	DIVW3	#DDCMP$C_MILLI,R2,TF$W_REPWAI(R5); Set the timer in seconds
+	POPL	R2
+	RSB
+
+
+
+	.SBTTL	Initate start of protocol
+
+; STARTINT - Initate start
+;
+; This routine initiates a start of the protocol. It expects that the char for
+; the protocol have been set or default elsewhere. If an error is found in
+; the header passed to the protocol then return immediately to the driver
+; to report a header error.
+;
+;	INPUT		R3 = Address of the GF block
+;			R5 = Address of the TF block
+;			R8 = Address of the message header if the start was
+;			     initated by a remote node
+;
+;	OUTPUTS		R5 and R8 are preserved
+;			R6,R7 contain the return status for driver
+;			XMTQ is given an entry
+;			RTOQ is given an entry
+	.ENABL	LSB
+DDCMP$SENDSTRT:
+	MOVZWL	S^#DLK$C_RETINFO,R6		; Set up return to driver
+	CLRL	R7				; Clear all set bits
+	BRB	12$				; Send the start
+
+DDCMP$STARTINT:
+	MOVZWL	S^#DLK$C_RETINFO,R6		; Set up return to driver
+	CLRL	R7				; Clear all set bits
+	TSTL	R8				; If the field is zero than
+	BEQL	10$				; it was a user init start
+	BSBW	DDCMP$CHK_HDR			; Else branch to check the hdr
+	TSTB	R7				; If not clear than an error
+	BNEQ	20$				; in the header.
+						; Continue if header ok
+10$:	BSBB	DDCMP$RESET_VAR			; Clear msg exch variables and
+	BBS	#TF$V_STATYP,TF$B_CHAR(R5),13$	; If BS don't send STRT
+12$:	MOVZBL	#DDCMP$C_STRT,R4		; Set up a STRT to be XMT'd
+	BSBW	DDCMP$QUEUE_XMT			; Place on queue to XMT
+	TSTB	R7				; If the reg has any bits
+						; set than there was error
+	BNEQ	20$				; Branch to report itto driver
+13$:	BSBW	DDCMP$RESET_GCTRS		; Reset global counters
+	BSBW	DDCMP$RESET_TCTRS		; Reset tributary counters
+	BISW2	#DLK$M_REINT,R7			; Set up to inform the driver
+	CMPB	S^#DDCMP$C_STA_IST,-		; Branch NEQ state was not IST
+		GF$B_STATE(R3)			; no need to incr threshold
+	BNEQ	15$
+	BSBW	DDCMP$INCR_XMT_THRS		; Increment the threshold cntrs
+15$:	MOVAL	TF$L_TQE(R5),R2			; Get the TQE address
+	MOVQ	#DDCMP$C_RUNTQE,TQE$Q_DELTA(R2) ; Set the delta for active pro
+	RSB
+
+20$:	BRW	DDCMP$ERROR
+	.DSABL	LSB
+
+
+	.SBTTL	Reset variables
+;RESET_VAR - Reset variables
+;
+; This routine is called on start up or reinti of the protocol to zero
+; the message exchange variables.
+;
+;	INPUTS		R5 = Address of the TF block
+;
+DDCMP$RESET_VAR:
+	ASSUME	TF$B_R EQ TF$B_SFLAGS+1
+	ASSUME	TF$B_N EQ TF$B_R+1
+	ASSUME	TF$B_A EQ TF$B_N+1
+	ASSUME	TF$B_T EQ TF$B_A+1
+	ASSUME	TF$B_X EQ TF$B_T+1
+	ASSUME	TF$B_SELTIM EQ TF$B_X+1
+
+	CLRL	TF$B_SFLAGS(R5)			; Clear above fields
+	CLRW	TF$B_T(R5)
+	CLRB	TF$B_SELTIM(R5)
+	CLRB	TF$B_NAKRSN(R5)
+	CLRB	TF$B_MMCTR(R5)			; Clear then nmb of msgs sent
+
+	MOVAL	TF$Q_CTLQ(R5),TF$Q_CTLQ(R5)		; Init control queue
+	MOVAL	TF$Q_CTLQ(R5),TF$Q_CTLQ+4(R5)		; Init control queue
+
+	REMQUE	@TF$Q_XMTQ(R5),R0
+	BVC	10$
+	REMQUE	@TF$Q_RTOQ(R5),R0
+	BVC	10$
+	REMQUE	@TF$Q_CMPQ(R5),R0
+	BVC	10$
+	REMQUE	@TF$Q_XMTOVF(R5),R0
+	BVS	20$
+10$:	BUG_CHECK NOBUFPCKT,FATAL
+; Set up the queue block with ENQ type and subtype
+
+20$:	MOVB	#DDCMP$C_SIZEOFQ,TF$B_XQCNT(R5)		; Set the max no of msg
+							; allowed on the queue
+	MOVAL	TF$L_QACK(R5),R1			; Get ACK queue block
+	CLRL	XMTQ$L_IRP(R1)				; Set no IRP address
+	CLRB	XMTQ$B_FLAG(R1)				; Clear flags 
+	MOVB	#XMTQ$M_CONTROL,XMTQ$B_FLAG(R1)		; Set cntrl flag
+	MOVZBW	S^#DDCMP$C_HEADER,XMTQ$W_MSGSIZE(R1)	; Set message size
+	MOVAL	XMTQ$B_MSGHDR(R1),R1			; Get header field
+	MOVB	S^#DDCMP$C_ENQ,MFD$B_MSGID(R1)		; Fill ENQ into msgid
+	MOVZBW	#DDCMP$C_ACK,MFD$W_TYPFLG(R1)		; Insert ACK type
+
+	MOVAL	TF$L_QNAK(R5),R1			; Get NAK queue block
+	CLRL	XMTQ$L_IRP(R1)				; Set no IRP address
+	CLRB	XMTQ$B_FLAG(R1)				; Clear flags 
+	MOVB	#XMTQ$M_CONTROL,XMTQ$B_FLAG(R1)		; Set cntrl flag
+	MOVZBW	S^#DDCMP$C_HEADER,XMTQ$W_MSGSIZE(R1)	; Set message size
+	MOVAL	XMTQ$B_MSGHDR(R1),R1			; Get header field
+	MOVB	S^#DDCMP$C_ENQ,MFD$B_MSGID(R1)		; Fill ENQ into msgid
+	MOVZBW	#DDCMP$C_NAK,MFD$W_TYPFLG(R1)		; Insert NAK type
+
+	MOVAL	TF$L_QREP(R5),R1			; Get REP queue block
+	CLRL	XMTQ$L_IRP(R1)				; Set no IRP address
+	CLRB	XMTQ$B_FLAG(R1)				; Clear flags 
+	MOVB	#XMTQ$M_CONTROL,XMTQ$B_FLAG(R1)		; Set cntrl flag
+	MOVZBW	S^#DDCMP$C_HEADER,XMTQ$W_MSGSIZE(R1)	; Set message size
+	MOVAL	XMTQ$B_MSGHDR(R1),R1			; Get header field
+	MOVB	S^#DDCMP$C_ENQ,MFD$B_MSGID(R1)		; Fill ENQ into msgid
+	MOVZBW	#DDCMP$C_REP,MFD$W_TYPFLG(R1)		; Insert REP type
+
+	MOVAL	TF$L_QSTRT(R5),R1			; Get STRT queue block
+	CLRL	XMTQ$L_IRP(R1)				; Set no IRP address
+	CLRB	XMTQ$B_FLAG(R1)				; Clear flags 
+	MOVB	#XMTQ$M_CONTROL,XMTQ$B_FLAG(R1)		; Set cntrl flag
+	MOVZBW	S^#DDCMP$C_HEADER,XMTQ$W_MSGSIZE(R1)	; Set message size
+	MOVAL	XMTQ$B_MSGHDR(R1),R1			; Get header field
+	MOVB	S^#DDCMP$C_ENQ,MFD$B_MSGID(R1)		; Fill ENQ into msgid
+	MOVZBW	#DDCMP$C_STRT,MFD$W_TYPFLG(R1)		; Insert STRT type
+	BISW2	#<MFD$M_QSYNC!-				; Set to always resync
+		MFD$M_SELECT>,MFD$W_TYPFLG(R1)		; and to send select
+
+	MOVAL	TF$L_QSTACK(R5),R1			; Get STACK queue block
+	CLRL	XMTQ$L_IRP(R1)				; Set no IRP address
+	CLRB	XMTQ$B_FLAG(R1)				; Clear flags 
+	MOVB	#XMTQ$M_CONTROL,XMTQ$B_FLAG(R1)		; Set cntrl flag
+	MOVZBW	S^#DDCMP$C_HEADER,XMTQ$W_MSGSIZE(R1)	; Set message size
+	MOVAL	XMTQ$B_MSGHDR(R1),R1			; Get header field
+	MOVB	S^#DDCMP$C_ENQ,MFD$B_MSGID(R1)		; Fill ENQ into msgid
+	MOVZBW	#DDCMP$C_STACK,MFD$W_TYPFLG(R1)		; Insert STACK type
+	BISW2	#<MFD$M_QSYNC!-				; Set to always resync
+		MFD$M_SELECT>,MFD$W_TYPFLG(R1)		; and to send select
+	RSB
+
+	.SBTTL	Start acknowledge
+;STARTACK - Start acknowledge
+;
+; This routine acknowledges starts of the protocol. If an error is found in
+; the header passed to the protocol then return immediately to the driver
+; to report a header error.
+;
+;	INPUTS:		R3 = Address of the GF block
+;			R5 = Address of TF block
+;			R6 = Command code from driver
+;			R7 = Code/status associated with return states
+;			R8 = Address of the ENQ message header
+;
+;	OUTPUTS:	R5 and R8 are preserved
+;			R6,R7 are set up with the return status for driver
+;			XMTQ is given an entry
+;			RTOQ is given an entry
+;
+DDCMP$STARTACK:
+	MOVZWL	S^#DLK$C_RETINFO,R6		; Set up return to driver
+	CLRL	R7				; Clear all set bits
+	BSBW	DDCMP$CHK_HDR			; Chk the mdg hdr for errors
+	TSTB	R7				; Branch on NEQ to report err
+	BNEQ	20$
+						; Else continue
+	MOVZBL	#DDCMP$C_STACK,R4		; Set up a STACK to be XMT'd
+	BSBW	DDCMP$QUEUE_XMT			; Place on the XMT queue
+	TSTB	R7				; Branch on NEQ to report error
+	BNEQ	20$
+	CMPB	S^#DDCMP$C_STA_AST,-		; Branch NEQ the state is not
+		GF$B_STATE(R3)			; AST do not incr the threshold
+	BNEQ	5$
+	BSBW	DDCMP$INCR_XMT_THRS		; Incr the threshold cntrs
+5$:	TSTB	TF$B_CHAR(R5)			; If EQL then FPC station don't
+	BEQL	10$				; turn the link
+	BBC	#MFD$V_SELECT,-			; If BC then don't turn the
+		MFD$W_TYPFLG(R8),10$		; link
+	BISW	#DLK$M_TRNLK,R7
+10$:	RSB
+
+20$:	BRW	DDCMP$ERROR
+
+
+
+
+	.SBTTL	Start maintenance mode
+;
+; DDCMP$STARTMNT - Start maintenance mode
+;
+; The only purpose of this routine is to provide a branch in the state
+; tables and to set the status registers for return to the driver. The
+; ulitimate goal is only to change the state of the protocol.
+;
+;	INPUTS	 none
+;
+;	OUTPUTS	R5 and R8 are preserved
+;		R6, R7 and R9 are set to normal return
+;
+DDCMP$STARTMNT:
+	MOVZWL	S^#DLK$C_RETINFO,R6		; Set up return to driver
+	CLRL	R7				; Clear all set bits
+	CLRQ	R8				; driver
+	BSBW	DDCMP$MAINT_HALT		; Be sure to clean up the q's
+	MOVAL	TF$L_TQE(R5),R2			; Get the TQE address
+	MOVQ	#DDCMP$C_RUNTQE,TQE$Q_DELTA(R2) ; Set the delta for active pro
+	RSB
+
+
+	.SBTTL	Receive message
+; DDCMP$RCVMSG - Receive message
+;
+; This routine processes received messages. It first checks the headers
+; to ensure that there is no CRC or ADDR errors. Then it goes decides
+; which type of message it is. The first thing it must do for any message
+; is to check the header fields and make sure that things are kosher.
+; For instance if it receives a data message with the NUMB field
+; less than the last message RCV'd (R) then it should ignore the message.
+; And not allocate a buffer (IRP) for it. For data messages if the message
+; header is ok then a buffer is allocated for the message. For all messages
+; the message exchange variables are updated. Only after it has determined
+; that the headers are ok will it check to see if the select has been set.
+; If it has then the selection timer is stopped and the protocol issues
+; a command to the driver that it must stop receiving messages and start
+; sending them. For H or FMT before turning the link over it must retransmit
+; all messages on the RTOQ.
+;
+; The modulo arithmetic in DDCMP is done in the following manner.
+;
+; Assume that the number of outstanding transmits will never exceed 127. This
+; allows us to use 127 as our modulus, that is we know that two message
+; exchange fields will always be between 0 and 127 away from each other. This
+; allows us to use the following formula for modulo arithmetic:
+;
+;	GIVEN:	A; B; X; MOD = 127
+;
+;		B - A --> X
+;
+;		If  X > 127 Then B < A
+;		If  X < 127 Then B > A
+;		If  X = 0   Then B = A	
+;
+;	INPUTS		R3 = Address of the GF block
+;			R5 = Address of the TF block
+;			R8 = Address of RCV message
+;
+;	OUTPUTS		R5 is preserved
+;			R6 and R7 are set up for return to driver
+;			R8 is scratched
+;			R9 is size of the data message received
+;
+DDCMP$RCVMSG:
+	MOVZWL	S^#DLK$C_RETINFO,R6		; Set up return to driver
+	CLRL	R7				; Clear all set bits
+	BSBW	DDCMP$CHK_HDR			; Check CRC and ADDR
+	TSTB	R7				; On error return to driver
+	BEQL	5$
+	BRW	140$
+5$:	INSV	#0,#DDCMP$C_RCV_THRS,-		; Zero the RCV threshold
+		#DDCMP$C_THR_SIZE,-		; counter
+		TF$W_THRES(R5)
+	CLRL	R2				; If NAK rcv'd because REP 
+						; was sent this will be set
+	CMPB	#DDCMP$C_SOH,MFD$B_MSGID(R8)	; Branch if it is an SOH
+	BEQL	20$
+	CMPB	#DDCMP$C_ENQ,MFD$B_MSGID(R8)	; Branch if it is an ENQ
+	BNEQ	10$
+	MOVZBL	MFD$W_TYPFLG(R8),R1		; Get the type of cntrl msg
+	ASSUME	DDCMP$C_ACK EQ 1
+	ASSUME	DDCMP$C_NAK EQ 2
+	ASSUME	DDCMP$C_REP EQ 3
+	CASE	R1,<-				; ACK,NAK,REP
+		30$,-
+		40$,-
+		50$,-
+		>,LIMIT=#DDCMP$C_ACK
+	CMPB	S^#DDCMP$C_STACK,R1		; Branch if a STACK msg
+	BEQL	28$
+10$:	BRW	130$				; Return to driver
+
+; SOH message only
+
+20$:	ADDB3	TF$B_R(R5),#1,R1		; Branch on EQL because the
+	CMPB	MFD$B_NUMB(R8),R1		; incoming message is the next
+	BEQL	25$				; message expected
+	BRW	140$				; Else ignore the message
+25$:	INCB	TF$B_R(R5)			; Incr nmbr of RCV'd data msgs
+	INCL	TF$L_DMSGR(R5)			; Incr nmbr of data msgs RCV'd
+	MOVZWL	MFD$W_CNTFLG(R8),R9		; Get the count
+	BICW	#<MFD$M_SELECT!-		; Clear if flags are set
+		MFD$M_QSYNC>,R9
+	ADDL2	R9,TF$L_DBYTR(R5)		; the data msg
+	BISB2	#TF$M_SACK,-			; Set to send an ACK
+		TF$B_SFLAGS(R5)
+	CMPB	S^#DDCMP$C_STA_AST,-		; Branch if not AST
+		GF$B_STATE(R3)
+	BNEQ	30$
+	CMPB	#0,MFD$B_RESP(R8)		; Branch if 0 (hdr ok)
+28$:	BEQL	37$
+	BRW	130$				; Report it
+
+; SOH message or an ACK received
+
+	ASSUME	DDCMP$C_MODULO EQ 127
+
+; Check that A < RESP <= N
+
+30$:	SUBB3	TF$B_A(R5),MFD$B_RESP(R8),R0	; Branch If RESP <= A
+	BLEQ	37$				; no fields to update
+	SUBB3	TF$B_N(R5),MFD$B_RESP(R8),R0	; Branch if RESP > N
+	BGTR	45$				; To report a problem with hdr
+	INSV	#0,#DDCMP$C_XMT_THRS,-		; Zero the XMT threshold
+		#DDCMP$C_THR_SIZE,-		; counter
+		TF$W_THRES(R5)
+	MOVB	MFD$B_RESP(R8),TF$B_A(R5)	; Update msg exchange fields
+
+; Check that   T <= A
+
+	SUBB3	TF$B_A(R5),TF$B_T(R5),R0	; Branch if  T > A
+	BGTR	33$				; If GTR no field to update
+	ADDB3	TF$B_A(R5),#1,-			; Update T
+		TF$B_T(R5)
+
+; Check the condtion A < X
+
+33$:	SUBB3	TF$B_A(R5),TF$B_X(R5),R0	; Branch if  X <= A
+	BLEQ	35$				; to stop the timer
+	BSBW	DDCMP$CONT_REP_TIMER		; Else start reply timer
+	BRB	37$
+35$:	BSBW	DDCMP$STOP_REP_TIMER
+37$:	CMPB	#DDCMP$C_SOH,MFD$B_MSGID(R8)	; If this is an SOH
+	BNEQ	43$
+	BISW2	#DLK$M_RCVACK,R7		; RCV message was ok
+	BRB	43$
+
+39$:	MOVB	#1,TF$B_T(R5)			; T must be equal to 1 at
+						; protocol start up
+	BISB2	#TF$M_SACK,-			; Set to send an ACK
+		TF$B_SFLAGS(R5)
+	BRB	100$				; end of start up
+
+
+; NAK messages
+
+; Check the condition A <= RESP <= N
+
+40$:	SUBB3	TF$B_A(R5),MFD$B_RESP(R8),R0	; Branch RESP < A
+	BLSS	45$				; report a problem	
+	SUBB3	TF$B_N(R5),MFD$B_RESP(R8),R0	; Branch if RESP > N
+	BGTR	45$				; report the problem
+	INSV	#0,#DDCMP$C_XMT_THRS,-		; Zero the XMT threshold
+		#DDCMP$C_THR_SIZE,-		; counter
+		TF$W_THRES(R5)
+	MOVB	MFD$B_RESP(R8),TF$B_A(R5)	; Update message fields
+	ADDB3	TF$B_A(R5),#1,-
+		TF$B_T(R5)
+	BSBW	DDCMP$STOP_REP_TIMER
+	BSBW	DDCMP$LOGNAK			; Record why the NAK was RCV'd
+43$:	BRB	100$				; Check select flags
+45$:	BRW	130$
+
+
+; REP message
+
+50$:	CMPB	TF$B_R(R5),MFD$B_NUMB(R8)	; Ignore if R # NUMB
+	BNEQ	55$
+	BISB2	#TF$M_SACK,-			; An ACK needs be sent
+		TF$B_SFLAGS(R5)
+	BICB2	#TF$M_SNAK,-			; Clear send NAK
+		TF$B_SFLAGS(R5)
+	INCB	TF$B_RRTO(R5)			; Incr the nmbr of remote
+						; reply timeouts
+	BRB	100$				; Check select flags
+55$:	MOVB	#DDCMP$C_NAK3,-			; Set NAK reason
+		TF$B_NAKRSN(R5)
+	BISB2	#TF$M_SNAK,-			; An NAK needs be sent
+		TF$B_SFLAGS(R5)
+	BICB2	#TF$M_SACK,-			; Clear send ACK
+		TF$B_SFLAGS(R5)
+	INCB	TF$B_DEI(R5)			; Incr data error inbound
+	BISW2	S^#TF$M_IREPS,-			; Set reason to be SNAK set
+		TF$W_DEIBC(R5)			; in repsonse to REP RCV'd
+	BSBW	DDCMP$INCR_RCV_THRS		; Incr the rcv threshold cnter
+100$:	TSTB	TF$B_CHAR(R5)			; If FPC ignore select flags
+	BEQL	120$
+	BBC	#MFD$V_SELECT,-			; Branch if BC else turn link
+		MFD$W_TYPFLG(R8),120$
+;&	BBSS	#TF$V_OWNSELT,-			; Branch BS because there
+;&		TF$B_SELTIM(R5),130$		; is an error
+	BISB2	#TF$M_OWNSELT,TF$B_SELTIM(R5)	; Set that we own the select
+	BBC	#TF$V_TIMER,-			; If BC then no messages to REP
+		TF$B_SELTIM(R5),110$
+
+	CMPB	#DDCMP$C_NXTINTVL,-		; Branch NEQ because not the
+		TF$B_REPTIM(R5)			; right time to reply T/O
+	BNEQ	110$
+	TSTB	R2				; If NEQ then NAK was rcv'd
+	BNEQ	110$				; because a REP was sent
+	BBC	#TF$V_TIMER,-			; If BC then no msgs to T/O
+		TF$B_SELTIM(R5),110$
+	BISB2	#TF$M_SREP,-			; Else set REP flag to send a
+		TF$B_SFLAGS(R5)			; reply to msg number
+	INCB	TF$B_LRTO(R5)			; Incr the local reply timeout
+						; counter
+	BSBW	DDCMP$INCR_XMT_THRS		; Incr the XMT threshold cntr
+	INCB	TF$B_CURRTO(R5)			; Incr the number of times that
+						; a RTO has been snt on the msg
+	CMPB	TF$B_CURRTO(R5),-		; Branch on NEQ because the max
+		TF$B_MAXRTO(R5)			; RTO has not been reached
+	BNEQ	110$
+	BISW2	#DLK$M_PRSTERR,R7		; Report to driver a peristant
+	CLRB	TF$B_CURRTO(R5)			; Reset the cur num of RTO's
+	BRB	140$
+110$:	BISW2	#DLK$M_TRNLK,R7			; Driver must know to start XMT
+	BBS	#TF$V_POINT,-			; Branch BS because no timer is
+		TF$B_CHAR(R5),120$		; running for TRIB stations
+	BSBW	DDCMP$STOP_SEL_TIMER		; Stop selection timer
+	INSV	#0,#DDCMP$C_SEL_THRS,-		; Clear the selection threshold
+		#DDCMP$C_THR_SIZE,-		; counter
+		TF$W_THRES(R5)
+120$:	CLRL	R8				; Clear to handle XMT
+	BRB	DDCMP$XMTMSG_ALT		; Handle sending of ENQ's and
+						; retransmits
+
+130$:	BISW2	#DLK$M_HDRERR,R7		; Fatal problem with msg RCV'd
+140$:	BRW	DDCMP$ERROR			; Return to driver
+
+
+
+	.SBTTL	Transmit message
+; DDCMP$XMTMSG - Transmit a message
+; DDCMP$XMTMSG_ALT
+;
+; This routine performs the transmit state table of DDCMP. It sets up
+; headers, sends NAK's, REP's and ACK's when necessary (when those
+; flags are set). It is called to retransmit data messages. Takes care of
+; the XMT message exchange variables (X,T, & N). Sending DLE msgs is
+; handled elsewhere.
+;
+; This routine starts out checking the SNAK and SREP flags. If either of these
+; are set then an NAK or REP must be sent. If these are clear it checks
+; to see if any messages need be retransmitted. It retransmits all messages
+; required for retransmit before it sends any new data. New data is queued to
+; the overflow queue first. This means that if any messages are outstanding
+; the data will not get sent until that condition is resolved. If none of 
+; these conditions are true the messages are taken from the front of the 
+; XMTOVF queue and given to the XMTQ until it is full. ACKs are piggybacked
+; on other messages except REPs when possible else are sent when the XMTer
+; has no other work.
+;
+;	INPUTS		R3 = Address of the GF block
+;			R5 = Address of the TF block
+;			R8 = Address of data for SOH message
+;
+;	OUTPUTS		R5 and R8 is preserved
+;			R6 and R7 contain return information for driver
+;			Messages to be sent are placed on the XMTQ and RTOQ
+;
+DDCMP$XMTMSG:
+	MOVZWL	S^#DLK$C_RETINFO,R6		; Set up return to driver
+	CLRL	R7				; Clear all set bits
+	TSTL	R8				; If Eql then no data to XMT
+	BEQL	DDCMP$XMTMSG_ALT
+	TSTW	XMTQ$W_MSGSIZE(R8)		; If NEQ then legal size
+	BNEQ	10$
+	BRW	DDCMP$XMTERR
+10$:	INSQUE	(R8),@TF$Q_XMTOVF+4(R5)		; Assume msg can't be sent
+	CMPB	XMTQ$B_BUFTYP(R8),S^#DYN$C_BUFIO ; If EQL then correct buf
+	BEQL	20$
+	BUG_CHECK	NOBUFPCKT,FATAL
+20$:	BISW2	#DLK$M_XMTACK,R7		; Msg to XMT has been queue'd
+DDCMP$XMTMSG_ALT:				; When coming from RCVMSG
+	BBC	#TF$V_SNAK,-			; If not BC send NAK
+		TF$B_SFLAGS(R5),10$
+	MOVZBL	#DDCMP$C_NAK,R4			; Set up that it is a NAK to Q
+	BSBW	DDCMP$QUEUE_XMT			; Q the NAK, hdr is also setup
+	TSTB	R7				; Branch on NEQ to report error
+	BNEQ	15$
+	BICB2	#<-
+		TF$M_SNAK!-			; Clear send NAK flag
+		TF$M_SACK-			; Clear send ACK flag
+		>,TF$B_SFLAGS(R5)
+10$:	BBC	#TF$V_SREP,-			; If not BC send REP
+		TF$B_SFLAGS(R5),20$
+	MOVZBL	#DDCMP$C_REP,R4			; Set up that it is a REP to Q
+	BSBW	DDCMP$QUEUE_XMT			; Q the REP, hdr is also setup
+	TSTB	R7				; Branch on NEQ to report error
+	BNEQ	15$
+	BICB2	#TF$M_SREP,-			; Clear send REP flag (REP has
+		TF$B_SFLAGS(R5)			; been sent
+
+12$:	BRW	60$				; If a reply is sent don't XMT
+						; more messages
+15$:	BRW	70$				; Return in error
+20$:	ADDB3	TF$B_N(R5),#1,R1		; Any messages to reXMT
+	SUBB3	TF$B_T(R5),R1,R0		; Branch  N + 1 <= T
+	BLEQ	30$				; No msgs to retransmit
+	BSBW	DDCMP$REQUEUE_XMT		; If GTR then req MSG(T)
+	TSTB	R7				; If NEQ then prst error found
+	BNEQ	15$
+
+; Now T = N + 1 and SREP and SNAK flags are clear, send SOH messages
+;
+30$:	REMQUE	@TF$Q_XMTOVF(R5),R8		; Get the next message to XMT
+	BVS	12$				; If VS then queue empty
+	BEQL	33$				; If NEQ then more to come
+	TSTB	TF$B_CHAR(R5)			; If this is not a FPC sta
+	BEQL	34$
+	INCB	TF$B_MMCTR(R5)			; Incr the max msg counter
+	CMPB	TF$B_MSGCNT(R5),TF$B_MMCTR(R5)	; If LSS then max amount of
+	BGTR	34$				; msg to xmt in an interval
+33$:	BISB2	#TF$M_SELECT,-			; Set to send a select flag
+		TF$B_SELTIM(R5)
+	CLRB	TF$B_MMCTR(R5)
+34$:	PUSHL	R10				; Save a register
+	MOVB	TF$B_SELTIM(R5),R10		; Pick up select flag
+	CMPB	XMTQ$B_BUFTYP(R8),S^#DYN$C_BUFIO ; If EQL then correct buf
+	BEQL	35$
+	BUG_CHECK	NOBUFPCKT,FATAL
+35$:	SUBW3	#MFD$K_LENGTH,-			; Set size of data message
+		XMTQ$W_MSGSIZE(R8),R9
+	CLRL	R1				; Clear the reg of old addr
+	MOVZBL	#DDCMP$C_SOH,R4			; SOH header to setup
+	BSBW	DDCMP$QUEUE_XMT			; Queue the msg also hdr setuP
+	BBS	#DLK$V_QFULERR,R7,50$		; Message not on XMTQ 
+	INCB	TF$B_N(R5)			; Increment the highest XMT'd
+	ADDB3	TF$B_N(R5),-			; Set next to XMT
+		#1,TF$B_T(R5)
+	TSTB	TF$B_CHAR(R5)			; If this is not a FPC sta
+	BEQL	50$
+
+	BBC	#TF$V_SELECT,R10,50$		; BR if did not send select flg
+	CMPB	#DDCMP$C_EOINTVL,-		; Branch NEQ the station is
+		TF$B_REPTIM(R5)			; Multipoint control station
+	BNEQ	50$				; reply T/O must be handled
+	BBC	#TF$V_TIMER,-			; If BC then timer not running
+		TF$B_SELTIM(R5),50$		; no need to send a REP
+	BISB2	#TF$M_SREP,-			; Else must send a REP before
+		TF$B_SFLAGS(R5)			; the msg with the select flag
+	INCB	TF$B_LRTO(R5)			; Incr the local reply timeout
+						; error counter
+	BSBW	DDCMP$INCR_XMT_THRS		; Incr the XMT threshold cntr
+	INCB	TF$B_CURRTO(R5)			; Incr the number of times that
+						; a RTO has been snt on the msg
+	CMPB	TF$B_CURRTO(R5),-		; Branch on NEQ because the max
+		TF$B_MAXRTO(R5)			; RTO has not been reached
+	BNEQ	40$
+	CLRB	TF$B_CURRTO(R5)			; Reset the cur num of RTO's
+	BISW2	#DLK$M_PRSTERR,R7		; Report to driver a peristant
+	POPL	R10				; Restore R10
+	BRB	70$
+40$:	MOVZBL	#DDCMP$C_REP,R4			; Set up that it is a REP to Q
+	BSBW	DDCMP$QUEUE_XMT			; Q the REP, hdr is also setup
+	TSTB	R7				; Branch on NEQ to report error
+	BNEQ	50$
+	BICB2	#TF$M_SREP,-			; Clear send REP flag (REP has
+		TF$B_SFLAGS(R5)			; been sent
+50$:	POPL	R10				; Restore R10
+60$:	RSB
+
+70$:	BRW	DDCMP$ERROR
+
+DDCMP$XMTERR:
+	BISW	#DLK$M_XMTERR,R7		; Set error on XMT
+	INCB	GF$B_LSE(R3)			; Bump error counters
+	BISW2	#GF$M_LXMT_UNDER,-		; XMT underruns
+		GF$W_LSE_BCTRS(R3)
+	BRW	DDCMP$ERROR
+
+
+
+	.SBTTL	Calculate the CRC
+
+;DDCMP$SETCRC - Calulate the CRC for devides that don't support CRC
+;
+; This routine calculates CRC's for devices that don't support CRC checking.
+; Once calculated it stores the CRC in fields on XMTQ it is up to the
+; device to send the CRC at the proper time.
+;
+;		INPUTS	R2 = Address of XMTQ entry
+;			R9 = Length of the data message
+;
+;		OUTPUTS R0 is destroyed
+;			R8 and R9 are preserved
+DDCMP$SETCRC:
+	PUSHR	#^M<R1,R2,R3,R4>		; Save registers
+	MOVL	R2,R4
+	CRC	CRCTABLE,#0,#MFD$K_LENGTH,-	; Calculate CRC for header
+		XMTQ$B_MSGHDR(R4)
+	MOVW	R0,XMTQ$W_HCRC(R4)		; Move into HCRC field
+	MOVAL	XMTQ$B_MSGHDR(R4),R1		; Get the address of the data
+	CMPB	#DDCMP$C_ENQ,MFD$B_MSGID(R1)	; If EQL then no need to calc
+	BEQL	10$				; data CRC
+	CRC	CRCTABLE,#0,R9,-		; Calculate the CRC for data
+		XMTQ$K_LENGTH(R4)
+	MOVW	R0,XMTQ$W_DCRC(R4)		; Movw into DCRC field
+10$:	POPR	#^M<R1,R2,R3,R4>		; Restore registers
+	RSB
+
+
+	.SBTTL	Check the receives message header
+;DDCMP$CHK_HDR - Check the receive message header
+;
+; This routine checks the receive messages' header to ensure that the header
+; has no errors. It also checks the CRC's if the device this protocol is
+; running on does not support CRC checking.
+;
+;	INPUTS		R3 = Address of the GF block
+;			R5 = Address of the TF block
+;			R7 = Clear
+;			R8 = Address of message header
+;
+;	OUTPUTS		R7 = Bits are set according to the errors found
+; 			R5,R8 are preserved
+;
+DDCMP$CHK_HDR:
+	BBC	#GF$V_CRC,GF$B_DRVCHR(R3),10$	; If not BC then chk CRC's
+	CRC	CRCTABLE,#0,#MFD$K_LENGTH,(R8)	; Calc the header CRC
+	MOVW	MFD$K_LENGTH(R8),R1		; Get CRC from Message
+	CMPW	R1,R0				; If EQL then no lost data
+	BEQL	5$
+	MOVB	#DDCMP$C_NAK1,TF$B_NAKRSN(R5)	; Set the reason for NAK
+	BRB	20$				; Branch to set NAK flag
+5$:	CMPB	#DDCMP$C_SOH,MFD$B_MSGID(R8)	; If not a data message CRC 
+	BNEQ	10$				; is done
+	MOVW	MFD$W_CNTFLG(R5),R1		; Get the count field
+	BICW	#<MFD$M_SELECT!-		; Clear if flags are set
+		MFD$M_QSYNC>,R1
+	SUBL3	#MFD$K_LENGTH,R9,R1		; Get actual size of data
+	CRC	CRCTABLE,#0,R1,-		; Calc CRC for data
+		MFD$K_LENGTH+2(R8)
+	MOVL	R8,R1				; Get RCV message address
+	ADDL2	R9,R1				; Add the size of message
+	ADDL2	#2,R1				; Add 2 bytes of CRC check
+	CMPW	R0,(R1)				; Branch EQL the data CRC was
+	BEQL	10$				; was OK
+	MOVB	#DDCMP$C_NAK2,TF$B_NAKRSN(R5)	; Set NAK reason and
+	BRB	20$				; Branch to set NAk flag
+10$:	TSTB	TF$B_CHAR(R5)			; If full point control skip
+	BEQL	30$				; Address checking
+	CMPB	MFD$B_ADDR(R8),-		; Do the addr match
+		TF$B_ADDR(R5) 
+	BEQL	30$				; Yes
+	MOVB	#DDCMP$C_NAK17,-		; Set NAK rsn
+		TF$B_NAKRSN(R5)
+20$:	BISB2	#TF$M_SNAK,-			; Set to send the NAK
+		TF$B_SFLAGS(R5)
+	BISW2	#DLK$M_HDRERR,R7		; To report the error to driver
+	BSBW	DDCMP$INCR_RCV_THRS		; Incr the receive threshold
+						; counter
+30$:	RSB
+
+
+
+	.SBTTL	Reply timing
+;DDCMP$REPTIM - Reply Timing
+;
+; This routine is called after a message has been transmitted by the driver.
+; When the routine receives a message that must have reply timeout it enters
+; it onto the RTOQ. In the case where the queue is full the routine returns
+; an error condition to the driver. In the case where the message transmitted
+; does need to have a reply timeout the routine returns a normal status to the
+; driver.
+;
+;	INPUTS		R5 = Address of the TF block
+;			R8 = Address of the XMT'd message
+;
+;	OUTPUTS		R6,R7 contain the return status for driver
+;			R8 is preserved
+;			R9 is cleared
+;
+DDCMP$REPTIM:
+	MOVZWL	S^#DLK$C_RETINFO,R6		; Set up return status for
+	CLRL	R7				; driver
+	MOVAL	XMTQ$B_MSGHDR(R8),R1		; Get the addr of the msg hdr
+	CMPB	#DDCMP$C_SOH,MFD$B_MSGID(R1)	; Branch on NEQ not SOH msg
+	BNEQ	20$
+	BSBW	DDCMP$INS_RTOQ			; Insert the message on RTOQ
+	MOVB	MFD$B_NUMB(R1),TF$B_X(R5)	; Set X = NUMB
+
+; Check the condtion A < X
+
+	SUBB3	TF$B_A(R5),TF$B_X(R5),R0	; Branch X <= A
+	BLEQ	10$				; Stop the timer
+	BRB	DDCMP$START_REP_TIMER		; Branch to enter the message
+						; to be timed
+10$:	BRW	DDCMP$STOP_REP_TIMER		; Stop the timer because all
+						; msgs on the RTOQ have been
+						; ACK'd
+20$:	RSB
+
+
+		
+	.SBTTL	Queue empty - protocol may have work
+
+;DDCMP$QEMPTY - Queue  empty
+;
+; This routine is called when the user detects that the XMTQ is empty
+; but the protocol may have ACK's to send.
+;
+;	INPUTS		R5 = Address of the TF block
+;
+;	OUTPUTS		R6,R7 contain status info
+;			Other registers are destroyed
+;
+DDCMP$QEMPTY:
+	MOVZWL	S^#DLK$C_XMTMSG,R6		; Set up return status for
+	CLRL	R7				; Set up for return status
+	BBCC	#TF$V_SACK,TF$B_SFLAGS(R5),20$	; If BC then no ACK to send
+10$:	MOVZBL	S^#DDCMP$C_ACK,R4		; Set to send and ACK
+	BSBW	DDCMP$QUEUE_XMT			; Queue the ACK
+	TSTB	R7				; If EQL then error msg not
+	BNEQ	20$				; sent
+	BISW	#DLK$M_MSGSENT,R7		; Set that the ACK is on q
+20$:	RSB	
+
+
+
+	.SBTTL	Reply and selection timeout clock
+
+; TIMER - Reply and selection timeout clock
+;
+; This routine is responsible for the real time clock associated with this
+; protocol. The TQE is part of the TF block hence no need to worry about
+; allocating and deallocating it. The TQE is set up only once at controller 
+; init time. It ticks once per second while the system is running. In this 
+; way the driver can use the system clock to time selection intervals and 
+; reply timeouts, but not use large pieces of system non-paged pool. Half
+; duplex and multipoint stations use the TQE as aselection timer. Full
+; duplex uses the TQE for a reply timeout clock.
+;
+; This is also reponsible for queueing messages for reply timeout. Handling
+; these timeouts is different for each type of station.
+;
+;	FPC	=	Real time clock
+;	HPC	=	End of next selection interval
+;	FMC	=	Before next selection interval
+;	HMC	=	Before next selection interval
+;	FMT	=	Before next selection interval
+;	HMT	=	Before next selection interval
+;
+;
+;	INPUTS		R5 = TF block
+;			R8 = Address of messge to reply timeout
+;
+;	OUTPUTS		R2,R3,R5 and R8 are preserved
+;
+;
+DDCMP$START_REP_TIMER:
+	BISW2	#TF$M_TIMER,-			; Set timer running in either
+		TF$B_SELTIM(R5)			; case
+	RSB
+
+
+DDCMP$START_SEL_TIMER:
+	MOVL	G^EXE$GL_ABSTIM,R0		; Get the current time
+	MOVZWL	GF$W_SELWAI(R3),R1		; Get selection time wait
+	ADDL3	R0,R1,GF$L_SELEND(R3)		; Add the wait time to current
+	RSB					; time to get select end time
+
+
+
+;DDCMP$START_TIMER
+;
+; Starts the TQE running if not already running. Called only once via a fork
+; at controller init time.
+;
+;	INPUTS		R3 = Address of UCB
+;			R4 = Address of TF block
+;			R5 = Address of TQE block
+;
+;	OUTPUTS		R5 is preserved
+;
+DDCMP$START_TIMER::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>		; Save registers
+	MOVL	R3,TQE$L_FR3(R5)		; Save UCB address
+	MOVL	R4,TQE$L_FR4(R5)		; Save TFB address
+	MOVAL	G^DDCMP$TIMER,TQE$L_FPC(R5)	; Set address of timer routine
+	MOVB	#TQE$C_SSREPT,TQE$B_RQTYPE(R5)	; Set repeat bit sets 
+						; TF$M_REPEAT also
+	MOVQ	#DDCMP$C_STPTQE,TQE$Q_DELTA(R5)	; Set delta for halted protocol
+		
+	CLRL	GF$L_TQE_STS(R3)		; Clear status
+	MOVQ	G^EXE$GQ_SYSTIME,R0		; Get system time
+	JSB	G^EXE$INSTIMQ			; Insert the TQE on timer queue
+5$:	MOVL	R4,R5				; Set TF address
+	MOVAL	TF$Q_XMTQ(R5),TF$Q_XMTQ(R5)		; Init transmit queue
+	MOVAL	TF$Q_XMTQ(R5),TF$Q_XMTQ+4(R5)		; Init transmit queue
+	MOVAL	TF$Q_CTLQ(R5),TF$Q_CTLQ(R5)		; Init control queue
+	MOVAL	TF$Q_CTLQ(R5),TF$Q_CTLQ+4(R5)		; Init control queue
+	MOVAL	TF$Q_RTOQ(R5),TF$Q_RTOQ(R5)		; Init reply timeout Q
+	MOVAL	TF$Q_RTOQ(R5),TF$Q_RTOQ+4(R5)		; Init reply timeout Q
+	MOVAL	TF$Q_CMPQ(R5),TF$Q_CMPQ(R5)		; Init completetion Q
+	MOVAL	TF$Q_CMPQ(R5),TF$Q_CMPQ+4(R5)		; Init completetion Q
+	MOVAL	TF$Q_XMTOVF(R5),TF$Q_XMTOVF(R5)		; Init overflow queue
+	MOVAL	TF$Q_XMTOVF(R5),TF$Q_XMTOVF+4(R5)
+	POPR	#^M<R0,R1,R2,R3,R4,R5>		; Restore registers
+	RSB
+
+
+
+
+;DDCMP$CONT_REP_TIMER
+;
+; This routine is called when a message is received and A < X. This checks
+; the messages on the RTOQ to see if any of them have been ACK'd. See below.
+;
+;DDCMP$STOP_TIMERS
+;
+; This routine is called to stop reply timing. First all ACK'd entries are
+; removed from the queue. Then the bit is cleared to say nothing is
+; being timed
+;
+;	INPUTS		R5 = Address of the TF block
+;			R8 = Address of the receive message
+;
+;	OUTPUTS		R2,R3,R5 and R8 are preserved
+;
+DDCMP$CONT_REP_TIMER:
+DDCMP$STOP_REP_TIMER:
+	PUSHL	R2
+	BSBW	DDCMP$REM_RTOQ			; Remove any ACK'd msgs from Q
+	POPL	R2
+	RSB
+
+
+;DDCMP$STOP_SEL_TIMER
+;
+; This routine stops the selection timer by clearing the bit to say nothing is
+; being timed.
+;
+;	INPUTS		R5 = Address of the TF block
+;
+;	OUTPUTS		R2 is destroyed
+;			R5 is preserved
+;
+DDCMP$STOP_SEL_TIMER:
+	CLRB	TF$B_MSGCNT(R5)			; Clear the number of msgs XMTd
+	RSB
+
+
+
+
+	.SBTTL	Queue  and requeue the message to be transmitted
+; QUEUE_XMT - Queue transmission
+;
+; This routine is responsible for the XMT Queue (XMTQ). When a mesage is
+; XMT'd this routine is called to manage the queue. If it is a DLE message
+; then it is only queued when XMTQ is empty. SOH and ENQ's are transmitted
+; in the following order:
+;		NAK,REP,(N * SOH),ACK
+; A NAK and ACK should not be on the queue simultaneously.
+; This routine also calls SETUP_HDR to include the header message in the
+; queue, hence when the driver is to transmit the message it must first
+; set up its' header.
+;
+; XMTQ is full when each of the slots allowed to transmit data messages is
+; filled or inthe case of retransmitting when that value is less than or
+; equal to zero. In such cases an error is returned and the transmit is
+; queued to the overflow queue.
+;
+; NOTE: Any change to the XMTQ or control messages on that queue must be
+;       done at device IPL
+;
+;	INPUT		R3 = Address of the GF block
+;			R4 = Type of message
+;			R5 = address of TF block
+;			R8 = Address of buffer to queue for data and maint
+;			messages only
+;			R9 = Size of data message
+;
+;	OUTPUTS		R5,R8,R9 is preserved
+;			
+;
+;	A new entry is put onto the XMT QUEUE
+;
+DDCMP$QUEUE_XMT:
+
+; Handle SOH message
+
+	CMPB	#DDCMP$C_SOH,R4			; Branch if not SOH
+	BNEQ	20$
+	TSTB	TF$B_XQCNT(R5)			; Br NEQ XMTQ  is not yet
+	BNEQ	5$				; filled
+	BISW2	#DLK$M_QFULERR,R7		; Set queue full error
+2$:	BRW	150$
+5$:	DECB	TF$B_XQCNT(R5)			; If free grab it
+	BSBW	DDCMP$SETUP_MSG_HDR		; Set up the msg header
+	MOVL	R8,R2				; Save in R2 for CRC calc
+	DSBINT	GF$B_DIPL(R3)			; Disable device interrupts
+	CMPB	XMTQ$B_BUFTYP(R8),S^#DYN$C_BUFIO ; If EQL then correct buf
+	BEQL	10$
+	BUG_CHECK	NOBUFPCKT,FATAL
+10$:	INSQUE	(R8),@TF$Q_XMTQ+4(R5)		; Q at end of XMTQ
+	ENBINT					; Enable interrupts
+	TSTB	TF$B_CHAR(R5)			; If EQL then don't start
+	BEQL	15$				; selection timer
+	BBC	#MFD$V_SELECT,-			; If BC no select to process
+		MFD$W_CNTFLG(R1),15$
+	BRW	100$				; Branch to start timer
+15$:	BRW	120$				; Branch to comp queueing
+
+; Handle DLE message
+
+20$:	CMPB	#DDCMP$C_DLE,R4			; Branch if not DLE
+	BNEQ	30$
+	BSBW	DDCMP$SETUP_MSG_HDR		; Set up the header
+	MOVL	R8,R2				; Save in R2 for CRC calc
+	DSBINT	GF$B_DIPL(R3)			; Disable device interrupt
+	INSQUE	(R8),TF$Q_XMTQ(R5)		; Queue the msg to XMT
+	DECB	TF$B_XQCNT(R5)			; Dec number of free places
+	ENBINT					; Enable interrupts
+	BISW2	#XMTQ$M_SELECT,XMTQ$B_FLAG(R8)	; Driver must know to turn link
+	BRW	120$
+25$:	BRW	125$
+
+; Assume that it must be an ENQ
+
+30$:	BSBW	DDCMP$SETUP_ENQ_HDR		; Set up the header for the ENQ
+						; This also returns the ENQ
+						; block in R8
+	TSTB	R7				; If NEQ then an hdr error
+	BNEQ	25$
+
+; Handle an ACK
+
+33$:	CMPB	S^#DDCMP$C_ACK,R4		; Branch NEQ ACK
+	BNEQ	50$
+	MOVAL	TF$L_QNAK(R5),R0		; Get the addr of the NAK block
+	DSBINT	GF$B_DIPL(R3)			; Disable device interrupts
+	BBCC	#XMTQ$V_ONQUEUE,-		; If BC no NAK on queue
+		XMTQ$B_FLAG(R0),35$
+	REMQUE	(R0),R0				; If BS on q remove it
+35$:	BBSS	#XMTQ$V_ONQUEUE,-		; Is BS then ACK q'd
+		XMTQ$B_FLAG(R2),40$
+	INSQUE	(R2),@TF$Q_CTLQ+4(R5)		; If BC must q the ACK
+40$:	ENBINT					; Enable device interrupts
+	TSTB	TF$B_CHAR(R5)			; If EQL then FPC no need
+	BEQL	48$				; to set selection timer
+45$:	BBC	#MFD$V_SELECT,-			; If BS branch to proc sel exp
+		MFD$W_TYPFLG(R1),48$
+	BRW	100$
+48$:	BRW	120$				; Else return
+
+; Handle NAK message
+
+50$:	CMPB	S^#DDCMP$C_NAK,R4		; Branch in NEQ
+	BNEQ	70$
+	MOVAL	TF$L_QACK(R5),R0		; Get addr of ACK Q block
+	DSBINT	GF$B_DIPL(R3)			; Disable device interrupts
+	BBCC	#XMTQ$V_ONQUEUE,-		; If BC then not on Q
+		XMTQ$B_FLAG(R0),55$
+	REMQUE	(R0),R0				; If BS then rem ACK from Q
+55$:	BBSS	#XMTQ$V_ONQUEUE,-		; If BS msg on queue
+		XMTQ$B_FLAG(R2),60$
+	INSQUE	(R2),@TF$Q_CTLQ+4(R5)		; Queue the NAK at front of Q
+60$:	ENBINT					; Enable device interrupts
+	TSTB	TF$B_CHAR(R5)			; If EQL then don't start
+	BEQL	65$				; selection timer
+	BBC	#MFD$V_SELECT,-			; If BC no select to process
+		MFD$W_CNTFLG(R1),65$
+	BRW	100$				; Branch to start timer
+65$:	BRW	120$				; Branch to comp queueing
+
+; Handle REP
+
+70$:	CMPB	S^#DDCMP$C_REP,R4		; Branch NEQ
+	BNEQ	90$
+	DSBINT	GF$B_DIPL(R3)			; Disable device interrupts
+	BBSS	#XMTQ$V_ONQUEUE,-		; If BS then entry on queue
+		XMTQ$B_FLAG(R2),75$
+	INSQUE	(R2),@TF$Q_CTLQ+4(R5)		; at the top of the queue
+75$:	ENBINT					; Eanble interrupts
+	TSTB	TF$B_CHAR(R5)			; If EQL then don't start
+	BEQL	80$				; selection timer
+	BBC	#MFD$V_SELECT,-			; If BC no select to process
+		MFD$W_CNTFLG(R1),80$
+	BRW	100$				; Branch to start timer
+80$:	BSBW	DDCMP$START_REP_TIMER		; Branch to start reply timer
+	BRW	120$				; Branch to comp queueing
+
+; Assume that message is an STRT or STACK
+
+90$:	BBSS	#XMTQ$V_ONQUEUE,-		; If BS then message in on
+		XMTQ$B_FLAG(R2),100$		; the queue
+	DSBINT	GF$B_DIPL(R3)			; Disable device interrupts
+	INSQUE	(R2),@TF$Q_CTLQ+4(R5)		; Insert message on XMIT Q
+	ENBINT					; Enable device interrupts
+100$:	BBS	#TF$V_STATYP,-			; Branch BS because the station
+		TF$B_CHAR(R5),119$		; is a tributary, hence do not
+						; start the selection timer
+110$:	BSBW	DDCMP$START_SEL_TIMER
+	BICB2	#TF$M_RCVDET,-			; Reset the RCV detect field
+		TF$B_SELTIM(R5)			; for a new selection
+	EXTZV	#DDCMP$C_SEL_THRS,-		; Extract the field
+		#DDCMP$C_THR_SIZE,-		; to increment
+		TF$W_THRES(R5),R1
+	CMPB	#DDCMP$C_THR_MAX,R1		; Has the thres been exceeded
+	BGTR	115$				; No
+	BISW2	#DLK$M_TRNSERR,R7		; Report that thres exceeded
+	CLRL	R1				; Set the SEL threshold count
+						; to zero
+	BRB	118$
+
+115$:	INCB	R1				; Incr the thres error counter
+118$:	INSV	R1,#DDCMP$C_SEL_THRS,-		; Insert count
+		#DDCMP$C_THR_SIZE,-
+		TF$W_THRES(R5)
+	TSTB	TF$B_CHAR(R5)			; Branch EQL the station is a
+	BEQL	120$				; FPC and there is no need to
+						; turn the link
+119$:	BISW2	#XMTQ$M_SELECT,XMTQ$B_FLAG(R2)	; Driver must know to start XMT
+	BICB2	#TF$M_OWNSELT,TF$B_SELTIM(R5)	; We have now de-selected
+						; ourself.
+120$:	BBC	#GF$V_CRC,GF$B_DRVCHR(R3),125$	; If BC then device does CRC
+	BSBW	DDCMP$SETCRC			; Else DDCMP must do it
+125$:	RSB
+
+
+150$:	CMPB	XMTQ$B_BUFTYP(R8),S^#DYN$C_BUFIO ; If EQL then correct buf
+	BEQL	160$
+	BUG_CHECK	NOBUFPCKT,FATAL
+160$:	INSQUE	(R8),TF$Q_XMTOVF(R5)		; Insert at top of queue
+	RSB
+
+
+
+;DDCMP$REQUEUE_XMT
+;
+; This routine is called when a message is to be transmitted but T < N + 1
+; which implies that an ACK was received for some messages but not all that
+; were sent. This retransmits these messages. These messages already have 
+; headers set up and they can be found on the RTOQ. This routine will 
+; retransmit all messages until T < N + 1 regardless of whether or not
+; the XMTQ gets filled.
+;
+;	INPUTS		R5 = Address of the TF block
+;
+;	OUTPUTS		R5 is preserved
+;			Entries added to the XMTQ
+;
+DDCMP$REQUEUE_XMT:
+	INCB	TF$B_CURRTO(R5)			; Increment the number of times
+						; a REP has occured
+	CMPB	TF$B_CURRTO(R5),-		; Branch on EQL because the rep
+		TF$B_MAXRTO(R5)			; T/O max has been reached
+	BNEQ	10$				; which implies a problem with
+						; the other node
+	CLRB	TF$B_CURRTO(R5)			; Reset the cur num of RTO's
+	BISW2	#DLK$M_PRSTERR,R7
+	BRB	50$
+10$:	DSBINT	GF$B_DIPL(R3)			; Disable interrupts to DIPL
+	MOVAL	TF$Q_XMTQ(R5),R2		; Queue the reXMT's at
+						; top of queue
+20$:	REMQUE	@TF$Q_RTOQ(R5),R1		; Get the entry to reXMT
+	BVS	40$				; No more enties on queue
+	CMPB	XMTQ$B_BUFTYP(R1),S^#DYN$C_BUFIO ; If EQL then correct buf
+	BEQL	30$
+	BUG_CHECK	NOBUFPCKT,FATAL
+30$:	MOVAL	XMTQ$B_MSGHDR(R1),R0		; Get the addr of the msg hdr
+	MOVB	TF$B_R(R5),MFD$B_RESP(R0)	; Update the RESP field with
+						; the most recent RCV msg
+	INSQUE	(R1),(R2)			; Insert onthe XMTQ
+	MOVL	R1,R2				; Set new place to insque after
+	DECB	TF$B_XQCNT(R5)			; Grab a slot on the queue
+	INCB	TF$B_T(R5)			; Increment T (last xmt'd)
+	BRB	20$
+40$:	ENBINT
+45$:	BICB2	#TF$M_TIMER,TF$B_SELTIM(R5)	; Set reply timer not running
+50$:	RSB
+
+
+
+	.SBTTL	Setup headers for maint and data messages
+; SETUP_MSG_HDR - Set up the header for  a maint or data message
+;
+; This routine sets up a header message for a maintenance or data message.
+; It is passed the buffer which is going to be queued for XMT and inserts
+; the header into the proper area for transmission.
+;
+;	INPUTS		R3 = Address of the GF block
+;			R4 = Type of message
+;			R5 = Address of the TF block
+;			R7 = Clear
+;			R8 = Address of the buffer to be queued for transmit
+;
+;	OUTPUTS		R1 = Address of header to queue
+;			R4,R5,R8,R9 are preserved.
+;			R7 is set if any errors are found
+;
+DDCMP$SETUP_MSG_HDR:
+	MOVAL	XMTQ$B_MSGHDR(R8),R1		; Get addr of the hdr to setup
+	MOVB	R4,MFD$B_MSGID(R1)		; Move in the data msg ID
+	BICW2	#<MFD$M_SELECT!-		; Be sure the count isn't over
+		MFD$M_QSYNC>,R9			; a 65K (14 bit field)
+	MOVW	R9,MFD$W_CNTFLG(R1)		; Insert into the count field
+	CMPB	#DDCMP$C_SOH,R4			; Is this a hdr for a data msg
+	BNEQ	20$				; No
+
+; Yes, set up a data message header
+
+	BBCC	#TF$V_SELECT,TF$B_SELTIM(R5),15$  ; Send select flag??
+	BISW2	#MFD$M_SELECT,-			; Set the select flag in header
+		MFD$W_CNTFLG(R1)
+15$:	MOVB	TF$B_R(R5),MFD$B_RESP(R1)	; Piggyback ACK's in header
+	ADDB3	TF$B_N(R5),#1,-			; Number the data msg
+		MFD$B_NUMB(R1)
+	MOVB	TF$B_XADDR(R5),-		; Move in trib addr
+		MFD$B_ADDR(R1)			; to transmit to
+	BISW2	#MFD$M_QSYNC,MFD$W_CNTFLG(R1)	; Set to always resync
+	RSB
+
+; Set up a maintenance message header
+
+20$:	BISW2	#<MFD$M_QSYNC!-			; Set the flags (always ones
+		MFD$M_SELECT>,-			; when sending main msgs)
+		MFD$W_TYPFLG(R1)
+
+	ASSUME	DDCMP$C_FILL EQ 0
+	ASSUME	MFD$B_NUMB EQ MFD$B_RESP+1
+
+	CLRW	MFD$B_RESP(R1)			; Zero field
+	MOVB	TF$B_XADDR(R5),-		; Set up addr to XMT to
+		MFD$B_ADDR(R1)
+	RSB
+
+
+
+	.SBTTL	Set up control message headers
+
+; SETUP_ENQ_HDR - Set up an ENQ message
+;
+; This routine sets up a the appropriate ENQ message. The buffers for each
+; of these messages is stored in the TF block hence no allocation of memory
+; need take place
+;
+;	INPUTS		R4 = Type of message
+;			R5 = Address of the TF block
+;			R7 = Clear
+;
+;	OUTPUTS		R1 = Address of header to queue
+;			R2 = Address of the block to queue
+;			R4,R5 are preserved.
+;			R7 is set if any errors are found
+;
+
+
+DDCMP$SETUP_ENQ_HDR:
+	ASSUME	DDCMP$C_ACK EQ 1
+	ASSUME	DDCMP$C_NAK EQ 2
+	ASSUME	DDCMP$C_REP EQ 3
+	ASSUME	DDCMP$C_STRT EQ 6
+	ASSUME	DDCMP$C_STACK EQ 7
+	CASE	R4,<-
+		20$,-				; Branch if ACK to send
+		30$,-				; Branch if NAK to send
+		40$,-				; Branch if REP to send
+		10$,-				; Error
+		10$,-				; Error
+		60$,-				; Branch if STRT to send
+		70$,-				; Branch if STACK to send
+		>,LIMIT=#DDCMP$C_ACK
+
+10$:	BISW2	#DLK$M_HDRERR,R7		; Set up for header error
+	RSB
+		
+; Set up a ACK message
+
+20$:	MOVAL	TF$L_QACK(R5),R2		; Addr of block to queue
+	MOVAL	XMTQ$B_MSGHDR(R2),R1		; Addr of header
+	DSBINT	GF$B_DIPL(R3)			; Disable interrupts to DIPL
+	BRB	50$
+
+
+
+; Set up a NAK message
+
+30$:	MOVAL	TF$L_QNAK(R5),R2		; Addr of block to queue
+	MOVAL	XMTQ$B_MSGHDR(R2),R1		; Addr of header
+	DSBINT	GF$B_DIPL(R3)			; Disable interrupts to DIPL
+	INSV	TF$B_NAKRSN(R5),-		; Insert the reason for the NAK
+		#MFD$C_SUBTYP,#MFD$C_SUBTYPL,-
+		MFD$W_TYPFLG+1(R1)
+	BRB	50$				; Send select flag not set
+
+
+; Set up th e REP message
+
+40$:	MOVAL	TF$L_QREP(R5),R2		; Addr of block to queue
+	MOVAL	XMTQ$B_MSGHDR(R2),R1		; Addr of header
+
+	DSBINT	GF$B_DIPL(R3)			; Disable interrupts to DIPL
+	CLRB	MFD$B_RESP(R1)			; Zero field
+	MOVB	TF$B_X(R5),MFD$B_NUMB(R1)	; Number of last data msg XMT'd
+						; to transmit to
+	BRB	55$
+
+50$:	MOVB	TF$B_R(R5),MFD$B_RESP(R1)	; Piggyback ACK's in header
+	CLRB	MFD$B_NUMB(R1)			; Zero the field
+
+
+55$:	BICW	#<MFD$M_SELECT!-		; Clear the flags in header
+		MFD$M_QSYNC>,MFD$W_CNTFLG(R1)
+	BBCC	#TF$V_SELECT,-			; Send select flag??
+		TF$B_SELTIM(R5),57$  
+	BISW2	#MFD$M_SELECT,MFD$W_CNTFLG(R1)	; Set the select flag in header
+57$:	BISW2	#MFD$M_QSYNC,MFD$W_TYPFLG(R1)	; Always set QSYNC flag
+	MOVB	TF$B_XADDR(R5),-		; Move in trib addr
+		MFD$B_ADDR(R1)			; to transmit to
+	ENBINT					; Reset interrupts
+	RSB
+
+
+
+; Set up a STRT message
+
+60$:	MOVAL	TF$L_QSTRT(R5),R2		; Addr of block to queue
+	MOVAL	XMTQ$B_MSGHDR(R2),R1		; Addr of header
+	BRB	80$
+
+
+; Set up the STACK message
+
+70$:	MOVAL	TF$L_QSTACK(R5),R2		; Addr of block to queue
+	MOVAL	XMTQ$B_MSGHDR(R2),R1		; Addr of header
+
+80$:	DSBINT	GF$B_DIPL(R3)			; Disable interrupts to DIPL
+	CLRW	MFD$B_RESP(R1)			; Zero field
+	MOVB	TF$B_XADDR(R5),MFD$B_ADDR(R1)	; Move in trib addr
+						; to transmit to
+	ENBINT					; Reset interrupts
+	RSB
+
+
+	
+
+
+	.SBTTL	Real clock timer
+; DDCMP$TIMER - Reply or Selection clock has expired
+;
+; This routine handles real time clock timeouts. This routine is called by
+; the software timer interrupt routine when the clock ticks a second.
+;
+;	INPUT		R3 = Address of the UCB
+;			R4 = Address of the TFB
+;			R5 = Address of the TQE
+;
+;	OUTPUTS		FR3 contains the status of the operation
+;
+DDCMP$TIMER::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9>
+	MOVL	R5,R2				; Put addr of TQE into R2
+	MOVL	TQE$L_FR3(R2),R1		; Get the UCB address
+	MOVL	TQE$L_FR4(R2),R5		; Get the TF block address
+	MOVL	TF$A_GFB(R5),R3			; Get GF block address
+	DSBINT	GF$B_FIPL(R3)			; Sync to get UCB
+	CLRL	GF$L_TQE_STS(R3)		; Use for status
+
+	ASSUME	DDCMP$C_STA_HLT EQ 0
+
+	TSTB	GF$B_STATE(R3)			; If protocol halted no work
+	BEQL	10$
+	BBSC	#TF$V_NEXT,TF$B_SELTIM(R5),8$	; If BS then send next interval
+	BISB	#TF$M_NEXT,TF$B_SELTIM(R5)	; Set the bit for next tick
+	BBS	#TF$V_STATYP,TF$B_CHAR(R5),3$	; If Trib don't use for startup
+
+	CMPB	#DDCMP$C_STA_IST,GF$B_STATE(R3)	; Branch EQL because selection
+	BEQL	DDCMP$SELECT			; timer is running
+	CMPB	#DDCMP$C_STA_AST,GF$B_STATE(R3)	; Branch EQL because selection
+	BEQL	DDCMP$SELECT			; timer is running
+	TSTB	TF$B_CHAR(R5)			; Is this a FPC line?
+	BNEQ	5$				; Branch if anything else
+	BRW	DDCMP$REP_TO			; Branch to handle as a reply
+						; timer
+3$:	BBC	#TF$V_OWNSELT,TF$B_SELTIM(R5),8$ ; If we don't own line - don't
+						; send the ACK
+5$:	BISB	#TF$M_SACK,TF$B_SFLAGS(R5)	; Set to send the ACK
+	BBC	#TF$V_OWNSELT,TF$B_SELTIM(R5),8$ ; Branch if we do not own line
+	BISB	#TF$M_SELECT,TF$B_SELTIM(R5)	; with the selection timer set
+8$:	MOVL	R1,R5				; Get UCB address in R5
+	BSBW	DEVTIMER			; Inform dirver of more work
+10$:	ENBINT					; Restore IPL
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9>
+	RSB
+
+DDCMP$SELECT:
+	MOVL	G^EXE$GL_ABSTIM,R0		; Get time
+	CMPL	R0,GF$L_SELEND(R3)		; If NEQ then timer hasn't
+	BLEQ	35$				; expired - Compare seconds
+	BISW2	#DLK$M_TMREXPD,GF$L_TQE_STS(R3)	; Set the select time has expd
+	INCB	GF$B_CURSEL(R3)			; Incr the nmb of sel intvls
+	INCB	TF$B_STO(R5)			; Incr the seltimeout field
+	BBC	#TF$V_RCVDET,-			; Branch BS RCV was detected
+		TF$B_SELTIM(R5),5$
+	BISW2	#TF$M_NOREP_SEL,-		; Else set bit no reply to sel
+		TF$W_STOBC(R5)
+5$:	BISW2	#TF$M_INCREP_SEL,-		; Set attempt to reply was
+		TF$W_STOBC(R5)			; detected
+	EXTZV	#DDCMP$C_SEL_THRS,-		; Extract the field
+		#DDCMP$C_THR_SIZE,-		; to increment
+		TF$W_THRES(R5),R4
+	INCB	R4				; Incr the thres error counter
+	CMPB	#DDCMP$C_THR_MAX,R4		; Has the thres been exceeded
+	BGTR	10$				; No
+	BISW2	#DLK$M_TRNSERR,GF$L_TQE_STS(R3)	; Report that thres exceeded
+	CLRL	R4				; Clear the field
+10$:	INSV	R4,#DDCMP$C_SEL_THRS,-		; Insert the count
+		#DDCMP$C_THR_SIZE,-
+		TF$W_THRES(R5)
+	INCB	GF$B_CURSEL(R3)			; Incr the number of times that
+						; a SEL has T/O on this station
+	CMPB	GF$B_CURSEL(R3),-		; Branch on GEQ because the max
+		GF$B_MAXSEL(R3)			; SEL T/O has been not reached
+	BLSS	15$
+	BISW2	#DLK$M_PRSTERR,GF$L_TQE_STS(R3)	; Report to driver a peristant
+	BRB	35$
+15$:	CMPB	#DDCMP$C_STA_IST,GF$B_STATE(R3)	; Branch NEQ not IST state
+	BNEQ	20$
+	MOVZBL	#DDCMP$C_STRT,R4		; Set that a STRT must be sent
+	BRB	30$
+20$:	CMPB	#DDCMP$C_STA_AST,GF$B_STATE(R3)	; Branch NEQ not in AST state
+	BNEQ	25$
+	MOVZBL	#DDCMP$C_STACK,R4		; Set that a STACK must be sent
+	BRB	30$
+25$:	BISB	#TF$M_SACK,TF$B_SFLAGS(R5)	; Set to send the ACK
+	BISB	TF$M_SELECT,TF$B_SELTIM(R5)	; Set to send a select flag
+	BRB	35$				; Branch to give work to driver
+30$:	CLRL	R7				; Clear error reg
+	PUSHL	R1				; Save R1
+	BSBW	DDCMP$QUEUE_XMT			; Queue the transmit
+	POPL	R1				; Restore R1
+	BISW	R7,GF$L_TQE_STS(R3)		; Set any errors on queueing
+35$:	MOVL	R1,R5				; Get UCB address in R5
+	BSBW	DEVTIMER			; Inform dirver of more work
+	ENBINT					; Restore IPL
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9>
+	RSB
+
+DDCMP$REP_TO:
+	MOVL	G^EXE$GL_ABSTIM,R0		; Get time
+	MOVAL	TF$Q_RTOQ(R5),R4		; Get the addr of the queue
+	MOVL	TF$Q_RTOQ(R5),R8		; Get the first entry on queue
+	CMPL	R4,R8				; Branch on EQL queue is empty
+	BEQL	20$
+	CMPL	R0,XMTQ$L_TIMEND(R8)		; Branch NEQ timer hasn't exprd
+	BLEQ	20$
+	PUSHR	#^M<R1,R4>			; Save R1
+	MOVZBL	#DDCMP$C_REP,R4			; Set up to queue the REP
+	CLRL	R7				; Clear error reg
+	BSBW	DDCMP$QUEUE_XMT			; Queue the transmit
+	POPR	#^M<R1,R4>			; Restore R1
+	BISW	R7,GF$L_TQE_STS(R3)		; Set any errors on queueing
+	MOVZWL	TF$W_REPWAI(R5),R0		; Get reply wait time
+10$:	ADDL3	XMTQ$L_TIMEND(R8),-		; Get new expiration time
+		R0,XMTQ$L_TIMEND(R8)
+	MOVL	(R8),R8				; Get next entry
+	CMPL	R4,R8				; Branch EQL end of queue
+	BNEQ	10$
+	INCB	TF$B_LRTO(R5)			; Incr the num of local reply
+						; timeouts
+	PUSHL	R1				; Save the register
+	BSBW	DDCMP$INCR_XMT_THRS		; Incr the XMT thres counter
+	POPL	R1				; Restore the register
+	INCB	TF$B_CURRTO(R5)			; Incr the number of times that
+						; a RTO has been snt on the msg
+	CMPB	TF$B_CURRTO(R5),-		; Branch on NEQ because the max
+		TF$B_MAXRTO(R5)			; RTO has not been reached
+	BNEQ	30$
+	CLRB	TF$B_CURRTO(R5)			; Reset the cur num of RTO's
+	BISW2	#DLK$M_PRSTERR,GF$L_TQE_STS(R3)	; Report to driver a peristant
+	BRB	30$
+20$:	BISB	#TF$M_SACK,TF$B_SFLAGS(R5)	; Set to send the ACK
+	BISB	TF$M_SELECT,TF$B_SELTIM(R5)	; Set to send a select flag
+30$:	MOVL	R1,R5				; Get UCB address
+	BSBW	DEVTIMER			; Poke the device with work
+	ENBINT					; Restore IPL
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9>
+	RSB
+
+
+
+		.SBTTL	Reply timeout queues 
+
+; REPLY_TO_QUEUES
+;
+; These routines manage the RTOQ by adding messages that need be ACK'd
+; to the queue and removing messages that have been ACK'd from the queue.
+;
+;	INPUTS		R5 = Address of the TF block
+;			R8 = Address of message to add to queue
+;
+;	OUTPUTS		R0,R1,R5,R8 are preserved
+;	Addition or deletion form the RTOQ
+;			R2 is destroyed
+;
+DDCMP$INS_RTOQ:
+	PUSHR	#^M<R0,R1>			; Save registers
+	MOVL	G^EXE$GL_ABSTIM,R0		; Get the addr of timer buffer
+	MOVZWL	TF$W_REPWAI(R5),R1		; Get reply wait time
+	ADDL3	R0,R1,XMTQ$L_TIMEND(R8)		; Set time to expire
+		
+	INSQUE	(R8),@TF$Q_RTOQ+4(R5)		; Insert at end of queue
+	CMPB	XMTQ$B_BUFTYP(R8),S^#DYN$C_BUFIO ; If EQL then correct buf
+	BEQL	20$
+	BUG_CHECK	NOBUFPCKT,FATAL
+20$:	POPR	#^M<R0,R1>			; Restore registers
+	RSB
+
+DDCMP$REM_RTOQ:
+	REMQUE	@TF$Q_RTOQ(R5),R1		; Get the next entry on RTOQ
+	BVS	10$				; If VS then queue empty
+	CMPB	XMTQ$B_BUFTYP(R1),S^#DYN$C_BUFIO ; If EQL then correct buf
+	BEQL	5$
+	BUG_CHECK	NOBUFPCKT,FATAL
+5$:	MOVAL	XMTQ$B_MSGHDR(R1),R2		; The addr of the msg hdr
+
+; Check the condition NUMB <= A
+
+	SUBB3	TF$B_A(R5),MFD$B_NUMB(R2),R0	; Branch if A < NUMB
+	BGTR	20$				; No more to take off queue
+	CLRB	TF$B_CURRTO(R5)			; Clear the count of rep's
+	BISW	#DLK$M_XMTCMP,R7		; Inform the driver there is
+						; an I/O to complete
+	CMPB	XMTQ$B_BUFTYP(R1),S^#DYN$C_BUFIO ; If EQL then correct buf
+	BEQL	8$
+	BUG_CHECK	NOBUFPCKT,FATAL
+8$:	INSQUE	(R1),@TF$Q_CMPQ+4(R5)		; Insert request on CMPQ
+	MOVZWL	MFD$W_CNTFLG(R2),R0		; Get the count
+	BICW	#<MFD$M_SELECT!-		; Clear if flags are set
+		MFD$M_QSYNC>,R0
+	INCL	TF$L_DMSGX(R5)			; Incr the number of msgs XMT'd
+	ADDL2	R0,TF$L_DBYTX(R5)		; Incr the number of byte XMT'd
+	BRB	DDCMP$REM_RTOQ			; Get next entry
+10$:	BICB2	#TF$M_TIMER,-			; Set timer no longr running
+		TF$B_SELTIM(R5)
+	RSB
+
+20$:	CMPB	XMTQ$B_BUFTYP(R1),S^#DYN$C_BUFIO ; If EQL then correct buf
+	BEQL	30$
+	BUG_CHECK	NOBUFPCKT,FATAL
+30$:	INSQUE	(R1),TF$Q_RTOQ(R5)		; Insert the entry back on RTOQ
+	RSB
+
+
+	.SBTTL	Halt
+
+;DDCMP$HALT
+;
+; This routine halts the protocol. The only action halting the protocol
+; is to stop any real time clocks which may be running and returns all
+; outstanding transmits.
+;
+;	INPUTS		R5 = Address of the TF block
+;			R8 = Address of the data message header if given
+;
+;	OUTPUTS		R5 is preserved
+;			R6 and R7 contian return status to driver
+;
+DDCMP$HALT:
+	MOVZWL	S^#DLK$C_RETINFO,R6
+	CLRL	R7
+	CLRB	TF$B_SFLAGS(R5)			; Clear flags
+	TSTL	R8				; Branch NEQ because this halt
+	BEQL	10$				; was not initiated by RCV'ing
+						; a STRT
+	MOVZWL	#DLK$M_STRTRCV,R7		; Assume that a STRT was rcvd
+	CMPB	#DDCMP$C_DLE,MFD$B_MSGID(R8)	; If NEQ then a STRT was rcv'd
+	BNEQ	10$
+	MOVZWL	#DLK$M_MNTRCV,R7		; Else a DLE was received
+10$:
+DDCMP$MAINT_HALT:				; Complete XMT's when MOP mode
+	BICB2	#TF$M_TIMER,TF$B_SELTIM(R5)	; Clear bit to set timer off
+	MOVAL	TF$L_TQE(R5),R2			; Get TQE address
+	MOVQ	#DDCMP$C_STPTQE,TQE$Q_DELTA(R2) ; Set delta for halted protocol
+20$:	REMQUE	@TF$Q_RTOQ(R5),R1		; Send all outstanding XMT's
+						; to I/O complete
+	BVS	25$				; If VS then Q empty
+	CMPB	XMTQ$B_BUFTYP(R1),S^#DYN$C_BUFIO ; If EQL then correct buf
+	BEQL	22$
+	BUG_CHECK	NOBUFPCKT,FATAL
+22$:	INSQUE	(R1),@TF$Q_CMPQ+4(R5)
+	BRB	20$
+25$:	DSBINT	GF$B_DIPL(R3)			; Lock out device interrupts
+30$:	REMQUE	@TF$Q_XMTQ(R5),R1		; Send all outstanding XMT's 
+						; to I/O complete
+	BVS	40$				; If VS then Q empty
+	CMPB	XMTQ$B_BUFTYP(R1),S^#DYN$C_BUFIO ; If EQL then correct buf
+	BEQL	35$
+	BUG_CHECK	NOBUFPCKT,FATAL
+35$:	BBS	#XMTQ$V_CONTROL,-		; If BS then control msg
+		XMTQ$B_FLAG(R1),30$		; don't sendto I/O complete
+	INSQUE	(R1),@TF$Q_CMPQ+4(R5)
+	INCB	TF$B_XQCNT(R5)			; Free the next spot on queue
+	BRB	30$
+40$:	ENBINT					; Enable interrupts
+45$:	REMQUE	@TF$Q_XMTOVF(R5),R1		; Send all XMTs on overflow q
+	BVS	50$				; to I/O complete
+	CMPB	XMTQ$B_BUFTYP(R1),S^#DYN$C_BUFIO ; If EQL then correct buf
+	BEQL	43$
+	BUG_CHECK	NOBUFPCKT,FATAL
+43$:	INSQUE	(R1),@TF$Q_CMPQ+4(R5)
+	BRB	45$
+50$:	RSB
+
+
+	.SBTTL	Maintenance mode
+; DDCMP$MAINT - Maintenance mode
+;
+; This routine is called when the protocol is in maintenance mode or when a
+; maintenance msg has been received ot must be sent.  Maintenance mode
+; performs only the framming and link management portions of DDCMP.
+;
+;	INPUTS		R6 = Contain the action to be executed
+;			R7 = Any bits set then message was in error
+;			R8 = Address of maintenance message header
+;			R9 = Contians the number of bytes to send
+;
+;	OUTPUTS		R6,R7 = Contain status of the action
+;			R8 is preserved
+;			R9 is the size of the maintenance message received
+;
+;	The XMTQ may have an entry on it.
+;
+DDCMP$MAINT:
+	CMPB	S^#DLK$C_XMTMSG,R6		; Branch if EQL xmtmsg
+	BEQL	20$
+	MOVZWL	S^#DLK$C_RETINFO,R6		; Set up return to driver
+	CLRL	R7				; Clear all set bits
+	BSBW	DDCMP$CHK_HDR			; Check the header
+	TSTB	R7				; Branch NEQ errors in header
+	BNEQ	30$
+	BISW2	#<DLK$M_RCVACK!-		; Set rcv msg is ok
+		DLK$M_TRNLK>,R7			; Set to turn link
+	MOVW	MFD$W_CNTFLG(R8),R9		; Get the size of the 
+	BICW	#<MFD$M_SELECT!-		; of the message received
+		MFD$M_QSYNC>,R9
+	BRB	30$
+20$:	MOVZWL	#DLK$C_RETINFO,R6		; Set up return to driver
+	CLRL	R7				; Clear all set bits
+	CMPB	#DDCMP$C_STA_RUN,GF$B_STATE(R3)	; If NEQ then no XMT's are
+	BNEQ	25$				; outstanding
+	BSBW	DDCMP$MAINT_HALT		; Branch to send XMT's to comp
+25$:	MOVZBL	#DDCMP$C_DLE,R4			; Set to queue a maint msg
+	BSBW	DDCMP$QUEUE_XMT			; Queue the msg
+	TSTB	R7				; Branch NEQ error in msg
+	BNEQ	30$
+27$:	BISW2	#DLK$M_XMTACK,R7		; Msg xmt'd ok
+30$:	BISW	#DLK$M_ENTMNT,R7		; Inform driver of maint mode
+	RSB
+
+;DDCMP$CMPMNT - Complete the maintenance message
+;
+; This routine is called after the maint message has been sent to put
+; the message on the CMPQ for IO completion.
+;
+;	INPUTS	R5 = Address of the TF block
+;		R8 = Address of the XMT'd message
+;
+;	OUTPUTS	R6,R7 contain return status for driver
+;		All other registers are preserved
+DDCMP$CMPMNT:
+	MOVZWL	S^#DLK$C_RETINFO,R6		; Set up return status
+	MOVZWL	#DLK$M_XMTCMP,R7		; for driver
+	INSQUE	(R8),@TF$Q_CMPQ+4(R5)		; Put XMT in queue to comp
+	RSB
+
+
+
+	.SBTTL	Return error counters
+;DDCMP$RETERR - Return protocol error counters
+;
+; This routine is set up to return and/or clear error counters requested by
+; the calling program. It will return the parameters in the buffer specified
+; in R8, if there is no buffer then no parameters are returned.
+;
+;	INPUTS:	R3 = GFB address
+;		R5 = TFB address
+; 		R6 = Action asked of protocol
+;		R7 = Error counters to return
+;		R8 = Address of buffer to return in which to return counters
+;
+;	OUTPUTS	R6,R7 contain the return status
+;		R8 contains the error counters
+;		The counters may or may not be cleared depending on the request
+;
+DDCMP$RETERR:
+	BBC	#DLK$V_TRIB,R7,10$		; If BC then assume GLOB cntrs
+	PUSHR	#^M<R3,R5>			; Save registers
+	MOVZWL	TF$W_TEB(R5),R6			; Get size to transfer
+	TSTL	R8				; If EQL then no buffer
+	BEQL	5$				; specified
+	MOVC3	R6,TF$K_ERRSTRT(R5),(R8)	; Put counters into block
+5$:	POPR	#^M<R3,R5>			; Restore registers
+	BBC	#DLK$V_CLEAR,R7,20$		; If BC then do not clear cntrs
+	BSBW	DDCMP$RESET_TCTRS		; Else clear counters
+	BRB	20$
+10$:	PUSHR	#^M<R3,R5>			; Save registers
+	MOVZWL	GF$W_GEB(R3),R6			; Get size to transfer
+	TSTL	R8				; If EQL then no buffer
+	BEQL	15$				; specified
+	MOVC3	R6,GF$K_ERRSRT(R3),(R8)		; Put counters into block
+15$:	POPR	#^M<R3,R5>			; Restore registers
+	BBC	#DLK$V_CLEAR,R7,20$		; If BC then do not clear cntrs
+	BSBW	DDCMP$RESET_GCTRS		; Else clear counters
+20$:	MOVZWL	S^#DLK$C_RETINFO,R6		; Set up return to driver
+	BISW2	#DLK$M_ERROR,R7			; A error block has been passed
+						; to driver
+	RSB
+
+
+
+	.SBTTL	Routines to handle sending and logging NAK's
+
+;DDCMP$LOGNAK
+;
+; This routine is called when a NAK is received to increment the proper
+; counter associated with the NAK subtype.
+;
+;	INPUTS		R3 = Address of the GF block
+;			R5 = Address of the TF block
+;			R8 = Address of teh received block
+;
+;	OUTPUTS		R2 = NAK type if NAK sent in reply to a REP 
+;			R3,R5,R8 are preserved
+;
+;
+DDCMP$LOGNAK:
+	EXTZV	#MFD$C_SUBTYP,-		; Get the NAK type
+		#MFD$C_SUBTYPL,-
+		MFD$W_TYPFLG+1(R8),R0
+	CMPB	S^#DDCMP$C_NAK3,R0		; Branch EQL because XMT
+	BEQL	20$				; thresholds aren't counted
+						; on these NAK's
+	BSBW	DDCMP$INCR_XMT_THRS		; Incr XMT threshold counter
+	CMPB	S^#DDCMP$C_NAK1,R0		; Branch NEQ not reason code 1
+	BNEQ	10$
+	INCB	TF$B_DEO(R5)			; Incr the data error outbound
+						; field
+	BISW2	#TF$M_OHCRC,-			; Set bit that NAK was set for
+		TF$W_DEOBC(R5)			; a header CRC
+	BRB	70$
+10$:	CMPB	S^#DDCMP$C_NAK2,R0		; Branch NEQ not reason code 2
+	BNEQ	30$
+	INCB	TF$B_DEO(R5)			; Incr the data error outbound
+						; field
+	BISW2	#TF$M_ODCRC,-			; Set bit that NAK was set for
+		TF$W_DEOBC(R5)			; a data CRC
+	BRB	70$
+20$:	INCB	TF$B_DEO(R5)			; Incr the data error outbound
+						; field
+	BISW2	#TF$M_OREPS,-			; Set bit that NAK was sent in
+		TF$W_DEOBC(R5)			; reply to a REP
+	MOVL	R0,R2				; Set up R2 with NAK type
+	BRB	70$
+30$:	CMPB	S^#DDCMP$C_NAK8,R0		; Branch NEQ not reason code 8
+	BNEQ	40$
+	INCB	TF$B_RBE(R5)			; Incr the remote buffer error
+						; field
+	BISW2	#TF$M_RBUF_NAVL,-		; Set bit that NAK was sent 
+		TF$W_RBEBC(R5)			; because a RCV buffer was
+						; not available
+	BRB	70$
+40$:	CMPB	S^#DDCMP$C_NAK16,R0		; Branch NEQ not reason code 16
+	BNEQ	50$
+	INCB	TF$B_RBE(R5)			; Incr the remote buffer error
+						; field
+	BISW2	#TF$M_RBUF_SML,-		; Set bit that NAK was sent 
+		TF$W_RBEBC(R5)			; because a RCV buffer was
+						; too small
+	BRB	70$
+50$:	CMPB	S^#DDCMP$C_NAK9,R0		; Branch NEQ not reason code 9
+	BNEQ	60$
+	INCB	GF$B_RSE(R3)			; Incr the global remote
+						; station error counter
+	BISW2	#GF$M_RRCV_OVR,-		; Set bit that NAK was sent
+		GF$W_RSE_BCTRS(R3)		; because of a RCV overrun
+	BRB	70$
+60$:	CMPB	S^#DDCMP$C_NAK17,R0		; Branch NEQ not reason code 17
+	BNEQ	70$
+	INCB	GF$B_LSE(R3)			; Incr the global local
+						; station error counter
+	BISW2	#GF$M_LMSGHDR_FMT,-		; Set bit that NAK was sent
+		GF$W_LSE_BCTRS(R3)		; because of a RCV overrun
+70$:	RSB
+
+
+
+;DDCMP$SENDNAK
+;
+; This routine is called when the driver informs the protocol of some
+; error it received when receiving the message. This routine covers the
+; senting of the SNAK field for five NAK reasons (1,2,8,9,16) and also
+; incrementing the counters associated with those reasons.
+;
+;	INPUT		R3 = Address of the GF block
+;			R5 = Address of the TF block
+;			R7 = The RCV message error from driver.
+;
+;	OUTPUTS		R6 = Retrun information for driver
+;			R7 = Errors encountered
+;
+DDCMP$SENDNAK:
+	MOVL	R7,R1				; Move into R1 for the Case
+	MOVZWL	S^#DLK$C_RETINFO,R6		; Set up return status
+	CLRL	R7				; for driver
+	ASSUME	DLK$V_HDRCRC EQ 1
+	ASSUME	DLK$V_DATACRC EQ 2
+	ASSUME	DLK$V_BUNAVL EQ 3
+	ASSUME	DLK$V_BUFTOSML EQ 4
+	ASSUME	DLK$V_RCVOVR EQ 5
+	ASSUME	DLK$V_PADBYTE EQ 6
+
+	CASE	R1,<-
+		10$,-
+		20$,-
+		30$,-
+		40$,-
+		50$,-
+		70$,-
+		>,LIMIT=DLK$V_HDRCRC
+
+	MOVZWL	#DLK$M_CMDERR,R7			; Return error
+	BRB	70$
+10$:	MOVB	#DDCMP$C_NAK1,-			; Set the NAK reason to 1
+		TF$B_NAKRSN(R5)
+	INCB	TF$B_DEI(R5)			; Incr the data error inbound
+						; field
+	BISW2	#TF$M_IHCRC,-			; Set bit that SNAK set because
+		TF$W_DEIBC(R5)			; a header err was encountered
+	BRB	60$
+
+20$:	MOVB	#DDCMP$C_NAK2,-			; Set the NAK reason to 2
+		TF$B_NAKRSN(R5)
+	INCB	TF$B_DEI(R5)			; Incr the data error inbound
+						; field
+	BISW2	#TF$M_IDCRC,-			; Set bit that SNAK set because
+		TF$W_DEIBC(R5)			; a data err was encountered
+	BRB	60$
+30$:	MOVB	#DDCMP$C_NAK8,-			; Set the NAK reason to 8
+		TF$B_NAKRSN(R5)
+	INCB	TF$B_LBE(R5)			; Incr the local buffer error
+						; field
+	BISW2	#TF$M_LBUF_NAVL,-		; Set bit that SNAK set because
+		TF$W_LBEBC(R5)			; the local buffer was unavl
+	BRB	60$
+40$:	MOVB	#DDCMP$C_NAK16,-		; Set the NAK reason to 16
+		TF$B_NAKRSN(R5)
+	INCB	TF$B_LBE(R5)			; Incr the local buffer error
+						; field
+	BISW2	#TF$M_LBUF_SML,-		; Set bit that SNAK set because
+		TF$W_LBEBC(R5)			; the local buffer was too sml
+	BRB	60$
+50$:	MOVB	#DDCMP$C_NAK9,-			; Set NAK reason code 9
+		TF$B_NAKRSN(R5)
+	INCB	GF$B_LSE(R3)			; Incr global error local
+						; station error
+	CMPB	#DDCMP$C_STA_RUN,GF$B_STATE(R3)	; Branch NEQ the SNAK is set
+	BNEQ	55$				; only in RUN state
+	BISW2	#GF$M_LRCV_OVR,-		; Set the reason for the SNAK
+		GF$W_LSE_BCTRS(R3)		; as local RCV overrun
+	BRB	60$
+55$:	BISW2	#GF$M_LNRCV_OVR,-		; Set the that the NAK is
+		GF$W_LSE_BCTRS(R3)		; not sent
+	BRB	65$
+60$:	MOVZBL	S^#DDCMP$C_NAK,R4		; Set up to queue NAK
+	BSBW	DDCMP$QUEUE_XMT			; Queue the NAK
+	TSTB	R7				; Branch on EQL all is well
+	BEQL	65$
+	BISB2	#TF$M_SNAK,-			; Else set that a NAK needs to
+		TF$B_SFLAGS(R5)			; be sent
+65$:	BSBB	DDCMP$INCR_RCV_THRS		; Incr the RCV threshold cntrs
+70$:	RSB
+
+
+
+	.SBTTL	Routines to increment threshold counter
+
+;DDCMP$INCR_RCV_THRS, DDCMP$INCR_XMT_THRS
+;
+; These routines increment the receive or transmit threshold error fields.
+; If a threshold has been exceeded the routine reports the error and
+; clears the field.
+;
+;	INPUTS		R5 = Address of the TF block
+;
+;	OUTPUTS		R5 is preserved
+;			R7 will have a bit set if the threshold has
+;			been exceeded
+;
+DDCMP$INCR_RCV_THRS:
+	EXTZV	#DDCMP$C_RCV_THRS,-		; Extract the field
+		#DDCMP$C_THR_SIZE,-		; to increment
+		TF$W_THRES(R5),R1
+	INCB	R1				; Incr the thres error counter
+	CMPB	#DDCMP$C_THR_MAX,R1		; Has the thres been exceeded
+	BGTR	10$				; No
+	BISW2	#DLK$M_TRNSERR,R7		; Report that thres exceeded
+	CLRL	R1				; Set the RCV threshold count
+						; to zero
+
+10$:	INSV	R1,#DDCMP$C_RCV_THRS,-		; Insert count
+		#DDCMP$C_THR_SIZE,-
+		TF$W_THRES(R5)
+	RSB
+
+DDCMP$INCR_XMT_THRS:
+	EXTZV	#DDCMP$C_XMT_THRS,-		; Extract the field
+		#DDCMP$C_THR_SIZE,-		; to increment
+		TF$W_THRES(R5),R1
+	INCB	R1				; Incr the thres error counter
+	CMPB	#DDCMP$C_THR_MAX,R1		; Has the thres been exceeded
+	BGTR	10$				; No
+	BISW2	#DLK$M_TRNSERR,R7		; Report that thres exceeded
+	CLRL	R1				; Set the XMT threshold count
+						; to zero
+
+10$:	INSV	R1,#DDCMP$C_XMT_THRS,-		; Insert count
+		#DDCMP$C_THR_SIZE,-
+		TF$W_THRES(R5)
+	RSB
+
+
+
+	.SBTTL	Read or clear error counters
+
+; RESET_GCTRS - Clear global counters
+;
+; This routine zeros the global counter fields.
+;
+;	INPUT		R3 = Address of GF block
+;			R5 = Address of TF block
+;
+;	OUTPUT		Global counters are zeroed
+;
+DDCMP$RESET_GCTRS:
+
+	CLRW	GF$W_LSE_BCTRS(R3)
+	CLRB	GF$B_LSE(R3)
+	CLRW	GF$W_RSE_BCTRS(R3)
+	CLRB	GF$B_RSE(R3)
+
+	ASSUME	GF$B_MDF_CRC EQ GF$B_GH_CRC+1
+
+	CLRW	GF$B_GH_CRC(R3)
+
+	RSB
+
+; RESET_TCTRS - Clear tributary error counters
+;
+; This routine clear error counters kept for specfic tributaries. Clearing
+; them for one tributary will not nessicarily clear them for all tributaries.
+;
+;	INPUT		R5 = Adress of the TF block
+;
+;	OUTPUT		Tributary coutners are cleared
+;
+DDCMP$RESET_TCTRS:
+	CLRW	TF$W_DEOBC(R5)
+	CLRB	TF$B_DEO(R5)
+	CLRW	TF$W_DEIBC(R5)
+	CLRB	TF$B_DEI(R5)
+	CLRB	TF$B_LRTO(R5)
+	CLRB	TF$B_RRTO(R5)
+	CLRW	TF$W_STOBC(R5)
+	CLRB	TF$B_STO(R5)
+	CLRW	TF$W_LBEBC(R5)
+	CLRB	TF$B_LBE(R5)
+	CLRW	TF$W_RBEBC(R5)
+	CLRB	TF$B_RBE(R5)
+	CLRW	TF$W_SELSP(R5)
+	CLRL	TF$L_DMSGX(R5)
+	CLRL	TF$L_DMSGR(R5)
+	CLRL	TF$L_DBYTX(R5)
+	CLRL	TF$L_DBYTR(R5)
+
+	CLRW	TF$W_THRES(R5)
+
+	RSB
+
+	HALT					; Problem if it gets here
+DRIVER_END::
+	.END

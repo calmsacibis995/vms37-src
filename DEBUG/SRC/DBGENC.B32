@@ -1,0 +1,2606 @@
+MODULE DBGENC ( IDENT = 'V03-000') =
+BEGIN
+
+!++
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!--
+
+!++
+! FACILITY:
+!	VAX INSTRUCTION ENCODER.
+!
+! Version:	1.05
+!
+! History:
+!	Author:
+!		Kevin Pammett, April 1977: Version 01
+!
+!	Modified by:
+!		Bruce Dawson, 13-July-1979
+!		Kathleen D. Morse (via Bert Beander), 11-AUG-1981
+!
+!
+! 1.01	25-sep-78	MCC	Deleted require file SYSLIT
+! 1.02	10-oct-78	MCC	DBG$INS_ENCODE modified to check for too many
+!				operands when depositing instructions.
+! 1.03	18-OCT-78	DAR	Edit 1.02 won't allow 0 operand instructions.
+! 1.04	12-JUL-79	JBD	Inserted lots of changes to support 2
+!				byte opcodes.
+! 1.05  18-apr-80	ala	Added parameter to output formatting routines
+!				to give knowledge of output buffer to them.
+! 1.06	11-AUG-81	KDM	Fix bug that prevented branch displacements
+!				from ending in "2D".
+!--
+
+! Table of contents:
+!
+FORWARD ROUTINE
+	DBG$INS_ENCODE,		! ENCODE AN INSTRUCTION.
+	GET_NEXT_TOKEN,		! Pick up the next token from the input stream.
+
+	GET_OPCODE,		! Extract the opcode from instruction string.
+	ENC_OPERAND,		! Encode AN OPERAND REFERENCE.
+	ASSUME_AT_PC,		! Temporary 'look ahead' routine
+				!  to implement <operand> ::= <number>
+	INST_OUTPUT,		! Output bytes of instruction.
+	OPCODE_MATCH,		! LOOK UP AN OPCODE IN THE OPINFO TABLE.
+	GET_OPERAND,		! Translate an arbitrary expression to a form
+				! ENC_OPERAND understands.
+	INS_GET_TOKEN,		! Returns the next token in the input string.
+	ADD_TO_OPER_STG;	! Adds an ascii string to an existing string.
+
+!
+! Require files:
+!
+    
+REQUIRE 'SRC$:DBGPROLOG.REQ';
+REQUIRE 'SRC$:DBGGEN.REQ';
+REQUIRE 'SRC$:VAXOPS.REQ';
+REQUIRE 'SRC$:COMTER.REQ';
+REQUIRE 'SRC$:SYSSER.REQ';	! Macros for diagnostic output.
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+	MAX_REG		= 15,		! maximum number of registers - 1
+	MAX_BUF_SIZ	= 512,
+	OPR_FOUND	= 1,		! success return from GET_OPERAND
+	NO_MORE_OPR	= 0;		! "eol_token" found by GET_OPERAND
+
+EXTERNAL ROUTINE
+	DBG$CONV_R_50 : NOVALUE,
+	DBG$MAR_GET_LEX,		! Pick up next macro token
+	DBG$BUILD_PATH,			! Routine to build a path name
+	dbg$path_to_val,		! Evaluate a pathname
+	DBG$FAO_PUT : NOVALUE,		! FORMATTED ASCII OUTPUT.
+	DBG$OUT_PUT : NOVALUE,		! ACTUALLY WRITE OUT LINES TO TTY.
+	dbg$read_access,		! does a PROBER instruction
+	DBG$REG_MATCH;			! See if a char string is a reference
+					!   to a register.
+
+EXTERNAL
+	DBG$CP_OUT_STR : REF VECTOR[,BYTE],	! POINTS INTO OUTPUT STRING.
+	DBG$GB_MOD_PTR : REF VECTOR[,BYTE],
+	DBG$GB_OPINFO : OPCODE_TBL,
+	DBG$GL_BUF_SIZ;				! DATA VECTOR THAT DESCRIBES OPCODES.
+
+GLOBAL ROUTINE DBG$INS_ENCODE( INST_CS, OUT_BYTE_STREAM, OUT_PC ) =
+
+!++
+! 
+! FUNCTIONAL DESCRIPTION:
+!	THIS ROUTINE EXAMINES AN ASCII STREAM WHICH IT IS PASSED
+!	A POINTER TO, AND TRIES TO COME UP WITH WHAT INSTRUCTION
+!	BYTE STREAM THIS WOULD CORRESPOND TO.
+!
+! INPUTS:
+!	INST_CS		- A POINTER TO THE COUNTED STRING WHICH
+!			THE USER INPUT AS THE SUPPOSED INSTRUCTION.
+!
+!	OUT_BYTE_STREAM	- THE ADDRESS OF WHERE WE ARE TO STUFF THE
+!			  COUNTED INSTRUCTION STREAM WE GENERATE.
+!	OUT_PC		- The PC (memory address) where the instruction
+!			  will eventually reside.  This is used only for
+!			  PC-relative address calculations.
+!
+! IMPLICIT INPUTS:
+!	DBG$GB_OPINFO	- DATA VECTOR WHICH CONTAINS THE INSTRUCTION
+!			  MNEMONICS AND RELATED INFORMATION.
+!
+! OUTPUTS:
+!	THE COUNTED INSTRUCTION (BYTE) STREAM IS STUFFED INTO THE BYTE 
+!	VECTOR WHICH WE ARE PASSED A POINTER TO.
+!
+! IMPLICIT OUTPUTS:
+!	NONE.
+!
+! ROUTINE VALUE:
+!	TRUE, if the encoding went ok,
+!	FALSE, if it didn't and if we didn't already produce
+!	       a message (and an UNWIND) to this effect.
+!
+! SIDE EFFECTS:
+!	In most cases an error message is produced and an
+!	UNWIND is done if the encoding can not be done.
+!--
+
+	BEGIN
+	MAP
+		OUT_BYTE_STREAM : REF VECTOR[,BYTE],
+		INST_CS : REF VECTOR[,BYTE];
+
+	LOCAL
+		opcode_name : ref vector[,byte],
+					! We make our own copy of the instruction
+					! string so we don't have to worry about
+					! overwriting parts of it.
+		INSTR_STRING : VECTOR[NO_OF_INP_CHARS,BYTE],
+		inst_stg_desc : BLOCK [8, BYTE],	! instruction string descriptor
+					! Pointer into the OPINFO table
+		OPINFO_PTR : REF BLOCK[ OPTSIZE, BYTE],
+
+					! This pointer contains the address
+					!  of where each successive byte of 
+					!  instruction is to be placed.
+					!  stuff into the instruction stream.
+		OUT_BYTE_PTR : REF VECTOR[,BYTE],
+		BRANCH_SIZE,
+		OPRNDS,			! Number of operands to expect.
+		OPRND_STG_DESC : BLOCK [12,BYTE], ! String descriptor for next operand
+		OPRND_BUF : VECTOR [CHS_PER_LEXEME,BYTE]; ! Buffer to hold processed expression.
+
+	!++
+	! See whether the address passed can be read. If it cannot,
+	! a SIGNAL will be propagated and an unwind performed
+	! within the routine READ_ACCESS.
+	!--
+	dbg$read_access (inst_cs [0], 4);
+	dbg$read_access (inst_cs [0], .inst_cs [0] + 1);
+
+	! Copy the instruction string into our own local area
+	! so that we don't have to worry about overwriting it.
+	! Then put a terminator at the end of it as this
+	! will make recognizing the EOS easier for the scanner.
+	! Also initialize the pointer to where we
+	! will stuff the instruction.
+
+	CH$MOVE( .INST_CS[0] +1, INST_CS[0], INSTR_STRING );
+
+	instr_string [.instr_string [0] + 1] = 0;
+	instr_string [0] = .instr_string [0] + 1;
+	inst_stg_desc [dsc$w_length] = .instr_string [0];
+	inst_stg_desc [dsc$a_pointer] = instr_string [1];
+
+	OUT_BYTE_PTR = OUT_BYTE_STREAM[1];
+
+
+	! Extract the opcode mnemonic from the instruction string
+	! and encode the corresponding opcode into the output byte
+	! stream.  We pass the address of our local, OPINFO_PTR,
+	! so that GET_OPCODE can initialize this for us.  This
+	! is done in this way because it is GET_OPCODE who
+	! looks up the opcode (and hence finds the OPINFO record
+	! we need), but it is here that we need the other OPINFO
+	! information.
+
+	opcode_name = GET_OPCODE( inst_stg_desc, OUT_BYTE_PTR, OPINFO_PTR, OUT_PC);
+
+	! The instruction-stream counted-string pointer now
+	!  points to the beginning of the operand reference
+	!  string, if there is one.  This must be the 
+	!  case unless this opcode has no operands.
+
+	OPRNDS = .OPINFO_PTR [ OP_NUMOPS ];
+
+
+	INCR I FROM 1 TO .OPRNDS	! Loop extracting each operand reference
+		DO
+		BEGIN
+		!+
+		! Decide what type of branching we will allow the
+		! following routine to use, if any.  We do this here
+		! because we have the OPINFO information and may as
+		! well sort it out here.  For the same reason
+		! we pass the PC-relative context information
+		! as well.  Start by assuming the usual case.
+		!-
+
+		BRANCH_SIZE = NO_BR;
+		IF( .I EQL .OPRNDS )
+		THEN
+			!+
+			! Branching can only be considered for the last
+			! operand of an instruction which has less than
+			! the maximum number of operands.  This assumption
+			! was made in constructing the data structure (OPINFO)
+			! from which the instruction encoding and decoding works.
+			! The table is generated in DBGINS.B32.
+			!-
+
+			IF( .I LSS MAXOPRNDS )
+			THEN
+				BRANCH_SIZE = .OPINFO_PTR[ OP_BR_TYPE ];
+
+		!+
+		! This routine preprocesses each operand, evaluating the
+		! expressions and symbols, and returns in, OPRND_BUF, an operand
+		! that ENC_OPERAND can translate.
+		!-
+		OPRND_STG_DESC[DSC$W_LENGTH] = 0;		! Initial length is zero
+		OPRND_STG_DESC[DSC$A_POINTER] = OPRND_BUF;	! Address of buffer
+		OPRND_STG_DESC[DSC$W_MAXLEN] = CHS_PER_LEXEME;	! Length of buffer
+		IF (GET_OPERAND (INST_STG_DESC, OPRND_STG_DESC))
+		THEN						! Successful processing.
+		    BEGIN
+		    !+
+		    ! Extract and encode one operand reference.  Normally,
+		    ! if this fails, a message is produced in ENC_OPERAND,
+		    ! and an UNWIND is done.  In some cases, however,
+		    ! a return of FALSE is done and we produce the message.
+		    !-
+		    IF ( NOT ENC_OPERAND ( OPRND_STG_DESC, OUT_BYTE_PTR,
+			    1 ^ .OPINFO_PTR [OP_CONTEXT(.I)],
+			    .BRANCH_SIZE, OUT_PC ) )
+		    THEN				! Encoding failed
+			SIGNAL (DBG$_NUMOPRNDS, 2, .opcode_name, .oprnds); ! No return
+		    !+
+		    ! Check if user gave too many operands
+		    !-
+		    IF (.I EQL .OPRNDS) AND (.INST_STG_DESC[DSC$W_LENGTH] NEQ 0)
+		    THEN
+			SIGNAL (DBG$_NUMOPRNDS, 2, .opcode_name, .oprnds);
+			! point of no return
+
+
+		    IF (.OPRND_STG_DESC[DSC$W_LENGTH] NEQ 0)
+		    THEN
+			SIGNAL (DBG$_NODELIMTR);	! No return
+
+		    END
+		ELSE
+		    BEGIN
+		    !+
+		    ! End of line returned, insufficient operands.
+		    !-
+		    SIGNAL (DBG$_NUMOPRNDS, 2, .opcode_name, .oprnds); ! no return
+		    EXITLOOP;
+		    END;
+
+		END;					! End of INCR loop
+
+	!+
+	! Calculate the number of bytes we stuffed into
+	! the 'instruction' stream and copy this value
+	! into the 0th byte of the output vector.  This
+	! makes it now a counted byte stream.
+	!-
+	OUT_BYTE_STREAM[0] = .OUT_BYTE_PTR - OUT_BYTE_STREAM[1];
+
+	RETURN(TRUE);
+END;
+
+ROUTINE GET_NEXT_TOKEN ( inst_stg_desc, LEX_BUFFER ) =
+
+!++
+! Functional Description:
+!	Scan the input stream and extract the next token
+!	from it.  This routine is similar to the one that
+!	the parser uses - it is just that this one does
+!	a little more for us, and it a little more selective
+!	about what it accepts.
+!
+! Formal Parameters:
+!	INST_STG_DESC	-Contains the address of the current instruction
+!			 string descriptor.  This string descriptor is
+!			 updated by this routine.
+!	LEX_BUFFER	-A pointer to where we can pass back a value
+!			 which is associated with whatever token we
+!			 discover.  If this value is 0, we don't
+!			 try to pass back anything.
+!
+! Implicit Inputs:
+!	DBG$GL_MOD_PTR	- is used by the radix convert routine
+!			  to convert numeric input.
+! Implicit Outputs:
+!	Via LEX_BUFFER, we pass back:
+!			-a counted byte stream in LEX_BUFFER if the token
+!			 is LONG_VAL_TOKEN, WORD_VAL_TOKEN, LIT_TOKEN,
+!			 or BYTE_VAL_TOKEN.  Even though only <count> bytes
+!			 of this value are valid as far as operand size is
+!			 concerned, the value is written out as a (sign-extended)
+!			 longword so that we can do arithmetic on it and worry
+!			 about the size only when we want to extract it again.
+!			-a REGister number in a 1-byte field of LEX_BUFFER
+!			 for REGISTER_TOKEN, INDEXING_TOKEN, or AT_REG_TOKEN.
+!			-A 5-byte sequence for BRCH_TOKEN.  The first byte
+!			 of this is 1 => PC-relative type, or 0 => absolute
+!			 type.  The remaining 4 bytes are the
+!			 longword representation of the branch operand.
+!
+! Return Value:
+!	The literal that stands for the token type we have
+!	extracted.  This is either one of those mentioned
+!	above, or it is BAD_TOKEN.
+!--
+	BEGIN
+	MAP
+		inst_stg_desc : REF BLOCK [, BYTE],
+		LEX_BUFFER : REF VECTOR[,BYTE];
+
+	LOCAL
+		lex_stg_desc : BLOCK [12, BYTE],	! lexeme string descriptor
+		TOKEN_BUFFER : VECTOR[ CHS_PER_LEXEME+1, BYTE ],
+		GARBAGE : VECTOR[ CHS_PER_LEXEME, BYTE ],
+		INST_CS : REF VECTOR[,BYTE],
+		REG_NUM,
+		MODE,
+		RETURN_PTR,
+		TOKEN_TYPE : BYTE;		! The returned value.
+
+	MACRO
+		PASS_BACK( BYTES, VALUE )	! Used to pass back the indicated
+						!   number of bytes, if requested.
+
+			=
+			(.RETURN_PTR)<0,BYTES*BITS_PER_BYTE> = VALUE %;
+
+	! If some value is extracted that corresponds to
+	! the token we extract, this value is returned via the
+	! pointer, LEX_BUFFER.  If, however, this value is 0,
+	! then the caller does not want such information.  To avoid
+	! having to check this several times, then, we use the
+	! local pointer, RETURN_PTR, to point either to where the
+	! user wants the value, or to some 'don't care' location.
+
+	IF( (RETURN_PTR = .LEX_BUFFER) EQL 0 )
+	THEN
+		RETURN_PTR = GARBAGE;
+
+	! Pick up the current instruction counted-string pointer.
+
+	lex_stg_desc [dsc$w_length] = 0;
+	lex_stg_desc [dsc$a_pointer] = token_buffer;
+	lex_stg_desc [dsc$w_maxlen] = chs_per_lexeme + 1;
+
+	! Extract the next token and take the appropriate action.
+	TOKEN_TYPE = INS_GET_TOKEN ( .inst_stg_desc, lex_stg_desc );
+
+
+	TOKEN_TYPE = ( SELECTONE .TOKEN_TYPE OF
+
+		SET
+		[HASH_TOKEN]:	! '#'
+
+			! Extract the literal and pass it back.
+
+			IF( INS_GET_TOKEN( .inst_stg_desc, lex_stg_desc ) NEQ DIGIT_STR_TOKEN )
+			THEN
+				BEGIN
+
+
+				BAD_TOKEN
+				END
+			ELSE
+				BEGIN
+				PASS_BACK ( LONG_LENGTH, .(.lex_stg_desc [dsc$a_pointer]) );
+				LIT_TOKEN
+				END;
+
+		[AT_SIGN_TOKEN,	! '@', For @#const, @(reg), and @displ(reg)
+		 PLUS_TOKEN,	! '+', for (reg)+
+		 MINUS_TOKEN,	! '-', For -(sp) Etc.
+		 COMMA_TOKEN,	! ',', For arg1, arg2, Etc.
+		 EOL_TOKEN ]:	!  LF, Terminates the command line.
+
+			! Just return the token type directly.
+
+			.TOKEN_TYPE;
+
+
+		[DIGIT_STR_TOKEN,	! For branch operands where we interpret
+					! the operand as an absolute address.
+
+		 PERIOD_TOKEN]:		! We also handle operands of the
+					! form '.' <sign> <number>, where
+					! <sign> must be '+' or '-'.
+
+			BEGIN
+			LOCAL
+				BR_FLAG,NUMBER,SIGN;
+
+			! In this case we build a token string
+			! consisting of a flag byte followed by
+			! the branch operand in a longword.
+			! Assume PC-relative type branching.
+
+			BR_FLAG = 1;
+			SIGN = 0;
+
+			! Handling the more-difficult
+			! syntax requires more work.
+
+			IF( .TOKEN_TYPE EQL PERIOD_TOKEN )
+			THEN
+				BEGIN
+
+				BR_FLAG = 0;
+
+				TOKEN_TYPE = INS_GET_TOKEN (.inst_stg_desc, lex_stg_desc );
+				SIGN =
+					(
+					IF (.TOKEN_TYPE EQL PLUS_TOKEN )
+					THEN
+						%C'+'
+					ELSE IF ( .TOKEN_TYPE EQL MINUS_TOKEN )
+					     THEN
+						%C'-'
+					     ELSE
+						BEGIN
+
+						RETURN( BAD_TOKEN )
+						END
+					);
+
+				! After the <sign> we expect <number>.
+
+				IF( INS_GET_TOKEN( .inst_stg_desc, lex_stg_desc ) NEQ DIGIT_STR_TOKEN )
+				THEN
+					BEGIN
+
+
+					RETURN( BAD_TOKEN );
+					END;
+				END;
+
+			! Pass back the flag and operand.
+
+			number = .(.lex_stg_desc [dsc$a_pointer]);
+			IF .SIGN EQL %C'-' THEN NUMBER = -.NUMBER;
+			PASS_BACK( BYTE_LENGTH, .BR_FLAG );
+			RETURN_PTR = .RETURN_PTR + BYTE_LENGTH;
+			PASS_BACK( LONG_LENGTH, .number );
+
+			! PASS BACK THE TOKEN TYPE.
+
+			BRCH_TOKEN
+			END;
+
+		[ALPHA_STR_TOKEN]: ! For now, this must be a register reference,
+				! or a displacement indicator ("B", "W", or "L").
+
+			BEGIN
+
+			LOCAL
+				lexeme_ptr,
+				char : byte;
+
+
+			lexeme_ptr = ch$ptr (.lex_stg_desc [dsc$a_pointer]);
+			char = ch$rchar (.lexeme_ptr);
+
+			IF( (REG_NUM = DBG$REG_MATCH( lex_stg_desc )) GEQ 0 )
+			THEN
+				BEGIN
+				! Pass back the number of this register.
+
+
+				PASS_BACK( BYTE_LENGTH, .REG_NUM );
+
+				IF( .REG_NUM LEQ MAX_REG )
+				THEN
+					REGISTER_TOKEN
+				ELSE
+					BEGIN
+
+
+					BAD_TOKEN
+					END
+				END
+			ELSE IF( .lex_stg_desc [dsc$w_length] NEQ 1 )
+			THEN
+				! The string must be only 1 character long.
+				BEGIN
+
+
+				BAD_TOKEN
+				END
+			ELSE IF (.char NEQ %C'B') AND (.char NEQ %C'W') AND (.char NEQ %C'L')
+			THEN
+				! The string must be one of the valid displacement
+				! characters only.
+				BEGIN
+
+				BAD_TOKEN
+				END
+
+			! <Size> must be followed by '^' to produce <size indicator>.
+
+			ELSE IF( INS_GET_TOKEN( .inst_stg_desc, lex_stg_desc ) NEQ UP_ARROW_TOKEN )
+			THEN
+				BEGIN
+
+
+				BAD_TOKEN
+				END
+			ELSE
+				! Extract the following number and pass it back.
+				! \This is where we would like to switch grammars
+				!  to take advantage of what DEBUG already
+				!  knows about expression evaluation\.
+
+				BEGIN
+				IF( INS_GET_TOKEN( .inst_stg_desc, lex_stg_desc ) NEQ DIGIT_STR_TOKEN )
+				THEN
+					! The following token must be <number>.
+					BEGIN
+
+
+					BAD_TOKEN
+					END
+				ELSE
+					BEGIN
+
+					! See what displacement mode was requested.
+
+					MODE = 0;
+
+					IF( .CHAR EQL %C'B' )
+					THEN
+						MODE = BYTE_LENGTH;
+
+					IF( .CHAR EQL %C'W' )
+					THEN
+						MODE = WORD_LENGTH;
+
+					IF( .CHAR EQL %C'L' )
+					THEN
+						MODE = LONG_LENGTH;
+
+					IF( .MODE EQL 0 )
+					THEN
+						RETURN(BAD_TOKEN);
+
+					! Pass back the number as a counted
+					! byte stream.  The <number> part of it
+					! is passed back as a sign-extended
+					! longword so that we can look at it 
+					! as a longword if we like.
+
+					PASS_BACK( BYTE_LENGTH, .MODE );
+					RETURN_PTR = .RETURN_PTR + BYTE_LENGTH;
+					PASS_BACK( LONG_LENGTH, .(.lex_stg_desc [dsc$a_pointer]) );
+
+					! Pass back the token type.
+
+					VAL_TOKEN + .MODE
+					END
+				END
+			END;
+
+		[OP_PAREN_TOKEN,	! ( reg ), ETC.
+		 LSQUARE_TOKEN]:	! [ reg ], for INDEXing mode.
+
+			! This case looks for an 'at register' reference
+			! or an indexing mode indicator.  The reason
+			! why they are lumped together is simply due
+			! their similarity.  The two tokens are in no
+			! other way related.
+			! The REGister number is passed back in the 1st
+			! byte of LEX_BUFFER.
+
+			IF( INS_GET_TOKEN( .inst_stg_desc, lex_stg_desc ) NEQ ALPHA_STR_TOKEN )
+			THEN
+				BEGIN
+
+
+				BAD_TOKEN
+				END
+			ELSE
+			IF( (REG_NUM = DBG$REG_MATCH( lex_stg_desc )) LSS 0 )
+			THEN
+				BEGIN
+
+
+				BAD_TOKEN
+				END
+			ELSE
+				! Make sure that the register is not PSL
+
+				IF( .REG_NUM GTR MAX_REG )
+				THEN
+					BEGIN
+
+
+					BAD_TOKEN
+					END
+				ELSE
+					BEGIN
+					! Now we must get the closing parenthesis
+					! or square bracket, and we give up unless
+					! we get it.
+	
+					IF( INS_GET_TOKEN( .inst_stg_desc, lex_stg_desc )
+					    NEQ ( IF( .TOKEN_TYPE EQL OP_PAREN_TOKEN )
+							THEN
+								CL_PAREN_TOKEN
+							ELSE
+								RSQUARE_TOKEN
+					        )
+					  )
+					THEN
+						BEGIN
+
+
+						BAD_TOKEN
+						END
+					ELSE
+						BEGIN
+	
+						! We got what we wanted!  Now all that	
+						!  remains is to pass back the register
+						!  number and token type.
+	
+						PASS_BACK( BYTE_LENGTH, .REG_NUM );
+	
+						IF( .TOKEN_TYPE EQL OP_PAREN_TOKEN )
+						THEN
+							AT_REG_TOKEN
+						ELSE
+							! You can't index off the PC
+	
+							IF( .REG_NUM EQL PC_REG )
+							THEN
+								BEGIN
+
+
+								BAD_TOKEN
+								END
+							ELSE
+								INDEXING_TOKEN
+						END
+					END;
+	
+
+		[OTHERWISE]:		! ERROR.
+
+			! We don't recognize this token.
+			! Cause termination of the encoding.
+
+			BEGIN
+
+
+			BAD_TOKEN
+			END;
+
+		TES);
+
+	! Update the counted string pointer which is being
+	! maintained elsewhere.
+
+	! The returned value is whatever was arrived at
+	! in the above CASE statement.
+
+	RETURN( .TOKEN_TYPE );
+	END;
+
+ROUTINE GET_OPCODE ( inst_stg_desc, F_OUT_BYTE_PTR, OPINFO_PTR, OUT_PC ) =
+
+!++
+! Functional Description:
+!	Scan the supposed instruction string to extract the
+!	opcode from it.  If a valid opcode is found, its
+!	numeric value is 'stuffed back', otherwise a signal is
+!	generated and the reutine does not return.
+!
+! Formal parameters:
+!	INST_STG_DESC	-The address of a string descriptor which points to
+!			 the instruction string we are working on.
+!	OUT_BYTE_PTR	-The address of where we should stuff the
+!			 opcode if we find a valid one.
+!	OPINFO_PTR	-A pointer to where we should stuff the address
+!			 of the OPINFO record which we find as a match
+!			 to the opcode we extract from the instruction string.
+!	OUT_PC		-A pointer to a loc that we bump for each byte
+!			 placed in the instruction stream.
+!
+! Implicit Inputs:
+!	The OPINFO data structure which is described in DBGINS.B32
+!
+! Outputs:
+!	None other than via the parameters given above.
+!
+! Implicit Outputs:
+!	None.
+!
+! Returned Value:
+!	A pointer to a counted string (which we build)
+!	which is the name of the opcode.
+!
+!	If the opcode is invalid, the routine does no return.
+!--
+BEGIN
+	MAP
+					! Pointer into the OPINFO table
+		OPINFO_PTR : REF VECTOR[,LONG],
+		OUT_PC : REF VECTOR[,LONG],
+		F_OUT_BYTE_PTR : REF VECTOR[,BYTE],
+		inst_stg_desc : REF BLOCK [, BYTE];
+
+	!  The following BIND works, but causes the compiler
+	! to croak from time to time.  Once this
+	! works ok, put back in the '!' lines,
+	! and remove the lines flagged '*** Temporary'.
+
+!	BIND
+!		OPINFO_RECORD = (.OPINFO_PTR) : REF BLOCK[ OPTSIZE,BYTE ];
+	BIND OUT_BYTE_PTR = .F_OUT_BYTE_PTR : REF VECTOR;
+	own
+		opcode_name : vector[8,byte];
+	LOCAL
+
+		OPINFO_RECORD : REF BLOCK[ OPTSIZE,BYTE];	! *** Temporary
+
+	LOCAL
+		TOKEN_TYPE,
+		OPCODE,			! Numeric Opcode.
+
+		opco_stg_desc : BLOCK [12, BYTE],
+		USER_OPCODE : VECTOR[ CHS_PER_LEXEME, BYTE];
+
+	! Make sure that the first token is a
+	! potential opcode.
+
+	opco_stg_desc [dsc$w_length] = 0;
+	opco_stg_desc [dsc$a_pointer] = user_opcode;
+	opco_stg_desc [dsc$w_maxlen] = chs_per_lexeme;
+
+	IF ((TOKEN_TYPE = INS_GET_TOKEN ( .inst_stg_desc, opco_stg_desc )) NEQ ALPHA_STR_TOKEN)
+	THEN
+		SIGNAL (DBG$_BADOPCODE, 2, .opco_stg_desc[dsc$w_length],
+				.opco_stg_desc[dsc$a_pointer]);
+		! no return
+
+	! Look in the opcode table for a match to this string.
+
+	IF( (OPCODE = OPCODE_MATCH( opco_stg_desc, .OPINFO_PTR)) LSS 0 )
+	THEN
+		signal(DBG$_BADOPCODE, 2, .opco_stg_desc[ dsc$W_LENGTH ],
+			.opco_stg_desc[dsc$A_POINTER]);
+		! no return
+
+	! Found it.  Put the opcode byte into the instruction
+	! stream we are building, unless we do not have
+	! enough information to continue.  So far this only
+	! happens when the opcode is reserved, because we then
+	! do not know how many operands to expect.
+
+	OPINFO_RECORD = ..OPINFO_PTR;		!  *** Temporary
+
+	IF( .OPINFO_RECORD [ OP_NUMOPS ] EQL NOT_AN_OP )
+	THEN
+		signal(DBG$_RESOPCODE, 2, .opco_stg_desc[ dsc$W_LENGTH ],
+			.opco_stg_desc[dsc$A_POINTER]);
+		! no return
+
+	! Pass back the opcode byte.
+
+	IF (.OPCODE AND %X'FF') EQL %X'FD'
+	THEN
+		BEGIN		! Output 1st byte of 2 byte opcode
+		OUT_BYTE_PTR[0] = %X'FD';
+		OUT_BYTE_PTR = .OUT_BYTE_PTR + 1;
+		OUT_PC[0] = .OUT_PC[0] + 1;
+		OPCODE = .OPCODE ^ -8;
+		END;
+
+	OUT_BYTE_PTR[0] = .OPCODE;
+	OUT_BYTE_PTR = .OUT_BYTE_PTR + 1;
+	OUT_PC[0] = .OUT_PC[0] + 1;
+
+	! Build a counted string which contains the name
+	! of the opcode for possible use later in error reporting.
+	! Return a pointer to this string as the result
+	! of this routine.
+
+	ch$move (.opco_stg_desc[dsc$w_length],
+		 .opco_stg_desc[dsc$A_POINTER],
+		 opcode_name[1]);
+
+	opcode_name[0] = .opco_stg_desc[ dsc$w_length ];
+
+	return(opcode_name);
+END;
+
+ROUTINE ENC_OPERAND ( inst_stg_desc, OUT_BYTE_STREAM, PC_REL_CONTEXT, BRANCH_SIZE, OUT_PC_PTR ) =
+
+!++
+! Functional Description:
+!	Scan (parse, whatever) the string that supposedly
+!	represents one operand reference, and come up
+!	with the machine code representation for it. 
+!
+! Formal Parameters:
+!
+!	inst_stg_desc	-A string descriptor for the string that
+!			 contains the operand reference.
+!	OUT_BYTE_STREAM	-A pointer to the output byte stream pointer
+!			 that is being maintained by the routine
+!			 we are called by.
+!	PC_REL_CONTEXT	-The number of bytes that we should encode
+!			 into the output byte stream to correspond to
+!			 a PC-relative (literal) operand.  
+!	BRANCH_SIZE	-The number of  bytes that we should allow
+!			 if the current operand tries to use branch
+!			 type addressing.  0 => do not allow branch operands.
+!	OUT_PC_PTR	-A pointer to the pointer that we maintain that
+!			 indicates where the next byte of instruction we
+!			 generate will go.  This is used to calculate
+!			 PC-displacement values.
+!
+! Implicit Inputs:
+!	None.
+!
+! Outputs:
+!	The bytes that correspond to the operand reference are
+!	stuffed into the vector pointed to by the pointer
+!	contained in the location pointed to by OUT_BYTE_STREAM.
+!	This pointer is also updated so that it points to the
+!	next vacant byte position.
+!
+! Routine Value:
+!	If a SIGNAL/UNWIND is not done, we return TRUE if
+!	all goes well, FALSE, otherwise.
+!
+! Side Effects:
+!	A SIGNAL causing an UNWIND is done in most error situations.
+!--
+
+	BEGIN
+	MAP
+		! The reason why the following 2 are REFs to LONGs
+		! instead of to BYTEs is because they are actually
+		! REF REF VECTOR[,BYTE], which we can only achieve
+		! (so far!?) via a REF LONG.  Even this only
+		! works because LONG happens to be the size
+		! of a REF BYTE (or of any REF, for that matter).
+
+		OUT_PC_PTR : REF VECTOR[,LONG],
+		OUT_BYTE_STREAM : REF VECTOR[,LONG],
+		inst_stg_desc : REF BLOCK [, BYTE];
+
+	LOCAL
+		TOKEN_STRING : VECTOR[ CHS_PER_LEXEME, BYTE],
+		LEXEME_BUFFER : VECTOR[ CHS_PER_LEXEME, BYTE],
+		lexeme_stg_desc : BLOCK [12, BYTE],
+		OUT_BYTE_PTR : REF VECTOR[,BYTE],
+		TOKEN_TYPE : BYTE,
+		AT_FLAG,
+		MODE;
+
+	BIND
+		TOKEN_LONG = TOKEN_STRING : VECTOR[,LONG];
+	MACRO
+		OUT_CODE ( ctrl_string ) =
+			!+
+			! This macro is used to call the routine to
+			!  check for indexing and actually output the
+			!  bytes of 'instruction' into the instruction
+			!  stream.  The reason why we use this macro
+			!  is because it inserts the first 2 parameters
+			!  for us, (we may later use GLOBALs for this),
+			!  and because we may later have to make the
+			!  control string parameter a counted string
+			!  if we find that 4 characters (a longword)
+			!  are not enough.
+			!-
+			BEGIN
+			IF (NOT INST_OUTPUT (	.OUT_BYTE_STREAM,
+						.OUT_PC_PTR,
+						.inst_stg_desc,
+						ctrl_string,
+						%REMAINING ) )
+			THEN
+				RETURN FALSE;
+			END%,
+
+		MAKE_A_MODE ( dmode ) =
+			!+
+			! How we usually make up the dominant
+			! mode addressing byte.
+			!-
+			( (dmode ^ 4) OR .TOKEN_STRING[0])%,
+
+		MAKE_PC_MODE ( dmode ) =
+
+			!+
+			! Macro to make PC relative mode
+			!-
+			( (dmode ^4) OR PC_REG )%;
+
+
+	! Fetch the first token from the instruction string,
+	!  and take action depending on it.  If we first 
+	!  get an 'at' sign, we simply set a flag for later
+	!  reference, extract the next token, and continue on.
+
+	AT_FLAG = FALSE;
+	OUT_BYTE_PTR = .OUT_BYTE_STREAM[0];
+
+	IF( (TOKEN_TYPE = GET_NEXT_TOKEN( .inst_stg_desc, TOKEN_STRING )) EQL AT_SIGN_TOKEN )
+	THEN
+		BEGIN
+		AT_FLAG = TRUE;
+		TOKEN_TYPE = GET_NEXT_TOKEN( .inst_stg_desc, TOKEN_STRING );
+		END;
+
+	! Enforce branch-type syntax only when a branch operand
+	! is expected, and vice versa.
+
+	IF( .TOKEN_TYPE NEQ BRCH_TOKEN )
+	THEN
+		IF( .BRANCH_SIZE NEQ 0 )
+		THEN
+			! "Branch Operand Expected" error.
+
+			signal(dbg$_nobranch);
+			! no return
+
+
+	SELECTONE .TOKEN_TYPE OF
+		SET
+
+		[EOL_TOKEN]:
+
+			! INS_ENCODE can produce a more meaningful
+			! message at this point than we can.
+
+			RETURN(FALSE);
+
+		[REGISTER_TOKEN]:
+
+			!  The operand is Rn, where 'n' was passed back 
+			!  in the TOKEN_STRING.  Output the proper 
+			!  addressing mode byte, and increment the 
+			!  instruction stream pointer.
+
+			! Note that we don't allow indexing to follow REGISTER.
+			! We also disallow the old MACRO11 notion of '@Rx'.
+
+			BEGIN
+			IF( .AT_FLAG )
+			THEN
+				! "@Rx not equivalent to (Rx)" error.
+
+				signal(dbg$_opsyntax)
+				! no return
+			ELSE
+				OUT_CODE ( 'NB', (REGISTER_AMODE^4) OR .TOKEN_STRING[0] );
+			END;
+
+		[LIT_TOKEN]:
+
+			! This is either 'short literal', 'PC-Relative Literal',
+			! or Absolute addressing, depending on whether the string
+			! began with '@' or not, and on the number of
+			! bits needed to encode the number.
+
+			IF( .AT_FLAG )
+			THEN
+				! Absolute addressing is actually a PC-relative
+				! mode with longword context.  Note that this
+				! one may be followed by [ Rx ], which means
+				! that we have indexing.
+
+				OUT_CODE( 'YBD',
+					  MAKE_PC_MODE( AT_PC_REL_MODE ),
+					  4,
+					  TOKEN_STRING
+					)
+			ELSE
+				BEGIN
+
+				! Here we have an immediate operand.
+				! If it will fit into 6 bits, we can
+				! generate 'short literal' addressing,
+				! otherwise we generate a PC-relative
+				! (immediate) mode.
+	
+				IF( .TOKEN_LONG[0] GTRU 63 )
+				THEN
+					BEGIN
+					! The literal is too big for a 6-bit
+					! field.  Therefore we must use a
+					! PC-relative mode and insert
+					! the literal into the instruction
+					! stream.  Unfortunately, the number
+					! of bits we must use is NOT a
+					! function of how large the literal is,
+					! instead this is dictated by the
+					! so-called 'context' of this instruction.
+
+					IF( .PC_REL_CONTEXT GTR 4 )
+					THEN
+						!+
+						! QUAD literals not supported.
+						! This is because GET_NEXT_TOKEN
+						! does not put 8 bytes into
+						! TOKEN_STRING.
+						!-
+						SIGNAL(dbg$_notdone, 1, uplit(%ascic 'quadword literals'));
+						! no return
+	
+					! See if truncation will occur by checking
+					! on whether the longword which we take
+					! the number from is different from the
+					! number we get when we take it out
+					! as the hardware will do - ie, with sign
+					! extension.
+
+					IF( .TOKEN_LONG[0] NEQ
+					    .(TOKEN_STRING[0])<0,.PC_REL_CONTEXT*BITS_PER_BYTE, 1>
+					  )
+					THEN
+						! The following code should 
+						! disappear when we make
+						! RADX_CONVRT take the length into
+						! account.  For now we make a further
+						! check to see if the bits which we 
+						! will throw away simply weren't given.
+
+						INCR I FROM .PC_REL_CONTEXT TO LONG_LENGTH -1
+							DO
+							IF( .TOKEN_STRING[.I] NEQ 0 )
+							THEN
+								BEGIN
+								! We only WARN, though.
+
+								SIGNAL (dbg$_numtrunc);
+								EXITLOOP;
+								END;
+
+					! SRM says that #constant[Rx] is
+					! supported, however, to be like MARS,
+					! we generate an error for it.
+
+					OUT_CODE( 'NBD',
+						  MAKE_PC_MODE( PC_REL_MODE ),
+						  .PC_REL_CONTEXT,
+						  TOKEN_STRING
+						)
+					END
+				ELSE
+					BEGIN
+					! Short literals have to fit in 6 bits.
+					! They also can not be indexed.
+
+					OUT_CODE( 'NB', MAKE_A_MODE( SHORT_LIT_AMODE ) );
+					END;
+				END;
+
+
+		[BRCH_TOKEN]:		! For branch type operand addressing,
+					! and for assumed PC-displacement addressing.
+
+			BEGIN
+				BIND
+					ACTUAL_OPRND = TOKEN_STRING[1] : VECTOR[,LONG];
+
+			! Check the flag passed in byte 0 of the
+			! token string.  A zero here means that 
+			! the associated number is a branch operand
+			! and it is what we want to stuff directly
+			! into the instruction.  A 1 here
+			! means that the number must be made into
+			! a PC-relative offset - ie, it is absolute,
+			! and that it may or may not be a branch operand.
+
+			IF( .TOKEN_STRING[0] )
+			THEN
+				BEGIN
+
+				! To calculate the PC-relative value, we must
+				! start with a pointer to where we will stuff
+				! the actual operand, add in the length of
+				! the operand because that will give us what
+				! the VAX PC will be when it has been used to
+				! pick up the operand, and then subtract
+				! from that the absolute (virtual) destination.
+				! This gives the number of bytes which you would
+				! have to add to the PC to get the address of where
+				! you want to go - which is exactly what the
+				! operand is supposed to contain.
+
+				ACTUAL_OPRND[0] = .ACTUAL_OPRND[0] - (.OUT_PC_PTR[0] + .BRANCH_SIZE);
+				IF( .BRANCH_SIZE EQL 0 )
+				THEN
+					! If BRANCH_SIZE is not the right size
+					! (of displacement) to add, assume
+					! and use LONGWORD displacement.  We
+					! must take into consideration the fact
+					! that we will be writing out a 1-byte
+					! MODE field before the displacement,
+					! and perhaps also a 1-byte index field,
+					! as well as the displacement itself.
+
+					ACTUAL_OPRND[0] = .ACTUAL_OPRND[0]
+							- (4 + 1 +
+								ASSUME_AT_PC( .inst_stg_desc ) );
+				END;
+
+
+			! Check for branch overflow - the user
+			! trying to branch further than the
+			! instruction can 'reach'.  First, we must
+			! be trying to branch.
+
+			IF( .BRANCH_SIZE NEQ 0 )
+			THEN
+				BEGIN
+
+				! Overflow happens when all bits in 
+				! the unused part of the LONG which
+				! we are using to contain the branch
+				! operand are not the same as the
+				! 'sign' bit of the branch operand.  We find
+				! this out by extracting the branch operand
+				! as the hardware would (ie, with sign extension),
+				! and then comparing to see if this is the same
+				! as what we have calculated.
+	
+				IF( .ACTUAL_OPRND[0] NEQ .(ACTUAL_OPRND)<0,.BRANCH_SIZE*BITS_PER_BYTE, 1> )
+				THEN
+					! "Branching Out-of-Range" error.
+
+					signal(DBG$_BRTOOFAR, 1, .actual_oprnd[0]);
+					! no return
+	
+				! Branch operand is OK.  Output
+				! the code and don't allow indexing.
+
+				OUT_CODE( 'ND', .BRANCH_SIZE, ACTUAL_OPRND[0] );
+				END
+			ELSE
+				BEGIN
+
+				! PC-displacement operands are similar
+				! at this point except that we must
+				! allow indexing and we assume longword
+				! (deferred) displacement.
+				! This code is the same as that at the end
+				! of case [BYTE_VAL_TOKEN], etc, below;
+				! we are relying on the compiler to combine
+				! the code rather than putting it into a
+				! special-purpose routine.
+
+				LEXEME_BUFFER[0] = PC_REG;
+				TOKEN_STRING[0] = 4;
+				MODE = DISP_LONG_AMODE;
+
+				IF( .AT_FLAG )
+				THEN
+					MODE = .MODE +1;
+	
+				! Pass back the single mode byte followed
+				! by the counted byte stream we calculated. 
+				! Indexing is allowed in all cases.
+	
+				OUT_CODE( 'YBC',
+					  ((.MODE^4) OR .LEXEME_BUFFER[0]),
+					  TOKEN_STRING
+					);
+				END;
+			END;
+	
+		[MINUS_TOKEN]:
+
+			BEGIN
+
+			! This must be auto decrement, '-(Rn)', or
+			! auto decrement indexed, '-(Rn)[Rx]'.
+
+			IF( GET_NEXT_TOKEN( .inst_stg_desc, TOKEN_STRING) NEQ AT_REG_TOKEN )
+			THEN
+				BEGIN
+
+				! "Operand Syntax" error.
+				signal(DBG$_OPSYNTAX)
+				! no return
+
+				END;
+
+			! Check for indexing and output the instruction.
+
+			IF( .AT_FLAG )
+			THEN
+				BEGIN
+
+				! "Deferred Auto Decrement Not Allowed" error.
+				signal(DBG$_OPSYNTAX)
+				! no return
+
+				END
+			ELSE
+				OUT_CODE( 'YB', MAKE_A_MODE( AUTO_DEC_AMODE ) );
+			END;
+
+		[AT_REG_TOKEN]:
+
+			BEGIN
+
+			LOCAL
+				input_ptr,
+				char;
+
+			! This form is either register deferred, '(reg)',
+			! auto increment, '(reg)+', auto increment 
+			! deferred, '@(reg)+', or any one of these
+			! plus indexing.
+
+			MODE = REG_DEF_AMODE;
+
+			! A following '+' indicates one of the auto inc modes.
+
+			input_ptr = .inst_stg_desc [dsc$a_pointer];
+			char = ch$rchar (.input_ptr);
+			IF .char EQL %C'+'
+			THEN
+				BEGIN
+				! Update the counted-string pointer,
+				! and decide which auto inc mode we have.
+
+				MODE = AUTO_INC_AMODE;
+				IF( .AT_FLAG )
+				THEN
+					MODE = .MODE +1;
+					! MODE = AUTO_INC_DEF_AMODE;  ! Generates longer code.
+
+				inst_stg_desc [dsc$a_pointer] = ch$plus (.input_ptr, 1);
+				inst_stg_desc [dsc$w_length] = .inst_stg_desc [dsc$w_length] - 1;
+				END
+			ELSE
+				IF( .AT_FLAG )
+				THEN
+					! "@(Rn) Not Supported" error.
+					BEGIN
+
+					! Operand syntax error
+					signal(DBG$_OPSYNTAX)
+					! no return
+
+					END;
+
+			! In all cases we allow indexing.
+
+			OUT_CODE( 'YB', MAKE_A_MODE( .MODE ) );
+			END;
+
+		[BYTE_VAL_TOKEN,
+		 WORD_VAL_TOKEN,
+		 LONG_VAL_TOKEN
+		]:
+	
+			BEGIN
+			BIND
+				ACTUAL_OPRND = TOKEN_STRING[1] : VECTOR[,LONG];
+			LOCAL
+				INDEXING;
+		
+			! Displacement or Deferred Displacement addressing.
+
+			! Here we have to 'look ahead' to see if an
+			! actual register to displace off has 
+			! been given.  If not, we assume "(PC)" and 
+			! treat the displacement as a virtual address,
+			! calculating what real displacement we need
+			! to use given that the PC is the same as the 
+			! address of where we are depositing the instruction
+			! into.
+
+			IF( (INDEXING = ASSUME_AT_PC( .inst_stg_desc )) GEQ 0 )
+			THEN
+				BEGIN
+
+				! Ok to assume PC-displacement mode.
+				! This means that we must take the given
+				! displacement to be the virtual
+				! address we want to reach, so we must convert
+				! this field to a real displacement.  To do
+				! this we calculate what the PC will be after
+				! it has been used to pick up the displacement
+				! so that we can find out how much this
+				! displacement must be.   The INDEXING value
+				! returned above indicates how many bytes will
+				! be output due to indexed addressing.
+
+				ACTUAL_OPRND[0] = .ACTUAL_OPRND[0]
+						- (.OUT_PC_PTR[0] + .TOKEN_STRING[0] + 1 + .INDEXING);
+
+				! We also fake the user having said "(PC)"
+				! by filling in LEXEME_BUFFER with the
+				! right AT_REGister name.
+
+				LEXEME_BUFFER[0] = PC_REG;
+
+				! Check for trying to branch too far.  Here,
+				! the check must be ensuring that the unused
+				! bits in the LONG version of ACTUAL_OPRND
+				! are the same as the sign bit of the actual
+				! displacement part of ACTUAL_OPRND.
+
+				IF( .ACTUAL_OPRND[0] NEQ
+				    .(ACTUAL_OPRND)<0,.TOKEN_STRING[0]*BITS_PER_BYTE, 1>
+				  )
+				THEN
+					! "Branching Out-of-Range" error.
+
+					signal(DBG$_BRTOOFAR, 1, .actual_oprnd[0])
+					! no return
+				END
+			ELSE
+				BEGIN
+
+				! Check that the displacement is followed
+				! by a register reference in parenthesis.
+
+				IF( GET_NEXT_TOKEN( .inst_stg_desc, LEXEME_BUFFER ) NEQ AT_REG_TOKEN )
+				THEN
+					BEGIN
+
+					! "Must Displace off a Reg" error.
+					signal(DBG$_OPSYNTAX)
+					! no return
+
+					END;
+
+				! Check for displacement truncation and produce
+				! a message if this will occur.  Here the check is
+				! based on the sign bit of the actual displacement,
+				! as we did to check this above.  Here, however, we
+				! we further check whether or not the upper bits
+				! of the given displacement are all 0, and 'forgive'
+				! if this is true.  This nonsense is necessary to avoid
+				! to avoid complaining when one says "B^95(reg)".
+				! Here the 95 is taken as a negative number rather
+				! than assuming a large positive one was intended.
+	
+				IF( .ACTUAL_OPRND[0] NEQ
+				    .(ACTUAL_OPRND)<0,.TOKEN_STRING[0]*BITS_PER_BYTE, 1 >
+				  )
+				THEN
+					! When RADX_CONVRT is fixed to take
+					! size into account (ie, to complain
+					! if the number is too big), we should
+					! just produce a message at this point.
+					! For now, however, we let them away
+					! with it if the unused bytes are
+					! all zero.
+	
+					BEGIN
+	
+					BIND
+						ACTUAL_BYTES = ACTUAL_OPRND[0] : VECTOR[,BYTE];
+	
+					INCR I FROM .TOKEN_STRING[0] TO LONG_LENGTH -1
+						DO
+						IF( .ACTUAL_BYTES[.I] NEQ 0 )
+						THEN
+							BEGIN
+
+							! "Branching Out-of-Range" error.
+
+							signal(DBG$_BRTOOFAR, 1, .actual_oprnd[0])
+							! no return
+
+							END;
+					END;
+				END;
+
+			! Ok.  Now calculate the right mode to use.
+			! The following code is extremely instruction-set
+			! dependent, and relies on the relative values
+			! of the various displacement modes.  Essentially
+			! we just start out with the lowest mode and keep
+			! adding on until we've got what we wanted.  This
+			! code is shorter but admittedly less intuitive
+			! than perhaps a SELECTONE or whatever.
+
+			MODE = DISP_BYTE_AMODE;
+
+			IF( .TOKEN_TYPE GTR BYTE_VAL_TOKEN )
+			THEN
+				MODE = .MODE +2;
+
+			IF( .TOKEN_TYPE GTR WORD_VAL_TOKEN )
+			THEN
+				MODE = .MODE +2;
+
+			IF( .AT_FLAG )
+			THEN
+				MODE = .MODE +1;
+
+			! Pass back the single mode byte followed
+			! by the counted byte stream we were 
+			! passed.  Indexing is allowed in all cases.
+
+			OUT_CODE( 'YBC',
+				  ((.MODE^4) OR .LEXEME_BUFFER[0]),
+				  TOKEN_STRING
+				);
+
+			END;
+
+		[OTHERWISE]:	! Error.
+
+			BEGIN
+
+			! "Operand Syntax" error.
+			signal(DBG$_OPSYNTAX)
+			! no return
+
+			END;
+
+		TES;
+
+	! The updated string descriptor has already effectively
+	! been passed back because we used the one given directly.
+	! We return here to imply a successful ENC_OPERAND.
+	
+	RETURN (TRUE);
+END;
+
+ROUTINE ASSUME_AT_PC( inst_stg_desc ) =
+
+!++
+! Functional Description:
+!	This routine is called from ENC_OPERAND to determine if
+!	the addressing mode should be PC-relative.
+!
+! Formal Parameters:
+!	inst_stg_desc	-String descriptor that points to the operand buffer.
+!			 The pointer and length fields provide information
+!			 on the remaining characters in the current operand.
+!
+! Implicit Inputs:
+!	NONE
+!
+! Implicit Outputs:
+!	NONE
+!
+! Routine Value:
+!	 0 - PC-relative addressing mode (input buffer was empty).
+!	 1 - PC-relative indexed addressing mode (first non-blank was "[").
+!	-1 - NOT PC-relative.
+!
+! Side Effects:
+!	NONE
+!--
+	BEGIN
+	MAP
+		inst_stg_desc : REF BLOCK [, BYTE];
+
+	LOCAL
+		CHAR : BYTE;
+
+
+	IF ( .inst_stg_desc[dsc$w_length] NEQ 0 )
+	THEN
+	    BEGIN
+	    char = ch$rchar (.inst_stg_desc [dsc$a_pointer]);
+	    IF (.char EQL ASC_SQ_OPN_BRAK)		! If square bracket
+	    THEN					! then indexing mode is needed
+		RETURN (1)
+	    ELSE
+		RETURN (-1);
+	    END
+	ELSE
+	    RETURN (0);					! No indexing off PC
+END;
+
+ROUTINE INST_OUTPUT ( OUT_BYTE_STREAM,
+			OUT_PC_PTR,
+			inst_stg_desc,
+			CTRL_STRING,
+			ARG0,
+			ARG1,
+			ARG2 ) =
+!++
+! Functional Description:
+!	This routine serves two purposes.
+!	1) It checks whether an INDEXed operand reference
+!	   has been made, and outputs the proper mode byte
+!	   if it has.
+!	2) It takes care of all other instruction byte
+!	   output as well - not that this routine computes
+!	   any of this - it just localizes such output.
+!
+! Formal Parameters:
+!	OUT_BYTE_STREAM	-The address of a pointer to where
+!			 we are in the output stream.  The address
+!			 is passed here so that we can both
+!			 use and update this pointer.
+!	OUT_PC_PTR	-The address of a pointer to where we
+!			 will eventually be stuffing the encoded
+!			 instruction in memory.  We both read
+!			 and write (update) this pointer.
+!	INST_CS_PTR	-The address of a pointer to the counted
+!			 string which describes where we are at
+!			 in operand encoding.  Again, a pointer is
+!			 passed here so that we may update the cs-pointer.
+!	CTRL_STRING	-A 4-character 'string' (a longword) which effectively
+!			 controls the action taken by this routine.  The first
+!			 (0th) character should be 'Y' or 'N', and is taken to
+!			 indicate whether we should allow indexing
+!			 for the current operand reference or not.
+!			 The next 2 or 3 characters must be 1 of 'B', 'C', or 'D',
+!			 and are used to indicate how the remaining parameters
+!			 should be interpreted.  See below.
+!			 The last of these characters must be 0 (null) to
+!			 indicate when the routine should stop.
+!	ARG?		-These args are interpretted differently depending
+!			 on the 'control string'.  See above and below.
+!
+! Implicit Inputs:
+!	None.
+!
+! Outputs:
+!	None.
+!
+! Implicit Outputs:
+!	The instruction bytes are copied into the output vector.
+!
+! Routine Value:
+!	TRUE - if all went OK,
+!	FALSE otherwise.  The only thing that can go wrong
+!	is that we are prepared to allow indexing, see that the
+!	indexing reference is started, ('[' is encountered),
+!	but then don't get a proper completion of this token.
+!--
+	BEGIN
+	MAP
+		! The reason why the following 3 are REFs to LONGs
+		! instead of to BYTEs is because they are actually
+		! REF REF VECTOR[,BYTE], which we can only achieve
+		! (so far!?) via a REF LONG.
+
+		OUT_PC_PTR  : REF VECTOR[,LONG],
+		inst_stg_desc : REF BLOCK [, BYTE],
+		OUT_BYTE_STREAM : REF VECTOR[,LONG];
+
+	LOCAL
+		CTRL_PTR : REF VECTOR[,BYTE],		! Examine the control string.
+		OUT_BYTE_PTR : REF VECTOR[,BYTE],	! Pass back instruction bytes.
+		ARG_PTR : REF VECTOR[,LONG],		! Used to pick up ARGx.
+
+		TOKEN_BUFFER : VECTOR[ CHS_PER_LEXEME, BYTE],
+		token_stg_desc : BLOCK [12, BYTE];
+
+	! Set up the various pointers we will use.
+
+	! The ARG_PTR is used to access each
+	! successive ARGx actual parameter.  Since
+	! we loop thru them, we can't use the formal
+	! parameter's name.
+
+	ARG_PTR = ARG0;
+
+	! CTRL_PTR points to the individual characters
+	! passed to us in the actual parameter, 'CTRL_STRING'.
+	! Note that this is actually a literal, because
+	! the characters are contained within the parameter.
+
+	CTRL_PTR = CTRL_STRING;
+
+	! OUT_BYTE_PTR points to where in the output
+	! byte instruction stream we currently are
+	! expected to stuff instruction bytes.  
+	! We fetch this value by loading the
+	! contents of the cell pointed to by
+	! OUT_BYTE_STREAM.  The reason why we must be
+	! passed the address of this pointer is because
+	! we must also be able to increment the pointer.
+
+	OUT_BYTE_PTR = .OUT_BYTE_STREAM[0];
+
+	! Likewise, we are passed the address of the
+	! current instruction-stream counted-string
+	! pointer, INST_CS.  We initialize ourselves
+	! a copy of it in a similar manner.  The reason
+	! for this, again, is because we must be able
+	! to update this pointer.
+
+	token_stg_desc [dsc$w_length] = 0;
+	token_stg_desc [dsc$a_pointer] = token_buffer;
+	token_stg_desc [dsc$w_maxlen] = chs_per_lexeme;
+
+	! Whether or not we should consider INDEXing
+	! mode is indicated by the first character in
+	! the control string.  We take 'Y' to mean
+	! yes, and assume that anything else means no.
+
+	IF( .CTRL_PTR[0] EQL %C'Y' )
+	THEN
+		BEGIN
+
+		! Check for indexing.
+		! The difficulty here is that we must 'look ahead'
+		! ourselves before calling GET_NEXT_TOKEN because
+		! it doesn't mind overwriting the instruction
+		! string and we can't allow that since we should
+		! really leave the string untouched unless
+		! indexing mode was actually specified.
+
+		LOCAL
+			input_ptr,
+			char;
+
+		input_ptr = .inst_stg_desc [dsc$a_pointer];
+		char = ch$rchar (.input_ptr);
+		IF .char EQL %C'['
+		THEN
+			BEGIN
+
+			! Now we had better have an indexed reference
+			! or we must complain.
+
+			IF( GET_NEXT_TOKEN( .inst_stg_desc, TOKEN_BUFFER ) NEQ INDEXING_TOKEN )
+			THEN
+				! Operand syntax error
+
+				signal(DBG$_OPSYNTAX);
+				! no return
+
+			! Output the indexing mode byte.
+
+			OUT_BYTE_PTR[0] = (INDEXING_MODE ^ 4) OR .TOKEN_BUFFER[0];
+			OUT_BYTE_PTR = .OUT_BYTE_PTR + BYTE_LENGTH;
+			END;
+		END;
+
+	! We continue on according to the control string,
+	! breaking out of the loop when the first 0 byte
+	! is encountered.
+
+	CTRL_PTR = .CTRL_PTR +1;
+
+	DO
+		BEGIN
+		BIND
+			ARG_BYTE	= (.ARG_PTR) : REF VECTOR[,BYTE];
+	
+		SELECTONE .CTRL_PTR[0] OF
+			SET
+
+			[%C'B']: ! Pass back 1 byte.
+
+				BEGIN
+
+				OUT_BYTE_PTR[0] = .ARG_PTR[0];
+				OUT_BYTE_PTR = .OUT_BYTE_PTR +BYTE_LENGTH;
+				ARG_PTR = .ARG_PTR +LONG_LENGTH;
+				END;
+
+			[%C'C']: ! Counted byte string.
+
+				BEGIN
+				CH$MOVE( .ARG_BYTE[0], ARG_BYTE[1], .OUT_BYTE_PTR );
+				OUT_BYTE_PTR = .OUT_BYTE_PTR + .ARG_BYTE[0];
+				ARG_PTR = .ARG_PTR + LONG_LENGTH;
+				END;
+
+			[%C'D']: ! Count + byte address.
+
+				BEGIN
+				CH$MOVE( .ARG_PTR[0], .ARG_PTR[1], .OUT_BYTE_PTR );
+				OUT_BYTE_PTR = .OUT_BYTE_PTR + .ARG_PTR[0];
+				ARG_PTR = .ARG_PTR + 2*LONG_LENGTH;
+				END;
+
+			[OTHERWISE]:	! Error.
+				RETURN(0);
+
+			TES;
+
+		! Loop back to consider the next control character
+		! until a null character is encountered.
+
+		CTRL_PTR = .CTRL_PTR + 1;
+
+		END
+
+	WHILE( .CTRL_PTR[0] NEQ 0 );
+
+
+	! Before we return we must update the
+	! instruction-stream pointer which is being
+	! maintained by the routine which called
+	! us.  We can do this since we were passed
+	! the address of this pointer.  We must also update
+	! the output PC pointer, and we can do this because
+	! we know how many bytes this call to this routine
+	! has added to the output byte stream.
+
+	OUT_PC_PTR[0] = .OUT_PC_PTR[0] + (.OUT_BYTE_PTR - .OUT_BYTE_STREAM[0] );
+
+	OUT_BYTE_STREAM[0] = .OUT_BYTE_PTR;
+
+	! Likewise, we update the caller's instruction string pointer.
+
+	RETURN(TRUE);
+	END;
+
+ROUTINE OPCODE_MATCH ( opco_stg_desc, OPINFO_PTR ) = 
+
+!++
+! Functional Description:
+!	Look up the given opcode mnemonic in the OPINFO
+!	table to see if it is there.  If so, return the
+!	opcode and a pointer to the OPINFO table entry which 
+!	corresponds to this opcode.
+!
+! Formal Parameters:
+!	opco_stg_desc	-String descriptor for the given opcode.
+!	OPINFO_PTR	-The address of where we should copy the
+!			 OPINFO record pointer when we find the
+!			 one which corresponds to the given opcode.
+! Implicit Inputs:
+!	The OPINFO table.  See DBGINS.B32
+!
+! Implicit Outputs:
+!	A pointer to the OPINFO table entry that
+!	corresponds to the found opcode mnemonic
+!	is returned via the formal pointer OPINFO_PTR.
+!
+! Returned Value:
+!	-1	-if the lookup fails or if there is insufficient
+!		 information in the table entry for the program
+!		 to continue.
+!	The found OPCODE, otherwise.  This is non-standard,
+!	so we use a local macro to draw attention to it.
+!--
+	BEGIN
+	MACRO
+		OPC_MATCH_ERROR = -1 %;		!  Error return for this routine.
+	MAP
+		opco_stg_desc : REF BLOCK [, BYTE],
+		OPINFO_PTR : REF VECTOR[,LONG];
+
+	LOCAL
+		OP_SIZE,
+		OP_FROM_TABLE	:	VECTOR[ OP_CH_SIZE, BYTE ],
+		OP_FROM_USER	:	VECTOR[ OP_CH_SIZE, BYTE ];
+
+	! First check that the supposed opcode is not too long
+	! or too short.  We can't return 0 and be like
+	! you'd expect because 0 is a valid opcode.
+
+	OP_SIZE = .opco_stg_desc [dsc$w_length];
+	IF( .OP_SIZE GTR OP_CH_SIZE  OR  .OP_SIZE LEQ 0 )
+	THEN
+		BEGIN
+
+
+		RETURN( OPC_MATCH_ERROR );
+		END;
+
+	! Otherwise do the lookup linearly by first filling a local
+	! vector with spaces, copying in the given opcode mnemonic,
+	! and then looping thru the table comparing this one with
+	! the ones encoded (from RAD50) into ASCII.  This approach
+	! is easier and less wasteful of code space than writing a 
+	! routine to convert ASCII to RAD50.
+
+	CH$FILL ( ASC_SPACE, OP_CH_SIZE, OP_FROM_USER );
+	CH$MOVE ( .OP_SIZE, ch$ptr (.opco_stg_desc [dsc$a_pointer]), OP_FROM_USER );
+
+	INCR OPCODE FROM 0 TO MAXOPCODE DO
+		BEGIN
+
+		! Extract the opcode from the OPINFO table, 
+		! converting it to ASCII, and compare
+		! this with what we are looking for.
+
+		DBG$CONV_R_50( .DBG$GB_OPINFO[ .OPCODE, OP_NAME], OP_FROM_TABLE );
+		IF( CH$EQL( OP_CH_SIZE, OP_FROM_USER, OP_CH_SIZE, OP_FROM_TABLE ) )
+		THEN
+			BEGIN
+			!  Pass back both the opcode (the current
+			!  index into the table), and the pointer
+			!  to the current table entry.
+
+			OPINFO_PTR[0] = DBG$GB_OPINFO[ .OPCODE, OP_NAME ];
+			RETURN(.OPCODE);
+			END;
+		END;
+
+	INCR OPCODE FROM 0 TO MAXOPCODE DO
+		BEGIN
+
+		! Extract the opcode from the OPINFO table, 
+		! converting it to ASCII, and compare
+		! this with what we are looking for.
+
+		DBG$CONV_R_50(.DBG$GB_OPINFO[.OPCODE^8+%X'FD',OP_NAME],OP_FROM_TABLE);
+		IF( CH$EQL( OP_CH_SIZE, OP_FROM_USER, OP_CH_SIZE, OP_FROM_TABLE ) )
+		THEN
+			BEGIN
+			!  Pass back both the opcode (the current
+			!  index into the table), and the pointer
+			!  to the current table entry.
+
+			OPINFO_PTR[0]=DBG$GB_OPINFO[.OPCODE^8+%X'FD',OP_NAME];
+			RETURN(.OPCODE^8+%X'FD');
+			END;
+		END;
+	! If we don't RETURN in the above loop,
+	! the lookup has failed.
+
+	RETURN( OPC_MATCH_ERROR );
+	END;
+
+ROUTINE GET_OPERAND ( INS_STG_DESC, OPRND_STG_DESC ) =
+
+!++
+! Functional Description:
+!
+!	This routine scans the input stream and extracts the next operand from
+!	it.  During this scan, all expressions and symbolic names are evaluated.
+!	The resultant "operand" string is placed in the buffer pointed to by
+!	OPRND_STG_DESC.  This string can then be encoded by ENC_OPERAND into
+!	a binary operand for the instruction.
+!
+! Formal Parameters:
+!	INS_STG_DESC	- Address of string descriptor for remaining operands of
+!			  instruction being encoded.
+!	OPRND_STG_DESC	- Address of string descriptor for buffer into which the
+!			  "pre-processed" operand string will be placed
+!
+! Implicit Inputs:
+!	DBG$GL_MOD_PTR	- is used by the radix convert routine
+!			  to convert numeric input.
+!
+! Implicit Outputs:
+!	OPRND_STG_DESC[DSC$W_LENGTH] will be set to the length of the operand.
+!	The buffer pointed to by OPRND_STG_DESC[DSC$A_POINTER] will contain the
+!	ASCII operand string.
+!
+! Return Value:
+!	OPR_FOUND (1)	- if an operand is found.
+!	NO_MORE_OPR (0)	- if there are no more operands.
+!
+! Side Effects:
+!	All errors in expressions or undefined symbols are signaled, causing
+!	an warning message to be printed, and a stack unwind to occur.
+!--
+
+BEGIN
+
+MAP
+	INS_STG_DESC : REF BLOCK [,BYTE],			! String descriptor for remaining operands
+	OPRND_STG_DESC : REF BLOCK[,BYTE];			! String descriptor for returned operand
+
+LABEL
+	DIGIT_CODE,						! Digit string token code
+	OPERATOR_CODE,						! Operator handling code
+	RANGLE_CODE,						! Right angle bracket handling code
+	ALPHA_CODE,						! Alpha_str_token handling code
+	GET_PATHNAME;						! Code to get a pathname
+
+BIND
+	EXP_STG = UPLIT BYTE (%ASCIC '^X!XL');			! FAO control string to convert binary numbers to ASCII
+
+MACRO
+	EXP$L_VALUE = 0, 0, 32, 0%,				! EXP$L_VALUE (expression value stacked)
+	EXP$B_OPERATOR = 0, 32, 8, 1%;				! EXP$B_OPERATOR (token_type for stacked operator)
+
+LITERAL
+	EXP$C_SIZE = 5,						! Length of one expression stack entry
+	EXPR_STK_SIZ = EXP$C_SIZE * 20,				! Allow 20 entries on expression stack
+	NEGATION_TOKEN = %X'FF';				! Token value for unary '-'
+
+LOCAL
+	FLAG,							! Flag to exit operator select loop
+	CUR_VALUE,						! Current numeric value found
+	CUR_OPERATOR: BYTE,					! Current operator to process
+	NUMBER_FLAG,						! Flag set if operand contained a numeric value
+	PREV_TOKEN: BYTE,					! Previous token_type value
+	TOKEN_TYPE: BYTE,					! Encoded type of token found by DBG$MAR_GET_LEX
+	LEX_STG_DESC : BLOCK[12,BYTE],				! String descriptor for current lexeme
+	STACK_PTR : REF BLOCK[,BYTE],				! Pointer to next free position on expression stack
+	EXPR_STACK : BLOCK[EXPR_STK_SIZ,BYTE],			! Expression stack (grows from low address to high address)
+	LEX_BUF : VECTOR [CHS_PER_LEXEME,BYTE];			! Buffer to hold ascii lexeme string
+
+!++
+! First check that there is more input in the remaing operand string.
+!--
+IF (.INS_STG_DESC[DSC$W_LENGTH] EQL 0)
+THEN
+	RETURN(NO_MORE_OPR);
+
+!++
+! Initialize local variables before starting lexical scan.
+!--
+CUR_VALUE = 0;
+CUR_OPERATOR = 0;
+NUMBER_FLAG = FALSE;
+TOKEN_TYPE = 0;
+STACK_PTR = CH$PTR(EXPR_STACK, 0);
+
+!++
+! Zero the buffer which will hold the return operand.
+!--
+ZEROCOR (.OPRND_STG_DESC[DSC$A_POINTER], (.OPRND_STG_DESC[DSC$W_MAXLEN]/4));
+
+!++
+! Now enter a loop to process the operand.  There are two ways out of this loop.
+! The first is by signaling an error.  The second is by encountering a comma or
+! end of line.  Some tokens may be passed directly into the operand string and
+! others indicate expressions or symbols.  There is no check in this routine
+! of the validity of the resultant operand string.
+!--
+REPEAT
+	BEGIN
+	!++
+	! Get the next token.  The process this token based on its
+	! encoded token_type.
+	!--
+	LEX_STG_DESC[DSC$W_LENGTH] = 0;
+	LEX_STG_DESC[DSC$A_POINTER] = LEX_BUF;
+	LEX_STG_DESC[DSC$W_MAXLEN] = CHS_PER_LEXEME;
+	PREV_TOKEN = .TOKEN_TYPE;
+	TOKEN_TYPE = INS_GET_TOKEN (.INS_STG_DESC, LEX_STG_DESC);
+	SELECTONE .TOKEN_TYPE OF
+
+		SET
+
+	[CL_PAREN_TOKEN,				! ')' as in (reg)
+	 RSQUARE_TOKEN,					! ']' as in [reg]
+	 HASH_TOKEN,					! '#' as in #literal
+	 UP_ARROW_TOKEN,				! '^' as in ^X,^O,^D
+	 PERIOD_TOKEN]:					! '.' as in .+offset, .-offset
+		BEGIN
+		!++
+		! All of these tokens are passed directly into the resultant
+		! operand string.
+		!--
+		ADD_TO_OPER_STG ( LEX_STG_DESC, .OPRND_STG_DESC);
+		END;
+
+
+	[OP_PAREN_TOKEN,				! '(' as in (reg)
+	 LSQUARE_TOKEN]:				! '[' as in [reg]
+		BEGIN
+		!++
+		! These tokens signify the end of an expression, if there is
+		! one.  The expression and the token should be passed through.
+		!--
+		IF (.NUMBER_FLAG)
+		THEN
+			BEGIN
+			!++
+			! Output the literal to the operand string.  The case
+			! here is number(reg) or number[reg].
+			!--
+			IF (.STACK_PTR NEQU EXPR_STACK)
+			THEN
+				BEGIN
+				SIGNAL(DBG$_NOANGLE);		! Invalid expression - no closing ">"
+				RETURN (0);			! No return
+				END;
+			DBG$GL_BUF_SIZ = 0;
+			DBG$CP_OUT_STR = CH$PTR(.OPRND_STG_DESC[DSC$A_POINTER],
+						.OPRND_STG_DESC[DSC$W_LENGTH]);
+
+    			! dbg$cp_out_str contains a pointer to the output 
+    			! buffer
+
+			DBG$FAO_PUT( (.dbg$cp_out_str-1), EXP_STG, .CUR_VALUE, 
+    				dbg$cp_out_str);
+			OPRND_STG_DESC[DSC$W_LENGTH] = .OPRND_STG_DESC[DSC$W_LENGTH] + .DBG$GL_BUF_SIZ;
+			NUMBER_FLAG = FALSE;			! Reset literal flag
+			CUR_VALUE = 0;
+			END;
+
+		!++
+		! Now pass through the '(' or the ')'.
+		!--
+		ADD_TO_OPER_STG ( LEX_STG_DESC, .OPRND_STG_DESC);
+		END;
+
+
+	[AT_SIGN_TOKEN,					! '@' shift operator or @(reg)
+	 PLUS_TOKEN,					! '+' addition operator or (reg)+
+	 MINUS_TOKEN,					! '-' subtraction operator or -(reg)
+	 SLASH_TOKEN,					! '/' division operator
+	 ASTERISK_TOKEN]:				! '*' multiplication operator
+    OPERATOR_CODE:
+		BEGIN
+		!++
+		! All operators are handled here.  Later additions should be the
+		! ampersand (&) for logical AND and exclamation point (!) for
+		! logical OR.  These are not currently passed through the
+		! lexical scanner.
+		!--
+		IF (.TOKEN_TYPE EQLU AT_SIGN_TOKEN) AND (.PREV_TOKEN EQL 0)
+		THEN
+			BEGIN
+			!++
+			! There is no previous token therefore this must the
+			! @(reg) case.  Just pass the operator through to the
+			! resultant operand string.
+			!--
+			ADD_TO_OPER_STG ( LEX_STG_DESC, .OPRND_STG_DESC);
+			LEAVE OPERATOR_CODE;
+			END;
+
+		IF ((.TOKEN_TYPE EQLU PLUS_TOKEN) OR (.TOKEN_TYPE EQLU MINUS_TOKEN)) AND
+		   (.PREV_TOKEN EQLU PERIOD_TOKEN)
+		THEN
+			BEGIN
+			!++
+			! This is the case of .+offset or .-offset; pass through
+			! the operator to the resultant string.
+			!--
+			ADD_TO_OPER_STG ( LEX_STG_DESC, .OPRND_STG_DESC);
+			LEAVE OPERATOR_CODE;
+			END;
+
+		IF (.TOKEN_TYPE EQLU PLUS_TOKEN) AND (.PREV_TOKEN EQLU CL_PAREN_TOKEN)
+		THEN
+			BEGIN
+			!++
+			! This is the case (reg)+.  Pass through the operator.
+			!--
+			ADD_TO_OPER_STG ( LEX_STG_DESC, .OPRND_STG_DESC);
+			LEAVE OPERATOR_CODE;
+			END;
+
+		IF (.TOKEN_TYPE EQLU MINUS_TOKEN)
+		THEN
+			BEGIN
+			!++
+			! Check for the case -(reg).
+			!--
+			LOCAL
+				NEXT_CHAR : BYTE;		! Next character from operand stream
+
+			!++
+			! Is the next character a '('?
+			!--
+			NEXT_CHAR = CH$RCHAR(.INS_STG_DESC[DSC$A_POINTER]);
+			IF (.NEXT_CHAR EQL %C'(')
+			THEN
+				BEGIN
+				!++
+				! This was a case of -(reg).  Pass through the '-'.
+				!--
+				ADD_TO_OPER_STG (LEX_STG_DESC, .OPRND_STG_DESC);
+				LEAVE OPERATOR_CODE;
+				END;
+			END;
+
+		!++
+		! There should never be two successive operators unless the
+		! second is the unary negation operator.  If the second is the
+		! negation operator, then stack it and the current value.
+		! Then set the current operator to be negation_token.
+		!--
+		IF (.CUR_OPERATOR NEQ 0)
+		THEN
+			IF (.TOKEN_TYPE NEQU MINUS_TOKEN)
+			THEN
+				BEGIN
+				SIGNAL(DBG$_MULTOPR);		! Two sequential operators found
+				RETURN (0);			! No return
+				END
+			ELSE
+				BEGIN
+				IF ((.STACK_PTR + EXP$C_SIZE) GTRU (EXPR_STACK + EXPR_STK_SIZ))
+				THEN
+					BEGIN
+					SIGNAL(DBG$_EXPSTKOVR);	! Stack overflow
+					RETURN (0);		! No return
+					END;
+
+				!++
+				! Stack the current operator and value.
+				!--
+				STACK_PTR[EXP$L_VALUE] = .CUR_VALUE;
+				STACK_PTR[EXP$B_OPERATOR] = .CUR_OPERATOR;
+				STACK_PTR = CH$PTR(.STACK_PTR, EXP$C_SIZE);
+				CUR_VALUE = 0;
+				CUR_OPERATOR = NEGATION_TOKEN;
+				LEAVE OPERATOR_CODE;
+				END;
+
+		!++
+		! Set the new current operator and go get the next token.
+		!--
+		CUR_OPERATOR = .TOKEN_TYPE;
+		END;
+
+
+	[LANGLE_TOKEN]:					! '<' encloses expression
+		BEGIN
+		!++
+		! Check for expression stack overflow.
+		!--
+		IF ((.STACK_PTR + EXP$C_SIZE) GTRU (EXPR_STACK + EXPR_STK_SIZ))
+		THEN
+			BEGIN
+			SIGNAL(DBG$_EXPSTKOVR);		! Stack overflow
+			RETURN (0);			! No return
+			END;
+
+		!++
+		! Put new entry on expression stack.  Then reset the pointer
+		! to the next unused entry.  Push the current operator if there
+		! is one, otherwise push a '<' as the operator.
+		!--
+		STACK_PTR[EXP$L_VALUE] = .CUR_VALUE;
+		STACK_PTR[EXP$B_OPERATOR] = (IF (.CUR_OPERATOR NEQ 0)
+					     THEN
+						    .CUR_OPERATOR
+					     ELSE
+						    .TOKEN_TYPE);
+		STACK_PTR = CH$PTR(.STACK_PTR, EXP$C_SIZE);
+		CUR_VALUE = 0;
+		CUR_OPERATOR = 0;
+		END;
+
+
+	[RANGLE_TOKEN]:					! '>' encloses expression
+		BEGIN
+		!++
+		! The right angle bracket causes one entry to be taken off the
+		! expression stack.  This entry always immediately precedes the
+		! next free entry pointed to by STACK_PTR.  When an entry is
+		! removed, the current value and the stacked value must be
+		! combined using the stacked operator.  If the operator is a
+		! left angle bracket, then there were two consecutive left
+		! angle brackets in the expression and there is no stacked value
+		! to be combined.
+		!--
+		IF (.STACK_PTR LEQU EXPR_STACK)			! Check for stack underflow
+		THEN
+			BEGIN
+			SIGNAL(DBG$_NOANGLE);		! Stack underflow
+			RETURN (0);			! No return
+			END;
+		IF (.CUR_OPERATOR NEQU 0) OR (.PREV_TOKEN EQLU LANGLE_TOKEN) ! Check for missing operand
+		THEN
+			BEGIN
+			SIGNAL(DBG$_NOOPRND);		! Missing operand (got operator>)
+			RETURN (0);			! No return
+			END;
+		STACK_PTR = CH$PTR(.STACK_PTR, -EXP$C_SIZE); ! Point to last entry
+		DO
+		BEGIN
+		FLAG = TRUE;
+		SELECTONE .STACK_PTR[EXP$B_OPERATOR] OF
+			SET
+		[PLUS_TOKEN]:		CUR_VALUE = .STACK_PTR[EXP$L_VALUE] + .CUR_VALUE;
+		[MINUS_TOKEN]:		CUR_VALUE = .STACK_PTR[EXP$L_VALUE] - .CUR_VALUE;
+		[ASTERISK_TOKEN]:	CUR_VALUE = .STACK_PTR[EXP$L_VALUE] * .CUR_VALUE;
+		[SLASH_TOKEN]:		CUR_VALUE = .STACK_PTR[EXP$L_VALUE] / .CUR_VALUE;
+ 		[AT_SIGN_TOKEN]:	CUR_VALUE = .STACK_PTR[EXP$L_VALUE] ^ .CUR_VALUE;
+		[LANGLE_TOKEN]:		0;			! No operation to perform
+		[NEGATION_TOKEN]:	BEGIN
+					FLAG = FALSE;
+					CUR_VALUE = -.CUR_VALUE;
+					IF (.STACK_PTR GTRU EXPR_STACK) ! Check for stack underflow
+					THEN
+						STACK_PTR = CH$PTR(.STACK_PTR, -EXP$C_SIZE); ! Point to last entry
+					END;
+		[OTHERWISE]:		BEGIN
+					SIGNAL(DBG$_INVOPR);	! Unrecognized operand
+					RETURN (0);		! No return
+					END;
+			TES;
+		END
+		UNTIL (.FLAG);
+
+		CUR_OPERATOR = 0;
+		NUMBER_FLAG = TRUE;
+		END;
+
+
+	[DIGIT_STR_TOKEN]:				! numeric string
+		BEGIN
+		IF (.CUR_OPERATOR EQL 0)
+		THEN
+			CUR_VALUE = .(.LEX_STG_DESC[DSC$A_POINTER])
+		ELSE
+			DO
+			BEGIN
+			FLAG = TRUE;
+			IF (.CUR_OPERATOR EQL NEGATION_TOKEN)
+			THEN
+				CUR_VALUE = .(.LEX_STG_DESC[DSC$A_POINTER]);
+			SELECTONE .CUR_OPERATOR OF
+				SET
+			[PLUS_TOKEN]:	CUR_VALUE = .CUR_VALUE + .(.LEX_STG_DESC[DSC$A_POINTER]);
+			[MINUS_TOKEN]:	CUR_VALUE = .CUR_VALUE - .(.LEX_STG_DESC[DSC$A_POINTER]);
+			[ASTERISK_TOKEN]: CUR_VALUE = .CUR_VALUE * .(.LEX_STG_DESC[DSC$A_POINTER]);
+			[SLASH_TOKEN]:	CUR_VALUE = .CUR_VALUE / .(.LEX_STG_DESC[DSC$A_POINTER]);
+			[AT_SIGN_TOKEN]: CUR_VALUE = .CUR_VALUE ^ .(.LEX_STG_DESC[DSC$A_POINTER]);
+			[LANGLE_TOKEN]:	0;		! No operation to perform
+			[NEGATION_TOKEN]:
+					BEGIN
+					FLAG = FALSE;
+					CUR_VALUE = -.CUR_VALUE;
+					IF (.STACK_PTR GTRU EXPR_STACK) ! Check for stack underflow
+					THEN
+						BEGIN
+						STACK_PTR = CH$PTR(.STACK_PTR, -EXP$C_SIZE); ! Point to last entry
+						CUR_OPERATOR = .STACK_PTR[EXP$B_OPERATOR];
+						.LEX_STG_DESC[DSC$A_POINTER] = .CUR_VALUE;
+						CUR_VALUE = .STACK_PTR[EXP$L_VALUE];
+						END;
+					END;
+			[OTHERWISE]:	BEGIN
+					SIGNAL(DBG$_INVOPR);	! Unrecognized operand
+					RETURN (0);		! No return
+					END;
+				TES;
+			END
+			UNTIL (.FLAG);
+		CUR_OPERATOR = 0;
+		NUMBER_FLAG = TRUE;
+		END;
+
+
+	[EOL_TOKEN,
+	 COMMA_TOKEN]:					! End of operand string
+		BEGIN
+		!++
+		! Either of these tokens signals the end of the operand string.
+		! Check if there is a numeric value to be written to the
+		! resultant string.  Check for expressions left on the stack.
+		!--
+		IF (.NUMBER_FLAG)
+		THEN
+			BEGIN
+			!++
+			! Output the current value as an ASCII string.
+			!--
+			DBG$GL_BUF_SIZ = 0;
+			DBG$CP_OUT_STR = CH$PTR(.OPRND_STG_DESC[DSC$A_POINTER],
+						.OPRND_STG_DESC[DSC$W_LENGTH]);
+			DBG$FAO_PUT( (.dbg$cp_out_str-1), EXP_STG, .CUR_VALUE, 
+    				dbg$cp_out_str);
+
+			OPRND_STG_DESC[DSC$W_LENGTH] = .OPRND_STG_DESC[DSC$W_LENGTH] + .DBG$GL_BUF_SIZ;
+			END;
+
+		!++
+		! Check that there is not a missing operand, i.e., there exists
+		! a current operator.
+		!--
+		IF (.CUR_OPERATOR NEQ 0)
+		THEN
+			BEGIN
+			SIGNAL(DBG$_NOOPRND);		! Missing operand (got operator>)
+			RETURN (0);			! No return
+			END;
+
+		!++
+		! Check that there was nothing left on the expression stack.
+		!--
+		IF (.STACK_PTR NEQU EXPR_STACK)
+		THEN
+			BEGIN
+			SIGNAL(DBG$_NOANGLE);		! Expression stack not empty
+			RETURN (0);			! No return
+			END;
+		IF (.OPRND_STG_DESC[DSC$W_LENGTH] EQL 0)
+		THEN
+			RETURN(NO_MORE_OPR)				! Got , or EOL_TOKEN and no operand
+		ELSE
+			RETURN(OPR_FOUND);
+		END;
+
+
+	[ALPHA_STR_TOKEN]:				! Register, L^,B^,... or symbolic name
+    ALPHA_CODE:
+		BEGIN
+		!++
+		! First check if the string is a register.  If so then pass
+		! it through.
+		!--
+		LOCAL
+			SYMBOL_BUF : VECTOR[MAX_BUF_SIZ,BYTE],	! Buffer to hold all of pathname
+			SYMBOL_DESC : BLOCK[12,BYTE],		! String descriptor for pathname
+			REG_NUM,				! Number of register found
+			LEXEME_PTR,				! Pointer to ASCII lexeme
+			temp_valu_desc : VALU_DESCRIPTOR,
+			NEXT_CHAR : BYTE,			! Next ASCII character in input stream
+			CHAR : BYTE;				! First ASCII character in lexeme
+
+		IF ((REG_NUM = DBG$REG_MATCH(LEX_STG_DESC)) GEQ 0) AND
+		    (.REG_NUM LEQ MAX_REG)
+		THEN
+			BEGIN
+			!++
+			! Found a register.  Pass it through.
+			!--
+			ADD_TO_OPER_STG ( LEX_STG_DESC, .OPRND_STG_DESC);
+			LEAVE ALPHA_CODE;
+			END;
+
+		!++
+		! It was not a register.  Check if it is one of the following
+		! directives:  L^, W^, B^, I^, or S^.  If so, pass the token
+		! through.
+		!--
+		LEXEME_PTR = CH$PTR(.LEX_STG_DESC[DSC$A_POINTER], 0);
+		CHAR = CH$RCHAR(.LEXEME_PTR);
+		IF (.LEX_STG_DESC[DSC$W_LENGTH] EQL 1)
+		THEN
+			IF (.CHAR EQL %C'B') OR
+			   (.CHAR EQL %C'W') OR
+			   (.CHAR EQL %C'L') OR
+			   (.CHAR EQL %C'I') OR
+			   (.CHAR EQL %C'S')
+			THEN
+				BEGIN
+				NEXT_CHAR = CH$RCHAR(.INS_STG_DESC[DSC$A_POINTER]);
+				IF (.NEXT_CHAR EQL %C'^')
+				THEN
+					BEGIN
+					LEX_BUF[1] = %C'^';	! add up-arrow too
+					LEX_STG_DESC[DSC$W_LENGTH] = .LEX_STG_DESC[DSC$W_LENGTH] + 1;
+					INS_STG_DESC[DSC$W_LENGTH] = .INS_STG_DESC[DSC$W_LENGTH] - 1;
+					INS_STG_DESC[DSC$A_POINTER] = .INS_STG_DESC[DSC$A_POINTER] + 1;
+					ADD_TO_OPER_STG (LEX_STG_DESC, .OPRND_STG_DESC);
+					LEAVE ALPHA_CODE;
+					END;
+				END;
+
+		!++
+		! The alpha string must be a symbolic name.
+		! Add the current token to the path name by calling DBG$BUILD_PATH.
+		! Also build an ascii string of the pathname using ADD_TO_OPER_STG 
+		! in case the symbol turns out to be undefined.  This will be
+		! used for forward branching in patch area.
+		!--
+		SYMBOL_DESC[DSC$W_LENGTH] = 0;
+		SYMBOL_DESC[DSC$A_POINTER] = SYMBOL_BUF;
+		SYMBOL_DESC[DSC$W_MAXLEN] = MAX_BUF_SIZ;
+		ADD_TO_OPER_STG (LEX_STG_DESC, SYMBOL_DESC);
+
+		! If build_path returns, then it must have worked.
+
+		DBG$BUILD_PATH(LEX_STG_DESC, FALSE);
+
+    GET_PATHNAME:
+			BEGIN
+			!++
+			! Now loop to get the rest of the pathname (if any).
+			!--
+			REPEAT
+			BEGIN
+			NEXT_CHAR = CH$RCHAR(.INS_STG_DESC[DSC$A_POINTER]);
+			IF (.NEXT_CHAR NEQ %C'\')
+			THEN
+				LEAVE GET_PATHNAME
+			ELSE
+				BEGIN
+				!+
+				! Found a backslash.  There must be another
+				! piece of the pathname.
+				!-
+				!+
+				! At this point the only valid tokens are:
+				! BACK_SLASH_TOKEN and ALPHA_STR_TOKEN.
+				!-
+				LEX_STG_DESC[DSC$W_LENGTH] = 0;
+				LEX_STG_DESC[DSC$A_POINTER] = LEX_BUF;
+				LEX_STG_DESC[DSC$W_MAXLEN] = CHS_PER_LEXEME;
+				INS_GET_TOKEN (.INS_STG_DESC, LEX_STG_DESC);
+				ADD_TO_OPER_STG (LEX_STG_DESC, SYMBOL_DESC); ! Add backslash to symbol
+
+				LEX_STG_DESC[DSC$W_LENGTH] = 0;
+				LEX_STG_DESC[DSC$A_POINTER] = LEX_BUF;
+				LEX_STG_DESC[DSC$W_MAXLEN] = CHS_PER_LEXEME;
+				IF (INS_GET_TOKEN (.INS_STG_DESC, LEX_STG_DESC)) NEQ ALPHA_STR_TOKEN
+				THEN
+					BEGIN
+					SIGNAL(DBG$_INVPATH, 1, SYMBOL_DESC); ! Invalid pathname
+					RETURN (0);		! No return
+					END;
+
+				! Build_path either works or SIGNALs its way out.
+				
+				DBG$BUILD_PATH(LEX_STG_DESC, FALSE);
+				ADD_TO_OPER_STG (LEX_STG_DESC, SYMBOL_DESC);
+				END;
+			END;
+			END;
+
+		!++
+		! Now the complete pathname has been acquired.  Try to
+		! convert it into a numerical value.  If the symbol is not
+		! defined then dbg$sym_to_valu signals an error and does
+		! not return.
+		!--
+		dbg$path_to_val(temp_valu_desc);
+
+		!++
+		! Now that a value has been found, process it as if a
+		! DIGIT_STR_TOKEN had been found.
+		!--
+		IF (.CUR_OPERATOR EQL 0)
+		THEN
+			CUR_VALUE = .temp_valu_desc[VALU_VALUE]
+		ELSE
+			DO
+			BEGIN
+			FLAG = TRUE;
+			IF (.CUR_OPERATOR EQL NEGATION_TOKEN)
+			THEN
+				CUR_VALUE = .TEMP_VALU_desc[VALU_VALUE];
+			SELECTONE .CUR_OPERATOR OF
+				SET
+			[PLUS_TOKEN]:	CUR_VALUE = .CUR_VALUE + .temp_valu_desc[VALU_VALUE];
+			[MINUS_TOKEN]:	CUR_VALUE = .CUR_VALUE - .temp_valu_desc[VALU_VALUE];
+			[ASTERISK_TOKEN]: CUR_VALUE = .CUR_VALUE * .temp_valu_desc[VALU_VALUE];
+			[SLASH_TOKEN]:	CUR_VALUE = .CUR_VALUE / .temp_valu_desc[VALU_VALUE];
+			[AT_SIGN_TOKEN]: CUR_VALUE = .CUR_VALUE ^ .temp_valu_desc[VALU_VALUE];
+			[LANGLE_TOKEN]:	0;		! No operation to perform
+			[NEGATION_TOKEN]:
+					BEGIN
+					FLAG = FALSE;
+					CUR_VALUE = -.CUR_VALUE;
+					IF (.STACK_PTR GTRU EXPR_STACK) ! Check for stack underflow
+					THEN
+						BEGIN
+						STACK_PTR = CH$PTR(.STACK_PTR, -EXP$C_SIZE); ! Point to last entry
+						CUR_OPERATOR = .STACK_PTR[EXP$B_OPERATOR];
+						temp_valu_desc[VALU_VALUE] = .CUR_VALUE;
+						CUR_VALUE = .STACK_PTR[EXP$L_VALUE];
+						END;
+					END;
+			[OTHERWISE]:	BEGIN
+					SIGNAL(DBG$_INVOPR);	! Unrecognized operand
+					RETURN (0);		! No return
+					END;
+				TES;
+			END
+			UNTIL (.FLAG);
+		CUR_OPERATOR = 0;
+		NUMBER_FLAG = TRUE;
+		END;
+
+
+	[OTHERWISE]:					! Illegal token type
+		BEGIN
+		SIGNAL(DBG$_INVOPR);			! Unrecognized operand
+		RETURN (0);				! No return
+		END;
+
+		TES;
+	END;						! End of REPEAT loop
+RETURN (OPR_FOUND);
+END;
+
+ROUTINE INS_GET_TOKEN (INPUT_STG_DESC, LEXEME_STG_DESC) = 
+
+!++
+! Functional Description:
+!	Extracts a lexeme from the input stream by calling the routine
+!	DBG$MAR_GET_LEX . This routine first zeroes a buffer to hold the lexeme.
+!	The value of the routine is the token in the character string
+!	pointed to by LEXEME_STG_DESC, the string descriptor for the lexeme.
+!	Also the input buffer string descriptor is updated.
+!
+! Formal parameters:
+!	INPUT_STG_DESC - String descriptor for input line
+!	LEXEME_STG_DESC - String descriptor for lexeme found
+!
+! Implicit Inputs:
+!	None.
+!
+! Implicit Outputs:
+!	The string descriptors are updated.
+!
+! Returned Value:
+!	An encoded representation of the token found.
+!--
+
+    BEGIN
+
+    MAP
+	INPUT_STG_DESC : REF BLOCK [, BYTE],
+	LEXEME_STG_DESC : REF BLOCK[,BYTE];
+
+    !++
+    ! First zero out the buffer which will hold the lexeme found.
+    !--
+
+    ZEROCOR (.LEXEME_STG_DESC[DSC$A_POINTER], (.LEXEME_STG_DESC[DSC$W_MAXLEN]/4));
+    RETURN (DBG$MAR_GET_LEX(.INPUT_STG_DESC, .LEXEME_STG_DESC));
+
+    END;
+
+ROUTINE ADD_TO_OPER_STG (LEX_STG_DESC, OPRND_STG_DESC, MAX_BUF_SIZ) = 
+
+!++
+! Functional Description:
+!	This routine takes an ASCII lexeme and adds it to an operand buffer.
+!	It may be used to take any ASCII string described by a string
+!	descriptor and add it to a buffer described by another string
+!	descriptor.  The string descriptor for the latter is updated to
+!	include the new ASCII string.  The third input parameter gives the
+!	maximum size of the operand buffer.
+!
+! Formal Parameters:
+!	LEX_STG_DESC - String descriptor for input lexeme
+!	OPRND_STG_DESC - String descriptor for resultant operand string
+!	MAX_BUF_SIZ - Size of the buffer pointed to by OPRND_STG_DESC
+!
+! Implicit Inputs:
+!	None.
+!
+! Implicit Outputs:
+!	The lexeme string is written into the next free bytes of the operand
+!	buffer.  The string descriptor for the resultant string, OPRND_STG_DESC,
+!	is updated.
+!
+! Returned Value:
+!	TRUE, if successful.
+!	FALSE, if the buffer overflowed.
+!--
+
+BEGIN
+
+MAP
+	LEX_STG_DESC : REF BLOCK [, BYTE],
+	OPRND_STG_DESC : REF BLOCK[,BYTE];
+
+!++
+! First check that there is room in the operand buffer for the lexeme string.
+!--
+IF ((.LEX_STG_DESC[DSC$W_LENGTH] + .OPRND_STG_DESC[DSC$W_LENGTH]) GTR .OPRND_STG_DESC[DSC$W_MAXLEN])
+THEN
+	RETURN(FALSE);
+
+!++
+! Plenty of room in buffer.  Move the lexeme string into the buffer, starting
+! at the next unused byte in the buffer.
+!--
+CH$MOVE(.LEX_STG_DESC[DSC$W_LENGTH], .LEX_STG_DESC[DSC$A_POINTER],
+	CH$PTR(.OPRND_STG_DESC[DSC$A_POINTER], .OPRND_STG_DESC[DSC$W_LENGTH]));
+
+!++
+! Now update the operand string descriptor to include the appended lexeme.
+!--
+OPRND_STG_DESC[DSC$W_LENGTH] = .OPRND_STG_DESC[DSC$W_LENGTH] + .LEX_STG_DESC[DSC$W_LENGTH];
+RETURN(TRUE);
+END;
+
+END
+ELUDOM

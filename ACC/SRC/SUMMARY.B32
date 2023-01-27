@@ -1,0 +1,857 @@
+MODULE
+SUMMARY (IDENT = 'V03-000') = 
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  ACC, Account file dumper
+!
+! ABSTRACT:
+!
+!	This module contains routines used to build and manipulate
+!	sort and summarization keys as well as routines to accumulate
+!	and report summarization totals and general totals.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. unprivileged user mode,
+!
+! AUTHOR:  Greg Robert and Steve Forgey, January 1982
+!
+! Modified by:
+!
+!	V03-003	SPF0082		Steve Forgey	Feb-11-1982
+!		Don't write records rejected by SORT if the /REJECTED
+!		qualifier was not present.
+!
+!	V03-002	SPF0081		Steve Forgey	Feb-06-1982
+!		Output delta times in "!2UL !%T" format.
+!
+!	V03-001	SPF0071		Steve Forgey	Jan-23-1982
+!		Include report item name in bar chart reports.
+!
+!--
+
+!-----------------------------------------------------------------------------+
+!									      !
+! 				INCLUDE  FILES				      !
+!									      !
+!-----------------------------------------------------------------------------+
+
+REQUIRE 'MSRC$:ACCDEF.REQ';		! Common ACC definitions
+
+!-----------------------------------------------------------------------------+
+!									      !
+! 			TABLE  OF  CONTENTS				      !
+!									      !
+!-----------------------------------------------------------------------------+
+
+UNDECLARE
+	RELEASE_TO_SORT,
+	SUMMARIZE,
+	WRITE_SUMMARY,
+	FIND_WATERMARK,
+	WRITE_BAR_GRAPH,
+	WRITE_TOTALS;
+
+FORWARD ROUTINE
+	RELEASE_TO_SORT,		! Build keys and release to sort
+	SUMMARIZE,			! Summation main control loop
+	BUILD_SUMMARY,			! Builds a summarization key
+	FIND_SUMMARY,			! Locates and allocates summary buckets
+	ACCUMULATE_SUMMARY,		! Accumulates summary totals
+	WRITE_SUMMARY,			! Output summary at end of file
+	FIND_WATERMARK,			! Determine peak values
+	WRITE_BAR_GRAPH,		! Output bar graphs
+	SETUP_GRAPH,			! Prepare to do bar graph
+	WRITE_TOTALS;			! Output totals at end of program
+
+
+!-----------------------------------------------------------------------------+
+!									      !
+! 			GENERAL  STORAGE  DEFINITIONS			      !
+!									      !
+!-----------------------------------------------------------------------------+
+
+OWN
+	hwm_bucket: ref vector [],	! Pointer to high watermark bucket
+	lwm_bucket: ref vector [],	! Pointer to low watermark bucket
+	key_desc: bblock [dsc$k_d_bln]	! Dynamic key symbol descriptor
+		  preset([dsc$b_class] = dsc$k_class_d),
+	bar_fao: bblock [dsc$k_d_bln]	! Dynamic work descriptor
+	      preset([dsc$b_class] = dsc$k_class_d),
+	bar_char: bblock [dsc$k_d_bln]	! Dynamic work descriptor
+	      preset([dsc$b_class] = dsc$k_class_d),
+	desc: bblock [dsc$k_d_bln]	! Dynamic work descriptor
+	      preset([dsc$b_class] = dsc$k_class_d),
+	wdesc: bblock [dsc$k_d_bln]	! Dynamic work descriptor
+	      preset([dsc$b_class] = dsc$k_class_d);
+
+
+
+GLOBAL ROUTINE RELEASE_TO_SORT (INPUT, KEYS, TABLE, OUTPUT) =
+
+!----
+!
+! Functional description
+!
+!	This routine builds a concatenated key string using standard
+!	sort key descriptors. And then release the record to the sort
+!	package.
+!
+! Input parameters
+!
+!	INPUT	= Address of the input record
+!	KEYS	= Address of a key descriptor list head
+!	TABLE	= Address of key table
+!
+! Output parameters
+!
+!	OUTPUT	= Address of a buffer to recieve the concatenated key
+!	Any errors encountered are RETURNed immediately.
+!	TRUE is returned on a normal exit.
+!
+!----
+
+BEGIN
+
+EXTERNAL
+	selected,			! Selected record count
+	rejected_rab,			! Rejected record output file RAB
+	version;			! Record format version
+
+MAP
+   input: ref bblock,
+   keys: ref blockvector [,quad,byte],	! Key descriptors
+   table: ref blockvector [,3];		! Key table
+
+LOCAL
+	index,				! Key table index
+	srcptr,				! Source string pointer
+	srclen,				! Source string length
+	desc:	vector [2, long];	! Temporary string descriptor
+
+!
+!INITIALIZE THE DESCRIPTOR --
+!	Initialize a descriptor with the address and size of the
+!	sort record including keys.
+!
+
+SELECTONEU .version of
+	SET
+	[acr$k_version2]:
+		desc [0] = .input + .input [acc$w_msgsiz] - .output;
+	[acr$k_version3t, acr$k_version3]:
+		desc [0] = .input + .input [acr$w_length] - .output;
+	TES;
+
+desc [1] = .output;
+
+Incr i to .(.keys-2)<0,8> do 
+	BEGIN
+	index = .keys [.i, key_w_pos];		! Key table index
+	srclen = .(.table [.index, sort_desc]);	! Source string length
+	if	.srclen eql 0
+	then	BEGIN
+		selected = .selected - 1;
+		if	PRESENT (REJECTED)
+		then	perform (write_binary (.input, rejected_rab));
+		return true;
+		END;
+	srcptr = .(.table [.index, sort_desc] + 4);! Source string address
+	output = ch$copy ( .srclen, .srcptr,
+		0,				! Fill character
+		.keys [.i, key_w_length],	! Destination length
+		.output);			! Destination address
+	END;
+
+!
+! RELEASE TO SORT --
+!	Release the record to the sort package.
+!
+
+Return sor$release_rec (desc);
+
+END;
+
+GLOBAL ROUTINE SUMMARIZE (BUFFER) =
+
+!----
+!
+! Functional description
+!
+!	This routine is part of summarization logic.  It is the main
+!	control routine.  It is entered when a record is selected and
+!	the user has specified /SUMMARY.
+!
+!	A symbol is constructed from the record which uniquely identifies
+!	the summarization 'bucket' to which this record belongs.  The
+!	construction is driven by the list of summarization keys supplied
+!	by the user.
+!
+!	Example:  If the user specified:
+!
+!			ACC /SUMMARY=(DAY, USER, ACCOUNT)
+!
+!	then a symbol (key) would be build out of a date string, username,
+!	and account name from the record:
+!
+!			YYYY MM DD USER---- ACCOUNT-----
+!			1980 10 21 ROBERT   VMS
+!
+!	Next the summarization bucket for the key is located.  If not found
+!	then a new bucket is allocated and intialized.
+!
+!	Finally the bucket is updated with the contents of the record.  Only
+!	those fields requested by the user via the /REPORT qualifier are
+!	summed.  Note that some fields are summed, some are mazimized, and
+!	some are averaged.
+!
+! Input parameters
+!
+!	BUFFER	=	Address of a record to be summed
+!
+! Output parameters
+!
+!	Any errors encountered are RETURNed immediately.
+!
+!----
+
+BEGIN
+
+LOCAL
+	bucket;				! Receives address of summation bucket
+
+Perform (build_summary (.buffer, key_desc));	! Build a summarization key
+
+Perform (find_summary (key_desc, bucket));	! Locate the summary bucket
+
+Perform (accumulate_summary (.buffer, .bucket));! Merge this record
+
+
+return true;
+END;
+
+ROUTINE BUILD_SUMMARY (BUFFER, KEY) =
+
+!----
+!
+! Functional description
+!
+!	This routine is part of summarization logic.  A summation key is
+!	built for the record contained in BUFFER.  The user has supplied
+!	a list of summation keys via the /SUMMARY=(key1, key2, ...) syntax.
+!	A string is built by appending the values associated with each key
+!	for this particular record.
+!
+! Input parameters
+!
+!	BUFFER	=	Address of a record
+!	KEY	=	Address of a dynamic descriptor to receive symbol
+!
+! Output parameters
+!
+!	A summary key is built in the output key buffer.
+!	Any errors encountered are RETURNed immediately.
+!
+!----
+
+BEGIN
+
+EXTERNAL
+	sum_key_fao,		! FAO describing key
+	sum_key_value;		! Values matching FAO
+!
+! SUM_KEY_FAO is a descriptor of the desired key value.  It is built out
+! of the individual descriptors associated with each possible summation key.
+!
+! SUM_KEY_VALUE is a table of addresses of values suitable for a FAOL call.
+! This table matches the set of FAO directives in SUM_KEY_FAO and is built
+! in a similar way.
+!
+! For construction details see PARSE_KEYS.
+!
+
+perform (lib$sys_faol (sum_key_fao, 0, .key, sum_key_value));
+
+return true;
+END;
+
+ROUTINE FIND_SUMMARY (KEY, BUCKET_ADR) =
+
+!----
+!
+! Functional description
+!
+!	This routine is part of summarization logic.  Given a summation
+!	key, this routine locates the matching summation bucket.  If no
+!	match is found, then a new bucket is allocated and a entry is
+!	made in the symbol table for this key.  The value associated with
+!	the symbol is the address of the summation bucket.
+!
+! Input parameters
+!
+!	KEY		=	Address of descriptor of summation key
+!	BUCKET_ADR	=	Address of longword to recieve bucket address
+!
+! Output parameters
+!
+!	BUCKET_ADR is loaded with the address of the summation bucket.
+!	Any errors encountered are RETURNed immediately.
+!
+!----
+
+BEGIN
+
+EXTERNAL
+	bucket_size,			! Bucket size to allocate in bytes
+	summation_table;		! Symbol table number for summation
+	
+
+If not lookup_symbol (.summation_table, .key, .bucket_adr)	! New symbol?
+then	BEGIN
+	perform (allocate (.bucket_size, .bucket_adr));		! Y, get bucket
+	ch$fill (0, .bucket_size, ..bucket_adr);		! Zero it
+	perform (add_symbol
+		(.summation_table, .key, ..bucket_adr));	! Enter symbol
+	END;
+
+return true;
+
+END;
+
+ROUTINE ACCUMULATE_SUMMARY (BUFFER, BUCKET) =
+
+!----
+!
+! Functional description
+!
+!	This routine is part of summarization logic.  It is called to
+!	merge a given record into its summation bucket.  The values to
+!	be merged are determined by the list of values to be reported
+!	given with the /REPORT=(val1, val2, ...) syntax, plus some
+!	standard values that are always summarized.
+!
+!	Summation bucket elements may be manipulated in any of the
+!	following ways:
+!
+!		Addition	(e.g. connect time)
+!		Integration	(e.g. CPUTIM * WSPEAK)
+!		Incrementing	(e.g. counting records)
+!		Maximizing	(e.g. generating a watermark)
+!
+! Input parameters
+!
+!	BUFFER	=	Address of a record to be summed
+!	BUCKET	=	Address of a summation bucket
+!
+! Output parameters
+!
+!	Any errors encountered are RETURNed immediately.
+!
+!----
+
+BEGIN
+
+EXTERNAL
+	report_items,			! Number of report items
+	report_value: vector [];	! Table of pointers to offsets
+
+MAP
+	bucket: ref vector [],		! Summary array
+	buffer:	ref bblock [];		! Record buffer
+
+LOCAL
+	index;				! Index to summation bucket item
+
+!
+! Using the report_value table build by parse_keys accumulate data
+! in the summary array.  Each entry in the report_value vector contains
+! the address of a structure that describes a report item.
+!
+
+Index = 1;				! First bucket_item reserved
+
+Incr i to .report_items - 1 do
+  BEGIN
+  BIND rep_item = .report_value [.i]: vector [];
+  case .rep_item [sum_ent_type] from 0 to 5 of
+    SET
+    [sum_type_add]:
+	bucket [.index]  = .bucket [.index] + ..rep_item [sum_ent_adr];
+
+    [sum_type_addx]:
+	perform (lib$addx (
+		bucket [.index], .rep_item [sum_ent_adr],
+		bucket [.index], rep_item [sum_ent_bsize]));
+
+    [sum_type_peak]:
+	bucket [.index] = maxu (.bucket [.index], ..rep_item [sum_ent_adr]);
+
+    [sum_type_incr]:
+	bucket [.index] = .bucket [.index] + 1;
+
+    [sum_type_type]:
+	if .buffer [acc$w_msgtyp] eqlu .rep_item [sum_ent_adr]
+	then bucket [.index] = .bucket [.index] + 1;
+
+    [sum_type_elap]:
+	0;
+
+    TES;
+  index = .index + .rep_item [sum_ent_bsize];
+  END;
+
+return true;
+END;
+
+GLOBAL ROUTINE WRITE_SUMMARY (key, data) =
+
+!----
+!
+! Functional description
+!
+!	This routine is called to output summarization lines.
+!	These lines are accumulated and totals lines are output
+!	each time a key break occurs
+!
+! Input parameters
+!
+!	KEY	= Address of descriptor of symbol
+!	DATA	= Address of a summation bucket
+!
+!
+! Output parameters
+!
+!	Any errors encountered are RETURNed immediately.
+!
+!----
+
+BEGIN
+
+EXTERNAL
+	report_items,
+	report_value: vector [],
+	report_hdr1_fao,		! Report header 1 FAO string
+	report_hdr2_fao,		! Report header 2 FAO string
+	report_det_fao;			! Report detail FAO string
+
+OWN
+	title_desc:bblock [dsc$k_d_bln]	! Allocate dynamic descriptor
+		preset([dsc$b_class] = dsc$k_class_d),
+	first: initial (true),		! First time switch
+	fao_list: VECTOR [MAX_REPORT+2];
+
+LOCAL
+	index_src,
+	index_dst;
+
+MAP
+	report_hdr1_fao: bblock,	! Upper report header
+	report_hdr2_fao: bblock,	! Lower report header
+	key:  ref bblock [2],		! Symbol descriptor
+	data: ref vector [];		! Summation record
+
+If .first then
+    BEGIN
+    EXTERNAL first_date, last_date;
+    LITERAL date1_size = 23, date2_size = 21;	! Length of date strings
+    LOCAL fill;
+
+    First = false;				! Clear switch
+    SET_SCROLL (5, SCREEN (length));		! Only effects Vt100's
+    ERASE_PAGE ();				! Erase entire screen
+
+    GET_VALUE ('TITLE', title_desc);		! Get the title
+    fill = SCREEN (width) - 2			! Compute available title area
+	- date1_size - date2_size;
+    if .title_desc [dsc$w_length] gtru .fill 	! If title is too long
+	then BEGIN
+	    signal (acc_titletrunc,1, .fill);	! -- then warn user
+    	    title_desc [dsc$w_length] =	.fill;	! -- truncate title
+	    END;
+
+    fill = .fill - .title_desc [dsc$w_length] + 2;
+
+    WRITE_LINE (XFAO (AD ('From: !17%D!#* !AS!#* To: !17%D'),
+	first_date,				!  -"From" date
+	.fill /2,				!  -fill to title
+	title_desc,				!  -title
+	.fill /2 + .fill mod 2,			!  -fill after title
+	last_date));				!  -"To" Date
+
+    WRITE_LINE (XFAO (report_hdr1_fao));	! Write report header 1
+    WRITE_LINE (XFAO (report_hdr2_fao));	! Write report header 2
+    WRITE_LINE (XFAO (AD ('!#*-'),		! Underline them
+	.report_hdr1_fao [dsc$w_length]));
+    END;
+
+fao_list [0] = .key;				! Store address of symbol desc
+						! as first data item
+index_src = 1;
+index_dst = 1;
+Incr i to .report_items - 1 do
+  BEGIN
+  BIND rep_item = .report_value [.i]: vector [];
+
+!
+! Check the field length.  If 1 then copy the summation value. Else copy the
+! summation value address.
+!
+
+  if .rep_item [sum_ent_bsize] eql 1
+  then	fao_list [.index_dst] = .data [.index_src]
+  else	BEGIN
+	BUILTIN emul;
+	lib$day (data [.index_src + 2], data [.index_src], data [.index_src]);
+	emul (%ref(100000), data [.index_src], %ref(0), data [.index_src]);
+	fao_list [.index_dst] = .data [.index_src + 2];
+	index_dst = .index_dst + 1;
+	fao_list [.index_dst] = data [.index_src];
+	END;
+  index_src = .index_src + .rep_item [sum_ent_bsize];
+  index_dst = .index_dst + 1;
+  END;
+
+Write_line (XFAOL (report_det_fao, fao_list [0]));	! Output a detail line
+
+return true;
+END;
+
+GLOBAL ROUTINE FIND_WATERMARK (BUFFER, BUCKET) =
+
+!----
+!
+! Functional description
+!
+!	This routine is called to scan the summarization buckets
+!	and determine the high watermark for each value.  A new
+!	summarization bucket is allocated and filled with the highest
+!	value encountered for each bucket item.
+!
+! Input parameters
+!
+!	BUFFER	=	Address of a record to be summed
+!	BUCKET	=	Address of a summation bucket
+!
+! Output parameters
+!
+!	Any errors encountered are RETURNed immediately.
+!
+!----
+
+BEGIN
+
+EXTERNAL
+	bucket_size,			! Size of a summation bucket
+	report_items,			! Number of report items
+	report_value: vector [];	! Table of pointers to offsets
+
+MAP
+	bucket: ref vector [],		! Summary array
+	buffer:	ref bblock [];		! Record buffer
+
+LOCAL
+	index;				! Index to bucket items
+
+If .hwm_bucket eql 0			! If no bucket allocated yet
+then	BEGIN
+	perform (allocate (.bucket_size, lwm_bucket));	! Then get low bucket
+	perform (allocate (.bucket_size, hwm_bucket));	! and high bucket
+	ch$fill (15, .bucket_size, .lwm_bucket);	! Fill with high values
+	ch$fill (0, .bucket_size, .hwm_bucket);		! Fill with low values
+	END;
+
+
+!
+! For each report item, maximize the value stored in the watermark
+! bucket with itself and the value stored in the current summation bucket.
+! Minimize the value with the one stored in the lowwatermark bucket and
+! store it.
+!
+
+Index = 1;				! First bucket_item reserved
+
+Incr i to .report_items - 1 do
+  BEGIN
+  BIND rep_item = .report_value [.i]: vector [];
+
+!
+! Check the field length.  If 1 then do a simple MAXU function to
+! determine watermark.  Else assume length is 2 and do a COMPARE_QUAD.
+! Do a MINU or COMPARE_QUAD for the minimum value
+!
+
+  if .rep_item [sum_ent_bsize] eql 1
+  then	BEGIN
+	hwm_bucket [.index] = maxu (.hwm_bucket [.index], .bucket [.index]);
+	lwm_bucket [.index] = minu (.lwm_bucket [.index], .bucket [.index]);
+	END
+  else	BEGIN
+	if COMPARE_QUAD (bucket [.index], GTRU, hwm_bucket [.index])
+	then MOVE_QUAD (bucket [.index], hwm_bucket [.index]);
+
+	if COMPARE_QUAD (bucket [.index], LSSU, lwm_bucket [.index])
+	then MOVE_QUAD (bucket [.index], lwm_bucket [.index]);
+	END;
+
+  index = .index + .rep_item [sum_ent_bsize];
+  END;
+
+return true;
+END;
+
+GLOBAL ROUTINE WRITE_BAR_GRAPH (key, data) =
+
+!----
+!
+! Functional description
+!
+!	This routine is called to output summarization totals in
+!	the form of a bar graph.  For each invocation it outputs
+!	a summarization key and a horizontal bar.
+!
+!	The length of the bar is based on the number of available
+!	columns and the highest value found for the report item.
+!	The highest value has been previously obtained by FIND_WATERMARK
+!	and is available in a watermark_bucket built by that subroutine.
+!
+! Input parameters
+!
+!	KEY	= Address of descriptor of symbol
+!	DATA	= Address of a summation bucket
+!
+! Output parameters
+!
+!	Any errors encountered are RETURNed immediately.
+!
+!----
+
+BEGIN
+
+EXTERNAL
+	report_value: vector [],
+	report_hdr1_fao: bblock [],	! First header for symbol column
+	report_hdr2_fao: bblock [];	! Second header for symbol column
+
+GLOBAL
+	reset_graph: initial (true);	! Triggers graph initialization
+
+OWN
+	title_desc:bblock [dsc$k_d_bln]	! Allocate dynamic descriptor
+		preset([dsc$b_class] = dsc$k_class_d);
+
+LOCAL
+	worth;				! Worth of column
+
+MAP
+	key:  ref bblock [2],		! Symbol descriptor
+	data: ref vector [];		! Summation record
+
+If .reset_graph then
+   BEGIN
+   EXTERNAL first_date, last_date;
+   LITERAL date1_size = 23, date2_size = 21;	! Length of date strings
+   LOCAL fill;
+
+   reset_graph = false;				! Clear switch
+
+   perform (setup_graph (
+	.lwm_bucket [1],			! Minimum value
+	.hwm_bucket [1],			! Maximum value
+	.key [dsc$w_length]+columns_per_group,	! Reserve left margin
+	worth,					! Receives computed worth
+	desc));					! Receives header string
+
+   GET_VALUE ('BAR_GRAPH', bar_char);		! Get graphing character
+
+   perform (str$append (bar_fao, ad ('!132<!#*')));! Load descriptor
+   perform (str$append (bar_fao, bar_char));	! Append to descriptor
+   perform (str$append (bar_fao, ad ('!>')));	! Append to descriptor
+   perform (str$append (report_hdr2_fao, desc));! Append graph header to symhdr
+
+   SET_SCROLL (5, SCREEN (length) - 1);		! Only effects Vt100's
+
+   ERASE_PAGE ();				! Erase entire screen
+
+   GET_VALUE ('TITLE', title_desc);		! Get the title
+
+   fill = SCREEN (width) - 2			! Compute available title area
+	- date1_size - date2_size;
+
+   if .title_desc [dsc$w_length] gtru .fill	! If title is too long
+	then BEGIN
+	    signal (acc_titletrunc,1, .fill);	! -- then warn user
+   	    title_desc [dsc$w_length] = .fill;	! Truncate title if necessary
+	    END;
+
+   fill = .fill - .title_desc [dsc$w_length] + 2;
+
+   WRITE_LINE (XFAO (AD ('From: !17%D!#* !AS!#* To: !17%D'),
+		first_date,			!  -"From" date
+		.fill/2,			!  -fill to title
+		title_desc,			!  -title
+		.fill/2 + .fill mod 2,		!  -fill after title
+		last_date));			!  -"To" Date
+
+   WRITE_LINE (report_hdr1_fao);		! Write report header 1
+   WRITE_LINE (report_hdr2_fao);		! Write report header 2
+   WRITE_LINE (XFAO (AD ('!#*-'),		! Underline it
+	.report_hdr2_fao [dsc$w_length]));	!  -Header length
+
+   END;
+
+Perform (lib$sys_fao (				! Build a bar
+		bar_fao,			!  -FAO control string
+		0,				!  -no output byte count
+		desc,				!  -output buffer
+		.data [1] / .worth));		!  -length of bar
+
+Incra ptr from .desc [dsc$a_pointer] to
+	.desc [dsc$a_pointer] + .desc [dsc$w_length] -1 by columns_per_group
+	do (.ptr)<0,8> = '|';
+
+BEGIN
+BIND rep_item = .report_value [0]: vector [];
+if .rep_item [sum_ent_bsize] eql 1
+then	BEGIN
+	WRITE_LINE (XFAO (AD ('!#<!AS!9UL !AS!>'),	! Write detail line
+		.report_hdr2_fao [dsc$w_length],	!  -maximum line size
+		.key,					!  -key descriptor
+		.data [1],				!  -data value
+		desc));					!  -bar descriptor
+	END
+else	BEGIN
+	OWN
+		day,
+		post_midnight: vector [2];
+	BUILTIN emul;
+	lib$day (day, data [1], post_midnight);
+	emul (%ref(100000), post_midnight, %ref(0), post_midnight);
+	WRITE_LINE (XFAO (AD ('!#<!AS!2UL !%T !AS!>'),	! Write detail line
+		.report_hdr2_fao [dsc$w_length],	!  -maximum line size
+		.key,					!  -key descriptor
+		.day,					!  -day value
+		post_midnight,				!  -time value
+		desc));					!  -bar descriptor
+	END;
+END;
+return true;
+END;
+
+ROUTINE SETUP_GRAPH (MINVAL, MAXVAL, RESERVE, WORTH, DESC) =
+
+!----
+!
+! Functional description
+!
+!	This routine calculates the worth of a column for a bar
+!	graph and prepares a header line to go over the graph.
+!
+! Input parameters
+!
+!	MINVAL	= Minimum value to be graphed
+!	MAXVAL	= Maximum value to be graphed
+!	RESERVE	= Number of columns to reserve for symbols
+!
+! Output parameters
+!
+!	WORTH	= Address of a longword to receive worth of a column
+!	DESC	= Address of a dynamic descriptor to receive header
+!
+!	Any errors encountered are RETURNed immediately.
+!
+!----
+
+BEGIN
+
+LOCAL
+	min,				! Holds local minimum value
+	width,				! Width of output device
+	range,				! maxval - minval
+	numgrp;				! Number of groups
+
+
+Width = SCREEN (width) - .reserve;		! Calc useable space
+
+Width = (.width/columns_per_group) * 		! Use integral number of groups
+	columns_per_group;
+
+If .minval lssu (.maxval/4) then min = 0
+   else min = .minval;				! Only offset if significant
+
+Range = maxu (.maxval - .min, 1);		! Compute range of graph
+
+.Worth = (.range+.width)/.width;		! Calc worth of column
+
+Numgrp = .width / columns_per_group;		! Calc number of groups
+
+Perform (str$dupl_char (.desc, 0));		! Zero result descriptor
+
+Incru i to .width by columns_per_group do	! For each group
+   BEGIN
+   perform (lib$sys_fao (			! Create a detail header
+	ad ('!#<!UL!>'),			!  -control string
+	0,					!  -no result length needed
+	wdesc,					!  -output buffer
+	columns_per_group,			!  -width of a column group
+	.min + (.i * ..worth)));		!  -group value
+
+   perform (str$append (			! Concatenate with header
+	.desc,					!  -destination
+	wdesc));				!  -source
+   END;
+
+Perform (str$left (.desc, .desc, width));	! Limit max string size
+
+Return true;
+END;
+
+GLOBAL ROUTINE WRITE_TOTALS  =
+
+!----
+!
+! Functional description
+!
+!	This routine is called when a totals page is required.  A
+!	totals page contains statistics accumlated during the running
+!	of the program, such as number of records read.
+!
+! Input parameters
+!
+!
+! Output parameters
+!
+!	Any errors encountered are RETURNed immediately.
+!
+!----
+
+BEGIN
+return true;
+END;
+
+END
+ELUDOM

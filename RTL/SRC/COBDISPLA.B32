@@ -1,0 +1,625 @@
+MODULE COB$DISPLAY (				!
+		   IDENT = '1-011'	! File: COBDISPLA.B32 EDIT:LB1011
+				   ) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!
+
+!++
+! FACILITY:  COBOL SUPPORT
+!
+! ABSTRACT:
+!
+!	Supports the COBOL DISPLAY and DISPLAY WITH NO ADVANCING
+!	statements.
+!
+!	Contains COB$$OPEN_OUT	to open an RMS file for output, and
+!		 COB$$WRITE_RMS to write a record on the file.
+!
+!	Avoids use of STR$CONCAT to avoid its overhead.  The 
+!	concatenation which needs to be done is done inline since
+!	all required lengths are known.
+!
+! ENVIRONMENT:  VAX-11 User Mode
+!
+! AUTHOR: Rich Reichert, CREATION DATE: 17-JULY-79
+!
+! MODIFIED BY:
+!
+! 1-001	- Original.  RKR 17-JULY-79
+! 1-002 - Remove usage of STR$CONCAT and associated string routines,
+!	  as well as minor code rearrangements to improve resulting
+!	  code.  RKR 17-SEPT-79
+! 1-003 - Change basic algorithm for concatenation.
+!	  If 1 string, write from caller's buffer
+!	  If more than 1 string and total length less than 132 chars,
+!		concatenated on stack.
+!	  Else concatenate in heap storage.
+!	  RKR 25-SEPT-79
+! 1-004 - Change symbolic name of LIBRARY file. RKR 1-OCT-79
+! 1-005 - Change references to LIB$_INVARG to COB$_INVARG
+!	  Cosmetic changes.  RKR 21-OCT-79
+! 1-006 - Make sensitive to REQUIRE file.  RKR 21-OCT-79
+! 1-007 - Improve error messages.  RKR 21-OCT-79
+! 1-008 - Pass filename descriptor to COB$$WRITE_RMS so that we have
+!	  filename available for signaling if errors arise.
+!	  RKR 05-NOV-79
+! 1-009 - Make smaller by creating additional common code.
+!	  RKR 07-NOV-79
+! 1-010	- Imperative clean-ups, also try SYS$ logicals.
+!	  PDG 00-FEB-81
+! 1-011 - Added EDIT phrase so CHECKIN creates a valid audit trail.  Also
+!	  updated copyright date.  LB 9-AUG-81
+!--
+
+
+!
+! SWITCHES:
+!
+SWITCHES ADDRESSING_MODE (EXTERNAL = GENERAL, NONEXTERNAL = WORD_RELATIVE);
+
+!
+! LINKAGES:
+!
+
+!
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+	COB$DISPLAY:	NOVALUE,		! Display with normal advancing
+	COB$DISP_NO_ADV:NOVALUE,		! Display with no advancing
+	COMMON_CODE:	NOVALUE,		! Code which is common to both
+	COMMON_CODE_1:	NOVALUE,
+	COB$$OPEN_OUT:	NOVALUE;		! Open for output
+
+!
+! INCLUDE FILES:
+!
+REQUIRE 'RTLIN:RTLPSECT';			! Macros for PSECTS
+REQUIRE 'RTLIN:COBDEF';				! Unit names
+
+LIBRARY 'RTLSTARLE';				! System symbols
+
+!
+! EQUATED SYMBOLS:
+!
+LITERAL
+    NUM_UNITS = COB$K_UNIT_MAX - COB$K_UNIT_MIN + 1,	! number of units
+    DISP =	0,		! code for display
+    DNA =	1,		! code for display with no advancing
+    CR =	%X'8D',		! code for carriage return
+    LINE_FEED =	%X'8A';		! code for line-feed
+
+
+!
+! PSECTS:
+!
+DECLARE_PSECTS (COB);		! declare psects for COB$ facility
+
+!
+! GUARDS:
+!
+!   Since the code assumes that COB$K_UNIT_MIN equals 0, and COB_TABLE
+!	has only 7 items in it, we safeguard this module.
+!
+%IF COB$K_UNIT_MIN NEQ 0 %THEN %ERROR('Unexpected COB$K_UNIT_MIN value') %FI
+%IF COB$K_UNIT_MAX GTR 6 %THEN %ERROR('Unexpected COB$K_UNIT_MAX value') %FI
+
+
+!
+! OWN STORAGE:
+!
+!   The following OWN cells are used by the file I/O routines.
+!
+OWN
+    WRITE_RAB:	VECTOR[NUM_UNITS] 
+		INITIAL (REP NUM_UNITS  OF LONG (0)),	! Address of output RAB
+    WRITE_IFI:	VECTOR[NUM_UNITS, WORD] 
+		INITIAL	(REP NUM_UNITS  OF WORD (0)),	! Internal file identifiers
+    PREV:	VECTOR [NUM_UNITS, BYTE]		! History of whether previous call was
+		INITIAL (REP NUM_UNITS OF BYTE (DISP)),	! a DISPLAY or DISPLAY_NO_ADV
+
+    USPCODE:	VECTOR[2,BYTE];				! byte 0 is prefix upspacing
+							! byte 1 is post upspacing
+
+!
+!   The following tables convert the UNIT number into a logical name.
+!
+MACRO
+    DESC_(A) = UPLIT BYTE(%ASCIC A) - BASE %;
+BIND
+    BASE = UPLIT(REP 0 OF (0)),
+    COB_TABLE = UPLIT(
+	DESC_('COB$INPUT'),
+	DESC_('COB$OUTPUT'),
+	DESC_('COB$CONSOLE'),
+	DESC_('COB$CARDREADER'),
+	DESC_('COB$PAPERTAPEREADER'),
+	DESC_('COB$LINEPRINTER'),
+	DESC_('COB$PAPERTAPEPUNCH')):	VECTOR[NUM_UNITS],
+    SYS_TABLE = UPLIT(
+	DESC_('SYS$INPUT'),
+	DESC_('SYS$OUTPUT'),
+	DESC_('SYS$ERROR'),
+	DESC_('SYS$INPUT'),
+	DESC_('SYS$INPUT'),
+	DESC_('SYS$OUTPUT'),
+	DESC_('SYS$OUTPUT')):		VECTOR[NUM_UNITS];
+
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+	LIB$STOP : NOVALUE,			! signals fatal error
+	LIB$GET_VM,				! Get virtual memory
+	LIB$FREE_VM;				! Free virtual memory
+
+EXTERNAL LITERAL
+	COB$_ERRDURDIS,				! Error during DISPLAY
+	COB$_FAIGET_VM,				! Failure to get VM
+	COB$_INVARG;				! Error message - 
+						! Invalid Argument(s)
+
+
+GLOBAL ROUTINE COB$DISPLAY (UNIT, STRING): NOVALUE =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Performs COBOL DISPLAY statement given a unit number and
+!	one or more strings to display.  If more than one string is
+!	specified, these strings are concatenated into a single string
+!	before being output.  The upspacing to be employed is a function
+!	of this call (normal ADVANCING) and the upspacing used on a
+!	previous call to this routine or to COB$DISP_NO_ADV.
+!
+!
+! FORMAL PARAMETERS:
+!
+!	UNIT.rl.v	integer unit number designating the device
+!			on which the string(s) is(are) to be displayed.
+!
+!	STRING.rt.dx	address of 1st of up to 254 string descriptors
+!			which are to concatenated and displayed on the
+!			specified device.
+!
+! IMPLICIT INPUTS:
+!
+!	Status information as to whether the output file in question
+!	is currently open.
+!
+! IMPLICIT OUTPUTS:
+!
+!	Updated status information for this file.
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Outputs a record on the specified file.
+!--
+    BEGIN
+    BUILTIN
+	CALLG,
+	AP;
+
+    USPCODE[1] = CR;			! Upspace code is carraige return
+    CALLG(.AP, COMMON_CODE_1);
+    PREV[.UNIT] = DISP;			! Prev. unit to become DISPLAY
+
+    END;
+
+GLOBAL ROUTINE COB$DISP_NO_ADV (UNIT, STRING): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Performs COBOL DISPLAY with NO ADVANCING statement given a unit number and
+!	one or more strings to display.  If more than one string is
+!	specified, these strings are concatenated into a single string
+!	before being output.  The upspacing to be employed is a function
+!	of this call (NO ADVANCING )and the upspacing used on a
+!	previous call to this routine or to COB$DISPLAY.
+!
+!
+! FORMAL PARAMETERS:
+!
+!	UNIT.rl.v	integer unit number designating the device
+!			on which the string(s) is(are) to be displayed.
+!
+!	STRING.rt.dx	address of 1st of up to 254 string descriptors
+!			which are to concatenated and displayed on the
+!			specified device.
+!
+! IMPLICIT INPUTS:
+!
+!	Status information as to whether the output file in question
+!	is currently open.
+!
+! IMPLICIT OUTPUTS:
+!
+!	Updated status information for this file.
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Outputs a record on the specified file.
+!
+!--
+    BEGIN
+    BUILTIN
+	CALLG,
+	AP;
+
+    USPCODE[1] = 0;			! Upspace code is 0
+    CALLG(.AP, COMMON_CODE_1);
+    PREV[.UNIT] = DNA;			! Prev. unit to become DISPLAY_NO_ADV
+
+    END;
+
+ROUTINE COMMON_CODE_1 (UNIT, STRING): NOVALUE =
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Performs common part of DISPLAY and DISPLAY_NO_ADV processing.
+!
+!
+! FORMAL PARAMETERS:
+!
+!	UNIT.rl.v	integer unit number designating the device
+!			on which the string(s) is(are) to be displayed.
+!
+!	STRING.rt.dx	address of 1st of up to 254 string descriptors
+!			which are to concatenated and displayed on the
+!			specified device.
+!
+! IMPLICIT INPUTS:
+!
+!	Status information as to whether the output file in question
+!	is currently open.
+!
+! IMPLICIT OUTPUTS:
+!
+!	Updated status information for this file.
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Outputs a record on the specified file.
+!--
+    BEGIN
+    BUILTIN
+	ACTUALPARAMETER,
+	ACTUALCOUNT;
+
+    LOCAL
+	TEMP:	VECTOR [COB$K_DIS_SIZE,BYTE],	! Temp buffer on stack
+	COUNT,					! Total chars to output
+	ADDR,					! Pointer into allocated storage
+	STATUS,					! Status from LIB$GET_VM call
+	DESC:	BLOCK [8,BYTE];			! Dynamically constructed desc.
+						!  for concatenating strings
+
+
+    ! If there is only one item to display, write directly from caller's buffer
+    !
+    IF ACTUALCOUNT() EQL 2
+    THEN
+	BEGIN
+	COMMON_CODE(.UNIT, .STRING);		! Do common processing
+	RETURN;
+	END;
+
+
+    ! Count total text to be displayed
+    !
+    COUNT = 0;
+    INCR I FROM 2 TO ACTUALCOUNT() DO
+	BEGIN
+	COUNT = .COUNT + .BLOCK[ ACTUALPARAMETER(.I), DSC$W_LENGTH; , BYTE];
+	END;
+
+
+    ! Build a fixed string descriptor
+    !
+    DESC[DSC$W_LENGTH]  = 0;
+    DESC[DSC$B_DTYPE]   = DSC$K_DTYPE_T;
+    DESC[DSC$B_CLASS]   = DSC$K_CLASS_S;
+    DESC[DSC$A_POINTER] = TEMP;			! Assume stack is used
+
+
+    ! Concatenate the caller's string(s) into a single string.
+    ! If there are more than "COB$K_DIS_SIZE" characters to be displayed,
+    ! allocate heap storage -- else use the stack.
+    !
+    IF .COUNT GTR COB$K_DIS_SIZE
+    THEN
+	BEGIN
+	!
+	! Allocate space and store its address into descriptor
+	!
+	IF NOT (STATUS = LIB$GET_VM(COUNT, DESC[DSC$A_POINTER]))
+	THEN
+	    LIB$STOP(COB$_FAIGET_VM, 0, .STATUS);
+	END;
+
+
+    ADDR = .DESC[DSC$A_POINTER];
+
+    INCR I FROM 2 TO ACTUALCOUNT() DO
+	BEGIN
+	LOCAL
+	    PTR: REF BLOCK[,BYTE];
+	PTR = ACTUALPARAMETER(.I);
+	CH$MOVE(.PTR[DSC$W_LENGTH], .PTR[DSC$A_POINTER], .ADDR);
+	ADDR = .ADDR + .PTR[DSC$W_LENGTH];
+	END;
+
+    DESC[DSC$W_LENGTH] = .ADDR - .DESC[DSC$A_POINTER];
+
+
+    COMMON_CODE(.UNIT, DESC);		! Do common processing
+
+
+    ! If we've been using heap storage, give it back
+    !
+    IF .COUNT GTR COB$K_DIS_SIZE
+    THEN
+	LIB$FREE_VM(COUNT, .DESC[DSC$A_POINTER]);
+
+    END;
+
+ROUTINE COMMON_CODE (UNIT, STRING): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Performs processing which is common to both DISPLAY and
+!	DISPLAY WITH NO ADVANCING.
+!	consisting of:
+!		Open unit if currently not open
+!		Complete calculation of upspace code
+!		Writes out the string
+!
+!
+!
+! FORMAL PARAMETERS:
+!
+!	UNIT.rl.v	integer unit number designating the device
+!			on which the string(s) is(are) to be displayed.
+!
+!	STRING.rt.dx	address of descriptor for the concatenated
+!			strings.
+!
+! IMPLICIT INPUTS:
+!
+!	Status information as to whether the output file in question
+!	is currently open.
+!
+! IMPLICIT OUTPUTS:
+!
+!	Updated status information for this file.
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Outputs a record on the specified file.
+!
+!--
+    BEGIN
+    MAP
+	STRING:	REF BLOCK[8, BYTE];
+
+    LOCAL
+	FILE_NAME:	BLOCK [8,BYTE],		! dynamically constructed desc.
+	RAB:		REF $RAB_DECL;
+
+
+    IF .UNIT GTRU COB$K_UNIT_MAX
+    THEN
+	RETURN LIB$STOP(COB$_INVARG);
+
+
+    ! If file is not yet open, open it.
+    !
+    IF .WRITE_RAB[.UNIT] EQL 0
+    THEN
+	COB$$OPEN_OUT(.UNIT);
+
+
+    ! Calculate the upspacing codes we need to use on this action
+    ! If previous operation was a DISPLAY, a line-feed is needed
+    !
+    USPCODE[0] = 0;
+    IF .PREV[.UNIT] EQL DISP
+    THEN
+	USPCODE[0] = LINE_FEED;
+
+
+    ! Write out the concatenated string
+    !
+    RAB = .WRITE_RAB[.UNIT];
+    RAB[RAB$L_RBF] = .STRING[DSC$A_POINTER];
+    RAB[RAB$W_RSZ] = .STRING[DSC$W_LENGTH];
+
+
+    ! Write the record.  Retry certain errors, signal others.
+    !
+    WHILE $PUT(RAB = .RAB) EQL RMS$_RSA DO $WAIT(RAB = .RAB);
+
+
+    IF NOT .RAB[RAB$L_STS]
+    THEN
+	RETURN LIB$STOP(COB$_ERRDURDIS, 1, .RAB+RAB$C_BLN, .RAB[RAB$L_STS], .RAB[RAB$L_STV]);
+
+    END;
+
+ROUTINE COB$$OPEN_OUT (UNIT): NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Open a file for writing, given a unit number.
+!
+! FORMAL PARAMETERS:
+!
+!	UNIT.rl.v	integer unit number designating the device
+!			on which the string(s) is(are) to be displayed.
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	Opens a file.  On error, Signals a fatal condition.
+!
+!--
+
+    BEGIN
+    LITERAL
+	MAX_BUF =	MAX(64, NAM$C_MAXRSS);
+    LOCAL
+	FAB:		$FAB_DECL,
+	NAM:		$NAM_DECL,
+	RAB:		REF $RAB_DECL,
+	FILE_NAME:	BLOCK[8, BYTE],		! Descriptor for the file name
+	TRANSLATE:	BLOCK[8, BYTE],
+	P:		REF VECTOR[,BYTE],
+	RSLBUF:		VECTOR[MAX_BUF,BYTE],
+	STATUS;
+
+
+    ! Determine whether the COB$xxx name is defined.
+    ! If so, use it.  If not, use the corresponding SYS$xxx name.
+    !
+    TRANSLATE[DSC$B_DTYPE]   = DSC$K_DTYPE_T;
+    TRANSLATE[DSC$B_CLASS]   = DSC$K_CLASS_S;
+    TRANSLATE[DSC$W_LENGTH]  = MAX_BUF;
+    TRANSLATE[DSC$A_POINTER] = RSLBUF;
+    P = .COB_TABLE[.UNIT] + BASE;
+    FILE_NAME[DSC$B_DTYPE]   = DSC$K_DTYPE_T;
+    FILE_NAME[DSC$B_CLASS]   = DSC$K_CLASS_S;
+    FILE_NAME[DSC$W_LENGTH]  = .P[0];
+    FILE_NAME[DSC$A_POINTER] = P[1];
+    IF $TRNLOG(LOGNAM = FILE_NAME, RSLBUF = TRANSLATE) NEQ SS$_NORMAL
+    THEN
+	BEGIN
+	P = .SYS_TABLE[.UNIT] + BASE;
+	FILE_NAME[DSC$W_LENGTH] = .P[0];
+	FILE_NAME[DSC$A_POINTER] = P[1];
+	END;
+
+
+    $FAB_INIT(
+	FAB = FAB,
+	NAM = NAM,
+	FAC = PUT,
+	FNA = .FILE_NAME[DSC$A_POINTER],
+	FNS = .FILE_NAME[DSC$W_LENGTH],
+	RAT = PRN,
+	FOP = SQO,
+	RFM = VFC);
+
+    $NAM_INIT(
+	NAM = NAM,
+	ESA = RSLBUF,
+	ESS = NAM$C_MAXRSS,
+	RSA = RSLBUF,
+	RSS = NAM$C_MAXRSS);
+
+    STATUS = $CREATE(FAB = FAB);
+    IF (TRANSLATE[DSC$W_LENGTH] = .NAM[NAM$B_RSL]) EQL 0 THEN
+    IF (TRANSLATE[DSC$W_LENGTH] = .NAM[NAM$B_ESL]) EQL 0
+    THEN
+	BEGIN
+	TRANSLATE[DSC$W_LENGTH] = .FAB[FAB$B_FNS];
+	TRANSLATE[DSC$A_POINTER]= .FAB[FAB$L_FNA];
+	END;
+
+
+    IF NOT .STATUS
+    THEN
+	RETURN LIB$STOP(COB$_ERRDURDIS, 1, TRANSLATE, .FAB[FAB$L_STS], .FAB[FAB$L_STV]);
+
+
+    IF NOT (STATUS = LIB$GET_VM(%REF(RAB$C_BLN + 8 + .NAM[NAM$B_RSL]), RAB))
+    THEN
+	RETURN LIB$STOP(COB$_FAIGET_VM, 0, .STATUS);
+
+
+    ! Save a descriptor for the resultant file name string,
+    ! and the string itself, after the RAB
+    !
+    BEGIN
+    LOCAL
+	Q: REF BLOCK[,BYTE];
+    Q = .RAB + RAB$C_BLN;
+    Q[DSC$B_DTYPE]   = DSC$K_DTYPE_T;
+    Q[DSC$B_CLASS]   = DSC$K_CLASS_S;
+    Q[DSC$W_LENGTH]  = .TRANSLATE[DSC$W_LENGTH];
+    Q[DSC$A_POINTER] = .RAB+RAB$C_BLN+8;
+    CH$MOVE( .Q[DSC$W_LENGTH], .TRANSLATE[DSC$A_POINTER], .RAB+RAB$C_BLN+8 );
+    END;
+
+
+    $RAB_INIT(
+	RAB = .RAB,
+	FAB = FAB,
+	ROP = EOF,
+	RHB = USPCODE);
+
+    IF NOT $CONNECT(RAB = .RAB)
+    THEN
+	RETURN LIB$STOP(COB$_ERRDURDIS, 1, .RAB+RAB$C_BLN, .RAB[RAB$L_STS], .RAB[RAB$L_STV]);
+
+    WRITE_RAB[.UNIT] = .RAB;
+    WRITE_IFI[.UNIT] = .FAB[FAB$W_IFI];
+    END;
+
+END
+ELUDOM

@@ -1,0 +1,887 @@
+	.TITLE	MCHECK730 -- NEBULA MACHINE CHECK
+	.IDENT	'V03-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY: SYSLOA730 - loadable CPU-dependent code
+;
+; ABSTRACT:
+;	This module contains routines to handle VAX 11/730 specific
+;	machine check errors.
+;
+; ENVIRONMENT:
+;	IPL = 31	Mode = KERNEL
+;
+; AUTHOR:  TRUDY MATTHEWS,	CREATION DATE: 25-Feb-1981
+;
+; MODIFIED BY:
+;
+;	V02-005	HRJ0050		Herb Jacobs		27-Jan-1981
+;		Add global counters for machine checks and memory errors.
+;
+;	V02-004	TCM0004		Trudy C. Matthews	23-Dec-1981
+;		Add comment to EXE$LOGMEM noting that error bits in memory
+;		CSRs are read-to-clear.
+;
+;	V02-003	TCM0003		Trudy C. Matthews	11-Aug-1981
+;		Move loading of machine check type code to LOG_MCHECK routine.
+;
+;	V02-002	TCM0002		Trudy C. Matthews	29-Jul-1981
+;		Change all "7ZZ"s to "730"s.
+;
+;	V02-001	TCM0001		Trudy C. Matthews	8-Jul-1981
+;		Check for "Do not enable CRD interrupts" flag in EXE$GL_FLAGS,
+;		not EXE$GL_DEFFLAGS.
+;
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+;
+; INCLUDED SYSTEM SYMBOL DEFINITIONS
+;
+	$EMBDEF <MC,SE>
+	$IPLDEF
+	;$MPMDEF
+	$PCBDEF
+	$PFNDEF
+	$PHDDEF
+	$PRDEF
+	$PSLDEF
+	$PTEDEF
+	$RPBDEF
+; put these definitions into SYSDEF?
+	$MCDEF
+	$MCHKDEF
+	$MEMDEF
+	$CSR0DEF
+	$CSR1DEF
+	$CSR2DEF
+
+;
+; OWN STORAGE:
+;
+
+MC$L_RECOVMSK = -4			; These symbols define offsets from AP
+MC$L_PCPSLPTR = -8			; to locations on the stack; see
+					; functional description of MCHECK730.
+
+	.PSECT	$$$260,QUAD,WRT
+;****** WHERE IS THIS TO BE DOCUMENTED???? ********
+EXE$MCHK_ERRCNT::			; Used to locate error counters
+					; via SYS.MAP.
+
+EXE$GL_TB1OLD::				; Time of last TB parity error.
+	.LONG	0
+EXE$GL_TB2OLD::				; Time of next-to-last TB error.
+	.LONG	0
+TB_THRESHOLD = 10			; Allowable time between TB errors
+					; (in 10 millisecond units).
+
+
+LAST_BADMCK:				; Time of last bad machine check code.
+	.LONG	0
+BADMCK_MIN = 1				; Allowable time between bad machine
+					; check codes.
+
+LAST_BADINT:				; Time of last illegal interrupt.
+	.LONG	0
+BADINT_MIN = 1				; Allowable time between bad interrupts.
+
+LAST_FPAPARITY:				; Time of last FPA parity error.
+	.LONG	0
+FPAPARITY_MIN = 1			; Allowable time between FPA errors.
+
+LAST_RDS:				; Time of last RDS error.
+	.LONG	0
+RDS_MIN = 1				; Allowable time between RDS errors.
+
+;
+; This data is used by ECC$REENABLE, which is periodically called to scan
+; the memory controller CSRs for CRD errors.
+;
+ECC$GW_REENAB:				; Time since CRD interrupts
+	.WORD	0			; were last enabled.
+
+REENABTIME = 60*15			; Reenable CRD interrupts every
+					; 15 minutes.
+
+ECC$GW_CRDWATCH:			; Time since last scanned mem
+	.WORD	0			; CSR for CRD errors.
+
+CRDWATCHTIME = 60			; Scan for non-interrupt CRD
+					; errors every 60 seconds.
+
+;
+; The following data is used by the CRD interrupt handler, EXE$LOGCRD, and
+; the memory CSR logging routine, EXE$LOGMEM.
+;
+ECC$AB_MEMERR:				; Count CRD errors logged recently.
+	.BYTE	0			; (within REENABTIME)
+
+CRDLOGMAX = 6				; Maximum number of CRD errors to log.
+
+ECC$AB_CRDCNT:				; Count recent CRD interrupts (within
+	.BYTE	0			; REENABTIME).
+
+CRDINTMAX = 3				; Maximum number of CRD interrupts
+					; before interrupts are disabled.
+
+MMG$L_CRDCNT:				; Count total CRD interrupts.
+	.LONG	0			;
+
+;
+; This is a table that maps one bit for each opcode in the VAX
+; instruction set.  If the corresponding bit is set, that opcode
+; may be safely restarted if interrupted by a machine check.
+;
+RESUME_TABLE:
+	.WORD	^B0011000000010111	;HALT,NOP,REI,RET,PROBER/W
+	.WORD	^B1111111110111110	;BRANCHES
+	.WORD	^B0000000000000000	;
+	.WORD	^B0000000000000010	;BRW
+	.WORD	^B0000000000000000	;
+	.WORD	^B0000000000001010	;CMPF,TSTF
+	.WORD	^B0000000000000000	;
+	.WORD	^B0000000000001010	;CMPD,TSTD
+	.WORD	^B0000000000000000	;
+	.WORD	^B0000000000100010	;CMPB,TSTB
+	.WORD	^B0000000000000000	;
+	.WORD	^B0000001100100010	;CMPW,TSTW,BISPSW,BICPSW
+	.WORD	^B0000000000000000	;
+	.WORD	^B0000000000100010	;CMPL,TSTL
+	.WORD	^B0011001100000011	;BBS,BBC,BLBS,BLBC,CMPV,CMPZV
+
+
+	.PSECT	WIONONPAGED,QUAD,RD,WRT
+	.SBTTL	* MACHINE CHECK ENTRY POINT *
+
+;++
+; MCHECK730 -- NEBULA MACHINE CHECK
+;
+; FUNCTIONAL DESCRIPTION:
+;	All machine checks are vectored to this entry point.  By casing
+;	off of the machine check type code in the machine check logout
+;	stack, determine the recovery action (if any) appropriate for
+;	each error.
+;
+; FORMAT OF NEBULA'S MACHINE CHECK LOGOUT STACK:
+;	On entry to this machine check handler, the stack is set up as follows:
+;
+;		00(SP):	# bytes in machine check log on stack (always 0C hex)
+;		04(SP):	machine check type code
+;		08(SP):	1st machine check parameter
+;		0C(SP):	2nd machine check parameter
+;		10(SP):	exception PC
+;		14(SP):	exception PSL
+;
+;	The meanings of the third and fourth longwords depend on the
+;	machine check type code.
+;
+;	As soon as the machine check handler is invoked, it sets up the stack
+;	as follows:
+;	+-------------------------------+	:(SP)
+;	|		.		|
+;	|		.		|
+;	|	saved R0 - R5, AP	|
+;	|		.		|
+;	|		.		|
+;	+-------------------------------+
+;	| pointer to PC/PSL of exception|	:MC$L_PCPSLPTR(AP)
+;	+-------------------------------+
+;	|	recovery mask		|	:MC$L_RECOVMSK(AP)
+;	+-------------------------------+
+;	| # bytes pushed on logout stack| :(AP)	:MC$L_BYTCNT(AP)
+;	+-------------------------------+
+;	|  machine check type code	|	:MC$L_TYPECODE(AP)
+;	+-------------------------------+
+;	|	1st parameter		|	:MC$L_P1(AP)
+;	+-------------------------------+
+;	|	2nd parameter		|	:MC$L_P2(AP)
+;	+-------------------------------+
+;	|	exception PC		|	:MC$L_PC(AP)
+;	+-------------------------------+
+;	|	exception PSL		|	:MC$L_PSL(AP)
+;	+-------------------------------+
+;
+;	AP will point to the beginning of the machine check log on the stack.
+;	2 longwords are immediately pushed on top of the machine check log, and
+;	are referenced as negative offsets from AP.  These two longwords are
+;	input arguments to EXE$MCHK_BUGCHK, a routine that is called to check
+;	for a user-declared machine check recovery block.  This routine is
+;	called immediately before bugchecking, and expects the mask and the
+;	pointer to the exception PC/PSL to be right on top of the machine check
+;	log on the stack.
+;--
+	.ALIGN	LONG	
+EXE$INT58::				; These interrupts are 11-780
+EXE$INT5C::				; specific and should never be
+EXE$INT60::				; seen on Nebula.
+EXE$DW780_INT::
+EXE$RH780_INT::
+	BRB	BAD_TYPE
+
+
+	.ALIGN	LONG
+EXE$MCHK::				; Machine check handler.
+	PUSHL	#MCHK$M_MCK		; Mask signals machine check.
+	PUSHAL	MC$L_PC+4(SP)		; Push pointer to exception PC/PSL.
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,AP> ; Working registers.
+	ADDL3	#<9*4>,SP,AP		; AP points to mchk log frame.
+
+	CASE	MC$L_TYPECODE(AP), -	; Case on machine check code.
+		<MICRO_ERRORS, -	; code	0
+		TB_PARITY, -		;	1
+		BAD_TYPE, -		; code	2 should never be seen.
+		BAD_MEM_CSR, -		;	3
+		NO_FAST_INT, -		; 	4
+		FPA_PARITY, -		; 	5
+		SPTE_READCHK, -		;	6
+		RDATASUBS, -		;	7
+		NX_MEM, -		;	8
+		UNALIGNED_IO, -		;	9
+		UNK_IO_ADDR, -		;	A
+		BAD_UB_ADDR>, -		;	B
+		TYPE=B
+
+BAD_TYPE:				; undefined exception
+	MOVL	#<MCHK$M_MCK! -		; Type code for check for
+		MCHK$M_LOG>,R2		; recovery block.
+	BSBW	LOG_MCHECK		; Log a machine check.
+;
+; Check to see if bad machine checks are occurring too rapidly.
+;
+	MOVAL	W^LAST_BADMCK,R0	; Address of time stamp.
+	MOVL	#BADMCK_MIN,R1		; Min allowable time between errors.
+	BSBW	CHK_AND_RESUME		; Try to resume.  Returns if
+					; unresumable opcode.
+	BUG_CHECK  BADMCKCOD,FATAL	; Bad machine check code.
+
+	.SBTTL	TRANSLATION BUFFER PARITY ERRORS
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Find and log the PTE in memory which is a correct copy of the
+;	bad PTE in the translation buffer.
+;	The microcode has already invalidated the translation buffer
+;	entry that caused the parity error.
+;	If TB errors are occurring too fast, bug check.
+;	Else attempt to resume the faulting instruction.
+;	If instruction not resumable, reflect exception/bugcheck.
+;
+; Machine check parameters:
+;	MC$L_P1(AP): TB entry in error
+;		<31>	- PTE valid bit
+;		<30:27>	- protection mask
+;		<26>	- PTE modify bit
+;		<25>	- TB valid bit
+;		<23:0>	- PFN
+;	MC$L_P2(AP): VA of reference whose PTE was in TB.
+;	******************************************************************
+;	*** NOTE *** This routine will look up the PTE corresponding to the
+;	VA in MC$L_P2(AP) and subtitute the contents of the PTE for the VA
+;	in the error log.
+;	*******************************************************************
+;--
+
+TB_PARITY:
+	MOVL	G^MMG$GL_SPTBASE,R1	; R1 = address of system page table.
+	MOVL	MC$L_P2(AP),R2		; R2 = VA of reference causing error.
+	EXTZV	#VA$V_VPN,#VA$S_VPN, -	; Get virtual page number.
+		R2,R3			; 
+	BBC	#VA$V_SYSTEM,R2, -	; Branch if process virtual address.
+		P0P1SPACE		;
+;
+; System virtual address.
+;	System page tables are never paged.  Use VPN to get the address of
+;	the PTE	which maps the system virtual address.
+;
+SYSTEMSPACE:
+	MOVL	(R1)[R3],R3		; Get PTE to log from system page table.
+	BRB	LOG_TBERR		; Go log PTE.
+
+;
+; P0 or P1 space address.
+;	P0 and P1 page tables can be paged.  Use VPN to get the address of
+;	the PTE which maps the P0 or P1 space address, then extract its VPN
+;	to check that the PTE is resident (valid).
+;
+P0P1SPACE:
+	MOVL	G^SCH$GL_CURPCB,R4	; R4 = address of current process PCB.
+	MOVL	PCB$L_PHD(R4),R5	; R5 = address of process header.
+	BBC	#VA$V_P1,R2,P0SPACE	; Branch if P0 space.
+P1SPACE:
+	MOVAL	@PHD$L_P1BR(R5)[R3],R3	; Get SVAPTE for P1 space VA.
+	BRB	CHECK_PTE		; Go check for valid PTE.
+P0SPACE:
+	MOVAL	@PHD$L_P0BR(R5)[R3],R3	; Get SVAPTE for P0 space VA.
+;
+; Check for valid PTE.
+;
+CHECK_PTE:
+	EXTZV	#VA$V_VPN,#VA$S_VPN, -	; Get VPN index into System Page Table.
+		R3,R0			;
+	MOVAL	(R1)[R0],R1		; Get address of SPTE for page table.
+	TSTL	(R1)			; Is SPTE valid?
+	BGTR	PTE_NOT_RESIDENT	; Branch if not.
+	MOVL	(R3),R3			; Get PTE.
+	BRB	LOG_TBERR		; Go log PTE.
+;
+; The page table containing the PTE which matches the PTE in the translation
+; buffer is not currently resident in memory.  Log a 0 as the memory PTE
+; parameter.
+;
+PTE_NOT_RESIDENT:
+	CLRL	R3
+
+;
+; Log Translation Buffer Parity error.  R3 contains the good PTE from memory.
+;
+LOG_TBERR:
+	MOVL	R3,MC$L_P2(AP)		; Substitute PTE as P2 parameter.
+	MOVL	#<MCHK$M_MCK! -		; Type code for check for
+		MCHK$M_LOG>,R2		; recovery block.
+	BSBW	LOG_MCHECK		; Log the machine check.
+
+	MFPR	#PR$_TODR,R0		; Get current time, in 10ms
+					; units.
+	SUBL3	W^EXE$GL_TB1OLD,R0,R2	; How long since last error?
+	CMPL	R2,#TB_THRESHOLD	; Errors coming too fast?
+	BGTRU	10$			; No; continue.
+	BRW	BUGCHECK		; TB bad -- fatal error.
+10$:
+	MOVL	W^EXE$GL_TB1OLD, -	; Save time of next-to-last
+		W^EXE$GL_TB2OLD		; TB error.
+	MOVL	R0,W^EXE$GL_TB1OLD	; Save time of last TB error.
+	BSBW	RESUME			; Try to resume instruction.
+					; Returns if unresumable opcode.
+	BRW	REFLECTCHK		; Reflect exception/bugcheck.
+
+	.SBTTL	MICROCODE DETECTED ERRORS
+;++
+; The following machine checks are caused by microcode-detected
+; inconsistencies in the hardware.
+;
+; Machine check parameters:
+;	if MC$L_P1(AP) = 0: No other information available
+;	if MC$L_P1(AP) = 2: Unable to write back PTE<M> bit
+;	if MC$L_P1(AP) = 3: Bad 8085 interrupt
+;	MC$L_P2(AP) is always 0
+;--
+
+MICRO_ERRORS:
+
+	.SBTTL	MEMORY REFERENCE ERRORS
+;++
+; These machine checks are caused by memory reference errors.
+;
+; Illegal format of memory CSR.
+;	MC$L_P1(AP): Virtual address referenced
+;	MC$L_P2(AP): Bad CSR value
+;
+; Unaligned or non-longword reference to I/O space.
+;	MC$L_P1(AP): Physical address referenced
+;	MC$L_P2(AP): 0
+;
+; Illegal UNIBUS reference.
+;	MC$L_P1(AP): physical address referenced
+;	MC$L_P2(AP): 0
+;
+; Hard memory error on SPTE read.
+;	MC$L_P1(AP): physical address of SPTE
+;	MC$L_P2(AP): error syndrome bits
+;--
+
+BAD_MEM_CSR:				; Illegal format of memory CSR.
+UNALIGNED_IO:				; Unaligned reference to I/O space, or
+					; non-longword ref to I/O space.
+BAD_UB_ADDR:				; Unaligned or longword ref
+					; to UNIBUS space.
+SPTE_READCHK:				; Hard memory error on SPTE read.
+	MOVL	#<MCHK$M_MCK! -		; Type code for recovery block
+		MCHK$M_LOG>,R2		; check.
+	BSBW	LOG_MCHECK		; Log the machine check.
+	BRW	REFLECTCHK		; Reflect exception/bugcheck,
+					; based on current process mode.
+
+	.SBTTL	NON-EXISTENT MEMORY
+;++
+; Machine Checks due to non-existent memory or non-existent I/O space addresses
+; may have their own specific recovery block.  A recovery block may prevent
+; logging of an NXM machine check, and/or it may prevent bugchecking because
+; of an NXM machine check.
+;
+; Non-existent memory.
+;	MC$L_P1(AP): physical address referenced
+;	MC$L_P2(AP): 0
+;
+; Illegal I/O space address.
+;	MC$L_P1(AP): physical address referenced
+;	MC$L_P2(AP): 0
+;--
+NX_MEM:					; Reference to non-existent memory.
+UNK_IO_ADDR:				; Unrecognized I/O space address.
+	MOVL	#<MCHK$M_LOG! -		; Type code for checking for
+		MCHK$M_MCK! -		; recovery block.
+		MCHK$M_NEXM>,R2		;
+	BSBW	LOG_MCHECK		; Log the machine check.
+
+	BISL	#MCHK$M_NEXM, -		; Indicate NXM in recovery mask on the
+		MC$L_RECOVMSK(AP)	; stack.
+	BRW	REFLECTCHK		; Reflect exception/bugcheck.
+
+
+	.SBTTL	ILLEGAL INTERRUPTS
+;++
+; Since this error occurs asynchronously, it doesn't make sense 
+; to decide what action to take based on the current process (as 
+; REFLECTCHK does).  Log the error and try to resume.
+;
+; Machine check parameters:
+;	MC$L_P1(AP): 0
+;	MC$L_P2(AP): 0
+;--
+
+NO_FAST_INT:				; Fast interrupt without support.
+	MOVL	#<MCHK$M_MCK! -		; Type code for recovery block
+		MCHK$M_LOG>,R2		; check.
+	BSBW	LOG_MCHECK		; Log the machine check.
+	MOVAL	W^LAST_BADINT,R0	; Get address of bad int time stamp.
+	MOVL	#BADINT_MIN,R1		; Min time between bad interrupts.
+	BSBW	CHK_AND_RESUME		; If errors not occurring too rapidly,
+					; try to resume; returns if attempt fails.
+	BRW	BUGCHECK		; Bugcheck.
+
+	.SBTTL	FPA PARITY
+;++
+; Floating Point Accelerator Parity Error
+;
+;	Retry the instruction.  The subroutine CHK_AND_RESUME checks to see if
+;	errors are recurring too rapidly.
+;
+; Machine check parameters:
+;	MC$L_P1(AP):
+;		<31:3>	- UNPREDICTABLE
+;		<2>	- Group 1 parity bit
+;		<1>	- Group 0 parity bit
+;		<0>	- Error summary bit
+;	MC$L_P2(AP): 0
+;--
+
+FPA_PARITY:
+	MOVL	#<MCHK$M_MCK! -		; Type code for recovery
+		MCHK$M_LOG>,R2		; block check.
+	BSBW	LOG_MCHECK		; Log the machine check.
+	MOVAL	W^LAST_FPAPARITY,R0	; Time of last FPA parity error.
+	MOVL	#FPAPARITY_MIN,R1	; Error threshhold.
+	BSBW	CHK_AND_RESUME		; If errors not occurring too rapidly,
+					; try to resume.  Return if opcode is
+					; unresumable.
+	BRW	REFLECTCHK		; Reflect exception/bugcheck.
+
+	.SBTTL	RDATASUBS
+
+;++
+;	UNCORRECTABLE ECC ERRORS -- READ DATA SUBSTITUTE
+;
+; Since this memory error could not be corrected by the hardware, the 
+; physical memory page is unusable.  Mark the page bad, and reflect exception/
+; bugcheck.
+;
+; Machine check parameters:
+;	MC$L_P1(AP): physical address of reference
+;	MC$L_P2(AP): error syndrome bits
+;--
+	.ENABL	LSB
+RDATASUBS:				; Read data substitute.
+;
+; Mark page bad.
+;
+	ASHL	#-9,MC$L_P1(AP),R0	; Get PFN of bad memory location.
+	CMPL	R0,G^MMG$GL_MAXPFN	; PFN data base for this page?
+	BGTRU	10$			; No, cannot mark page bad.
+	MOVAL	G^PFN$AB_TYPE, R1	; Get address of PFN TYPE array.
+	BISB2	#PFN$M_BADPAG, -	; Mark page bad.
+		@(R1)[R0]		;
+10$:
+;
+; Log a machine check and a memory error.
+;
+	MOVL	#<MCHK$M_MCK! -		; Type code for recovery block
+		MCHK$M_LOG>,R2		; check.
+	BSBW	LOG_MCHECK		; Log the machine check.
+	MOVZBL	#EMB$K_HE,R3		; Error type code for logging.
+	BSBW	EXE$LOGMEM		; Log a hard memory error.
+	BRW	REFLECTCHK		; Reflect exception/bugcheck.
+	.DSABL	LSB
+
+	.SBTTL	* EXITS FROM MACHINE CHECK ROUTINES *
+	.SBTTL	CHK_AND_RESUME
+;++
+; CHK_AND_RESUME
+;
+; FUNCTIONAL DESCRIPTION:
+;	Called to check time that this error last occurred.
+;	CHK_AND_RESUME has three possible exit paths:
+;		(1) If errors are occurring too rapidly, BUGCHECK.
+;	Else fall through to RESUME:
+;		(2) If opcode is unresumable, RSB.
+;		(3) Else resume: clear stack and REI to retry the instruction.
+; INPUTS:
+;	R0: Address of longword which contains time error last occurred.
+;	R1: Minimum time that must have elapsed since the last error.
+;
+; IMPLICIT INPUTS:
+;	 PR$_TODR
+;
+; OUTPUTS:
+;	The longword pointed to by R0 is updated with the time of this error.
+;--
+CHK_AND_RESUME:
+	MFPR	#PR$_TODR,R2		; Get current time in R2.
+	SUBL3	(R0),R2,R3		; How long since last error?
+	CMPL	R3,R1			; Compare against minimum threshhold.
+	BGTRU	10$			; Br if enough time has elapsed.
+	TSTL	(SP)+			; Else clear return address from stack.
+	BRW	BUGCHECK		; Errors recurring too fast; bugcheck.
+10$:
+	MOVL	R2,(R0)			; Save time of latest error.
+					; Fall through to RESUME.
+
+	.SBTTL	RESUME
+;++
+; RESUME
+;
+; FUNCTIONAL DESCRIPTION:
+;	Try to resume faulting instruction.
+;	Instruction can be resumed if its corresponding bit in RESUME_TABLE
+;	is set.  Resumable instructions have the common characteristic that
+;	they can be guaranteed to re-execute correctly.
+;
+; CALLING SEQUENCE:
+;	RESUME is called as a subroutine, or entered as the back-end of the
+;	CHK_AND_RESUME subroutine. It only returns to its caller,
+;	however, if instruction could not be resumed.  If it was successful,
+;	it REIs to the resumable instruction.
+;
+; IMPLICIT INPUTS:
+;	MC$L_PC(AP): the address of the faulting instruction
+;	RESUME_TABLE: a table that maps one bit to each VAX-11 opcode
+;--
+
+RESUME:
+	MOVZBL	@MC$L_PC(AP),R5		; Get faulting opcode.
+	BBS	R5,W^RESUME_TABLE,10$	; Branch if resumable.
+	RSB				; Unable to resume; return to
+					; caller.
+;
+; Instruction can be resumed.  Retry the opcode.
+;
+10$:
+	TSTL	(SP)+			; Pop return addr from stack.
+	POPR	#^M<R0,R1,R2,R3,R4,R5,AP> ; Restore registers.
+	ADDL	#<2*4>,SP		; Remove inputs for recovery blk check.
+	ADDL	(SP)+,SP		; Clear mck log from stack.
+	MTPR	#0,#PR$_MCESR		; Clear "mcheck in progress" flag.
+	REI				; Retry faulting instruction.
+
+	.SBTTL	REFLCTCHK
+;++
+;	REFLECT MACHINE CHECK TO USER
+;
+; This code is entered if the machine check was fatal.  It determines
+; if it was just fatal to the process which caused it (current process
+; is in USER or SUPER mode), or if it was fatal to the entire system
+; (current process is in EXEC or KERNEL mode).
+;
+; If current process is in USER or SUPER mode,
+;	set up an exception on user's stack and REI to it
+; If current process is in EXEC or KERNEL mode,
+;	issue a fatal bugcheck.
+; CALLING SEQUENCE:
+;	BRB/W -- NOTHING EXTRA CAN BE ON THE STACK!!
+;
+; STACK CONTENTS:
+;	00(SP): saved R0,R1,R2,R3,R4,R5,AP
+;	1C(SP): 2 longword inputs for recovery block check
+;	24(SP): (also AP) machine check log -- 1st longword is a byte count.
+;--
+REFLECTCHK:				; Reflect exception according
+					; to current access mode.
+	BBS	#PSL$V_CURMOD+1, -	; Branch if USER or SUPER.
+		MC$L_PSL(AP),10$	;
+	BRW	BUGCHECK		; EXEC or KERNEL; bugcheck.
+
+10$:					; SUPER or USER; exception.
+	MFPR	#PR$_KSP,R0		; Get kernel stack pointer.
+	MOVQ	MC$L_PC(AP),-(R0)	; Push PC,PSL on kernel stack.
+	MTPR	R0,#PR$_KSP		; Replace new kernel stack ptr.
+	POPR	#^M<R0,R1,R2,R3,R4,R5,AP> ; Restore registers.
+	ADDL	#<2*4>,SP		; Pop inputs for recovery block check.
+	ADDL	(SP)+,SP		; Pop mck log from stack.
+;
+; Set up an exception stack for current process.
+; The faulting PC,PSL pair are still on the interrupt stack.  Alter
+; them to look as if an exception has occurred.
+;
+	MOVAB	G^EXE$MCHECK,(SP)	; Replace exception PC.
+	EXTZV	#PSL$V_CURMOD, -	; Zero exception PSL, except
+		#PSL$S_CURMOD, -	; for current access mode.
+		4(SP),4(SP)
+	ROTL	#PSL$V_PRVMOD, -	; Create a PSL of current mode
+		4(SP),4(SP)		; kernel, correct previous
+					; mode, and IPL 0.
+	MTPR	#0,#PR$_MCESR		; Clear "mcheck in progress" flag.
+	REI				; Go to exception handler.
+
+
+	.SBTTL	BUGCHECK
+;++
+; If user has declared a recovery block, transfer control to it.
+; Else issue a fatal bugcheck.
+;
+; CALLING SEQUENCE:
+;	BRB/W -- NOTHING EXTRA CAN BE ON THE STACK!!!
+;
+; STACK CONTENTS ON ENTRY:
+;	00(SP): saved R0,R1,R2,R3,R4,R5,AP
+;	1C(SP): 2 longword inputs for recovery block check
+;	24(SP): (also AP) machine check log
+;--
+BUGCHECK:
+	POPR	#^M<R0,R1,R2,R3,R4,R5,AP> ; Restore registers.
+;
+; A fatal bugcheck is now inevitable unless a user has declared a machine
+; check recovery block.
+;
+
+	MTPR	#0,#PR$_MCESR		; ******* temporary!! **********
+	JSB	G^EXE$MCHK_BUGCHK	; If return, no recovery block.
+	BUG_CHECK -			; Issue fatal bugcheck.
+		MACHINECHK,FATAL
+
+	.SBTTL	* LOGGING ROUTINES FOR MACHINE CHECKS *
+;++
+; LOG_MCHECK -- format inputs to LOGGER
+;
+; INPUTS:
+;	R2: a mask which specifies the type of error (hence, the type
+;		of recovery block to check for)
+;
+; IMPLICIT INPUTS:
+;	(AP): points to machine check log on stack
+;
+; OUTPUTS:
+;	Error is formatted and logged in system error log.
+;--
+
+LOG_MCHECK:
+;
+; Test if a machine check recovery block that specifies no error
+; logging is in effect.
+;
+	MOVAL	MC$L_PC(AP),R1		; R1 points to PC,PSL of abort.
+	JSB	G^EXE$MCHK_TEST		; Logging inhibited?
+	BLBC	R0,10$			; Branch if no.
+	RSB				; Else return.
+10$:					; Set up inputs to LOGGER.
+	INCL	G^EXE$GL_MCHKERRS	; Bump machine check error count
+	MOVL	#EMB$K_MC,R3		; Use Machine Check type code.
+	ADDL3	MC$L_BYTCNT(AP), -	; Size of data to log: machine check
+		#<2*4>,R4		; stack + PC,PSL.
+	MOVAL	MC$L_TYPECODE(AP),R5	; Address of data to log.
+;++
+; LOGGER - release error data to error logger
+;
+; INPUTS:
+;	R3: error type
+;	R4: number of bytes to log
+;	R5: address of information to be logged
+;
+; OUTPUTS:
+;	Error log is inserted into error log buffer.
+;	If no error log buffer, return with error status in R0.
+;	R0-R5 destroyed.
+;--
+
+LOGGER:
+	ADDL3	#EMB$B_MC_SUMCOD,R4,R1	; Add space for log header.
+	JSB	G^ERL$ALLOCEMB		; Get error logging buffer.
+	BLBC	R0, 20$			; Br if failed to get buffer.
+	PUSHL	R2			; Save buffer addr on stack.
+	MOVW	R3,EMB$W_MC_ENTRY(R2)	; Set entry type.
+	MOVC3	R4,(R5),EMB$B_MC_SUMCOD(R2)	; transfer info to log
+	POPR	#^M<R2>			; Retreive buffer address.
+	JSB	G^ERL$RELEASEMB		; Give buffer to logger.
+20$:
+	RSB
+
+;++
+; EXE$LOGMEM -- log memory Control and Status Registers
+;
+; FUNCTIONAL DESCRIPTION:
+;	EXE$LOGMEM is called to log memory CSRs.  If called with R3 = 
+;	EMB$K_SE (log a soft memory error), look at the memory CSRs to see
+;	if the CRD (soft error) bit was set; if not, don't log the CSRs.
+;	If "too many" CRD errors have been logged recently, also don't log
+;	the CSRs.
+;
+;	NOTE: The error bits in Nebula's memory CSRs are read-to-clear.
+;
+; INPUTS:
+;	R3: errorlog type code
+;
+; IMPLICIT INPUTS:
+;	The first longword of @MMG$GL_SBICONF contains the virtual address of
+;	the first memory controller CSR.
+;
+; OUTPUTS:
+;	Create entry in errorlog buffer containing the three memory controller
+;	Control and Status Registers.
+;	CRD error logging may be disabled.
+;	R0: low bit signals success/failure
+;	R1-R5 destroyed.
+;--
+EXE$LOGMEM:
+	MOVL	G^MMG$GL_SBICONF,R1	; Get address of SBICONF array.
+	MOVL	(R1),R1			; Get VA of 1st memory controller CSR.
+	DSBINT	#31,R0			; Block out all interrupts.
+	PUSHL	MEM$L_CSR2(R1)		; Push memory controller registers
+	PUSHL	MEM$L_CSR1(R1)		; on the stack.  NOTE: memory error
+	PUSHL	MEM$L_CSR0(R1)		; bits are read-to-clear.
+	ENBINT	R0			; Restore IPL.
+	CMPB	R3,#EMB$K_SE		; Looking for CRD errors?
+	BNEQ	LOG_CSRS		; No.  Unconditionally log CSRs.
+	BBC	#CSR1$V_CRD, -		; If CRD error bit not set,
+		MEM$L_CSR1(SP),NOLOG	; do not log soft memory error.
+;
+; A CRD error occurred.  Count it, and if we haven't logged a lot of CRD errors
+; recently, log it.
+;
+	INCL	G^EXE$GL_MEMERRS	; Bump memory error counter
+	INCB	W^ECC$AB_MEMERR		; Count # of CRD errors LOGGED recently.
+	CMPB	W^ECC$AB_MEMERR, -	; Already logged enough CRD errors
+		#CRDLOGMAX		; recently?
+	BGTRU	NOLOG			; Yes.  Skip the logging.
+	BRB	LOGNOCNT		; Don't bump count again.
+
+LOG_CSRS:
+	INCL	G^EXE$GL_MEMERRS	; Bump memory error counter
+LOGNOCNT:
+	MOVZBL	#<4*3>,R4		; Size of errorlog buffer.
+	MOVL	SP,R5			; Point to error log buffer.
+	BSBW	LOGGER			; Log memory CSRs.
+NOLOG:
+	ADDL	#<4*3>,SP		; Pop CSRs off stack.
+	RSB
+
+	.SBTTL	ECC$REENABLE -- TIMER CALL FROM SYSTEM CLOCK ROUTINE
+;++
+; ECC$REENABLE -- TIMER CALL FROM SYSTEM CLOCK ROUTINE
+;
+; FUNCTIONAL DESCRIPTION:
+;	This routine periodically scans memory controller CSRs for
+;	CRD errors.  CRD errors are normally reported by interrupt,
+;	but even when CRD interrupts are turned off this routine will
+;	still scan memory controller CSRs periodically, to report a
+;	representative sample of CRD errors.
+;
+;	Also, check if it is time to reenable CRD interrupts.
+;	CRD interrupts may have been disabled by the CRD interrupt handler,
+;	EXE$LOGCRD, if it determines that "too many" interrupts are being
+;	received.
+;
+; INPUTS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	If a CRD error is found the memory controller CSRs will be logged.
+;	CRD (Corrected Read Data) interrupts may be enabled for all
+;	memory controllers.
+;--
+
+ECC$REENABLE::
+	DECW	W^ECC$GW_CRDWATCH	; Time to scan for CRD errors?
+	BGTR	REENAB_SCAN		; Branch if no.
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save working registers.
+	MOVW	#CRDWATCHTIME, -	; Reset scan timer.
+		W^ECC$GW_CRDWATCH	;
+	MOVZWL	#EMB$K_SE,R3		; Test for CRD error,
+	BSBB	EXE$LOGMEM		; and log memory CSRs if found.
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore registers.
+;
+; If any CRD errors were found, the memory controller CSRs were logged.
+; Now check to see if its time to enable CRD interrupts.  CRD interrupts are
+; enabled periodically, whether or not they were disabled by EXE$LOGCRD.
+;
+REENAB_SCAN:
+	DECW	W^ECC$GW_REENAB		; Has reenable time elapsed?
+	BGTR	20$			; Branch if no.
+	MOVW	#REENABTIME, -		; Yes.  Reset reenable timer.
+		W^ECC$GW_REENAB		;
+	CLRB	W^ECC$AB_MEMERR		; Reset CRD log counter.
+	CLRB	W^ECC$AB_CRDCNT		; Reset CRD interrupt counter.
+	BBC	S^#EXE$V_CRDENABL, -	; Br if SYSGEN parameter does
+		G^EXE$GL_FLAGS,20$	; not specify CRD interrupts.
+	PUSHL	R1			; Save working register.
+	MOVL	G^MMG$GL_SBICONF,R1	; Get address of CONFREG array.
+	MOVL	(R1),R1			; Get VA of 1st memory controller CSR.
+	BISL	#CSR1$M_CRDENAB, -	; Reenable CRD interrupts.
+		MEM$L_CSR1(R1)		;
+	POPR	#^M<R1>
+20$:	RSB				; Return.
+
+	.SBTTL	EXE$LOGCRD -- CORRECTED MEMORY DATA INTERRUPTS
+;++
+; This routine is called when a CRD -- Corrected Read Data -- interrupt
+; is received from a memory controller.  Log all interrupts, and
+; continue.  If too many CRD interrupts are logged, turn off CRD interrupts.
+;--
+	.ALIGN	LONG
+EXE$LOGCRD::
+EXE$INT54::
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save working registers.
+	MOVZWL	#EMB$K_SE,R3		; Soft memory error.
+	BSBW	EXE$LOGMEM		; Log a memory error.
+	INCL	W^MMG$L_CRDCNT		; Count total CRD interrupts.
+	INCB	W^ECC$AB_CRDCNT		; Count recent CRD interrupts.
+	CMPB	W^ECC$AB_CRDCNT, -	; More than enough CRD interrupts
+		#CRDINTMAX		; lately?
+	BLEQU	10$			; No, do not disable CRD interrupts.
+	MOVL	G^MMG$GL_SBICONF,R1	; Get address of CONFREG array.
+	MOVL	(R1),R1			; Get VA of 1st memory controller CSR.
+	BICL	#CSR1$M_CRDENAB, -	; Disable CRD interrupts.
+		MEM$L_CSR1(R1)
+10$:
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore registers.
+	REI				; Return from interrupt.
+
+
+	.SBTTL	END OF MODULE
+	.END

@@ -1,0 +1,583 @@
+
+MODULE RM3FNDRRV (LANGUAGE (BLISS32) ,
+		IDENT = 'V03-001'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:	RMS32 INDEX SEQUENTIAL FILE ORGANIZATION
+!
+! ABSTRACT:
+!                Find record by RRV, taking indirection if neccessary
+!
+!
+! ENVIRONMENT:
+!
+!		VAX/VMS OPERATING SYSTEM
+!
+!--
+
+!
+! AUTHOR:        Christian Saether     CREATION DATE:	28-APR-78  13:21
+!
+!
+! MODIFIED BY:
+!
+!	V03-001	TMK0001		Todd M. Katz		17-Mar-1981
+!		In order to solve the SIDR deadlock problem, the cache
+!		flag CSH$V_NOWAIT is set before this routine is called
+!		whenever we are attempting to access the primary data record
+!		by its RFA address from a SIDR. Therefore, the possibility
+!		exists that when we attempt to access the primary data bucket,
+!		we will recieve a record lock error in circumstances other than
+!		when the input parameter flag LOCK_ORIG caused the NOWAIT cache
+!		flag to be set when taking an indirection. The current behavior
+!		assumes that the LOCK_ORIG bit is set under such circumstances,
+!		that we should release our lock on the RRV bucket, try (with 
+!		waiting) for the primary data bucket, and then reclaim the 
+!		lock on the RRV bucket. This is not the desirable behavior when
+!		our original bucket was a SIDR. Instead we want to immediately
+!		return a RLK error when one is encountered. Therefore, add a
+!		further restriction so that after RM$GETBLK has been called
+!		and an error of RLK returned, that the original bucket 
+!		represented by the BDB whose address is in IRAB[IRB$L_NEXTBDB] 
+!		is not released, and another attempt is made to access the
+!		data record indirectly unless the input parameter flag 
+!		LOCK_ORIG was also set. 
+!
+!	V02-008	MCN0007		Maria del C. Nasr	27-Apr-1981
+!		Change input parameters to separate record identifier from
+!		lock flag.  Also define macro to detect prologue version and
+!		use correct record id.
+!
+!	V02-007	MCN0006		Maria del C. Nasr	16-Mar-1981
+!		Increase size of record identifier to a word in the local
+!		internal structures.
+!
+!	V02-006	REFORMAT	K. E. Kinnear		23-Jul-1980  9:58
+!
+! REVISION HISTORY:
+!
+!	V01-005			W. Koenig		24-Oct-1978  8:40
+!		Make changes caused by sharing conventions.
+!
+!	V01-004			C. D. Saether		29-Sep-1978  13:57
+!		Complete Rewrite.
+!
+!	V01-003			C. D. Saether		28-Aug-1978  15:23
+!		Fix logic on error pass.
+!
+!*****
+
+LIBRARY 'RMSLIB:RMS';
+
+REQUIRE 'RMSSRC:RMSIDXDEF';
+
+! Define default psects for code
+!
+
+PSECT
+    CODE = $$RMS3(PSECT_ATTR),
+    PLIT = $RMS3(PSECT_ATTR);
+
+! Linkages
+!
+
+LINKAGE
+    L_FIND_BY_ID,
+    L_FIND_BY_RRV,
+    L_GETBKT,
+    L_KEY_DESC,
+    L_RLSBKT,
+    L_RECORD_VBN;
+
+! Forward Routines
+!
+! External Routines
+!
+
+EXTERNAL ROUTINE
+    RM$FIND_BY_ID	: RL$FIND_BY_ID,
+    RM$GETBKT		: RL$GETBKT,
+    RM$KEY_DESC		: RL$KEY_DESC,
+    RM$RECORD_VBN	: RL$RECORD_VBN,
+    RM$RLSBKT		: RL$RLSBKT;
+
+MACRO
+    LOCK_ORIG 	= FLAGS[0,0,1,0] %,
+    ST 		= TMP1[0,0,16,0] %,
+    PTR_ID 	= TMP1[2,0,16,0] %,
+    LOOP_CONTROL = TMP1[4,0,8,0] %,
+    INDIRECT 	= TMP1[4,0,1,0] %,
+    ERROR_PASS 	= TMP1[4,1,1,0] %,
+    IND_DELETED = TMP1[4,2,1,0] %;
+
+
+GLOBAL ROUTINE RM$FIND_BY_RRV (VBN, ID, FLAGS) : RL$FIND_BY_RRV =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+! Using the VBN and ID passed as input parameters, search the
+! bucket for the desired record.  If the record found is an RRV, take
+! the indirection to the bucket pointed to after first releasing the
+! original bucket. Return with bucket accessed and REC_ADDR pointing
+! to the user data record.
+!
+! If the low bit of the FLAGS parameter is set (LOCK_ORIG), then the
+! original bucket is saved in NXTBDB and not released if the indirection
+! is taken.
+!
+! CALLING SEQUENCE:
+!
+!	RM$FIND_BY_RRV (VBN,ID,FLAGS)
+!
+! INPUT PARAMETERS:
+!
+!	VBN - of record to search for
+!	ID - contains ID to search for
+!	FLAGS - low bit (LOCK_ORIG) set if original
+!		bucket is to be retained if indirection taken
+!
+! IMPLICIT INPUTS:
+!
+!	COMMON_RABREG - registers used by GETBKT, GETNEXT_REC
+!
+! OUTPUT PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	REC_ADDR - address of record found
+!	IFAB[IFB$B_PLG_VER] - prologue version
+!	IRAB[IRB$L_CURBDB] - address of current BDB, contains data record
+!	IRAB[IRB$L_NXTBDB] - address of BDB referencing original bucket, if
+!			LOCK_ORIG specified and indirection taken
+!			otherwise not modified
+!
+! ROUTINE VALUE:
+!
+!	SUC - data record successfully found, REC_ADDR pointing
+!		to record in bucket referenced by CURBDB
+!
+!	ERRORS:
+!
+!		CURBDB and NXTBDB (if appropriate) are released and zeroed
+!
+!	RFA - bad bucket level (i.e, neq 0)
+!	RNF - record not found
+!	DEL - record deleted
+!	RRV - record pointer mismatchs
+!	plus assorted I/O error codes
+!
+! SIDE EFFECTS:
+!
+!	On any error condition, CURBDB is zeroed and bucket is released.
+!	No check made for RLSBKT errors.
+!	AP is blown across this routine.
+!	IRAB[ PTR_VBN ] is used if indirection taken, otherwise not
+!
+!--
+
+    BEGIN
+
+    LABEL
+	ALOOP,
+	BLOOP;
+
+    BUILTIN
+	AP;
+
+    MAP
+	FLAGS : BBLOCK;
+
+    MACRO
+	ERROR (CODE) =
+		BEGIN
+		ST = RMSERR(CODE);
+		EXITLOOP
+		END %,
+
+	EXIF_LOCK_ORIG =
+
+		IF .LOCK_ORIG
+		THEN
+
+		    IF (BDB = .IRAB[IRB$L_NXTBDB]) NEQ 0
+
+		    ! release the original bucket (NXTBDB) if it is still accessed
+		    !
+		    THEN
+			BEGIN
+			RM$RLSBKT(0);
+			IRAB[IRB$L_NXTBDB] = 0;
+			BDB = .IRAB[IRB$L_CURBDB];
+			EXITLOOP
+			END
+		    ELSE
+
+		        ! If original bucket had been released, then put CURBDB 
+		        ! back into BDB and continue.
+		        !
+		        BDB = .IRAB[IRB$L_CURBDB]; %,
+
+	! Determine if byte or word record identifier, depending on prologue
+	! version of file.
+	!
+	IRC$_RRV_ID =
+		(IF .IFAB[IFB$B_PLG_VER] LSSU PLG$C_VER_3
+		THEN
+		    .REC_ADDR[IRC$B_RRV_ID]
+		ELSE
+		    .REC_ADDR[IRC$W_RRV_ID]) %,
+
+	MAKE_ERR_PASS =
+		BEGIN
+
+		! 2 is the error pass flag
+		!
+		LOOP_CONTROL = .LOOP_CONTROL OR 2;
+		LEAVE BLOOP
+		END %,
+
+	GO_INDIRECT =
+		BEGIN
+		LOOP_CONTROL = 1;		! set control flags to INDIRECT
+		PTR_ID = IRC$_RRV_ID;
+		PTR_VBN = .REC_PTR_VBN;
+
+		IF .LOCK_ORIG
+		THEN
+		    BEGIN
+		    IRAB[IRB$L_NXTBDB] = .BDB;
+		    IRAB[IRB$B_CACHEFLGS] = CSH$M_NOWAIT;
+		    LEAVE ALOOP
+		    END
+		ELSE
+		    LEAVE BLOOP
+		END %,
+
+	PTR_VBN =
+		IRAB[IRB$L_PTR_VBN] %;
+
+    EXTERNAL REGISTER
+	COMMON_RAB_STR,
+	R_REC_ADDR_STR;
+
+    GLOBAL REGISTER
+	R_IDX_DFN_STR,
+	COMMON_IO_STR;
+
+    LOCAL
+	SAV_CFLAGS	: BYTE,
+	TMP1		: BBLOCK [5];
+
+    CH$FILL(0,5,TMP1);					! initialize LOOP_CONTROL
+
+    ! Save cacheflags for future passes and set up index descriptor for key 0.
+    !
+    SAV_CFLAGS = .IRAB[IRB$B_CACHEFLGS];
+    IRAB[IRB$B_CACHEFLGS] = 0;
+    RM$KEY_DESC(0);
+
+    DO
+
+    ! Leaving ALOOP causes another pass to be made with no additional action.
+    !
+ALOOP :
+	BEGIN
+	IRAB[IRB$B_CACHEFLGS] = .IRAB[IRB$B_CACHEFLGS] OR .SAV_CFLAGS;
+
+	! Leaving BLOOP releases the current BDB, resets cacheflags and makes
+	! another pass.
+	!
+BLOOP :
+	BEGIN
+	ST =
+	    BEGIN
+
+	    LOCAL
+	        SIZE;
+
+	    SIZE = .IDX_DFN[IDX$B_DATBKTSZ]*512;
+
+	    IF .INDIRECT
+	    THEN
+	        RM$GETBKT(.PTR_VBN, .SIZE)
+	    ELSE
+	        RM$GETBKT(.VBN, .SIZE)
+
+	    END;
+
+	IF NOT .ST
+	THEN
+
+	    IF 	 .LOCK_ORIG
+		 AND
+		(.ST EQL RMSERR(RLK))
+	    THEN
+
+		! One way to get an RLK error is when LOCK_ORIG caused the
+		! NOWAIT cacheflag to be set when taking an indirection.  In
+		! that case go indirect again without the NOWAIT set after
+		! releasing the original bucket first.  It will be picked up
+		! again later if the indirect pass is successful.
+		!
+		BEGIN
+		BDB = .IRAB[IRB$L_NXTBDB];
+		IRAB[IRB$L_NXTBDB] = 0;
+		LEAVE BLOOP;
+
+		END
+	    ELSE
+
+		! This is most likely a hardware failure so get out and make
+		! sure everything is released.
+		!
+		! Another possibility is that we encountered a RLK error when
+		! attempting to access a primary data bucket from a SIDR. In
+		! this case we want to just return the error status regardless
+		! if we were going indirect or direct at the time.
+		!
+		BEGIN
+
+		IF .LOCK_ORIG AND (BDB = .IRAB[IRB$L_NXTBDB]) NEQ 0
+		THEN
+		    EXITLOOP;		! causing NXTBDB to be released
+
+		IRAB[IRB$L_CURBDB] = 0;
+		RETURN .ST;
+
+		END;
+
+	! The bucket is accessed successfully.  Save the current BDB and
+	! continue.
+	!
+	IRAB[IRB$L_CURBDB] = .BDB;
+
+	!		*** NOTE ***
+	! that with reallocation of buckets to different levels,
+	! it may be possible to get this condition on an indirect pass.  This
+	! is not currently implemented and therefore not currently checked for.
+	!
+
+	IF .BKT_ADDR[BKT$B_LEVEL] NEQ 0
+	THEN
+
+	    ! Exit with RFA error, making sure that original bucket is released
+	    ! if indirection taken with LOCK_ORIG.
+	    !
+	    BEGIN
+	    ST = RMSERR(RFA);
+
+	    IF .INDIRECT
+	    THEN
+		EXIF_LOCK_ORIG;
+
+	    EXITLOOP;
+
+	    END;
+
+	! Load AP with the appropriate ID for the FIND_BY_ID search of this
+	! bucket.
+	!
+
+	IF .INDIRECT
+	THEN
+	    AP = .PTR_ID
+	ELSE
+	    AP = .ID;
+
+	ST = RM$FIND_BY_ID();
+	AP = 3;		! initialize for subsequent calls to RECORD_VBN
+
+	IF .INDIRECT
+	THEN
+
+	    ! This code is executed on the indirect pass.  In LOCK_ORIG mode,
+	    ! an error condition will cause an exit if the original bucket is
+	    ! still accessed. Otherwise, an error pass back to the original
+	    ! bucket is made to confirm that the pointers to this bucket have
+	    ! not changed.
+	    !
+	    BEGIN
+	    LOOP_CONTROL = 0;
+
+	    IF NOT .ST
+	    THEN
+		BEGIN
+		EXIF_LOCK_ORIG;
+		MAKE_ERR_PASS;
+		END;
+
+	    IF .REC_ADDR[IRC$V_DELETED]
+	    THEN
+		BEGIN
+		IND_DELETED = 1;
+		ST = RMSERR(DEL);
+		EXIF_LOCK_ORIG;
+		MAKE_ERR_PASS;
+		END;
+
+	    IF .REC_ADDR[IRC$V_RRV]
+	    THEN
+		BEGIN
+		ST = RMSERR(RRV);
+		EXIF_LOCK_ORIG;
+		MAKE_ERR_PASS;
+		END;
+
+	    IF (IRC$_RRV_ID NEQ .ID)
+		OR
+		(RM$RECORD_VBN() NEQ .VBN)
+	    THEN
+		BEGIN
+		ST = RMSERR(RRV);
+		EXIF_LOCK_ORIG;
+		MAKE_ERR_PASS;
+		END;
+
+	    ! If we have gotten this far, we have successfully found the
+	    ! correct record taking the indirection.  If LOCK_ORIG mode, we
+	    ! must get back the original bucket if we had to release it to get
+	    ! this one, otherwise just exit (STATUS contains success).
+	    !
+
+	    IF .LOCK_ORIG AND .IRAB[IRB$L_NXTBDB] EQL 0
+	    THEN
+		BEGIN
+		IRAB[IRB$B_CACHEFLGS] = .SAV_CFLAGS;
+		ST = RM$GETBKT(.VBN, .IDX_DFN[IDX$B_DATBKTSZ]*512);
+
+		IF .ST
+		THEN
+		    BEGIN
+		    IRAB[IRB$L_NXTBDB] = .BDB;
+		    RETURN .ST;
+
+		    END
+		ELSE
+		    BEGIN
+		    BDB = .IRAB[IRB$L_CURBDB];
+		    EXITLOOP;
+
+		    END;
+
+		END
+	    ELSE
+		RETURN .ST;
+
+	    END;				! of INDIRECT pass code
+
+	! This is a direct pass, i.e., we are looking at the bucket described
+	! by the input VBN and ID.  Note that not finding the original record
+	! if on an error pass is a bug for prologue version 1, but may not be
+	! one if RRV's can be purged when the record is deleted.  At any rate,
+	! I'm not checking for it.
+	!
+
+	IF NOT .ST
+	THEN
+	    EXITLOOP;
+
+	IF .REC_ADDR[IRC$V_DELETED]
+	THEN
+	    ERROR(DEL);
+
+	BEGIN
+
+	LOCAL
+	    REC_PTR_VBN;
+
+	REC_PTR_VBN = RM$RECORD_VBN();
+
+	! If this is an error pass and the indirect pointers are still the
+	! same, then we have a real error, otherwise just go indirect and try
+	! again.
+	!
+
+	IF .ERROR_PASS
+	THEN
+
+	    IF (.PTR_ID EQL IRC$_RRV_ID)
+		AND
+		(.PTR_VBN EQL .REC_PTR_VBN)
+	    THEN
+
+		IF .IND_DELETED
+		THEN
+		    ERROR(DEL)
+		ELSE
+		    ERROR(RRV)
+	    ELSE
+		GO_INDIRECT;
+
+	! This is not an error pass so check if the record is an RRV.
+	!
+
+	IF .REC_ADDR[IRC$V_RRV]
+	THEN
+	    GO_INDIRECT;
+
+	! Record is not an RRV, so if the back pointers match, this is the
+	! record we want, otherwise return an RRV error.
+	!
+
+	IF (IRC$_RRV_ID EQL .ID)
+	    AND
+	    (.REC_PTR_VBN EQL .VBN)
+	THEN
+	    BEGIN
+	    RETURN .ST;
+
+	    END
+	ELSE
+	    ERROR(RRV);
+
+	END;				! of block defining REC_PTR_VBN
+	END;					! of BLOOP
+
+	! We have left BLOOP so release the bucket, reset cacheflags and go
+	! again.
+	!
+	RM$RLSBKT(0);
+	END					! of ALOOP
+    UNTIL 0;			! an EXITLOOP or RETURN is the only way out
+
+    ! This code executed on an EXITLOOP
+    !
+    RM$RLSBKT(0);
+    IRAB[IRB$L_CURBDB] = 0;
+    RETURN .ST
+
+    END;
+
+END
+
+ELUDOM

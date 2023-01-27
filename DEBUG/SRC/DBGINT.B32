@@ -1,0 +1,1563 @@
+MODULE DBGINT ( IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	DEBUG (DBG)
+!
+! ABSTRACT:
+!	DBGINT - the RST/DST/DEBUG interface module.
+!		 This module exists because the DST/RST
+!		 module simply declares how it wants to see
+!		 the world, and leaves it up to this module
+!		 to interface to DEBUG to make things look
+!		 that way.
+!
+!	This module defines the interface between the
+!	DEBUG RST builder/manipulator and the LNK-produced
+!	so-called DST.  The former would like to show as little
+!	concern for where DST records are actually stored as
+!	possible.  The latter would like to provide this facility,
+!	but it must do so simply, (because we don't want to
+!	re-invent the world), efficiently, and in such
+!	as way as to allow us to do radically different
+!	things about where the DST actually exists.
+!
+!	Essentially what we do to solve this is to restrict the
+!	DST user to requesting records before he uses them,
+!	(probably) saying something about how long he wants
+!	to use them (or, equivalently, when he is willing to give
+!	them up), and using them given that they exist at the
+!	address he is told they are currently at.  This means that
+!	he can never make any assumptions about where a record is at.
+!	To get around this we introduce the concept of "Record Ids",
+!	which are simply identifiers by which the two sides of the
+!	interface agree to call records.  The first time you
+!	gett a record, the interface tells you how you must
+!	henceforth refer to it.
+!
+!	The other aspect of the interface concerns so-called
+!	RST-pointers.  These pointers are used throught the
+!	RST module to access various (all) records.  The code
+!	uses these pointers implicitly, knowing nothing
+!	about what they actually are, and leaves it up to this
+!	interface to define them.  This is done by
+!	having a special storage allocator for the RST
+!	module.  It uses whatever kind of pointer this
+!	allocator returns, and leaves it up to
+!	the definition of the RST structures (RST_NT,
+!	RST_MC, etc.  see DBGRST.BEG) to make
+!	sure that these RST-pointers do the job.
+!
+! Version	1.09
+!
+! ENVIRONMENT:
+!	This module runs on VAX under STARLET, user mode, non-AST level.
+!
+! AUTHOR:	Kevin Pammett, CREATION DATE: 12 JULY 77
+!
+! MODIFIED BY:
+!	Reworked for DEBUG V3.0 1980 KAN
+!
+!--
+
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+	DBG$PARS_LINNUM : NOVALUE,	! Parse a line/statement number
+	dbg$path_to_val,
+	dbg$sav_pth_nam,
+	label_error_msg : NOVALUE,	! report on faulty %LABEL references
+	DBG$SAVE_SCOPE,			! STORE AWAY THE CURRENT SCOPE LIST
+	dbg$bld_num_pth,		! Collect numeric pathnames.
+	DBG$BLD_INVOC_NUM : NOVALUE,	! Adds an invocation number from ascii input
+	DBG$BUILD_PATH,			! Collect symbol pathnames
+	dbg$DELETE_PATH : NOVALUE,	! Throw away a pathvector.
+	DBG$FIND_MODULE,		! Scan MC for a given module name.
+	POSITION_GST,			! Make a certain GST record available
+	DBG$GET_NXT_DST,		! Make the next DST record available.
+	dbg$get_nxt_gst;		! make the next GST record available
+
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'src$:dbgprolog.req';
+REQUIRE 'SRC$:DBGGEN.REQ';
+REQUIRE 'SRC$:BSTRUC.REQ';
+REQUIRE 'SRC$:SYSSER.REQ';
+REQUIRE 'src$:imgdef.req';
+
+!
+! MACROS:
+!
+
+!
+! EQUATED SYMBOLS:
+!
+
+!
+! OWN STORAGE:
+!
+
+OWN
+	line_num_present,		! True if a line # is in the pathname
+	stmt_num_present,		! True if a stmt # is in the pathname
+					! Pointer to the pathname vector we are 
+					! currently building.  If 0, no such vector
+					! is under construction.
+
+	pathname_ptr : REF pth$pathname INITIAL( 0 ),
+
+	path_vec_ptr : REF VECTOR [],
+	PV_INDEX,			! Current index into PATH_VEC_PTR
+
+					! Pointer to the list of pathname vectors
+					! currently under construction.
+	new_scop_list : REF LIST_LINK,
+
+					! Pointer to the last link added to the 
+					! list of pathnames currently under 
+					! construction.
+	new_scop_last : REF LIST_LINK,
+
+
+	exe_file : $FAB (FAC = GET
+			),
+
+	exe_input : $RAB (USZ = 512
+			),
+	gst_begin_addr : ref gst_record;	! virtual address of current GST record
+						! This is used solely by GET_NXT_GST
+
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+	dbg$nsave_decimal_integer,
+	dbg$language,
+	dbg$get_tempmem,
+	dbg$hash_find_setup : NOVALUE,
+	dbg$hash_find,
+	dbg$rst_char_addr,
+	dbg$rst_name_count,
+	dbg$radx_convrt,		! ASCII to numeric
+	dbg$npathdesc_to_cs : NOVALUE,
+	dbg$find_sym,			! Look up DEFine symbols.
+	dbg$reg_match,			! Compare a string to a register name.
+	dbg$add_nt_2_pv : NOVALUE,	! Convert an NT_POINTER to a pth$pathname.
+	dbg$sym_to_val,			! Correspond pathnames and values.
+	dbg$sym_to_valu,			! sym_to_val + goodies.
+	dbg$freez,			! Standard DEBUG storage allocator.
+	dbg$freerelease : NOVALUE,	! Standard DEBUG storage deallocator.
+	for$cnv_out_i,			! RTL routine to convert binary to char string.
+	dbg$rst_setscope : NOVALUE,
+	lib$_cremapsec;			! creates and maps a global section
+
+EXTERNAL LITERAL
+	dbg$gl_sup_or_test : WEAK;
+
+EXTERNAL
+	dbg$gb_language : BYTE,
+	dbg$gb_mod_ptr : REF VECTOR [,BYTE],
+	scope$list,
+	dst$begin_addr,		! virtual address where DST begins.
+	dst$end_addr,		! virtual address of last byte in DST.
+	dst$next_addr,		! virtual address where 'next' DST record begins.
+
+	! Like the DST, so the GST.
+
+	gst$begin_addr,			! virtual address where GST begins.
+	gst$next_addr : ref vector[,word],	! virtual address of 'next' GST
+	gst$rec_count,
+
+					! THE MODULE CHAIN
+	rst$start_addr : REF rst$entry,
+
+    	dbg$gb_signal_flag : BYTE;	! indicates signal for formatting
+    					! output
+
+
+
+GLOBAL ROUTINE DBG$PARS_LINNUM (SYMBOL_DESC, FLAG) : NOVALUE =
+!++
+! Functional Description:
+!	This routine adds a line or statement number
+! to the path vector.
+!
+! FORMAL PARAMETERS
+!	SYMBOL_DESC	Character string descriptor of the line or statment
+!			number
+!	FLAG		0 means the symbol is a line number, 1 means its a 
+!			statment number.
+!
+! IMPLICIT INPUTS
+!	NONE
+!
+! IMPLICIT OUTPUTS
+!	LINE_NUM_PRESENT	Set to true if a line number is to be inserted
+!				into the path vector.
+!	STMT_NUM_PRESENT	Set to true if a statmenet number is to be 
+!				inserted into the path vector.
+!
+! ROUTINE VALUE
+!	NONE
+!
+! SIDE EFFECTS
+!	The pathname descriptor built by dbg$build_path is modified to
+! include the line number.
+!--
+	BEGIN
+	MAP
+		SYMBOL_DESC : REF BLOCK[,BYTE];
+	LOCAL
+		sym1_desc : BLOCK[12,BYTE],
+		pct_line : REF VECTOR[,BYTE],
+		length,
+		cs_ptr : cs_pointer;
+
+	IF .flag EQL 0
+	THEN
+		BEGIN
+		pct_line = UPLIT BYTE(%ASCIC '%LINE ');
+		cs_ptr = dbg$freez(rst_units(.symbol_desc[dsc$w_length] + 6));
+		ch$move(6, pct_line[1], cs_ptr[0]);
+		length = .symbol_desc[DSC$W_LENGTH] + 6;
+		CH$MOVE( .symbol_desc[dsc$w_length],
+				.symbol_desc[dsc$a_pointer], cs_ptr[6] );
+		sym1_desc[dsc$w_length] = .length;
+		sym1_desc[dsc$a_pointer] = .cs_ptr;
+		dbg$build_path(sym1_desc, FALSE);
+		line_num_present = TRUE;
+	END
+	ELSE
+		BEGIN
+		LOCAL
+			dot : REF VECTOR[,BYTE],
+			cs_ptr1 : cs_pointer;
+		dot = UPLIT BYTE(%ASCIC '.');
+		stmt_num_present = TRUE;
+		cs_ptr = .path_vec_ptr[.pv_index - 1];
+		length = .cs_ptr[0] + .symbol_desc[dsc$w_length] +  1;
+		cs_ptr1 = dbg$freez(rst_units(.length + 1));
+		ch$move(.cs_ptr[0], cs_ptr[1], cs_ptr1[1]);
+		ch$move(1, dot[1], cs_ptr1[.cs_ptr[0]+1]);
+		ch$move(.symbol_desc[dsc$w_length],.symbol_desc[dsc$a_pointer],
+				cs_ptr1[.cs_ptr[0]+2]);
+		cs_ptr1[0] = .length;
+		path_vec_ptr[.pv_index - 1] = .cs_ptr1;
+		dbg$freerelease( .cs_ptr, .cs_ptr[0]);
+	END;
+
+END;
+
+GLOBAL ROUTINE dbg$path_to_val( valu_desc_ptr ) =
+!
+!
+BEGIN
+	MAP
+		valu_desc_ptr : REF valu_descriptor;
+	LOCAL
+		cs_ptr : cs_pointer,
+		cs_ptr1 : cs_pointer,
+		fcode;
+
+	IF .dbg$gb_mod_ptr[mode_fortran] EQL label_mode
+	THEN
+		BEGIN
+		cs_ptr = .path_vec_ptr[.pv_index-1];
+		cs_ptr1 = dbg$freez(rst_units(.cs_ptr[0] + 8));
+		CH$MOVE(.cs_ptr[0], cs_ptr[1], cs_ptr1[8]);
+		CH$MOVE(7, UPLIT BYTE(%ASCII '%LABEL '), cs_ptr1[1]);
+		cs_ptr1[0] = .cs_ptr[0] + 7;
+		dbg$freerelease(.cs_ptr, rst_units(.cs_ptr[0] + 1));
+		path_vec_ptr[.pv_index - 1] = .cs_ptr1;
+	END;
+
+	IF NOT dbg$sym_to_valu( .pathname_ptr, .valu_desc_ptr, fcode )
+	THEN
+		BEGIN
+		LOCAL
+			pct_line : cs_pointer,
+			message_buf : cs_pointer;
+
+		path_vec_ptr = pathname_ptr[pth$a_pathvector];
+		cs_ptr = .path_vec_ptr [.pv_index - 1];
+		pct_line = UPLIT BYTE(%ASCIC '%LINE');
+
+		! We produce a different message when a
+		! FORTRAN %LABEL lookup has been done.
+
+		IF( .dbg$gb_mod_ptr[ mode_fortran ] EQL label_mode )
+		THEN
+			label_error_msg()
+			! no return
+
+		ELSE IF ch$eql(5,cs_ptr[1],5,pct_line[1])
+		THEN
+			BEGIN
+			
+			local
+				stmt_number,
+				line_number,
+				length,
+				dec_no_desc : BLOCK [8,BYTE],
+				cs_ptr1 : cs_pointer,
+				rtn_cs_ptr : cs_pointer;
+
+			length = .cs_ptr[0];
+			cs_ptr = .cs_ptr + 6;
+			cs_ptr[0] = .length - 6;
+			cs_ptr1 = 0;
+			INCR i FROM 1 TO .cs_ptr[0]
+			DO
+				IF .cs_ptr[.i] EQL %C'.'
+				THEN
+					BEGIN
+					cs_ptr1 = cs_ptr[.i];
+					cs_ptr1[0] = .cs_ptr[0] - .i;
+					cs_ptr[0] = .i - 1;
+					EXITLOOP;
+				END;
+
+			dec_no_desc[dsc$w_length] = .cs_ptr[0];
+			dec_no_desc[dsc$a_pointer] = cs_ptr[1];
+			stmt_number = line_number = 0;
+			line_number = dbg$radx_convrt (dec_no_desc);
+			IF .cs_ptr1 NEQ 0
+			THEN
+				BEGIN
+				dec_no_desc[dsc$w_length] = .cs_ptr1[0];
+				dec_no_desc[dsc$a_pointer] = cs_ptr1[1];
+				stmt_number = dbg$radx_convrt(dec_no_desc);
+			END;
+
+	! Remove this last element from the pathvector.
+
+
+			pv_index = .pv_index - 1;
+			rtn_cs_ptr = 0;
+
+			IF .pv_index EQL 0
+			THEN
+				BEGIN
+				IF .stmt_number EQL 0
+				THEN
+					SIGNAL(dbg$_linnotfnd, 1, .line_number)
+				ELSE SIGNAL(dbg$_stmnotfnd, 2, .line_number,
+								.stmt_number);
+			END
+			ELSE
+				BEGIN
+				rtn_cs_ptr = .path_vec_ptr[.pv_index - 1];
+				IF .stmt_number EQL 0
+				THEN
+					SIGNAL(dbg$_noline, 2, .rtn_cs_ptr,
+								.line_number)
+				ELSE
+				   SIGNAL(dbg$_nostmt,3,.rtn_cs_ptr,
+						.line_number,.stmt_number);
+			END;
+		END;
+
+		! Encode the pathname into a counted
+		! string, and output the associated message.
+
+    		dbg$gb_signal_flag = 1;
+		dbg$npathdesc_to_cs( .pathname_ptr, message_buf );
+		dbg$delete_path();
+    		dbg$gb_signal_flag = 0;
+		IF .fcode EQL rst$k_notunique
+		THEN
+			SIGNAL(dbg$_nounique,1,.message_buf)
+		ELSE SIGNAL(dbg$_nosymbol, 1, .message_buf );
+		! no return
+		END;
+
+	! If the evaluation went OK, we must now
+	! throw away the pathname and return success.
+
+	dbg$delete_path();
+
+
+	RETURN TRUE;
+END;
+
+GLOBAL ROUTINE DBG$BUILD_PATH( symbol_desc, num_flag ) =
+!++
+! Functional Description:
+!
+!	This routine assumes that it is called with a valid string
+!    descriptor - i.e. the call was made to BUILD_PATH so that it could
+!    accumulate the elements of a pathname for later evaluation by PATH_TO_VAL.
+!
+! Formal Parameters:
+!
+!	symbol_desc	-the address of a string descriptor for the
+!			 symbol we are to add to the current pathname
+!			 or the binary value of a numeric path element
+!	num_flag	- TRUE if symbol_desc contains binary numeric path
+!			  element.
+!
+! Implicit Inputs:
+!
+!	This routine works from the OWN that is local to this
+!	module, PATH_VEC_PTR, which points to the current pathname vector
+!	we are building.
+!
+! Return Value:
+!
+!	TRUE, unless some error like no free storage
+!	happens, in which case we SIGNAL our way out.
+!--
+BEGIN
+
+	MAP
+				! This describes the element of the
+				! pathname which we are to add on
+				! to our list.
+		symbol_desc : REF BLOCK[,BYTE];
+	LOCAL
+		CS_PTR : CS_POINTER,	! Temp counted string pointer.
+		STATUS;			! Success/failure indication that we return.
+
+	!++
+	! A real string descriptor is supposed to pass on
+	! to us another pathname element to accumulate.
+	!--
+
+	! If this is the first call for a new pathname,
+	! we must allocate the storage we will need
+	! for the vector of pointers to the element strings.
+
+	IF( .pathname_ptr EQL 0 )
+	THEN
+		BEGIN
+
+		pathname_ptr = dbg$freez(dbg$k_pathname_size);
+		pathname_ptr[pth$b_pathcnt] = (pathname_ptr[pth$b_totcnt] = 0);
+		pathname_ptr[pth$b_locinvoc] = 0;
+		pathname_ptr[pth$l_invocnum] = 0;
+		path_vec_ptr = pathname_ptr[pth$a_pathvector];
+		! The storage manager zeros out the pathname vector
+		! for us, so we only have to set up the right
+		! pathname vector index.
+
+		LINE_NUM_PRESENT = STMT_NUM_PRESENT = FALSE;
+		PV_INDEX = 0;
+		END;
+
+	IF NOT .num_flag
+	THEN
+		BEGIN
+		LOCAL
+			ptr : REF VECTOR[,BYTE];
+		ptr = .symbol_desc[dsc$a_pointer];
+
+		IF .symbol_desc[dsc$w_length] EQL 1
+		AND .ptr[0] EQL %C '\'
+		THEN
+			BEGIN
+			cs_ptr = dbg$freez(1);
+			cs_ptr[0] = 0;
+			pathname_ptr[pth$b_locinvoc] = 0;
+		END
+		ELSE
+			BEGIN
+			IF .dbg$gb_mod_ptr[mode_fortran] NEQ line_mode
+			THEN
+				BEGIN
+				IF CH$EQL(5,.symbol_desc[dsc$a_pointer],
+						5,UPLIT BYTE(%ASCII '%LINE'))
+				THEN
+					SIGNAL(dbg$_pathline,1,
+					   dbg$language(.dbg$gb_language));
+			END;
+			IF .dbg$gb_mod_ptr[mode_fortran] NEQ label_mode
+			THEN
+				BEGIN
+				IF CH$EQL(6,.symbol_desc[dsc$a_pointer],
+						6,UPLIT BYTE(%ASCII '%LABEL'))
+				THEN
+					SIGNAL(dbg$_pathlabel,1,
+					   dbg$language(.dbg$gb_language));
+			END;
+			CS_PTR =
+			   dbg$freez(RST_UNITS(.symbol_desc[DSC$W_LENGTH]+1));
+
+
+	! Copy the string into the allocated storage.
+	! Note that we must make up a counted string
+	! because this is what pathname vector pointers
+	! are defined to point to.
+
+			CS_PTR[0] = .symbol_desc[DSC$W_LENGTH];
+			CH$MOVE( .symbol_desc[DSC$W_LENGTH],
+				.symbol_desc[DSC$A_POINTER], CS_PTR[1] );
+		END;
+	END
+	ELSE
+		BEGIN
+		cs_ptr = dbg$freez(1);
+		cs_ptr[0] = 0;
+		pathname_ptr[pth$b_locinvoc] = 1;
+		pathname_ptr[pth$l_invocnum] = ..symbol_desc;
+	END;
+		
+	! Now store the address of this counted string in 
+	! the 'next' slot in the pathname vector.
+
+	PATH_VEC_PTR[.PV_INDEX] = .CS_PTR;
+	pathname_ptr[pth$b_pathcnt] = pathname_ptr[pth$b_totcnt] = .pv_index+1;
+
+
+	! And set up so that the next call
+	! to this routine stores the CS pointer into the
+	! next slot.
+
+	IF( (PV_INDEX = .PV_INDEX +1) GTR dbg$k_max_pathname )
+	THEN
+		SIGNAL (dbg$_pathtlong);
+		! no return
+	RETURN(TRUE);
+END;
+
+GLOBAL ROUTINE DBG$DELETE_PATH : NOVALUE =
+!++
+! Functional Description:
+!
+!	Delete the pathname vector which is pointed to
+!	by the OWN, PATH_VEC_PTR, which several routines in this
+!	module work from.  Also zero out this pointer so that the
+!	next call to BUILD_PATH knows that there is no 'current'
+!	pathname vector being built.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	PATH_VEC_PTR - see above.
+!
+! Return Value:
+!
+!	NOVALUE - because the only thing which can (but shouldn't) go 
+!		  wrong is a free storage error and in that
+!		  case the manager itself SIGNALs its way out.
+!--
+
+BEGIN
+	LOCAL
+			! Each element of the pathname vector
+			! is a pointer to a counted string.
+		CS_PTR : CS_POINTER;
+
+	! Now see if there really is a pathanme vector
+	! currently pointed to by the PATH_VEC_PTR.
+
+	IF( .PATHname_PTR EQL 0 )
+	THEN
+		! No such vector is allocated so we're done.
+
+		RETURN;
+	!+
+	! Simply throw away the storage which we allocated
+	! for each element of the vector.
+	!-
+
+	INCR I FROM 0 TO .pathname_ptr[pth$b_totcnt] - 1
+		DO
+		BEGIN
+		cs_ptr = .path_vec_ptr[.i];
+		DBG$FREERELEASE( .cs_ptr, RST_UNITS(.CS_PTR[0]+1) );
+		END;
+
+	! Then throw away the vector itself.
+
+	DBG$FREERELEASE( .PATHname_PTR, dbg$k_pathname_size);
+
+	! Zero out the PATH_VEC_PTR pointer so that
+	! subsequent re-uses know there is no longer
+	! one there.
+
+	pathname_ptr = 0;
+	path_vec_ptr = 0;
+	pv_index = 0;
+END;
+
+
+GLOBAL ROUTINE DBG$FIND_MODULE( MOD_NAME_DESC, SIGNAL_FLAG ) =
+!++
+! Functional Description:
+!
+!	Search the MC to see if the given module is there.
+!
+! Formal Parameters:
+!
+!	MOD_NAME_DESC	-a string descriptor for the supposed
+!			 module name.
+!	SIGNAL_FLAG	-flag that indicates if this routine should
+!			 signal if the module is not found
+!
+! Implicit Inputs:
+!
+!	none.
+!
+! Implicit Outputs:
+!
+!	none.
+!
+! Returned Value:
+!
+!	0	 - if the module is not found,
+!	non-zero - an MC_PTR to the indicated MC record.
+!
+! Side Effects:
+!
+!	none.
+!--
+
+BEGIN
+	MAP
+				! The supposed module name is
+				! described via an SRM string descriptor.
+		MOD_NAME_DESC : REF BLOCK[,BYTE];
+	LOCAL
+				! We make a copy of the module name so that we
+				! can supply the needed counted-string pointer
+				! for the NOSUCHMODU error message.
+		MODU_CS_NAME : VECTOR[ SYM_MAX_LENGTH+1, BYTE],
+
+				! We chain along the MC via this temp pointer.
+		MC_PTR : REF rst$entry;
+
+
+	! Scan along the MC comparing the given string
+	! with the module name stored therein.
+	! Note that we skip the first MC record because
+	! it is reserved for globals and is therefore nameless.
+
+	MC_PTR = .rst$start_addr;
+
+	WHILE( (MC_PTR = .MC_PTR[rst$l_nxtmodptr]) NEQ 0 )
+		DO
+		BEGIN
+
+
+		IF( CH$EQL(	dbg$rst_name_count(.MC_PTR),
+				dbg$rst_char_addr(.MC_PTR),
+				.MOD_NAME_DESC[dsc$w_length],
+				.MOD_NAME_DESC[DSC$A_POINTER] )
+		  )
+		THEN
+			BEGIN
+
+			! Found.  Internally in DEBUG we agree that
+			! the 'value' of a module string will be the
+			! RST address of its MC record.
+			RETURN(.MC_PTR);
+			END;
+		END;
+	!+
+	! If we fall out of the above loop, then
+	! the given module name was not found.
+	! We must construct a counted-string pointer
+	! and pass it on to the error message routine.
+	!-
+
+	IF .signal_flag
+	THEN
+	    BEGIN
+	    modu_cs_name[0] = .mod_name_desc[ dsc$w_length ];
+	    CH$MOVE( .modu_cs_name[0], .mod_name_desc[ dsc$a_pointer ],
+			modu_cs_name[1]);
+	    SIGNAL(dbg$_nosuchmodu, 1, modu_cs_name[0]);
+	    END;
+
+	RETURN (0);
+END;
+
+ROUTINE POSITION_GST ( gst_rec_count ) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!	This routine, if called with a positive value initializes its OWN
+!	storage to remember the number of RMS-type records in the GST.
+!	If it is called with a negative or zero value, it returns the address
+!	of the next RMS-type record in the GST.  A negative value also causes
+!	the pointers to be positioned at the start of the GST.
+!
+! FORMAL PARAMETERS:
+!
+!	GST_REC_COUNT	- The number of RMS records in the GST.
+!			  (negative value) re-position to start and return
+!			  address of first GLOBAL.
+!			  (zero) return address of the next GLOBAL.
+!
+! IMPLICIT INPUTS:
+!
+!	gst$BEGIN_ADDR	- holds the starting address of the GST.  If this
+!			  value is not GTR 0 or 1, then the GST has
+!			  not been mapped in so this routine returns 0.
+!
+! IMPLICIT OUTPUTS:
+!
+!	GSR_NEXT_ADDR	- holds the address of the next RMS record in the GST.
+!
+! ROUTINE VALUE:
+!
+!	0		- If there are no more records in the GST,
+!			  of if the GST was not mapped in.
+!	non-zero	- The address of the next GST RMS record.
+!
+! SIDE EFFECTS:
+!
+!	The next GST record can now be accessed, and an OWN pointer to the next
+!	one is maintained.  The number of GST records yet to go is also updated
+!	so that the end of the GST can be detected.
+!--
+
+BEGIN
+
+OWN
+	RECORDS_LEFT;
+
+LOCAL
+	BLOCK_ADDR;
+
+	! If there is no mapped GST, then return 0,
+	! no matter why this routine was called.
+
+	IF (.gst$begin_addr LEQA 1)
+	THEN
+	    RETURN (0);
+
+	IF (.gst_rec_count GTR 0)
+	THEN
+	    BEGIN
+
+	    RETURN (0);
+	    END;
+
+	IF (.gst_rec_count NEQ 0)
+	THEN
+	    BEGIN
+	    gst$next_addr = .gst$begin_addr;
+	    records_left  = .gst$rec_count
+	    END;
+
+	! Stop the following from faulting if some caller
+	! ignores the end condition and effectively causes
+	! us to 'run off the end' of the mapped GST.
+
+	IF (.records_left LSS 1)
+	THEN
+	    RETURN (0);
+
+	! Pick up the address of the current record,
+	! and update the pointer to the subsequent one.
+
+	block_addr = .gst$next_addr + 2;
+	gst$next_addr = .gst$next_addr + 2 + ((.gst$next_addr[0] +1)/2)*2;
+	records_left = .records_left - 1;
+	RETURN (.block_addr);
+
+END;
+
+GLOBAL ROUTINE DBG$GET_NXT_DST ( REC_ID_PTR ) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!	Make the next DST record available,
+!	and return both a pointer to where it
+!	can now be referenced, as well as an ID
+!	for it so that we can ask for it later.
+!
+! FORMAL PARAMETERS:
+!
+!	REC_ID_PTR - the address of where this routine will
+!		     stuff the ID it wants.
+!
+! IMPLICIT INPUTS:
+!
+!	None
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	0, if the indicated record does not exist,
+!	the address of where is can now be referenced, otherwise.
+!
+! SIDE EFFECTS:
+!
+!	The DST record after the last one fetched is made available.
+!	If no record has yet been fetched, the first record in
+!	the DST is made available.
+!
+!--
+
+BEGIN
+
+	MAP
+		REC_ID_PTR : REF VECTOR[,LONG];
+	LOCAL
+		dst_rec : REF dst$record;
+	!+
+	! Since for us record IDs are the same as their
+	! virtual addresses, we can get the next one
+	! the same way we can get ANY one.  The only
+	! detail to fill in is passing back the ID
+	! for this next one.
+	!-
+	dst_rec = .dst$next_addr;
+	dst$next_addr = .dst_rec[dst$b_length] + .dst_rec + 1;
+	RETURN (rec_id_ptr[0] = .dst_rec);
+END;
+
+GLOBAL ROUTINE DBG$GET_NXT_GST (access_flag) =
+!++
+! Functional description:
+!	This routine returns the address of a fixed length record that
+!	contains a global symbol name and its associated value. This
+!	routine expects to be called repeatedly until each global symbol
+!	has been returned to the caller.
+!
+!	Before this routine is ever called, the location of the GST in
+!	the image file is found, and it is mapped into DEBUG's image.
+!	The address of this buffer is
+!	held in the OWN variable gst_begin_addr. This routine
+!	analyzes the GST record, and moves through the buffer, returning
+!	the buffer address of each global symbol entry as it is
+!	seen. When the buffer is exhausted, this routine reads in the
+!	next GST record. It halts at end of file and returns a value of
+!	zero to the caller.
+!
+!	This routine keeps the variable gst_begin_addr up to date.
+!
+!	The format of one of these concatenated records is a single
+!	leading byte containing the value 1, indicating that the record
+!	is indeed a GSD record. The variable gst_begin_addr addresses
+!	the byte following this leading byte.
+!
+!	Each entry in the record has a fixed number of overhead
+!	bytes followed by a symbol name that is a variable number of
+!	bytes. The entries we are interested in processing are the
+!	global symbol definitions and entry point symbol and mask
+!	definitions. The other defined type, PSECT definition, is
+!	noted only because it must be successfully passed over. The
+!	format of each of these types is illustrated below:
+!
+!	Global symbol definition:
+!
+!		-----------------
+!	0	!   GSD type 1  !
+!		-----------------
+!	1	!   data type   !	ignored for now
+!		-----------------
+!	2	!     flag      !	bit 1 set means that this is
+!	3	!     bytes     !	a definition. ignore bit 0.
+!		-----------------
+!	4	!  psect index  !	ignored.
+!		-----------------
+!	5	!		!
+!		!     value     !	4 bytes
+!		!		!
+!		-----------------
+!	9	!		!
+!		!    symbol     !	stock counted character
+!		!     name      !	string.
+!		!		!
+!		-----------------
+!
+!	The entry point symbol and mask definition entry is identical to
+!	the global symbol definition illustrated above, with the 
+!	addition of a two byte field for the procedure's register save
+!	mask. This two byte field is located after the symbol value
+!	field (which is an entry point address).
+!
+!		-----------------
+!	0	!   GSD type 2  !
+!		-----------------
+!	1	!   data type   !	ignored for now
+!		-----------------
+!	2	!     flag      !	not relevant for
+!	3	!     bytes     !	entry point def.
+!		-----------------
+!	4	!  psect index  !	ignored
+!		-----------------
+!		!		!
+!	5	!     value     !	4 bytes
+!		!		!
+!		-----------------
+!	9	!   register    !	ignored,
+!	10	!   save mask   !	2 bytes
+!		-----------------
+!	11	!		!
+!		!    symbol     !	stock counted character
+!		!     name      !	string
+!		!		!
+!		-----------------
+!
+!	The procedure definition with formal argument descriptions is
+!	identical to the "GSD type 2" definition above with the addition
+!	of fields that describe each formal argument.
+!	Following the symbol name there is one byte containing the minimum
+!	number of arguments allowed, and one byte containing the maximum
+!	number of arguments.
+!	These bytes are followed by a series of records of 2 - 257 bytes
+!	that describe each of the formal arguments (the number of these
+!	records is equal to the maximum number of arguments for the procedure.
+!
+!		-----------------
+!	0	!   GSD type 3  !
+!		-----------------
+!	1	!   data type   !	ignored for now
+!		-----------------
+!	2	!     flag      !	bit 1 set indicates that this is
+!	3	!     bytes     !	a definition.  Bit 0 ignored.
+!		-----------------
+!	4	!  psect index  !	ignored
+!		-----------------
+!		!		!
+!	5	!     value     !	4 bytes
+!		!		!
+!		-----------------
+!	9	!   register    !	ignored,
+!	10	!   save mask   !	2 bytes
+!		-----------------
+!	11	!		!
+!		!    symbol     !	stock counted character
+!		!     name      !	string
+!		!		!
+!		-----------------
+!		! min # of args !	1 byte
+!		-----------------
+!		! max # of args !	1 byte
+!		-----------------
+!		! formal arg #1 !
+!		!  description  !
+!		-----------------
+!		!	.	!
+!		!	.	!
+!		!	.	!
+!		-----------------
+!		! formal arg #n !
+!		!  description  !
+!		-----------------
+!	Format of each formal argument description.
+!
+!		-----------------
+!	0	! arg value ctl !	1 byte
+!		-----------------
+!	1	! remaining byte!	1 byte ( 0 - 255 )
+!		-----------------
+!		!   detailed	!
+!		!   argument	!
+!		!  description	!
+!		-----------------
+!
+!	PSECT definition:
+!
+!		-----------------
+!	0	!   GSD type 0  !
+!		-----------------
+!	1	!   alignment   !
+!		-----------------
+!	2	!     flag      !
+!	3	!     bytes     !
+!		-----------------
+!	4	!		!
+!		!  allocation   !	4 bytes
+!		!		!
+!		-----------------
+!	8	!		!
+!		!    symbol     !	stock counted character
+!		!     name      !	string.
+!		!		!
+!		-----------------
+!
+! Formal Parameters:
+!	access_flag	- 0 - return address of next GLOBAL symbol.
+!			  1 - reposition to start of GST and return address of
+!			      the first GLOBAL symbol.
+!
+! Implicit inputs:
+!	gst_begin_addr	- current address of record buffer
+!
+! Outputs:
+!	the address of the next global symbol entry, or 0, if EOF.
+!
+! Implicit outputs:
+!	gst_begin_addr is updated to address the next entry
+!
+! Routine value:
+!	an address or 0
+!
+! Side effects:
+!	another record may be read in.
+!--
+
+	BEGIN
+
+	LOCAL
+		old_address : REF BLOCK [, BYTE];
+
+	LABEL
+		get_record;
+
+
+	IF (.access_flag NEQ 0)
+	THEN
+		BEGIN
+		IF ((gst_begin_addr = position_gst(-1)) EQL 0)
+		THEN	gst_begin_addr = %X'FFFFFFFF';
+		RETURN (0);
+		END;
+
+	!++
+	! See whether the current buffer address is beyond the
+	! end of the last GST record we looked at.  Note that we
+	! rounded up GSR_NEXT_ADDR when calculating where the next
+	! GST record will begin.  Therefore we must temporarily round
+	! it down again when comparing it with gst_begin_addr since it
+	! may point to the last unused byte in a GST record.
+	!--
+	REPEAT
+get_record:
+		BEGIN
+		IF (.gst_begin_addr GEQA .gst$next_addr -1)
+		THEN
+			BEGIN
+			IF ((gst_begin_addr = position_gst(0)) EQL 0)
+			THEN
+				! There are no more GST records.
+				RETURN (0)
+			ELSE
+				BEGIN
+
+				!++
+				! GET succeeded. If the new record
+				! is a GST record, then initialize
+				! the variable gst_begin_addr to point 
+				! to the first global symbol definition
+				! block in this record.
+				!--
+
+				LOCAL
+					buffer_address : REF VECTOR [, BYTE];
+
+				buffer_address = .gst_begin_addr;
+			IF .buffer_address [gst_record_type] EQL gst_type
+				THEN gst_begin_addr = .gst_begin_addr + 1
+				ELSE
+					BEGIN
+
+					!++
+					! This record is not a GST record.
+					! Go on to the next.
+					!--
+					gst_begin_addr = %X'FFFFFFFF';
+					LEAVE get_record;
+					END;
+				END;
+			END
+		ELSE
+			BEGIN
+
+			!++
+			! This is a global symbol. Save its address.
+			! Then update the variable gst_begin_addr to
+			! point to the next symbol.
+			!--
+
+			old_address = .gst_begin_addr;
+		CASE .old_address [entry_type] FROM psect_def TO proc_def OF
+
+				SET
+
+				[psect_def]:
+					BEGIN
+				gst_begin_addr = .old_address + psect_overhead
+					+ .old_address [psect_nam_count];
+					END;
+
+
+				[global_symbol]:
+					BEGIN
+				gst_begin_addr = .old_address + glsym_overhead
+					+ .old_address [glsym_nam_count];
+					RETURN .old_address
+					END;
+
+
+				[entmsk_def]:
+					BEGIN
+				gst_begin_addr = .old_address + entmsk_overhead
+					+ .old_address [entms_nam_count];
+					RETURN .old_address
+					END;
+
+
+				[proc_def]:
+					BEGIN
+					LOCAL
+					    num_args;			! maximum number of arguments.
+				gst_begin_addr = .old_address + entmsk_overhead
+					+ .old_address [entms_nam_count];
+				num_args = .gst_begin_addr[gst_p_max_arg];
+			gst_begin_addr = .gst_begin_addr + minmax_overhead;
+					DECR I FROM .num_args-1 TO 0 BY 1
+					DO
+					    BEGIN
+					    gst_begin_addr = .gst_begin_addr +
+			.gst_begin_addr[gst_p_rem_cnt] + argdsc_overhead;
+					    END;
+					RETURN .old_address
+					END;
+
+				[OUTRANGE]:
+					BEGIN
+					gst_begin_addr = %X'FFFFFFFF';
+					END;
+
+				TES;
+
+			END;
+		END;
+	RETURN (0);
+	END;
+
+GLOBAL ROUTINE DBG$SAV_PTH_NAM =
+!+
+! Functional description:
+!
+!	This routine assumes that it is called when a pathname 
+!	has been parsed and is represented in the pathname vector pointed 
+!	to by the OWN variable PATH_VEC_PTR. Its function is to place 
+!	this pathname in the list of pathnames currently under construction. 
+!	It allocates a list_link and links it into the list. If the current 
+!	list is empty it initializes the list head pointer, NEW_SCOP_LIST.
+!
+! Formal Parameters: none
+!	
+! Implicit parameters:
+!
+!	PATH_VEC_PTR - points to the pathname vector just completed.
+!	NEW_SCOP_LIST - points to the head of the list of pathnames under construction.
+!	NEW_SCOP_LAST - points to the tail of the list of pathnames under construction.	
+!
+! Return Value:
+!
+!	TRUE, unless some error like no free storage or no current pathname
+!	vector in which case we signal our way out.
+!-
+BEGIN
+	LOCAL
+		pv_ptr : REF list_link;! temp to refer to the new list_link.
+
+	!+
+	! First check to see that PATH_VEC_PTR is not zero.
+	!-
+
+	IF (.PATHname_PTR EQL 0)
+	THEN
+		SIGNAL (dbg$_debugbug, 1, dbg$k_zero_length_pathname);
+	!+
+	! Allocate the storage for the list link cell.
+	!-
+
+	pv_ptr = dbg$freez(RST_UNITS(list_link_size));
+
+
+	!+ 
+	! If the list is empty initialize the head pointer,
+	! otherwise, link in the cell just allocated.
+	!-
+
+	IF (.new_scop_list EQL 0)
+	THEN new_scop_list = .pv_ptr
+	ELSE new_scop_last[next_one_ptr] = .pv_ptr;
+	
+	!+
+	! Update the tail pointer.
+	! Fill in the list link's current value pointer.
+	!-
+
+	new_scop_last = .pv_ptr;
+	new_scop_last[this_one_ptr] = .pathname_ptr;
+
+
+	!+
+	! Zero out path_vec_ptr so that dbg$build_path starts fresh next
+	! time it's called.
+	!-
+
+	pathname_ptr = 0;
+	path_vec_ptr = 0;
+
+
+	RETURN (TRUE);
+
+END;	!DBG$SAV_PTH_NAM.
+
+routine label_error_msg : NOVALUE =
+!++
+! Functional Description:
+!	Produce the proper error message given that a %LABEL
+!	lookup has been tried and failed.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!
+!	We use the OWN, PV_INDEX, that is maintained by
+!	several routines in this module.  This index points
+!	into the currently-free entry in PATH_VEC_PTR.
+!
+!	We are doing FORTRAN %LABELs, and the whole pathvector
+!	has been collected by BUILD_PATH.
+!
+!	We don't bother to DELETE_PATH the path vector because
+!	we assume that the END_OF_LINE processing will do it.
+!
+! Routine Value
+!	A signal is done and the routine doesn't return.
+!
+! Side Effects:
+!	A SIGNAL is done - see above.
+!--
+
+BEGIN
+	local
+		label_name : vector[ chs_per_lexeme, byte],
+		message_buf : cs_pointer,
+		label_cs : CS_POINTER,
+		pc_vector : pth$pathname;
+
+	!+
+	! This routine works from the same pathvector that
+	! several others in the module do, namely, the one
+	! pointed to by PATH_VEC_PTR.  Associated with this
+	! is PV_INDEX which points into this pathname vector
+	! currently under construction.  If PV_INDEX is
+	! 0, then this routine should not have been called.
+	!-
+
+	IF( (PV_INDEX = .pv_index -1) LSS 0 )
+	THEN
+		SIGNAL(dbg$_debugbug, 1, dbg$k_zero_length_pathname);
+		! no return
+
+	!+
+	! The last pathname entry added is supposedly
+	! a pointer to a counted string which is
+	! the ASCII of the %LABEL number.  We purposely don't
+	! convert this to numeric and put the number in
+	! the error message so that the expression
+	! "%label rtn\abc" will cause 'abc' to appear in
+	! the message.  We would get 'number conversion error'
+	! otherwise which is a less-obvious message.
+	! Also move this name to safer storage maintaining
+	! it as a counted string.
+	!-
+
+	label_cs = .path_vec_ptr [.pv_index];
+	CH$MOVE( .label_cs[0]+1, label_cs[0], label_name );
+	SIGNAL(dbg$_labnotfnd, 1, label_name);
+	!no return
+
+	!+
+	! Remove this last element from the pathvector
+	! in case we have to use the pathvector for the later
+	! 'routine' name part of the error message.
+	!-
+
+	pathname_ptr[pth$b_totcnt] = .pathname_ptr[pth$b_totcnt] - 1;
+	pathname_ptr[pth$b_pathcnt] = .pathname_ptr[pth$b_pathcnt] - 1;
+	dbg$freerelease( .label_cs, rst_units(.label_cs[0]+1) );
+
+	!+
+	! The remaining elements in the pathname vector 
+	! may implicate which routine the %LABEL number is relative to.
+	! How we handle this depends on how many elements there
+	! are left in the initial pathname vector.
+	!-
+
+	IF( .pv_index GTR 0 )
+				! pathname qualification was given, so
+	THEN
+		BEGIN
+
+		! Make up a counted string which contains
+		! the given pathname, and produce the corresponding
+		! error message.
+    			
+    		dbg$gb_signal_flag = 1;
+		dbg$npathdesc_to_cs( .pathname_ptr, message_buf);
+    		dbg$gb_signal_flag = 0;
+		SIGNAL(dbg$_nolabel, 2, .message_buf, label_name);
+		! no return
+		end
+
+	ELSE
+			! No pathname qualification was given, hence
+			! search rules were applied and failed.
+			! Announce that none of the lexical entities tried
+			! contained such a label.
+
+		BEGIN
+			
+			SIGNAL(dbg$_labnotfnd, 1, label_name);
+		END;
+END;
+
+GLOBAL ROUTINE DBG$SAVE_SCOPE( SET_SCOPE_FLAG ) =
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine installs a list of pathnames which is built while
+!	processing a SET SCOPE COMMAND. IF SET_SCOPE_FLAG is TRUE
+!	such a list has been built; if SET_SCOPE_FLAG is FALSE we build
+!	the default pathname, '0', and install it as the only element 
+!	in the list.
+!
+! IMPLICIT INPUTS:
+!	
+!	new_scop_list - a pointer to the head of the new list of pathnames.
+!	new_scop_list - a pointer to the tail of the new list of pathnames.
+!
+! RETURN VALUE:
+!	
+!	TRUE, upon success.
+!	SIGNAL an internal error and UNWIND upon FAILURE.
+!
+!-
+	BEGIN
+
+	LOCAL
+		pn_count,
+		errindx,
+		pnvec : REF VECTOR[],
+		ll_ptr : REF list_link;
+
+	IF (.set_scope_flag EQL TRUE )
+	THEN
+		BEGIN
+
+		IF (.new_scop_list EQL 0 ) OR 
+		   (.new_scop_last EQL 0 )
+		THEN 
+			SIGNAL(dbg$_debugbug, 1, dbg$k_incomplete_scope_name)
+		ELSE
+			BEGIN
+
+			pn_count = 0;
+			ll_ptr = .new_scop_list;
+			DO
+				pn_count = .pn_count + 1
+			WHILE (ll_ptr = .ll_ptr[next_one_ptr]) NEQA 0 ;
+
+			pnvec = dbg$get_tempmem(.pn_count + 1);
+			pnvec[0] = .pn_count;
+			ll_ptr = .new_scop_list;
+			INCR i FROM 1 TO .pn_count
+			DO
+				BEGIN
+				pnvec[.i] = .ll_ptr[this_one_ptr];
+				ll_ptr = .ll_ptr[next_one_ptr];
+			END;
+			new_scop_list = 0;
+			new_scop_last = 0;
+		END;
+	END
+	ELSE
+		BEGIN
+		pnvec = dbg$get_tempmem(1);
+		pnvec[0] = 0;
+
+	END;
+
+	dbg$rst_setscope(.pnvec, errindx);
+
+
+	! Check for bad scope
+	!
+	IF .errindx NEQ 0
+      	THEN
+	    BEGIN
+	    LOCAL
+		badscope;	    
+	    dbg$npathdesc_to_cs (.pnvec [.errindx], badscope);
+	    SIGNAL (dbg$_badscope, 1, .badscope);  ! No return
+	    END;
+	    
+
+	RETURN(TRUE);
+END;
+
+GLOBAL ROUTINE DBG$BLD_NUM_PTH( number_desc ) =
+!+
+! Functional description:
+!	
+!	This routine provides an interface between the parser and dbg$build_path.
+!	Its input is a string descriptor of the type produced by the parser when
+!	the input token is a digit string, i.e. the length field contains 4 and
+!	the pointer field points to a long word containing the value of the 
+!	input digit string IN BINARY. DBG$BUILD_PATH expects legitimate string
+!	descriptors, i.e. those in which the pointer specifies a sequence of bytes
+!	representing the data as characters, and the length field specifies how
+!	many bytes are in the sequence. This routine formats its input so that
+!	dbg$build_path can handle it and then calls dbg$build_path.
+!
+! Formal Parameters:
+!
+!	number_desc - a pseudo string descriptor with 
+!			i) a length field of 4 and a pointer field which 
+!			   specifies a long word binary integer.
+!			 -or-
+!			ii) a length field of 1 and a pointer to a single character
+!			    representing zero.
+!
+! Implicit Parameters:
+!
+!	none
+!
+! Return Value:
+!
+!	TRUE, unless some error like no free storage, in which case a no return
+!		SIGNAL is emitted.
+!
+!-
+BEGIN
+	MAP		! input descriptor for a non_negative integer stored 
+			! in a long word.
+		number_desc : REF BLOCK[, BYTE];
+
+	LOCAL
+		value;
+
+	SELECTONE .number_desc[dsc$w_length] OF
+	    SET
+		[1]: BEGIN
+			LOCAL byte_ptr : REF VECTOR[1, BYTE];
+
+			byte_ptr = .number_desc[dsc$a_pointer];
+			IF .byte_ptr[0] NEQ 0 
+			THEN
+				SIGNAL (dbg$_debugbug,1,dbg$k_bad_num_desc)
+			ELSE
+				value = 0;
+		     END;
+
+		[4]: value = ..number_desc[dsc$a_pointer];
+	
+		[OTHERWISE]: SIGNAL(dbg$_debugbug,1,dbg$k_bad_num_desc);
+
+	    TES;
+
+	RETURN dbg$build_path(value, TRUE);
+
+END;
+
+
+GLOBAL ROUTINE DBG$BLD_INVOC_NUM (STG_DESC) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Accepts an ascii string descriptor of a numeric literal and adds the
+!	translated number to the pathname vector as as invocation number.
+!
+! FORMAL PARAMETERS:
+!
+!	STG_DESC	- A longword containing the address of an ascii string
+!			  descriptor representing a decimal numeric literal
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	The pathname vector is modified by the addition of the invocation number.
+!
+! ROUTINE VALUE:
+!
+!	NOVALUE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+
+    MAP
+	STG_DESC	: REF BLOCK [,BYTE];
+
+    LOCAL
+	NEW_DESC	: BLOCK [8,BYTE],		! ASCII string descriptor
+	NUMBER,						! Holds converted number
+	NUM_BUFFER	: REF VECTOR [,BYTE],		! Number buffer,
+	DUMMY;						! Dummy parameter
+
+
+    ! First, we must copy the content of the input stg_desc into a new buffer
+    ! so that a <CR> may be appended for dbg$nsave_decimal_integer.
+    !
+    num_buffer = dbg$get_tempmem ((.stg_desc [dsc$w_length] / %UPVAL) + 2);
+    new_desc [dsc$a_pointer] = .num_buffer;
+    new_desc [dsc$w_length] = .stg_desc [dsc$w_length] + 1;
+    ch$move (.stg_desc [dsc$w_length], .stg_desc [dsc$a_pointer], .new_desc [dsc$a_pointer]);
+    num_buffer [.stg_desc [dsc$w_length]] = 13; ! <CR>
+
+
+    ! Call dbg$nsave_decimal_integer to convert the ascii input
+    !
+    IF NOT dbg$nsave_decimal_integer (new_desc, number, dummy)
+    THEN
+	SIGNAL (dbg$_invnumber, 1, .stg_desc);  ! No return
+
+
+    ! Call dbg$build_path to add the invocation number.
+    !
+    dbg$build_path (number, true);
+
+    END;		! End of dbg$bld_invoc_num
+
+END				!End of module
+ELUDOM

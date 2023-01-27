@@ -1,0 +1,502 @@
+MODULE setp0$mess (IDENT = 'V03-001',
+		ADDRESSING_MODE(EXTERNAL=GENERAL)) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  SET Command (SETP0.EXE)
+!
+! ABSTRACT:
+!
+!	This module processes the SET MESSAGE command
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. unprivileged user mode,
+!
+! AUTHOR:  Tim Halvorsen, Dec 1979
+!
+! Modified by:
+!
+!	V03-001	DWT0036		David Thiel	1-Apr-1982
+!		Don't allow an indirect message section to be installed.
+!
+!	V001	TMH0001		Tim Halvorsen	26-Dec-1981
+!		Complete the code to delete a message section when
+!		desired (/DELETE) by unmaping the section and deassigning
+!		the channel to the file.  Two new cells were added to P1
+!		space to hold the virtual address range and the channel #.
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET.L32';	! VAX/VMS common definitions
+
+LIBRARY	'SYS$LIBRARY:CLIMAC.L32';	! CLI macros
+
+REQUIRE 'SHRLIB$:CLIMSG.B32';		! Get CLI$_CONFQUAL message
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    setp0$message,			! Process SET MESSAGE
+    set_bit,				! Action routine if qual present/true
+    clear_bit,				! Action routine if qual absent/neg.
+    map_section,			! Map message section into P1 region
+    delete_section;			! Delete message section from P1 region
+
+!
+! Define literals
+!
+
+LITERAL
+    true = 1,
+    false = 0;
+
+!
+! Macros
+!
+
+MACRO
+    perform(command) =
+	BEGIN
+	LOCAL status;
+	status = command;
+	IF NOT .status
+	THEN
+	    BEGIN
+	    setp0$l_status = .status;
+	    RETURN true;
+	    END;
+	END%,
+
+    return_if_error(command) =
+	BEGIN
+	LOCAL status;
+	status = command;
+	IF NOT .status
+	THEN
+	    RETURN .status;
+	END%;
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    sys$cli;				! CLI call back routine
+
+!
+! External definitions
+!
+
+EXTERNAL
+    setp0$cli_work:	VECTOR [,BYTE],	! CLI work area
+    setp0$l_status,			! Status returned from option
+    ctl$gb_msgmask:	BYTE,		! Default message flags
+    ctl$gl_ppmsg:	VECTOR [2],	! Process permanent message section
+    ctl$gw_ppmsgchn:	WORD,		! Channel to message section
+    ctl$gl_ctlbasva;			! Base of fixed P1 region
+
+
+!
+! Define SET command qualifiers handled by SETP0.EXE
+!
+
+    $CLIQUALCODES (stms,
+			delete,
+			facility,
+			severity,
+			identification,
+			text);
+
+!
+! Define flags to indicate which qualifiers are present
+!
+
+LITERAL
+    $EQULST(qual_,,0,1,
+		(delete,),
+		(file,));
+
+!
+! CLI control blocks and work areas
+!
+
+OWN
+    cli_flags:	BITVECTOR[32],		! CLI qualifier flags
+    set_mask:	BYTE INITIAL(0),	! Mask of bits to explicitly set
+    clear_mask:	BYTE INITIAL(0),	! Mask of bits to explicitly clear
+
+    delete_desc:
+	$CLIQUALDESC(QDCODE = delete,
+		     SETLST = qual_delete),
+
+    facility_desc:
+	$CLIQUALDESC(QDCODE = facility,
+		     QDFLGS = QDEXPA,
+		     TRUACT = set_bit,
+		     FLSACT = clear_bit,
+		     USRVAL = 3),
+
+    severity_desc:
+	$CLIQUALDESC(QDCODE = severity,
+		     QDFLGS = QDEXPA,
+		     TRUACT = set_bit,
+		     FLSACT = clear_bit,
+		     USRVAL = 2),
+
+    ident_desc:
+	$CLIQUALDESC(QDCODE = identification,
+		     QDFLGS = QDEXPA,
+		     TRUACT = set_bit,
+		     FLSACT = clear_bit,
+		     USRVAL = 1),
+
+    text_desc:
+	$CLIQUALDESC(QDCODE = text,
+		     QDFLGS = QDEXPA,
+		     TRUACT = set_bit,
+		     FLSACT = clear_bit,
+		     USRVAL = 0),
+
+    end_of_quals:
+	$CLIQUALEND;
+
+OWN
+    file_desc:
+	$CLIREQDESC(RQTYPE = input1,	! Get file name
+		    BITNUM = qual_file,
+		    QUALST = delete_desc,
+		    RQFLGS = ABSADR),
+
+    qual_desc:				! Get the qualifiers
+	$CLIREQDESC(RQTYPE = getqual,
+		    QUALST = delete_desc,
+		    RQFLGS = ABSADR);
+
+GLOBAL ROUTINE setp0$message =		! SET MESSAGE command
+
+!---
+!
+!	This routine processes the SET MESSAGE command
+!
+! Inputs:
+!
+!	opt_desc = Address of option descriptor block
+!
+! Outputs:
+!
+!	status code
+!---
+
+BEGIN
+
+ROUTINE
+    set_flags =
+	(BUILTIN ap; ctl$gb_msgmask = .ap <0,4>; true); ! Set message flags
+
+LOCAL
+    status,				! status code
+    new_mask:	BYTE;			! New message bit mask
+
+!
+!	Get message file name
+!
+
+perform(sys$cli(file_desc,setp0$cli_work,cli_flags)); ! Get file name (if any)
+
+!
+!	Get qualifiers on command line
+!
+
+perform(sys$cli(qual_desc,setp0$cli_work,cli_flags));	! Parse qualifiers
+
+!
+!	Set the new message display flag settings first
+!
+
+IF .set_mask NEQ 0 OR .clear_mask NEQ 0	! If we gotta change something,
+THEN
+    BEGIN
+    new_mask = (.ctl$gb_msgmask OR .set_mask) AND NOT .clear_mask;
+
+    perform($CMKRNL(ROUTIN = set_flags,
+		ARGLST = .new_mask));	! Set new message flags
+    END;
+
+!
+!	If /DELETE was specified, then delete the current section
+!
+IF .cli_flags [qual_delete]		! If /DELETE specified,
+THEN
+    BEGIN
+    IF .file_desc [cli$w_rqsize] NEQ 0	! If file spec specified,
+    THEN
+	RETURN cli$_confqual;		! return conflicting qualifiers
+
+    perform($CMKRNL(ROUTIN=delete_section, ! then delete the section
+		ARGLST=file_desc));
+    END;
+
+!
+!	If message file name specified, then map the file into
+!	the P1 region and set the process permanent message pointer.
+!
+
+IF .file_desc [cli$w_rqsize] NEQ 0	! If parameter specified,
+    AND NOT .cli_flags [qual_delete]	! and not deleting the section
+THEN
+    BEGIN
+    !
+    !	Only allow 1 section to be mapped at a time for now
+    !	This can be extended at a later date.
+    !
+    IF .ctl$gl_ppmsg NEQ 0		! If section already mapped,
+    THEN
+        perform($CMKRNL(ROUTIN=delete_section,ARGLST=file_desc));! unmap it
+    !
+    !	Map the specified file as the current section
+    !
+    perform($CMKRNL(ROUTIN=map_section,	! map the section
+		ARGLST=file_desc));
+    END;
+
+RETURN true;
+
+END;
+
+ROUTINE set_bit (qual_desc_block) =
+
+!---
+!
+!	This action routine is called when a qualifier is
+!	present and not negated.
+!
+! Inputs:
+!
+!	qual_desc_block = Address of qualifier descriptor block
+!
+! Outputs:
+!
+!	set_mask = Bit mask of bits to explicitly set
+!---
+
+BEGIN
+
+MAP
+    qual_desc_block:	REF BLOCK [,BYTE];
+
+set_mask = .set_mask OR 1^(.qual_desc_block [cli$l_usrval]);
+
+RETURN true;
+
+END;
+
+ROUTINE clear_bit (qual_desc_block) =
+
+!---
+!
+!	This action routine is called when a qualifier is
+!	not present or negated.
+!
+! Inputs:
+!
+!	qual_desc_block = Address of qualifier descriptor block
+!
+! Outputs:
+!
+!	clear_mask = Bit mask of bits to explicitly clear
+!---
+
+BEGIN
+
+MAP
+    qual_desc_block:	REF BLOCK [,BYTE];
+
+clear_mask = .clear_mask OR 1^(.qual_desc_block [cli$l_usrval]);
+
+RETURN true;
+
+END;
+
+ROUTINE map_section =
+
+!---
+!
+!	This routine maps the message file into the P1 region
+!	as a process permanent message section.  The file name
+!	is described by the parameter descriptor block.
+!
+! Inputs:
+!
+!	ap = Address of parameter descriptor block
+!
+! Outputs:
+!
+!	The file is mapped; else status returned in setp0$l_status.
+!---
+
+BEGIN
+
+BUILTIN
+    AP,					! Register AP
+    PROBER;				! Built-in function PROBER
+
+MAP
+    ap:		REF BLOCK [,BYTE];	! Address of parm desc. block
+
+LOCAL
+    fab:	BLOCK [fab$c_bln,BYTE],	! FAB to access file with
+    status,				! temporary status
+    range:	VECTOR [2],		! CRMPSC address range
+    section:	REF BLOCK[,BYTE];	! Use to access actual section
+
+!
+!	Open the message file and obtain a channel to it
+!
+
+$FAB_INIT(FAB = fab,			! Initialize FAB
+	FNA = .ap [cli$a_rqaddr],	! Address of file name string
+	FNS = .ap [cli$w_rqsize],	! Length of file name string
+	DNA = UPLIT('.EXE'),		! Default name string
+	DNS = 4,
+	FOP = UFO);			! User file open
+
+return_if_error($OPEN(FAB = fab));	! Open the file
+
+!
+!	Map the section into P1 space
+!
+
+range [0] = %X'40000000';		! Signal to EXPREG in P1 region
+range [1] = .range [0];
+
+return_if_error($CRMPSC(INADR = range,	! Map the section into P1 space
+		RETADR = range,		! Get resulting address range
+		FLAGS = sec$m_expreg,	! Expand region to map section
+		CHAN = .fab [fab$l_stv],! Channel number of open file
+		ACMODE = psl$c_exec,	! Owned by exec mode, read only
+		VBN = 2));		! Start after image header
+					! NOTE: Assume 1 block image header
+
+
+!
+!	Change the page protection to user read only.  This
+!	is so that the probing in $GETMSG works for all callers.
+!
+
+status = $SETPRT(INADR=range,PROT=prt$c_ur);	! Change to user read only
+
+IF NOT .status				! If error changing protection
+THEN
+    BEGIN
+    $DELTVA(INADR=range);		! Unmap section
+    $DASSGN(CHAN=.fab [fab$l_stv]);	! and deassign channel
+    RETURN .status;			! return with status
+    END;
+
+!
+!	Verify validity of message section
+!
+
+section = .range [0];			! Address the contents of the section
+
+IF (.section [plv$l_type] NEQ plv$c_typ_msg)	! Verify validity of section
+    OR (.section [plv$l_version] NEQ 0)
+    OR (.section [plv$l_msgdsp] NEQ 6)
+    OR (.section [plv$l_exec] NEQ %X'65160101')
+    OR (
+	BEGIN
+
+	BIND
+	    rel = section [plv$l_usrundwn],	! self-relative pointer
+	    msc = rel + .rel : BLOCK [, BYTE];	! message section
+
+	IF PROBER (%REF (psl$c_user), %REF (1), msc [msc$b_type])
+	THEN
+	    .msc [msc$b_type] NEQ msc$c_msg	! only message text type allowed
+	ELSE
+	    true
+	END
+	)
+THEN					! Message file illegal, unmap it
+    BEGIN
+    $DELTVA(INADR=range);		! Unmap section
+    $DASSGN(CHAN=.fab [fab$l_stv]);	! and deassign channel
+    RETURN ss$_ivsecidctl;		! Signal invalid message file
+    END;
+
+ctl$gl_ppmsg [0] = .range [0];		! Set address of section vector
+ctl$gl_ppmsg [1] = .range [1];	
+ctl$gw_ppmsgchn = .fab [fab$l_stv];	! Save channel to message section
+
+ctl$gl_ctlbasva = .range [0];		! Set new base of fixed P1 region
+
+RETURN true;				! Return successful
+		
+END;
+
+ROUTINE delete_section =
+
+!---
+!
+!	This routine deletes an existing process permanent
+!	message file currently mapped in P1 space.
+!
+! Inputs:
+!
+!	ap = Address of parameter descriptor block
+!
+! Outputs:
+!
+!	The section is unmapped; or status returned in setp0$l_status.
+!---
+
+BEGIN
+
+IF .ctl$gl_ctlbasva EQL .ctl$gl_ppmsg [0]
+THEN
+    ctl$gl_ctlbasva = .ctl$gl_ppmsg [1] + 1;
+
+setp0$l_status = $DELTVA(INADR=ctl$gl_ppmsg);
+
+$DASSGN(CHAN = .ctl$gw_ppmsgchn);	! Deassign channel to file
+ctl$gw_ppmsgchn = 0;			! Indicate channel no longer valid
+
+ctl$gl_ppmsg [0] = 0;			! Zero address of section
+ctl$gl_ppmsg [1] = 0;
+
+RETURN true;
+
+END;
+
+END
+ELUDOM

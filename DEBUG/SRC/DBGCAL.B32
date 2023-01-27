@@ -1,0 +1,269 @@
+MODULE DBGCAL (IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	DEBUG (DBG)
+!
+! ABSTRACT:
+!	This module contains a routine that allows the user to call a
+!	subroutine from DEBUG, have it execute, and then view its
+!	returned value.
+!
+! ENVIRONMENT:	VAX/VMS, user mode, interrupts disabled
+!
+! AUTHOR:	Carol Peters, CREATION DATE:	26 October 1977
+!
+! MODIFIED BY:
+!		Mike Candela, 9 Oct 1978
+!
+! 1.01	22-SEP-78	DAR	Deleted require file LISTEL
+! 1.02	 9-OCT-78	MCC	dbg$call_cmd now probes the address of the
+!				subroutine to be called  for read access. This
+!				prevents an access violation if read access is
+!				not permitted. Instead an error is signaled.
+!--
+
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	dbg$call_cmd : NOVALUE;			! calls a subroutine
+
+!
+! INCLUDE FILES:
+!
+REQUIRE 'SRC$:DBGPROLOG.REQ';
+
+REQUIRE 'SRC$:DBGPCT.REQ';
+REQUIRE 'SRC$:DBGGEN.REQ';
+REQUIRE 'SRC$:BSTRUC.REQ';
+REQUIRE 'SRC$:SYSSER.REQ';
+
+!
+! MACROS:
+!
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+	dbg_cal	= FALSE;			! for debugging
+
+!
+! OWN STORAGE:
+!
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+	dbg$freez;				! allocates an area of storage
+
+EXTERNAL
+	dbg$gb_take_cmd : BYTE,			! flag that says take further commands
+	dbg$gl_head_lst,			! pointer to head of argument list
+	dbg$gl_runframe : REF BLOCK [, BYTE],	! pointer to current run context
+	dbg$pseudo_prog;			! address of phony user code
+
+GLOBAL ROUTINE dbg$call_cmd : NOVALUE =	! calls a user subroutine
+
+!++
+! Functional description:
+!	This routine calls a user-specified subroutine and displays the
+!	returned value from that subroutine on the output device.
+!
+!	The arguments to the subroutine are found in the normal command
+!	parameter singly-linked list. The arguments occur in items 1 to
+!	"n - 1" on the list and the subroutine address occurs in item
+!	"n" on the list.
+!
+!	The arguments are counted, and if any exist, a standard VAX
+!	call frame argument list is constructed. Then the routine
+!	is called via a CALLG instruction. If no arguments exist, the
+!	routine is called via a CALLS instruction.
+!
+! Formal parameters:
+!
+!	none
+!
+! Implicit inputs:
+!
+!	dbg$gl_head_lst points to the head of the command
+!	parameter list.
+!
+! Implicit outputs:
+!
+!	none
+!
+! Routine value:
+!
+!	novalue
+!
+! Side effects:
+!
+!	The user-specified routine is executed, and the returned value
+!	is displayed on the output device.
+!
+!--
+
+	BEGIN
+
+	LOCAL
+		argument_ptr,				! pointer to command parameter list
+		count,					! parameter count
+		frame_ptr : REF VECTOR,			! pointer to call frame
+		old_runframe : REF BLOCK [, BYTE],	! pointer to old runframe context
+		status,					! value from user routine
+		output_buffer : VECTOR [40, BYTE];	! output buffer
+
+	LITERAL
+		stock_user_psl	= %x'03C00000';		! standard user PSL value
+	BUILTIN
+		PROBER;
+
+
+	argument_ptr = .dbg$gl_head_lst;
+	IF .argument_ptr EQL 0
+	THEN SIGNAL (dbg$_parseerr);
+	count = 0;
+	REPEAT
+		BEGIN
+
+		!++
+		! This loop counts the number of command parameters.
+		! Increment the count by one each time through the
+		! loop. If this is the last link in the command
+		! list, exit the loop. The count will contain the number
+		! of arguments to the routine plus one (for the routine name
+		! itself) and argument_ptr is left pointing to the routine. 
+		!--
+		count = .count + 1;
+		IF .list_elem_flink (.argument_ptr) EQL 0
+		THEN EXITLOOP
+		ELSE argument_ptr = .list_elem_flink (.argument_ptr);
+		END;
+
+%IF dbg_cal
+%THEN
+	$fao_tt_out ('There are !SL arguments', .count - 1);
+%FI
+	!++
+	! Check for read access to the user specified routine location
+	!--
+	IF NOT PROBER (%REF(0), %REF(1), .list_elem_exp1 (.argument_ptr))
+	THEN
+		SIGNAL(DBG$_BADSTARTPC, 1, .list_elem_exp1 (.argument_ptr));
+		! point of no return
+
+
+	argument_ptr = .dbg$gl_head_lst;
+	IF .count GTR 1
+	THEN
+		BEGIN
+
+		!++
+		! If there were arguments to the routine, make a
+		! call frame argument list. Allocate enough storage for
+		! one longword per argument plus a longword for the
+		! count. Insert the arguments in order as they appear
+		! in the command parameter list.
+		!--
+		frame_ptr = dbg$freez (.count);
+
+		frame_ptr [0] = .count - 1;
+		INCR index FROM 1 to .count - 1 DO
+			BEGIN
+
+%IF dbg_cal
+%THEN
+			$fao_tt_out ('argument is !XL', .list_elem_exp1 (.argument_ptr));
+%FI
+
+			frame_ptr [.index] = .list_elem_exp1 (.argument_ptr);
+			argument_ptr = .list_elem_flink (.argument_ptr);
+			END;
+
+%IF dbg_cal
+%THEN
+		$fao_tt_out ('call frame is!/!SL!/!XL', .frame_ptr [0], .frame_ptr [1]);
+%FI
+
+		END
+	ELSE
+		BEGIN
+
+		!++
+		! No arguments. Construct a call frame with argument
+		! count of zero.
+		!--
+		frame_ptr = dbg$freez (1);
+		frame_ptr [0] = 0;
+
+%IF dbg_cal
+%THEN
+		$fao_tt_out ('call frame is!/!SL', .frame_ptr [0]);
+%FI
+
+		END;
+
+	!++
+	! Now activate a new block of runtime context for the routine
+	! to be called. Copy all the current user registers into it.
+	! Make its next_link point to the old runframe block. Load the
+	! address of the routine to be called and its call frame. Load
+	! the PC value with a phony program in DEBUG that will do the
+	! actual CALLG. Set the bit that says that interrupts are to
+	! be enabled before running the program.
+	!--
+	old_runframe = .dbg$gl_runframe;
+	dbg$gl_runframe = dbg$freez ((dbg$k_runfr_len + 3) / %UPVAL);
+	dbg$gl_runframe [dbg$l_next_link] = .old_runframe;
+	dbg$gl_runframe [dbg$l_frame_ptr] = .frame_ptr;
+	dbg$gl_runframe [dbg$l_call_addr] = .list_elem_exp1 (.argument_ptr);
+	dbg$gl_runframe [dbg$v_enab_ast] = TRUE;
+	ch$move ((register_count - 2) * %UPVAL, ch$ptr (old_runframe [dbg$l_user_r0]),
+			ch$ptr (dbg$gl_runframe [dbg$l_user_r0]));
+	dbg$gl_runframe [dbg$l_user_pc] = dbg$pseudo_prog;
+	dbg$gl_runframe [dbg$l_user_psl] = stock_user_psl;
+	dbg$gb_take_cmd = FALSE;
+
+%IF dbg_cal
+%THEN
+	$fao_tt_out ('run frame is !/next link is !XL!/R0:  !XL, PC:  !XL, PSL:  !XL',
+		.dbg$gl_runframe [dbg$l_next_link], .dbg$gl_runframe [dbg$l_user_r0],
+		.dbg$gl_runframe [dbg$l_user_pc], .dbg$gl_runframe [dbg$l_user_psl]);
+	$fao_tt_out ('call frame address is !XL!/call address is !XL', .dbg$gl_runframe [dbg$l_frame_ptr],
+		.dbg$gl_runframe [dbg$l_call_addr]);
+	$fao_tt_out ('argument count is !SL', .(.dbg$gl_runframe [dbg$l_frame_ptr]));
+%FI
+
+	END;
+END				!End of module
+ELUDOM

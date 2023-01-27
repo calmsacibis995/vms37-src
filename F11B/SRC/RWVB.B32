@@ -1,0 +1,246 @@
+MODULE RWVB (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This routine performs the window turn necessary to map a
+!	virtual I/O transfer which is not mapped by the current
+!	window. It also receives virtual I/O errors for bad block
+!	processing.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  7-Jan-1977  00:48
+!
+! MODIFIED BY:
+!
+!	V02-002	ACG0192		Andrew C. Goldstein,	18-Feb-1981  20:44
+!		Fix attempt at bad block handling on write locked disk
+!
+!	V02-001	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:27
+!		Previous revision history moved to F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	READ_WRITEVB,			! main read/write virtual handling
+	MARKBAD_FCB;			! mark bad block in FCB
+
+GLOBAL ROUTINE READ_WRITEVB  =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine performs the window turn necessary to map a
+!	virtual I/O transfer which is not mapped by the current
+!	window. It also receives virtual I/O errors for bad block
+!	processing. These are presently simply returned to the user.
+!
+! CALLING SEQUENCE:
+!	READ_WRITEVB ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	IO_PACKET: I/O packet of request
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1 if request requeued to driver
+!	0 if error
+!
+! SIDE EFFECTS:
+!	window turned
+!	request requeued to driver if mapped
+!
+!--
+
+BEGIN
+
+LOCAL
+	PACKET		: REF BBLOCK,	! pointer to I/O packet
+	WINDOW		: REF BBLOCK,	! file window
+	FCB		: REF BBLOCK,	! file FCB
+	BLOCK_COUNT,			! number of blocks in transfer
+	UNMAPPED,			! number of blocks not mapped
+	MODE,				! mode (read/write) of transfer
+	VBN,				! starting VBN of transfer
+	LBN,				! translated LBN
+	LAST_LBN;			! highest LBN touched by operation
+
+EXTERNAL
+	USER_STATUS	: VECTOR,	! user I/O status block
+	IO_PACKET	: REF BBLOCK,	! I/O request packet
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume in use
+	CURRENT_UCB	: REF BBLOCK;	! UCB of volume in use
+
+EXTERNAL ROUTINE
+	MAP_VBN,			! map and turn window
+	REQUEUE_REQ,			! requeue request to driver
+	SCAN_BADLOG;			! scan bad block log file
+
+
+! Extract the request parameters from the I/O packet. Compute VBN and LBN
+! of the next block to be transferred.
+!
+
+PACKET = .IO_PACKET;
+(USER_STATUS[0])<16,16> = .PACKET[IRP$W_ABCNT];
+WINDOW = .PACKET[IRP$L_WIND];
+BLOCK_COUNT = (.PACKET[IRP$W_BCNT]+511) / 512;
+VBN = .PACKET[IRP$L_SEGVBN];
+
+IF .VBN EQL 0 THEN ERR_EXIT (SS$_BADPARAM);
+
+
+! Attempt to map the request. If the map fails, report
+! failure. Else requeue the request to the driver.
+!
+
+LBN = MAP_VBN (.VBN, .WINDOW, .BLOCK_COUNT, UNMAPPED);
+IF .LBN EQL -1 THEN ERR_EXIT (SS$_ENDOFFILE);
+
+IF .PACKET[IRP$V_VIRTUAL]
+THEN
+    BEGIN
+    LAST_LBN = .LBN + (.BLOCK_COUNT - .UNMAPPED - 1);
+    IF .LBN GEQU .CURRENT_UCB[UCB$L_MAXBLOCK]
+    OR .LAST_LBN GEQU .CURRENT_UCB[UCB$L_MAXBLOCK]
+    THEN ERR_EXIT (SS$_ILLBLKNUM);
+    KERNEL_CALL (REQUEUE_REQ, .PACKET, .LBN, .UNMAPPED);
+    RETURN 1;
+    END
+
+! If the virtual bit is not set, this is an I/O error on a file sent here
+! for bad block processing. If the error is a parity, format, or datacheck
+! error, we set the bad block bit in the FCB of the file and enter the
+! block in question into the volume's bad block log. Note that we do not
+! do this on errors on the volume's reserved files, which are not subject
+! to dynamic bad block processing.
+!
+
+ELSE
+    BEGIN
+    USER_STATUS[0] = .PACKET[IRP$L_IOST1];	! get status to return to user
+    USER_STATUS[1] = .PACKET[IRP$L_IOST2];
+    FCB = .WINDOW[WCB$L_FCB];
+
+    IF
+	NOT .BBLOCK [CURRENT_UCB[UCB$L_DEVCHAR], DEV$V_SWL]
+    AND (
+	   .(PACKET[IRP$L_IOST1])<0,16> EQL SS$_PARITY
+	OR .(PACKET[IRP$L_IOST1])<0,16> EQL SS$_DATACHECK
+	OR .(PACKET[IRP$L_IOST1])<0,16> EQL SS$_FORMAT
+	)
+    AND (
+	.FCB[FCB$W_FID_NUM] GTRU .CURRENT_VCB[VCB$B_RESFILES]
+	OR (.CURRENT_VCB[VCB$V_EXTFID]
+	    AND .FCB[FCB$B_FID_NMX] NEQ 0)
+	)
+    THEN
+	BEGIN
+	KERNEL_CALL (MARKBAD_FCB, .FCB);
+	MODE = ENTER_READERR;			! assume read
+	IF .PACKET[IRP$V_FCODE] EQL IO$_WRITEPBLK
+	THEN MODE = ENTER_WRITERR;
+	SCAN_BADLOG (FCB[FCB$W_FID], .VBN, .LBN, .MODE, 0);
+	END;
+    RETURN 0;
+    END;
+
+END;					! end of routine READ_WRITEVB
+
+GLOBAL ROUTINE MARKBAD_FCB (FCB) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine set the bad block bit in the indicated FCB.
+!
+!
+! CALLING SEQUENCE:
+!	MARKBAD_FCB (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of FCB
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1
+!
+! SIDE EFFECTS:
+!	bad bit set in FCB
+!
+!--
+
+BEGIN
+
+MAP
+	FCB		: REF BBLOCK;	! FCB argument
+
+
+FCB[FCB$V_BADBLK] = 1;
+
+RETURN 1;
+
+END;					! end of routine MARKBAD_FCB
+
+END
+ELUDOM

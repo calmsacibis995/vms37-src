@@ -1,0 +1,779 @@
+
+	.TITLE	NETTRN - State transition routines
+	.IDENT	'V03-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+
+;++
+; FACILITY: NETWORK ACP
+;
+; ABSTRACT:
+;
+;	This module processes the work, timer, and AQB queues.  It also
+;	provides utility routines such as buffer management and timer/work
+;	queue element routines.
+;
+; ENVIRONMENT:
+;
+;	MODE = KERNEL
+;--
+	.SBTTL	HISTORY
+;
+; AUTHOR:	SCOTT G. DAVIS, CREATION DATE: 20-APR-77
+;
+; MODIFIED BY:
+;
+;	V02-02		S.G.D.		13-JUN-1979
+;		Modify for routing.
+;
+;	V02-03		A.D.E		26-NOV-1979
+;		Further Phase III modifications.  Moved I/O done
+;		processing into this file and eliminated NETIODONE.MAR
+;
+;	V02-04		A.D.E		03-APR-1980
+;		Added WQE and timer queue support.  General clean-up.
+;	V02-05
+;	V02-06		A.D.E		2-AUG-1981
+;		General clean-up
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+ 
+	$AQBDEF
+	$CCBDEF
+	$CNFDEF
+	$CNRDEF
+	$CRBDEF
+	$CXBDEF
+	$DYNDEF
+	$IRPDEF
+	$IODEF
+	$LPDDEF
+	$LTBDEF
+	$NETSYMDEF
+	$RCBDEF
+	$UCBDEF
+	$VECDEF
+	$VCBDEF
+	$WQEDEF
+	$XMDEF
+	$XWBDEF
+
+NET$C_DYN_WQE  ==  33			; Dummy type code for WQE's
+MASK		= ^XF			; Buffer rounding mask
+;
+; OWN STORAGE:
+;
+	.PSECT	NET_PURE,NOWRT,NOEXE,LONG
+ 
+RANGE:	.LONG	0			; Range for working-set purge
+	.LONG	<1@31>-1		; Do it all
+
+
+	.PSECT	NET_IMPURE,WRT,NOEXE,LONG
+
+;
+;  Setup the timer and work queue listheads.
+;
+	ASSUME	WQE$L_FLINK   EQ    0
+	ASSUME	WQE$L_BLINK   EQ    4
+	ASSUME	WQE$W_SIZE    EQ    8
+	ASSUME	WQE$B_TYPE    EQ   10
+	ASSUME	WQE$B_SUB     EQ   11
+	ASSUME	WQE$L_ACTION  EQ   12
+	ASSUME	WQE$L_PM1     EQ   16
+	ASSUME	WQE$L_PM2     EQ   20
+
+NET$GQ_WQE_WORK::			; ACP work queue listhead
+		.LONG	.		; Listhead
+		.LONG	.-4		; 
+		.WORD	0		; Zero the size field to bugcheck
+					; on attempted deallocation
+		.BYTE	NET$C_DYN_WQE	; Structure type
+		.BYTE	WQE$C_SUB_BAS	; Sub-type is "base"
+		.LONG	0[3]		; Zero the remainder of structure
+
+NET$GQ_WQE_TIMR::			; ACP timer queue listhead
+		.LONG	.		; Listhead
+		.LONG	.-4
+		.WORD	0		; Zero the size field to bugcheck
+					; on attempted deallocation
+		.BYTE	NET$C_DYN_WQE	; Structure type
+		.BYTE	WQE$C_SUB_BAS	; Sub-type is "base"
+		.LONG	0[3]		; Zero remainder of basic structure
+		.LONG	0[2]		; Zero the 'due time' to signal timer
+					; is currently inactive.
+NET_TIMER:	.LONG	0		; Low bit used to signal timer AST
+
+	.PSECT	NET_CODE,NOWRT,LONG
+
+	.SBTTL	Major NETACP work dispatching loop
+;++
+; NET$DISPATCH - Purge working set and dispatch whatever work there is to do
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The work queue must be serviced before servicing the AQB queue.  This is
+; because servicing a given AQB or WQE entry may result directly result in a
+; WQE being queued but will not directly result in an AQB entry being queued.
+;
+; The WQE entries are outline above.  The AQB entries are either IRPs or
+; NET buffers as follows:
+;
+;	The IRP must be dispatched by its IRP$W_FUNC value:
+;
+;		IO$_ACPCONTROL	- network management function if IRP$L_SVAPTE
+;				  is non-zero; $CANCEL function otherwise.
+;
+;		IO$_ACCESS	- logical-link connect or direct-line access
+;
+;		IO$_DEACESS	- logical-link disconnect or direct-line deaccess
+;
+;		IO$_DELETE	- datalink has gone inactive
+;
+;
+;	The NET buffer header format is that of WQE contains the following:
+;
+;		WQE$L_ACTION	- 0
+;		WQE$B_EVT	- One of the following:
+;
+;				  NETMSG$C_TR  - a Transport control message
+;				  NETMSG$C_ILL - an illegal message
+;				  NETMSG$C_UNK - an unknown message
+;				  NETMSG$C_IRP - a datalink has gone down
+;
+;		WQE$B_QUAL	- Not used
+;		WQE$W_PTH	- The LPD path i.d. of the datalink
+;		WQE$L_PM2	- Event dependent as follows:
+;
+;				  NETMSG$C_TR,
+;				  NETMSG$C_ILL,
+;				  NETMSG$C_UNK - Low order word contains the
+;						 byte offset from the top of
+;						 the structure to the message.
+;						 High order word contains the
+;						 message length in bytes.
+;				  NETMSG$C_IRP - Pointer to IOSB quadword image
+;						 (which contains the device
+;						  dependent status bits in the
+;						  second longword).
+;--
+NET$DISPATCH::				; Major NETACP work dispatching loop
+	$PURGWS_S	W^RANGE		; Purge the working set
+	;
+	;   Drain the scratch buffer queue
+	;
+GO:	CLRL	W^NET$GL_FLAGS		; Clear internal flags
+	REMQUE	@W^NET$GQ_TMP_BUF,R0	; Get then next buffer
+	BVS	50$			; Br if queue is empty
+	BSBW	NET$DEALLOCATE		; Deallocate it
+	BRB	GO			; Loop for next buffer
+	;
+	;   Process any work queue entries
+	;
+50$:	BBCCI	#0,W^NET_TIMER,70$	; If BS then timer AST occurred
+	BSBW	TIMER_EXP		; Service the timer
+70$:	BSBW	WQE$REMQUE		; Get and process next waiting WQE
+	BLBS	R0,GO			; If LBS keep going
+	;
+	;   Process any AQB entries
+	;
+	MOVL	W^NET$GL_PTR_AQB,R2	; Get address of queue head
+	REMQUE	@AQB$L_ACPQFL(R2),R3	; Try to get a packet
+	BVS	300$			; If VS queue is empty
+	PUSHAB	B^200$			; Set up return for dequeuing
+	CMPB	S^#DYN$C_IRP,IRP$B_TYPE(R3) ; Is the thing an IRP?
+	BEQL	PROC_IRP		    ; If EQL yes - process IRP
+	CMPB	S^#DYN$C_NDB,IRP$B_TYPE(R3) ; Is it an XWB ?
+	BNEQ	90$			    ; If NEQ no
+	BRW	NET$PROC_XWB		    ; Process the XWB
+90$:	CMPB	S^#DYN$C_NET,IRP$B_TYPE(R3) ; Is it from transport?
+	BNEQ	100$			; If NEQ no
+	MOVL	R3,R5			; Copy buffer address for call
+	BRW	NET$DLL_RCV		; Process the message
+
+100$:	BUG_CHECK NETNOSTATE,FATAL	; Bad IRP
+
+200$:	BSBW	NET$DEC_TRANS		; Decrement the transaction count
+	BRB	GO			; Loop
+	;
+	;   Go to sleep, my baaaby
+	;
+300$:	$HIBER_S			; Hibernate
+	BRB	GO			; Loop
+
+PROC_IRP:				; Process IRP
+	MOVL	IRP$L_UCB(R3),R5	; Get UCB address
+	MOVL	R5,W^NET$GL_SAVE_UCB	; Save it
+	MOVL	R3,W^NET$GL_SAVE_IRP	; Save the IRP address
+	MOVQ	S^#SS$_NORMAL,-		; Init IOSB image
+		    W^NET$GQ_USR_STAT	;
+	EXTZV	#IRP$V_FCODE,-		;
+		#IRP$S_FCODE,-		;
+		IRP$W_FUNC(R3),R7	; Get function code
+	BSBB	20$			; Dispatch
+	;
+	;   Finish IRP processing - either complete or requeue to driver.
+	;   If the NET$GL_SAVE_IRP is already zero then the ACP has tucked
+	;   away the IRP somewhere to avoid I/O completion.  If this is the
+	;   case then either mount or the transaction counts must have been
+	;   updated so that pool would not be lost due to a premature shutdown.
+	;
+	MOVL	W^NET$GL_SAVE_IRP,R3	; Get IRP 
+	BEQL	15$			; If EQL its gone 
+	MOVL	W^NET$GL_SAVE_UCB,R5	; Get UCB
+	MOVQ	W^NET$GQ_USR_STAT,-	;
+		IRP$L_MEDIA(R3)		; Jam back the i/o status
+	BBS	S^#NET$V_RQIRP,-	; Br if packet is to be given
+		     W^NET$GL_FLAGS,10$	; back to the driver
+	JMP	L^COM$POST		; Else post it for completion
+10$:	JMP	L^EXE$INSIOQ		; Queue packet to driver
+15$:	RSB				; Return to caller
+
+
+20$:	$DISPATCH  R7,<-
+
+		<IO$_ACCESS,	 30$>,-
+		<IO$_ACPCONTROL, 40$>,-
+		<IO$_DEACCESS,	 50$>,-
+	>
+	MOVW	#SS$_ILLIOFUNC,-	; Say "illegal I/O function"
+		    W^NET$GQ_USR_STAT	;
+	BRB	60$			; Return
+	;
+	;   ACCESS function - dispatch to connect processor
+	;
+30$:	CALLS	#0,W^NET$CONNECT	; Do it
+	BRB	60$			; Common exit
+	;
+	;   ACP Control 
+	;
+40$:	BBC	#IRP$V_COMPLX,-
+		    IRP$W_STS(R3),45$	; If BC then I/O rundown
+	BSBW	NET$CONTROL_QIO		; Process control function
+	BRB	60$			; Complete I/O and get next IRP
+45$:	BICB	#1,IRP$L_WIND(R3)	; Clear interlock bit in case an
+					; IO$_ACCESS or IO$_DEACCESS is pending
+	BSBW	NET$ACP_CANCEL		; Do cancel-related work
+	BRB	55$			; Continue
+	;
+	;   DEACCESS function 
+	;
+50$:	BICL3	#1,IRP$L_WIND(R3),R1	; Get XWB without interlock bit
+	BGEQ	55$			; If GEQ then no XWB
+	BBC	#XWB$V_STS_DLE,-	; If BC then not accessed for direct-
+		 XWB$W_STS(R1),55$	; line service
+	BSBW	NET$DEACCESS_DLE	; Call access module for cleanup
+55$:	BISW	#NET$M_RQIRP,-		; Cause packet to be requeued
+		     W^NET$GL_FLAGS	; to driver
+60$:	RSB				; Done
+
+;+
+; WQE$RESET_TIM  - Cancel and reset timer
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The WQE timer and work queue are searched and all entries which match the
+; WQE$B_EVT,WQE$B_QUAL and WQE$_REQIDT fields are deleted.  The timer is then
+; reset as specified.
+;
+; INPUTS:	R3,R4	Quadword 100 nsec new delay
+;		R2	Action routine to call when the timer expires
+;		R1	WQE$B_EVT,WQE$B_QUAL,WQE$W_REQIDT (EVT in low byte)
+;		R0	Scratch
+;
+; OUTPUTS:	All registers are unchanged
+;-
+WQE$RESET_TIM::				; Cancel and reset timer
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	;
+	BSBB	WQE$CANCEL_TIM		; Cancel all matching entries
+	BSBB	WAIT			; Set new timer
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	;
+	RSB
+
+WAIT:	ASSUME	WQE$L_FLINK EQ 0	; This assumption is made thru-out
+	PUSHL	R5			; Save reg
+	;
+	;   Allocate and initialize a Work Queue Element
+	;
+	PUSHR	#^M<R1,R2>		; Save regs
+	MOVB	#WQE$C_SUB_TIM,R0	; WQE subtype 
+	MOVZBL	#8,R1			; Additional data bytes required 
+	BSBW	WQE$ALLOCATE		; Allocate the WQE
+	MOVL	R2,R5			; Move WQE ptr, if any, to R5
+	POPR	#^M<R1,R2>		; Recover regs
+	BLBC	R0,30$			; Br on error
+	MOVAB	W^TIMER_ACTION,-	; Setup action routine address
+		WQE$L_ACTION(R5)	;
+	ASSUME	WQE$L_PM2  EQ  4+WQE$L_PM1
+	MOVQ	R1,WQE$L_PM1(R5)	; Setup action routine and parameter
+	;
+	;   Calculate expiration time and insert WQE in time ordered queue
+	;
+	MOVQ	G^EXE$GQ_SYSTIME,R1	; Get current time
+	ADDL	R1,R3			; Add low order delay
+	ADWC	R2,R4			; Add high order with carry
+	MOVQ	R3,WQE$C_LENGTH(R5)	; Setup due time in WQE data
+	MOVAB	W^NET$GQ_WQE_TIMR,R0	; Get timer queue listhead ptr address
+10$:	MOVL	(R0),R0			; Advance to next entry
+	BLBC	WQE$B_SUB(R0),20$	; Br if this is the timer listhead
+	MOVQ	WQE$C_LENGTH(R0),R1	; Get entry's due time
+	BSBW	CMPTIM_321		; New WQE's time is in R3,R4 
+					; Queued WQE's time is in R1,R2
+	BGTRU	10$			; If GTRU then R3 time may be later
+20$:	INSQUE	(R5),@4(R0)		; Insert current WQE before WQE with
+					; later expected time
+	BSBW	SET_TIMER		; Reset the timer
+	POPL	R5			; Restore reg
+30$:	RSB				; Done
+
+TIMER_ACTION:				; Timer action routine
+	JSB	(R2)			; Call action routine
+	RSB
+
+;+
+; WQE$CANCEL_TIM  - Cancel timer
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The WQE timer and work queue are searched and all entries which match the
+; WQE$B_EVT, WQE$B_QUAL and WQE$_REQIDT fields are deleted.  WQE$B_EVT = 0
+; matches all events.
+;
+; INPUTS:	R1	WQE$B_EVT,WQE$B_QUAL,WQE$W_REQIDT (EVT in low byte)
+;		R0	Scratch
+; OUTPUTS:
+;		R0	Clobbered
+;
+;		All other registers are unchanged
+;
+;		****  MUST BE CALLED AT IPL 0  ****
+;-
+WQE$CANCEL_TIM::			; Cancel all matching timer entries
+	MFPR	S^#PR$_IPL,R0		; Get current IPL
+	TSTB	R0			; Is it zero
+	BEQL	3$			; If EQL then okay
+	BUG_CHECK NETNOSTATE,FATAL	; Else race conditions could exist
+3$:	PUSHR	#^M<R2,R3,R4>		; Save regs
+	CLRL	R3			; Nullify event mask
+	TSTB	R1			; Cancel all ?
+	BNEQ	5$			; If NEQ then no
+	DECB	R3			; Set all low order bits
+5$:	MOVL	W^NET$GQ_WQE_WORK+4,R2	; Point to last item in the work queue
+	BSBB	10$			; Remove all matching entries
+	MOVL	W^NET$GQ_WQE_TIMR+4,R2	; Get last item in the timer queue
+	BSBB	10$			; Remove all matching entries
+	POPR	#^M<R2,R3,R4>		; Restore regs
+	RSB
+
+10$:	MOVL	(R2),R2			; Chain down the list
+20$:	MOVL	(R2),R0			; Get next entry
+	CMPB	WQE$B_SUB(R0),-		; Is the listhead ?
+	       #WQE$C_SUB_BAS		;
+	BEQL	30$			; If EQL then yes, we're done
+	CMPB	WQE$B_SUB(R0),-		; Is a timer element?
+	       #WQE$C_SUB_TIM		;
+	BNEQ	10$			; If NEQ then no, try next element
+	BICL3	R3,WQE$B_EVT(R0),R4	; Get event longword
+	CMPL	R1,R4			; Does the event match ?
+	BNEQ	10$			; If not, loop
+	REMQUE	(R0),R0			; Remove the entry
+	BSBW	WQE$DEALLOCATE		; Deallocate it
+	BRB	20$			; Loop
+30$:	RSB
+
+;+
+; WQE$TIMER_AST - Receive timer AST
+;
+;-
+WQE$TIMER_AST::				; Receive timer AST
+	.WORD	0			; Save regs
+	BBSSI	#0,W^NET_TIMER,10$	; Flag fact that the AST occurred
+10$:	$WAKE_S				; Wake the ACP
+	RET
+
+TIMER_EXP:
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save regs
+
+	ASSUME	WQE$L_FLINK EQ 0
+
+	MOVAB	W^NET$GQ_WQE_TIMR,R5	; Get address of TIME queue listhead
+	MOVQ	WQE$C_LENGTH(R5),R1	; Get due time
+	CLRQ	WQE$C_LENGTH(R5)	; Zero due time indicator to indicate
+					; that no timer is active
+5$:	MOVL	(R5),R0			; Advance to next element
+	MOVQ	WQE$C_LENGTH(R0),R3	; Get its due time
+	BEQL	10$			; If EQL then listhead
+	BSBB	CMPTIM_321		; Compare due time to current time
+	BGTRU	10$			; If GTRU then it must wait
+	REMQUE	(R0),R0			; Else deque the WQE 
+	BSBB	WQE$INSQUE		; and insert it on work queue
+	BRB	5$			; Loop for as many WQEs as possible
+10$:	BSBW	SET_TIMER		; Reset the timer
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore regs
+	RSB
+
+
+SET_TIMER:				; Conditionally reset timer
+	MOVAB	W^NET$GQ_WQE_TIMR,R0	; Get timer queue listhead ptr
+	MOVL	(R0),R3			; Get first timer entry -- it may will
+					; be the listhead if the queue is empty
+	MOVAB	WQE$C_LENGTH(R3),R3	; Get its expiration time address
+	MOVQ	(R3),WQE$C_LENGTH(R0)	; Setup new expiration time
+	BEQL	20$			; If EQL then queue is empty
+	$CANTIM_S  ACMODE = #0,-	; Cancel timer - kernel mode
+		   REQIDT = #0		; Cancel all timers (there's only one)
+10$:	$SETIMR_S  DAYTIM = (R3),-	; Expiration time
+		   REQIDT = #0,-	; Timer i.d.
+		   ASTADR = W^WQE$TIMER_AST ; AST routine address
+	BLBC	R0,10$			;!Keep trying          *** FIX THIS ***
+20$:	MOVB	#1,R0			; Set low bit to indicate success
+	RSB				; Done
+
+CMPTIM_321:				; Compare R3,R4 to R1,R2 quadwords
+	CMPL	R4,R2			; Compare high order expected time
+	BNEQ	10$			; Condition codes are valid if NEQ
+	CMPL	R3,R1			; Compare low order expected time
+10$:	RSB 
+
+;+
+; WQE$INSQUE - Insert WQE into work queue
+;
+; INPUTS:	R0 - address of WQE to be inserted
+;
+;-
+WQE$INSQUE::				; Insert WQE into work queue
+	INSQUE	(R0),@W^NET$GQ_WQE_WORK+4 ; Insert the element
+	BNEQ	20$			; If NEQ then not first
+	$DISPATCH TYPE=B,WQE$B_SUB(R0),-; Dispatch by subtype
+	<-
+	    <WQE$C_SUB_AST, 10$>,-	; Miscellaneous AST
+	    <WQE$C_SUB_TIM, 10$>,-	; Timer AST
+	    <WQE$C_SUB_MBX, 10$>,-	; Mailbox read AST
+	    <WQE$C_SUB_ACP, 20$>,-	; Internal non-AST routine
+	>
+	BUG_CHECK NETNOSTATE,FATAL	; Invalid subtype
+
+10$:	$WAKE_S				; Wake-up the ACP
+20$:	RSB
+
+;+
+; WQE$REMQUE  - Dispatch next work queue entry
+;
+; DISPATCH WITH:  R5	WQE address
+;		  R1	1st WQE parameter
+;		  R0	2nd WQE parameter
+;
+;		  All registers may be destroyed before returning
+;-
+WQE$REMQUE::				; Remove entry form work queue
+	CLRL	R0			; In case nothing in queue
+	REMQUE	@W^NET$GQ_WQE_WORK,R5	; Get next work queue entry
+	BVS	20$			; If VS then none
+	ASSUME	WQE$L_PM2  EQ  4+WQE$L_PM1
+	MOVQ	WQE$L_PM1(R5),R1	; Get the parameters
+	CMPB	#WQE$C_SUB_TIM,-	; Queued by timer?
+		WQE$B_SUB(R5)		;
+	BNEQ	10$			; If NEQ no
+	BISW	#NET$M_TIMER,-		; Set flag to inform action routine
+		W^NET$GL_FLAGS		;
+10$:	JSB	@WQE$L_ACTION(R5)	; Dispatch to action routine
+	MOVL	#1,R0			; Indicate should try again
+20$:	RSB
+
+;+
+; WQE$ALLOCATE	- Allocate a work queue element
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; Allocate and initialize a work queue element.
+;
+; INPUTS:	R2	Scratch
+;		R1	Bytes in data area at end of block
+;		R0	WQE subtype code
+;
+; OUTPUTS:	R2	Address of block
+;		R1	Garbage
+;		R0	Status
+;-
+WQE$ALLOCATE::				; Allocate a work queue element
+	PUSHL	R0			; Save subtype
+	ADDL	#WQE$C_LENGTH,R1	; Get total size
+	BSBW	NET$ALLOCATE		; Allocate the block
+	POPL	R1			; Recover the subtype
+	BLBC	R0,10$			; Br on error
+	MOVB	#NET$C_DYN_WQE,-	;
+		WQE$B_TYPE(R2)		; Setup the block type
+	MOVB	R1,WQE$B_SUB(R2)	; Setup the subtype
+	RSB
+
+10$:	BUG_CHECK NETNOBUF,FATAL	; No WQE available
+;+
+; WQE$DEALLOCATE - Deallocate work queue element
+;
+; FUNCIONAL DESCRIPTION:
+;
+; Deallocate work queue element.  This routine calls NET$DEALLOCATE to 
+; deallocate the block is and is therefore currently unnecessary.  It is
+; used as a possible hook for the furture when it may be used to recycle
+; a WQE for a waiting caller to WQE$ALLOCATE.
+;
+; INPUTS:	R0	Address of block to be deallocated
+;
+; OUTPUTS:	R0	Garbage.
+;
+;		All other registers are preserved.
+;
+;-
+WQE$DEALLOCATE::			; Deallocate a WQE
+	CMPB	#NET$C_DYN_WQE,-	; Is this really a WQE ?
+		    WQE$B_TYPE(R0)	;
+	BEQL	5$			; If so, deallocate it
+	CMPB	#DYN$C_NET,-		; This type code comes from NETDRIVER
+		    WQE$B_TYPE(R0) 	; evnets
+	BNEQ	10$			; If NEQ then bug
+5$:	BSBW	NET$DEALLOCATE		; Deallocate the block
+	RSB				; Return
+
+10$:	BUG_CHECK NETNOSTATE,FATAL	; Invalid WQE
+
+;+
+; NET$GETUTLBUF	- Acquire use of utility buffer (co-routine)
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; Authorize the use of the utility buffer.  This is coded as a co-routine
+; so that the utility buffer may be automatically released when the requesting
+; routine exits.
+;
+; CALLED VIA:
+;
+;	BSB  NET$GETUTLBUF  or  JSB NET$GETUTLBUF
+;
+;-
+NET$GETUTLBUF::				; Acquire use of utility buffer
+	BBSS	S^#NET$V_UTLBUF,-	; Obtain buffer if possible
+		      W^NET$GL_FLAGS,10$;
+	JSB	@(SP)+			; Call our caller
+	BICW	#NET$M_UTLBUF,-		; Free the utility buffer
+		      W^NET$GL_FLAGS	;
+	RSB				; Return to caller's original
+					; caller.
+10$:	BUG_CHECK NETNOSTATE,FATAL	; UTLBUF is already in use
+
+	.SBTTL	NET$BIN2ASC	- Convert binary to ASCII
+;++
+;
+; NET$BIN2ASC	- Convert binary to ASCII string
+;
+; FUNCTIONAL DESCRIPTION
+;
+; A binary number is converted to its ASCII representation.  The most
+; significant character is stored in the low order byte of the 
+; destination string.
+;
+; INPUTS:   R0	Binary value to be converted
+;	    R3	Pointer to byte to receive most significant ASCII character
+;
+; OUTPUTS:  R0	Garbage
+;	    R3	Pointer to first byte passed the least significant ASCII
+;		character
+;--
+NET$BIN2ASC::				; Convert binary to ASCII
+	PUSHR	#^M<R1,R2>		; Save regs
+	CLRQ	R1			; Init high order dividend,
+					; character count
+	;
+	; Note that this algorithm yields an ASCII "0" if R0=0
+	;
+10$:	INCL	R2			; Account for char to be moved
+	EDIV	#10,R0,R0,-(SP)		; Get decimal digit
+	BNEQ	10$			; Done if EQL
+20$:	ADDL3	#^A"0",(SP)+,R0		; Convert digit to ascii
+	MOVB	R0,(R3)+		; Move it to dest buffer
+	SOBGTR	R2,20$			;  most significant character first
+	POPR	#^M<R1,R2>		; Restore regs
+	RSB
+
+;+
+; NET$JNX_CO   - Journalling co-routine
+;
+; This is common co-routine to facilitate "journalling".  Journalling is a
+; debugging aid and is not part of the DECnet product.
+;
+;-
+	BUF_SIZ = 32
+NET$JNX_CO::				; Journalling co-routine
+	BSBW	FIND_JNX		; Find the journal bufer
+	BNEQ	10$			; If NEQ the journalling is active
+	RSB				; Return with low bit clear in R0
+
+10$:	POPL	R0			; Get caller's address, cleanup stack
+	PUSHR	#^M<R1,R2,R3,R4,R5>	; Save regs
+	SUBL	#BUF_SIZ,SP		; Create nonpaged buffer
+	MOVL	SP,R1			; Point to buffer
+	PUSHL	R0			; Push caller's address
+	MOVL	#1,R0			; Set success
+	JSB	@(SP)+			; Call back for data
+	MOVAB	4(SP),R2		; Get 'buffer' address
+	SUBL	R2,R1			; Get number of bytes moved
+	CMPL	R1,#BUF_SIZ		; Too much data moved?
+	BLEQU	20$			; If LEQU then okay
+	
+	BUG_CHECK NETNOSTATE,FATAL	; Too much journalling data
+
+20$:	DSBINT	B^IPL			; Synchronize with NETDRIVER and I/O
+					; data base changes.  Lock code into
+					; memory
+	BSBB	FIND_JNX		; JNX buffer still around?
+	BEQL	30$			; If not, we're done
+	MOVL	(R0),R3			; Get pointer to free area
+	CMPW	#BUF_SIZ,6(R0)		; Enough bytes left
+	BGEQU	30$			; If LEQU then no
+	SUBW	#BUF_SIZ,6(R0)		; Take the space
+	ADDL	#BUF_SIZ,(R0)		; Update pointer
+	MOVC3	#BUF_SIZ,(R2),(R3)	; Enter JNX record
+30$:	ENBINT				; Restore IPL, fix stack
+	POPL	R0			; Get return address
+	ADDL	#BUF_SIZ,SP		; Fix stack
+	POPR	#^M<R1,R2,R3,R4,R5>	; Restore regs
+	JMP	(R0)			; Return	
+
+FIND_JNX:
+	MOVL	W^NET$GL_PTR_VCB,R0	; Get RCB
+	BEQL	10$			; If EQL then none
+	MOVL	RCB$L_LOC_LPD(R0),R0	; Get local LPD
+	BEQL	10$			; If EQL then none
+	MOVL	LPD$L_PORT1(R0),R0	; Get journal buffer (0 if none)
+10$:	RSB
+IPL:	.LONG	NET$C_IPL		; Sync with NETDRIVER and I/O data
+					; base
+
+	.PSECT	NET_LOCK_CODE,NOWRT,LONG
+
+;++
+; NET$ALONPGD_Z	- Allocate and zero a block of nonpaged system pool
+; NET$ALONPAGED	- Allocate a block of nonpaged system pool
+; NET$ALLOCATE	- Allocate a process space memory block
+; NET$DEALLOCATE- Deallocate memory to either process or non-paged pool
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; A block is allocated and the block header is initialized as follows:
+;
+;		+-------------------------------+
+;		|		0		|
+;		+-------------------------------+
+;		|		0		|
+;		+-------+---------+-------------+
+;		|   0	|DYN$C_NET|     size	|
+;		+-------+---------+-------------+
+;		|				|
+;		|				|
+;		|				|
+;
+;
+; INPUTS:	R1 - Block size
+;--
+NET$ALONPGD_Z::				; Allocate/zero non-paged pool
+	BSBB	NET$ALONPAGED		; Get the block
+	BLBC	R0,10$			; Br on error
+	SUBW	#12,R1			; Get number of bytes to zero
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save regs
+	MOVC5	#0,12(R2),#0,R1,12(R2)	; Zero the block
+	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore regs
+10$:	RSB				; Done
+
+NET$ALONPAGED::				; Allocate non-paged pool
+	PUSHR	#^M<R1,R3,R4,R5>	; Save regs
+	JSB	G^EXE$ALONONPAGED	; Get the block
+	POPR	#^M<R1,R3,R4,R5>	; Restore regs
+	BRB	INIT
+
+
+NET$ALLOCATE::
+	ADDL	#MASK,R1		; Round size to next boundary
+	BICL	#MASK,R1		;
+	BNEQ	5$			; If EQL bad allocation request
+					;
+	BUG_CHECK BADALORQSZ,FATAL  	; Bad allocation request size
+					;
+5$:	MOVQ	R3,-(SP)		; Save regs
+	MOVAB	W^NET$GL_MY_POOL,R3	; Point to memory listhead
+	DSBINT	(R3)+			; Synchronize pool
+	JSB	@#EXE$ALLOCATE		; Allocate block
+	ENBINT				;
+	MOVQ	(SP)+,R3		; Restore regs
+INIT:	BLBC	R0,10$			; If LBC error
+	CLRQ	(R2)			; Clear the first 2 header longwords
+	MOVW	R1,IRP$W_SIZE(R2)	; Enter size
+	MOVZBW	#DYN$C_NET,IRP$B_TYPE(R2) ; Enter default type, clear 11th byte
+	RSB				
+
+10$:	CLRL	R2			; Nullify block pointer
+	RSB				;
+
+;++
+;
+; NET$DEALLOCATE -  Deallocate memory
+;
+; INPUTS:	R0 - Address of block to be deallocated
+;--
+NET$DEALLOCATE::
+	MOVL	(SP),4(R0)		; Save caller's address for journalling
+	PUSHR	#^M<R1,R2,R3,R4>	;
+	TSTL	R0			; Is block from system pool?
+	BLSS	50$			; If LSS yes
+	BEQL	60$			; If EQL then there's no block
+	BITL	#MASK,R0		; Block aligned on boundary?
+	BNEQ	10$			; If NEQ no - bad deallocation
+	MOVZWL	IRP$W_SIZE(R0),R1	; Get size of block in bytes
+	ADDL	#MASK,R1		; Round size up to next boundary
+	BICL	#MASK,R1		; Truncate size back to multiple
+	BNEQ	20$			; If NEQ okay
+10$:	BUG_CHECK BADDALRQSZ,FATAL	; Bad deallocation request size or address
+20$:	MOVAB	W^NET$GL_MY_POOL,R3	; Point to memory listhead
+	DSBINT	(R3)+			; Synchronize pool
+	JSB	@#EXE$DEALLOCATE	; Deallocate the block
+	ENBINT				; Restore IPL
+	BRB	60$			; Continue
+50$:	MOVL	R0,R4			; Save buffer address
+	BSBW	NET$JNX_CO		; See if journalling is enabled
+	BLBC	R0,55$			; If LBC then no
+	MOVL	#^X<DE>,(R1)+		; Enter record type
+	MOVL	R4,(R1)+		; Enter buffer address
+	MOVQ	(R4),(R1)+		; Enter buffer header
+	MOVQ	8(R4),(R1)+		;
+	JSB	@(SP)+			; Return to co-routine to fill journal
+55$:	MOVL	R4,R0			; Restore buffer address
+	JSB	@#EXE$DEANONPAGED	; Deallocate and return
+60$:	POPR	#^M<R1,R2,R3,R4>
+	RSB
+
+.END

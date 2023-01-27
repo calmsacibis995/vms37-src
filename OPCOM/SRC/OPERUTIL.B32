@@ -1,0 +1,962 @@
+MODULE	OPERUTIL	(
+			 LANGUAGE (BLISS32),
+			 IDENT = 'V03-000'
+			) =
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:
+!
+!	OPCOM
+!
+! ABSTRACT:
+!
+!	This module contains the general utility routines used
+!	to manipulate operator control blocks.  These routines
+!	are used freely throughout OPCOM's request handlers.
+!
+! Environment:
+!
+!	VAX/VMS operating system.
+!
+! Author:
+!
+!	Steven T. Jeffreys
+!
+! Creation date:
+!
+!	March 10, 1981
+!
+! Revision history:
+!
+! V02-002	STJ0165		Steven T. Jeffreys,	08-Feb-1982
+!		Make references to library routines use general addressing mode.
+!
+!--
+
+BEGIN						! Start of OPERUTIL
+
+LIBRARY	'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:OPCOMDEF.REQ';
+
+FORWARD ROUTINE
+	CHECK_OPER_COVERAGE : NOVALUE,	! Check operator coverage on requests
+	FIND_OPERATOR,			! Find a given operator RQCB
+	IMPLICIT_DISABLE,		! Check for implict disable of an operator
+	NOTIFY_LISTED_OPERATORS,	! Notify the operators on the given list
+	NOTIFY_OPERATOR,		! Send a message to an operator
+	UPD_OPER_CONTEXT,		! Update operator context
+	VALID_OPERATOR;			! Check for valid operator device
+
+BUILTIN
+	INSQUE,				! Insert entry onto a queue
+	REMQUE;				! Remove entry from a queue
+
+
+GLOBAL ROUTINE CHECK_OPER_COVERAGE (OCD) : NOVALUE =
+
+!++
+! Functional descripton:
+!
+!	This routine will check all outstanding requests queued to
+!	a given OCD for proper operator coverage.  Any request that
+!	no longer has operator coverage will be canceled.  The requestor
+!	will receive a NOPERATOR cancelation message.  No operators are
+!	notified, since none are interested in the request.  The cancelation
+!	is, however, logged.
+!
+! Input:
+!
+!	OCD	: Address of an OCD
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implicit Output:
+!
+!	None.
+!
+! Side Effects:
+!
+!	None.
+!
+! Routine Value
+!
+!	None.
+!--
+
+BEGIN						! Start of CHECK_OPER_COVERAGE
+
+MAP
+	OCD		: REF BBLOCK;		! OCD data structure
+
+EXTERNAL ROUTINE
+	DEALLOCATE_RQCB	: NOVALUE,		! Dispose of an RQCB
+	FORMAT_MESSAGE,				! Format a message
+	LOG_MESSAGE,				! Log an event
+	SEND_REPLY;				! Send a reply to reply mailbox
+
+LOCAL
+	MESSAGE_VECTOR	: VECTOR [2,LONG],	! Message info
+	MCB		: REF BBLOCK,		! MCB data structure
+	RQST_COUNT	: LONG,			! Count of outstanding requests
+	RQST		: REF BBLOCK,		! Pointer to current request RQCB
+	NEXT_RQST	: LONG;			! Pointer to next request RQCB
+!
+! Set up the message info vector.
+!
+MESSAGE_VECTOR [0] = OPC$_NOPERATOR;		! Set message code
+MESSAGE_VECTOR [1] = 0;				! Set # of FAO arguements
+!
+! Set up for the search loop.
+!
+NEXT_RQST = .OCD [OCD_L_RQSTFLINK];		! Get address of next RQCB
+RQST_COUNT = .OCD [OCD_W_RQSTCOUNT];		! Get count of requests
+WHILE (.RQST_COUNT GTR 0) DO
+    BEGIN
+    !
+    ! Compare the request attention mask against the operator
+    ! intererst mask for this OCD.  If there are no common
+    ! bits, then the request does not have any operator coverage
+    ! and must be canceled.  
+    !
+    RQST = .NEXT_RQST;				! Get address of request RQCB
+    NEXT_RQST = .RQST [RQCB_L_FLINK];		! Get address of next RQCB
+    IF  ((.RQST [RQCB_L_ATTNMASK1] AND .OCD [OCD_L_ATTNMASK1]) EQL 0)
+    AND ((.RQST [RQCB_L_ATTNMASK2] AND .OCD [OCD_L_ATTNMASK2]) EQL 0)
+    THEN
+	BEGIN
+	!
+	! Cancel the request.  This entails removing it from the OCD
+	! request queue, sending the cancel notice to the requestor,
+	! and deallocating the request RQCB.
+	!
+	REMQUE (.RQST, RQST);			! Dequeue the request
+	OCD [OCD_W_RQSTCOUNT] = .OCD [OCD_W_RQSTCOUNT] - 1;
+	FORMAT_MESSAGE (.RQST, MESSAGE_VECTOR);
+	SEND_REPLY (.RQST);
+	LOG_MESSAGE (.RQST);
+	DEALLOCATE_RQCB (.RQST);
+	END;
+    RQST_COUNT = .RQST_COUNT - 1;
+    END;
+	
+END;						! End of CHECK_OPER_COVERAGE
+
+GLOBAL ROUTINE FIND_OPERATOR (RQCB, BLOCK) =
+
+!++
+! Functional description:
+!
+!	This routine will scan through the list(s) of operators
+!	known by OPCOM, and return the address of the operator
+!	RQCB if it is found.
+!
+! Input:
+!
+!	RQCB	: Address of an RQCB that describes the operator
+!			  device that is being sought.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	BLOCK	: Contains the address of a longword to receive
+!		  the address of the known operator RQCB. 
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	If the operator is found, then the RQCB is provided
+!	with a pointer to the OCD.
+!
+! Routine value:
+!
+!	TRUE	: If the operator is known to OPCOM
+!	FALSE	: If the operator is not known to OPCOM
+!--
+
+BEGIN						! Start of FIND_OPERATOR
+
+MAP
+	RQCB		: REF BBLOCK;		! RQCB data structure
+
+EXTERNAL ROUTINE
+	IMPLICIT_DISABLE;			! Check for implicit disable
+
+EXTERNAL LITERAL
+	MIN_SCOPE,				! Minimum scope value
+	MAX_SCOPE;				! Maximum scope value
+
+EXTERNAL
+	OCD_VECTOR	: VECTOR;		! Pointer to OCD structure
+
+LOCAL
+	OCD		: REF BBLOCK,		! OCD data structure
+	OPER_RQCB	: REF BBLOCK,		! Operator RQCB structure
+	OCD_INDEX	: LONG,			! Index into OCD_VECTOR
+	OCD_COUNT	: LONG,			! Count of OCDs in the OCD list
+	OPER_COUNT	: LONG,			! Count of operators in OCD list
+	FOUND		: LONG;			! Boolean loop control
+
+!
+! Scan through the list of all known operators,
+! looking for a match on the device name.
+! The scan is started on the lowest privileged
+! operator class and proceeds to the highest.
+!
+.BLOCK = 0;						! Zero the output parameter
+FOUND = FALSE;						! Assume not found
+OCD_INDEX = MAX_SCOPE;					! Set higest (lowest privileged) scope value
+WHILE (.OCD_INDEX GEQ MIN_SCOPE) AND (NOT .FOUND) DO
+    BEGIN
+    !
+    ! Scan the OCD list for each class of operator.
+    !
+    OCD = .OCD_VECTOR [(.OCD_INDEX - 1)*2];		! Get OCD address
+    OCD_COUNT = .OCD_VECTOR [(.OCD_INDEX - 1)*2+1];	! Get count of known operators of this scope
+    WHILE (NOT .FOUND) AND (.OCD_COUNT GTR 0) DO
+	BEGIN
+	!
+	! Scan the operator list for each OCD.
+	!
+	OPER_COUNT = .OCD [OCD_W_OPERCOUNT];		! Get the count of operators in the list
+	OPER_RQCB  = .OCD [OCD_L_OPERFLINK];		! Get pointer to first operator in the list
+	WHILE (.OPER_COUNT GTR 0) AND (NOT .FOUND) DO
+	    BEGIN
+	    !	    
+	    ! Examine the device name for each operator in the list.
+	    ! Compare the operator device names for equality.
+	    ! Both device names are assumed to be in the DDCU format.
+	    !
+	    IF CH$EQL	(.OPER_RQCB [RQCB_L_OPER_LEN],
+			 .OPER_RQCB [RQCB_L_OPER_PTR],
+			 .RQCB [RQCB_L_OPER_LEN],
+			 .RQCB [RQCB_L_OPER_PTR],
+			 0
+			)
+	    THEN
+		BEGIN
+		FOUND = TRUE;				! The opeator is known to OPCOM	
+		.BLOCK = .OPER_RQCB;			! Save the RQCB address
+		RQCB [RQCB_L_OCD] = .OCD;		! Save the OCD address
+		END
+	    ELSE
+		BEGIN
+		OPER_RQCB = .OPER_RQCB [RQCB_L_FLINK];	! Get link to next operator RQCB
+		OPER_COUNT = .OPER_COUNT - 1;		! Decrement operator count
+		END;	
+	    END;
+	OCD = .OCD [OCD_L_FLINK];			! Get address of next OCD
+	OCD_COUNT = .OCD_COUNT - 1;			! Decrement OCD count
+	END;
+    OCD_INDEX = .OCD_INDEX - 1;				! Decrement OCD_INDEX
+    END;
+
+!
+! If the operator was found, make sure
+! it has not been implicitly disabled.
+!
+IF .FOUND
+THEN
+    FOUND = NOT (IMPLICIT_DISABLE (.OPER_RQCB));
+RETURN (.FOUND);					! Return status of search
+
+END;							! End of FIND_OPERATOR
+
+GLOBAL ROUTINE IMPLICIT_DISABLE (OPER_RQCB) =
+
+!++
+! Functional description:
+!
+!	This routine will determine if an operator device has
+!	been implicitly disabled.  That is, if the operator device
+!	is no longer marked as an operator.  The OPR bit is cleared
+!	when the last channel to a non-allocated device has been
+!	released, or when a device is deallocated.  The OPR bit will
+!	be reset if the operator is a "permanent" operator.
+!
+! Input:
+!
+!	OPER_RQCB	: Address of an operator RQCB
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	If the operator has been implicitly disabled, and is not
+!	a permanent operator, then the operator will be disabled
+!	without a disable message being sent to the operator.
+!
+! Routine value:
+!
+!	TRUE	: If the operator is disabled
+!	FALSE	: If the operator is still enabled
+!--
+
+BEGIN						! Start of IMPLICIT_DISABLE
+
+MAP
+	OPER_RQCB	: REF BBLOCK;		! Operator RQCB structure
+
+EXTERNAL ROUTINE
+	CHECK_OPER_COVERAGE,			! Check coverage for requests
+	DEALLOCATE_RQCB	: NOVALUE,		! Dispose of an RQCB
+	EXE$SETOPR	: ADDRESSING_MODE (GENERAL),
+	UPD_OPER_CONTEXT;			! Update an operator context
+
+LOCAL
+	LOST_COVERAGE	: LONG,			! Boolean
+	DEV_CHAR	: BBLOCK [DIB$K_LENGTH],! Device characteristics buffer
+	CHAR_DESC	: BBLOCK [DSC$K_S_BLN],	! Dev. char. buffer descriptor
+	OCD		: REF BBLOCK,		! OCD data structure
+	DISABLED	: LONG,			! Boolean
+	ARG_LIST	: VECTOR [3];		! Arguement list for EXE$SETOPR
+
+
+!
+! Create a descriptor for the characteristics buffer and
+! get the operator device characteristics.
+!
+DISABLED = FALSE;				! Assume operator not disabled
+CHAR_DESC [0,0,32,0] = DIB$K_LENGTH;		! Set buffer length
+CHAR_DESC [DSC$A_POINTER] = DEV_CHAR;		! Set buffer address
+IF NOT ($GETDEV (DEVNAM=OPER_RQCB [RQCB_L_OPER_LEN], PRIBUF=CHAR_DESC))
+THEN
+    DISABLED = TRUE;				! Device no longer exists
+!
+! Check the OPR bit.  Reset it if this is a permanent operator.
+!
+IF NOT (.BBLOCK [DEV_CHAR [DIB$L_DEVCHAR], DEV$V_OPR])
+THEN
+    IF .BBLOCK [OPER_RQCB [RQCB_L_RQ_OPTIONS], OPC$V_PERMOPER]
+    THEN
+	BEGIN
+	!
+	! Reset the OPR bit in the device UCB.
+	!
+	ARG_LIST [0] = 2;			! Set number of arguements
+	ARG_LIST [1] = OPER_RQCB [RQCB_L_OPER_LEN];
+	ARG_LIST [2] = ON;			! Set bit state
+	IF NOT $CMKRNL (ROUTIN=EXE$SETOPR, ARGLST=ARG_LIST)
+	THEN
+	    DISABLED = TRUE;
+	END
+    ELSE
+	DISABLED = TRUE;
+!
+! If the operator is disabled, then remove it from the operator list.
+! Do not notify the operator of the disable.  After doing the disable,
+! check to see if any requests have lost operator coverage.
+!
+IF .DISABLED
+THEN
+    BEGIN
+    LOST_COVERAGE = UPD_OPER_CONTEXT	(TRUE,			! Do the disable
+					 .OPER_RQCB [RQCB_L_ATTNMASK1],
+					 .OPER_RQCB [RQCB_L_ATTNMASK2],
+					 .OPER_RQCB
+					);
+    REMQUE (.OPER_RQCB, OPER_RQCB);		! Remove RQCB from operator list
+    OCD = .OPER_RQCB [RQCB_L_OCD];		! Get OCD address
+    OCD [OCD_W_OPERCOUNT] = .OCD [OCD_W_OPERCOUNT] - 1;
+    DEALLOCATE_RQCB (.OPER_RQCB);		! Dispose of the RQCB
+    !
+    ! If operator coverage was lost due to the disable, check all
+    ! outstanding reuquests queued to this OCD for operator coverage.
+    ! All requests that no longer have operator coverage will be canceled.
+    !
+    IF .LOST_COVERAGE
+    THEN
+	CHECK_OPER_COVERAGE (.OCD);
+    END;
+
+RETURN (.DISABLED);				! Return the routine value
+
+END;						! End of IMPLICIT_DISABLE
+
+GLOBAL ROUTINE NOTIFY_LISTED_OPERATORS (RQST_RQCB) =
+
+!++
+! Functional description:
+!
+!	This routine will traverse a list of operators
+!	(pointed to by the OCD pointed to by the request RQCB)
+!	and send the message associated with the RQCB to all
+!	operators who are enabled to receive the message.
+!
+! Input:
+!
+!	RQST_RQCB	: Address of a request RQCB
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	The message will be sent to the interested operators.
+!
+! Side effects:
+!
+!	As part of sending the message, the operators are checked
+!	to see if they have been implicitly disabled.  If so, they
+!	are removed from the operator list.
+!
+! Routine value:
+!
+!	TRUE	: If at least one operator was notified.
+!	FALSE	: If no operators were notified.
+!--
+
+BEGIN						! Start of NOTIFY_LISTED_OPERATORS
+
+MAP
+	RQST_RQCB 	: REF BBLOCK;		! Request RQCB structure
+
+EXTERNAL ROUTINE
+	IMPLICIT_DISABLE,			! Check for implicit disable
+	NOTIFY_OPERATOR;			! Send a message to a giiven operator
+
+LOCAL
+	OCD		: REF BBLOCK,		! OCD data structure
+	SAVED_MCB	: LONG,			! Address of an MCB
+	OPER_COUNT	: LONG,			! Count of operators on list
+	CURRENT_OPER	: REF BBLOCK,		! Current operator RQCB
+	NEXT_OPER	: REF BBLOCK,		! Next operator RQCB
+	NOTIFIED	: LONG;			! Boolean
+
+NOTIFIED = FALSE;				! Assume no operator notified
+!
+! Check the request to see if NOBRD is specified.  If it is, and the requestor
+! has the proper privileges, return failure without sending the message.
+!
+IF .BBLOCK [RQST_RQCB [RQCB_L_OPTIONS], OPC$V_NOBRD]
+THEN
+    IF (.BBLOCK [RQST_RQCB [RQCB_L_PRIVMASK1], PRV$V_OPER])
+    OR ((.RQST_RQCB [RQCB_B_SCOPE] EQL OPC$K_GROUP) AND ((.BBLOCK [RQST_RQCB [RQCB_L_PRIVMASK1], PRV$V_OPER]) OR
+						         (.BBLOCK [RQST_RQCB [RQCB_L_PRIVMASK1], PRV$V_GROUP])))
+THEN
+    RETURN (FALSE);
+OCD = .RQST_RQCB [RQCB_L_OCD];			! Get OCD address
+OPER_COUNT = .OCD [OCD_W_OPERCOUNT];		! Get count of operators
+NEXT_OPER = .OCD [OCD_L_OPERFLINK];		! Get address of next operator in list
+WHILE (.OPER_COUNT GTR 0) DO
+    BEGIN
+    !
+    ! Link to the next operator RQCB.  We have to keep the address
+    ! of the next operator RQCB in case this one evaporates as a
+    ! side effect of IMPLICT_DISABLE.
+    !
+    CURRENT_OPER = .NEXT_OPER;
+    NEXT_OPER = .CURRENT_OPER [RQCB_L_FLINK];
+    !
+    ! Check the request attention mask against the operator's
+    ! enable mask.  If an bits in common, then notify the operator.
+    ! The message is also sent if a special status bit is set.
+    ! This is an internal hack used to force message output.
+    !
+    IF ((.RQST_RQCB [RQCB_L_ATTNMASK1] AND .CURRENT_OPER [RQCB_L_ATTNMASK1]) NEQ 0)
+    OR ((.RQST_RQCB [RQCB_L_ATTNMASK2] AND .CURRENT_OPER [RQCB_L_ATTNMASK2]) NEQ 0)
+    OR (.BBLOCK [RQST_RQCB [RQCB_L_STATUS], HDR_V_BRD])
+    THEN
+	IF NOT (IMPLICIT_DISABLE (.CURRENT_OPER))
+	THEN
+	    BEGIN
+	    !
+	    ! Send the message to the operator.  The MCB from the RQST_RQCB is
+	    ! reused to avoid the overhead of creating a new MCB for each operator.
+	    !
+	    SAVED_MCB = .CURRENT_OPER [RQCB_L_MCB];
+	    CURRENT_OPER [RQCB_L_MCB] = .RQST_RQCB [RQCB_L_MCB];
+	    IF NOTIFY_OPERATOR (.CURRENT_OPER)
+	    THEN
+		NOTIFIED = TRUE;		! An operator was notified
+	    CURRENT_OPER [RQCB_L_MCB] = .SAVED_MCB;
+	    END;
+    OPER_COUNT = .OPER_COUNT - 1;		! Decrement the operator count
+    END;
+
+RETURN (.NOTIFIED);				! Return routine value
+    
+END;						! End of NOTIFY_LISTED_OPERATORS
+
+GLOBAL ROUTINE NOTIFY_OPERATOR (RQCB) =
+
+!++
+! Functional description:
+!
+!	This routine will send a message to an operator,
+!	be it a terminal or a mailbox.
+!
+! Input:
+!
+!	RQCB		: Address of an operator RQCB
+!
+! Implicit Input:
+!
+!	The RQCB points to an MCB that describes the message.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	A message is sent to the operator.
+!
+! Side effects:
+!
+!	If the operator device is a mailbox, the message
+!	may be truncated if the mailbox buffer size is not
+!	large enough to hold the entire message.
+!
+! Routine value:
+!
+!	TRUE		: If success
+!	<anything else>	: If the message could not be sent
+!--
+BEGIN						! Start of NOTIFY_OPERATOR
+
+MAP
+	RQCB		: REF BBLOCK;		! Operator RQCB structure
+
+LOCAL
+	OCD		: REF BBLOCK,		! OCD data structure
+	MSG_SIZE	: WORD,			! Size of message to operator
+	MBX_CHANNEL	: WORD,			! Channel to operator mailbox
+	IOSB		: BBLOCK [8],		! I/O status block
+	MCB		: REF BBLOCK,		! MCB data structure
+	STATUS		: LONG;
+
+!
+! If there is no MCB connected to the RQCB, then return an error status.
+!
+MCB = .RQCB [RQCB_L_MCB];
+IF .MCB EQL 0
+THEN
+    RETURN (FALSE);
+!
+! Check the request to see if NOBRD is specified.  If it is, and the requestor
+! has the proper privileges, return failure without sending the message.
+!
+IF .BBLOCK [RQCB [RQCB_L_OPTIONS], OPC$V_NOBRD]
+THEN
+    IF (.BBLOCK [RQCB [RQCB_L_PRIVMASK1], PRV$V_OPER])
+    OR ((.RQCB [RQCB_B_SCOPE] EQL OPC$K_GROUP) AND ((.BBLOCK [RQCB [RQCB_L_PRIVMASK1], PRV$V_OPER]) OR
+						    (.BBLOCK [RQCB [RQCB_L_PRIVMASK1], PRV$V_GROUP])))
+THEN
+    RETURN (FALSE);
+!
+! Send the message.  How it is sent depends on the device type.
+!
+IF .BBLOCK [RQCB [RQCB_W_OPRSTS], OPRSTS_V_TRM]
+OR .BBLOCK [RQCB [RQCB_W_OPRSTS], OPRSTS_V_REMTRM]
+THEN
+    BEGIN
+    !
+    ! The operator device is a terminal or remote terminal.
+    ! Send the message via $BRDCST.
+    !
+    RETURN ($BRDCST (MSGBUF = MCB [MCB_L_TEXTLEN],
+		     DEVNAM = RQCB [RQCB_L_OPER_LEN]
+		    ));
+    END
+ELSE
+    IF .BBLOCK [RQCB [RQCB_W_OPRSTS], OPRSTS_V_MBX]
+    THEN
+	BEGIN
+	!
+	! The operator device is a mailbox.
+	! Send the message via $QIO.  If the mailbox is
+	! too small, truncate the message to fit.
+	!
+	MSG_SIZE = .MCB [MCB_L_TEXTLEN];		! Assume mailbox big enough
+	IF .MSG_SIZE GTR .RQCB [RQCB_W_MBXSIZE]		! Is message to big?
+	THEN
+	    MSG_SIZE = .RQCB [RQCB_W_MBXSIZE];		! Yes, truncate message
+	
+	IF NOT (STATUS = $ASSIGN (CHAN = MBX_CHANNEL,	! Assign a channel to the  operator device
+				  DEVNAM = RQCB [RQCB_L_OPER_LEN]
+				 ))
+	THEN
+	    RETURN (.STATUS);
+
+	IF (STATUS = $QIOW (FUNC = (IO$_WRITEVBLK OR IO$M_NOW),	! Send the message
+			    CHAN = .MBX_CHANNEL,
+			    IOSB = IOSB,
+			    P1   = .MCB [MCB_L_TEXTPTR],
+			    P2   = .MSG_SIZE
+			   ))
+	THEN
+	    STATUS = .IOSB [0,0,16,0];		! Get actual I/O operation status
+
+	$DASSGN (CHAN = .MBX_CHANNEL);		! Deassign channel to operator device
+	RETURN (.STATUS);			! Return the appropriate status
+	END;
+!
+! If we get this far, it means that the device is not a 
+! legal operator device, and that the message cannot be sent.
+! Return an error status.
+!
+RETURN (FALSE);
+
+END;						! End of NOTIFY_OPERATOR
+
+GLOBAL ROUTINE UPD_OPER_CONTEXT (DISABLE, MASK1, MASK2, RQCB) =
+
+!++
+! Functional description:
+!
+!	Update the OCD count vector for each bit present in the bit mask.
+!	The count will be decremented for a DISABLE, incremented for an ENABLE.
+!	Also update the OCD operator intrest mask, and the corresponding intrest
+!	mask in the operator RQCB.  This must be done in two loops, due to
+!	BLISS's inability to cope with a bitmask of more then 32 elements.
+!	Also note that the code could be more compact, but I traded that
+!	for readability.
+!
+! Input:
+!
+!	DISABLE	: A boolean value that declares whether this is an ENABLE or DISABLE.
+!	MASK1	: The first 32 bits of an operator attention mask.
+!	MASK2	: The second 32 bits of an operator attention mask.
+!	RQCB	: Address of an operator RQCB.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	The operator context contained in the RQCB
+!	and the appropriate OCD is updated.
+!
+! Side effects:
+!
+!	None.
+!
+! Routine value:
+!
+! 	TRUE	: If an element of the countvector went to 0
+!	FALSE	: If no element of the countvector went to 0
+!--
+
+BEGIN						! Start of UPD_OPER_CONTEXT
+
+MAP
+	RQCB		: REF BBLOCK;		! Operator RQCB
+
+LOCAL
+	OCD		: REF BBLOCK,		! OCD data structure
+	K		: LONG,			! Index into enablecount vector
+	TRANSITION	: LONG,			! Boolean
+	ENABLE_MASK	: BITVECTOR [32],	! ENABLE/DISABLE control bits
+	CHANGE_BITS1	: LONG,			! ditto
+	CHANGE_BITS2	: LONG;			! ibid
+
+TRANSITION = FALSE;
+IF .DISABLE
+THEN
+    BEGIN
+    !
+    ! This is a DISABLE request.  Determine the bits to clear.
+    !
+    CHANGE_BITS1 = .RQCB [RQCB_L_ATTNMASK1] AND .MASK1;
+    CHANGE_BITS2 = .RQCB [RQCB_L_ATTNMASK2] AND .MASK2;
+    END
+ELSE
+    BEGIN
+    !
+    ! This is an ENABLE request.  Determine the bits to set.
+    !
+    CHANGE_BITS1 = (NOT .RQCB [RQCB_L_ATTNMASK1]) AND .MASK1;
+    CHANGE_BITS2 = (NOT .RQCB [RQCB_L_ATTNMASK2]) AND .MASK2;
+    END;
+
+!
+! Get the OCD address and do the update.
+!
+OCD = .RQCB [RQCB_L_OCD];			! Get OCD address
+ENABLE_MASK = .CHANGE_BITS1;			! Get first 32 bits
+INCR J FROM 0 TO 31 DO
+    IF .ENABLE_MASK [.J]
+    THEN
+	IF .DISABLE
+	THEN
+	    BEGIN
+	    RQCB [RQCB_L_ATTNMASK1] = .RQCB [RQCB_L_ATTNMASK1] AND (NOT (1^.J));
+	    OCD [OCD_W_ENABLECOUNT (.J)] = .OCD [OCD_W_ENABLECOUNT (.J)] - 1;
+	    IF (.OCD [OCD_W_ENABLECOUNT (.J)] EQL 0)
+	    THEN
+		BEGIN
+		TRANSITION = TRUE;
+		OCD [OCD_L_ATTNMASK1] = .OCD [OCD_L_ATTNMASK1] AND (NOT (1^.J));
+		END;
+	    END
+	ELSE
+	    BEGIN
+	    RQCB [RQCB_L_ATTNMASK1] = .RQCB [RQCB_L_ATTNMASK1] OR (1^.J);
+	    OCD [OCD_W_ENABLECOUNT (.J)] = .OCD [OCD_W_ENABLECOUNT (.J)] + 1;
+	    OCD [OCD_L_ATTNMASK1] = .OCD [OCD_L_ATTNMASK1] OR (1^.J);
+	    END;
+
+ENABLE_MASK = .CHANGE_BITS2;			! Get second 32 bits
+INCR J FROM 0 TO 31 DO
+    IF .ENABLE_MASK [.J]
+    THEN
+	BEGIN
+	K = .J + 32;
+	IF .DISABLE
+	THEN
+	    BEGIN
+	    RQCB [RQCB_L_ATTNMASK2] = .RQCB [RQCB_L_ATTNMASK2] AND (NOT (1^.J));
+	    OCD [OCD_W_ENABLECOUNT (.K)] = .OCD [OCD_W_ENABLECOUNT (.K)] - 1;
+	    IF (.OCD [OCD_W_ENABLECOUNT (.K)] EQL 0)
+	    THEN
+		BEGIN
+		TRANSITION = TRUE;
+		OCD [OCD_L_ATTNMASK2] = .OCD [OCD_L_ATTNMASK2] AND (NOT (1^.J));
+		END;
+	    END
+	ELSE
+	    BEGIN
+	    RQCB [RQCB_L_ATTNMASK2] = .RQCB [RQCB_L_ATTNMASK2] OR (1^.J);
+	    OCD [OCD_W_ENABLECOUNT (.K)] = .OCD [OCD_W_ENABLECOUNT (.K)] + 1;
+	    OCD [OCD_L_ATTNMASK2] = .OCD [OCD_L_ATTNMASK2] OR (1^.J);
+	    END;
+	END;
+
+RETURN (.TRANSITION);
+
+END;						! End of UPD_OPER_CONTEXT
+
+GLOBAL ROUTINE VALID_OPERATOR (BUFFER_DESC, RQCB) =
+
+!++
+! Functional description:
+!
+!	This routine will make sure that the device
+!	specified in the user's request is capable
+!	of being an operator device.  A side effect
+!	of this routine is to create an operator device
+!	name descriptor within the RQCB.  Note that
+!	the operator device name is formatted in such
+!	a way as to make for easy string compares in
+!	the future.
+!
+! Input:
+!
+!	BUFFER_DESC	: Address of string descriptor that points
+!			  to the user's request message.
+!	RQCB		: Address of an RQCB data structure.
+!
+! Implicit Input:
+!
+!	None.
+!
+! Output:
+!
+!	None.
+!
+! Implict output:
+!
+!	None.
+!
+! Side effects:
+!
+!	A string descriptor of the validated operator device name
+!	is created within the RQCB.
+!
+! Routine value:
+!	
+!	TRUE	: If the device is a valid operator device
+!	FALSE	: If the device is not a valid operator device.
+!--
+
+BEGIN						! Start of VALID_OPERATOR
+
+MAP
+	BUFFER_DESC	: REF BBLOCK,		! User's request descriptor
+	RQCB		: REF BBLOCK;		! RQCB data structure
+
+EXTERNAL
+	OPR_DEV_FAO	: BBLOCK;		! FAO control string descriptor
+
+EXTERNAL ROUTINE
+	LIB$GET_VM	: ADDRESSING_MODE (GENERAL),	! Get a block of memory
+	EXE$CHKRDACCES	: ADDRESSING_MODE (GENERAL),
+	EXE$CHKWRTACCES	: ADDRESSING_MODE (GENERAL);
+
+LOCAL
+	ARG_LIST	: VECTOR [4],		! Arguement list structure
+	ARB		: BBLOCK [ARB$K_LENGTH],! Access rights block
+	MSG		: REF BBLOCK,		! Pointer to user request
+	DEV_CHAR	: BBLOCK [DIB$K_LENGTH],! Dev. char. buffer
+	CHAR_DESC	: BBLOCK [DSC$K_S_BLN],	! Dev. char. buffer descriptor
+	OPR_NAM_BUF	: BBLOCK [MAX_DEV_NAM],	! Oper. device name buffer
+	OPR_NAM_DESC	: BBLOCK [DSC$K_S_BLN],	! Oper. dev. name buffer descriptor
+	STATUS		: LONG;
+!
+! See if the requestor is issuing this request in another's behalf.
+! If, and the requestor does not have the privilege to do so, then
+! return FALSE.  Allow the request if the requestor has OPER pivilege,
+! or the GROUP field of the UIC's are the same and the requestor has
+! GROUP privilege.
+!
+IF .RQCB [RQCB_L_SENDERUIC] NEQ .RQCB [RQCB_L_UIC]
+THEN
+    IF  (NOT .BBLOCK [RQCB [RQCB_L_PRIVMASK1], PRV$V_OPER])
+    THEN
+	IF NOT ((.BBLOCK [RQCB [RQCB_L_SENDERUIC], 2,0,16,0] EQL .BBLOCK [RQCB [RQCB_L_UIC], 2,0,16,0]) AND
+		(.BBLOCK [RQCB [RQCB_L_PRIVMASK1], PRV$V_GROUP]))
+	THEN
+	    RETURN (FALSE);
+!
+! Create a descriptor for the operator device name.
+!
+MSG = .BUFFER_DESC [DSC$A_POINTER] + OPC$K_COMHDRSIZ;
+OPR_NAM_DESC [0,0,32,0] = .BBLOCK [MSG [OPC$T_OPRENABLE_OPR], 0,0,8,0];
+OPR_NAM_DESC [DSC$A_POINTER] = MSG [OPC$T_OPRENABLE_OPR] + 1;
+!
+! Create a buffer descriptor and get the device
+! characteristics of the operator device.
+!
+CHAR_DESC [0,0,32,0] = DIB$K_LENGTH;
+CHAR_DESC [DSC$A_POINTER] = DEV_CHAR;
+IF NOT $GETDEV (DEVNAM=OPR_NAM_DESC, PRIBUF=CHAR_DESC)
+THEN
+    RETURN (.STATUS);				! There is no such device
+!
+! Check the device type.  The device must be a
+! terminal, remote terminal, or mailbox.
+!
+IF (NOT .BBLOCK [DEV_CHAR [DIB$L_DEVCHAR], DEV$V_TRM]) AND
+   (NOT .BBLOCK [DEV_CHAR [DIB$L_DEVCHAR], DEV$V_MBX])
+THEN
+    RETURN (FALSE);
+!
+! If the device is a mailbox, then indicate such
+! and save the device buffer size.  The requestor
+! must have read and write access to the mailbox.
+!
+IF .BBLOCK [DEV_CHAR [DIB$L_DEVCHAR], DEV$V_MBX]
+THEN
+    BEGIN
+    BBLOCK [RQCB [RQCB_W_OPRSTS], OPRSTS_V_MBX] = TRUE;	! Mark OPER as MBX
+    RQCB [RQCB_W_MBXSIZE] = .DEV_CHAR [DIB$W_DEVBUFSIZ];! Save MBX size
+    !
+    ! The following code is a workaround until a GETACCess
+    ! system service can be written.  Check for R/W access.
+    !
+    ARB [00,0,32,0] = .RQCB [RQCB_L_ATTNMASK1];		! Build a dummy ARB
+    ARB [04,0,32,0] = .RQCB [RQCB_L_ATTNMASK2];		!    
+    ARB [08,0,32,0] = 0;				!
+    ARB [12,0,32,0] = .RQCB [RQCB_L_UIC];		!
+    ARG_LIST [0] = 3;					! Build an argument list
+    ARG_LIST [1] = ARB;					! Address of ARB
+    ARG_LIST [2] = .DEV_CHAR [DIB$W_VPROT];		! Volume protection mask
+    ARG_LIST [2] = .DEV_CHAR [DIB$L_OWNUIC];		! Volume owner
+    IF NOT (STATUS = $CMKRNL (ROUTIN=EXE$CHKRDACCES, ARGLST=ARG_LIST))
+    OR NOT (STATUS = $CMKRNL (ROUTIN=EXE$CHKWRTACCES, ARGLST=ARG_LIST))
+    THEN
+	RETURN (.STATUS);				! No R/W access
+    END;
+!
+! If the device is terminal or remote 
+! terminal then mark it as such.
+!
+IF .BBLOCK [DEV_CHAR [DIB$L_DEVCHAR], DEV$V_TRM]
+THEN
+    IF .BBLOCK [DEV_CHAR [DIB$L_DEVCHAR], DEV$V_MNT]
+    THEN
+	BBLOCK [RQCB [RQCB_W_OPRSTS], OPRSTS_V_REMTRM] = TRUE
+    ELSE
+	BBLOCK [RQCB [RQCB_W_OPRSTS], OPRSTS_V_TRM] = TRUE;
+!
+! Format the operator device name from the info
+! in the device characteristics buffer.  All operator
+! devices known to OPCOM have their operator device
+! names formatted here, so that they are in a consistant
+! format.
+!
+OPR_NAM_DESC [0,0,32,0] = MAX_DEV_NAM;		! Create an output string descriptor
+OPR_NAM_DESC [DSC$A_POINTER] = OPR_NAM_BUF;	!
+IF NOT (STATUS = $FAO	(OPR_DEV_FAO,		! Format the operator device name
+			 RQCB [RQCB_L_OPER_LEN],!
+			 OPR_NAM_DESC,		!
+			 DEV_CHAR + .DEV_CHAR [DIB$W_DEVNAMOFF],
+			 .DEV_CHAR [DIB$W_UNIT]
+			))
+THEN
+    RETURN (.STATUS);
+!
+! Create a string descriptor for the formatted
+! operator device name, within the RQCB.
+!
+IF NOT (STATUS = LIB$GET_VM (RQCB [RQCB_L_OPER_LEN], RQCB [RQCB_L_OPER_PTR]))
+THEN
+    RETURN (.STATUS);
+!
+! Copy the operator device name to the new buffer.
+!
+CH$MOVE (.RQCB [RQCB_L_OPER_LEN],
+	 .OPR_NAM_DESC [DSC$A_POINTER],
+	 .RQCB [RQCB_L_OPER_PTR]
+	);
+RETURN (TRUE);
+
+END;						! End of VALID_OPERATOR
+
+END						! End of OPERUTIL
+ELUDOM

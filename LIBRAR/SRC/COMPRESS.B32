@@ -1,0 +1,444 @@
+MODULE lib_compress (			! Compress the library
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  Library command processor
+!
+! ABSTRACT:
+!
+!	The VAX/VMS librarian is invoked by DCL to process the LIBRARY
+!	command.  It utilizes the librarian procedure set to perform
+!	the actual modifications to the library.
+!
+! ENVIRONMENT:
+!
+!	VAX native, user mode.
+!
+!--
+!
+!
+! AUTHOR:  Benn Schreiber,	 CREATION DATE:  22-June-1979
+!
+! MODIFIED BY:
+!
+!	V02-007		RPG0037		Bob Grosso		15-Jan-1982
+!		Use library history attributes rather than default.
+!
+!	V02-006		RPG0036		Bob Grosso		18-Dec-1981
+!		Improve error reporting with update history
+!
+!	V02-005		RPG0035		Bob Grosso		7-Aug-1981
+!		lib$gl_ctlmsk now a quadword.
+!
+!	V02-004		RPG0034		Bob Grosso		30-Jul-1981
+!		Support CREATE=KEEP.
+!
+!	V02-003	BLS0029		Benn Schreiber		23-Dec-1980
+!		Change messages to use message compiler.
+!
+!	V02-002	RPG0004		Bob Grosso		3-Sep-1980
+!		Exit read or write loops and print end of module header
+!		and continue compressing.
+!--
+
+
+
+LIBRARY
+	'SYS$LIBRARY:STARLET.L32';
+REQUIRE
+	'PREFIX';
+REQUIRE
+	'LIBDEF';
+REQUIRE
+	'LBRDEF';
+
+EXTERNAL ROUTINE
+    lbr$get_history : ADDRESSING_MODE (GENERAL),!Get the library history
+    lbr$put_history : ADDRESSING_MODE (GENERAL),!Replace history
+    lbr$get_index : ADDRESSING_MODE (GENERAL),	!Call routine for index entries
+    lbr$find : ADDRESSING_MODE (GENERAL),	!Find module by RFA
+    lbr$lookup_key : ADDRESSING_MODE (GENERAL),	!Lookup key in index
+    lbr$insert_key : ADDRESSING_MODE (GENERAL),	!Insert new key into index
+    lbr$put_end : ADDRESSING_MODE (GENERAL),	!Terminate writing module text
+    lbr$set_index : ADDRESSING_MODE (GENERAL),	!Set index number to use
+    lbr$set_module : ADDRESSING_MODE (GENERAL),	!Read/update module header
+    lbr$get_record : ADDRESSING_MODE (GENERAL),	!Read text record
+    lbr$put_record : ADDRESSING_MODE (GENERAL),	!Write text record
+    lbr$search : ADDRESSING_MODE (GENERAL),	!Search an index for an RFA
+    lbr$open : ADDRESSING_MODE (GENERAL),	!Open library
+    lbr$close : ADDRESSING_MODE (GENERAL),	!Close library
+    lbr$ini_control : ADDRESSING_MODE (GENERAL),!Initialize control index
+    lbr$insert_time : ADDRESSING_MODE (GENERAL),!Set module insert date/time
+    lib_log_op,					!Log operation
+    lib_create_lib;				!Create output library
+
+EXTERNAL
+    lbr$gl_control : REF BBLOCK ADDRESSING_MODE (GENERAL), !Librarian control table address
+    lbr$gl_rmsstv : ADDRESSING_MODE (GENERAL),	!RMS STV from librarian
+    lib$gl_type,				!Type of library
+    lib$al_hdrlen : VECTOR [,LONG],		!Lengths of various module headers
+    lib$al_ascbinf : VECTOR [,LONG],		!Key lengths
+    lib$gl_keysize,				!Max size of key in library
+    lib$gl_libctl : BLOCK [2],			!Input library control index
+    lib$gl_libfdb : REF BBLOCK,			!Pointer to library FDB
+    lib$gl_outfdb : REF BBLOCK,			!Pointer to output library FDB
+    lib$gl_ctlmsk : BLOCK [1],			!Librarian control flags
+    lib$gl_cre8flags : BITVECTOR,		!Compress option flags
+    lib$gl_allgbls,				!Number of globals to allocate in new library
+    lib$gl_allmods,				!Number of modules to allocate in new library
+    lib$gl_allksz,				!Size of keys in new library
+    lib$gl_allhis,				!Max number of history records in new library
+    lib$gl_objgsdix,				!Index number of object globals
+    lib$gl_modnamix;				!Index number of module names
+
+EXTERNAL LITERAL
+    lib$_cnvrting,				!Converting info message
+    lib$_histerr,				!Error in update history
+    lib$_indexerr,				!Some strange index error
+    lib$_initerr,				!Initialization error
+    lib$_inserted,				!Module inserted
+    lib$_inserterr,				!Error inserting into index
+    lib$_lookuperr,				!Error looking up module
+    lib$_mhderr;				!Module header error
+
+FORWARD ROUTINE
+    lib_put_history,				!Copy over the history records.
+    copymodule,					!Copy one object module
+    enterglobals;				!Enter globals for obj lib
+
+OWN
+    curindex,					!Current index being searched
+    newtxtrfa : BBLOCK [dsc$c_s_bln],		!Module RFA in new library
+    outlibindex,				!Control index for output library
+    func : LONG INITIAL  (lbr$c_create);	!Function to create library
+
+GLOBAL ROUTINE lib_comprs_lib  (after_func) =
+BEGIN
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine compresses one library into another.
+!
+! CALLING SEQUENCE:
+!
+!	status = lib_comprs_lib (after_func)
+!
+! INPUT PARAMETERS:
+!
+!	after_func	is the function (lbr$c_read, lbr$c_update) to open the compressed library with
+!			after the compress has been completed
+!
+! IMPLICIT INPUTS:
+!
+!	lib$gl_libfdb	is the pointer to the library (input FDB)
+!	lib$gl_outfdb	is the pointer to the output FDB
+!
+! IMPLICIT OUTPUTS:
+!
+!	lib$gl_libfd is changed to point to the output FDB
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+LOCAL
+    usrmodhdrlen,			! temp store expansion size of module header
+    header : REF BBLOCK,
+    status;
+
+BIND
+    libdesc = lib$gl_libfdb [fdb$l_namdesc] : BBLOCK,		!Name the filename descriptor
+    outdesc = lib$gl_outfdb [fdb$l_namdesc] : BBLOCK,		! for input and output libraries
+    libnamblk = lib$gl_libfdb [fdb$t_nam] : BBLOCK,		!Name the NAM blocks
+    outnamblk = lib$gl_outfdb [fdb$t_nam] : BBLOCK;		! ...
+
+!
+! Determine what create options we need to derive from input library
+! and do it.
+!
+header = .lbr$gl_control [lbr$l_hdrptr];			!point to library header
+IF NOT .lib$gl_cre8flags [lib$c_opt_gbls]			!Globals specified by option?
+THEN lib$gl_allgbls = .header [lhd$l_idxcnt] - .header [lhd$l_modcnt]; !No--compute from header
+IF NOT .lib$gl_cre8flags [lib$c_opt_mods]			!Modules specified by option
+THEN lib$gl_allmods = .header [lhd$l_modcnt] + .header [lhd$l_idxovh];
+IF NOT .lib$gl_cre8flags [lib$c_opt_ksz]			!Key size specified?
+THEN IF .lib$gl_ctlmsk [lib$v_oldlib]
+    THEN lib$gl_allksz = .lib$al_ascbinf [.lib$gl_type]		! if old library, then get new size
+    ELSE BEGIN
+!
+! Get size of keys from input library if new format
+!
+	BIND
+	    indexdesc = .header + lhd$c_idxdesc : BBLOCK;	!Point to first index descriptor
+
+	lib$gl_allksz = .indexdesc [idd$w_keylen] - 1;		!Get size of keys minus count byte
+	END;
+lib$gl_keysize = .lib$gl_allksz;				!Set key size for future reference
+lib$gl_cre8flags [lib$c_opt_ksz] = true;			!Flag specified now
+!
+!   To determine the maximum number of history records for new library,
+!   if /COMPRESS=HISTORY:n specified then its value will be used,
+!   else use attribute from old library header.
+!
+IF NOT .lib$gl_cre8flags [lib$c_opt_luhs]
+THEN
+    lib$gl_allhis = .header [lhd$w_maxluhrec];
+perform (lbr$ini_control (outlibindex, func,			!Init the control index
+		lib$gl_type, outnamblk), lib$_initerr, 
+		1, outdesc);
+
+CH$MOVE  (dsc$c_s_bln, lib$gl_libfdb [fdb$l_defext],		!Set default ext.
+		lib$gl_outfdb [fdb$l_defext]);
+outnamblk [nam$l_rlf] = libnamblk;				!Set up related filename block
+!
+!   Save size of additional data area in module if /COMP=KEEP
+!
+usrmodhdrlen = .lib$al_hdrlen [.lib$gl_type];			!Save defaults
+IF .lib$gl_ctlmsk [lib$v_keep] 
+THEN lib$al_hdrlen [.lib$gl_type] = .header [lhd$b_mhdusz];	!Use value in library
+perform (lib_create_lib (.lib$gl_outfdb, outlibindex)); 	!Open output library
+lib$al_hdrlen [.lib$gl_type] = .usrmodhdrlen;			!Restore defaults
+IF .lib$gl_ctlmsk [lib$v_convert]				!If this is forced convert
+THEN SIGNAL (lib$_cnvrting, 2, outdesc, libdesc);		! tell user whats happening
+!
+! Call the library procedures to return each entry in the module name
+! index.  It will call copymodule for each entry.
+!
+rms_perform (lbr$get_index (lib$gl_libctl, lib$gl_modnamix,	!Return the index
+			copymodule),		     		!and call copymodule for each entry
+		lib$_indexerr, .lbr$gl_rmsstv, 1, libdesc);
+IF .lib$gl_ctlmsk [lib$v_keep] 					!If history is to be retained then
+THEN 
+    BEGIN
+    status = lbr$get_history (lib$gl_libctl, lib_put_history);	!copy history
+    IF NOT .status
+    THEN
+	SIGNAL (lib$_histerr, 1, libdesc, .status);
+    END;
+
+rms_perform (lbr$close (outlibindex),				!Close the new library
+		lib$_closeout, .lbr$gl_rmsstv, 1, outdesc);
+
+rms_perform (lbr$close (lib$gl_libctl),				!and the old library
+		lib$_closein, .lbr$gl_rmsstv, 1, outdesc);
+
+lib$gl_ctlmsk [lib$v_oldlib] = false;				!No longer old library
+lib$gl_libfdb = .lib$gl_outfdb;					!Make the library FDB
+								! the old output FDB
+perform (lbr$ini_control (lib$gl_libctl, after_func, 		!Init control block to open lib
+		lib$gl_type, outnamblk),
+		lib$_initerr, 1, outdesc);
+
+rms_perform (lbr$open (lib$gl_libctl),				!Open newly created library
+		lib$_openin, .lbr$gl_rmsstv, 1, outdesc);
+
+RETURN true
+END;						!Of lib_compress_lib
+
+ROUTINE copymodule (keydesc, modrfa) =
+BEGIN
+
+!++
+! This routine is called by the librarian for each name in the
+! module name index.  The text for the name is read and inserted
+! into the new library, and then the key is inserted into the
+! index.  If there is more than one index in the library, the other
+! indices are searched to find all symbols associated with
+! the module, and they are entered into the new library.
+!
+! Inputs:
+!
+!	keydesc		address of string descriptor for module name
+!	modrfa		address of rfa of module
+!
+! Outputs:
+!
+!	The module is copied into the output library
+!
+!--
+
+MAP
+    keydesc : REF BBLOCK [dsc$c_s_bln];
+
+LOCAL
+    rms_status,					!Status from RMS operations
+    first_put,					!flag true when first put done
+    header : BBLOCK [lbr$c_pagesize],		!Buffer for header
+    bufdesc : BBLOCK [dsc$c_s_bln],		!descriptor for buffer
+    rfa : BBLOCK [rfa$c_length];		!Dummy RFA
+
+BIND
+    libheader = .lbr$gl_control [lbr$l_hdrptr] : BBLOCK,!Point to the library header
+    libdesc = lib$gl_libfdb [fdb$l_namdesc] : BBLOCK,	!Name the filename descriptor
+    outdesc = lib$gl_outfdb [fdb$l_namdesc] : BBLOCK;	!...
+
+rms_perform (lbr$find (lib$gl_libctl, .modrfa), 	!Lookup key to find text
+		lib$_lookuperr, .lbr$gl_rmsstv, 2, .keydesc, libdesc);
+
+bufdesc [dsc$a_pointer] = header;
+first_put = true;
+!
+! Read all text records for the module until end of file is returned.  Write the records
+! into the new library.
+!
+WHILE (bufdesc [dsc$w_length] = lbr$c_pagesize;
+	rms_status = lbr$get_record (lib$gl_libctl, bufdesc, bufdesc); !Read all records of module
+	IF NOT .rms_status AND (.rms_status NEQ rms$_eof)
+	THEN BEGIN
+	    SIGNAL (lib$_readerr, 1, libdesc, .rms_status, .lbr$gl_rmsstv);
+	    EXITLOOP;
+	    END;
+
+	.rms_status NEQ rms$_eof)
+DO BEGIN
+	LOCAL
+	    status;
+	status = lbr$put_record (outlibindex, bufdesc,		! and write them to new library
+	             (IF .first_put THEN newtxtrfa ELSE rfa));
+	IF NOT .status 
+	THEN BEGIN				! exit and write end of module record
+	    signal(lib$_writeerr, 1, outdesc, .status, .lbr$gl_rmsstv);
+	    EXITLOOP;
+	    END;
+
+    first_put = false;
+    END;
+!
+! Text for module has been copied. Write end of module record
+!
+rms_perform (lbr$put_end (outlibindex),		!Terminate PUT
+		lib$_writeerr, .lbr$gl_rmsstv, 1, outdesc);
+!
+! Insert the module name into the new library
+!
+perform (lbr$set_index (outlibindex, lib$gl_modnamix),	!Insert into module name index
+		lib$_indexerr, 1, outdesc);
+
+rms_perform (lbr$insert_key (outlibindex, .keydesc, newtxtrfa), !Insert key into index
+		lib$_inserterr, .lbr$gl_rmsstv, 2, .keydesc, outdesc);
+
+!
+! Read module header from old library
+!
+bufdesc [dsc$w_length] = lbr$c_maxhdrsiz;
+bufdesc [dsc$a_pointer] = header;
+rms_perform (lbr$set_module (lib$gl_libctl, .modrfa, bufdesc, bufdesc),
+	lib$_mhderr, .lbr$gl_rmsstv, 2, .keydesc, libdesc);
+!
+! Set insert date/time of module in new library
+!
+lbr$insert_time (outlibindex, newtxtrfa, header [mhd$l_datim]);
+perform (lbr$set_index (lib$gl_libctl, lib$gl_modnamix),	!Set to old library
+		lib$_indexerr, 1, libdesc);
+!
+! If there is user information in the module header, update the module header
+! in the new library.
+!
+IF .libheader [lhd$b_mhdusz] NEQ 0
+THEN BEGIN
+    bufdesc [dsc$w_length] = .libheader  [lhd$b_mhdusz]; 		!Set length of update data
+    bufdesc [dsc$a_pointer] = header [mhd$b_usrdat];			!Point to update data
+    rms_perform (lbr$set_module (outlibindex, newtxtrfa,0,0,bufdesc),	!Update module header
+		lib$_mhderr, .lbr$gl_rmsstv, 2, .keydesc, outdesc);
+    perform  (lbr$set_index (lib$gl_libctl, lib$gl_modnamix),		!Set to old library
+		lib$_indexerr, 1, libdesc);
+    END;
+!
+! If there are global symbols in the module, then search the index of the old library for them
+! so they can be entered into the new library global symbol index
+!
+IF .libheader [lhd$b_nindex] GTR 1			!If there is more than one index
+THEN BEGIN
+    INCRU i FROM 2 TO .libheader [lhd$b_nindex]		!Loop through the other indices
+    DO BEGIN
+	curindex = .i;					!Set current index number
+	rms_perform (lbr$search (lib$gl_libctl,		!Search index for symbols
+		curindex, .modrfa, enterglobals), 	!so they can be entered in new library
+		lib$_indexerr, .lbr$gl_rmsstv, 1, libdesc);
+
+	END;
+    END;
+
+perform (lbr$set_index (lib$gl_libctl, lib$gl_modnamix),!Do set index to set index number and lbr$gl_control
+		lib$_indexerr, 1, libdesc);
+
+lib_log_op (lib$_inserted, .keydesc, .lib$gl_outfdb);	!Log on console if logging
+
+RETURN true
+END;					!Of copymodule
+
+ROUTINE lib_put_history (rec_desc) =
+BEGIN
+!++
+!
+!--
+RETURN lbr$put_history ( outlibindex, .rec_desc );
+END;	! of lib_put_history
+
+ROUTINE enterglobals (keydesc) =
+BEGIN
+!++
+!
+! This routine is called to enter a global symbol into the global symbol
+! index for an object module
+!
+! Inputs:
+!
+!	keydesc		address of descriptor for symbol name
+!
+! Outputs:
+!
+!	Global symbol name is entered into index of new library
+!
+!--
+
+MAP
+    keydesc : REF BBLOCK;			!Really a string descriptor
+BIND
+    libdesc = lib$gl_libfdb [fdb$l_namdesc] : BBLOCK,	!Name the filename descriptor
+    outdesc = lib$gl_outfdb [fdb$l_namdesc] : BBLOCK;	!...
+
+perform (lbr$set_index (outlibindex, curindex),
+		lib$_indexerr, 1, outdesc);
+
+rms_perform (lbr$insert_key (outlibindex, .keydesc, newtxtrfa),
+		lib$_inserterr, .lbr$gl_rmsstv, 2, .keydesc, outdesc);
+
+perform (lbr$set_index (lib$gl_libctl, lib$gl_modnamix),
+		lib$_indexerr, 1, libdesc);
+
+RETURN true
+END;					!of enterglobals
+END					! Of module
+ELUDOM

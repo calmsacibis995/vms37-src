@@ -1,0 +1,206 @@
+MODULE CHKDMO (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This routine dismounts the volume in use if it should be.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  29-Apr-1977  17:19
+!
+! MODIFIED BY:
+!
+!	V02-001	ACG0226		Andrew C. Goldstein,	24-Nov-1981  22:28
+!		Issue IO$_AVAILABLE on DISMOUNT/NOUNLOAD
+!
+!	V02-000	ACG0167		Andrew C. Goldstein,	7-May-1980  18:47
+!		Previous revision history moved to F11A.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+!
+! Part of this routine runs at IPL$_SYNCH, so it must be locked into the
+! working set.
+!
+
+LOCK_CODE;
+
+GLOBAL ROUTINE CHECK_DISMOUNT : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine checks if the volume in use is marked for dismount and
+!	idle. If so, it completes the dismount.
+!
+! CALLING SEQUENCE:
+!	CHECK_DISMOUNT ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CURRENT_UCB: UCB of unit in use
+!	CURRENT_VCB: VCB of volume in use
+!	ACP$AQB0: queue header for ACP
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	Volume dismounted if appropriate
+!
+!--
+
+BEGIN
+
+LOCAL
+	UCB		: REF BBLOCK,	! local address of UCB
+	VCB		: REF BBLOCK,	! local address of VCB
+	FCB		: REF BBLOCK;	! local address of FCB
+
+EXTERNAL
+	IO_CHANNEL,			! channel number for all I/O
+	CURRENT_UCB	: REF BBLOCK,	! UCB of unit in process
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume in process
+	QUEUE_HEAD	: REF BBLOCK;	! address of ACP queue header
+
+EXTERNAL ROUTINE
+	LOCK_IODB,			! lock I/O data base mutex
+	UNLOCK_IODB,			! unlock I/O data base mutex
+	DEALLOCATE,			! deallocate dynamic memory
+	FLUSH_FID,			! flush blocks from the buffer pool
+	SEND_ERRLOG;			! send message to error logger
+
+
+! First check the mark for dismount bit.
+!
+
+UCB = .CURRENT_UCB;
+IF NOT .BBLOCK [UCB[UCB$L_DEVCHAR], DEV$V_DMT]
+THEN RETURN;
+
+! The volume is marked for dismount. The remainder of the tests and the
+! dismount bit twiddling must be done interlocked.
+!
+
+LOCK_IODB ();
+SET_IPL (IPL$_SYNCH);
+
+VCB = .CURRENT_VCB;
+IF .VCB[VCB$W_TRANS] EQL 1
+THEN
+    BEGIN
+
+! The volume is marked for dismount and idle. Make an error log entry to
+! record the dismount.
+!
+
+    SEND_ERRLOG (0, .UCB);
+
+! Mark the volume dismounted and disconnect the VCB from the UCB.
+!
+
+    BBLOCK [UCB[UCB$L_DEVCHAR], DEV$V_MNT] = 0;
+    BBLOCK [UCB[UCB$L_DEVCHAR], DEV$V_DMT] = 0;
+    BBLOCK [UCB[UCB$L_DEVCHAR], DEV$V_SWL] = 0;
+    UCB[UCB$V_VALID] = 0;
+    UCB[UCB$L_VCB] = 0;
+    UCB[UCB$W_VPROT] = 0;
+    UCB[UCB$L_OWNUIC] = 0;
+    UCB[UCB$W_DIRSEQ] = .UCB[UCB$W_DIRSEQ] + 1;
+
+! We can now release the locks while we proceed to clean up the mounted
+! volume data base.
+!
+
+    UNLOCK_IODB ();
+
+    FCB = .VCB[VCB$L_FCBFL];		! index file FCB
+    DEALLOCATE (.FCB[FCB$L_WLFL]);	! release index file window
+
+    WHILE 1 DO
+	BEGIN
+	IF REMQUE (.VCB[VCB$L_FCBFL], FCB) THEN EXITLOOP;
+	DEALLOCATE (.FCB);		! release all FCB's
+	END;
+
+    DEALLOCATE (.VCB);			! release the VCB
+
+! Flush the buffer pool of any blocks of this volume.
+! ***** Note - this call must be moved to exec mode if we get a write on
+! ***** replace cache.
+!
+
+    FLUSH_FID (0);
+
+! Issue an unload function if unload was requested.
+!
+
+    $QIOW (
+	   CHAN = .IO_CHANNEL,
+	   EFN  = EFN,
+	   FUNC = (IF .UCB[UCB$V_UNLOAD]
+		   THEN IO$_UNLOAD
+		   ELSE IO$_AVAILABLE)
+	   );
+
+    QUEUE_HEAD[AQB$B_MNTCNT] = .QUEUE_HEAD[AQB$B_MNTCNT] - 1;
+    END				! end of dismount processing
+
+ELSE
+    UNLOCK_IODB ();
+
+END;					! end of routine CHECK_DISMOUNT
+
+END
+ELUDOM

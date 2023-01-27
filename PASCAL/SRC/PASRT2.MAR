@@ -1,0 +1,528 @@
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;*                                                                         *
+;*                            PAS$RT_HEAP                                  *
+;*           RUNTIME SUPPORT MODULE FOR PASCAL -- SECTION 2                *
+;*                                                                         *
+;*                   VERSION V1.0-1 -- OCTOBER 1979                        *
+;*                                                                         *
+;*   This module defines the following routines:                           *
+;*                                                                         *
+;*      pas$new:     routine to implement the Pascal procedure new(p)      *
+;*      pas$dispose: routine to implement the Pascal procedure dispose(p)  *
+;*      pas$mark:    routine to implement the Pascal procedure mark(p)     *
+;*      pas$release: routine to implement the Pascal procedure release(p)  *
+;*      pas$snap:    debug routine to examine state of the heap            *
+;*                                                                         *
+;*   Written by: Jeff Scofield 10-Dec-78                                   *
+;*                                                                         *
+;*   Edit History :
+;*         01-002 Paul Hohensee 27feb80. Modified to prevent duplicate
+;*                error messages form printing. Eliminate for v1.2
+;
+;	01-003 Susan Azibert 28may80. Changed the printing of error 
+;		messages so that they are both printed and signaled
+;		by calling lib$stop.
+;
+;	01-004 Susan Azibert 24sep80. Fixed bug introduced by change
+;		01-003 in outputting message attdisinv
+;
+;	01-005 Paul Hohensee 11-Aug-81. Changed references to external routines to use General addressing
+;*
+;***************************************************************************
+	.title	pas$rt_heap
+	.ident	'V03-000'
+
+	.extrn	pas$_proexchea
+	.extrn	pas$_attdisinv
+
+	$stsdef
+;
+;   ROUTINES  TO  IMPLEMENT  THE  PASCAL  HEAP-MANAGEMENT  PROCEDURES
+;		      NEW,  DISPOSE,  MARK,  RELEASE
+;
+;
+;   OWN STORAGE USED BY THE ROUTINES
+;
+	.psect _pas$data,pic,noexe,2
+;
+;	lasps: pointers to the lists of available space for each level
+;	pblbs: pointers to the page block lists for each level
+;	pools: pointers to the pools of free page blocks for each level
+;	marks: pointers to the next block of LAS to be allocated by
+;		 procedure mark
+;	nestl: the nesting level
+;
+lasps:	.long	0,0			; pointers to LAS's, initialized to nil
+pblps:	.long	0,0			; pointers to PBL's, initialized to nil
+pools:	.long	0,0			; pointers to pools, initialized to nil
+marks:	.long	0,0			; pointers to marks, initialized to nil
+nestl:	.byte	0			; re-entrancy level, initialized to 0
+;
+	.psect _pas$code,pic,shr,exe,nowrt
+;
+;   ROUTINE TO IMPLEMENT THE PASCAL STANDARD PROCEDURE NEW
+;
+	.entry	pas$new,^m<r2,r3,r4,r5,r6,r7,r8,r9>
+;
+;   Move important values to registers
+;
+	incb	nestl			; increment nest level
+	movzbl	nestl,r2		; r2 <- incremented nesting level
+	movl	lasps-4[r2],r3		; r3 <- LASP for this level
+	movl	pblps-4[r2],r4		; r4 <- PBLP for this level
+	movl	pools-4[r2],r5		; r5 <- addr of first block of pool
+	movl	4(ap),r6		; r6 <- # of bytes to allocate
+;
+;   Look through LAS for first block large enough to satisfy the request.
+;   Register 7 finds the predecessor of the block, r8 finds the block.
+;
+	clrl	r7			; initialize the predecessor to nil
+	movl	r3,r8			; initialize r8 to LASP
+	beql	inpool			; LAS is empty--find other memory
+10$:	cmpl	-4(r8),r6		; is this block big enough?
+	blssu	20$			; continue looking if not
+	brw	alloc			; else take it
+20$:	movl	r8,r7			; no--try next block
+	movl	(r8),r8
+	bneq	10$			; loop until found or end of LAS
+;
+;   Block was not found on LAS.  Try to find block in pool that will do.
+;   Register 7 has address of last block of LAS; r8 will find predecessor
+;   of page block, r9 will find page block in pool.
+;
+inpool:					; try to find block in pool
+	clrl	r8			; initialize predecessor to nil
+	movl	r5,r9			; initialize r9 to pool ptr
+10$:	beql	expand			; pool is empty--expand memory
+	subl3	#8,-4(r9),r0		; r0 <- avail space in this block
+	cmpl	r0,r6			; is there room in this block?
+	bgequ	20$			; yes--link new blk into LAS & PBL
+	movl	r9,r8			; no--try next page block
+	movl	(r9),r9
+	brb	10$			; loop until found or end of pool
+20$:	tstl	r8			; is there a predecessor of pg block?
+	beql	30$			; no--remove first block of PBL
+	movl	(r9),(r8)		; yes--link predecessor to successor
+	brb	linkpb			; link page block into LAS & PBL
+30$:	movl	(r9),r5			; remove first block of PBL
+	brb	linkpb			; link page block into LAS & PBL
+;
+;   No block was found in pool.  Expand program region to get new block.
+;
+expand:					; expand program region for memory
+	addl3	#519,r6,r8		; round (r6 + 8) up to next 512 bytes
+	bicl2	#511,r8			; r8 <- # of bytes to ask for
+	pushl	r8			; -4(fp) <- # of bytes to ask for
+	moval	-(sp),r9		; r9 <- addr of free longw on stack
+	pushl	r9			; push arg2: addr to get addr
+	pushal	-4(fp)			; push arg1: addr of # bytes asked for
+	calls	#2,G^lib$get_vm		; get memory; (r9) <- addr of mem
+	blbs	r0,10$			; continue if no errors
+	subl3	#7,16(fp),-(sp)		; third FAO argument (PC of call)
+	pushl	#0			; second FAO argument (null)
+	pushl	#0			; first FAO argument (null)
+	pushl	#3			; number of FAO arguments preceding
+	addl3	#4,#pas$_proexchea,-(sp)	; error message #8110
+	calls	#5,G^lib$stop		; signal error and stop execution
+10$:	movl	(r9),r9			; r9 <- addr of new memory
+	movl	r8,(r9)+		; set size of new block
+;
+;   Link new page block to end of PBL.  If adjacent to previous page
+;   block, merge the two and set flag so that LAS is also merged if
+;   possible.   Register 4 has addr of last page block, r9 has addr of
+;   new page block.
+;
+linkpb:					; link new page block to PBL
+	clrl	r1			; r1 is flag: init to 0
+	tstl	r4			; is PBL empty?
+	beql	10$			; yes--link new block to PBL
+	addl3	-4(r4),r4,r0		; no--r0 <- addr of end of last blk
+	cmpl	r9,r0			; is new block adjacent?
+	bneq	10$			; no--link new block to PBL
+	addl2	-4(r9),-4(r4)		; yes--lengthen old block
+	incl	r1			; set flag to show merge done
+	brb	linkla			; go link block into LAS
+10$:	movl	r4,(r9)			; link new block to PBL
+	movl	r9,r4			; set new head of PBL
+	addl2	#8,r9			; r9 <- addr of new LAS block
+	subl3	#8,-12(r9),-4(r9)	; set length of new LAS block
+;
+;   Link new block into LAS, kept sorted in memory order.  If r1 = 1,
+;   try to merge new block with predecessor.   Register 7 has addr of
+;   last block of LAS, r9 has address of new block.
+;
+linkla:					; link new block into LAS
+	clrl	r8			; set successor to nil
+	cmpl	r9,r7			; new block goes at end of LAS?
+	bgtru	20$			; yes--go ahead and insert
+	clrl	r7			; r7 finds predecessor of block
+	movl	r3,r8			; r8 finds successor of block
+10$:	cmpl	r9,r8			; does block belong here?
+	blssu	20$			; yes--insert
+	movl	r8,r7			; no--try after next block
+	movl	(r8),r8
+	bneq	10$			; loop until found or end of list
+20$:	tstl	r7			; is there a predecessor?
+	beql	50$			; no--add to front of LAS
+	blbc	r1,40$			; do not merge if flag clear
+	addl3	-4(r7),r7,r0		; r0 <- addr of end of predecessor
+	cmpl	r9,r0			; is new block adjacent?
+	bneq	40$			; no--link predecessor to block
+	addl2	-4(r9),-4(r7)		; yes--lengthen predecessor
+	movl	r7,r9			; use lengthened block
+	movl	r3,r7			; init r7 to LASP, find pred of (r9)
+30$:	cmpl	(r7),r9			; is this predecessor of (r9)?
+	beql	setmk			; yes--go set mark location
+	movl	(r7),r7			; no--try next block
+	bneq	30$			; loop until found or end of list
+	brb	setmk			; go set mark location
+40$:	movl	r9,(r7)			; link predecessor to block
+	brb	60$
+50$:	movl	r9,r3			; add new block to front of LAS
+60$:	movl	r8,(r9)			; link new block to successor
+;
+;   Set location to be marked by next call of pas$mark
+;
+setmk:	movl	r9,r8			; r8 <- addr of block to allocate
+	movl	r8,marks-4[r2]		; set mark location to new block
+;
+;   Allocate part or all of the block whose address is in r8.  Register 6
+;   has the number of bytes to allocate, r7 has addr of the predecessor
+;   of the block.
+;
+alloc:	subl3	r6,-4(r8),r0		; compare sizes
+	cmpl	r0,#4			; within 4 bytes?
+	bgtr	split			; no--split block
+					; yes--remove whole block from LAS
+	tstl	r7			; is there a predecessor?
+	beql	10$			; no--remove first block from LAS
+	movl	(r8),(r7)		; yes--link predecessor to successor
+	brb	20$
+10$:	movl	(r8),r3			; set new LASP
+20$:	cmpl	r8,marks-4[r2]		; is this marked block?
+	bneq	exitmn			; no--return
+	clrl	marks-4[r2]		; yes--set mark to nil
+	brb	exitmn			; return
+;
+;   Split block whose address is in r8.  Register 7 has address of
+;   predecessor of this block, r0 has number of bytes left over after
+;   split, r6 has number of bytes to allocate.
+;
+split:	movl	r6,-4(r8)		; set size of alloc block
+	addl3	r6,r8,r9		; r9 <- addr of remainder
+	movl	r0,-4(r9)		; set size of remainder
+	movl	(r8),(r9)		; set link of remainder
+	tstl	r7			; is there a predecessor?
+	beql	10$			; no--link to beginning of LAS
+	movl	r9,(r7)			; link predecessor to block
+	brb	20$
+10$:	movl	r9,r3			; set new head of LAS
+20$:	cmpl	r8,marks-4[r2]		; is this marked block?
+	bneq	exitmn			; no--return
+	movl	r9,marks-4[r2]		; yes--set mark to remainder
+;
+;   Store values that may have been changed, set return value, return.
+;
+exitmn:					; exit from pas$mark or pas$new
+	movl	r3,lasps-4[r2]		; store LASP
+	movl	r4,pblps-4[r2]		; store PBLP
+	movl	r5,pools-4[r2]		; store pool pointer
+	movl	r8,@8(ap)		; return pointer to allocated block
+	decb	nestl			; reset nesting level
+	ret
+;
+;   ROUTINE TO IMPLEMENT THE PASCAL PROCEDURE MARK
+;
+;      This routine functions as a second entry point for pas$new, sharing
+;      much of the code of that routine.
+;
+	.entry	pas$mark,^m<r2,r3,r4,r5,r6,r7,r8,r9>
+;
+;   Move important values to registers
+;
+	incb	nestl			; increment nest level
+	movzbl	nestl,r2		; r2 <- incremented nesting level
+	movl	lasps-4[r2],r3		; r3 <- LASP for this level
+	movl	pblps-4[r2],r4		; r4 <- PBLP for this level
+	movl	pools-4[r2],r5		; r5 <- addr of first block of pool
+	movl	4(ap),r6		; r6 <- # of bytes to allocate
+;
+;   If current marked block exists & is large enough, take it.
+;
+	movl	r3,r7			; r7 <- LASP
+	movl	marks-4[r2],r8		; r8 <- addr of marked LAS block
+	beql	locend			; no marked block--find end of LAS
+	cmpl	-4(r8),r6		; is marked block big enough?
+	blss	locend			; no--find end of LAS
+					; yes--find predecessor of marked block
+10$:	cmpl	(r7),r8			; is this predecessor of marked block?
+	bneq	20$			; no--keep looking
+	brw	alloc			; yes--go allocate the marked block
+20$:	movl	(r7),r7			; else try next block
+	bneq	10$			; loop until found or end of LAS
+	brw	alloc			; go allocate the marked block
+;
+;   Current marked block was not big enough.  Find end of LAS, go try to
+;   get marked block from pool, or else get it by expanding memory.
+;
+locend:					; locate end of LAS
+	clrl	r8			; r8 <- nil successor
+	tstl	r7			; LASP is nil?
+	bneq	10$			; no--find end of LAS
+	brw	inpool			; yes--go find block to mark
+10$:	tstl	(r7)			; r7 is last LAS block?
+	bneq	20$			; no--keep looking
+	brw	inpool			; yes--go find block to mark
+20$:	movl	(r7),r7			; else try next block
+	brb	10$			; loop until last block found
+;
+;   ROUTINE TO IMPLEMENT THE PASCAL PROCEDURE RELEASE
+;
+	.entry	pas$release,^m<r2,r3,r4,r5,r6,r7,r8,r9>
+;
+;   Move important values to registers
+;
+	incb	nestl			; increment the nesting level
+	movzbl	nestl,r2		; r2 <- incremented nesting level
+	movl	lasps-4[r2],r3		; r3 <- LASP for this level
+	movl	pblps-4[r2],r4		; r4 <- PBLP for this level
+	bneq	10$			; continue if not nil
+	decb	nestl			; PBLP is nil--nothing to do
+	ret				; back to caller
+10$:	movl	pools-4[r2],r5		; r5 <- addr of pool for this level
+	movl	@4(ap),r6		; r6 <- addr to be released
+;
+;   Make sure that the block containing the addr to be released is on the
+;   PBL of this nesting level.  If so, set r7 to addr of the page block
+;   containing the released address.  If not, there is nothing to do.
+;
+	movl	r4,r7			; init r7 to first page block
+20$:	cmpl	r7,r6			; freed addr before this block?
+	bgtru	30$			; yes--loop to next block
+	addl3	-4(r7),r7,r0		; r0 <- addr of end of block
+	cmpl	r0,r6			; freed addr inside this block?
+	bgtru	pool			; yes--go add blocks to pool
+30$:	movl	(r7),r7			; no--try next block
+	bneq	20$			; loop until found or end of list
+	decb	nestl			; block not found--nothing to do
+	ret				; back to caller
+;
+;   Add the freed blocks to the pool, kept sorted in memory order.
+;   Register 4 has address of next block to add to pool, r8 and r9 find
+;   the spot to insert the block.
+;
+pool:	cmpl	r4,r7			; this block contains freed addr?
+	beql	part			; yes--done adding to pool
+	clrl	r8			; r8 finds predecessor of added block
+	movl	r5,r9			; r9 finds successor of added block
+10$:	beql	20$			; end of list--add new block
+	cmpl	r4,r9			; new block goes before (r9)?
+	blssu	20$			; yes--add new block
+	movl	r9,r8			; no--try next block
+	movl	(r9),r9
+	brb	10$			; loop until spot found
+20$:	tstl	r8			; is there a predecessor?
+	beql	30$			; no--add to front of pool
+	movl	r4,(r8)			; else link predecessor to new block
+	brb	40$
+30$:	movl	r4,r5			; add new block to front of pool
+40$:	movl	(r4),r0			; save addr of next block of PBL
+	movl	r9,(r4)			; link new block to successor
+	movl	r0,r4			; move to next block of PBL
+	brb	pool			; loop through all freed blocks
+;
+;   Find the spot in LAS for the freed storage in the page block containing
+;   the freed pointer.   LAS is also kept sorted in memory order.  Register 6
+;   has the address of the freed storage, r8 and r9 find the correct spot
+;   in LAS for the new free block.
+;
+part:	clrl	r8			; r8 finds predecessor of new block
+	movl	r3,r9			; r9 finds successor of new block
+10$:	beql	20$			; end of list--add new block
+	cmpl	r6,r9			; new block goes before (r9)?
+	blssu	20$			; yes--add new block
+	movl	r9,r8			; no--try next block
+	movl	(r9),r9
+	brb	10$			; loop until spot found
+20$:	tstl	r8			; is there a predecessor?
+	beql	30$			; no--add to front of LAS
+	movl	r6,(r8)			; else link predecessor to new block
+	brb	40$			; go set mark loc
+30$:	movl	r6,r3			; add new block to front of pool
+40$:	movl	r6,marks-4[r2]		; next spot to mark is (r6)
+;
+;   Compute size of newly-added block, and remove from LAS all former
+;   free blocks falling inside the new block.  Register 6 is address of
+;   newly-added block, r9 is successor of block, r7 is addr of page block
+;   containing the new free block.
+;
+size:	addl3	r7,-4(r7),r0		; r0 <- addr of end of page block
+	subl3	r6,r0,-4(r6)		; set size of new block
+	tstl	r9
+	beql	20$			; end of list--set successor
+10$:	cmpl	r9,r0			; this block inside new free block?
+	bgtru	20$			; no--set successor
+	movl	(r9),r9			; yes--try next block
+	bneq	10$			; loop through all possibilities
+20$:	movl	r9,(r6)			; set successor of new block
+;
+;   Try to merge newly-freed storage with predecessor in LAS. Register 7
+;   has the address of the predecessor, r6 has the address of the new block.
+;
+	tstl	r8			; is there a predecessor?
+	beql	removl			; no--go remove other garbage
+	addl3	r8,-4(r8),r0		; r0 <- addr of end of predecessor
+	cmpl	r6,r0			; is new block adjacent?
+	bneq	removl			; no--go remove other garbage
+	addl2	-4(r6),-4(r8)		; yes--lengthen predecessor
+	movl	(r6),(r8)		; set link of predecessor
+	movl	r8,marks-4[r2]		; next spot to mark is (r8)
+;
+;   Remove from LAS all storage contained in blocks now in the pool.
+;   Register 7 has address of next page block to check, r8 has address
+;   of predecessor of next LAS block to check, r9 has address of next
+;   LAS block to check.
+;
+removl:					; remove garbage from LAS
+	clrl	r8			; initialize r8 to nil predecessor
+	movl	r3,r9			; initialize r9
+	beql	exitr			; no LAS--exit
+	movl	r5,r7			; initialize r7
+	beql	exitr			; empty pool-exit
+10$:	addl3	-4(r7),r7,r0		; r0 <- addr of end of this page block
+20$:	cmpl	r9,r7			; LAS block starts after page block?
+	bgtru	40$			; yes--look for garbage
+	movl	r9,r8			; no--try next LAS block
+30$:	movl	(r9),r9			; move r9 to successor
+	beql	exitr			; end of LAS--exit
+	brb	20$			; loop through all LAS blocks
+40$:	cmpl	r9,r0			; LAS block inside page block?
+	bgtru	60$			; no--try next page block
+					; yes--remove garbage LAS block
+	tstl	r8			; is there a predecessor?
+	beql	50$			; no--delete first LAS block
+	movl	(r9),(r8)		; yes--delete successor of r8
+	brb	30$			; go try next LAS block
+50$:	movl	(r9),r3			; delete first LAS block
+	brb	30$			; go try next LAS block
+60$:	movl	(r7),r7			; try next page block
+	bneq	10$			; loop through all page blocks
+;
+;   Store values that may have changed, return to caller
+;
+exitr:	movl	r3,lasps-4[r2]		; store LASP
+	movl	r4,pblps-4[r2]		; store PBLP
+	movl	r5,pools-4[r2]		; store pool pointer
+	clrl	@4(ap)			; set released ptr to nil
+	decb	nestl			; reset nesting level
+	ret
+;
+;   ROUTINE TO IMPLEMENT THE PASCAL PROCEDURE DISPOSE
+;
+	.entry	pas$dispose,^m<r2,r3,r4,r5,r6,r7>
+;
+;   Move important values to registers
+;
+	incb	nestl			; increment nesting level
+	movzbl	nestl,r2		; r2 <- incremented nesting level
+	movl	lasps-4[r2],r3		; r3 <- LASP for this level
+	movl	marks-4[r2],r4		; r4 <- addr of marked blk
+	movl	@4(ap),r5		; r5 <- addr of block to be disposed
+	bneq	10$			; continue if not nil
+	brw	exitd			; nil pointer--exit
+10$:	bitl	#^xc0000000,r5		; check for illegal value
+	beql	look			; continue if not system or stack addr
+	subl3	#7,16(fp),-(sp)		; third FAO argument (PC of call)
+	pushl	#0			; second FAO argument (null)
+	pushl	r5			; first FAO argument (invalid pointer value)
+	pushl	#3			; number of FAO arguments preceding
+	addl3	#4,#pas$_attdisinv,-(sp)	; error message #8160
+	decb	nestl			; reset nesting level
+	calls	#5,G^lib$stop		; signal error and stop execution
+;
+;   Look through LAS for the spot to insert the disposed block.  Register 5
+;   has address of disposed storage, r6 finds the predecessor of the new
+;   block, r7 finds the successor of the new block.
+;
+look:					; look for spot to insert block
+	clrl	r6			; initialize predecessor to nil
+	movl	r3,r7			; initialize successor to LASP
+	beql	insert			; LAS is empty--insert new block
+10$:	cmpl	r5,r7			; new block goes before (r7)?
+	blssu	insert			; yes--go insert it
+	movl	r7,r6			; no--try next block
+	movl	(r7),r7
+	bneq	10$			; loop until found or end of LAS
+;
+;   Insert new block into LAS, merging with predecessor or successor if
+;   possible.  Register 5 has addr of disposed block, r6 has addr of
+;   predecessor in LAS, r7 has addr of successor in LAS.
+;
+insert:					; insert new block into LAS
+	addl3	-4(r5),r5,r0		; r0 <- addr of end of disposed block
+	cmpl	r0,r7			; is new block adjacent to successor?
+	bneq	10$			; no--link to successor
+	addl2	-4(r7),-4(r5)		; yes--merge with successor
+	movl	(r7),(r5)		; set link of new block
+	cmpl	r7,r4			; was successor the marked block?
+	bneq	20$			; no--try to merge with predecessor
+	movl	r5,r4			; yes--new block is now marked
+	brb	20$
+10$:	movl	r7,(r5)			; link new block to successor
+20$:	tstl	r6			; is there a predecessor?
+	bneq	30$			; yes--go try to merge
+	movl	r5,r3			; no--add new block to front of LAS
+	brb	exitd			; exit
+30$:	addl3	-4(r6),r6,r0		; r0 <- addr of end of predecessor
+	cmpl	r5,r0			; new block is adjacent to predecessor?
+	bneq	40$			; no--go link predecessor to new block
+	addl2	-4(r5),-4(r6)		; yes--lengthen predecessor
+	movl	(r5),(r6)		; set link of predecessor
+	cmpl	r5,r4			; was new block the marked block?
+	bneq	exitd			; no--exit
+	movl	r6,r4			; yes--predecessor is now marked
+	brb	exitd			; exit
+40$:	movl	r5,(r6)			; link predecessor to new block
+;
+;   Store values that may have changed, return to caller
+;
+exitd:	movl	r3,lasps-4[r2]		; store LASP
+	movl	r4,marks-4[r2]		; store addr of marked block
+	clrl	@4(ap)			; set disposed ptr to nil
+	decb	nestl			; reset nesting level
+	ret
+;
+;   DEBUGGING ROUTINE TO EXAMINE STATE OF HEAP STORAGE
+;
+	.entry pas$snap,^m<>
+;
+;   Return current values of level 1 LASP, PBLP, POOL, MARK
+;
+	movl	lasps,@4(ap)		; return lasp
+	movl	pblps,@8(ap)		; return pblp
+	movl	pools,@12(ap)		; return pool
+	movl	marks,@16(ap)		; return mark
+	ret
+	.end

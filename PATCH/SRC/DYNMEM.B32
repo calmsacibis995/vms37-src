@@ -1,0 +1,362 @@
+MODULE DYNMEM (%IF %VARIANT EQL 1
+		%THEN
+			ADDRESSING_MODE (EXTERNAL = LONG_RELATIVE,
+					NONEXTERNAL = LONG_RELATIVE),
+		%FI
+		IDENT='V03-000') =
+
+BEGIN
+!
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+!
+!
+!
+!
+!++
+!
+! MODULE: DYNMEM
+!
+! FACILITY: PATCH
+!
+! ABSTRACT:  DYNAMIC MEMORY ALLOCATION AND DEALLOCATION
+!
+! HISTORY:
+!
+!	VERSION: V02-007
+!
+!	AUTHOR: T.J. PORTER 14-JAN-77
+!
+! MODIFIED BY:
+!
+!	V02-001	PCG0001		Peter George		02-FEB-1981
+!		Add require statement for LIB$:PATDEF.REQ
+!
+!	MODIFICATIONS:
+!
+! NO.	DATE		PROGRAMMER	PURPOSE
+! ---	----		----------	-------
+! 001	19-SEP-77	T.J. PORTER	REMEMBER THE HIGHEST ADDRESS ALLOCATED
+! 002	12-OCT-77	K.D. MORSE	ADAPT TO PATCH
+! 003	19-OCT-77	K.D. MORSE	ADD REQUIRE FILE VXSMAC.REQ
+! 004	18-NOV-77	K.D. MORSE	ADD REQUIRE FILE PATPCT.REQ
+! 005	25-APR-78	K.D. MORSE	CONVERT TO NATIVE COMPILER.
+! 006	13-JUN-78	K.D. MORSE	ADD FAO COUNTS TO SIGNALS.
+!
+!--
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This module contains all the dynamic memory allocation
+!	and de-allocation logic for patch.  A singly
+!	linked list of free blocks of memory is maintained
+!	(listhead is pat$gl_memlhd) and memory is allocated
+!	by first fit.  Should there be no available memory block
+!	of required size, the allocation routine expands
+!	the program region by the number of pages equal to 
+!	PAT$K_MEMEXP, links this on the end of the free
+!	list and allocates the required memory from that new
+!	block.  The free memory list is therefore initialized
+!	on first allocation call.  Memory is always allocated
+!	in eight byte quanta, with a maximum of PAT$K_MEMEXP*512
+!	bytes.  Deallocation effects compaction whenever possible.
+!
+! CALLING SEQUENCES:
+!	PAT$ALLOBLK(BLOCKSIZE,BLOCKADDR)
+!	PAT$DEALBLK(BLOCKSIZE,BLOCKADDR)
+!		where:
+!		  BLOCKSIZE = number of bytes to be (de)allocated.
+!		  BLOCKADDR = address of cell for the address of
+!		              the block allocated or to be deallocated.
+! ERROR CONDITIONS:
+!
+!	1.  BLOCKSIZE < OR = 0 OR > PAT$K_MEMEXP*512 (CODE = 0,10)
+!
+!	2.  Failure to expand the program region issues a message
+!	    that memory is full and the linker aborts.
+!
+!	3.  Any part of a block to be deallocated is:
+!		(I) Within a free block (code = 2,13)
+!		(II) Beyond top of program region (code = 11)
+!		(III) Lower than than lowest block ever allocated (code = 12)
+!
+!	In cases 1 and 3 a fatal ("bug") message is issued and
+!		the patch terminates.
+!
+!--
+
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';				! Defines system structures and services
+REQUIRE 'SRC$:PREFIX.REQ';				! Defines useful macros
+REQUIRE 'LIB$:PATDEF.REQ';				! Defines literals
+REQUIRE 'LIB$:PATMSG.REQ';				! Define error codes
+REQUIRE 'SRC$:VXSMAC.REQ';				! Define TRUE and FALSE
+REQUIRE 'SRC$:PATPCT.REQ';				! Define PSECTS
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	PAT$ALLOBLK : NOVALUE,				! Allocation driver
+	ALLOCATE,					! Allocation routine
+	PAT$DEALBLK : NOVALUE,				! Deallocation driver
+	DEALLOCATE;					! Deallocation routine
+
+!
+! EXTERNAL DATA
+!
+
+EXTERNAL
+	PAT$GL_ISVADDR : VECTOR[,LONG],			! Contains starting and ending virtual addrs of last piece mapped
+	PAT$GL_ERRCODE,					! Global error code
+	PAT$GL_MEMLHD : VECTOR[,LONG],			! Free memory listhead
+	PAT$GL_MINADDR;					! Lowest address ever allocated
+
+!
+! EQUATED SYMBOLS
+!
+
+EXTERNAL LITERAL
+	PAT$K_MEMEXP,					! # of pages to extend program region
+	PAT$K_MAXBLKSIZ;				! Maximum allocation size
+
+!
+! OWN STORAGE
+!
+
+OWN
+	ERRORCODE : BYTE,				! Error code for failure message
+	NEWBLOCK : REF VECTOR[2],			! Current block pointer
+	NEXTBLOCK : REF VECTOR[2],			! Next block pointer
+	LASTBLOCK : REF VECTOR[2];			! Previous block pointer
+
+GLOBAL ROUTINE PAT$ALLOBLK(SIZE,BLOCKADDR):NOVALUE =
+!++
+!	Allocate a block from the free memory list.
+!--
+
+BEGIN
+
+LOCAL
+	BLOCKSIZE;
+
+!++
+! Initialize local error code.
+!--
+ERRORCODE = 0;						! Initialize error code
+
+!++
+! Set size of block to allocate (round up to 8 bytes).
+!--
+BLOCKSIZE = (.SIZE + 7) AND ( NOT 7);			! Round up to multiple of 8 bytes
+
+!++
+! Now check for zero size block then allocate it.
+!--
+IF (.BLOCKSIZE EQL 0)					! Check legal block
+OR		 					! Size was requested
+	.BLOCKSIZE GTRU PAT$K_MAXBLKSIZ
+OR NOT ( ERRORCODE = .ERRORCODE + 1;			! Set new error code
+	ALLOCATE (.BLOCKSIZE, .BLOCKADDR))		! Go allocate
+THEN
+	SIGNAL(PAT$_MEMBUG,1,.BLOCKSIZE,.BLOCKADDR,.ERRORCODE); ! Print error message and TERMINATE IF FAILURE
+RETURN;							! Otherwise return
+END;							! Of PAT$ALLOBLK routine
+
+ROUTINE ALLOCATE (SIZE,ADDRESS) =
+!++
+!	Routine to do actual allocation and program
+!	region expansion
+!--
+
+BEGIN
+
+LASTBLOCK = PAT$GL_MEMLHD[0];				! Initially at top of free list
+
+!++
+! Check down free list for first block of equal or larger size.
+!--
+WHILE (NEWBLOCK = .LASTBLOCK[0])NEQ 0 DO		! Follow down free list
+	BEGIN
+	IF (.NEWBLOCK[1] EQL .SIZE)			! Look for suitable free block
+	THEN BEGIN					! Exact size match
+		LASTBLOCK[0] = .NEWBLOCK[0];		! so last points where this one pointed
+		IF (.ADDRESS = NEWBLOCK[0]) LSSU .PAT$GL_MINADDR ! Now record lowest
+		THEN PAT$GL_MINADDR = NEWBLOCK[0];	! Allocated address
+		RETURN TRUE;				! And we are done
+		END
+	ELSE IF (.NEWBLOCK[1] GTRU .SIZE)			! Or one larger than requested
+	THEN BEGIN
+		NEXTBLOCK = NEWBLOCK[0]+.SIZE; 		! In which case there is a new
+		NEXTBLOCK[0] = .NEWBLOCK[0];
+		NEXTBLOCK[1] = .NEWBLOCK[1]-.SIZE; 	! Next block (the part remain-
+		LASTBLOCK[0] = NEXTBLOCK[0];		! ing) after taking requested block off
+		IF (.ADDRESS = NEWBLOCK[0]) LSSU .PAT$GL_MINADDR ! Now record lowest
+		THEN PAT$GL_MINADDR = NEWBLOCK[0];	! Allocated address
+		RETURN TRUE;				! And we are done
+	     END
+	ELSE LASTBLOCK = NEWBLOCK[0];			! When not suitable this block becomes previous block
+	END;						! Of while loop
+
+!++
+!	At this point we have reached the end of the free
+!	memory list without finding a block of required size.
+!	Thus, we expand the address space and attempt to
+!	allocate from additional virtual memory.
+!--
+IF PAT$GL_ERRCODE=$EXPREG(PAGCNT=PAT$K_MEMEXP
+			, RETADR=PAT$GL_ISVADDR)
+							! Successfully expanded program region
+THEN BEGIN						! Deallocate new space to end of
+	IF NOT DEALLOCATE(PAT$K_MAXBLKSIZ,.PAT$GL_ISVADDR[0],LASTBLOCK[0])
+		THEN RETURN FALSE;
+	IF NOT ALLOCATE(.SIZE,.ADDRESS)			! Free list then allocate from it
+		THEN RETURN FALSE;
+	RETURN TRUE;
+     END
+							! Failure to expand program region
+ELSE SIGNAL(PAT$_EXPREG,1,.PAT$GL_ERRCODE);		! Is fatal
+END;							! Of allocate routine
+
+GLOBAL ROUTINE PAT$DEALBLK(SIZE,BLOCKADDR):NOVALUE =
+!++
+!	Routine to deallocate a block to the free
+!	memory list after checking its size
+!--
+
+BEGIN
+
+LOCAL
+	BLOCKSIZE;
+
+!++
+! Initialize error code to deallocate routine.
+!--
+ERRORCODE = 10;						! Initialize error code
+
+!++
+! Round up the block size to the nearest quadword.
+!--
+BLOCKSIZE = (.SIZE + 7) AND ( NOT 7);			! Round up to a multiple of 8 bytes
+
+!++
+! Now search for place in free list to insert block.
+!--
+IF (.BLOCKSIZE EQL 0)					! Check block size is
+OR
+(.BLOCKSIZE GTRU PAT$K_MAXBLKSIZ)				! Legal and that it lies
+OR (ERRORCODE = .ERRORCODE + 1;				!
+(.BLOCKADDR + .BLOCKSIZE) ) GTRU CONTROL_REGION		! Completely within program region
+								! and if not...
+OR (ERRORCODE = .ERRORCODE + 1;				! Issue fatal error message
+.BLOCKADDR LSSU .PAT$GL_MINADDR)			! Also if below minimum allocated address
+OR NOT DEALLOCATE(.BLOCKSIZE,.BLOCKADDR,PAT$GL_MEMLHD)	! Attempt deallocation
+THEN SIGNAL(PAT$_MEMBUG,1,.BLOCKSIZE,.BLOCKADDR,.ERRORCODE); ! Issuing fatal error if failure
+
+RETURN;							! Otherwise just return
+END;
+
+ROUTINE DEALLOCATE(SIZE,ADDRESS,LISTHEAD) =
+!++
+!	Routine to put a block onto a list of free blocks,
+!	with maximal compaction
+!--
+
+BEGIN
+!++
+! Initialize search down the free list.
+!--
+LASTBLOCK = .LISTHEAD;					! Previous block initially the listhead
+NEWBLOCK = .ADDRESS;					! Current block is to be inserted
+
+!++
+! Now search the list for the place to insert the free block.
+!--
+WHILE (NEXTBLOCK = .LASTBLOCK[0])NEQ 0 DO		! Follow down free list till
+BEGIN							! The end, or till we reach
+IF NEWBLOCK[0] LEQU NEXTBLOCK[0]
+THEN
+	BEGIN						! The position for insertion.
+	IF NEWBLOCK[0]+.SIZE EQL NEXTBLOCK[0]
+	THEN
+		BEGIN					! Here we compact with next block
+		NEWBLOCK[0] = .NEXTBLOCK[0];
+		NEWBLOCK[1] = .NEXTBLOCK[1]+.SIZE;
+		END
+	ELSE
+		BEGIN
+		IF NEWBLOCK[0] + .SIZE GTRU NEXTBLOCK[0] ! If the block to deallocate
+		THEN (ERRORCODE = .ERRORCODE + 1;	! Extends into next free block
+			RETURN FALSE);			! And return failure
+		NEWBLOCK[0] = NEXTBLOCK[0];		! Else set pointer and size since no
+		NEWBLOCK[1] = .SIZE;			! Forward compaction needed
+		END;
+	IF NEWBLOCK[0] EQL LASTBLOCK[0]+.LASTBLOCK[1]
+	THEN
+		BEGIN					! Here we compact with previous
+		LASTBLOCK[0] = .NEWBLOCK[0];		! Block
+		LASTBLOCK[1] = .NEWBLOCK[1]+.LASTBLOCK[1];
+		END
+	ELSE							! No backward compaction but...
+		BEGIN						! Must check that block to
+		IF NEWBLOCK[0] LSSU LASTBLOCK[0] + .LASTBLOCK[1]
+							! Deallocate is not partially in
+			THEN (ERRORCODE = .ERRORCODE + 1; ! Previous hole -- failure if so
+			     RETURN FALSE);
+		LASTBLOCK[0] = NEWBLOCK[0];		! If ok previous points to new one.
+		END;					! And we are done compacting
+	RETURN TRUE;					! So return success.
+	END
+ELSE
+	LASTBLOCK = NEXTBLOCK[0];			! Not there yet so last block is one just tested
+END;							! Of while loop
+
+!++
+! The block to deallocate is beyond last hole
+!--
+IF NEWBLOCK[0] LSSU LASTBLOCK[0] + .LASTBLOCK[1]	! But if it starts within
+THEN (ERRORCODE = .ERRORCODE + 1;			! The last hole - fail it
+		RETURN FALSE)
+ELSE
+	BEGIN						! Otherwise check for compaction
+	IF NEWBLOCK[0] EQL LASTBLOCK[0] + .LASTBLOCK[1]	! With last hole
+	THEN LASTBLOCK[1] = .LASTBLOCK[1] + .SIZE	! And add in size if required
+	ELSE
+		BEGIN					! Otherwise just
+		NEWBLOCK[0] = 0;			! Put on end of free list.
+		NEWBLOCK[1] =.SIZE;
+		LASTBLOCK[0] = NEWBLOCK[0];
+		END;					! And all done
+	RETURN TRUE;					! So return success
+	END;
+END;							! Of routine
+END ELUDOM						! Of module

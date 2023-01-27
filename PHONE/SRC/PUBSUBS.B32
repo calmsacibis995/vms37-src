@@ -1,0 +1,605 @@
+%title 'PUBSUBS - Subroutines for Handling PUBs'
+	module pubsubs (
+			ident='V03-001') = begin
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! Facility:	VAX/VMS Telephone Facility, Subroutines for Handling PUBs
+!
+! Abstract:	This module provides the routines necessary for handling
+!		Phone Unit Blocks (PUB).  A PUB is used to describe the
+!		characteristics of one of the phone units that the user
+!		is talking to.  All information about that unit is in
+!		its PUB.
+!
+!
+! Environment:
+!
+! Author: Paul C. Anagnostopoulos, Creation Date: 18 November 1980
+!
+! Modified By:
+!
+!	V03-001	PCA0046		Paul Anagnostopoulos	26-Mar-1982
+!		Minor changes to convert from process name to user name.
+!--
+
+%sbttl 'Module Declarations'
+!
+! Libraries and Requires:
+!
+
+library 'sys$library:starlet.l32';
+require 'phonereq';
+
+!
+! Table of Contents:
+!
+
+forward routine
+	phn$make_pub,
+	phn$make_tsb,
+	phn$redundant,
+	phn$conversing,
+	phn$cmp_target,
+	phn$kill_pub: novalue,
+	phn$make_ctl: novalue,
+	phn$kill_ctl: novalue;
+
+!
+! Macro Definitions:
+!
+! The following macro is used in the PHN$MAKE_TSB routine.
+!
+
+macro add_token(length,pointer) = 
+(	inc (nt[tsb_w_tkncount]);
+	begin
+	bind
+		token_dsc = nt[tsb_q_tkndsc,.nt[tsb_w_tkncount]]: descriptor;
+
+	token_dsc[0,0,32,0] = length;
+	token_dsc[ptr] = .complete_spec_dsc[ptr] + .complete_spec_dsc[len];
+	ch$move(length,pointer,.token_dsc[ptr]);
+	complete_spec_dsc[len] = .complete_spec_dsc[len] + length;
+	end;
+)
+%;
+
+!
+! External References:
+!
+
+external routine
+	lib$free_vm: addressing_mode(general),
+	lib$get_vm: addressing_mode(general),
+	lib$tparse: addressing_mode(general);
+
+external literal
+	lib$_syntaxerr;
+
+!
+! Own Variables:
+!
+
+%sbttl 'PHN$MAKE_PUB - Create New Phone Unit Block'
+!++
+! Functional Description:
+!	This routine is called to create a new PUB.  The PUB is allocated,
+!	initialized, and chained onto the end of the PUB chain.  By chaining
+!	onto the end, we keep PUBs in the order of creation.
+!
+! Formal Parameters:
+!	target_spec	Address of descriptor of complete node/user name spec
+!			of person or node we need the PUB for.
+!	pub_address	Address of longword in which to return new PUB address.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	phn$_badspec	Invalid target specification syntax.
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$make_pub(target_spec,pub_address) = begin
+
+bind
+	target_spec_dsc = .target_spec: descriptor;
+
+local
+	status: long,
+	np: ref pub,			! Pointer to the new PUB.
+	c: ref ctl;
+
+
+! We begin by allocating memory for the new PUB.
+
+status = lib$get_vm(%ref(pub_k_size),np);
+check (.status);
+
+! Now we clear the PUB and fill in its length.
+
+ch$fill(0,pub_k_size,.np);
+np[pub_l_length] = pub_k_size;
+
+! Now we initialize the TSB portion of the PUB with the target spec
+! we have been passed.  If that fails, just delete the stupid thing
+! and return an error status.
+
+status = phn$make_tsb(.target_spec,np[pub_b_tsb]);
+if .status eqlu phn$_badspec then (
+	phn$kill_pub(.np);
+	return phn$_badspec;
+);
+check (.status);
+
+! Now we mark the PUB temporary (all new PUBs are marked as such).
+
+np[pub_v_temporary] = true;
+
+! Now we allocate an initial CTL buffer with no text in it.  Thus we will
+! be prepared to add text as the person talks.  We specify this CTL as
+! the top of the viewport.
+
+phn$make_ctl(0,c);
+np[pub_q_ctlhead0] = np[pub_q_ctlhead1] = np[pub_q_ctlhead0];
+insque(.c,np[pub_q_ctlhead0]);
+inc (np[pub_l_ctlcount]);
+np[pub_l_topctl] = .np[pub_l_ctlcount];
+
+! Finally, we queue the PUB at the end of the PUB chain and return its
+! address as requested.
+
+insque(.np,.phn$gq_pubhead[1]);
+.pub_address = .np;
+return phn$_ok;
+
+end;
+
+%sbttl 'PHN$MAKE_TSB - Build a Target Specification Block'
+!++
+! Functional Description:
+!	This routine is called to construct a Target Specification Block,
+!	a data structure containing the complete node and user name
+!	specification for some person or node we want to communicate with.
+!
+!	The original version of this routine used TPARSE, but it
+!	was rewritten by hand because of its frequency of use.
+!
+! Formal Parameters:
+!	target_spec	The node/user string in any valid format.
+!	new_tsb		The address of the TSB to be filled in.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	phn$_badspec	The target spec was syntactically incorrect.
+!			Currently this is never the case.
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$make_tsb(target_spec,new_tsb) = begin
+
+bind
+	target_spec_dsc = .target_spec: descriptor,
+	nt = .new_tsb: tsb,
+	complete_spec_dsc = nt[tsb_q_tkndsc,0]: descriptor;
+
+local
+	status: long,
+	spec_ptr: long, spec_ptr2: long,
+	spec_end_ptr: long;
+
+! We begin by clearing the new TSB and initializing the complete spec
+! descriptor.
+
+ch$fill(0,tsb_k_size,nt);
+complete_spec_dsc[ptr] = nt[tsb_t_string];
+
+! Now we look at the target spec and see if it contains a node name.
+
+spec_ptr = .target_spec_dsc[ptr];
+spec_end_ptr = .spec_ptr + .target_spec_dsc[len];
+
+if ch$find_sub(.target_spec_dsc[len],.target_spec_dsc[ptr],
+	       2,uplit byte('::')) eqla 0			then
+
+	! The spec does not contain a node name.  We will therefore use
+	! our node name as the default, unless we are not on a DECnet node.
+
+	if .phn$gq_node_name[len] nequ 0 then
+		add_token(.phn$gq_node_name[len],.phn$gq_node_name[ptr])
+	else
+		add_token(0,0)
+
+else
+	! The target spec contains at least one node name.  Now we have
+	! to scan off the node names and add them to the spec in the TSB.
+	! We normalize then by removing blanks and leading underscores.
+	! We also add build a descriptor for each one.
+
+	loop (
+		spec_ptr = ch$find_not_ch(.spec_end_ptr-.spec_ptr,
+					  .spec_ptr,' ');
+		if .spec_ptr eqla 0 then
+			spec_ptr = .spec_end_ptr;
+		spec_ptr2 = ch$find_sub(.spec_end_ptr-.spec_ptr,.spec_ptr,
+					2,uplit byte('::'));
+	exitif (.spec_ptr2 eqla 0);
+
+		if ch$rchar(.spec_ptr) eqlu '_' then
+			inc (spec_ptr);
+		add_token(.spec_ptr2-.spec_ptr+2,.spec_ptr);
+		spec_ptr = .spec_ptr2 + 2;
+	);
+
+! We have finished processing the node names.  Now we have to isolate the
+! user name (if any), add it to the spec in the TSB, and build a descriptor.
+
+spec_ptr = ch$find_not_ch(.spec_end_ptr-.spec_ptr, .spec_ptr,' ');
+if .spec_ptr eqla 0 then
+	spec_ptr = .spec_end_ptr;
+add_token(.spec_end_ptr-.spec_ptr,.spec_ptr);
+
+! If the explicit or default home node on the spec is not our node, then
+! we need to set the remote flag in the TSB.
+
+begin
+bind
+	home_node_dsc = nt[tsb_q_tkndsc,.nt[tsb_w_tkncount]-1]: descriptor;
+
+nt[tsb_v_remote] = ch$neq(.home_node_dsc[len],.home_node_dsc[ptr],
+			  .phn$gq_node_name[len],.phn$gq_node_name[ptr],' ');
+end;
+
+! If a user name was specified in the spec, we need to set the user
+! flag in the TSB.  If none was specified, the length of the user name
+! token was set to zero.
+
+begin
+bind
+	user_name_dsc = nt[tsb_q_tkndsc,.nt[tsb_w_tkncount]]: descriptor;
+
+nt[tsb_v_user] = .user_name_dsc[len] nequ 0;
+end;
+
+return phn$_ok;
+
+end;
+
+%sbttl 'PHN$REDUNDANT - Check for Redundant Link'
+!++
+! Functional Description:
+!	This routine is called to check for a redundant link, that is,
+!	a link with a person who is already linked to.  The PUB being
+!	checked is assumed to still be temporary!
+!
+! Formal Parameters:
+!	the_pub		Address of PUB for link that might be redundant.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	true if link is redundant, false otherwise.
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$redundant(the_pub) = begin
+
+bind
+	tp = .the_pub: pub;
+
+local
+	p: ref pub;
+
+
+! Basically, we just search all non-temporary PUBs for one with the same
+! target.  We don't search ours, however, because we do want to allow
+! the user to call him/herself once.
+
+p = ..phn$gq_pubhead[0];
+until .p eqla phn$gq_pubhead do (
+	if not .p[pub_v_temporary] and
+	   phn$cmp_target(p[pub_b_tsb],tp[pub_b_tsb]) then
+		return true;
+
+	p = .p[pub_l_flink];
+);
+
+return false;
+
+end;
+
+%sbttl 'PHN$CONVERSING - Is Conversation in Progress?'
+!++
+! Functional Description:
+!	This routine is called to find out if there is a conversation
+!	currently in progress.  Such is the case unless every PUB is
+!	either temporary, we have on hold, or has us on hold.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	1 if conversation in progress, 0 otherwise.
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$conversing = begin
+
+local
+	p: ref pub;
+
+
+! Basically, we just search every PUB (but not our own) to see if
+! any of them are in conversation with us.
+
+p = ..phn$gq_pubhead[0];
+until .p eqla phn$gq_pubhead do (
+	if not .p[pub_v_temporary] and
+	   not .p[pub_v_uhaveheld] and
+	   not .p[pub_v_hasuheld]	then
+		return true;
+
+	p = .p[pub_l_flink];
+);
+
+return false;
+
+end;
+
+%sbttl 'PHN$CMP_TARGET - Compare TSB Targets'
+!++
+! Functional Description:
+!	This routine is called to compare the targets specs in two TSBs.
+!	The portion compared consists of the home node and the user name.
+!
+! Formal Parameters:
+!	tsb1,tsb2	The addresses of the TSBs to be compared.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	true if targets are equal, false otherwise.
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$cmp_target(tsb1,tsb2) = begin
+
+bind
+	the_tsb1 = .tsb1: tsb,
+	the_tsb2 = .tsb2: tsb,
+
+	home_node1_dsc = the_tsb1[tsb_q_tkndsc,.the_tsb1[tsb_w_tkncount]-1]: descriptor,
+	user_name1_dsc = the_tsb1[tsb_q_tkndsc,.the_tsb1[tsb_w_tkncount]]: descriptor,
+
+	home_node2_dsc = the_tsb2[tsb_q_tkndsc,.the_tsb2[tsb_w_tkncount]-1]: descriptor,
+	user_name2_dsc = the_tsb2[tsb_q_tkndsc,.the_tsb2[tsb_w_tkncount]]: descriptor;
+
+return
+     ch$eql(.home_node1_dsc[len]+.user_name1_dsc[len],.home_node1_dsc[ptr],
+	    .home_node2_dsc[len]+.user_name2_dsc[len],.home_node2_dsc[ptr],
+	    ' ');
+
+end;
+
+%sbttl 'PHN$KILL_PUB - Kill Obsolete PUB'
+!++
+! Functional Description:
+!	This routine is called to deallocate an obsolete PUB.  We unhook
+!	it from the PUB chain, deallocate any CTL buffers hanging off it,
+!	and free it up.
+!
+! Formal Parameters:
+!	obsolete_pub	The address of the obsolete PUB.  It is assumed to
+!			still be in the PUB chain.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$kill_pub(obsolete_pub): novalue = begin
+
+local
+	status: long,
+	p: ref pub,
+	c: ref ctl;
+
+
+! We begin by removing the obsolete PUB from the PUB chain.
+
+remque(.obsolete_pub,p);
+
+! Now we remove and kill any CTL buffers hanging off the PUB.
+
+while not remque(.p[pub_q_ctlhead0],c) do
+	phn$kill_ctl(.c);
+
+! Now we can free up the memory occupied by the PUB.
+
+status = lib$free_vm(p[pub_l_length],p);
+check (.status);
+
+return;
+
+end;
+
+%sbttl 'PHN$MAKE_CTL - Create a Conversation Text Line'
+!++
+! Functional Description:
+!	This routine is called to allocate and initialize a new Conversation
+!	Text Line (CTL) buffer.
+!
+! Formal Parameters:
+!	line_text	Address of descriptor of text to go in CTL (optional).
+!	ctl_address	Address of longword in which to return CTL address.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$make_ctl(line_text,ctl_address): novalue = begin
+
+bind
+	line_text_dsc = .line_text: descriptor;
+
+own
+	sequence_stamp: long initial(0);
+
+local
+	status: long,
+	c: ref ctl;
+
+builtin
+	nullparameter;
+
+
+! We begin by allocating memory for the CTL.
+
+status = lib$get_vm(%ref(ctl_k_size),c);
+check (.status);
+
+! Now we initialize the CTL by filling in its length, the sequence
+! stamp (so we can tell the order in which CTLs were created), and the
+! line text if specified.
+
+c[ctl_l_length] = ctl_k_size;
+c[ctl_l_stamp] = inc (sequence_stamp);
+begin
+bind
+	line_dsc = c[ctl_q_line]: descriptor;
+
+line_dsc[0,0,32,0] = 0;
+if not nullparameter(1) then (
+	ch$move(.line_text_dsc[len],.line_text_dsc[ptr],c[ctl_t_linebuf]);
+	line_dsc[len] = .line_text_dsc[len];
+);
+line_dsc[ptr] = c[ctl_t_linebuf];
+end;
+
+! Finally, return the CTL address as requested.
+
+.ctl_address = .c;
+return;
+
+end;
+
+%sbttl 'PHN$KILL_CTL - Deallocate Dead CTL'
+!++
+! Functional Description:
+!	This routine is called to deallocate an obsolete CTL.  We just
+!	free up its memory.
+!
+! Formal Parameters:
+!	obsolete_ctl	The address of the obsolete CTL.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$kill_ctl(obsolete_ctl): novalue = begin
+
+bind
+	c = .obsolete_ctl: ctl;
+
+local
+	status: long;
+
+
+status = lib$free_vm(c[ctl_l_length],obsolete_ctl);
+check (.status);
+return;
+
+end;
+
+end eludom

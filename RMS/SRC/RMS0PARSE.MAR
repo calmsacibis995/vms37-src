@@ -1,0 +1,649 @@
+	$BEGIN	RMS0PARSE,024,F$RMS0MISC,<PARSE FILE SPECIFICATION>
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; Facility: rms32
+;
+; Abstract:
+;	this is the highest level routine to perform the $parse function
+;
+; Environment:
+;	vax/vms
+;
+; Author:
+;	Tim Halvorsen	AUG-1979
+;
+; Modified By:
+;
+;	V02-024	RAS0067		Ron Schaefer		9-Feb-1982
+;		Return canonical NAM$T_DVI using FWA$T_SHRFILDEV field.
+;
+;	V02-023	RAS0064		Ron Schaefer		2-Feb-1982
+;		Undo TMK0047 to leave the expanded string with a
+;		complete directory spec no matter what the device
+;		characteristics say; too many programs depend on
+;		$PARSE to just do the filename expansion.
+;		However, the NAM block and FWA control fields are
+;		properly initialized to make subsequent $SEARCHs work.
+;
+;	V02-022	TMK0048		Todd M. Katz		22-Jan-1982
+;		The user can request context to be saved by setting the
+;		bit NAM$V_SVCTX within the NAM field NAM$L_WCC. However,
+;		in the change of TMK0021, this entire field was being
+;		cleared, as part of the reinitialization of the NAM block 
+;		prior to the parse. This caused the loss of any user 
+;		requested context saving. Set the IFAB bit IFB$V_SEARCH,
+;		before clearing the NAM field NAM$L_WCC provided the 
+;		requested context saving, and use the status of this bit
+;		later on in the parse as an additional deciding factor
+;		when it must decided whether or not to save context.
+;
+;	V02-021	TMK0047		Todd M. Katz		17-Jan-1982
+;		Treat foreign mounted devices as unit record devices. 
+;		Inotherwards, arrange it so that the expanded name string
+;		contains a null length directory specification.
+;
+;	V02-020	TMK0046		Todd M. Katz		29-Dec-1981
+;		When context exists from a previous parse/search, return
+;		an error if that operation is still in progress. Otherwise
+;		turn on the busy bit and save the current stack pointer
+;		in the image I/O segment so that if any "stalls" are to take
+;		place during context cleanup, they maybe appropriate handled.
+;		Previously, context existing from a network search operation,
+;		when it was being cleaned up, would required a QIO (and
+;		subsequent stall) to break the network logical link, but
+;		because the IFAB busy bit was not set, and the current stack
+;		pointer had not been saved, synchronization was not possible
+;		and the process would bugcheck. 
+;
+;		Also, after a fresh IFAB has been allocated, check to see
+;		whether the parse is continuing at AST level (which it
+;		will be if any "stalls" had previously take place during
+;		cleanup of preexisting context), and if so, clear the
+;		inhibit AST bit on the I/O control page. The QIO and stall
+;		which brought this process to AST level had also cleared
+;		this AST inhibit bit, but it is set again within RM$FSETI,
+;		a routine which assumes it has not been called at AST level.
+;		This bit should never be set when RMS is at AST level as it
+;		will interfere with subsequent attempts to synchronize by
+;		stalling at user mode by leaving the process disabled for ASTs.
+;
+;		Also, use the newly defined bit, NAM$V_IFI instead of the 
+;		number 16, and change the check for spurious NAM$L_WCC bits
+;		so that it ignores NAM$V_SRCHNMF if it is on.
+;
+;	V02-019	TMK0045		Todd M. Katz		29-Dec-1981
+;		In RM$PARSE_FILE, before splitting apart disk from nondisk
+;		devices, check to see whether a node name was present
+;		within the file specification. If so, skip all the directory
+;		stuff and go immediately fill in the NAM.
+;
+;	V02-018	TMK0029		Todd M. Katz		21-Dec-1981
+;		Redid the logic of RM$PARSE_FILE such that PPF files, files on 
+;		disks, and nondisk files behave differently. PPF files have
+;		their device characteristics retrieved, not by assigning 
+;		another channel (which doesn't work as was shown by TMK0024),
+;		but by retrieving the PFF file's IFI from information provided
+;		by the translation of the PPF's logical name, and using it to
+;		retieve the original IFAB from which the device characteristics
+;		maybe obtained. While files that are found to be on disks 
+;		behave pretty much the same, nondisk files have all directory
+;		information (subdirectory levels, wild directory bits etc...)
+;		removed from their NAM, if present, and the expanded-name 
+;		string reconstructed so as to contain a null length directory
+;		specification.
+;
+;	V02-017	TMK0024		Todd M. Katz		17-Dec-1981
+;		Change the interface to RM0WILD. It will only be called
+;		for disk files. For nondisk (and all spooled devices),
+;		FWA$B_DIRLEN is set to 0, and for SDI devices, the DID
+;		is initialized to the MFD, and the FID to 0. Finally,
+;		context can now only be saved for network transactions
+;		and all other transactions involving disk devices.
+;
+;		Also, remove the check for PPF prior to the assigning of
+;		the channel, and before device characteristics are returned.
+;		This allows deivce characteristics to also be returned for
+;		PPF files.
+;
+;	V02-016	TMK0021		Todd M. Katz		12-Dec-1981
+;		Clear NAM$L_WCC. This is so when the FWA context is
+;		recovered within RMS0SRCH, the WCC context from the
+;		current PARSE is used to set the field FIB$L_WCC, 
+;		without any side-effect resulting from what might had
+;		been present in this NAM field from a previous parse.
+;
+;	V02-015	RAS0037		Ron Schaefer		21-Sep-1981
+;		Correct RM$WRITE_DVI to always return a leading "_".
+;
+;	V02-014	TMK0009		Todd M. Katz		08-Sep-1981
+;		When change of Aug 11 1981 was made, RM$NEXTDIR was no
+;		longer being called for SDI devices. Change it so it is
+;		so that mag tape stuff works correctly.
+;
+;	V02-013	TMH0013		Tim Halvorsen		05-Sep-1981
+;		Translate FWA$Q_DEVICE string once before storing it
+;		into DVI, so that DVI always gets the actual device name.
+;
+;	V02-012	KEK0007		K. E. Kinnear		11-Aug-1981
+;		Change IFB$L_AS_DEV to IFB$L_PRIM_DEV where necessary.
+;		Change handling of SDC FAB field if FOREIGN device --
+;		return unmodified DEV characteristics.
+;
+;	V02-011 MCN0001		Maria del C. Nasr	29-Jul-1981
+;		Rename entry point to RMS$$ to support long branches.
+;
+;	V02-010	TMH0010		Tim Halvorsen		15-May-1981
+;		Do not use bit 15 in NAM$L_WCC to indicate IFAB
+;		rather than ACP context, since that bit is used
+;		to indicate process I/O segment IFAB.  Change to
+;		use bit 16 instead.
+;
+;	V02-009	PSK0001		Paulina Knibbe		26-Jan-1980
+;		Clear the save context flag in the IFI so we recognize
+;		it as an IFI and deallocate it.
+;
+;	V02-008	REFORMAT	Maria del C. Nasr	24-Jul-1980
+;
+;	V007	JAK0038		Jim Krycka	12-MAR-1980
+;		Zero fnb field of nam block before parsing the file nameto fix
+;		node name 'stickiness' problem.
+;
+;	V006	TMH0003		Tim Halvorsen	05-FEB-1980
+;		avoid saving context or doing wildcard directory stuff
+;		on non-directory devices.
+;
+;	V005	FED0001		Fred Deen	31-DEC-1979
+;		install code to return device characteristics for process
+;		permanent files. bypass code until indirect command
+;		file access is resolved.
+;
+;	V004	JAK0035		Jim Krycka	27-DEC-1979
+;		modifications to support $parse/$search over the network
+;
+;	V003	JAK0032		Jim Krycka	03-DEC-1979
+;		Fix bug in return of device characteristics.
+;
+;	V002	TMH0002		Tim Halvorsen	02-DEC-1979
+;		Preset the esl and rsl fields of the nam block to zero
+;		before performing any parsing of the file name.  This
+;		avoids leaving any expanded or result name strings lying
+;		around from previous parses and using the wrong filespec
+;		in an error message.
+;
+;	V001	TMH0001		Tim Halvorsen	03-NOV-1979
+;		Return dnf/nosuchfile if rm$nextdir returns with nmf.
+;		Remove temporary definition of dirbdb (now in rmsint).
+;--
+;
+
+
+	.SBTTL	DEFINITIONS
+
+;
+;	symbol definitions
+;
+
+	$FABDEF				; fab definitions
+	$NAMDEF				; nam definitions
+	$IFBDEF				; ifab definitions
+	$FWADEF				; fwa definitions
+	$FIBDEF				; fib definitions
+	$IMPDEF				; impure area definitions
+	$PIODEF				; i/o control page definitions
+	$DEVDEF				; device characteristics
+
+;
+;	own storage
+;
+
+	.SBTTL	PARSE, INITIATE WILDCARD SEQUENCE
+
+;
+;---
+; PARSE
+;	RMS$$PARSE
+;	
+;	This routine initiates wildcarding within rms.
+;	it allocates swb and fwa buffers to handle context
+;	while traversing the directory tree.  They remain
+;	allocated until the wildcard sequence is terminated
+;	via either another parse or nmf error condition.
+;
+; inputs:
+;
+;	file spec from fab
+;
+; outputs:
+;
+;	r0 = status
+;	expanded name string set
+;	did set in nam block if non-wild directory
+;---
+;
+
+	$ENTRY	RMS$$PARSE
+	$TSTPT	PARSE
+
+;
+;	if another wildcard sequence was in progress using this
+;	ifab, then cleanup the previous one.
+;
+
+	BSBW	RM$FABCHK		; check fab validity
+					; returns only if ok
+					; r11 = impure area
+					; r8 = fab address
+
+	MOVL	FAB$L_NAM(R8),R7	; get nam address
+	BSBW	RM$CHKNAM		; check nam validity
+	BLBC	R0,10$			; branch if invalid (no error)
+
+	MOVL	NAM$L_WCC(R7),R9	; get ifi of previous ifab
+	BEQL	10$			; branch if none
+
+	BITW	NAM$L_WCC+2(R7),-	; check that there are no spurious
+		#^C<<NAM$M_SVCTX!-	; bits set in NAM$L_WCC other than
+		     NAM$M_SRCHNMF-	; the save context bit, the IFI bit,
+		     @-16>!1>		; or the search NMF bit
+	BEQL	5$			; if not, continue
+	BRW 	ERRWCC			; if so, error in wcc param
+
+5$:	BBCC	#NAM$V_IFI,R9,10$	; branch if not 'search' ifi
+
+	MOVL	#IMP$L_IFABTBL/4,R0	; ifab table longword offset
+	BSBW	RM$GTIADR		; get ifab address
+	BEQL	10$			; branch if illegal ifi
+	BBC	#IFB$V_SEARCH,(R9),10$	; branch if not ours
+	BBSS	#IFB$V_BUSY,(R9),ERRACT	; error if IFAB is busy
+
+
+;
+; before cleaning up the previous context (IFAB, FWA, etc...) save the current
+; stack pointer in the image I/O segment page so that if during the cleanup, 
+; any stalling takes place, the stalling routine will be able to determine how
+; much of the stack must be saved to maintain context, and where it should 
+; start saving it from.
+;
+
+	MOVL	SP,IMP$L_SAVED_SP(R11)	; store current stack pointer
+	PUSHL	AP			; save ap over cleanup call
+	BSBW	RM$CLEANUP		; terminate previous sequence
+	POPL	AP			; restore ap
+
+;
+;	allocate an ifab for internal context
+;
+
+10$:	BSBW	RM$FSETI		; allocate ifab/ifi
+
+;
+; if any context cleanup was necessary, and if during such cleanup any stalling
+; took place, then RMS will currently be at AST level. RM$FSETI though, sets
+; the inhibit AST bit on the I/O control page although this bit is cleared 
+; during the first stall, and must remain clear during all subsequent stalls
+; to insure proper synchronization. ASTs can not be delivered while RMS is at
+; AST level, but if RMS were to stall at user mode from AST level with the 
+; inhibit AST bit set on the I/O control page, then no executive ASTs could 
+; ever be delivered and RMS would stall forever. this is why this bit is 
+; cleared during any RMS operation's first stall, and why it must be cleared 
+; now if RMS is currently at AST level.
+;
+
+	BBC	#IMP$V_AST,(R11),20$	; if RMS is currently at executive
+	CSB	#PIO$V_INHAST,-		; AST level then clear the inhibit 
+		@#PIO$GW_STATUS		; AST bit on the I/O control page
+
+;
+;	parse the name, assign channel, and fill in nam fields
+;
+
+20$:	BSBB	RM$PARSE_FILE		; do the heavy work
+	BLBC	R0,EXIT			; branch if error
+
+;
+; fill in (in the FAB) the primary and secondary device characteristics.
+;
+
+	MOVL	IFB$L_AS_DEV(R9),-
+		 FAB$L_DEV(R8)		; return device characteristics
+	BBC	#DEV$V_FOR,IFB$L_PRIM_DEV(R9),30$ ; if device not foreign
+	MOVL	IFB$L_AS_DEV(R9),-	; return unadulterated dev chars
+		 FAB$L_SDC(R8)
+	BRB	40$	
+30$:	MOVL	IFB$L_PRIM_DEV(R9),-
+		 FAB$L_SDC(R8)		; return spooling device char.
+
+
+;
+;	if wcc was -1 on entry, then set a "save context" flag
+;	as the top bit of the ifi and save the ifi of the ifab/fwa
+;	for the current context in the nam block so we can pick
+;	it up later when the user calls search.  the save context flag
+;	enables keeping context around over parse/search calls
+;	and causes directory files to be read when possible.
+;
+
+40$:	BSBW	RM$CHKNAM		; check if nam valid
+	BLBS	R0,50$			; branch if ok
+	BBS	#FWA$V_WILD_DIR,(R10),EXIT; if wild dir, must have nam block
+	MOVL	#1,R0			; else, set success
+	BRB	EXIT			; and cleanup without saving context
+
+50$:	BBS	#FWA$V_NODE,(R10),60$	; always keep context for networks
+	BBC	#DEV$V_RND,-		; never keep context for devices with
+		IFB$L_PRIM_DEV(R9),EXIT	; nonrandom primary characteristics
+	BBS	#DEV$V_SPL,-		; never keep context for devices 
+		IFB$L_AS_DEV(R9),EXIT	; that are spooled
+	BBS	#FWA$V_WILD_DIR,(R10),60$; if wilddir, always keep context
+	BBC	#IFB$V_SEARCH,(R9),EXIT	; cleanup if svctx not requested
+
+60$:	MOVZWL	FAB$W_IFI(R8),-
+		 NAM$L_WCC(R7)		; save ifi of current context
+	SSB	#IFB$V_SEARCH,(R9)	; mark as search-type ifab
+	SSB	#NAM$V_IFI,NAM$L_WCC(R7); bit 16 set to indicate ifi, not wcc
+	CLRW	FAB$W_IFI(R8)		; mbz for subsequent operations on fab
+	CLRL	FWA$L_DIRBDB(R10)	; init directory bdb address
+	BRW	RM$EXSUC		; exit with success -- leave ifab alone
+EXIT:	BRW	RM$CLSCU		; cleanup ifab,etc and exit with error
+
+ERRWCC:	RMSERR	WCC			; error in wcc value
+	BRW	RM$EX_NOSTR		; exit without ifab
+
+ERRACT:	RMSERR	ACC			; illegal activity attempted
+	BRW	RM$EX_NOSTR		; exit without IFAB
+
+	.SBTTL	RM$PARSE_FILE, PARSE A FILE SPECIFICATION
+
+;
+;---
+; RM$PARSE_FILE
+;
+;	This routine parses the file specification and sets up
+;	the channel and did for the file.  This is also called
+;	by rms$$rename.  Rename calls this routine twice for each
+;	file specification - if the channel is already assigned,
+;	then the did must not be set.
+;
+; inputs:
+;
+;	r8 = fab address
+;	r9 = ifab address
+;	r11 = impure area
+;
+; outputs:
+;
+;	r0 = status
+;	r10 = fwa address
+;	IFB$V_SEARCH is set if the user requested context to be saved
+;
+;	registers r1-r7,ap are destroyed
+;	device characteristics if PPF
+;---
+;
+
+RM$PARSE_FILE::
+
+;
+;	zero the fid and did in nam block for rm$setdid to work
+;
+
+	MOVL	FAB$L_NAM(R8),R7	; get nam address
+	BEQL	10$			; branch if none
+	BSBW	RM$CHKNAM		; check nam validity
+	BLBC	R0,10$			; branch if illegal (no error)
+	CLRB	NAM$T_DVI(R7)		; clear device name
+	ASSUME	NAM$W_DID EQ NAM$W_FID+6
+	CLRQ	NAM$W_FID(R7)		; zero fid and did fields
+	CLRL	NAM$W_DID+2(R7)
+
+
+;
+; Zero expanded string length and resultant string length fields to avoid
+; leaving these strings lying around from previous parses and consequently
+; using the wrong filespec in an error message.
+;
+; Zero resultant string length and file name status fields to support network
+; (simulated) open by nam block (see expand_name and setnam in rm0xpfn).
+;
+; Zero the wildcard context field to avoid the situation whereby the WCC 
+; context of the current PARSE is OR'd in with the WCC context of the previous
+; PARSE, but save the fact that the user requested context to be saved
+; (if the user requested context to be saved), by setting IFB$V_SEARCH.
+;
+
+	CLRB	NAM$B_ESL(R7)		; preset expanded string null
+	CLRB	NAM$B_RSL(R7)		; and result string too
+	CLRL	NAM$L_FNB(R7)		; zero file name status bits
+	BBC	#NAM$V_SVCTX,-		; if the user requested context to be
+		NAM$L_WCC(R7),5$	; saved, then set the IFB$V_SEARCH bit
+	SSB	#IFB$V_SEARCH,(R9)	; as a marker to save it 
+5$:	CLRL	NAM$L_WCC(R7)		; clear NAM wildcard bits
+
+;
+;	Parse the input file name and store the pattern in swb
+;	buffer and initialize the fwa which will contain the result
+;	directory specification
+;
+
+10$:	BSBW	RM$XPFN			; expand the file spec.
+	BLBC	R0,20$			; branch if error
+
+
+;
+; if the file is a PPF, retrieve its IFAB and move the device characteristics
+; into the IFAB that has been allocated for this parse.
+;
+
+	TSTB	FWA$B_ESCFLG(R10)	; if this file is not a PPF then
+	BEQL	60$			; go assign a channel otherwise
+	BBS	#15,FWA$W_ESCIFI(R10),-	; make sure the escape sequence
+		30$			; is for a PPF IFI and if it is not
+	RMSERR	LNE			; go return am error of 
+20$:	BRW	130$			; invalid equivalence string
+
+30$:	PUSHR	#^M<R9,R11>		; save IFAB and impure area addresses
+	MOVZBL	#PSL$C_EXEC,R7		; this a executive mode request - NOP
+ 	MOVZWL	FWA$W_ESCIFI(R10),R9	; move ifi into R9
+	MOVL	#IMP$L_IFABTBL/4,R0	; ifab table offset/4
+
+	BSBW	RM$GTIADR		; get ifab address
+	BEQL	40$			; go handle case where no IFAB returned
+	CMPB	#IFB$C_BID,IFB$B_BID(R9); is this a valid ifab
+	BEQL	50$			; if so, go move device characteristics
+
+40$:	POPR	#^M<R9,R11>		; restore IFAB and impure area addrs
+	RMSERR	IFI			; return an error of 
+	BRW	130$			; invalid equivalence string IFI
+
+50$:	MOVL	R9,R0			; save PPF IFAB address in R0
+	POPR	#^M<R9,R11>		; restore IFAB and impure area addrs
+	MOVL	IFB$L_PRIM_DEV(R0),-	; move primary device characteristics
+		IFB$L_PRIM_DEV(R9)	; into IFAB from PPF IFAB
+	MOVL	IFB$L_AS_DEV(R0),-	; move secondary device characteristics
+		IFB$L_AS_DEV(R9)	; into IFAB from PPF IFAB
+	BRW	110$			; and go return device information
+
+;
+;	If channel is already assigned (must have been called by $rename),
+;	then exit immediately without assigning channel or setdid
+;
+
+60$:	TSTW	IFB$W_CHNL(R9)		; any channel assigned?
+	BNEQ	20$			; exit successfully if so
+
+;
+;	assign a channel to the device
+;
+
+	BSBW	RM$ASSIGN		; assign channel to device
+	BLBC	R0,20$			; branch if error
+
+
+;
+; for nondisk, foreign mounted, and spooled devices, set FWA$B_DIRLEN to 0, 
+; clear all directory related bits in the NAM$L_FNB and the wild card summary 
+; bit NAM$V_WILDCARD, if no wildcards remain. Leave the expanded-name 
+; string alone. for SDI 
+; devices initialize the FIB's DID to the MFD. if the file specification 
+; contained node names, skip all of this and go immediately fill in the NAM.
+;
+
+	BBS	#DEV$V_NET,-		; if this is a network operation, 
+		IFB$L_PRIM_DEV(R9),95$	; immediately skip the directory stuff
+	BBS	#DEV$V_RND,-		; go initialize SWB if device
+		IFB$L_PRIM_DEV(R9),85$	; is a random (disk) device
+
+70$:	CLRB	FWA$B_DIRLEN(R10)	; initialize the number of dirs to 0
+	CSB	#FWA$V_DIR,(R10)	; clear directory specification bit
+
+	MOVL	IFB$L_LAST_FAB(R9),R8	; reset r8 = fab address
+	MOVL	FAB$L_NAM(R8),R7	; get nam address
+	BEQL	80$			; branch if none
+
+	BSBW	RM$CHKNAM		; check nam validity
+	BLBC	R0,80$			; branch if illegal (no error)
+
+	BICL2	#NAM$M_GRP_MBR!-	; clear group-member dir bit if set
+		NAM$M_WILD_DIR!-	; clear wild dir summary bit if set
+		NAM$M_DIR_LVLS!-	; set directory sublevels to 0
+		^XFF000000,-		; clear all wild directory bits if set
+		NAM$L_FNB(R7)		; all these bits are cleared in the NAM
+
+	BITL	#NAM$M_WILD_NAME!-	; if either the file name
+		NAM$M_WILD_TYPE!-	; or the file type
+		NAM$M_WILD_VER,-	; or the file version number
+		NAM$L_FNB(R7)		; is wild in the expanded-name string
+	BNEQ	80$			; then keep the wildcard summary bit
+	CSB	#NAM$V_WILDCARD,-	; (NAM$V_WILDCARD), otherwise,
+		NAM$L_FNB(R7)		; clear it whether it was set or not
+
+80$:	BBS	#DEV$V_FOR,-		; if the device is foreign mounted
+		IFB$L_PRIM_DEV(R9),110$	; then go fill in the NAM block
+	BBC	#DEV$V_SDI,-		; if file is not on a mag tape then
+		IFB$L_PRIM_DEV(R9),110$	; go fill in the NAM block, otherwise,
+	MOVL	#^X00040004,-		; initialize the FIB's directory
+		FWA$T_FIBBUF+-		; identification field (DID) to the
+		FIB$W_DID(R10)		; value representing the mag tape's MFD
+	BRB	90$			; and go clear the FIB's FID field
+
+
+;
+;	Initialize the swb to process the directory pattern
+;	(this must follow rm$assign because both rm$assign and
+;	rm$init_swb use the same area in fwa)
+;
+
+85$:	BBS	#DEV$V_FOR,-		; if device is foreign mounted, then
+		IFB$L_PRIM_DEV(R9),110$	; don't do directory lookup
+	BBS	#DEV$V_SPL,-		; spooled devices are not treated
+		IFB$L_AS_DEV(R9),70$	; the same as disk devices
+
+	JSB	RM$INIT_SWB		; initialize swb context
+	BLBC	R0,100$			; branch if error
+
+	BBC	#FWA$V_DIR,(R10),110$	; skip nextdir if no dir in spec
+	JSB	RM$NEXTDIR		; get did of first directory spec.
+	BLBC	R0,100$			; go handle any errors otherwise
+
+90$:	CLRL	FWA$T_FIBBUF+-		; start at first file in directory
+		FIB$L_WCC(R10)		; by clear FIB's FID
+95$:	BRB	110$			; go fill in the NAM block
+
+100$:	MOVL	IFB$L_LAST_FAB(R9),R8	; restore fab address for exit
+	CMPW	R0,#RMS$_NMF&^XFFFF	; was any directory found at all?
+	BNEQ	130$			; branch if some other error
+
+	RMSERR	DNF			; set error to directory not found
+	MOVZWL	#SS$_NOSUCHFILE,-
+		 FAB$L_STV(R8)		; set stv secondary code
+	BRB	130$			; intermediate branch to rsb
+
+
+110$:	MOVL	IFB$L_LAST_FAB(R9),R8	; reset r8 = fab address
+	MOVL	FAB$L_NAM(R8),R7	; get nam address
+	BEQL	120$			; branch if none
+
+	BSBW	RM$CHKNAM		; check nam validity
+	BLBC	R0,120$			; branch if illegal (no error)
+
+	BBS	#FWA$V_NODE,(R10),120$	; skip dvi and did if nodename found
+	BSBB	RM$WRITE_DVI		; Write DVI into NAM block
+	ASSUME	NAM$L_WCC EQ NAM$W_DID+6
+	MOVQ	FWA$T_FIBBUF+FIB$W_DID(R10),-
+		 NAM$W_DID(R7)		; copy did and top word of wcc for fun 
+
+120$:	MOVL	#1,R0
+130$:	RSB
+
+	.SBTTL	RM$WRITE_DVI, Write DVI field of NAM block
+;++
+;
+;	This routine writes the DVI field of the NAM block from
+;	the information stored in the FWA.
+;	The DVI field is the PPF device string if this is a PPF;
+;	else it is a canoical device name of the form:
+;		_ddcuuuu
+;
+; Inputs:
+;
+;	R10 = Address of FWA
+;	R7 = Address of user's NAM block
+;
+; Outputs:
+;
+;	R0-R5 destroyed.
+;	The DVI field is written.
+;--
+
+RM$WRITE_DVI::
+	MOVAB	NAM$T_DVI(R7),R3	; Ptr to destination
+	TSTB	FWA$B_ESCFLG(R10)	; PPF file?
+	BNEQ	10$			; branch if so
+	MOVAB	FWA$T_SHRFILDEV(R10),R1	; Ptr to canonical device name
+	MOVZBL	(R1)+,R0		; Get length of string
+	SUBL2	#2,R0			; don't count unit number
+	CMPL	R0,#9			; room for name + "_" + 5 digit unit#?
+	BGTRU	20$			; nope
+	ADDB3	#1,R0,(R3)+		; store size +1 for "_"
+	MOVB	#^A'_',(R3)+		; Store leading "_"
+	MOVC3	R0,(R1),(R3)		; Copy device name
+	MOVZWL	(R1)+,R4		; Get binary unit #
+	MOVAB	NAM$T_DVI(R7),R2	; Ptr to count byte (R3 already set)
+	BSBW	RM$GETDEVUNI		; Convert unit# to ASCII
+	RSB
+
+10$:	CMPW	FWA$Q_DEVICE(R10),#15	; Will name fit?
+	BGTRU	20$			; nope
+	MOVB	FWA$Q_DEVICE(R10),(R3)+	; If PPF, put special name in DVI
+	MOVC3	FWA$Q_DEVICE(R10),-	; Store device name string
+		@FWA$Q_DEVICE+4(R10),(R3)
+	RSB
+
+20$:	CLRB	(R3)			; say no DVI field
+	RSB
+
+	.END

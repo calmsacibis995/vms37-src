@@ -1,0 +1,553 @@
+	$BEGIN	RMS0RNDWN,025,F$RMSCLOSERNDN,<RMS IO RUN DOWN>
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; Facility: rms32
+;
+; Abstract: this module insures all rms i/o activity is complete,
+;	    closes all files, and resets the ifab and irab tables.
+;
+; Environment:
+;		star processor running starlet exec.
+;
+; Author: l f laverdure,	 creation date: 5-5-77
+;
+; Modified By:
+;
+;	V02-025	TMK0002		Todd M. Katz	23-Feb-1982
+;		To the change TMK0001, skip the check for a special receive
+;		QIO posted but not received if a network work area has not
+;		yet been allocated.
+;
+;	V02-024	TMK0001		Todd M. Katz	19-Feb-1982
+;		RMS must always make sure that any outstanding special recieve 
+;		QIOs associated with network operations are canceled before
+;		attempting to close the file as part of rundown. It is possible
+;		for such a special recieve QIO to be outstanding, but for all
+;		IFABs/IRABs associated with the channel to not be busy, and so
+;		the $CANCEL would not normally have been done. If this special
+;		case is not checked for, when the attempt is made to disconnect
+;		the network logical link (as part of the $CLOSE), the
+;		NETDRIVER will be unable to break the link because it thinks
+;		there is activity outstanding, and the process hangs in rundown
+;		waiting for the $CLOSE to complete.
+;
+;	V02-023	KPL0005		P. Lieberwirth	10-Feb-1982
+;		Don't release record locks on indirect PPF rundown.
+;
+;	V02-022	TMK0016		Todd M. Katz	12-Nov-1981
+;		Add a sanity check so that (hopefully) a process in RMS
+;		rundown can not hang because it is waiting for I/O to
+;		complete which had never been started. This is accomplished
+;		by performing the cancel and waiting, only if RMS is stalled 
+;		on the I/O operation to be canceled. This additional check 
+;		is bypassed for network operations. The theory behind this
+;		sanity check, is that if rundown is not initiated because of
+;		user action (it which case either there won't be any I/O
+;		operations outstanding, or RMS will be stalled even if the
+;		user isn't), it must be due to a RMS internal error in which
+;		case we had better not do a cancel and wait for those 
+;		operations not stalled because they won't have been started
+;		and thus can never complete to wake us up from the wait state.
+;		
+;
+;	V02-021	TMK0012		Todd M. Katz	06-Nov-1981
+;		Take out all code to prevent user ASTs from being queued
+;		(presumably within RM0EXTRMS) if rundown is in progress
+;		since any queuing that is to be done has already been 
+;		done. The TYPE abort problem will be handled within
+;		DCL, or by special case checks within RM0EXTRMS.
+;
+;	V02-020	KPL0004		P Lieberwirth	22-Oct-1981
+;		Boy, this is getting embarassing.  We need to run down
+;		record locks here after all.  Re-instate v02-017.
+;
+;	V02-019	KPL0003		P Lieberwirth	 6-Oct-1981
+;		Fix v02-017 by not running down record locks here.
+;		CLOSE gets called and will do it there.
+;
+;	V02-018	CDS0001		C Saether	 8-Aug-1981
+;		Do not return pages from FMLH to process i/o control
+;		segment on rundown.
+;
+;	V02-017	KPL0002		P Lieberwirth	 3-Aug-1981
+;		Move list of RLBs to IRAB from IFAB.  This makes the
+;		multistreaming code much easier.  Do this in conjunction
+;		with running down any outstanding record locks.
+;
+;	V02-016	KPL0001		P Lieberwirth	24-Jul-1981
+;		Rename entry point to $$ form so we can get here via
+;		RMS0BRNCH.
+;
+;	V02-015	PSK0001		P S Knibbe	2-March-1981
+;		Before canceling outstanding I/O, make sure that
+;		no user ast's with a mode below the level of
+;		the rundown will be delivered.
+;
+;	V02-014	REFORMAT	P S Knibbe	25-Jul-1980
+;
+;	V013	RAN0003		R A Newell	20-DEC-1978	14:30
+;		file sharing code enhancements.
+; 01	-
+;--
+
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+
+;
+; Macros:
+;
+
+	$FABDEF
+	$IFBDEF
+	$IRBDEF
+	$DEVDEF
+	$IMPDEF
+	$NWADEF
+	$PIODEF
+	$PSLDEF
+	$RMSDEF
+	$RLBDEF
+
+;
+; Equated Symbols:
+;
+
+;
+; Own Storage:
+;
+
+
+	.SBTTL	RMS$$RMSRUNDWN - RMS I/O RUN DOWN
+
+;++
+; RMS$$RMSRUNDWN - RMS I/O run down
+;
+; this routine first determines the type of rundown desired, based
+; upon the second argument.  if the type is "abort rms i/o", a branch
+; is made to rm$last_chance, otherwise the routine checks that all ifabs and irabs
+; are inactive.  if any found active this routine awaits their completion after
+; first performing a $cancel i/o if not a file-oriented device.
+; when all i/o activity for the file is complete, $close is
+; performed for the file.  if the close failed for an output file
+; on a files-oreiented device, an error is returned to the caller
+; who should note the error and recall this routine to run down
+; further files.  if all files are successfully run down the
+; image ifab & irab tables are reset and return is made to the
+; caller with a success code.
+;
+; files are run down in this order:
+;
+;	1.  indirect process permanent files
+;	    ('error' should be first)
+;	2.  image files
+;	3.  (only if caller's mode is not user and arg2=1)
+;	    process permanent files
+;
+; Calling sequence:
+;
+;	calls	#2, sys$rmsrundwn
+;
+; Input Parameters:
+;
+;	ap	users argument list (2 arguments)
+;
+;	arg1	descriptor for 22-character buffer
+;		to receive information about
+;		unsuccessfully closed output file
+;		(device id and file id)
+;	arg2	rundown type, as follows:
+;
+;		0 - run down of image and indirect i/o for process permanent files
+;		1 - run down of image and process permanent files
+;		    (caller's mode must be other than user)
+;		2 - abort rms i/o (caller's mode must be exec or kernel)
+;
+;		all others are reserved, but currently behave as type 0
+;
+; Implicit Inputs:
+;
+;	caller's mode.
+;
+; Output Parameters:
+;
+;	r0	status code
+;	r1	destroyed
+;
+; Implicit Outputs:
+;
+; information describing an output file unsuccessfully closed is
+; stored in the caller-provided buffer in exactly the same
+; format as the dvi, did, and fid fields of the nam block.
+;
+; Completion Codes:
+;
+;	standard rms, in particular:
+;
+;	rms$_suc  -  all files closed
+;	rms$_ccf  -  an output file could not be closed
+;		     successfully.  caller-provided buffer
+;		     has information identifying the file
+;	rms$_ial  -  same as rms$_ccf except could not
+;		     access caller's buffer to store file
+;		     id information.
+;
+; Side Effects:
+;
+;	runs synchronously in exec mode inhibiting
+;	and enabling asts as required.
+;
+;--
+
+
+	$ENTRY	RMS$$RMSRUNDWN
+	$TSTPT	RUNDWN
+	MOVPSL	R11
+	EXTZV	#PSL$V_PRVMOD,-
+		#PSL$S_PRVMOD,R11,R7	; save caller's mode
+	CMPL	8(AP),#2		; abort rms i/o?
+	BEQL	RMSABORT		; branch if yes
+5$:	BSBB	INHAST			; inhibit rms ast's
+
+;
+; start by running down indirect i/o on
+; process-permanent files
+;
+
+	MOVAL	@#PIO$GW_PIOIMPA,R11	; get pio impure area address
+	ASSUME	IMP$W_RMSSTATUS EQ 0
+	MOVL	#1,R8			; indicate indirect run down
+	BSBW	RUNDWN			; do the run down
+					; (note: clears r8)
+;
+; now run down the image
+;
+
+	MOVAL	W^PIO$GW_IIOIMPA-PIO$GW_PIOIMPA(R11),R11
+
+;
+; point to image impure area
+;
+
+	BSBW	RUNDWN			; do the run down
+	CLRL	@IMP$L_IFABTBL(R11)	; reset ifab table link
+	CLRL	@IMP$L_IRABTBL(R11)	; reset irab table link
+
+;
+; point to process
+; i/o impure area again
+;
+
+	MOVAL	W^PIO$GW_PIOIMPA-PIO$GW_IIOIMPA(R11),R11
+;
+; At this point there used to be code to return any whole pages
+; on the FMLH free space list back to the process i/o free page
+; list.  The space on the FMLH list is currently (v 2) used only
+; for ASB allocation on IFAB operations and will bugcheck if space
+; is not found.  The behavior is now that a page will be added to
+; the FMLH list the first time a process stalls on an IFAB operation
+; and will remain there for the life of the process.
+;
+
+;
+; now run down direct i/o on process-permanent files if desired
+;
+
+	CMPB	8(AP),#1		; ppf rundown?
+	BNEQ	XITSUC			; branch if not
+	CMPB	R7,#PSL$C_USER		; caller sufficiently privileged?
+	BEQL	XITSUC			; branch if not
+60$:	BSBB	RUNDWN			; do the run down
+XITSUC:	RMSSUC
+EXIT:
+	SSB	#16, R0			; stamp 'rms' on status code
+	BSBB	ENBAST			; enable asts
+	RET				; back to caller
+
+;
+;  branch to rm$last_chance to do async process deletion rms i/o abort
+;
+
+RMSABORT:
+	BRW	RM$LAST_CHANCE
+
+
+;
+; enable rms ast's, reenabling exec ast's if necessary.
+;
+
+ENBAST:	BBSC	#PIO$V_INHAST, @#PIO$GW_STATUS, 10$
+
+;
+; clear ast inhibit
+; if already clear must enable asts
+;
+
+	$SETAST_S	#1		; enable exec mode asts
+10$:	RSB
+
+;
+; inhibit rms asts
+;
+
+INHAST:	BISW2	#1@PIO$V_INHAST, @#PIO$GW_STATUS
+	RSB
+
+;
+; wait for rms operation completion
+;
+
+WAIT:	$CLREF_S	#IMP$C_IOREFN	; clear rms event flag
+	BSBB	ENBAST			; enable asts
+	$WAITFR_S	#IMP$C_IOREFN	; wait for flag
+	BSBB	INHAST			; re-inhibit asts
+	RSB
+
+
+;++
+;
+; run down subroutine:
+;
+; checks ifab table for active files.
+; if any found waits for any i/o activity to finish
+; (doing a cancell i/o for non files-oriented devices)
+; and then issues a $close request.
+;
+; when all files run down performs a sanity check by seeing if all irab
+; table entries are also zero.
+;
+; inputs:
+;	r11 - impure area addr
+;	r8 - bit 0 set if indirect ppf run down
+;	ap - caller's arg list
+;	r7 - caller's mode
+;
+; outputs:
+;	returns only if noerror encountered.
+;	imp$v_ppfindrd cleared
+;	r0 - r6, r9, r10 destroyed
+;--
+
+RUNDWN:
+	SSB	#IMP$V_IORUNDOWN,(R11)	; set i/o rundown in progress flag
+					; to sync with ast-driven rms
+					; operations
+	MOVL	IMP$L_IFABTBL(R11),R5	; get ifab table addr
+	CLRL	R6			; build ifi value here
+NXTSEG:	MOVL	(R5)+,R2		; save addr next table seg in r2
+	MOVZWL	IMP$W_ENTPERSEG(R11),R4	; get # entries/seg
+NXTENT:	TSTW	IMP$W_NUM_IFABS(R11)	; any ifabs active?
+	BEQL	CHKIRB			; branch if none
+	INCL	R6			; bump ifi
+	MOVL	(R5)+,R10		; get ifab addr
+	BNEQ	RDIFAB			; branch if one
+NXTSOB:	SOBGTR	R4,NXTENT		; keep scanning segment
+
+;
+; no more ifabs this segment, try next
+;
+
+	MOVL	R2,R5			; get next segment addr
+	BNEQ	NXTSEG			; branch if one
+
+
+;
+; all ifabs have been run down now.
+;
+; unless this is indirect run down of ppf's,
+; check that all irabs are also gone.
+;
+
+CHKIRB:
+	.IF	NE $$RMSTEST&$$RMS_TBUGCHK
+	BBSC	#0,R8,30$		; branch if indirect run down
+	MOVL	IMP$L_IRABTBL(R11),R5	; get irab table addr
+10$:	MOVL	(R5)+,R2		; save addr next table seg.
+	MOVZWL	IMP$W_ENTPERSEG(R11),R4	; get # entries/seg.
+20$:	TSTL	(R5)+			; entry zero?
+	BNEQ	ERRBUG			; branch if not
+	SOBGTR	R4,20$			; branch if more entries
+	MOVL	R2,R5			; get next seg addr
+	BNEQ	10$			; branch if one
+30$:	CSB	#IMP$V_IORUNDOWN,(R11)	; turn off rundown in progress flag
+	.ENDC
+	RSB				; all o.k.
+
+;
+; close failed to zero ifab or irab table entry
+;
+ERRBUG:	RMSTBUG	FTL$_IORNDN
+
+
+;
+; found an ifab.  check for active and if so allow operation to finish
+;
+
+	ASSUME	IMP$W_RMSSTATUS EQ 0
+RDIFAB:
+	BLBS	R8,RDNET		; branch if indirect ppf
+10$:	BBC	#IFB$V_BUSY,(R10),RDNET	; if not busy then check NETWORK
+	BBS	#DEV$V_NET,(R10),20$	; do cancel if busy & network operation
+	BBC	#IFB$V_RMS_STALL,-	; if this RMS thread is not currently
+		(R10),RDIRAB		; stalled then skip the cancel and wait
+
+;
+; allow function to finish
+; \note: this code should be modified to
+; properly run down read-ahead and write-behind
+; operations to unit record devices.\
+;
+
+20$:	$CANCEL_S	IFB$W_CHNL(R10)	; cancel i/o (e.g. magtape create)
+	BSBB	WAIT			; wait for an operation to finish
+	TSTL	-4(R5)			; ifab disappear? (close)
+	BEQL	NXTSOB			; branch if yes
+	BBC	#IFB$V_BUSY,(R10),RDNET	; run down NETWORK if no longer busy 
+	BBS	#DEV$V_NET,(R10),20$	; but do cancel & wait again if busy &
+	BBS	#IFB$V_RMS_STALL,-	; network operation or busy and the RMS
+		(R10),20$		; thread is still stalled
+
+;
+; if the current operation is a network operation, and a special recieve QIO
+; has been posted but NOT recieved, a $CANCEL must always be done to flush 
+; this QIO. In file transfer mode it will be possible that a recieve has been
+; posted but no transfer operation is underway. therefore neither the IFAB nor
+; the IRAB will be busy. if a $CANCEL isn't explicitely issued, when the $CLOSE
+; is performed, the NETDRIVER will be unable to disconnect the logical link
+; (because of the outstanding recieve), and the process will hang.
+; 
+
+RDNET:	BBC	#DEV$V_NET,(R10),RDIRAB	; go run down IRABs if not network op
+	MOVL	IFB$L_NWA_PTR(R10),R0	; obtain network work area address
+	BEQL	RDIRAB			; skip check if not network work area
+	BBC	#NWA$V_RCVQIO,-		; if a special recieve QIO has not been
+		(R0),RDIRAB		; posted go run down the IRABs, but if
+	BBC	#NWA$V_RCVAST,-		; one has and it hasn't been recieved
+		(R0),CANCEL		; then go issue the cancel
+
+;
+; run down irabs
+;
+
+RDIRAB:
+	MOVL	R10,R9			; copy ifab addr
+10$:	MOVL	IRB$L_IRAB_LNK(R9),R9	; get next irab
+	BEQL	QUIET			; branch if none
+	BLBS	R8,12$			; don't release locks if indirect PPF
+					; rundown
+	BSBW	RM$UNLOCKALL		; kill all record locks, including
+					; outstanding waits.
+12$:	BBC	#IRB$V_BUSY,(R9),10$	; branch if idle
+	BBS	#DEV$V_NET,(R10),15$	; do cancel if busy & network operation
+	BBC	#IRB$V_RMS_STALL,-	; if this RMS thread is not currently 
+		(R9),10$		; stalled then skip the cancel and wait
+
+15$:	BLBS	(R11), 20$		; branch if image i/o segment
+	BBS	#IRB$V_PPF_IMAGE,(R9),20$
+
+;
+; branch if indirect i/o
+;
+
+	BLBC	R8,10$			; branch if only indirect ppfs
+					; to be run down
+20$:	BBS	#DEV$V_RND,-
+		IFB$L_PRIM_DEV(R10),-	; no need to do a cancel if this is
+		NOCANCEL		; a disk operation, just go wait
+	
+CANCEL:	$CANCEL_S	IFB$W_CHNL(R10)	; cancel i/o
+
+NOCANCEL:
+	BSBW	WAIT			; wait for all ASTs to be delivered
+	BRB	RDIRAB			; start from top of irab
+					; chain again (could
+					; have been disconnect)
+
+
+;
+; all activity ceased for this file.
+; force a close by constructing a fab and calling close.
+;
+
+QUIET:	TSTL	IFB$L_FRB_PTR(R10)	; is it a shared file?
+	BNEQ	5$			; yes, go close it
+	BBC	#IFB$V_WRTACC,-
+		(R10),NOERR		; branch if not write access
+	BBC	#DEV$V_DIR,-
+		IFB$L_PRIM_DEV(R10),NOERR;
+	BBC	#IFB$V_ACCESSED,-
+		(R10),NOERR		; branch if file not accessed
+5$:	MOVL	4(AP),R0		; get descriptor addr
+	IFNORD	#8, (R0), NOERR1, R7
+	CMPW	(R0), #28		; at least 22 bytes long?
+	BLSSU	NOERR1
+	MOVL	4(R0),R3		; get buffer address
+	MOVL	R10,R9			; ifab to right register
+	IFNOWRT	#22,(R3),NOERR1,R7	; branch if buffer not writable
+	PUSHR	#^M<R2>			; save r2 (ptr to next ifi seg)
+	BSBW	RM$GETDVIFID		; go fill buffer with dvi and fid
+	POPR	#^M<R2>			; restore r2
+	RMSERR	CCF,R3			; get set for close failure
+	BRB	CLOSE
+NOERR1:	RMSERR	IAL,R3			; if close failure, return ial
+	BRB	CLOSE
+NOERR:	RMSSUC	SUC,R3			; can't fail
+CLOSE:
+	MOVAL	-FAB$C_BLN(SP),SP	; create fab on stack
+	MOVW	#FAB$C_BID+<FAB$C_BLN @8>,-
+		(SP)			; fab block id and length
+	MOVW	R6, FAB$W_IFI(SP)	; ifi
+	BLBS	(R11),10$		; branch if iio seg
+	SSB	#15+<FAB$W_IFI*8>,(SP)	; set pio flag
+	BLBC	R8,10$			; branch if direct access
+	SSB	#FAB$V_PPF_IND+<FAB$W_IFI*8>,-
+		(SP)			; else make indirect ifi
+10$:	PUSHR	#^M<R2,R3,R4,R5>	; save regs
+	MOVC5	#0,(SP),#0,-
+		#FAB$C_BLN-4,4+<4*4>(SP); zero remainder of fab
+	POPR	#^M<R2,R3,R4,R5>	; restore r5
+	BSBW	ENBAST
+	PUSHL	SP			; addr of fab
+	CALLS	#1,@#SYS$CLOSE		; close it
+	BSBW	INHAST
+	ADDL	#FAB$C_BLN,SP		; 'pop' fab
+	BLBS	R8,15$			; omit check if indirect ppf
+	TSTL	-4(R5)			; did ifab go away?
+	BNEQ	ERRBUG_BR		; branch if not
+15$:	BLBC	R0,30$			; branch on error
+20$:	BRW	NXTSOB			; get next ifab
+30$:	MOVL	R3, R0			; get saved error code
+	BLBS	R0, 20$			; no problem if not
+					;  write-accessed file
+	BRW	EXIT			; return error to caller
+ERRBUG_BR:
+	BRW	ERRBUG			; extended branch
+
+	.END

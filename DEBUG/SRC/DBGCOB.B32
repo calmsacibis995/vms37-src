@@ -1,0 +1,910 @@
+MODULE DBGCOB ( IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	DEBUG (DBG)
+!
+! ABSTRACT:
+!	This module contains the lexical scanner and reduction routines
+!	for COBOL/DEBUG.
+!
+! ENVIRONMENT:	VAX/VMS, user mode, interrupts disabled.
+!
+! Version:	1.06
+!
+! History:
+!	Author:
+!		Dale Roedger, 22 November 1978
+!
+!	Modified by:
+!		Mike Candela,  13 July 1979
+!		Richard Title 7 Jul 1981
+!
+! 1.00	22-NOV-78	DAR	Initial version of COBOL lexical analyzer and
+!				reduction routine.
+! 1.01	19-DEC-78	DAR	Fixed radix_state "case" it did not update
+!				"input_ptr" properly.
+! 1.02	 4-JAN-79	MCC	Fixed alpha_state case so that "." will be
+!				understood as "last loc" when it appears alone
+! 1.03	30-MAR-79	MCC	Changed dbg$cob_reductn to support LOG files
+! 1.04	13-JUL-79	MCC	Added actions to dbg$cob_reductn to support
+!				indirect command files.
+! 1.05  29-NOV-79	BAO	Added support for type[/override].
+! 1.06	30-JAN-80	MCC	Added support for HELP
+!	7-JUL-1981	RT	Changed the parse tables in fortrn.req, 
+!				to allow types FLOAT, D_FLOAT, etc.,
+!				in a deposit, examine, or set type command.
+!				Changed the dbg$save_type macro in redmac.req
+!				accordingly.
+!--
+
+! TABLE OF CONTENTS:
+!
+FORWARD ROUTINE
+
+	dbg$cob_get_lex,	! extracts a COBOL lexeme from the input buffer
+	dbg$cob_reductn;	! COBOL action routines
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'src$:dbgprolog.req';
+REQUIRE 'SRC$:DBGGEN.REQ';
+REQUIRE 'src$:COMTER.REQ';			
+REQUIRE 'SRC$:BSTRUC.REQ';
+REQUIRE 'SRC$:scalit.REQ';		! COBOL/DEBUG Parse tables.
+REQUIRE 'src$:COBOL.REQ';		! COBOL/DEBUG Parse tables.
+REQUIRE 'SRC$:SYSSER.REQ';
+! REQUIRE 'SRC$:REDMAC.REQ' is required in MACRO section
+
+
+
+!
+! MACROS:
+!
+REQUIRE 'src$:REDMAC.REQ';
+
+
+!
+! EQUATED SYMBOLS:
+!
+
+
+!
+! OWN STORAGE:
+OWN
+	line_path : INITIAL(0);
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+	dbg$pars_linnum,
+	dbg$for_add,			! FORTRAN add
+	dbg$for_sub,			! FORTRAN subtract
+	dbg$for_mul,			! FORTRAN multiply
+	dbg$for_div,			! FORTRAN divide
+	dbg$for_neg,			! unary dbg$negation
+	dbg$lng_dig_str: novalue ,	! make a long digit string 
+	dbg$get_filesp,			! Extract filespec from input string
+	dbg$freerelease,		! Release dynamically allocated storage
+	dbg$radx_convrt,		! converts ASCII strings to binary numbers
+	dbg$cis_getfsp,			! get filespec for indirect com file
+	dbg$show_type,			! Print user specified type.
+	dbg$verify_out,			! decide whether to VERIFY input 
+	dbg$get_help,			! Invoke librarian for HELP
+	dbg$cis_openicf;		! Open indirect com file
+
+EXTERNAL
+	dbg$char_table : VECTOR [, BYTE],	! Character type table
+	dbg$token_table : VECTOR [, BYTE],	! Table of token types.
+	dbg$gb_def_mod : VECTOR [, BYTE],	! mode structure
+	dbg$gl_get_lex,				! holds name of get lexeme routine
+	dbg$gl_gbltyp,				! the type override field.
+	dbg$gw_gbllngth : WORD,			! The length field for use with 
+						! type ASCII.
+	dbg$gl_log_buf,				! Addr of buffer containing LOg filespec
+	dbg$gl_stk : semantic_stack;		! semantic stack for tokens, etc.
+
+GLOBAL ROUTINE dbg$cob_get_lex (input_stg_desc, lexeme_stg_desc) =
+!++
+! Functional description:
+!	Using the character pointer for the input line, extracts a lexeme
+!	from the input line. A lexeme is defined as an operator, an
+!	alphanumeric string, a numeric string, or an
+!	illegal string. Blanks and comments are absorbed.
+!	The lexeme is returned in the lexeme buffer in the
+!	same form as in the input string, except for numeric
+!	strings, in which case the string is converted to a
+!	binary number and that is returned in the lexeme buffer.
+!	A token equivalent of the lexeme is the value of the
+!	routine.
+!
+! Formal parameters:
+!	input_stg_desc	- string descriptor to the input buffer.
+!	lexeme_stg_desc	- varying string descriptor to the lexeme buffer
+!
+! Implicit inputs:
+!	DBG$CHAR_TABLE	- a 128 byte VECTOR that maps each ascii character
+!			  onto a dense list of equivalents.
+!	DBG$TOKEN_TABLE	- a 21 byte VECTOR that maps each operator onto
+!			  its token equivalent.
+!
+! Outputs:
+!	input_stg_desc	- the field dsc$a_pointer is updated to point to
+!			  the next byte to be read in the input stream.
+!			  This byte is the delimiter of the lexeme found.
+!			  The field dsc$w_length contains the length of
+!			  the yet unread input line.
+!	lexeme_stg_desc	- the field dsc$w_length holds the actual length
+!			  in bytes of the lexeme found. The lexeme buffer
+!			  addressed by the field dsc$a_pointer holds the
+!			  lexeme string or value.
+!
+! Implicit outputs:
+!	The ASCII representation of the lexeme is written into the
+!	string addressed by the dsc$a_pointer field of lexeme_stg_desc.
+!
+! Routine value:
+!	The type of lexeme found, alpha_str_token, digit_str_token,
+!	eol_token or "operator"_token.
+!
+! Side effects:
+!	Signal if an input character is invalid,
+!	or the input string has a negative length.
+!--
+
+	BEGIN
+
+	LITERAL
+		single_prec	= 1,
+		double_prec	= 3,
+		table_offset	= 9,
+		operator_max	= 29;
+
+	LITERAL
+		max_state_index	= 4,			! index ranges from 0 to 4
+		invalid_state	= 0,			! invalid character seen
+		alpha_state	= 1,			! alphabetic string expected
+		numeric_state	= 2,			! numeric string expected
+		eocommand_state	= 3,			! logical end of line or error seen
+		radix_state	= 4,			! radix setting expected
+		unspec_state	= 5;			! unspecified state, probably special character operator
+
+	BIND
+		lex_type_tbl	= UPLIT (
+
+		mask (illegal),
+		mask (alpha, alpha_low, alpha_and_hex, alphalo_and_hex,
+			period, percent_sign),
+		mask (numeric),
+		mask (ind_comment, end_of_line),
+		mask (up_arrow)
+
+		) : VECTOR;
+
+	BIND
+		lex_state_tbl	= UPLIT BYTE (
+
+		invalid_state,
+		alpha_state,
+		numeric_state,
+		eocommand_state,
+		radix_state
+
+		) : VECTOR [, BYTE];
+
+
+	MAP
+		input_stg_desc	: REF BLOCK [, BYTE],	! input string descriptor
+		lexeme_stg_desc	: REF BLOCK [, BYTE];	! lexeme string descriptor
+
+	LOCAL
+		input_ptr,				! character pointer for input
+		lexeme_ptr,				! character pointer for lexeme
+		previous_radix,				! current local radix
+		state_index,				! index into lex_state_tbl
+		state,					! current state of lexical processor
+		char,					! holds a single character
+		count;					! counts characters used
+
+	LABEL
+		alpha_block;				! label for alpha_state in CASE
+	!++
+	! See whether there is any input line left. If not, signal
+	! internal error.
+	!--
+	IF .input_stg_desc [dsc$w_length] LSS 0
+	THEN SIGNAL (dbg$_parseerr);
+
+	!++
+	! Make the string pointers into formal BLISS character
+	! pointers.
+	!--
+	input_ptr = ch$ptr (.input_stg_desc [dsc$a_pointer]);
+	lexeme_ptr = ch$ptr (.lexeme_stg_desc [dsc$a_pointer]);
+
+	previous_radix = .dbg$gb_mod_ptr [mode_radix];		! Save radix in case of local override.
+
+	count = -1;
+	DO						! Loop to skip leading blanks.
+	    BEGIN
+	    char = ch$rchar_a (input_ptr);
+	    count = .count + 1;
+	    END
+	UNTIL .dbg$char_table[.char] NEQ blanks;
+
+	input_ptr = ch$plus (.input_ptr, -1);		! Adjust ptr to first non-blank.
+	input_stg_desc [dsc$w_length] = .input_stg_desc [dsc$w_length] - .count;
+	input_stg_desc[dsc$a_pointer] = .input_stg_desc[dsc$a_pointer] + .count ;
+
+
+	!++
+	! Convert the mapping of the first significant character
+	! into a lexical state. This state drives the later CASE
+	! processing.
+	!--
+	state_index = 0;
+	REPEAT
+		BEGIN
+		IF .lex_type_tbl [.state_index] ^ .dbg$char_table [.char] LSS 0
+		THEN
+			BEGIN
+			state = .lex_state_tbl [.state_index];
+			EXITLOOP
+			END
+		ELSE
+			BEGIN
+			state_index = .state_index + 1;
+			IF .state_index GTR max_state_index
+			THEN
+				BEGIN
+				state = unspec_state;
+				EXITLOOP
+				END;
+			END;
+		END;
+
+
+	REPEAT CASE .state FROM 0 to max_state_index + 1 OF	! analyze current state
+
+		SET
+
+		[invalid_state]:			! if illegal, just signal
+			SIGNAL (dbg$_invchar);
+
+		[alpha_state]:				! alphanumeric string
+alpha_block:		BEGIN
+
+			!+
+			!If the initial character is a period, see whether
+			! the next character is a number. If so, go to numeric
+			! state. Otherwise, it must be a standalone term
+			!-
+			
+			IF .char EQL %C'.'
+			THEN
+				BEGIN
+				LOCAL
+					next_char;
+
+				next_char = ch$rchar(ch$plus(.input_ptr, 1));
+				IF .dbg$char_table [.next_char] EQL numeric
+				THEN
+					state = numeric_state
+				ELSE
+					state = unspec_state;
+				LEAVE alpha_block;
+				END;
+			!+
+			! Read the input buffer until a character not
+			! valid in a symbol is encountered. Store each
+			! character found in the buffer for the lexeme
+			! unless the length of that buffer is expended.
+			!-
+
+			count = 0;
+
+			DO
+				BEGIN
+				IF (.char GEQU %C'a')
+				THEN
+				    char = .char - upper_case_dif;
+				count = .count + 1;
+				IF .count LEQ sym_max_length
+				THEN
+				    ch$wchar_a (.char, lexeme_ptr);
+				char = ch$a_rchar (input_ptr);
+				END
+			WHILE	(oneof (.dbg$char_table [.char], alpha, alpha_low, numeric,
+					alpha_and_hex, alphalo_and_hex, minus_sign));
+			IF .count GTR sym_max_length
+			THEN
+			    BEGIN
+			    SIGNAL (dbg$_stgtrunc);
+			    lexeme_stg_desc [dsc$w_length] = sym_max_length;
+			    END
+			ELSE
+			    lexeme_stg_desc [dsc$w_length] = .count;
+
+			input_stg_desc [dsc$a_pointer] = .input_ptr;
+			input_stg_desc [dsc$w_length] = .input_stg_desc [dsc$w_length] - .count;
+
+
+			RETURN alpha_str_token
+			END;
+
+		[numeric_state]:			! numeric string
+			BEGIN
+
+			!++
+			! A number can begin with
+			! or contain a decimal point (period). See
+			! whether there is a leading decimal point,
+			! and if so, set a flag indicating that.
+			! This will allow trailing zeroes to be ignored.
+			!--
+
+			LOCAL
+				period_present,
+				floating_flag;
+
+			IF .char EQL asc_period
+			THEN period_present = TRUE
+			ELSE period_present = FALSE;
+			floating_flag = 0;
+
+			!++
+			! Now read the input buffer until a non-numeric
+			! character is encountered. Ignore all leading
+			! zeroes unless a decimal point was present.
+			! Store each character found in the buffer for
+			! the lexeme unless the length of that buffer
+			! is expended.
+			!--
+			count = 0;
+
+			IF NOT .period_present
+			THEN
+				WHILE (.char EQL %C'0')
+				DO
+					BEGIN
+					count = .count + 1;
+					char = ch$a_rchar (input_ptr);
+					END;
+
+			!++
+			! If the entire number was zero, put a single
+			! zero in the lexeme buffer and return.
+			!--
+			input_stg_desc [dsc$w_length] = .input_stg_desc [dsc$w_length] - .count;
+			count = 0;
+			IF .dbg$char_table [.char] NEQ numeric
+			AND .dbg$char_table [.char] NEQ period
+			AND NOT .period_present
+			AND NOT (oneof (.dbg$char_table [.char], alpha_and_hex, alphalo_and_hex))
+			THEN
+				BEGIN
+				input_stg_desc [dsc$a_pointer] = .input_ptr;
+				lexeme_stg_desc [dsc$w_length] = 1;
+				IF .dbg$gb_mod_ptr [mode_fortran] EQL label_mode
+							OR
+				   .dbg$gb_mod_ptr [mode_fortran] EQL line_mode
+				THEN
+				    BEGIN
+				    ch$wchar ('0', .lexeme_ptr);
+				    RETURN alpha_str_token;
+				    END
+				ELSE
+				    BEGIN
+				    ch$wchar (0, .lexeme_ptr);
+				    RETURN digit_str_token;
+				    END;
+				END;
+
+
+			!++
+			! This is the normal store and pick up next
+			! numeric character.
+			!--
+			IF NOT .period_present
+			AND .dbg$char_table [.char] NEQ period
+			THEN
+				DO
+					BEGIN
+					IF .dbg$char_table[.char] EQL alphalo_and_hex
+					THEN char = .char - upper_case_dif;
+					count = .count + 1;
+					IF .count GTR num_max_length
+					THEN
+						BEGIN
+
+
+						ch$move (num_max_length - 1,
+							ch$plus (ch$ptr (.lexeme_stg_desc [dsc$a_pointer]), 1),
+							ch$ptr (.lexeme_stg_desc [dsc$a_pointer]));
+						ch$wchar (.char, .lexeme_ptr-1);
+						END
+					ELSE ch$wchar_a (.char, lexeme_ptr);
+					char = ch$a_rchar (input_ptr);
+
+
+					END
+				WHILE (oneof (.dbg$char_table [.char], numeric,
+						alpha_and_hex, alphalo_and_hex));
+
+			!++
+			! COBOL may have a decimal point following the
+			! string of digits. Look for the decimal point.
+			! If it is present as the next character, set
+			! the period present flag.
+			!--
+			IF .char EQL asc_period
+			THEN
+			    IF NOT .period_present
+			    THEN
+				BEGIN
+				period_present = TRUE;
+				DO
+					BEGIN
+					count = .count + 1;
+					IF .count LEQ .lexeme_stg_desc [dsc$w_maxlen]
+					THEN ch$wchar_a (.char, lexeme_ptr);
+					char = ch$a_rchar (input_ptr);
+					END
+				WHILE (.dbg$char_table[.char] EQL numeric);
+				END;
+
+			!++
+			! Now allow for a D or E form of floating
+			! number, followed by an optional positive
+			! or negative sign, followed by more digits.
+			!--
+			IF (.char GEQU %C'a')
+			THEN char = .char - upper_case_dif;
+			IF (.char EQL %C'D') OR (.char EQL %C'E')
+			THEN
+				BEGIN
+				IF .char EQL %C'D'
+				THEN floating_flag = double_prec
+				ELSE floating_flag = single_prec;
+
+				ch$wchar_a (.char, lexeme_ptr);
+				count = .count + 1;
+				char = ch$a_rchar (input_ptr);
+				END;
+			IF .period_present AND .floating_flag
+			THEN
+				BEGIN
+				IF (.char EQL %C'+') OR (.char EQL %C'-')
+				THEN
+					BEGIN
+					ch$wchar_a (.char, lexeme_ptr);
+					count = .count + 1;
+					char = ch$a_rchar (input_ptr);
+					END;
+				END;
+			IF .period_present OR .floating_flag
+			THEN
+			    WHILE (.dbg$char_table[.char] EQL numeric)
+				DO
+				BEGIN
+				count = .count + 1;
+				IF .count LEQ .lexeme_stg_desc [dsc$w_maxlen]
+				THEN ch$wchar_a (.char, lexeme_ptr);
+				char = ch$a_rchar (input_ptr);
+				END;
+
+			! Update the input descriptor.
+			!
+			input_stg_desc [dsc$a_pointer] = .input_ptr;
+			input_stg_desc [dsc$w_length] = .input_stg_desc [dsc$w_length] - .count;
+
+
+			! Update the lexeme descriptor. Check for truncation.
+			!
+			IF .count GTR .lexeme_stg_desc [dsc$w_maxlen]
+			THEN
+			    BEGIN
+			    lexeme_stg_desc [dsc$w_length] = .lexeme_stg_desc [dsc$w_maxlen];
+			    SIGNAL (dbg$_stgtrunc);
+			    END
+			ELSE
+			    lexeme_stg_desc [dsc$w_length] = .count;
+
+
+			!++
+			! See whether the user has just said %LABEL or
+			! the %LABEL mode is in effect, in which case
+			! a string must be returned instead of the
+			! actual binary number.
+			!--
+
+			lexeme_stg_desc[dsc$w_length] = .count;
+			IF NOT .period_present
+			AND NOT .floating_flag
+			AND .dbg$gb_mod_ptr [mode_fortran] NEQ label_mode
+			AND .dbg$gb_mod_ptr [mode_fortran] NEQ line_mode
+			THEN
+				BEGIN
+
+
+				! Check for long or regular digit string.
+				!
+				IF .lexeme_stg_desc [dsc$w_length] GTR 9
+				THEN
+				    BEGIN
+
+
+				    ! Transform to long digit string
+				    !
+				    LOCAL
+					lng_dig_desc : BLOCK [8,BYTE];
+
+				    lng_dig_desc [dsc$w_length] = .lexeme_stg_desc [dsc$w_length];
+				    lng_dig_desc [dsc$a_pointer] = .lexeme_stg_desc [dsc$a_pointer];
+				    dbg$lng_dig_str (lng_dig_desc,
+						     .lexeme_stg_desc,
+						     .lng_dig_desc [dsc$w_length] + 1);
+				    RETURN l_dig_str_token;
+				    END
+				ELSE
+				    BEGIN
+
+
+				    ! Regular digit string
+				    !
+				    .lexeme_stg_desc[dsc$a_pointer] = dbg$radx_convrt (.lexeme_stg_desc);
+				    dbg$gb_mod_ptr [mode_radix] = .previous_radix;
+				    lexeme_stg_desc [dsc$w_length] = 4;
+				    RETURN digit_str_token;
+				    END;
+				END;
+
+			IF .dbg$gb_mod_ptr [mode_fortran] EQL label_mode
+			OR .dbg$gb_mod_ptr [mode_fortran] EQL line_mode
+			THEN
+				BEGIN
+				IF .dbg$gb_mod_ptr [mode_radix] NEQ .previous_radix
+				OR .period_present
+				THEN
+				    BEGIN
+				    SIGNAL (dbg$_invnumber, 1, .lexeme_stg_desc);
+				    RETURN (0);
+				    END;
+				RETURN alpha_str_token;
+				END
+			ELSE
+			    IF .floating_flag EQL double_prec
+			    THEN
+				RETURN double_fl_token
+			    ELSE
+				RETURN single_fl_token;
+			END;
+
+		[eocommand_state]:			! logical end of line
+			BEGIN
+
+			!++
+			! The length of the input line should be set to
+			! zero here. Reduce it one so that it is less than
+			! zero. This will cause an error if this same
+			! input line ever comes back to the lex routine.
+			!--
+			lexeme_stg_desc [dsc$w_length] = 0;
+			input_stg_desc [dsc$a_pointer] = ch$plus (.input_ptr, 1);
+			input_stg_desc [dsc$w_length] = .input_stg_desc [dsc$w_length] - 1;
+			RETURN eol_token
+			END;
+
+		[radix_state]:				! up arrow,
+			BEGIN		! COBOL
+
+			LOCAL
+			    temp_ptr;
+
+			temp_ptr = ch$plus (.input_ptr, 1);
+			char = ch$rchar_a(temp_ptr);
+			IF .char GEQU %C'a'
+			THEN
+			    char = .char - upper_case_dif;
+			SELECTONE .char OF
+			    SET
+
+			    [%C'D']:	BEGIN
+					dbg$gb_mod_ptr[mode_radix] = decimal_radix;
+					state = numeric_state;
+					END;
+
+			    [%C'O']:	BEGIN
+					dbg$gb_mod_ptr[mode_radix] = octal_radix;
+					state = numeric_state;
+					END;
+
+			    [%C'X']:	BEGIN
+					dbg$gb_mod_ptr[mode_radix] = hex_radix;
+					state = numeric_state;
+					END;
+
+			    TES;
+
+			IF .state EQL numeric_state
+			THEN
+			    BEGIN
+			    input_ptr = .temp_ptr;
+			    char = ch$rchar(.input_ptr);	! get first digit
+			    input_stg_desc[dsc$a_pointer] = .input_ptr;
+			    input_stg_desc[dsc$w_length] = .input_stg_desc[dsc$w_length] - 2;
+			    END
+			ELSE
+			    BEGIN
+			    char = ch$rchar(.input_ptr);
+			    state = unspec_state;
+			    END;
+
+			END;
+
+		[unspec_state]:				! special character like operator or illegal
+			BEGIN
+
+			!++
+			! Most likely, this is a single character
+			! operator. Write its ASCII value into the
+			! lexeme buffer, and return its equivalent
+			! token.
+			!--
+			LOCAL
+				index;
+
+			index = .dbg$char_table[.char];
+			IF ((.index GEQ table_offset) AND (.index LEQ operator_max))
+			THEN
+				BEGIN
+				ch$wchar (.char, .lexeme_ptr);
+				lexeme_stg_desc[dsc$w_length] = 1;
+				input_stg_desc[dsc$a_pointer] = ch$plus (.input_ptr, 1);
+				input_stg_desc[dsc$w_length] = .input_stg_desc[dsc$w_length] - 1;
+				RETURN .dbg$token_table[.index - table_offset]
+				END;
+
+			!++
+			! This doesn't seem to be anything about which
+			! we know. SIGNAL invalid character.
+			!--
+			SIGNAL (dbg$_invchar);
+			END;			! loop back to CASE statement.
+
+		TES;
+
+	RETURN 1;
+	END;					! end of dbg$cob_get_lex
+
+GLOBAL ROUTINE dbg$cob_reductn (action_key, stack, lex_stg_desc, lahead_stg_desc, parse_stg_desc) =
+!++
+! Functional description:
+!	Does the action associated with a reduction. The action is chosen
+!	based on the action_key, which is the name of an action routine
+!	as specified in the semantics table.
+!
+! Formal Parameters:
+!	action_key	- name of the action routine
+!	stack		- top of stack in the context of the reduction
+!
+! Implicit inputs:
+!	the name of the parse stack : dbg$gl_stk
+!
+! Outputs:
+!	none
+!
+! Routine value:
+!	TRUE or FALSE
+!
+! Side effects:
+!	The top of stack is often changed. arguments are put into
+!	linked lists, context values are altered.
+!--
+
+    BEGIN
+    MAP
+	lex_stg_desc	: REF BLOCK [ ,BYTE],
+	lahead_stg_desc	: REF BLOCK [ ,BYTE],
+	parse_stg_desc	: REF BLOCK [ ,BYTE];
+
+
+    CASE .action_key FROM 1 TO cobnone OF
+
+	SET
+
+	[cobcomlin]:	BEGIN
+			dbg$verify_out (.parse_stg_desc);
+			IF NOT dbg$perform_cmd(.stack) 
+			THEN 
+				RETURN false;
+			END;
+
+	[cobaddexa]:	dbg$add_arg (dbg$gl_stk[.stack+2, stk$v_base], 0);
+	[cobaddexp]:	dbg$for_add (dbg$gl_stk [.stack, stk$v_val1], dbg$gl_stk [.stack, stk$v_type],
+			     dbg$gl_stk [.stack + 2, stk$v_val1], dbg$gl_stk [.stack + 2, stk$v_type]);
+	[cobaddran]:	dbg$add_arg (dbg$gl_stk[.stack+2, stk$v_base],
+					dbg$gl_stk[.stack+4, stk$v_base]);
+	[cobaftcnt]:	dbg$get_step_count (.stack + 1, .lex_stg_desc);
+	[cobarrnam]:	dbg$redu_path_addr (.stack);
+	[cobascclr]:	IF .dbg$gl_gbltyp EQL dsc$k_dtype_t
+			THEN dbg$gl_gbltyp = -1;
+	[cobasclen]:	dbg$save_ascii_leng(.lex_stg_desc);
+	[cobbreacb]:	dbg$gl_list[2] = dbg$get_bpt_act(.parse_stg_desc);
+	[cobcanarg]:	dbg$cancel_parm (.stack);
+	[cobcanind]:	dbg$set_over_adr();
+	[cobcanovr]:	BEGIN
+			dbg$gl_gbltyp = -1;
+			dbg$gw_gbllngth = 0;
+			END;
+	[cobcanswi]:	dbg$can_switch (.stack);
+	[cobcalsub]:	dbg$add_arg (dbg$gl_stk[.stack+1, stk$v_base], 0);
+	[cobdefarg]:	dbg$add_arg (dbg$gl_stk[.stack, stk$v_base],
+					dbg$gl_stk[.stack+2, stk$v_base]);
+	[cobdeflst]:	dbg$add_arg (dbg$gl_stk[.stack+2, stk$v_base],
+					dbg$gl_stk[.stack+4, stk$v_base]);
+	[cobdefnam]:	dbg$save_name (.stack, .lex_stg_desc);
+	[cobdeploc]:	BEGIN
+			dbg$add_arg (dbg$gl_stk[.stack, stk$v_base], 0);
+			dbg$set_overs (override_mode, noimmed_n_token);
+			END;
+	[cobdgptho]:	dbg$bld_num_pth(.lahead_stg_desc);
+	[cobdigpat]:	dbg$bld_num_pth(.lex_stg_desc);
+	[cobdigstr]:	dbg$trans_name(.stack, .lahead_stg_desc);
+
+	[cobdimadd]:	dbg$add_dimension (.stack + 2);
+	[cobdimone]:	dbg$add_dimension (.stack);
+	[cobdivexp]:	dbg$for_div (dbg$gl_stk [.stack, stk$v_val1], dbg$gl_stk [.stack, stk$v_type],
+			     dbg$gl_stk [.stack + 2, stk$v_val1], dbg$gl_stk [.stack + 2, stk$v_type]);
+
+	[cobdfltyp]:	dbg$set_default_typ();
+	[cobexaone]:	dbg$add_arg (dbg$gl_stk[.stack, stk$v_base], 0);
+	[cobexpran]:	dbg$add_arg (dbg$gl_stk[.stack, stk$v_base],
+					dbg$gl_stk[.stack+2, stk$v_base]);
+	[cobindcom]:	dbg$cis_openicf();
+	[cobinsclr]:	IF .dbg$gl_gbltyp EQL dsc$k_dtype_zi
+			THEN dbg$gl_gbltyp = -1;
+	[cobgethlp]:	dbg$get_help( .parse_stg_desc);
+	[cobgeticf]:	dbg$cis_getfsp(.lex_stg_desc, .parse_stg_desc);
+	[cobgetfsp]:	BEGIN
+			MAP dbg$gl_log_buf : REF VECTOR [,BYTE];
+			dbg$gl_log_buf = dbg$get_filesp(.lex_stg_desc, .parse_stg_desc);
+			END;
+	[cobloctyp]:	dbg$set_local_type();
+	[cobmulexp]:	dbg$for_mul (dbg$gl_stk [.stack, stk$v_val1], dbg$gl_stk [.stack, stk$v_type],
+			     dbg$gl_stk [.stack + 2, stk$v_val1], dbg$gl_stk [.stack + 2, stk$v_type]);
+
+	[cobnegexp]:	dbg$for_neg (dbg$gl_stk [.stack + 1, stk$v_val1], dbg$gl_stk [.stack + 1, stk$v_type],
+			     dbg$gl_stk [.stack, stk$v_val1], dbg$gl_stk [.stack, stk$v_type]);
+
+	[cobnegstr]:
+		BEGIN
+		! we are trying to negate a long digit string
+		! just put the minus sign over the plus sing that is always present
+		! in long digit strings
+		LOCAL  s : ref vector[,byte];
+		dbg$pop_stack(.stack);				! get rid of '-' token
+		s = .dbg$gl_stk[.stack,stk$v_val1];	! get address of counted string
+		s[1] = %C'-' ;
+		END;
+
+	[cobovrins]:	dbg$gl_gbltyp = dsc$k_dtype_zi;
+	[cobovrasc]:	BEGIN
+			    dbg$gl_gbltyp = dsc$k_dtype_t;
+			    dbg$gw_gbllngth = 4;
+			END;
+	[cobovropl]:	dbg$set_overr_mode (.stack + 2);
+	[cobovropr]:	dbg$set_overr_mode (.stack);
+	[cobovropt]:	dbg$set_overr_mode (.stack + 1);
+	[cobovrstl]:	dbg$set_overr_step (.stack + 2);
+	[cobovrstp]:	dbg$set_overr_step (.stack + 1);
+	[cobovrtyp]:	dbg$set_over_typ();
+	[cobplsstr]:	dbg$pop_stack(.stack); ! do nothing for a plus sign is already there
+	[cobposexp]:	dbg$pop_stack (.stack);
+	[cobquotec]:	BEGIN
+			dbg$gl_stk [.stack, stk$v_val1] = dbg$extract_str (.parse_stg_desc);
+			dbg$gl_stk [.stack, stk$v_val2] = .dbg$gl_stk [.stack, stk$v_val1];
+			DBG$GL_STK [.STACK, STK$V_TYPE] = DSC$K_DTYPE_T;
+			END;
+	[cobrefarr]:	dbg$reduce_array (.stack);
+	[cobrempar]:	dbg$pop_stack (.stack);
+	[cobsavmod]:	dbg$add_module (.stack, .lex_stg_desc);
+	[cobsavone]:	dbg$sav_pth_nam();
+	[cobsavpat]:	BEGIN
+			IF .line_path
+			THEN
+				BEGIN
+				LOCAL
+					ptr : REF VECTOR[,BYTE];
+				ptr = .lex_stg_desc[dsc$a_pointer];
+				IF .ptr[0] GEQ %C'0'
+				AND .ptr[0] LEQ %C'9'
+				THEN
+					BEGIN
+					dbg$pars_linnum(.lex_stg_desc, 0);
+					line_path = FALSE;
+				END
+				ELSE
+					dbg$build_path(.lex_stg_desc, FALSE);
+			END
+			ELSE
+				dbg$build_path (.lex_stg_desc, FALSE);
+			END;
+	[cobsavtyp]:	dbg$save_type(.stack);
+	[cobsetbre]:	dbg$break_setup (.stack, .dbg$gl_stk [.stack + 2, stk$v_val1], 1);
+	[cobsetbra]:	dbg$break_setup (.stack, .dbg$gl_stk [.stack + 3, stk$v_val1],
+					.list_elem_exp1(.dbg$gl_head_lst));
+	[cobsettrc]:	dbg$gl_context[dbg$k_trce_call] = TRUE;
+	[cobsettrb]:	dbg$gl_context[dbg$k_trce_brch] = TRUE;
+	[cobsetdec]:	dbg$set_dec_overs() ;
+	[cobsetind]:	dbg$set_over_noadr();
+	[cobsetlan]:	dbg$save_lang_name (.stack+2, .lex_stg_desc);
+	[cobsetlin]:	BEGIN
+			dbg$set_line_dec (.stack);
+			line_path = TRUE;
+			END;
+	[cobsetloc]:	dbg$set_overs (local_mode, .dbg$gl_stk [.stack, stk$v_val1]);
+	[cobsetlog]:	dbg$gl_context[dbg$k_log] = TRUE;
+	[cobsetmdl]:	dbg$gl_context[dbg$k_module] = TRUE;
+	[cobsetmod]:	dbg$gl_context[dbg$k_mode] = TRUE;
+	[cobsetout]:	dbg$gl_context[dbg$k_output] = TRUE;
+	[cobsetsco]:	dbg$gl_context[dbg$k_scope] = TRUE;
+	[cobsetstp]:	dbg$gl_context[dbg$k_step] = TRUE;
+	[cobshoarg]:	dbg$show_param (.stack);
+	[cobshocal]:	dbg$gl_context[dbg$k_traceback] = TRUE;
+	[cobshcall]:	BEGIN
+			dbg$get_step_count (.stack + 1, .lex_stg_desc);
+			dbg$gl_context[dbg$k_traceback] = TRUE;
+			END;
+	[cobshotyp]:	dbg$show_type(default);
+	[cobshovtp]:	dbg$show_type(override);
+	[cobstaloc]:	dbg$add_arg (dbg$gl_stk[.stack+1, stk$v_base], 0);
+	[cobstcoun]:	dbg$get_step_count (.stack + 1, .lex_stg_desc);
+	[cobstpcnt]:	dbg$get_step_count (.stack + 2, .lex_stg_desc);
+	[cobsubexp]:	dbg$for_sub (dbg$gl_stk [.stack, stk$v_val1], dbg$gl_stk [.stack, stk$v_type],
+			     dbg$gl_stk [.stack + 2, stk$v_val1], dbg$gl_stk [.stack + 2, stk$v_type]);
+
+	[cobsubstr]:	dbg$char_substring(.stack);
+	[cobsvolpt]:	dbg$build_path(.lahead_stg_desc, FALSE);
+	[cobtrnlab]:	dbg$reduce_label (.stack, .lahead_stg_desc);
+	[cobtrnnam]:	dbg$reduce_pathname (.stack, .lahead_stg_desc);
+	[cobuqunam]:	dbg$translate_name (.stack, .lex_stg_desc);
+	[cobnone]:	0;
+
+	[inrange, outrange]:	RETURN FALSE;
+
+	TES;
+
+    RETURN TRUE
+    END;
+
+
+END							! End of module
+ELUDOM

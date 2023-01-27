@@ -1,0 +1,1084 @@
+MODULE GETMEMORY (IDENT = 'V03-000') =
+
+BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+! WRITTEN BY
+!	Bert Beander	August, 1980.
+!
+! MODULE FUNCTION
+!	This module contains the Debugger's Free Memory Manager, i.e. all the
+!	routines which initialize the free memory pool and allocate and dealloc-
+!	ate memory blocks.  These memory blocks are used for RST entries, Static
+!	Address Table entries, and most other descriptors used in the Debugger.
+!
+
+REQUIRE 'SRC$:DBGPROLOG.REQ';
+
+FORWARD ROUTINE
+    DBG$CHECK_MEMORY:	NOVALUE,	! Check the integrity of the memory pool
+    DBG$COPY_MEMORY,			! Make a copy of a memory block in a
+					!      permanent block
+    DBG$COPY_TEMPMEM,			! Make a copy of a memory block in a
+					!      temporary block
+    DBG$EXPAND_MEMORY,			! Expand the free memory pool
+    DBG$FREE_MEM_LEFT,			! Compute amount of free memory left
+    DBG$GET_MEMORY,			! Get a memory block
+    DBG$GET_TEMPMEM,			! Get a temporary memory block
+    DBG$INIT_MEMORY:	NOVALUE,	! Initialize the free memory pool
+    DBG$REL_MEMORY:	NOVALUE,	! Release a memory block
+    DBG$REL_TEMPMEM:	NOVALUE;	! Release all temporary memory blocks
+
+EXTERNAL ROUTINE
+    DBG$RST_REMOVE:	NOVALUE,	! Remove the RST for a specified module
+    LIB$GET_VM;				! Get a block of VAX virtual memory
+
+EXTERNAL LITERAL
+    DBG$GL_SUP_OR_TEST,			! Symbol defined at link-time.  The
+					!      possible values are:
+					!	0 = Standard Debugger
+					!	1 = Testable Debugger
+					!	2 = Super-Debugger
+    LIB$_INSVIRMEM;			! Insufficient Virtual Memory status
+					!      code--returned by LIB$GET_VM
+
+EXTERNAL
+    LRUM$LISTHEAD: REF LRUM$ENTRY,	! Pointer to list head for LRUM (Least
+					!      Recently Used Module) linked list
+    RST$REF_LIST: REF VECTOR[,LONG];	! Pointer to RST Reference List
+
+OWN
+    DBG$FREE_LIST: REF FMEM$BLOCK	! Pointer to the free-list list head
+			INITIAL(0),	!
+    DBG$TEMP_MEMORY: INITIAL(0),	! Pointer to the singly linked list of
+					!      "temporary" memory blocks
+    FMEM_BLOCK_LIST: INITIAL(0);	! Pointer to a singly linked list of
+					!      memory pool areas.
+
+GLOBAL ROUTINE DBG$CHECK_MEMORY: NOVALUE =
+!
+! FUNCTION
+!	This routine checks the Debugger's memory pool for integrity.  A com-
+!	plete scan is made over the entire memory pool to check that every free
+!	and allocated block has the proper format.  A second complete scan is
+!	made over the entire memory pool free-list to verify that every free
+!	block has the proper format and that the list is intact.  A third com-
+!	plete scan is made over the "temporary block" list, and each such block
+!	is checked for validity and consistency.  If any error is detected in
+!	any of these scans, an error is signalled (Internal Memory Error) which
+!	prints the address of the bad memory block.  If the memory pool is found
+!	to be correct, the routine returns normally.
+!
+! INPUTS
+!	NONE
+!
+! OUTPUTS
+!	NONE
+!
+
+    BEGIN
+
+    LOCAL
+	AREAPTR: REF VECTOR[,LONG],	! Pointer to current memory pool area
+	BACKPTR: REF FMEM$BLOCK,	! Pointer to previous free-list block
+	BLKADDR: REF VECTOR[,LONG],	! Pointer to "temporary" memory block
+	BLKPTR:  REF FMEM$BLOCK,	! Pointer to the current memory block
+	FREECOUNT1,			! Number of free blocks in memory pool
+	FREECOUNT2,			! Number of free blocks on free-list
+	LISTHEAD_FOUND,			! Flag indicating free-list list head
+					!       node has been found
+	NEXTBLK: REF FMEM$BLOCK,	! Pointer to next sequential memory blk
+	TEMPBLK: REF FMEM$BLOCK;	! Pointer to "temporary" block header
+
+
+
+    ! Loop over all the memory pool areas.  These areas are linked together in a
+    ! singly linked, zero-terminated list.  Check each such area for integrity.
+    !
+    LISTHEAD_FOUND = FALSE;
+    FREECOUNT1 = 0;
+    AREAPTR = .FMEM_BLOCK_LIST;
+    WHILE .AREAPTR NEQ 0 DO
+	BEGIN
+
+
+	! Loop over all the memory blocks in this area.  Check each such block
+	! for consistency.
+	!
+	BLKPTR = AREAPTR[2];
+	IF NOT .BLKPTR[FMEM$V_PREVALLOC] THEN SIGNAL(DBG$_INTMEMERR,1,.BLKPTR);
+	WHILE .BLKPTR LSSU AREAPTR[-1] + .AREAPTR[1] DO
+	    BEGIN
+
+
+	    ! Check the block's sentinel value.  Also get the address of the
+	    ! next sequential block in the memory area.
+	    !
+	    IF .BLKPTR[FMEM$B_SENTINEL] NEQ FMEM$K_SENTINEL
+	    THEN
+		SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+
+	    NEXTBLK = .BLKPTR + 4*.BLKPTR[FMEM$V_LENGTH];
+
+
+	    ! If this is an allocated block, make sure it is marked as allocated
+	    ! at both ends.
+	    !
+	    IF .BLKPTR[FMEM$V_THISALLOC]
+	    THEN
+		BEGIN
+		IF NOT .NEXTBLK[FMEM$V_PREVALLOC]
+		THEN
+		    SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+		END
+
+
+	    ! If this is a free block, check that the block length and the
+	    ! allocation bits are consistent at both ends.
+	    !
+	    ELSE
+		BEGIN
+		IF .NEXTBLK[FMEM$L_PREVLEN] NEQ .BLKPTR[FMEM$V_LENGTH]
+		THEN
+		    SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+
+
+		! Give special treatment to the free-list list head block.
+		!
+		IF .BLKPTR EQL .DBG$FREE_LIST
+		THEN
+		    BEGIN
+		    IF NOT .NEXTBLK[FMEM$V_PREVALLOC]
+		    THEN
+			SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+
+		    IF .LISTHEAD_FOUND THEN SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+		    LISTHEAD_FOUND = TRUE;
+		    END
+
+
+		! This is a free block but not the free-list list head.
+		!
+		ELSE
+		    BEGIN
+		    FREECOUNT1 = .FREECOUNT1 + 1;
+		    IF .NEXTBLK[FMEM$V_PREVALLOC]
+		    THEN
+			SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+		    END;
+
+		END;
+
+
+	    ! Go to the next sequential block in the memory area and loop.
+	    !
+	    BLKPTR = .NEXTBLK;
+	    END;
+
+
+	! Check the validity of the terminator block at the end of the current
+	! memory pool area.
+	!
+	IF .BLKPTR NEQ AREAPTR[-1] + .AREAPTR[1]
+	THEN
+	    SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+
+	IF (.BLKPTR[FMEM$B_SENTINEL] NEQ FMEM$K_SENTINEL) OR
+	   (NOT .BLKPTR[FMEM$V_THISALLOC])                OR
+	   (.BLKPTR[FMEM$V_LENGTH] NEQ 1)
+	THEN
+	    SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+
+
+	! The whole area look good.  Link to the next memory pool area and loop.
+	!
+	AREAPTR = .AREAPTR[0];
+	END;
+
+
+    ! Make sure the free-list list head was found in the memory pool.
+    !
+    IF NOT .LISTHEAD_FOUND THEN SIGNAL(DBG$_INTMEMERR, 1, .DBG$FREE_LIST);
+
+
+    ! Now make a complete scan over the memory pool free-list.  Check each block
+    ! on the list for consistency and check the integrity of the list itself.
+    !
+    FREECOUNT2 = 0;
+    BACKPTR = .DBG$FREE_LIST;
+    BLKPTR = .DBG$FREE_LIST[FMEM$L_FLINK];
+    WHILE .BLKPTR NEQ .DBG$FREE_LIST DO
+	BEGIN
+
+
+	! Make sure the top end of the free block is valid.
+	!
+	IF (.BLKPTR[FMEM$B_SENTINEL] NEQ FMEM$K_SENTINEL) OR
+	   (.BLKPTR[FMEM$V_THISALLOC])                    OR
+	   (.BLKPTR[FMEM$L_BLINK] NEQ .BACKPTR)
+	THEN
+	    SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+
+
+	! Make sure that the bottom end of the block is valid and consistent
+	! with the top end.
+	!
+	NEXTBLK = .BLKPTR + 4*.BLKPTR[FMEM$V_LENGTH];
+	IF (.NEXTBLK[FMEM$B_SENTINEL] NEQ FMEM$K_SENTINEL) OR
+	   (.NEXTBLK[FMEM$V_PREVALLOC])                    OR
+	   (.NEXTBLK[FMEM$L_PREVLEN] NEQ .BLKPTR[FMEM$V_LENGTH])
+	THEN
+	    SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+
+
+	! This block looks good.  Link to the next block on the list and loop.
+	!
+	FREECOUNT2 = .FREECOUNT2 + 1;
+	BACKPTR = .BLKPTR;
+	BLKPTR = .BLKPTR[FMEM$L_FLINK];
+	END;
+
+
+    ! We are back at the free-list list head.  Make sure its backward link
+    ! points to the last block we inspected.  Also make sure that the number
+    ! of free blocks came out the same in the memory-area and free-list scans.
+    !
+    IF (.BLKPTR[FMEM$L_BLINK] NEQ .BACKPTR) OR
+       (.FREECOUNT1 NEQ .FREECOUNT2)
+    THEN
+	SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+
+
+    ! Check the consistency of the "temporary" memory block chain.  Loop through
+    ! the DBG$TEMP_MEMORY list (which is singly linked) and check each block.
+    !
+    BLKADDR = .DBG$TEMP_MEMORY;
+    WHILE .BLKADDR NEQ 0 DO
+	BEGIN
+	TEMPBLK = BLKADDR[1];
+	BLKPTR = BLKADDR[-1];
+
+
+	! Make sure the temporary block header looks correct.
+	!
+	IF (.TEMPBLK[FMEM$B_SENTINEL] NEQ FMEM$K_TEMPSENT) OR
+	   (NOT .TEMPBLK[FMEM$V_THISALLOC])                OR
+	   (NOT .TEMPBLK[FMEM$V_PREVALLOC])
+	THEN
+	    SIGNAL(DBG$_INTMEMERR, 1, .TEMPBLK);
+
+
+	! Make sure the memory pool block header before that looks correct and
+	! is consistent with the temporary block header.
+	!
+	IF (.BLKPTR[FMEM$B_SENTINEL] NEQ FMEM$K_SENTINEL)           OR
+	   (NOT .BLKPTR[FMEM$V_THISALLOC])                          OR
+	   (.BLKPTR[FMEM$V_LENGTH] LSS .TEMPBLK[FMEM$V_LENGTH] + 2) OR
+	   (.BLKPTR[FMEM$V_LENGTH] GTR .TEMPBLK[FMEM$V_LENGTH] + 5)
+	THEN
+	    SIGNAL(DBG$_INTMEMERR, 1, .TEMPBLK);
+
+
+	! Make sure the bottom end of the memory block looks allright too.
+	!
+	NEXTBLK = .BLKPTR + 4*.BLKPTR[FMEM$V_LENGTH];
+	IF (.NEXTBLK[FMEM$B_SENTINEL] NEQ FMEM$K_SENTINEL) OR
+	   (NOT .NEXTBLK[FMEM$V_PREVALLOC])
+	THEN
+	    SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+
+
+	! This block looks good. Link to the next block and loop.
+	!
+	BLKADDR = .BLKADDR[0];
+	END;
+
+
+    ! The memory pool passes all tests.  Return successfully to the caller.
+    !
+    RETURN;
+
+    END;
+
+GLOBAL ROUTINE DBG$COPY_MEMORY(SOURCE) =
+!
+! FUNCTION
+!	This routine creates a new block of memory and copies the contents of a
+!	specified block to the new block.  The new block is made large enough to
+!	hold the entire contents of the specified block--the length of the spec-
+!	ified block is gotten from the block's control longword (FMEM$V_LENGTH).
+!	Note that the new block is a "permanent" memory block--it is not put on
+!	the temporary block list.
+!
+! INPUTS
+!	SOURCE	- A pointer to the memory block to be copied.  This may be
+!		  either a permanent or a temporary block.
+!
+! OUTPUTS
+!	A new block is allocated and the contents of the SOURCE block is copied
+!		  to the new block.  The address of the new block is returned as
+!		  the routine's value.
+!
+
+    BEGIN
+
+    MAP
+	SOURCE: REF FMEM$BLOCK;		! Pointer to allocated portion of the
+					!      memory block to be copied
+
+    LOCAL
+	LENGTH,				! The length of the source and target
+					!      blocks in longwords
+	SRCBLK: REF FMEM$BLOCK,		! Pointer to source block control info
+	TARGET;				! The address of the new memory block
+
+
+
+    ! Pick up the address of the source block's control information and check
+    ! that it is a valid memory block (permanent or temporary).
+    !
+    SRCBLK = SOURCE[FMEM$A_HEADER];
+    IF .SRCBLK[FMEM$B_SENTINEL] NEQ FMEM$K_SENTINEL AND
+       .SRCBLK[FMEM$B_SENTINEL] NEQ FMEM$K_TEMPSENT
+    THEN
+	SIGNAL(DBG$_INTMEMERR, 1, .SRCBLK);
+
+
+    ! Get the length of the source block, allocate the target block, copy the
+    ! the contents from the source to the target, and return the target address.
+    !
+    LENGTH = .SRCBLK[FMEM$V_LENGTH] - 1;
+    TARGET = DBG$GET_MEMORY(.LENGTH);
+    CH$MOVE(4*.LENGTH, .SOURCE, .TARGET);
+    RETURN .TARGET;
+
+    END;
+
+GLOBAL ROUTINE DBG$COPY_TEMPMEM(SOURCE) =
+!
+! FUNCTION
+!	This routine creates a new temporary block of memory and copies the con-
+!	tents of a specified block to that new block.  The new temporary block
+!	is made large enough to hold the entire contents of the specified block
+!	--the block's length is gotten from FMEM$V_LENGTH.  Since the new block
+!	is a "temporary" block, it disappears at the end of the current command.
+!
+! INPUTS
+!	SOURCE	- A pointer to the memory block to be copied.  This may be
+!		  either a permanent or a temporary block.
+!
+! OUTPUTS
+!	A temporary block is allocated and the contents of the SOURCE block is
+!		  copied to the temporary block.  The address of the temporary
+!		  block is returned as the routine's value.
+!
+
+    BEGIN
+
+    MAP
+	SOURCE: REF FMEM$BLOCK;		! Pointer to allocated portion of the
+					!      memory block to be copied
+
+    LOCAL
+	LENGTH,				! The length of the source and target
+					!      blocks in longwords
+	SRCBLK: REF FMEM$BLOCK,		! Pointer to source block control info
+	TARGET;				! The address of the new memory block
+
+
+
+    ! Pick up the address of the source block's control information and check
+    ! that it is a valid memory block (permanent or temporary).
+    !
+    SRCBLK = SOURCE[FMEM$A_HEADER];
+    IF .SRCBLK[FMEM$B_SENTINEL] NEQ FMEM$K_SENTINEL AND
+       .SRCBLK[FMEM$B_SENTINEL] NEQ FMEM$K_TEMPSENT
+    THEN
+	SIGNAL(DBG$_INTMEMERR, 1, .SRCBLK);
+
+
+    ! Get the length of the source block, allocate the target block, copy the
+    ! the contents from the source to the target, and return the target address.
+    !
+    LENGTH = .SRCBLK[FMEM$V_LENGTH] - 1;
+    TARGET = DBG$GET_TEMPMEM(.LENGTH);
+    CH$MOVE(4*.LENGTH, .SOURCE, .TARGET);
+    RETURN .TARGET;
+
+    END;
+
+GLOBAL ROUTINE DBG$EXPAND_MEMORY(LENGTH) =
+!
+! FUNCTION
+!	This routine expands the free memory pool.  To do so, it calls routine
+!	LIB$GET_VM to get a new memory pool area.  This area is then initialized
+!	to contain one big free block and a one longword terminator block, after
+!	which the free block is linked into the memory pool free-list.
+!
+!	This routine may be called during the Debugger's initialization phase,
+!	but not after the Debugger has given the user program control.  The
+!	reason is that memory expansions after the user program has started can
+!	cause checkerboarding of the Debugger's and the user's memory which may
+!	affect the user program's execution in unpredictable ways.  This is par-
+!	ticularly undesirable since the user program is being debugged and can
+!	be presumed to have errors, possibly including random addressing errors.
+!
+! INPUTS
+!	LENGTH	- The number of longwords to be added to the free memory pool.
+!		  This must be at least 4 and at most 3FFFFF hex.
+!
+! OUTPUTS
+!	The new memory area is acquired and added to the memory pool free-list.
+!	One of these two values is returned:
+!
+!		STS$K_SUCCESS -- All went well and the memory is available.
+!		STS$K_SEVERE  -- The requested memory could not be gotten
+!				 from LIB$GET_VM.  The memory pool was thus
+!				 not expanded.
+!
+
+    BEGIN
+
+    LOCAL
+	BACKPTR: REF FMEM$BLOCK,	! Pointer to previous free-list block
+	ENDPTR:  REF FMEM$BLOCK,	! Pointer to end of the memory pool area
+	FORWPTR: REF FMEM$BLOCK,	! Pointer to the next free-list block
+	FREEBLK: REF FMEM$BLOCK,	! Pointer to the one big free block
+	MEMVECTOR: REF VECTOR[,LONG],	! Pointer to acquired memory area
+	NUMBYTES,			! Number of bytes to get from LIB$GET_VM
+	STATUS: BLOCK[1, LONG];		! Status code returned by LIB$GET_VM
+
+
+
+    ! Check that the LENGTH parameter is in the valid range.
+    !
+    IF .LENGTH LSS 4 THEN SIGNAL(DBG$_DEBUGBUG, 1, DBG$K_ERR190);
+    IF .LENGTH GTR %X'3FFFFF' THEN RETURN STS$K_SEVERE;
+
+
+    ! Get the desired amount of memory from LIB$GET_VM.  Note that we request
+    ! three extra longwords for control information and the terminator block.
+    !
+    NUMBYTES = 4*(.LENGTH + 3);
+    STATUS = LIB$GET_VM(NUMBYTES, MEMVECTOR);
+    IF .STATUS EQL LIB$_INSVIRMEM THEN RETURN STS$K_SEVERE;
+    IF NOT .STATUS THEN SIGNAL(.STATUS);
+
+
+    ! We got the new memory pool area.  Link this area into the singly linked
+    ! list of memory pool areas and remember its byte length.  Also set up the
+    ! pointers to the one big free block and the terminator block.
+    !
+    MEMVECTOR[0] = .FMEM_BLOCK_LIST;
+    MEMVECTOR[1] = .NUMBYTES;
+    FMEM_BLOCK_LIST = MEMVECTOR[0];
+    FREEBLK = MEMVECTOR[2];
+    ENDPTR = MEMVECTOR[.LENGTH + 2];
+
+
+    ! Set up the one big free block in the memory area.  Note that we mark the
+    ! previous "block" as being allocated--this prevents any attempt to coalesce
+    ! free blocks off the top of the memory area.  Link the free block into the
+    ! memory pool free-list.
+    !
+    FREEBLK[FMEM$V_LENGTH] = .LENGTH;
+    FREEBLK[FMEM$V_THISALLOC] = FALSE;
+    FREEBLK[FMEM$V_PREVALLOC] = TRUE;
+    FREEBLK[FMEM$B_SENTINEL] = FMEM$K_SENTINEL;
+    ENDPTR[FMEM$L_PREVLEN] = .FREEBLK[FMEM$V_LENGTH];
+    FORWPTR = .DBG$FREE_LIST[FMEM$L_FLINK];
+    BACKPTR = .DBG$FREE_LIST;
+    FREEBLK[FMEM$L_FLINK] = .FORWPTR;
+    FREEBLK[FMEM$L_BLINK] = .BACKPTR;
+    FORWPTR[FMEM$L_BLINK] = .FREEBLK;
+    BACKPTR[FMEM$L_FLINK] = .FREEBLK;
+
+
+    ! Finally build the terminator block.  This "block" is marked as allocated
+    ! so that we will not coalesce free blocks off the end of the memory area.
+    ! Then return successful status.
+    !
+    ENDPTR[FMEM$V_LENGTH] = 1;
+    ENDPTR[FMEM$V_THISALLOC] = TRUE;
+    ENDPTR[FMEM$V_PREVALLOC] = FALSE;
+    ENDPTR[FMEM$B_SENTINEL] = FMEM$K_SENTINEL;
+    RETURN STS$K_SUCCESS;
+
+    END;
+
+GLOBAL ROUTINE DBG$FREE_MEM_LEFT =
+!
+! FUNCTION
+!	This routine returns the amount of free memory left in the free memory
+!	pool.  This is done by searching the entire free-list and adding up the
+!	sizes of all the free blocks.
+!
+! INPUTS
+!	NONE
+!
+! OUTPUTS
+!	The amount of free memory left in longwords is returned as the value.
+!
+
+    BEGIN
+
+    LOCAL
+	BLKPTR: REF FMEM$BLOCK,		! Pointer to the current free block
+	MEMLEFT;			! The amount of free memory in the pool
+
+
+
+    ! Search the free-list and add up the sizes of all the blocks.  Then return.
+    !
+    MEMLEFT = 0;
+    BLKPTR = .DBG$FREE_LIST[FMEM$L_FLINK];
+    WHILE .BLKPTR NEQ .DBG$FREE_LIST DO
+	BEGIN
+	MEMLEFT = .MEMLEFT + .BLKPTR[FMEM$V_LENGTH];
+	BLKPTR = .BLKPTR[FMEM$L_FLINK];
+	END;
+
+    RETURN .MEMLEFT;
+
+    END;
+
+GLOBAL ROUTINE DBG$GET_MEMORY(SIZE) =
+!
+! FUNCTION
+!	This routine allocates a memory block of a specified size and returns
+!	the block's address to the caller.  The block contents is zeroed out
+!	before being returned.  This is the primary routine for getting memory
+!	blocks from the free memory pool.
+!
+!	The routine uses the First-Fit algorithm for finding a free memory
+!	block.  The free-list is thus searched until a free block which is
+!	large enough is encountered.  That block is then split into two pieces,
+!	one to be allocated to the caller and one to remain on the free list.
+!	This splitting does not occur unless the remainder is large enough to
+!	be a free block (four longwords minimum).
+!
+!	If no free block of adequate size is found, an attempt is made to remove
+!	the Run-Time Symbol Table (RST) of the Least Recently Used module.  If
+!	this succeeds (i.e., if there is such a module and it's not the only RST
+!	module), the free-list search is tried again.  This is repeated until
+!	there are no more modules to be released except the Most Recently Used
+!	one.  For this reason, the Debugger should never run out of free memory
+!	under normal circumstances--the used memory is instead recycled.
+!
+!	However, if a free block of adequate size still cannot be found, an
+!	error is signalled unless a second parameter is present.  If a second
+!	parameter is present (e.g., ADDR = DBG$GET_MEMORY(.SIZE, 0);), a zero
+!	is returned as the routine value.
+!
+! INPUTS
+!	SIZE	- The size of the desired memory block in longwords.  This is
+!		  is the number of longwords to be allocated.
+!
+!	An optional second parameter specifies that a zero should be returned
+!		  if no block can be found to accommodate the request.  The
+!		  actual value of the parameter is not significant.  If this
+!		  parameter is omitted, an error is signalled.
+!
+! OUTPUTS
+!	A memory block of the desired size is allocated and its address is
+!		  returned as the routine's value.  If a second parameter is
+!		  specified and no block is found, zero is returned.
+!
+
+    BEGIN
+
+    BUILTIN
+	ACTUALCOUNT;			! Actual number of calling parameters
+
+    LOCAL
+	BACKPTR: REF FMEM$BLOCK,	! Pointer to previous block on free-list
+	BLKPTR:  REF FMEM$BLOCK,	! Pointer to the current memory block
+	FORWPTR: REF FMEM$BLOCK,	! Pointer to the next block on free-list
+	FREEBLK: REF FMEM$BLOCK,	! Pointer to free block split off from
+					!      the allocated block
+	LENGTH,				! The length of the allocated block
+					!      including the control longword
+	LRUMPTR: REF LRUM$ENTRY,	! Pointer to the Least Recently Used
+					!      Module (LRUM) table entry
+	NEXTBLK: REF FMEM$BLOCK;	! Pointer to the next sequential block
+					!      in the memory pool
+
+
+
+    ! Make sure the requested block size is strictly positive and not too large.
+    ! If less than three longwords are requested, allocate three longwords so
+    ! that the block can be released to give a four longword free block.
+    !
+    IF .SIZE LEQ 0 THEN SIGNAL(DBG$_DEBUGBUG, 1, DBG$K_ERR191);
+    IF .SIZE GTR 16000 THEN SIGNAL(DBG$_DEBUGBUG, 1, DBG$K_ERR191);
+    LENGTH = .SIZE + 1;
+    IF .LENGTH LSS 4 THEN LENGTH = 4;
+
+
+    ! Loop through the entire free-list, searching for a block large enough to
+    ! allocate to the caller.
+    !
+    BLKPTR = .DBG$FREE_LIST[FMEM$L_FLINK];
+    WHILE TRUE DO
+	BEGIN
+
+
+	! Do a few checks on the integrity of the free-list.
+	!
+	IF (.BLKPTR[FMEM$B_SENTINEL] NEQ FMEM$K_SENTINEL) OR
+	   (.BLKPTR[FMEM$V_THISALLOC])
+	THEN
+	    SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+
+
+	! If the current block is large enough, allocate all or part of it.
+	!
+	IF .BLKPTR[FMEM$V_LENGTH] GEQ .LENGTH
+	THEN
+	    BEGIN
+
+
+	    ! This block is large enough.  Unlink it from the free-list.
+	    !
+	    FORWPTR = .BLKPTR[FMEM$L_FLINK];
+	    BACKPTR = .BLKPTR[FMEM$L_BLINK];
+	    FORWPTR[FMEM$L_BLINK] = .BACKPTR;
+	    BACKPTR[FMEM$L_FLINK] = .FORWPTR;
+
+
+	    ! If the block is large enough to accommodate the request, one
+	    ! control longword, and a four longword free block, split it up.
+	    ! Put the free portion of the block back on the free-list.
+	    !
+	    IF .BLKPTR[FMEM$V_LENGTH] GEQ .LENGTH + 4
+	    THEN
+		BEGIN
+		FREEBLK = .BLKPTR + 4*.LENGTH;
+		FREEBLK[FMEM$V_LENGTH] = .BLKPTR[FMEM$V_LENGTH] - .LENGTH;
+		FREEBLK[FMEM$V_THISALLOC] = FALSE;
+		FREEBLK[FMEM$B_SENTINEL] = FMEM$K_SENTINEL;
+		FREEBLK[FMEM$L_FLINK] = .FORWPTR;
+		FREEBLK[FMEM$L_BLINK] = .BACKPTR;
+		FORWPTR[FMEM$L_BLINK] = .FREEBLK;
+		BACKPTR[FMEM$L_FLINK] = .FREEBLK;
+		NEXTBLK = .FREEBLK + 4*.FREEBLK[FMEM$V_LENGTH];
+		NEXTBLK[FMEM$L_PREVLEN] = .FREEBLK[FMEM$V_LENGTH];
+		BLKPTR[FMEM$V_LENGTH] = .LENGTH;
+		END;
+
+
+	    ! Mark the block as being allocated, zero it out, and return its
+	    ! address to the caller.
+	    !
+	    BLKPTR[FMEM$V_THISALLOC] = TRUE;
+	    NEXTBLK = .BLKPTR + 4*.BLKPTR[FMEM$V_LENGTH];
+	    NEXTBLK[FMEM$V_PREVALLOC] = TRUE;
+	    CH$FILL(0, 4*(.BLKPTR[FMEM$V_LENGTH] - 1), BLKPTR[FMEM$A_ALLOCBLK]);
+	    RETURN BLKPTR[FMEM$A_ALLOCBLK];
+	    END;
+
+
+	! The block was not large enough--link on to the next free-list entry.
+	! If this puts us past the end of the free-list, see if we can get some
+	! more space freed up by removing the Least Recently Used module from
+	! the RST.  Note that we never remove the Most Recently Used module.
+	!
+	BLKPTR = .BLKPTR[FMEM$L_FLINK];
+	IF .BLKPTR EQL .DBG$FREE_LIST
+	THEN
+	    BEGIN
+	    IF DBG$GL_SUP_OR_TEST LSS 10 THEN EXITLOOP; !<<----- TEMPORARY -----
+	    LRUMPTR = .LRUM$LISTHEAD[LRUM$L_BLINK];
+	    IF .LRUMPTR EQL .LRUM$LISTHEAD[LRUM$L_FLINK] THEN EXITLOOP;
+	    DBG$RST_REMOVE(.LRUMPTR[LRUM$L_RSTPTR]);
+	    BLKPTR = .DBG$FREE_LIST[FMEM$L_FLINK];
+	    END;
+
+	END;
+
+
+    ! We could not find a block large enough for the request.  If there is no
+    ! second parameter, signal the error.   Otherwise return zero as the block
+    ! address.
+    !
+    IF ACTUALCOUNT() EQL 1 THEN SIGNAL(DBG$_NOFREE);
+    RETURN 0;
+
+    END;
+
+GLOBAL ROUTINE DBG$GET_TEMPMEM(LENGTH) =
+!
+! FUNCTION
+!	This routine allocates a "temporary" memory block from the memory pool
+!	and returns its address.  A "temporary" block is a memory block which
+!	automatically disappears the next time DBG$REL_TEMPMEM is called, norm-
+!	ally at the end of the current command.  The advantage of temporary
+!	blocks is that they do not have to be explicitly released to the memory
+!	pool--one call on DBG$REL_TEMPMEM releases all temporary blocks.
+!
+!	All temporary memory blocks are put on the singly linked list pointed
+!	to by DBG$TEMP_MEMORY.  To accommodate this link and a second control
+!	word with the block's length and a sentinel value, two extra longwords
+!	are needed.
+!
+! INPUTS
+!	LENGTH	- The desired length of the temporary block in longwords.
+!
+! OUTPUTS
+!	The requested block is allocated and put on the temporary memory list.
+!		  The address of the allocated block is returned as the rout-
+!		  ine's value.
+!
+
+    BEGIN
+
+    LOCAL
+	BLKADDR: REF VECTOR[,LONG],	! Pointer to the block allocated by
+					!      routine DBG$GET_MEMORY
+	BLKPTR: REF FMEM$BLOCK;		! Pointer to the temporary block's own
+					!      control longword
+
+
+
+    ! Allocate a memory block of the desired size plus two longwords.  Link this
+    ! block into the temporary block list using longword 0, fill some control
+    ! information into longword 1, and return the address of longword 2.
+    !
+    BLKADDR = DBG$GET_MEMORY(.LENGTH + 2);
+    BLKADDR[0] = .DBG$TEMP_MEMORY;
+    DBG$TEMP_MEMORY = .BLKADDR;
+    BLKPTR = BLKADDR[1];
+    BLKPTR[FMEM$V_LENGTH] = .LENGTH + 1;
+    BLKPTR[FMEM$V_THISALLOC] = TRUE;
+    BLKPTR[FMEM$V_PREVALLOC] = TRUE;
+    BLKPTR[FMEM$B_SENTINEL] = FMEM$K_TEMPSENT;
+    RETURN BLKPTR[FMEM$A_ALLOCBLK];
+
+    END;
+
+GLOBAL ROUTINE DBG$INIT_MEMORY: NOVALUE =
+!
+! FUNCTION
+!	This routine initializes the free memory pool from which DBG$GET_MEMORY
+!	allocates memory blocks.  This is done by getting space either up in
+!	high P1 space (for a normal or a testable Debugger) or from LIB$GET_VM
+!	(for a Super-Debugger).  The free memory pool is initialized to have a
+!	free-list list head and one big free memory block from which space can
+!	later be allocated.
+!
+!	Note that the memory pool can be expanded later by calls on the routine
+!	DBG$EXPAND_MEMORY.  This routine can be called during the initialization
+!	phase of the Debugger, but not after the user program has been given
+!	control because that could cause checkerboarding of the Debugger's and
+!	the user's memory which may affect the user program's execution.  This
+!	is particularly undesirable since the user program is being debugged.
+!
+! INPUTS
+!	NONE
+!
+! OUTPUTS
+!	The memory pool is initialized.  No value is returned.
+!
+
+    BEGIN
+
+    LOCAL
+	ENDPTR: REF FMEM$BLOCK,		! Pointer to the end of memory pool area
+	FREEBLK: REF FMEM$BLOCK,	! Pointer to one big free block in pool
+	LENGTH,				! Longword length of memory pool area
+	LISTHEAD: REF FMEM$BLOCK,	! Pointer to the free-list list head
+	MEMBND_DESC: VECTOR[2],		! Memory bounds descriptor for $CRETVA
+	MEMVECTOR: REF VECTOR[,LONG],	! Pointer to the memory pool area
+	NUMBYTES,			! Number of bytes to get from LIB$GET_VM
+	STATUS: BLOCK[1, LONG];		! Status code from $CRETVA or LIB$GET_VM
+
+
+
+    ! If this is a normal Debugger or a Testable Debugger, we allocate the
+    ! initial chunk of memory pool area up in high user memory (P1 space).
+    ! This is done through the Create Virtual Address Space system service.
+    !
+    IF DBG$GL_SUP_OR_TEST EQL 0 OR DBG$GL_SUP_OR_TEST EQL 1
+    THEN
+	BEGIN
+	MEMBND_DESC[0] = %X'7FFF0000';
+	MEMBND_DESC[1] = %X'7FFFFFFF';
+	STATUS = $CRETVA(INADR=MEMBND_DESC, RETADR=MEMBND_DESC);
+	IF NOT .STATUS
+	THEN
+	    BEGIN
+	    STATUS[STS$V_SEVERITY] = STS$K_SEVERE;
+	    SIGNAL(.STATUS);
+	    END;
+
+	MEMVECTOR = .MEMBND_DESC[0];
+	LENGTH = ((.MEMBND_DESC[1] - .MEMBND_DESC[0]) + 1)/4;
+	END
+
+
+    ! If this is a Super-Debugger, we get the initial chunk of memory from the
+    ! LIB$GET_VM routine.  We cannot touch the P1-space area because it will be
+    ! used by the Testable Debugger that the Super-Debugger is debugging.
+    !
+    ELSE IF DBG$GL_SUP_OR_TEST EQL 2
+    THEN
+	BEGIN
+	LENGTH = 16384;
+	NUMBYTES = 4*.LENGTH;
+	STATUS = LIB$GET_VM(NUMBYTES, MEMVECTOR);
+	IF NOT .STATUS
+	THEN
+	    BEGIN
+	    STATUS[STS$V_SEVERITY] = STS$K_SEVERE;
+	    SIGNAL(.STATUS);
+	    END;
+
+	END
+
+
+    ! Any other value of DBG$GL_SUP_OR_TEST is illegal.
+    !
+    ELSE
+	SIGNAL(DBG$_DEBUGBUG, 1, DBG$K_ERR192);
+
+
+    ! Now initialize the memory pool area.  The first longword is a forward link
+    ! to the next memory pool area--for this initial area this field is always
+    ! zero.  The second longword contains the byte length of this area.  Long-
+    ! words 2 - 5 then contain the free-list list head.  The rest of the area
+    ! from longword 6 through the next to last longword constitutes a big free
+    ! block available for allocation.  Finally, the last longword is the termi-
+    ! nator block for this memory pool area.
+    !
+    MEMVECTOR[0] = 0;
+    MEMVECTOR[1] = 4*.LENGTH;
+    LISTHEAD = MEMVECTOR[2];
+    FREEBLK = MEMVECTOR[6];
+    ENDPTR = MEMVECTOR[.LENGTH - 1];
+
+
+    ! Set up the free-list list head.
+    !
+    LISTHEAD[FMEM$V_LENGTH] = 4;
+    LISTHEAD[FMEM$V_THISALLOC] = FALSE;
+    LISTHEAD[FMEM$V_PREVALLOC] = TRUE;
+    LISTHEAD[FMEM$B_SENTINEL] = FMEM$K_SENTINEL;
+    LISTHEAD[FMEM$L_FLINK] = .FREEBLK;
+    LISTHEAD[FMEM$L_BLINK] = .FREEBLK;
+    FREEBLK[FMEM$L_PREVLEN] = 4;
+
+
+    ! Set up the one big free block in the initial memory pool.  Note that we
+    ! claim that the List Head is allocated--this prevents the List Head from
+    ! being coalesced with the following memory block by DBG$REL_MEMORY.
+    !
+    FREEBLK[FMEM$V_LENGTH] = .LENGTH - 7;
+    FREEBLK[FMEM$V_THISALLOC] = FALSE;
+    FREEBLK[FMEM$V_PREVALLOC] = TRUE;
+    FREEBLK[FMEM$B_SENTINEL] = FMEM$K_SENTINEL;
+    FREEBLK[FMEM$L_FLINK] = .LISTHEAD;
+    FREEBLK[FMEM$L_BLINK] = .LISTHEAD;
+    ENDPTR[FMEM$L_PREVLEN] = .FREEBLK[FMEM$V_LENGTH];
+
+
+    ! Set up the "allocated" terminator block at the end of the memory pool
+    ! area to prevent blocks from being coalesced beyond the end of the area.
+    !
+    ENDPTR[FMEM$V_LENGTH] = 1;
+    ENDPTR[FMEM$V_THISALLOC] = TRUE;
+    ENDPTR[FMEM$V_PREVALLOC] = FALSE;
+    ENDPTR[FMEM$B_SENTINEL] = FMEM$K_SENTINEL;
+
+
+    ! Set up the two OWN pointers we need to maintain.  One points the the list
+    ! of memory pool areas and the other points to the free-list.  Then return.
+    !
+    FMEM_BLOCK_LIST = MEMVECTOR[0];
+    DBG$FREE_LIST = .LISTHEAD;
+    RETURN;
+
+    END;
+
+GLOBAL ROUTINE DBG$REL_MEMORY(ADDRESS): NOVALUE =
+!
+! FUNCTION
+!	This routine releases the memory block at a specified address to the
+!	free memory pool.  The memory block is coalesced with the previous and
+!	the following memory blocks if these are free and is added to the free-
+!	list.
+!
+! INPUTS
+!	ADDRESS	- The address of the memory block to be released.  This must be
+!		  the same address as originally returned by DBG$GET_MEMORY when
+!		  the block was allocated.
+!
+! OUTPUTS
+!	The specified memory block is released.  No value is returned.
+!
+
+    BEGIN
+
+    MAP
+	ADDRESS: REF FMEM$BLOCK;	! Pointer to the allocated part of the
+					!      block to be released
+
+    LOCAL
+	BACKPTR: REF FMEM$BLOCK,	! Pointer to previous free-list block
+	BLKPTR:  REF FMEM$BLOCK,	! Pointer to the released memory block
+	FORWPTR: REF FMEM$BLOCK,	! Pointer to the next free-list block
+	NEXTBLK: REF FMEM$BLOCK,	! Pointer to the next sequential memory
+					!      block in the memory pool
+	PREVBLK: REF FMEM$BLOCK;	! Pointer to the previous sequential
+					!      memory block in the memory pool
+
+
+
+    ! Pick up the address of the memory block header.  Then do some integrity
+    ! checks to make sure this is a valid allocated memory block.
+    !
+    BLKPTR = ADDRESS[FMEM$A_HEADER];
+    IF (.BLKPTR[FMEM$B_SENTINEL] NEQ FMEM$K_SENTINEL) OR
+       (NOT .BLKPTR[FMEM$V_THISALLOC])
+    THEN
+	SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+
+
+    ! See if we can combine the released block with the previous sequential
+    ! block in the memory pool.  If we can, we make BLKPTR point to that prev-
+    ! ious block and increase its length accordingly.
+    !
+    IF NOT .BLKPTR[FMEM$V_PREVALLOC]
+    THEN
+	BEGIN
+	PREVBLK = .BLKPTR - 4*.BLKPTR[FMEM$L_PREVLEN];
+	IF .PREVBLK[FMEM$B_SENTINEL] NEQ FMEM$K_SENTINEL
+	THEN
+	    SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+
+	PREVBLK[FMEM$V_LENGTH] =
+		.PREVBLK[FMEM$V_LENGTH] + .BLKPTR[FMEM$V_LENGTH];
+	BLKPTR = .PREVBLK;
+	END
+
+
+    ! If the previous block was not free, mark the released block itself as
+    ! unallocated and link it into the free-list.
+    !
+    ELSE
+	BEGIN
+	BLKPTR[FMEM$V_THISALLOC] = FALSE;
+	FORWPTR = .DBG$FREE_LIST[FMEM$L_FLINK];
+	BACKPTR = .DBG$FREE_LIST;
+	BLKPTR[FMEM$L_FLINK] = .FORWPTR;
+	BLKPTR[FMEM$L_BLINK] = .BACKPTR;
+	FORWPTR[FMEM$L_BLINK] = .BLKPTR;
+	BACKPTR[FMEM$L_FLINK] = .BLKPTR;
+	END;
+
+
+    ! Now see if the next sequential block in the memory pool is free.  If it
+    ! is, we unlink it from the free-list and coalesce it with the BLKPTR block.
+    !
+    NEXTBLK = .BLKPTR + 4*.BLKPTR[FMEM$V_LENGTH];
+    IF .NEXTBLK[FMEM$B_SENTINEL] NEQ FMEM$K_SENTINEL
+    THEN
+	SIGNAL(DBG$_INTMEMERR, 1, .BLKPTR);
+
+    IF NOT .NEXTBLK[FMEM$V_THISALLOC]
+    THEN
+	BEGIN
+	FORWPTR = .NEXTBLK[FMEM$L_FLINK];
+	BACKPTR = .NEXTBLK[FMEM$L_BLINK];
+	FORWPTR[FMEM$L_BLINK] = .BACKPTR;
+	BACKPTR[FMEM$L_FLINK] = .FORWPTR;
+	BLKPTR[FMEM$V_LENGTH] =
+		.BLKPTR[FMEM$V_LENGTH] + .NEXTBLK[FMEM$V_LENGTH];
+	END;
+
+
+    ! We have now done all coalescing we can do.  Set the length of the block at
+    ! the end of the block and mark it there as being unallocated.  Then return.
+    !
+    NEXTBLK = .BLKPTR + 4*.BLKPTR[FMEM$V_LENGTH];
+    NEXTBLK[FMEM$L_PREVLEN] = .BLKPTR[FMEM$V_LENGTH];
+    NEXTBLK[FMEM$V_PREVALLOC] = FALSE;
+    RETURN;
+
+    END;
+
+GLOBAL ROUTINE DBG$REL_TEMPMEM: NOVALUE =
+!
+! FUNCTION
+!	This routine releases all "temporary" memory blocks allocated by routine
+!	DBG$GET_TEMPMEM.  This routine is normally called after the completion
+!	of each command--it thus cleans up any storage used in processing the
+!	command without requiring an explicit release call for each such block.
+!
+! INPUTS
+!	NONE
+!
+! OUTPUTS
+!	All "temporary" blocks on the DBG$TEMP_MEMORY list are released to the
+!		  memory pool.  No value is returned.
+!
+
+    BEGIN
+
+    LOCAL
+	BLKPTR: REF VECTOR[,LONG],	! Pointer to the current temporary block
+					!      to release
+	NEXTBLK;			! Pointer to the next block on the chain
+
+
+
+    ! If this is a Testable Debugger, check the condition of the memory pool.
+    !
+    IF DBG$GL_SUP_OR_TEST EQL 1 THEN DBG$CHECK_MEMORY();
+
+
+    ! Clear the RST Reference List to contain zero entries.  This says that the
+    ! current Debug command has ended, and the RST entries it referenced are no
+    ! longer being referenced by SYMIDs elsewhere in the Debugger.
+    !
+    RST$REF_LIST[1] = 0;
+
+
+    ! Loop through the singly linked list pointed to by DBG$TEMP_MEMORY and
+    ! release each block on the list to the free memory pool.
+    !
+    BLKPTR = .DBG$TEMP_MEMORY;
+    WHILE .BLKPTR NEQ 0 DO
+	BEGIN
+	NEXTBLK = .BLKPTR[0];
+	DBG$REL_MEMORY(.BLKPTR);
+	BLKPTR = .NEXTBLK;
+	END;
+
+    DBG$TEMP_MEMORY = 0;
+    RETURN;
+
+    END;
+
+END ELUDOM

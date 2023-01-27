@@ -1,0 +1,588 @@
+	.TITLE	POWERFAIL - POWER FAIL INTERRUPT HANDLER
+	.IDENT	'V03-001'
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+;
+; Facility:  Executive , Hardware fault handling
+;
+; Abstract: POWERFAIL contains the code necessary to save the volatile state
+;	    necessary for restart when power is restored. POWERFAIL also
+;	    contains the code to restore this state and continue operation
+;	    upon power restoration.
+;
+; Environment: MODE=Kernel , IPL=31
+;
+; Author:  RICHARD I. HUSTVEDT, Creation date:  15-JUN-1978
+;
+; Modified by:
+;
+;	V03-001	KTA0096		Kerbey T. Altmann	16-Apr-1982
+;		Fix small problem with KTA0055.
+;
+;	V02-014	KTA0055		Kerbey T. Altmann	28-Dec-1981
+;		Change register usage for ADP pointer. Make routine
+;		INIT_DEVICE useable from INIT.
+;
+;	V02-013	BLS0015		Benn Schreiber		 2-Dec-1981
+;		Change INI$PROCREG to EXE$INIPROCREG
+;
+;	V02-012	ROW0042		Ralph O. Weber		28-OCT-1981
+;		Modify EXE$INIT_DEVICE to assume DDT$L_UNITINIT contains a 
+;		relocated system virtual address.
+;
+;	V02-011	KTA0038		Kerbey T. Altmann	23-Oct-1981
+;		Add entry for CI in adapter table.
+;
+;	V02-010	ROW0002		Ralph O. Weber		28-JUL-1981
+;		Alter EXE$INIT_DEVICE to use DDT pointer in UCB rather than
+;		DDT pointer in DDB.  Also added comments about unit initial-
+;		ization routine call.
+;
+;	V09	TCM0001		Trudy C. Matthews	8-May-1981
+;		Use RPB$L_ISP field in RPB as "Software state successfully
+;		saved on power down" flag.  Drop IPL to IPL$_POWER-1 at the
+;		end of powerfail restart routine to allow any impending
+;		powerfail interrupts to occur before enabling subsequent
+;		powerfails.  Only restore PR$_SISR, PR$_PCBB if executing
+;		a powerfail recovery; these fields are invalid if restarting
+;		after executing a halt code.  Add a bugcheck for halt code
+;		^X0C - SCB physical read error.
+;
+;	V08	NPK0003		N. KRONENBERG		18-FEB-1980
+;		ADDED RESTART HALT CODE, CHM VECTOR <1:0> .NE. 0
+;
+;	V07	CAS0008		C. A. Samuelson 	7-Jan-1980
+;		Made device initialization code a global subroutine.
+;		Made it capable of initializaion only for a specific TR #.
+;
+;	V06	MHB0011		M. H. Bramhall	25-Sep-1979
+;		Removed reference to IOC$GL_DIALUP.
+;
+;	V05	SRB0001		STEVE BECKHARDT	7-SEP-1979
+;		Added call to unit initialization routine specified
+;		in DDT.
+;
+;	V04	NPK0002		N. KRONENBERG	16-JUL-1979
+;		Fixed bug in dummy P0LR on restart.
+;
+;	V03	NPKCOMET	N. KRONENBERG	2-JUL-1979
+;		Removed CPU dependencies to ERRSUB.
+;
+;--
+
+;
+; Include files:
+;
+	$ADPDEF				; DEFINE ADAPTER CONTROL BLOCK
+	$CRBDEF				; DEFINE CRB OFFSETS
+	$DDBDEF				; DEFINE DEVICE DATA BLOCK
+	$DDTDEF				; DEFINE DRIVER DISPATCH TABLE
+	$IDBDEF				; DEFINE IDB OFFSETS
+	$IPLDEF				; DEFINE INTERRUPT PRIORITY LEVELS
+	$PRDEF				; DEFINE PROCESSOR REGISTER NUMBERS
+	$RPBDEF				; DEFINE RESTART PARAMETER BLOCK OFFSETS
+	$TQEDEF				; DEFINE TIMER QUEUE ENTRY OFFSETS
+	$UBADEF				; DEFINE UBA REGISTERS
+	$UCBDEF				; DEFINE UNIT CONTROL BLOCK
+	$VECDEF				; DEFINE VECTOR OFFSETS
+
+;
+; MACROS:
+;
+
+;
+; Equated Symbols:
+;
+RESTRT_POWERUP	=	3		; Power recovery restart code
+RESTRT_IVLISTK	=	4		; Interrupt stack not valid
+RESTRT_DBLERR	=	5		; Double error restart code
+RESTRT_HALT	=	6		; Halt restart code
+RESTRT_ILLVEC	=	7		; Illegal vector code
+RESTRT_NOUSRWCS	=	8		; No user WCS restart code
+RESTRT_ERRHALT	=	9		; Error halt restart code
+RESTRT_CHM	=	10		; CHMx with IS=1 restart code
+;
+ 
+	.PSECT	$$$220,LONG		; Data psect
+EXE$GL_PWRDONE::			; End time for power up interval
+	.LONG	0			; Done now
+EXE$GL_PWRINTVL::			; Allowable interval in 10MS units
+	.LONG	100*180			; Allow three minutes
+	.PSECT	$AEXENONPAGED,LONG	; INTERRUPT ROUTINES MUST BE LONGWORD
+					; ALIGNED
+;
+; Own Storage:
+;
+;
+; Table of addresses of adapter initialization routines ordered
+; by adapter type in ADP$W-ADPTYPE.
+;
+
+INITTABLE:				; Address table start
+	.LONG	MBA$INITIAL		; MBA
+	.LONG	UBA$INITIAL		; UBA
+	.LONG	NOINITIAL		; DR32--inited by unit init
+	.LONG	MA$INITIAL		; MA780
+	.LONG	NOINITIAL		; CI--inited by unit init
+
+NOINITIAL:				; Dummy initialization for DR32
+	RSB
+	.PAGE
+	.SBTTL	EXE$POWERFAIL - POWER FAIL INTERRUPT SERVICE ROUTINE
+;++
+;
+; Functional Description:
+;	EXE$POWERFAIL is entered with IPL=31 as a result of a power fail
+;	interrupt.  The objective is to save the critical volatile machine
+;	state as quickly as possible and halt the machine.
+;
+; Calling Sequence:
+;	Powerfail interrupt through Vector at offset 12 in the SCB.
+;
+; Input Parameters:
+;	00(SP) - PC at time of powerfail interrupt
+;	04(SP) - PSL at tiem of powerfail interrupt
+;
+; Implicit Inputs:
+;	All registers and processor registers.
+;	Restart Parameter Block located via EXE$GL_RPB
+;
+;--
+	.LIST	MEB			; Show macro expansions
+
+	.ALIGN	LONG			; Exception and Interrupt routines must 
+					; be longword aligned
+EXE$POWERFAIL::				;
+	TSTL	W^EXE$GL_PFAILTIM		; Have we restarted yet?
+	BNEQ	10$			; No, wait for restart
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11,AP,FP> ; Save all registers
+	MOVL	W^EXE$GL_RPB,R5		; Get address of restart parameter block
+	MFPR	#PR$_PCBB,RPB$L_PCBB(R5); Save physical address of current pcb
+	MFPR	#PR$_SCBB,RPB$L_SCBB(R5); Save physical address of System Control Block
+	MFPR	#PR$_SBR,RPB$L_SBR(R5)	; Save physical address of System page table
+	MFPR	#PR$_SISR,RPB$L_SISR(R5); Save software interrupt summary register
+	MFPR	#PR$_SLR,RPB$L_SLR(R5)	; Save SPT length
+	MFPR	#PR$_TODR,W^EXE$GL_PFAILTIM	; Save time of day at power fail
+;
+; Save all other volatile processor registers on the current stack (ISP)
+;
+	MFPR	#PR$_KSP,-(SP)		; Save kernel stack pointer
+	MFPR	#PR$_ESP,-(SP)		; Save exec stack pointer
+	MFPR	#PR$_SSP,-(SP)		; Save supervisor stack pointer
+	MFPR	#PR$_USP,-(SP)		; Save user stack pointer
+	MFPR	#PR$_ASTLVL,-(SP)	; Save AST level
+	MFPR	#PR$_PME,-(SP)		; Save performance monitor enable
+	MFPR	#PR$_P0BR,-(SP)		; Save P0 base register
+	MFPR	#PR$_P0LR,-(SP)		; Save P0 length register
+	MFPR	#PR$_P1BR,-(SP)		; Save P1 base register
+	MFPR	#PR$_P1LR,-(SP)		; Save P1 length register
+	JSB	EXE$REGSAVE		; Save CPU-specific IPR's
+;
+; All volatile machine state necessary for restart has now been saved.
+; At this point the interrupt stack contains:
+;
+;	+-------------------------+
+;	!    CPU-specific IPR's   ! 0-n(SP)
+;	+-------------------------+
+;	|	   P1LR		  | n+1(SP)
+;	+-------------------------+
+;	|	   P1BR		  | 
+;	+-------------------------+
+;	|	   P0LR		  | 
+;	+-------------------------+
+;	|	   P0BR		  | 
+;	+-------------------------+
+;	|	   PME		  | 
+;	+-------------------------+
+;	|	   ASTLVL	  | 
+;	+-------------------------+
+;	|	   USP		  | 
+;	+-------------------------+
+;	|	   SSP		  | 
+;	+-------------------------+
+;	|	   ESP		  | 
+;	+-------------------------+
+;	|	   KSP		  | 
+;	+-------------------------+
+;	|	   R0		  | 
+;	+-------------------------+
+;	|	   R1		  | 
+;	+-------------------------+
+;	|	   R2		  | 
+;	+-------------------------+
+;	|	   R3		  | 
+;	+-------------------------+
+;	|	   R4		  | 
+;	+-------------------------+
+;	|	   R5		  | 
+;	+-------------------------+
+;	|	   R6		  | 
+;	+-------------------------+
+;	|	   R7		  | 
+;	+-------------------------+
+;	|	   R8		  | 
+;	+-------------------------+
+;	|	   R9		  | 
+;	+-------------------------+
+;	|	   R10		  | 
+;	+-------------------------+
+;	|	   R11		  | 
+;	+-------------------------+
+;	|	   AP		  | 
+;	+-------------------------+
+;	|	   FP		  | 
+;	+-------------------------+
+;	|	   PC		  | 
+;	+-------------------------+
+;	|	   PSL		  | 
+;	+-------------------------+
+;
+	MOVL	SP,RPB$L_ISP(R5)	; Save final interrupt stack pointer
+10$:	BRB	10$			; Wait for power off halt
+					; This loop is to avoid halting
+					; and confusing the console
+					; by inadvertently triggering an
+					; automatic restart too soon.
+
+	.PAGE				;
+	.SBTTL	EXE$RESTART - Restore state and restart after power on
+;++
+; Functional Description:
+;	EXE$RESTART is given control by the restart ROM bootstrap if it
+;	is determined that memory content is valid, the checksum of the 
+;	restart routine verifies and the restart flag in the Restart Control
+;	Block is enabled.  Initial entry to EXE$RESTART is made with memory
+;	management disabled IPL=31 with the stack pointer set to the high
+;	end of the page containing the restart control block.
+;
+; Calling Sequence:
+;	JMP	@RPB$L_RESTART-^X200(SP)
+;
+; Input Parameters:
+;	SP - Address of RPB+^x200
+;
+;--
+
+	.PSECT	$AAEXENONPAGED,PAGE	; Must be in page aligned psect
+EXE$RESTART::				; Restart entry point
+5$:	MFPR	#PR$_TXCS,R6		; Get console transmitter status
+	BBC	#7,R6,5$		; Wait until ready
+	MTPR	#^XF03,#PR$_TXDB	; Send code to clear warmstart inhibit
+6$:	MFPR	#PR$_TXCS,R6		; Get console transmitter status
+	BBC	#7,R6,6$		; Wait until console accepts request
+	MOVAB	-512(SP),R5		; Compute base of RPB
+	BICL	#1,RPB$L_RSTRTFLG(R5)	; Clear flag to re-enable warmstart
+	MOVL	RPB$L_SBR(R5),R4	; Get base of SPT
+	MTPR	R4,#PR$_SBR		; Set SPT base register
+	MTPR	RPB$L_SLR(R5),#PR$_SLR	;  and length register
+	MTPR	RPB$L_SCBB(R5),#PR$_SCBB; Restore pointer to System Control Block
+	MOVL	RPB$L_SVASPT(R5),R3	; Get virtual address of SPT
+	MOVL	#<<EXE$RESTART-^X80000000>@-9>,R1; VPN of EXE$RESTART
+	MOVAB	EXE$RESTART,R0		; Physical address of EXE$RESTART
+	ASHL	#-9,R0,R0		; Convert to physical page number
+	SUBL	R0,R1			; Compute delta VPN-PFN
+	MOVAL	(R3)[R1],R3		; Now compute base address for P0PT
+	INCL	R0			; Get PFN+1 of EXE$RESTART for P0LR
+	MTPR	R0,#PR$_P0LR		; Set dummy P0 length
+	MTPR	R3,#PR$_P0BR		; Set base for P0 page table
+	MOVL	RPB$L_ISP(R5),R6	; Get Saved interrupt stack pointer
+	INVALID				; Clear translation buffer
+	MTPR	#1,#PR$_MAPEN		; Enable memory management
+	JMP	@#10$			; Set PC to system space
+10$:	MOVL	R6,SP			; Now restore correct Stack pointer
+	CMPL	AP,#RESTRT_POWERUP	; Is this a power recovery?
+	BEQL	POWERUP			; Yes
+	ADDL3	#512,EXE$GL_RPB,SP	; Use end of restart page as stack
+	CASE	AP,<-			; Else switch on restart code
+		20$,-			; 4 => Interrupt stack not valid
+		30$,-			; 5 => CPU oduble error halt
+		40$,-			; 6 => Halt instruction
+		50$,-			; 7 => Illegal I/E vector
+		60$,-			; 8 => No user WCS
+		70$,-			; 9 => Error pending on Halt
+		80$,-			;10 => CHM on ISTK halt
+		90$,-			;11 => CHM vector <1:0> .NE. 0
+	100$,-				;12 => SCB physical read error
+		>,LIMIT=#RESTRT_IVLISTK	;
+	BUG_CHECK	UNKRSTRT,FATAL	; Unknown restart code
+20$:	BUG_CHECK	IVLISTK,FATAL	; Invalid interrupt stack
+30$:	BUG_CHECK	DBLERR,FATAL	; Double error halt
+40$:	BUG_CHECK	HALT,FATAL	; Halt instruction
+50$:	BUG_CHECK	ILLVEC,FATAL	; Illegal Vector code
+60$:	BUG_CHECK	NOUSRWCS,FATAL	; No user WCS for vector
+70$:	BUG_CHECK	ERRHALT,FATAL	; Error pending on halt
+80$:	BUG_CHECK	CHMONIS,FATAL	; CHM on interrupt stack
+90$:	BUG_CHECK	CHMVEC,FATAL	; CHM vector <1:0> .NE. 0
+100$:	BUG_CHECK	SCBRDERR,FATAL	; SCB physical read error.
+
+POWERUP:				;
+;
+; None of the interrupt stack area containing saved state will be overwritten
+; during the restart process in case another power failure occurs. The restart
+; procedure only reads the saved state and re-writes volatile registers so
+; that it can be repeated without harm.
+;
+	MOVL	G^EXE$GL_RPB,R1		; Get virtual address of RPB.
+	TSTL	RPB$L_ISP(R1)		; Test saved Interrupt SP from RPB.
+	BNEQ	10$			; Branch if valid ISP.
+;
+; Interrupt stack pointer field in RPB is 0.  This indicates that the
+; the powerfail routine was not able to complete successfully, and that
+; it was unable to save the software state of the machine.
+;
+	ADDL3	#512,R1,SP		; Use end of RPB for stack space.
+	BUG_CHECK -			; Fatal error.
+		STATENTSVD,FATAL
+10$:
+	MTPR	RPB$L_SISR(R1),#PR$_SISR; Restore software interrupt state.
+	MTPR	RPB$L_PCBB(R1),#PR$_PCBB; Restore pointer to current PCB.
+	JSB	EXE$REGRESTOR		; Restore CPU-specific registers
+	MTPR	(R6)+,#PR$_P1LR		; Restore P1 length register
+	MTPR	(R6)+,#PR$_P1BR		;  and P1 base register
+	MTPR	(R6)+,#PR$_P0LR		; Restore real P0 length register
+	MTPR	(R6)+,#PR$_P0BR		;  and P0 base register
+	MTPR	(R6)+,#PR$_PME		; Restore performance monitor enable
+	MTPR	(R6)+,#PR$_ASTLVL	; Restore AST level
+	MTPR	(R6)+,#PR$_USP		; Restore user mode stack pointer
+	MTPR	(R6)+,#PR$_SSP		; Restore supervisor mode stack pointer
+	MTPR	(R6)+,#PR$_ESP		; Restore executive mode stack pointer
+	MTPR	(R6)+,#PR$_KSP		; Restore kernel mode stack pointer
+;
+; All saved Machine state has now been restored.  Renable SBI and CRD error
+; interrupts, re-initialize interval timer and Scan device data base to
+; set powerfail status for all units.  All controllers and devices are then
+; re-initialized.
+;
+	PUSHL	R6			; Save updated "stack pointer"
+	JSB	EXE$INIPROCREG		; Initialize processor registers
+					; for error detection and start interval
+					; timer.
+TIMERESET:				;
+	MFPR	#PR$_TODR,R0		; Get current time of day
+	ADDL3	R0,W^EXE$GL_PWRINTVL,W^EXE$GL_PWRDONE	; Compute expected done 
+					; time
+	SUBL3	W^EXE$GL_PFAILTIM,R0,W^EXE$GL_PFATIM	; Get duration of power fail
+	SUBL	W^EXE$GL_TODR,R0		; Compute time since boot
+	EXTZV	#1,#31,R0,R0		; Unsigned divide by 2
+	EMUL	#<100*1000*2>,R0,#0,R0	; Convert to 100 nanosecond units
+	ADDL	W^EXE$GQ_TODCBASE,R0	; Compute current system time	
+	ADWC	W^EXE$GQ_TODCBASE+4,R1	; 
+	MOVQ	R0,W^EXE$GQ_SYSTIME	; Set as current system time
+	MOVAB	W^EXE$GL_TQFL,R6	; Get pointer to timer queue head
+	MOVL	(R6),R7			; Point at head of timer queue
+10$:	CMPL	R6,R7			; Check for end of timer queue
+	BEQL	30$			; Branch if yes
+	CMPL	R1,TQE$Q_TIME+4(R7)	; Check high order bits for past due
+	BLSSU	20$			; No try another
+	BGTRU	15$			; Past due, convert entry
+	CMPL	R0,TQE$Q_TIME(R7)	; High order bits equal, check low order
+	BLSSU	20$			; Not yet due
+15$:	MOVQ	R0,TQE$Q_TIME(R7)	; Set new expiration time
+20$:	MOVL	(R7),R7			; Flink to next entry
+	BRB	10$			; 
+30$:					;
+	BSBW	ERL$WARMSTART		; Log power recovery in the error log
+RESTARTIO:				; 
+	MOVL	SP,FP			; Save current stack pointer
+	MOVL	#<IOC$GL_ADPLIST-ADP$L_LINK>,R2	; Get pointer to head of adapter list
+10$:	MOVL	ADP$L_LINK(R2),R2	; Flink onward
+	BEQL	50$			; Branch if at end of list
+	MOVL	ADP$L_CSR(R2),R4	; Get address of CSR
+	MOVZWL	ADP$W_ADPTYPE(R2),R0	; Get adapter type code
+	MOVAL	INITTABLE[R0],R0	; Get table entry of adap init
+	JSB	@(R0)			; Call adapter initialization
+	BRB	10$			; Next adapter
+					;
+50$:	CLRL	AP			; Set up to
+	MNEGW	#1,AP			; Initialize all controllers
+	BSBB	EXE$INIT_DEVICE		; Call controller init routine
+ 
+	MOVL	FP,SP			; Restore stack pointer
+	SETIPL	#IPL$_POWER		; Block power fail interrupt
+	MOVL	(SP)+,SP		; Set up to point to saved registers
+	MOVL	G^EXE$GL_RPB,FP		; Get address of RPB.
+	POPR	#^M<R0,R1,R2,R3,R4,R5,R6,R7,R8,R9,R10,R11,AP>
+;
+; Drop IPL here to allow any impending powerfail interrupts to occur.  This
+; is because we have been running at IPL$_POWER, and if another powerfail
+; interrupt has occurred, it will be taken as soon as this routine REIs.
+; There would be no guarantee how much time the power down routine has left to
+; save the software state.  However, if we drop IPL BEFORE enabling subsequent
+; power fails, we allow any impending powerfail interrupt to occur; it will
+; essntially be ignored by the power down routine.  The power up routine will
+; then be re-executed.  And by the time we REI we are again guaranteed an
+; adequate amount of time to execute the power down routine.
+;
+	SETIPL	#<IPL$_POWER-1>		; Allow impending powerfail interrupts
+	NOP				; to occur before enabling another
+	NOP				; execution of power down routine.
+	SETIPL	#IPL$_POWER		; Back to guaranteed amount of time.
+	CLRL	W^EXE$GL_PFAILTIM		; Enable subsequent power fail
+	CLRL	RPB$L_ISP(FP)		; Indicate software state not saved.
+	POPL	FP			; Restore FP.
+	REI				; Return from powerfail restart.
+ 
+	.PAGE
+	.SBTTL	EXE$INIT_DEVICE - Initialize device drivers
+ 
+;++
+; EXE$INIT_DEVICE - Call device drivers at controller and unit initialization
+;
+; INPUTS:
+;
+;     Low order word:	
+;	AP = -1  -> Do initialization for all devices on all adaptors
+;	AP >= 0  -> Only initialize for devices on this TR level
+;
+;     Hi order word:
+;	AP = -1  -> Called from INIT - No powerfail
+;	AP =  0  -> Called from POWERFAIL/ADAPTERR (UBA powerfail)
+;
+; OUTPUTS:
+;
+;	Device controller and units initialized
+;	All registers destroyed!!!!!
+;--
+ 
+EXE$INIT_DEVICE::
+ 
+	MOVAL	IOC$GL_DEVLIST,R11	; Get pointer to head of device list
+DDBLOOP:				; 
+	ASSUME	DDB$L_LINK EQ 0		;
+	MOVL	DDB$L_LINK(R11),R11	; Get address of next DDB
+	BNEQ	5$			;
+	RSB				; Thats all, return
+
+5$:	TSTL	AP			; Check if POWERFAIL mode
+	BGEQ	7$			; Yes, skip next
+	JSB	G^IOC$RELOC_DDT		; Make offsets absolute system addresses
+7$:	MOVAL	DDB$L_UCB-UCB$L_LINK(R11),R10	; Get address of first UCB address
+	CLRL	R9			; Clear last CRB address
+10$:	MOVL	UCB$L_LINK(R10),R10	; Get address of next UCB
+	BEQL	DDBLOOP			; If zero, no more for this DDB
+	BBS	S^#DEV$V_MBX,UCB$L_DEVCHAR(R10),10$ ; Branch if mailbox
+;
+; Check to see if we must init all devices on all adaptors or on just
+; one specific adaptor.
+;
+	MOVL	UCB$L_CRB(R10),R4	; Point to CRB
+	TSTW	AP			; If AP neg, init all
+	BLSS	15$			; Init all
+	MOVL	CRB$L_INTD+VEC$L_ADP(R4),R0 ; Point to ADP
+	BEQL	10$			; No adaptor for this "device"
+	CMPW	AP,ADP$W_TR(R0)		; TR's match
+	BNEQ	10$			; No, look for others
+ 
+15$:	TSTL	AP			; Check if POWERFAIL mode
+	BLSS	17$			; No, do not set it
+	BISW	#UCB$M_POWER,UCB$W_STS(R10)	; Set power failed status
+17$:	CMPL	R4,R9			; Is address equal to last
+	BEQL	40$			; If yes, controller already initialized
+	MOVL	R4,R9			; Save CRB address
+	MOVL	R9,R8			; Copy primary CRB address
+	TSTL	CRB$L_LINK(R8)		; Slave controller?
+	BEQL	30$			; If equal, then no
+	MOVL	CRB$L_LINK(R8),R8	; Get link to secondary CRB
+30$:	MOVL	CRB$L_INTD+8(R8),R5	; Get address of IDB
+	BEQL	35$			; None, no hardware/adapter
+	MOVL	IDB$L_CSR(R5),R4	; Get address of controller CSR
+	MOVL	CRB$L_INTD+VEC$L_ADP(R8),R3 ; Get address of ADP
+	BEQL	35$			; If equal, then none
+	CMPW	#AT$_UBA,ADP$W_ADPTYPE(R3); Is this a UNIBUS adapter?
+	BNEQ	35$			; Branch if not
+	MOVL	ADP$L_CSR(R3),R6	; Get address of adapter configuration register
+	MOVL	R4,R0			; Get copy of CSR address
+	BSBW	EXE$TEST_CSR		; Check if CSR exists
+	BLBC	R0,70$			; Branch if CSR doesn't exist
+35$:	MOVL	R11,R6			; Set address of DDB for driver init
+	MOVL	CRB$L_INTD+VEC$L_INITIAL(R8),R0	; Initialize controller
+	BEQL	40$			; Branch if no controller initialization
+;
+; Enter controller initialization with:
+;	R4 - CSR (or 0 or systemid)
+;	R5 - IDB
+;	R6 - DDB
+;
+;	R8,R9,R10,R11 must be preserved.
+;
+	JSB	(R0)			; Call controller initialization
+40$:	MOVL	R10,R5			; Set device unit UCB address
+	MOVL	UCB$L_DDT(R5),R0	; Get address of DDT (from UCB)
+	MOVL	DDT$L_UNITINIT(R0),R1	; Get address of unit init.
+	CMPL	R1,#IOC$RETURN		; If equal to IOC$RETURN then
+	BNEQ	50$			; unit init. wasn't specified
+	MOVL	CRB$L_INTD+VEC$L_UNITINIT(R9),R1  ; So get it from CRB
+	BEQL	60$			; Not specified in CRB either
+	CLRL	R4			; Set up for possible class driver
+	MOVL	CRB$L_INTD+VEC$L_IDB(R9),R3	; Get primary controller IDB
+	BEQL	50$			; None, probably class driver
+	MOVL	(R3),R3			; Pick up primary CSR address
+	MOVL	@CRB$L_INTD+VEC$L_IDB(R8),R4	; And get secondary control register
+;
+; Enter unit initialization with:
+;	R3 - primary CSR (or 0)
+;	R4 - secondary CSR (equals primary CSR if none)
+;	R5 - UCB
+;	R4 through R11 must be preserved.
+;
+50$:	JSB	(R1)			; Call unit initialization
+60$:	BITW	#UCB$M_INT!UCB$M_TIM,-
+		UCB$W_STS(R5)		; Interrupt or timeout expected?
+	BEQL	65$			; If eql then no
+	BICW	#UCB$M_INT,UCB$W_STS(R5); Clear interrupt expected
+	BISW	#UCB$M_TIM,UCB$W_STS(R5); Set timeout expected
+	CLRL	UCB$L_DUETIM(R5)	; Now
+65$:	BRW	10$			; Next unit
+
+70$:	CLRL	R9			; Zap CRB to force CRB search
+	BICW	#UCB$M_ONLINE,UCB$W_STS(R10)	; Set unit offline
+	BRW	10$			; Continue search
+
+	.PAGE
+	.SBTTL	EXE$PWRTIMCHK - Check for reasonable interval since power recovery
+;++
+; Functional Description:
+;	EXE$PWRTIMCHK is called by driver initialization code to check for
+;	a sufficient interval since power recovery to expect devices to be
+;	ready again.  If the return from EXE$PWRTIMCHK indicates that the
+;	reasonable interval has not yet elapsed, the device driver may elect
+;	to wait for a while using EXE$PWRTIMCHK check the time.
+;
+; Calling Sequence:
+;	BSB/JSB	EXE$PWRTIMCHK
+;
+; Output Parameters:
+;	R0 - Low bit clear if interval expired.
+;--
+EXE$PWRTIMCHK::				;
+	CLRL	R0			; Assume interval expired
+	MFPR	#PR$_TODR,-(SP)		; Get current time of day
+	CMPL	W^EXE$GL_PWRDONE,(SP)+	; Check for time expired
+	BLEQU	10$			; Exit with low bit clear if expired
+	INCL	R0			; Else set low bit of R0
+10$:	RSB				;
+
+	.END				;

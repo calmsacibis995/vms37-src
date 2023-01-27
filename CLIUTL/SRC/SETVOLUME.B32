@@ -1,0 +1,848 @@
+MODULE setvol	(
+		IDENT = 'V03-000',
+    		ADDRESSING_MODE(EXTERNAL=GENERAL,
+    				NONEXTERNAL=LONG_RELATIVE)
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	Set Volume Command
+!
+! ABSTRACT:
+!
+!	This module processes the Set Volume command.
+!
+! ENVIRONMENT:
+!
+!	Vax native, privileged user mode
+!
+!--
+!
+! AUTHOR:	Gerry Smith	 	CREATION DATE: 3-Nov-1981
+!
+! MODIFIED BY:
+!
+!	V03-005	GAS0040		Gerry Smith		 2-Feb-1982
+!		Fix privilege checking to check for write access to
+!		the volume's index file.  Also, fix write bug that
+!		prevented modified home blocks to be written back.
+!
+!	V03-004	GAS0033		Gerry Smith		12-Jan-1982
+!		Fix various bugs.
+!
+!	V03-003	GAS0030		Gerry Smith		 1-Jan-1982
+!		Add /RETENTION, the default retention period for files
+!		created on a volume.
+!
+!	V03-002 GAS0026		Gerry Smith		18-Dec-1981
+!		Use shared message file, and lower fatal messages to
+!		simple error messages.
+!
+!	V03-001	GAS0025		Gerry Smith		14-Dec-1981
+!		Add /LOG qualifier 
+!
+!**
+
+LIBRARY	'SYS$LIBRARY:LIB';
+LIBRARY 'SYS$LIBRARY:CLIMAC';
+LIBRARY 'SYS$LIBRARY:TPAMAC';
+
+STRUCTURE
+    BBLOCK [O, P, S, E; N] =
+    	[N]
+    	(BBLOCK + O)<P,S,E>;
+
+!
+! ***** Note: The following macro violates the Bliss language definition
+! ***** in that it makes use of the value of SP while building the arg list.
+! ***** It is the opinion of the Bliss maintainers that this usage is safe
+! ***** from planned future optimizations.
+!
+! Macro to call the change mode to kernel system service.
+! Macro call format is "KERNEL_CALL (ROUTINE, ARG1, ARG2, ... )".
+!
+MACRO
+	KERNEL_CALL (R) =
+	    BEGIN
+	    EXTERNAL ROUTINE SYS$CMKRNL : ADDRESSING_MODE (ABSOLUTE);
+	    BUILTIN SP;
+	    SYS$CMKRNL (R, .SP, %LENGTH-1
+			%IF %LENGTH GTR 1 %THEN ,%REMAINING %FI)
+	    END%;
+
+
+FORWARD ROUTINE
+    set$volume,				! Main routine for volume
+    set_home,				! Modify the homeblock
+    set_ucbvcb : NOVALUE,		! Modify the UCB and VCB for the disk
+    read_homeblock;			! Find and read first good homeblock
+    
+
+EXTERNAL ROUTINE
+    lib$file_scan,			! Routine to get next directory
+    handler,				! Condition handler
+    check_privilege : NOVALUE,		! Routine to check for privilege
+    confirm_action,			! Routine to ask for confirmation
+    search_error,			! Where to go if file search fails
+    file_error,				! Where to go if file error occurs
+    cli_error,				! Where to go if CLI error
+    acc_act,				! ACCESSED action routine
+    data_act,				! DATA_CHECK action routine
+    ext_act,				! EXTENSION action routine
+    fprot_act,				! FILE_PROTECTION action routine
+    label_act,				! LABEL action routine
+    owner_act,				! OWNER_UIC action routine
+    retent_act,				! RETENTION action routine
+    user_act,				! USER_NAME action routine
+    vprot_act,				! PROTECTION action routine
+    window_act,				! WINDOWS action routine
+    checksum2,				! Compute checksum
+    get_channelucb,			! Routine to get address of UCB
+    lib$tparse,				! Parser
+    sys$fao;				! Formatted ASCII output
+
+!
+! External data references
+!
+EXTERNAL
+!
+! Data
+!
+    setfile$flags : BITVECTOR[32],		! Qualifier flags word
+    setfile$dflags : BITVECTOR[32],		! DATA_CHECK flags word
+    exte_value,					! EXTENSION value
+    uic_value,					! Owner UIC
+    group,					! UIC group number
+    member,					! UIC member number
+    worst_error,				! Worst error encountered
+!
+! SET dispatcher externals
+!
+    set$l_status,			! Status return for SET dispatcher
+    set$a_cliwork;			! CLI work area in SET dispatcher
+
+!
+! External literal references
+!
+EXTERNAL LITERAL
+    qual_access,			! ACCESSED bit
+    qual_data,				! DATA_CHECK bit
+    qual_exte,				! EXTENSION bit
+    qual_fprot,				! FILE_PROTECTION bit
+    qual_label,				! LABEL bit
+    qual_log,				! LOG bit
+    qual_owner,				! OWNER_UIC bit
+    qual_retent,			! RETENTION bit
+    qual_username,			! USER_NAME bit
+    qual_vprot,				! PROTECTION bit
+    qual_windows,			! WINDOWS bit
+
+    data_read,				! DATA_CHECK = READ
+    data_write,				! DATA_CHECK = WRITE
+    data_noread,			! DATA_CHECK = NOREAD
+    data_nowrite,			! DATA_CHECK = NOWRITE
+!
+! Error messages
+!
+    set$_facility,			! SET facility code
+    set$_hbread,			! Error reading homeblock
+    set$_hbwrite,			! Error writing homeblock
+    set$_modified,			! Volume modified
+    set$_nohome,			! Volume has no good home block
+    set$_notods2,			! Qualifier invalid for ODS1
+    set$_readerr,			! Error reading volume
+    set$_sysnotupd,			! Error updating ucb and vcb
+    set$_writeerr;			! Could not write to file
+
+!
+! Literal data definitions
+!
+LITERAL
+    true = 1,
+    false = 0;
+
+!
+! Define the CLI codes for SET VOLUME
+!
+
+$CLIQUALCODES  (stvl,
+		accessed,
+		data_check,
+		extension,
+		file_protection,
+		label,
+		log,
+		owner_uic,
+		protection,
+    		retention,
+		user_name,
+		windows);
+
+!
+! CLI command qualifier list
+!
+OWN
+    acc_desc:				! ACCESSED
+	$CLIQUALDESC(QDCODE = accessed,
+		     TRUACT = acc_act,
+		     SETLST = qual_access,
+		     QDFLGS = qdexpa),
+    dc_desc:				! DATA_CHECK
+	$CLIQUALDESC(QDCODE = data_check,
+		     TRUACT = data_act,
+		     SETLST = qual_data,
+		     QDFLGS = qdexpa),
+    exte_desc:				! EXTENSION
+	$CLIQUALDESC(QDCODE = extension,
+		     TRUACT = ext_act,
+		     SETLST = qual_exte,
+		     QDFLGS = qdexpa),
+    fp_desc:				! FILE_PROTECTION
+	$CLIQUALDESC(QDCODE = file_protection,
+		     TRUACT = fprot_act,
+		     SETLST = qual_fprot,
+		     QDFLGS = qdexpa),
+    label_desc:				!LABEL
+	$CLIQUALDESC(QDCODE = label,
+		     TRUACT = label_act,
+		     SETLST = qual_label,
+		     QDFLGS = qdexpa),
+    log_desc:				! LOG
+	$CLIQUALDESC(QDCODE = log,
+		     SETLST = qual_log),
+    own_desc:				! OWNER_UIC
+	$CLIQUALDESC(QDCODE = owner_uic,
+		     TRUACT = owner_act,
+		     SETLST = qual_owner,
+		     QDFLGS = qdexpa),
+    ret_desc:				! RETENTION
+	$CLIQUALDESC(QDCODE = retention,
+		     TRUACT = retent_act,
+		     SETLST = qual_retent,
+		     QDFLGS = qdexpa),
+    un_desc:				! USER_NAME
+	$CLIQUALDESC(QDCODE = user_name,
+		     TRUACT = user_act,
+		     SETLST = qual_username,
+		     QDFLGS = qdexpa),
+    vp_desc:				! PROTECTION
+	$CLIQUALDESC(QDCODE = protection,
+		     TRUACT = vprot_act,
+		     SETLST = qual_vprot,
+		     QDFLGS = qdexpa),
+
+    wind_desc:				! WINDOWS
+	$CLIQUALDESC(QDCODE = windows,
+		     TRUACT = window_act,
+		     SETLST = qual_windows,
+		     QDFLGS = qdexpa),
+    end_desc:
+	$CLIQUALEND,
+
+    qual_desc:				! Block that asks for qualifiers
+	$CLIREQDESC(RQTYPE = getqual,
+		    RQFLGS = absadr,
+		    QUALST = acc_desc,
+		    ERRACT = cli_error),
+
+    inp_desc:				! Block that gets next dir spec
+	$CLIREQDESC(RQTYPE = input1,
+		    RQFLGS = absadr,
+		    ERRACT = cli_error);
+
+!
+! Define storage for this module that must be global
+!
+GLOBAL
+    acc_value,					! ACCESSED value
+    fprot_value,				! FILE_PROTECTION value
+    label_value : VECTOR[2],			! LABEL label
+    vprot_value,				! PROTECTION value
+    retmin_value : VECTOR[2],			! Minimum retention period
+    retmax_value : VECTOR[2],			! Maximum retention period
+    user_value : VECTOR[2],			! USER_NAME 
+    window_value;				! WINDOWS
+
+!
+! Define own storage for this module
+!
+OWN
+    buffer : BLOCK[512,BYTE],		! Place for home block
+    acc_inc : BYTE,			! Increment to LRU limit
+    ods1 : BYTE,			! ODS1 indicator
+
+    FAB : $FAB (DNA = UPLIT BYTE ('[0,0]INDEXF.SYS'),
+		DNS = %CHARCOUNT ('[0,0]INDEXF.SYS'),
+		FAC = (get, put, bio),
+		SHR = (get, upi)),
+
+    RAB : $RAB (FAB = fab,
+		UBF = buffer,
+		USZ = 512);
+		
+
+GLOBAL ROUTINE set$volume (option_block,callback) =
+!++
+!
+! Functional description
+!
+!	This is the main control module for SET VOLUME.  It obtains the
+!	qualifiers and, for each volume specification, calls the routine
+!	that actually modifies the volume's home block.
+!
+! Calling sequence
+!
+!	CALL set$volume(option_block,callback)
+!
+! Input parameters
+!
+!	option_block = option descriptor block from the CLI
+!	callback = address of CLI callback routine
+!
+! Output parameters
+!	none
+!
+! Implicit outputs
+!	none
+!
+! Routine value
+!	none
+!
+! Side effects
+!	none
+!
+!--
+BEGIN
+
+
+LOCAL
+    vbn,				! Place to store vbn
+    ucb,				! Place to store UCB address
+    cluster,				! Cluster size of volume
+    desc : BBLOCK[dsc$c_s_bln],		! Descriptor for the volume name
+    volume_name : VECTOR[128,BYTE],	! Place to store the volume name
+    status;				! Status
+
+!
+! Establish a condition handler, that will remember the most severe
+! error, for return to the set command dispatcher.
+!
+ENABLE handler;
+
+!
+! Check that the image is running with appropriate privilege.
+!
+check_privilege();
+
+!
+! Get the command qualifiers.  By calling the CLI, the appropriate action
+! routine for each qualifier will be called, and the corresponding bit in
+! setfile$flags will be set.
+!
+
+IF NOT (status = (.callback)(qual_desc,
+			     set$a_cliwork,
+			     setfile$flags))
+THEN SIGNAL_STOP(.status);
+!
+! Since the /EXTENSION action routine for SET FILE is also used for SET 
+! VOLUME, and the defaults are different, it is necessary here to check the 
+! value of EXTE_VALUE.  If zero, then change it to the VOLUME default of 5
+!
+IF .setfile$flags[qual_exte] AND .exte_value EQL 0
+THEN exte_value = 5;
+
+!
+! For each volume specified, perform the operations requested.
+!
+
+inp_desc[cli$v_concatinp] = true;	! Initialize the input flag
+
+WHILE .inp_desc[cli$v_concatinp]	! For each volume specified,
+DO
+    BEGIN
+    (.callback)(inp_desc, set$a_cliwork, setfile$flags);! Get the volume name
+
+    CH$MOVE(.inp_desc[cli$w_rqsize],			! Copy the volume name
+	    .inp_desc[cli$a_rqaddr],			! to a local buffer in 
+	    volume_name);				! case a colon is needed
+
+    desc[dsc$a_pointer] = volume_name;			! Put the name in a
+    desc[dsc$w_length] = .inp_desc[cli$w_rqsize];	! descriptor
+
+    IF .volume_name[.inp_desc[cli$w_rqsize] - 1] NEQ ':'! If no colon at end,
+    THEN
+	BEGIN
+	desc[dsc$w_length] = .desc[dsc$w_length] + 1;	! Add a colon
+	volume_name[.inp_desc[cli$w_rqsize]] = ':' ;
+	END;
+
+    fab[fab$b_fns] = .desc[dsc$w_length];		! Stuff the FAB with
+    fab[fab$l_fna] = volume_name;			! the device name
+
+!
+! Open the index file for this volume
+!
+
+    IF NOT (status = $OPEN(FAB = fab))
+    THEN SIGNAL(set$_readerr,		! Error accessing
+    		1,
+    		desc,			! this disk
+    		.status)		! for this reason
+    ELSE IF NOT (status = $CONNECT(RAB = rab))
+    THEN SIGNAL(SET$_readerr,		! Error accessing
+    		1,
+    		desc,			! this disk
+    		.status)		! for this reason
+
+
+    ELSE
+	BEGIN
+!
+! Read a homeblock, and from it determine the structure level and cluster
+! size.
+!
+	IF NOT read_homeblock(cluster) THEN SIGNAL(set$_nohome)
+	ELSE
+	    BEGIN
+
+
+	    status = 0;			! Show that no homeblocks modified yet
+
+	    INCR vbn FROM 2 TO .cluster*3 DO
+		BEGIN
+!
+! Call the routine that reads, modifies, and writes the homeblock.  If 
+! successful, set STATUS = 1
+!
+		IF set_home(.vbn, desc) THEN status = 1;
+		IF .ods1 THEN EXITLOOP;	! Finished for ODS1
+		END;
+!
+! If STATUS = 1, then at least some of the homeblocks were good and were 
+! modified.  So, go ahead and change the I/O database
+!
+	    IF .status THEN		
+		BEGIN
+		LOCAL channel;
+		IF NOT (status = $ASSIGN(DEVNAM = desc,
+					 CHAN = channel))
+		THEN SIGNAL(set$_sysnotupd,		! Say I/O database
+    			    1,				! didn't get updated
+    			    desc,
+    			    .status)
+    		ELSE
+		    BEGIN
+		    ucb = KERNEL_CALL (GET_CHANNELUCB, .channel);
+		    KERNEL_CALL(SET_UCBVCB, .ucb);
+		    $DASSGN(CHAN = .channel);
+		    END;
+		IF .setfile$flags[qual_log]		! If /LOG, tell user
+		THEN SIGNAL (set$_modified, 1, desc);
+	    	END;
+!
+! Now close INDEXF.SYS, and loop.
+!
+	    END;			! End of READ_HOMEBLOCK block
+	END;				! End of ELSE block
+    $CLOSE(FAB = fab);
+    END;				! End of block for this volume
+!
+! Retrieve the worst error and return to the SET command dispatcher.
+!
+set$l_status = .worst_error OR sts$m_inhib_msg;
+RETURN true;
+END;
+
+ROUTINE read_homeblock(cluster) =
+!++
+!
+! This routine reads the first good home block of the volume.
+! In addition the cluster size and structure level are determined and stored.
+!
+! Outputs:
+!	cluster - cluster size
+!	ods1 - 0 => ODS2
+!	       1 => ODS1
+!
+!--
+BEGIN
+
+LOCAL
+    block,			! Temporary block count
+    status;			! Status
+
+!
+! Keep reading until we get a block that reads without errors and meets the 
+! criteria for a homeblock.
+!
+INCR block FROM 2 TO 100 DO
+    BEGIN
+    rab[rab$l_bkt] = .block;
+    IF (status = $READ (RAB = rab))
+    THEN
+	BEGIN
+	IF
+	    .buffer[hm2$b_struclev] EQL 2 AND
+	    .buffer[hm2$l_altidxlbn] NEQ 0 AND
+	    .buffer[hm2$w_cluster] NEQ 0 AND
+	    .buffer[hm2$w_homevbn] NEQ 0 AND
+	    .buffer[hm2$w_alhomevbn] NEQ 0 AND
+	    .buffer[hm2$w_altidxvbn] NEQ 0 AND
+	    .buffer[hm2$w_ibmapvbn] NEQ 0 AND
+	    .buffer[hm2$l_ibmaplbn] NEQ 0 AND
+	    .buffer[hm2$l_maxfiles] NEQ 0 AND
+	    .buffer[hm2$w_ibmapsize] NEQ 0 AND
+	    .buffer[hm2$w_resfiles] NEQ 0 AND
+	    checksum2(buffer, $BYTEOFFSET(hm2$w_checksum1)) AND
+	    checksum2(buffer, $BYTEOFFSET(hm2$w_checksum2))
+	THEN
+	    BEGIN
+	    ods1 = 0;				! This is an ODS2 volume
+	    .cluster = .buffer[hm2$w_cluster];	! with this cluster size
+	    IF .setfile$flags[qual_access]	! If /ACCESSED was specified,
+	    THEN				! compute the value to add
+		BEGIN				! to the LRU value in the VCB
+		acc_inc = 0;
+		IF .acc_value GTR .buffer[hm2$b_lru_lim]
+		THEN acc_inc = .acc_value - .buffer[hm2$b_lru_lim];
+		END;
+	    RETURN true;
+	    END
+	ELSE IF
+	    .buffer[hm1$w_struclev] EQL hm1$c_level1 AND
+	    .buffer[hm1$w_cluster] NEQ 0 AND
+	    .buffer[hm1$l_ibmaplbn] NEQ 0 AND
+	    .buffer[hm1$w_maxfiles] NEQ 0 AND
+	    .buffer[hm1$w_ibmapsize] NEQ 0 AND
+	    checksum2(buffer, $BYTEOFFSET(hm1$w_checksum1)) AND
+	    checksum2(buffer, $BYTEOFFSET(hm1$w_checksum2))
+	THEN
+	    BEGIN
+	    ods1 = 1;				! Volume is ODS1
+	    .cluster = 1;			! Dummy in a cluster size of 1
+	    IF .setfile$flags[qual_access]	! If /ACCESSED was specified,
+	    THEN				! compute the value to add
+		BEGIN				! to the LRU value in the VCB
+		acc_inc = 0;
+		IF .acc_value GTR .buffer[hm1$b_lru_lim]
+		THEN acc_inc = .acc_value - .buffer[hm1$b_lru_lim];
+		END;
+	    RETURN true;
+	    END;
+	END;					! End of read success block
+    END;					! End of INC block
+!
+! If here, then no good homeblock was found. Return a value of FALSE to
+! show that.
+!
+RETURN false;
+END;
+
+ROUTINE set_home (vbn, desc) =
+!++
+!
+! This routine reads a homeblock, modifies it, and writes it back to the
+! volume.
+!
+! Inputs:
+!	vbn - current vbn to read 
+!	ods1 - 0 => ODS2
+!    	       1 => ODS1
+!	desc - descriptor for the volume
+!
+!--
+BEGIN
+
+
+LOCAL status;			! General status return
+
+!
+! Stuff the RAB with the vbn number, and read the homeblock.
+!
+rab[rab$l_bkt] = .vbn;
+IF NOT (status = $READ (RAB = rab))
+THEN
+    BEGIN
+    SIGNAL(set$_hbread,		! Error reading homeblock
+	   1,
+	   .desc,		! for this volume
+	   .status);		! for this reason
+    RETURN false;
+    END;
+
+!
+! Change the ACCESSED (LRU) value, if requested
+!
+IF .setfile$flags[qual_access]
+THEN
+    IF .ods1 THEN buffer[hm1$b_lru_lim] = .acc_value	! For ODS1
+    ELSE buffer[hm2$b_lru_lim] = .acc_value;		! For ODS2
+
+!
+! If the DATA_CHECK qualifier is set, check to see if ODS1 or ODS2.  If ODS1, 
+! tell the user that DATA_CHECK is illegal.  Otherwise, set the bits.
+!
+IF .setfile$flags[qual_data]
+THEN IF .ods1					! If ODS1,
+THEN SIGNAL(set$_notods2,			! tell user no
+	    1,
+	    $DESCRIPTOR('DATA_CHECK'))
+ELSE
+    BEGIN
+    IF .setfile$dflags[data_read] THEN buffer[hm2$v_readcheck] = 1;
+    IF .setfile$dflags[data_noread] THEN buffer[hm2$v_readcheck] = 0;
+    IF .setfile$dflags[data_write] THEN buffer[hm2$v_writcheck] = 1;
+    IF .setfile$dflags[data_nowrite] THEN buffer[hm2$v_writcheck] = 0;
+    END;
+
+!
+! For the EXTENSION qualifier, if ODS1, the field is only a byte long, so
+! the greatest value is 255.  If the user specified a larger value, tell the
+! user and return.  Otherwise, make the change.
+!
+IF .setfile$flags[qual_exte]
+THEN IF .ods1
+THEN
+    BEGIN						! Start of ODS1
+    IF .exte_value GTR 255
+    THEN
+	BEGIN
+	SIGNAL(set$_facility^16 + shr$_valerr + sts$k_error);
+	RETURN false;
+	END
+    ELSE buffer[hm1$b_extend] = .exte_value;
+    END							! End of ODS1
+ELSE buffer[hm2$w_extend] = .exte_value;		! Change ODS2 extend
+
+!
+! For FILE_PROTECTION, the location is different, depending on which type of 
+! disk we have.
+!
+! Also, a word about the value in FPROT_VALUE.  The high word, 
+! FPROT_VALUE<16,16>, contains a mask indicating which groups are to
+! be changed (SYSTEM,OWNER,GROUP,WORLD), while the low word, 
+! FPROT_VALUE<0,16>, contains the complement of the new protection for each group.
+! Thus, if FPROT_VALUE<16,16> is zero, then nothing is to be changed and 
+! there's no need to go thru the Boolean algebra.
+!
+IF .setfile$flags[qual_fprot] AND (.fprot_value<16,16> NEQ 0)
+THEN
+    IF .ods1
+    THEN			! For ODS1
+    buffer[hm1$w_fileprot] = (.buffer[hm1$w_fileprot] AND NOT.fprot_value<16,16>)
+    			    OR (NOT.fprot_value<0,16> AND .fprot_value<16,16>)
+    ELSE			! For ODS2
+    buffer[hm2$w_fileprot] = (.buffer[hm2$w_fileprot] AND NOT.fprot_value<16,16>)
+    			    OR (NOT.fprot_value<0,16> AND .fprot_value<16,16>);
+
+!
+! In the case of LABEL, the label is stored in the same place on both ODS1 and 
+! ODS2 disks.  However, there is an additional field in ODS1 homeblocks, which 
+! contain the volume label, padded with zeroes instead of blanks.
+!
+If .setfile$flags[qual_label]
+THEN
+    BEGIN	
+    CH$COPY(.label_value[0],		! Copy label into VOLNAME2,
+	    .label_value[1],
+	    ' ',			! padding with spaces.
+	    12,
+	    buffer[hm1$t_volname2]);
+    IF .ods1
+    THEN CH$COPY(.label_value[0],	! For ODS1, also copy to VOLNAME,
+		 .label_value[1],
+		 0,			! padding with zeroes
+		 12,
+		 buffer[hm1$t_volname]);
+    END;
+
+!
+! For OWNER_UIC, the ODS2 homeblock allows a full 16 bits for group, and 
+! another 16 bits for member.  In the case of ODS1 disks, each of these fields 
+! is only 8 bits long.
+
+IF .setfile$flags[qual_owner]
+THEN
+    BEGIN
+    IF .ods1
+    THEN buffer[hm1$w_volowner] = (.uic_value<16,8> ^8) + .uic_value<0,8>
+    ELSE buffer[hm2$l_volowner] = .uic_value;
+    END;
+
+!
+! The retention period is something that only exists for ODS2 volumes.  If
+! this volume is not an ODS2 disk, then signal an error.  Otherwise, set the
+! default retention periods.
+!
+
+IF .setfile$flags[qual_retent]
+THEN
+    BEGIN
+    IF .ods1				! IF ODS1 disk
+    THEN SIGNAL(set$_notods2,		! Signal an error
+    		1,
+    		$DESCRIPTOR('/RETENTION'))	! Saying it can't be done
+    ELSE
+    	BEGIN
+	CH$MOVE(8, retmin_value, buffer[hm2$q_retainmin]);
+	CH$MOVE(8, retmax_value, buffer[hm2$q_retainmax]);
+	END;
+    END;
+    	
+!
+! PROTECTION, the volume protection, is also stored in two different places in 
+! the home blocks.  See the discussion of the protection value for 
+! FILE_PROTECTION, above.
+!
+IF .setfile$flags[qual_vprot] AND (.vprot_value<16,16> NEQ 0)
+THEN
+    IF .ods1
+    THEN			! For ODS1
+    buffer[hm1$w_protect] = (.buffer[hm1$w_protect] AND NOT.vprot_value<16,16>)
+    			    OR (NOT.vprot_value<0,16> AND .vprot_value<16,16>)
+    ELSE			! For ODS2
+    buffer[hm2$w_protect] = (.buffer[hm2$w_protect] AND NOT.vprot_value<16,16>)
+    			    OR (NOT.vprot_value<0,16> AND .vprot_value<16,16>);
+
+
+!
+! WINDOWS is also in two different places.
+!
+IF .setfile$flags[qual_windows]
+THEN
+    BEGIN
+    IF .ods1 THEN buffer[hm1$b_window] = .window_value	! For ODS1
+    ELSE buffer[hm2$b_window] = .window_value;		! For ODS2
+    END;
+
+!
+! The USER_NAME is in the same place for both types of home blocks.
+!
+IF .setfile$flags[qual_username]
+THEN CH$COPY(.user_value[0],		! Copy the username to the homeblock
+	     .user_value[1],
+	     ' ',			! padded with spaces
+	     12,
+	     buffer[hm2$t_ownername]);
+
+!
+! Recompute the checksums
+!
+
+checksum2(buffer, $BYTEOFFSET(hm2$w_checksum1));
+checksum2(buffer, $BYTEOFFSET(hm2$w_checksum2));
+
+!
+! Write the modified homeblock back to the disk
+!
+rab[rab$l_bkt] = .vbn;
+rab[rab$l_rbf] = buffer;
+IF NOT (status = $WRITE(RAB = rab))
+THEN
+    BEGIN
+    SIGNAL(set$_hbwrite,		! Error writing a homeblock
+	   1,
+	   .desc,			! to this disk
+	   .status);			! for this reason
+    RETURN false;			! don't mod database
+    END
+ELSE RETURN true;
+END;
+
+ROUTINE set_ucbvcb (ucb) : NOVALUE =
+!++
+!
+! This routine is called in kernel mode, to modify the fields in the UCB and 
+! VCB which correspond to changes made in the homeblock.  The address of the 
+! UCB is passed as the input argument.
+!
+!--
+BEGIN
+
+MAP ucb : REF BBLOCK;				! Define the UCB
+
+BIND
+    vcb = .ucb[ucb$l_vcb] : BBLOCK,		! Define the VCB
+    devchar = .ucb[ucb$l_devchar] : BBLOCK;	! and devchar longword
+
+!
+! Go thru the UCB and VCB, making the same changes to it that were made
+! to the homeblock.  Note that, if the LABEL qualifier is set, the volume 
+! label is changed in the homeblock and in the VCB, but the logical name
+! (DISK$label) is NOT CHANGED.
+!
+
+IF .setfile$flags[qual_access] AND (.acc_inc NEQ 0)
+THEN vcb[vcb$b_lru_lim] = .vcb[vcb$b_lru_lim] + .acc_inc;
+
+IF (.setfile$flags[qual_data] AND (.buffer[hm2$b_struclev] NEQ 1))
+THEN
+    BEGIN
+    IF .setfile$dflags[data_read] THEN devchar[dev$v_rck] = 1;
+    IF .setfile$dflags[data_noread] THEN devchar[dev$v_rck] = 0;
+    IF .setfile$dflags[data_write] THEN devchar[dev$v_wck] = 1;
+    IF .setfile$dflags[data_nowrite] THEN devchar[dev$v_wck] = 0;
+    END;
+
+IF .setfile$flags[qual_exte]
+THEN vcb[vcb$w_extend] = .exte_value;
+
+IF .setfile$flags[qual_fprot] AND (.fprot_value<16,16> NEQ 0)
+THEN vcb[vcb$w_fileprot] = (.vcb[vcb$w_fileprot] AND NOT .fprot_value<16,16>)
+    			  OR (NOT.fprot_value<0,16> AND .fprot_value<16,16>);
+
+IF .setfile$flags[qual_label]
+THEN CH$COPY(.label_value[0],
+	     .label_value[1],
+	     ' ',
+	     12,
+	     vcb[vcb$t_volname]);
+
+IF .setfile$flags[qual_owner]
+THEN ucb[ucb$l_ownuic] = .uic_value;
+
+IF .setfile$flags[qual_retent] AND (NOT .ods1)
+THEN
+    BEGIN
+    CH$MOVE(8, retmin_value, vcb[vcb$q_retainmin]);
+    CH$MOVE(8, retmax_value, vcb[vcb$q_retainmax]);
+    END;
+
+IF .setfile$flags[qual_vprot] AND (.vprot_value<16,16> NEQ 0)
+THEN ucb[ucb$w_vprot] = (.ucb[ucb$w_vprot] AND NOT .vprot_value<16,16>)
+    			OR (NOT.vprot_value<0,16> AND .vprot_value<16,16>);
+
+IF .setfile$flags[qual_windows]
+THEN vcb[vcb$b_window] = .window_value;
+
+RETURN;
+END;
+
+END
+ELUDOM

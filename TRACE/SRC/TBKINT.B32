@@ -1,0 +1,506 @@
+MODULE TBKINT (	IDENT = 'V03-000' ) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	DEBUG (DBG)
+!
+! ABSTRACT:
+!	This module opens the image file, maps the DST (if
+!	any) into P0 space, and supplies routines to read sequentially
+!	through the DST.
+!
+! Version	1.02
+!
+! ENVIRONMENT:
+!	This module runs on VAX under VAX/VMS, user mode, non-AST level.
+!
+! Author:	Carol Peters,	Creation Date:	11 January 1978
+!
+! MODIFIED BY:
+!		Dale Roedger, 08 December 1978
+!
+! Revision History:
+!
+!	02	18-jan-78	KGP	-Changed POSITON_DST to allow
+!					 an arg of 0 to imply rewind.
+!	03	25-jan-78	KGP	-More detailed error reporting
+!	04	28-feb-78	KGP	-POSITION_DST now knows about
+!					 whether the DST actually got
+!					 mapped or not (so that even when 
+!					 we can't map the DST we can still
+!					 produce a TRACEback).
+!					-FIND_DST finds the DST where it mapped
+!					 the first time, on subsequent TRACEs.
+!	05	01-mar-78	KGP	-FIND_DST is now NOVALUE - it either
+!					 does its thing or leaves things so
+!					 that a non-symbolic TRACE is done.
+!	06	8-mar-78	KGP	-Beefed up FIND_DST to return a
+!					 symbolic indication, and to print
+!					 proper error messages.
+!					-Completed the separation of TRACE
+!					 and DEBUG - even the REQUIRE files
+!					 and P-SECT names are now separate.
+!	07	27-mar-78	KGP	-Renamed TBK$PUTMSG to TBK$FAKE_MSG
+!	08	26-APR-78	DAR	Modified require and library directives
+!					for native build.
+!	09	15-JUN-78	DAR	Changed all DBG$ symbols to TBK$.
+!	1.01	08-DEC-78	DAR	In TBK$FIND_DST ask for the number of
+!					pages we need instead of 1 ($EXPREG).
+!	1.02	30-OCT-79	JBD	Changed CREMAPSEC to use EXPREG.
+!	3.01	03-Mar-82	 RT	Passed in channel number to TBK$RST_FIND
+!					so it doesn't have to open image file 
+!					again.
+!--
+
+! Table of contents:
+!
+FORWARD ROUTINE
+	tbk$find_dst,			! Find the DST and make it available.
+	tbk$get_dst_rec,		! Make a certain DST record available.
+	tbk$get_nxt_dst,		! Make the next DST record available.
+	tbk$positon_dst;		! Make a certain DST record available
+					!   and set up for tbk$get_nxt_dst
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+
+REQUIRE 'SRC$:TBKPCT.REQ';
+REQUIRE 'SRC$:TBKGEN.REQ';
+REQUIRE 'SRC$:TBKRST.REQ';
+REQUIRE 'SRC$:TBKSER.REQ';
+REQUIRE 'LIB$:TRACEMSG.REQ';
+
+!
+! MACROS:
+!
+
+!
+! EQUATED SYMBOLS:
+!
+LITERAL
+	TBK_INT1	= 0;	! Diagnostic variable for mapping the DST in.
+
+
+!
+! OWN STORAGE:
+!
+
+OWN
+	dst_begin_addr : INITIAL(1),		! virtual address where DST begins.
+						! 1 => the DST did not get mapped.
+	dst_end_addr,				! virtual address of last byte in DST.
+	dst_next_addr,				! virtual address where 'next' DST record begins.
+	exe_file : $FAB (FAC = GET),
+
+	exe_input : $RAB (USZ = 512);
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL ROUTINE
+	tbk$fake_msg : novalue,			! print TRACEback messages.
+	lib$_cremapsec;				! creates and maps a global section
+
+GLOBAL ROUTINE tbk$find_dst (imgfilchan, file_name, 
+			img_header_blk, symtab_sec_bnds) =
+
+!++
+! Functional description:
+!	If a DST exists for the specified image, open the image file,
+!	map in the DST, and set it up for get_nxt_dst,
+!	get_dst_rec, and positon_dst.
+!
+!	If the DST cannot be mapped, for any reason, things are
+!	left so that a non-symbolic TRACE happens along with the
+!	appropriate (warning) error message.
+!
+! Formal parameters:
+!	imgfilchan 	- the channel number that the image file is open on
+!	file_name	- a counted string to the file specification of
+!			  the image file.
+!	img_header_blk	- the address of a byte block that contains the
+!			  image header data needed to locate the DST.
+!	symtab_sec_bnds	-The address of a 2-longword vector where the
+!			 beginning and end of where the DST was mapped to
+!			 can be stored across TRACE invocations.
+!
+! Implicit inputs:
+!	The image activator has read in the image file header.
+!
+! Output parameters:
+!	none
+!
+! Implicit outputs:
+!	Three own variables are set up after the DST is mapped in.
+!		dst_begin_addr	- beginning of the DST
+!		dst_end_addr	- end of the DST
+!		dst_next_addr	- address of next DST record
+!
+! Routine value:
+!	TRUE, if we expect the TRACEback will be symbolic,
+!	FALSE, otherwise.
+!
+! Side effects:
+!	The image file is opened and closed. The DST is mapped into the
+!	top of P0 space.  When this is done, the beginning and ending
+!	addresses are 'stuffed' back into the 2-longword vector
+!	we are passed a pointer to (symtab_sec_bnds).
+!
+!--
+
+	BEGIN
+
+	MAP
+		symtab_sec_bnds : ref vector[,long],
+		file_name	: REF VECTOR [, BYTE],
+		img_header_blk	: REF BLOCK [, BYTE];
+
+	BIND
+		sym_tbl_data	= .img_header_blk + .img_header_blk [ihd$w_symdbgoff] : BLOCK [, BYTE],
+		exesecnam	= UPLIT BYTE (%ASCIC 'DST');
+
+	LITERAL
+		dst_end_address	= 1;
+
+	LOCAL
+		local_buffer	: VECTOR [10],
+		exe_sec_bounds	: VECTOR [2],
+		exesecnam_desc	: VECTOR [2],
+		exefilnam_desc	: VECTOR [2],
+		status;
+
+%if tbk_int1
+%then
+	$fao_tt_out('!/symtab sec bnds vector is at !XL, begin = !XL',
+		.symtab_sec_bnds,.symtab_sec_bnds[0]);
+%FI
+	! See if this is a second (or greater) invocation of
+	! TRACE so that we can just reuse the DST we mapped last time.
+
+	IF( .SYMTAB_SEC_BNDS[0] NEQ 0 )
+	THEN
+		BEGIN
+
+		! Set up to use the DST in the same way as we used
+		! it during the first invocation of TRACE.
+
+		dst_begin_addr = .symtab_sec_bnds [0];
+		dst_end_addr = .symtab_sec_bnds [1];
+		dst_next_addr = .dst_begin_addr;
+
+%IF TBK_INT1
+%THEN
+		$fao_tt_out('!/DST exists at !XL and ends at !XL',
+			.dst_begin_addr,.dst_end_addr);
+%FI
+		! The traceback will be symbolic.
+
+		return(TRUE);
+		END;
+
+	!++
+	! First invocation - try to map in the DST.
+	! See whether the image header has valid data in it.
+	!--
+
+%if tbk_int1
+%then
+	$fao_tt_out('!/symdbgoff is !XL',.img_header_blk[ihd$w_symdbgoff]);
+%FI
+	IF .img_header_blk [ihd$w_symdbgoff] EQL 0 
+	then
+		begin
+		TBK$fake_MSG(TBK$_BADHDR,0);
+	
+		! traceback will be non-symbolic.
+
+		return(false);
+		END;
+
+	!++
+	! Now that the image header seems to be a valid one, see whether
+	! it included DST data.
+	!--
+%if tbk_int1
+%then
+	$fao_tt_out('!/dstblks = !XL, dstvbn = !XL',
+		.sym_tbl_data[ ihs$w_dstblks ],
+		.sym_tbl_data[ ihs$l_dstvbn ]);
+%FI
+	IF .sym_tbl_data[ ihs$w_dstblks ] EQL 0
+	then
+		begin
+		TBK$fake_MSG(TBK$_BADDST,0);
+
+		! traceback will be non-symbolic
+	
+		return(false);
+		end;
+	!++
+	! There appears to be a DST. Do one more consistency
+	! check.
+	!--
+	IF NOT (.sym_tbl_data [ihs$l_dstvbn] GTR 2) 
+	then
+		begin
+		TBK$fake_MSG(TBK$_BADDSTVBN,.SYM_TBL_DATA[IHS$L_DSTVBN]);
+
+		! TRACEback will be non-symbolic.
+
+		return(false);
+		end;
+
+
+	!++
+	! Map the DST into P0 space.
+	!--
+	exe_sec_bounds[0] = 200;
+	exe_sec_bounds[1] = 400;
+	exesecnam_desc [0] = 3;
+	exesecnam_desc [1] = exesecnam;
+	exefilnam_desc [0] = .file_name [0];
+	exefilnam_desc [1] = file_name[1];
+	status = lib$_cremapsec (exe_sec_bounds
+				, exe_sec_bounds
+				, SEC$M_EXPREG
+				, exesecnam_desc
+				, 0
+				, 0
+				, .sym_tbl_data [ihs$w_dstblks]
+				, .sym_tbl_data [ihs$l_dstvbn]
+				, 0
+				, imgfilchan);
+	IF NOT .status
+	THEN
+		begin
+		TBK$fake_MSG(TBK$_BADDSTMAP,.status);
+
+		! TRACEback will be non-symbolic.
+		return(false);
+		end;
+
+	!++
+	! Now load up the addresses of the beginning and end of the DST.
+	!--
+	dst_begin_addr = .exe_sec_bounds [0];
+	dst_end_addr = .exe_sec_bounds [1];
+	dst_next_addr = .dst_begin_addr;
+
+%IF TBK_INT1
+%THEN
+	$fao_tt_out('!/DST mapped to begin at !XL and end at !XL',
+		.dst_begin_addr,.dst_end_addr);
+%FI
+	! Save the mapped-to addresses so that if TRACE
+	! is invoked a second time we don't have to redo
+	! this mapping.
+
+	symtab_sec_bnds[0] = .dst_begin_addr;
+	symtab_sec_bnds[1] = .dst_end_addr;
+
+	RETURN(true);
+	END;
+
+GLOBAL ROUTINE tbk$get_dst_rec (rec_id) =
+
+!++
+! Functional description:
+!	Make the indicated DST record available.
+!
+! Input parameters:
+!	rec_id	- The ID of the record to be fetched.
+!		  This ID must be one that was previously returned
+!		  by a call to tbk$get_nxt_dst.
+!
+! Implicit inputs:
+!	none
+!
+! Output parameters:
+!	none
+!
+! Implicit outputs:
+!	none
+!
+! Routine value:
+!	0, if the indicated record does not exist;
+!	the address of where it can now be referenced, otherwise.
+!
+! Side effects:
+!	The DST record is made available.
+!
+!--
+
+	BEGIN
+
+	BIND
+		dst_recrd = .rec_id : dst_record;
+
+	!++
+	! The record ID is the same as the virtual address at which it
+	! can be referenced. The next record, then, is simply the one that
+	! is virtually contiguous to this one, except for the last record.
+	! In that case, the convention is that the DST ended properly
+	! if a record is requested past the end marker, or if the count
+	! field for the supposed "next" record is 0.
+	!--
+	IF .rec_id EQL .dst_end_addr + 1
+	THEN RETURN 0;
+
+	!++
+	! Now that it is safe, check for zero length records.
+	!--
+	IF .dst_recrd [dstr_size] EQL 0
+	THEN RETURN 0;
+
+	!++
+	! Check that the ID is valid.  
+	!--
+	IF .rec_id LSSA .dst_begin_addr OR .rec_id GTRA .dst_end_addr
+	THEN RETURN 0
+	ELSE RETURN .rec_id 
+	END;
+
+GLOBAL ROUTINE tbk$get_nxt_dst (rec_id_ptr) =
+
+!++
+! Functional description:
+!	Make the next DST record available. Return a pointer by which it
+!	can be referenced, as well as an identifying code for it.
+!
+! Input parameters:
+!	none
+!
+! Implicit inputs:
+!	Current values of dst_begin_addr, dst_end_addr, and dst_next_addr.
+!
+! Output parameters:
+!	rec_id_ptr	- the identifier found for the DST record.
+!
+! Implicit outputs:
+!	dst_next_addr is advanced by one DST record.
+!
+! Routine value:
+!	0, if the indicated record does not exist; otherwise, the
+!	address of the record.
+!
+! Side effects:
+!	none
+!
+!--
+
+	BEGIN
+
+	MAP
+		rec_id_ptr : REF VECTOR [,LONG];
+
+	!++
+	! Since record IDs are the same as their virtual addresses, the
+	! next can be obtained in the same way than ANY one can be
+	! obtained. The only detail to fill in is passing back the ID
+	! for this next one.
+	!--
+	RETURN (rec_id_ptr [0] = tbk$positon_dst (.dst_next_addr));
+	END;
+
+GLOBAL ROUTINE tbk$positon_dst (rec_id) =
+
+!++
+! Functional description:
+!	Position dst_next_addr to point to the DST record following the
+!	record whose DST identifying code is passed to this routine as
+!	an argument.
+!
+! Input parameters:
+!	rec_id	- the identifying code of the DST record.
+!		- 0 => position DST to the beginning.
+!
+! Implicit inputs:
+!	dst_begin_addr and dst_end_addr
+!
+! Output parameters:
+!	none
+!
+! Implicit outputs:
+!	dst_next_addr is set to point to the DST record following the
+!	record whose identifying code is passed as an argument.
+!
+! Routine value:
+!	FALSE - if the DST didn't get mapped.
+!
+!	0, if the indicated record does not exist; otherwise,
+!	the address of the DST record.
+!
+! Side effects:
+!	"next" record is changed.
+!
+!--
+
+	BEGIN
+
+	LOCAL
+		rec_addr : REF dst_record;
+
+	!+
+	! Check for a 'rewind' command.
+	!-
+
+	IF( .REC_ID EQL 0 )
+	THEN
+		BEGIN
+		
+		! Reposition the 'dst' to the beginning.
+		! Note special return for when the
+		! DST didn't get mapped.
+
+		IF( (DST_NEXT_ADDR = .DST_BEGIN_ADDR) EQL 1 )
+		THEN
+			RETURN(FALSE);
+		RETURN(TRUE);
+		END;
+
+	!++
+	! get_dst_rec does most of the work - this routine just
+	! includes the side effect described above.
+	!--
+	rec_addr = tbk$get_dst_rec (.rec_id);
+	IF .rec_addr EQL 0
+	THEN RETURN 0;
+
+	!++
+	! Re-initialize the notion of 'next' DST record.
+	!--
+	dst_next_addr = .rec_addr + .rec_addr [dstr_size] + 1;
+	RETURN .rec_addr
+	END;
+
+END				!End of module
+ELUDOM

@@ -1,0 +1,2399 @@
+	.TITLE	SYSENQDEQ - ENQUEUE/DEQUEUE SYSTEM SERVICES
+	.IDENT	'V03-002'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY: EXECUTIVE, SYSTEM SERVICES
+;
+; ABSTRACT: 
+;	This module implements the $ENQ, $ENQW, and $DEQ system services.
+;
+; ENVIRONMENT: VAX/VMS
+;
+; AUTHOR: Steve Beckhardt,	 CREATION DATE: 30-Oct-1980
+;
+; MODIFIED BY:
+;
+;	V03-002	SRB0049		Steve Beckhardt			5-Apr-1982
+;		Changed handling of no lockids to always return
+;		SS$_NOLOCKID error.  Process is now never put into
+;		MWAIT waiting for a lockid.
+;
+;	V03-001	SRB0048		Steve Beckhardt			29-Mar-1982
+;		Changed handling of blocking ASTs on conversions so that
+;		a process cannot receive a blocking AST for a lock it has
+;		dequeued.
+;
+;	V02-014			Steve Beckhardt			1-Mar-1981
+;		If the LCK$M_DEQALL flag is set on a $DEQ, then verify
+;		that the lock id. is 0.  Return error if not.
+;
+;	V02-013			Maryann Hinden			19-Feb-1982
+;		Fix PROBE problem.
+;
+;	V02-012			Steve Beckhardt			 3-Feb-1981
+;		Added rotates to hash algorithm.  Also changed pool allocation
+;		to use SRP list instead of IRP list.
+;
+;	V02-011			Steve Beckhardt			13-Jan-1981
+;		Removed counters for total number of locks and resources.
+;		These are now computed by the MONITOR utility.
+;
+;	V02-010	MSH0001		Maryann Hinden			23-Dec-1981
+;		Have $DEQ return status correctly if DEQALL specified and
+;		no locks in list.  Correct count of total locks in
+;		system (PMS$GL_NUMLOCKS).
+;
+;	V02-009			Steve Beckhardt			30-Nov-1981
+;		Added support for new argument for $DEQ (FLAGS).  The
+;		only flag defined thus far is LCK$M_DEQALL which dequeues
+;		all locks at the specified access mode.  The previous way
+;		to do this (lock id of 0) will now return an error.
+;		Also added a depth check on the depth of the resource
+;		name tree.
+;
+;	V02-008			Steve Beckhardt			11-Nov-1981
+;		Made lock ids a resource and added code to wait for
+;		them if necessary.   Rearranged $ENQ error handling code.
+;
+;	V02-007			Steve Beckhardt
+;		Rewrote clearing of event flag in $ENQ to only clear if
+;		necessary.  Fixed allocation of pool to wait in caller's
+;		mode, if necessary.  Removed check in conversion code that
+;		disallowed conversions of parent locks.  This required that
+;		the $DEQ all locks code be rewritten.
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+
+;
+; EXTERNAL SYMBOLS:
+;
+
+;
+; MACROS:
+;
+	$ACBDEF				; ACB offsets
+	$CADEF				; Conditional assembly switches
+	$DYNDEF				; Structure type code definitions
+	$IPLDEF				; IPL definitions
+	$IRPDEF				; IRP offsets
+	$JIBDEF				; JIB offsets
+	$LCKDEF				; LCK definitions
+	$LKBDEF				; LKB offsets
+	$PCBDEF				; PCB offsets
+	$PRIDEF				; Priority increment class definitions
+	$PRVDEF				; Privilege bits
+	$PSLDEF				; PSL definitions
+	$RSBDEF				; RSB offsets
+	$RSNDEF				; Resource numbers
+;
+; EQUATED SYMBOLS:
+;
+
+;
+; Enqueue system service argument list offsets:
+;
+
+EFN = 4					; Event flag number
+LKMODE = 8				; Lock mode
+LKSB = 12				; Lock status block address
+FLAGS = 16				; Flags
+RESNAM = 20				; Resource name
+PARID = 24				; Parent id
+ASTADR = 28				; AST routine address
+ASTPRM = 32				; AST routine parameter
+BLKAST = 36				; Blocking AST address
+ACMODE = 40				; Access mode
+PROT = 44				; Protection mask
+
+;
+; Dequeue system service argument list offsets
+;
+
+LOCKID = 4				; Lock id
+VALBLK = 8				; Value block address
+DEQ_ACMODE = 12				; Access mode
+DEQ_FLAGS = 16				; Flags
+
+POOL_MASK = ^XF				; Pool allocation granularity mask
+
+;
+; OWN STORAGE:
+;
+
+	.PSECT	LOCKMGR,LONG
+
+
+;
+;		LOCK MODE COMPATIBILITY TABLE
+;
+;
+; The lock mode compatibility table represents the following
+; compatibility matrix.
+;
+;
+;	         |   NL  |   CR  |   CW  |   PR  |   PW  |   EX
+;	         | NL/SW |  R/SW |  W/SW |  R/SR |  W/SR |  W/NL   
+;	---------+-------+-------+-------+-------+-------+-------
+;	NL NL/SW |  yes  |  yes  |  yes  |  yes  |  yes  |  yes
+;	---------+-------+-------+-------+-------+-------+-------
+;	CR  R/SW |  yes  |  yes  |  yes  |  yes  |  yes  |   no   
+;	---------+-------+-------+-------+-------+-------+-------
+;	CW  W/SW |  yes  |  yes  |  yes  |   no  |   no  |   no   
+;	---------+-------+-------+-------+-------+-------+-------
+;	PR  R/SR |  yes  |  yes  |   no  |  yes  |   no  |   no   
+;	---------+-------+-------+-------+-------+-------+-------
+;	PW  W/SR |  yes  |  yes  |   no  |   no  |   no  |   no   
+;	---------+-------+-------+-------+-------+-------+-------
+;	EX  W/NL |  yes  |   no  |   no  |   no  |   no  |   no   
+;
+; The compatibility table makes the following assumptions regarding
+; the values of the lock modes.  These values cannot be changed without
+; changing the table
+
+	ASSUME	LCK$K_NLMODE  EQ  0
+	ASSUME	LCK$K_CRMODE  EQ  1
+	ASSUME	LCK$K_CWMODE  EQ  2
+	ASSUME	LCK$K_PRMODE  EQ  3
+	ASSUME	LCK$K_PWMODE  EQ  4
+	ASSUME	LCK$K_EXMODE  EQ  5
+
+LCK$COMPAT_TBL::
+	.BYTE	^B 111111
+	.BYTE	^B 011111
+	.BYTE	^B 000111
+	.BYTE	^B 001011
+	.BYTE	^B 000011
+	.BYTE	^B 000001
+
+	.SBTTL	EXE$ENQ - Enqueue system service
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine handles the $ENQ system service.
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/G	EXE$ENQ (actually called through the system service
+;	dispatcher)
+;
+; INPUT PARAMETERS:
+;
+;	EFN(AP)		Event flag number
+;	LKMODE(AP)	Lock mode
+;	LKSB(AP)	Address of lock status block
+;	FLAGS(AP)	Flags
+;	RESNAM(AP)	Address of descriptor of resource name
+;	PARID(AP)	Parent lock id
+;	ASTADR(AP)	Address of completion AST routine
+;	ASTPRM(AP)	AST parameter
+;	BLKAST(AP)	Address of blocking AST routine
+;	PROT(AP)	Protection mask
+;	ACMODE(AP)	Access mode
+;
+;	R4		Address of PCB
+;
+; OUTPUT PARAMETERS:
+;
+;	R0		Completion code
+;
+; COMPLETION CODES:
+;
+;   In R0:
+;
+;	SS$_NORMAL		Successful completion
+;	SS$_SYNCH		Synchronous successful completion
+;	SS$_ACCVIO		Access violation (on LKSB or resource name)
+;	SS$_BADPARAM		Bad lock mode
+;	SS$_IVLOCKID		Invalid lock id
+;	SS$_CVTUNGRANT		Attempted to convert an ungranted lock
+;	SS$_PARNOTGRANT		Parent lock not granted
+;	SS$_NOSYSLCK		No SYSLCK privilege (needed for a system lock)
+;	SS$_IVBUFLEN		Resource name length = 0 or > 31
+;	SS$_INSFMEM		Insufficient dynamic memory
+;	SS$_EXASTLM		Exceeded AST quota
+;	SS$_EXENQLM		Exceeded enqueue quota
+;	SS$_NOTQUEUED		Request was not queued
+;	SS$_EXDEPTH		Exceeded allowed depth of resource name tree
+;
+;   In LKSB:
+;
+;	SS$_NORMAL		Successful completion
+;	SS$_DEADLOCK		Deadlock detected
+;	SS$_ABORT		Lock was dequeued before being granted
+;
+;--
+
+	.PSECT	YEXEPAGED
+
+	.ENABL	LSB
+
+5$:	JSB	G^SCH$GETEFC		; Validate common event flag
+	BLBS	R0,10$			; Rejoin common code
+	RET				; Return - bad event flag
+
+	.IF NDF	LOADSW
+	.ENTRY	EXE$ENQ,^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	.IFF
+	.ENTRY	EXE$$ENQ,^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	.ENDC
+
+	; Verify event flag is ok
+
+	MOVL	EFN(AP),R3		; Get event flag number
+	CMPB	R3,#63			; Is it a local event flag?
+	BGTRU	5$			; No - validate common event flag
+
+10$:	; Probe lock status block.  For performance reasons, we assume the
+	; presence of a value block and probe 24 bytes.  If this fails,
+	; then we check to see if there isn't a value block and in
+	; that case probe 8 bytes.
+
+	ASSUME	FLAGS  EQ  LKSB+4
+	ASSUME	LCK$V_VALBLK  EQ  0
+
+	MOVQ	LKSB(AP),R8		; Get address of lock status block in 
+					; R8 and get flags in R9
+	IFWRT	#24,(R8),20$		; Branch if writable
+	BLBS	R9,60$			; Error if there's a value block
+	IFNOWRT	#8,(R8),60$		; No value block - br. if not writable
+
+20$:	; Get lock mode and check for legality
+
+	MOVZBL	LKMODE(AP),R7		; Get lock mode
+	CMPB	R7,#LCK$K_EXMODE	; Is it legal?
+	BGTRU	70$			; No - error
+
+	; Determine if this is a new lock request or a conversion
+
+	BBC	#LCK$V_CONVERT,R9,-	; Branch if new lock
+		NEW_LOCK
+	BRW	CONVERSION		; Conversion
+
+;
+; ERRORS:
+;
+
+60$:	BRW	ACCVIO			; Couldn't access LKSB
+
+70$:	MOVZWL	S^#SS$_BADPARAM,R0	; Bad lock mode
+	BRW	ERROR_EXIT_R0
+
+	.DSABL	LSB
+
+	.SBTTL	CONVERSIONS
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine handles lock mode conversions.
+;
+; CALLING SEQUENCE:
+;
+;	Branched to from $ENQ service
+;	RET back to caller
+;
+; INPUTS:
+;
+;	R3	Event flag number
+;	R4	Address of PCB
+;	R7	Lock mode
+;	R8	Address of LKSB
+;	R9	Flags
+;
+;	Caller's argument list (offsets from AP)
+;
+; OUTPUTS:
+;
+;	R0	Completion code
+;
+; IMPLICIT OUTPUTS:
+;
+;	Caller's lock status block gets final request status (perhaps
+;	aynchronously)
+;
+; COMPLETION CODES:
+;
+;   In R0:
+;
+;	SS$_NORMAL		Successful completion
+;	SS$_SYNCH		Synchronous successful completion
+;	SS$_IVLOCKID		Invalid lock id
+;	SS$_CVTUNGRANT		Attempted to convert an ungranted lock
+;	SS$_INSFMEM		Insufficient dynamic memory
+;	SS$_EXASTLM		Exceeded AST quota
+;	SS$_NOTQUEUED		Request was not queued
+;
+;   In LKSB:
+;
+;	SS$_NORMAL		Successful completion
+;	SS$_DEADLOCK		Deadlock detected
+;	SS$_ABORT		Lock was dequeued before being granted
+;--
+
+	.PSECT	LOCKMGR
+
+	.ENABL	LSB
+
+;
+; Errors:
+;
+
+10$:	MOVZWL	#SS$_CVTUNGRANT,R0	; Lock not currently granted
+12$:	BRW	ERROR_EXIT_R0
+
+14$:	BBS	#LKB$V_DCPLAST,R7,16$	; Branch if queued for completion AST
+	MOVL	R6,R5			; Queued for blocking AST only
+	JSB	G^SCH$REMOVACB		; Remove it
+	BRB	20$			; Continue with conversion
+16$:	SETIPL	#0			; Lower IPL
+	BSBW	FREE_LKB		; Free up LKB
+	BRB	20$			; Returns at IPL$_SYNCH
+
+CONVERSION:
+	; First get input arguments into registers (and on stack) because
+	; when they're stored we'll be at IPL$_SYNCH.
+
+	ASSUME	ASTPRM  EQ  ASTADR+4
+	ASSUME	LCK$V_VALBLK  EQ  0
+
+	MOVQ	ASTADR(AP),R10		; Fetch completion AST address (R10)
+					; and AST parameter (R11)
+	MOVL	BLKAST(AP),R2		; Fetch blocking AST address (R2)
+	BLBC	R9,15$			; Branch if no value block
+	MOVQ	8(R8),-(SP)		; Copy caller's value block onto stack
+	MOVQ	16(R8),-(SP)		; (in reverse order due to cache)
+
+15$:	; Get lock id, validate and convert to LKB address in R6.
+	; Note that our raising IPL to IPL$_SYNCH is tied to the assumptions
+	; stated in the routine FREE_LKB.
+
+	MOVL	4(R8),R6		; Fetch lock id
+	SETIPL	#IPL$_SYNCH		; Raise IPL
+	BSBW	VERIFYLOCKID		; Verify lock id and return LKB in R6
+	BLBC	R0,12$			; Error
+
+	; Verify lock is granted and that the LKB is not queued to deliver 
+	; an AST.  If ok, store input args in LKB.
+
+	ASSUME	LKB$W_STATUS  EQ  LKB$W_FLAGS+2
+	ASSUME	LKB$K_GRANTED  GT  0
+	ASSUME	LKB$L_BLKASTADR  EQ  LKB$L_CPLASTADR+4
+
+	TSTB	LKB$B_STATE(R6)		; Is the lock currently granted?
+	BLEQ	10$			; No - error
+	MOVL	R7,R1			; Move lock mode to R1
+	MOVZWL	LKB$W_STATUS(R6),R7	; Pick up current status
+	BITW	#LKB$M_DCPLAST-		; Is the ACB portion of the LKB in use?
+		!LKB$M_DBLKAST,R7	; (are we delivering a completion or
+	BNEQ	14$			; blocking AST?).  Branch if yes.
+
+20$:	MOVB	R3,LKB$B_EFN(R6)	; No, store event flag number
+	MOVL	R8,LKB$L_LKSB(R6)	; Store LKSB address
+	MOVL	LKB$L_RSB(R6),R8	; Get RSB address in R8
+	TSTL	LKB$L_BLKASTADR(R6)	; Blocking AST address specified?
+					; Note:  This tests the old contents
+					; of this field and must come before
+					; the new contents are stored.
+	BEQL	30$			; No
+	DECL	RSB$L_BLKASTCNT(R8)	; Decr. blocking AST count
+30$:	MOVL	R11,LKB$L_ASTPRM(R6)	; Store AST parameter 
+	MOVL	R2,R11			; Move blocking AST address
+	MOVQ	R10,LKB$L_CPLASTADR(R6)	; Store new completion AST address (R10)
+					; and new blocking AST address (R11)
+	MOVZWL	R9,LKB$W_FLAGS(R6)	; Store flags and zero status
+	MOVZBL	LKB$B_GRMODE(R6),R11	; Save old granted mode
+
+	.IF NE	CA$_MEASURE
+	INCL	G^PMS$GL_ENQCVT
+	.ENDC
+
+	; Remove this lock from the granted queue.  If it was the only one and
+	; if the conversion queue is also empty, then the conversion request 
+	; can be granted immediately.  This path is special cased because it
+	; is the normal case.
+
+	REMQUE	LKB$L_SQFL(R6),R0	; Remove lock from granted queue
+	BNEQ	40$			; Not the only one
+	MOVAL	RSB$L_CVTQFL(R8),R10	; It's the only granted lock
+	CMPL	(R10),R10		; Is conversion queue empty?
+	BNEQ	40$			; It's not - must check the longer way
+	BSBW	GRANT_LOCK_ALT		; It is - grant lock
+	ADDL	#8,R10			; Point to wait queue
+	CMPL	(R10),R10		; Is wait queue empty?
+	BEQL	60$			; Yes, exit with completion status in R0
+	MOVL	R0,R10			; No, save status in R10
+	BSBW	LCK$GRANTWTRS		; Try granting waiting locks
+	BRB	50$			; Exit with completion status in R10
+
+40$:	; There was at least one other holder of the resource so we have
+	; to check for compatibility the longer way.  The granted mode
+	; of this lock is compared with the conversion grant mode.  If,
+	; other than the head of the conversion queue, there are granted
+	; locks with higher lock modes than this lock, then there
+	; is no need to recompute the group grant mode or attempt to
+	; grant waiting conversions.
+
+	CMPB	R11,RSB$B_CGMODE(R8)	; Is granted mode = conv. grant mode?
+	BEQL	45$			; Yes
+	MOVZBL	RSB$B_GGMODE(R8),R5	; No, get group grant mode
+	BBC	R1,LCK$COMPAT_TBL[R5],80$ ; Branch if not compatible
+	BSBW	GRANT_LOCK		; Grant the lock
+	BRB	60$			; Exit with completion status in R0
+
+45$:	BSBW	COMPUTE_GGMODE		; Compute new group grant mode in R5
+	BBC	R1,LCK$COMPAT_TBL[R5],80$ ; Branch if not compatible 
+	MOVB	R5,RSB$B_GGMODE(R8)	; Store group grant mode in RSB
+	MOVB	R5,RSB$B_CGMODE(R8)	; Also store conversion grant mode
+	BSBW	GRANT_LOCK		; Grant lock
+	MOVL	R0,R10			; Save completion status in R10
+	BSBW	LCK$GRANTCVTS		; Try granting conversions and waiters
+50$:	MOVL	R10,R0			; Restore completion status to R0
+
+60$:	; The conversion was performed synchronously.  Completion
+	; status is in R0.  If we converted down from PW or EX then copy
+	; the caller's value block (if specified) into the RSB.
+
+	ASSUME	LCK$V_VALBLK  EQ  0
+
+	BLBC	R9,70$			; Branch if no value block specified
+	CMPB	R11,LKB$B_GRMODE(R6)	; Was conversion to a lower lock mode?
+	BLSSU	75$			; No
+	CMPB	R11,#LCK$K_PWMODE	; Yes, was old mode PW or higher?
+	BLSSU	70$			; No
+	MOVQ	(SP)+,RSB$Q_VALBLK+8(R8); Yes, copy caller's value block to RSB
+	MOVQ	(SP)+,RSB$Q_VALBLK(R8)
+70$:	BRW	NOSTORE_VALBLK
+75$:	BRW	STORE_VALBLK
+
+80$:	; The conversion cannot be granted.  Queue the request
+	; unless the noqueue bit is set.  If the conversion queue is empty 
+	; then R5 contains the new conversion grant mode.
+
+	BBS	#LCK$V_NOQUEUE,R9,85$	; Branch if noqueue is set
+	MOVB	R1,LKB$B_RQMODE(R6)	; Store requested mode
+	BSBW	QUEUECVT		; Insert onto conversion queue, etc.
+	BRW	QUEUED_EXIT
+
+85$:	; The request is not to be queued.  Insert back onto the
+	; granted queue.  R7 contains old LKB$W_STATUS.
+
+	.IF NE	CA$_MEASURE
+	INCL	G^PMS$GL_ENQNOTQD
+	.ENDC
+
+	INSQUE	LKB$L_SQFL(R6),-	; Put lock back on granted queue
+		RSB$L_GRQFL(R8)
+	TSTL	LKB$L_BLKASTADR(R6)	; Blocking AST address specified?
+	BEQL	95$			; No
+	INCL	RSB$L_BLKASTCNT(R8)	; Incr. blocking AST count
+					; Note:  The new blocking AST address
+					; is now being used - not the one
+					; before the attempted conversion.
+	BBC	#LKB$V_DBLKAST,R7,95$	; Branch if blocking AST wasn't queued
+	MOVL	R6,R5
+	BSBW	QUEUE_BLKAST		; Requeue blocking AST
+95$:	MOVZWL	#SS$_NOTQUEUED,R0	; Store status
+	BRW	ERROR_EXIT_R0		; Exit
+
+	.DSABL	LSB
+
+	.SBTTL	NEW_LOCK - New lock request (not conversion)
+
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine handles requests for new locks, as opposed to
+;	conversions.  This routine eventually branches to NEW_RESOURCE
+;	or OLD_RESOURCE depending on whether the resource already
+;	exists or not.
+;
+; CALLING SEQUENCE:
+;
+;	Branched to from $ENQ service
+;	RET back to caller
+;
+; INPUTS:
+;
+;	R3	Event flag number
+;	R4	Address of PCB
+;	R7	Lock mode
+;	R8	Address of LKSB
+;	R9	Flags
+;
+;	Caller's argument list (offsets from AP)
+;
+; OUTPUTS:
+;
+;	R0	Completion code
+;
+; IMPLICIT OUTPUTS:
+;
+;	Caller's lock status block gets final request status (perhaps
+;	aynchronously)
+;
+; COMPLETION CODES:
+;
+;   In R0:
+;
+;	SS$_NORMAL		Successful completion
+;	SS$_SYNCH		Synchronous successful completion
+;	SS$_IVLOCKID		Invalid lock id
+;	SS$_ACCVIO		Access violation (on resource name)
+;	SS$_PARNOTGRANT		Parent lock not granted
+;	SS$_NOSYSLCK		No SYSLCK privilege (needed for a system lock)
+;	SS$_IVBUFLEN		Resource name length = 0 or > 31
+;	SS$_INSFMEM		Insufficient dynamic memory
+;	SS$_EXENQLM		Exceeded enqueue quota
+;	SS$_NOTQUEUED		Request was not queued
+;
+;   In LKSB:
+;
+;	SS$_NORMAL		Successful completion
+;	SS$_DEADLOCK		Deadlock detected
+;	SS$_ABORT		Lock was dequeued before being granted
+;--
+
+	.PSECT	YEXEPAGED
+
+	.ENABL	LSB
+
+;
+; Errors:
+;
+
+ACCVIO:	MOVZWL	S^#SS$_ACCVIO,R0	; Access violation on res. name or LKSB
+	BRB	8$
+2$:	MOVZWL	#SS$_IVBUFLEN,R0	; Invalid length for resource name
+	BRB	8$
+6$:	MOVZWL	#SS$_EXENQLM,R0		; Exceeded enqueue quota
+8$:	BRW	ERROR_EXIT_R0
+
+NEW_LOCK:
+
+	; Get pointer to resource name, probe it, and check the length
+	; for legality (0 < length <= RSB$K_MAXLEN).
+
+	MOVL	RESNAM(AP),R0		; Get address of resource name descriptor
+	IFNORD	#8,(R0),ACCVIO		; Branch if descriptor not readable
+	MOVQ	(R0),R10		; Get length (R10) and address (R11)
+	MOVZWL	R10,R10			; Clear top half of length
+	BEQL	2$			; Error, length is zero
+	ASSUME 	RSB$K_MAXLEN LE 512
+	CMPL	R10,#RSB$K_MAXLEN	; Is length > maximum allowed?
+	BGTRU	2$			; Yes, error, length is too big
+	IFNORD	R10,(R11),ACCVIO	; Branch if string not readable
+	
+	; Check enqueue quota and allocate a lock block
+	; NOTE:  There is an implicit assumption here (unchecked!) that
+	;	 the minimum size of an SRP is 96 bytes.
+
+	ASSUME	LKB$K_LENGTH  LE  96
+	ASSUME	LKB$B_TYPE  EQ  LKB$W_SIZE+2
+
+	SETIPL	#IPL$_ASTDEL		; Raise IPL (to allocate pool)
+	MOVL	PCB$L_JIB(R4),R5	; Get pointer to JIB
+	TSTW	JIB$W_ENQCNT(R5)	; Is there enough quota remaining?
+	BLEQ	6$			; No - error
+	MOVAL	G^IOC$GL_SRPFL,R0	; *** Combine this and the following 
+					; instruction when loading is resolved
+	REMQUE	@(R0),R2		; Try lookaside list
+	BVC	10$			; Have one
+	MOVZWL	#LKB$K_LENGTH,R1	; List empty - do it the hard way
+	CLRL	R0			; No cleanup routine needed
+	JSB	G^EXE$ALONPAGWAIT	; Allocate; wait if necessary
+	BLBC	R0,8$			; None there and resource wait off
+10$:	MOVL	R2,R6			; R6 will point to LKB
+	MOVL	#<DYN$C_LKB@16>!-	; Store size and type fields
+		LKB$K_LENGTH,LKB$W_SIZE(R6)
+
+	; Fill in various fields in LKB
+
+	ASSUME	ASTPRM  EQ  ASTADR+4
+	ASSUME	LKB$W_STATUS  EQ  LKB$W_FLAGS+2
+	ASSUME	LKB$B_GRMODE  EQ  LKB$B_RQMODE+1
+
+	MOVZBW	R7,LKB$B_RQMODE(R6) 	; Store req. mode; clear granted mode
+	MOVL	R8,LKB$L_LKSB(R6)	; Store LKSB address
+	MOVZWL	R9,LKB$W_FLAGS(R6)	; Store flags and zero status
+	MOVB	EFN(AP),LKB$B_EFN(R6)	; Store event flag number
+	MOVL	ASTADR(AP),-		; Store completion AST address
+		LKB$L_CPLASTADR(R6)
+	MOVL	BLKAST(AP),-		; Store blocking AST address
+		LKB$L_BLKASTADR(R6)
+	MOVL	ASTPRM(AP),-		; Store AST parameter
+		LKB$L_ASTPRM(R6)
+	MOVL	PCB$L_PID(R4),-		; Store PID
+		LKB$L_PID(R6)
+	CLRL	LKB$L_REFCNT(R6)	; Clear sub LKB reference count
+
+	; Allocate a resource block (RSB).  This is done now because the
+	; resource name must be copied from the caller's buffer to a system
+	; one before it is used.  It is copied right into the
+	; resource block because the common case is that the resource does
+	; not currently exist.  If we later find the resource, this RSB
+	; will be deallocated.
+
+	MOVAB	RSB$K_LENGTH(R10),R1	; Add length of name to fixed size 
+	CMPL	R1,IOC$GL_SRPSIZE	; Will it fit in a SRP?
+	BGTRU	15$			; No
+	MOVAL	G^IOC$GL_SRPFL,R0	; *** Combine this and the following 
+					; instruction when loading is resolved
+	REMQUE	@(R0),R2		; Try lookaside list
+	BVC	35$			; Have one
+15$:	MOVAB	W^CLEANUP4,R0		; List empty or RSB too big.
+					; Set address of cleanup routine
+	JSB	G^EXE$ALONPAGWAIT	; and allocate.  Wait if necessary.
+	BLBS	R0,35$			; Have one
+					; No pool - fall through to ...
+;
+; Errors:
+;
+
+	CLRL	R8			; Indicate no RSB to deallocate
+	BRB	30$			; Deallocate LKB and return
+23$:	MOVZWL	#SS$_PARNOTGRANT,R0	; Parent lock not granted
+25$:	MOVL	R3,R6			; Restore address of LKB
+30$:	MOVL	R0,R11			; Save completion code
+	BSBW	CLEANUP3		; Deallocate LKB and RSB; then exit
+	BRB	34$
+33$:	MOVZWL	#SS$_NOSYSLCK,R11	; No privilege for system lock
+	BSBW	CLEANUP2		; Cleanup
+34$:	BRW	ERROR_EXIT_R11
+
+
+35$:	; Continue building RSB and LKB
+
+	ASSUME	RSB$B_TYPE  EQ  RSB$W_SIZE+2
+	ASSUME	RSB$B_DEPTH  EQ  RSB$B_TYPE+1
+
+	MOVZWL	R1,RSB$W_SIZE(R2)	; Store size of RSB and zero depth
+	MOVL	R2,R8			; R8 will point to RSB
+; *** only if PROT is implemented:
+;	MOVW	PROT(AP),RSB$W_PROT(R8)	; Store protection mask in RSB
+
+	; Get parent id and convert to parent LKB if non-zero.  If a parent is
+	; specified get parent RSB address (in R7) and store access mode
+	; from parent LKB.  Otherwise, R7 = 0 and store access mode from
+	; argument list (maximized, of course).
+
+	ASSUME	LKB$B_RMOD  EQ  ACB$B_RMOD
+	ASSUME	LKB$M_NODELETE  EQ  ACB$M_NODELETE
+	ASSUME	LKB$K_GRANTED  GT  0
+
+	MOVL	R6,R3			; Save LKB address
+	CLRL	R7			; Assume no parent RSB
+	MOVL	PARID(AP),R6		; Get parent id
+	BEQL	45$			; Branch if no parent specified
+	BSBW	VERIFYLOCKID		; Verify lock id and return LKB in R6
+	BLBC	R0,25$			; Error
+	TSTB	LKB$B_STATE(R6)		; Is parent lock granted?
+	BLEQ	23$			; No - error
+	MOVL	LKB$L_RSB(R6),R7	; Yes, get parent RSB address
+	BICB3	#^C<3>,LKB$B_RMOD(R6),R0; Get parent's access mode
+	INCL	LKB$L_REFCNT(R6)	; Increment parent's sub LKB ref. count
+	BRB	50$
+45$:	BICL3	#^C<3>,ACMODE(AP),R0	; No parent - get specified access mode
+	JSB	G^EXE$MAXACMODE		; Maximize with previous mode
+50$:	BISB3	#LKB$M_NODELETE,R0,-	; Store access mode in LKB and set
+		LKB$B_RMOD(R3)		; no delete bit
+	MOVL	R6,LKB$L_PARENT(R3)	; Store parent LKB ptr in new LKB
+	MOVL	R3,R6			; Restore LKB address
+
+	; R0 (low byte) contains access mode; R7 contains parent RSB address.
+	; Build composite group number, access mode and resource name
+	; length for RSB.
+
+	ASSUME	RSB$B_RMOD  EQ  RSB$W_GROUP+2
+	ASSUME  RSB$B_RSNLEN  EQ  RSB$B_RMOD+1
+
+	ASHL	#8,R10,R1		; Put length in second byte of R1
+	MOVB	R0,R1			; Put access mode in first byte
+	ASHL	#16,R1,R1		; Move both to high word
+	BBS	#LCK$V_SYSTEM,R9,55$	; Branch if system name
+	MOVW	PCB$W_GRP(R4),R1	; Group name - store group number
+	BRB	57$
+55$:	CMPB	R0,#PSL$C_EXEC		; System name - allow without priv.
+					; if request is EXEC mode or better
+	BLEQU	56$
+	IFNPRIV	SYSLCK,33$		; SUPER or USER mode needs privilege
+56$:	BISL	#<RSB$M_SYSNAM@16>,R1	; Set system bit
+57$:	MOVL	R1,RSB$W_GROUP(R8)	; Store it all in RSB
+
+	; Decrement enqueue quota and and copy resource name to RSB.
+
+	DECW	JIB$W_ENQCNT(R5)	; Decrement enqueue count remaining
+	MOVC3	R10,(R11),RSB$T_RESNAM(R8) ; Copy resource name to RSB
+					; (R0 - R5 not valid anymore)
+	.IF NE	CA$_MEASURE
+	INCL	G^PMS$GL_ENQNEW
+	.ENDC
+
+	BRW	75$			; Branch to nonpageable code
+
+	.PSECT	LOCKMGR
+
+	; No lock ids - Either return an error or cleanup and wait
+	; in caller's access mode for a lockid.
+
+70$:	BSBW	CLEANUP1		; Cleanup (deallocate LKB, RSB, etc.)
+					; (puts PCB address in R4)
+	BRB	72$			; Exit with error
+					; Following MWAIT code not used
+	BBS	#PCB$V_SSRWAIT,-	; Br. if resource wait disabled
+		PCB$L_STS(R4),72$
+	MOVQ	8(SP),AP		; Restore pre-call AP and FP (Note:
+					; this assumes stack is at entry depth)
+	ADDL	S^#EXE$C_CMSTKSZ,SP	; Clean call frame off stack
+	SUBL	#4,(SP)			; Back up saved PC to point to CHMK
+	MOVZBL	#RSN$_LOCKID,R0		; Set lockid resource number
+	JMP	G^SCH$RWAIT		; Wait for resource
+
+72$:	MOVZWL	#SS$_NOLOCKID,R0	; Set error status
+	BRW	ERROR_EXIT_R0
+
+75$:	; Continue normal path here.
+	; Allocate a lock id and point the id slot to this LKB.
+
+	SETIPL	#IPL$_SYNCH		; Raise IPL - Can't reference caller's
+					; address space after this point
+	MOVL	G^LCK$GL_IDTBL,R1	; Get address of lock id table
+	MOVL	G^LCK$GL_NXTID,R0	; Get next lock id
+	BEQL	70$			; No more - back up and wait
+	MOVL	(R1)[R0],-		; Have one; update ptr to next free id
+		G^LCK$GL_NXTID
+	MOVL	R6,(R1)[R0]		; Set lock id to point to LKB
+	MOVL	R0,LKB$L_LKST2(R6)	; Store lock id in 2nd longword of LKSB
+
+	; Now hash resource name and search hash table for a matching
+	; name and parent RSB address.
+
+	BSBW	SEARCH_HASHTBL		; Hash and search the table for a match
+	BLBS	R0,NEW_RESOURCE		; Didn't find one
+					; Found one - fall through to ...
+
+
+	.DSABL	LSB
+
+	.PSECT	LOCKMGR
+
+OLD_RESOURCE:
+	; Found a matching resource block (RSB).  Address of RSB is in R5.
+	; Address of LKB is in R6.  First deallocate the temporary RSB 
+	; pointed to by R8.  If anyone is waiting 
+	; (in either the waiting queue or the conversion queue), then 
+	; this request must also wait.  If no one is waiting, then this 
+	; lock can be granted if it is compatible with the group grant mode.
+
+	MOVL	R8,R0
+	JSB	G^EXE$DEANONPAGED	; Deallocate temporary RSB
+	MOVL	R5,R8			; Use R8 from now on for RSB address
+;	check protection - could be a problem since that code pages
+;	BLBC	R0,NOT_QUEUED_R0	; Status in R0
+	MOVL	R8,LKB$L_RSB(R6)	; Store RSB pointer in LKB
+
+	ASSUME	RSB$L_WTQFL  EQ  RSB$L_CVTQFL+8
+
+	MOVAL	RSB$L_CVTQFL(R8),R0	; Get address of conversion queue
+	CMPL	R0,(R0)			; Queue empty?
+	BNEQ	76$			; No
+	ADDL	#8,R0			; Get address of wait queue
+	CMPL	R0,(R0)			; Queue empty?
+	BNEQ	76$			; No
+
+	; No waiting requests; is the lock compatible?
+
+	MOVZBL	LKB$B_RQMODE(R6),R1	; Get lock mode
+	MOVZBL	RSB$B_GGMODE(R8),R5	; Get group grant mode
+	BBC	R1,LCK$COMPAT_TBL[R5],76$ ; Branch if incompatible
+
+	; Lock can be granted
+
+	BSBW	GRANT_LOCK		; Returns status in R0
+	BRW	SYNC_EXIT
+
+76$:	; Request cannot be granted due to other waiters or incompatibility.
+	; The request gets queued unless the user requested that it not
+	; be queued if it cannot be granted.
+
+	BBS	#LCK$V_NOQUEUE,R9,80$	; Br. if request should not be queued
+	MOVL	G^SCH$GL_CURPCB,R4	; Get PCB address
+	BSBW	QUEUEWAIT		; Insert lock on wait queue, etc.
+	BRW	QUEUED_EXIT		; Exit system service
+
+80$:	; Request is not to be queued.  Clean up and return status in R0.
+
+	.IF NE	CA$_MEASURE
+	INCL	G^PMS$GL_ENQNOTQD
+	.ENDC
+
+	MOVZWL	#SS$_NOTQUEUED,R11	; Status
+	BRW	NOT_QUEUED
+
+	.PSECT	LOCKMGR
+
+NEW_RESOURCE:
+	; Resource does not exist, so create it.  Register usage is:
+	;
+	;	R6	Address of LKB
+	;	R7	Address of parent RSB (or 0 if no parent)
+	;	R8	Address of RSB being created
+	;	R9	Flags
+	;	R11	Address of last RSB in hash chain
+
+85$:	MOVB	#DYN$C_RSB,-		; Store type field
+		RSB$B_TYPE(R8)
+	MOVL	R8,LKB$L_RSB(R6)	; Store RSB pointer in LKB
+
+	; Store pointer to parent RSB, incr. sub-RSB reference count
+	; and check for maximum depth of resource name tree.
+
+	MOVL	R7,RSB$L_PARENT(R8)	; Store parent RSB pointer
+	BEQL	90$			; No parent
+	ADDB3	#1,RSB$B_DEPTH(R7),R0	; Add 1 to parent's depth
+	CMPB	R0,G^LCK$GB_MAXDEPTH	; Is it equal to maximum allowed?
+	BGEQU	DEPTH_ERROR		; Yes - error
+	MOVB	R0,RSB$B_DEPTH(R8)	; No, store depth in sub RSB
+	INCL	RSB$L_REFCNT(R7)	; Increment parent's sub RSB ref. count
+
+90$:	; Insert RSB into hash chain.  R11 points to previous entry 
+	; which was, until now, the last one in the chain.
+
+	MOVL	R8,RSB$L_HSHCHN(R11)	; Make previous entry point to this one
+	CLRL	RSB$L_HSHCHN(R8)	; This one now ends the chain
+	MOVL	R11,RSB$L_HSHCHNBK(R8)	; Back pointer points to previous one
+
+	; Fill in remaining fields in RSB
+
+	ASSUME	RSB$L_BLKASTCNT  EQ  RSB$L_REFCNT+4
+	ASSUME	RSB$L_CVTQFL  EQ  RSB$L_GRQFL+8
+	ASSUME	RSB$L_WTQFL  EQ  RSB$L_CVTQFL+8
+
+; *** Store UIC from PCB??? (R4 NOT VALID)
+	CLRQ	RSB$L_REFCNT(R8)	; Clear sub RSB reference count and
+					; blocking AST count 
+	MOVAL	RSB$L_GRQFL(R8),R0	; Initialize all three queue headers
+	MOVL	R0,R1
+	MOVL	R0,(R1)+		; Granted queue
+	MOVAQ	(R0)+,(R1)+
+	MOVL	R0,(R1)+		; Conversion queue
+	MOVAQ	(R0)+,(R1)+
+	MOVL	R0,(R1)+		; Waiting queue
+	MOVL	R0,(R1)
+	CLRQ	RSB$Q_VALBLK(R8)	; Clear value block
+	CLRQ	RSB$Q_VALBLK+8(R8)
+
+	MOVZBL	LKB$B_RQMODE(R6),R1	; Get requested lock mode
+	BSBW	GRANT_LOCK_ALT		; Grant lock
+; *** NEXT INSTRUCTION REQUIRED IF PROT IS IMPLEMENTED ***
+;	MOVW	#SS$_CREATED,-		; Store created status in LKSB
+;		LKB$L_LKST1(R6)
+
+SYNC_EXIT:
+	; The request has been satisfied synchronously.  Status is already
+	; in R0 and LKB$L_LKST1.  Insert the lock onto the head of the
+	; lock list in the PCB and store value block if specified.
+	; Note: Conversions should not use this exit path as they are
+	; already on the PCB's lock list.
+
+	ASSUME	LCK$V_VALBLK  EQ  0
+
+	MOVL	G^SCH$GL_CURPCB,R4	; Get address of PCB
+	INSQUE	LKB$L_OWNQFL(R6),-	; Insert lock at head of process
+		PCB$L_LOCKQFL(R4)	; lock list
+	BLBC	R9,NOSTORE_VALBLK	; Branch if no value block
+
+STORE_VALBLK:
+	; Store RSB's value block in caller's value block, store LKSB,
+	; and return.  Status is already in R0 and LKB$L_LKST1.
+
+	SETIPL	#IPL$_ASTDEL		; Lower IPL to write in caller's
+					; address space but still block ASTs
+	MOVL	LKB$L_LKSB(R6),R1	; Get LKSB address
+	MOVQ	LKB$L_LKST1(R6),(R1)+	; Store LKSB
+	MOVQ	RSB$Q_VALBLK(R8),(R1)+	; Copy RSB value block to caller's
+	MOVQ	RSB$Q_VALBLK+8(R8),(R1)+; value block
+	RET				; Return
+
+
+
+QUEUED_EXIT:
+	; Come here if request was queued.
+
+	MOVZWL	S^#SS$_NORMAL,R0	; Indicate it was queued successfully
+
+NOSTORE_VALBLK:
+	; Exit service with status in R0.  Copy contents of internal
+	; LKSB to the caller's LKSB.  Remember, once IPL is lowered to 0
+	; the LKB can be instantly deleted out from under us.
+
+	SETIPL	#IPL$_ASTDEL		; Lower IPL to write in caller's
+					; address space but still block ASTs
+	MOVQ	LKB$L_LKST1(R6),-	; Store contents of LKSB
+		@LKB$L_LKSB(R6)
+	RET				; Return
+
+
+	.SBTTL	Error Handling for $ENQ
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine performs the error handling for the $ENQ system
+;	service.  This routine has a number of entry points, depending
+;	on what the error is.  Each error entry point backs up the 
+;	operations performed thus far.  Consequently, the order of operations
+;	in this routine must be exactly the reverse of the order of 
+;	operations in the $ENQ system service.
+;
+; CALLING SEQUENCE:
+;
+;	Branch to error entry point.  This routine returns from the system
+;	service.  The entry points named CLEANUPx are called with a BSBW
+;	and they return to the caller.  Then the appropriate ERROR_EXIT
+;	may be branched to.
+;
+; INPUT PARAMETERS:
+;
+;	R0	Completion code (some entry points)
+;	R6	Address of LKB (some entry points)
+;	R8	Address of RSB (some entry points)
+;	R11	Completion code (some entry points)
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Status code
+;
+; COMPLETION CODES:
+;
+;	SS$_ACCVIO		Access violation (on LKSB or resource name)
+;	SS$_BADPARAM		Bad lock mode
+;	SS$_IVLOCKID		Invalid lock id
+;	SS$_CVTUNGRANT		Attempted to convert an ungranted lock
+;	SS$_PARNOTGRANT		Parent lock not granted
+;	SS$_NOSYSLCK		No SYSLCK privilege (needed for a system lock)
+;	SS$_IVBUFLEN		Resource name length = 0 or > 31
+;	SS$_INSFMEM		Insufficient dynamic memory
+;	SS$_EXASTLM		Exceeded AST quota
+;	SS$_EXENQLM		Exceeded enqueue quota
+;	SS$_NOTQUEUED		Request was not queued
+;	SS$_EXDEPTH		Exceeded allowed depth of resource name tree
+;
+; SIDE EFFECTS:
+;
+;	None
+;--
+
+	.PSECT	LOCKMGR
+
+	.ENABL	LSB
+
+DEPTH_ERROR:
+	; Deallocate both LKB (R6) and RSB (R8).
+
+	MOVZWL	#SS$_EXDEPTH,R11	; Store status
+	BRB	10$
+
+NOT_QUEUED:
+	; Deallocate lock id.  LKB address in R6, status in R11.
+
+	CLRL	R8			; Indicates no RSB to deallocate
+
+10$:	MOVL	LKB$L_LKST2(R6),R0	; Get lock id
+	MOVL	G^LCK$GL_NXTID,-	; Store next id in this id's slot
+		@LCK$GL_IDTBL[R0]
+	MOVL	R0,G^LCK$GL_NXTID	; This id becomes the next one
+					; Note - We don't need to call
+					; SCH$RAVAIL here as allocation and
+					; dealloc. were both done at IPL$_SYNCH.
+	BSBB	CLEANUP1		; Cleanup (puts PCB address in R4)
+
+ERROR_EXIT_R11:
+	MOVL	R11,R0			; Move status to R0
+
+ERROR_EXIT_R0:
+	; Everything has been cleaned up; status is in R0.  Set event flag
+	; and exit.
+
+	SETIPL	#0			; Lower IPL
+	PUSHL	R0			; Save status
+	MOVL	G^SCH$GL_CURPCB,R4	; Get PCB address
+	MOVL	PCB$L_PID(R4),R1	; Get PID
+	MOVZWL	#PRI$_RESAVL,R2		; Get priority increment class
+	MOVZBL	EFN(AP),R3		; Get event flag
+	JSB	G^SCH$POSTEF		; Set event flag
+	POPL	R0			; Restore status
+	RET	
+
+
+; Cleanup subroutine.  This subroutine has various entry points which
+; are called depending on how much cleanup is required.
+;
+; Inputs:
+;
+;	R6	Address of LKB
+;	R8	Address of RSB or 0 to indicate no RSB
+;
+; Outputs:
+;
+;	R4	Address of PCB (CLEANUP1 entry point only)
+
+CLEANUP1:
+	; Increment enqueue count.
+
+	MOVL	G^SCH$GL_CURPCB,R4	; Get PCB address
+	MOVL	PCB$L_JIB(R4),R0	; Get address of JIB
+	INCW	JIB$W_ENQCNT(R0)	; Increment enqueue count
+
+CLEANUP2:
+	; Decrement parent LKB's sub LKB reference count.
+
+	MOVL	LKB$L_PARENT(R6),R0	; Get parent LKB address
+	BEQL	CLEANUP3		; No parent
+	DECL	LKB$L_REFCNT(R0)	; Decrement parent's sub LKB ref. count
+	BLSS	90$			; Ref. count went negative
+
+CLEANUP3:
+	; Deallocate RSB.   R8 contains RSB address or
+	; 0 indicating no RSB to deallocate, R11 contains status.
+
+	MOVL	R8,R0			; Address of RSB
+	BEQL	CLEANUP4		; No RSB
+	JSB	G^EXE$DEANONPAGED	; Deallocate it
+
+CLEANUP4:
+	; Deallocate LKB.  R6 contains LKB address.
+
+	MOVL	R6,R0			; Address of LKB
+	JSB	G^EXE$DEANONPAGED	; Deallocate it
+	RSB
+
+90$:	BUG_CHECK	LKBREFNEG,FATAL
+	.DSABL	LSB
+
+	.SBTTL	SEARCH_HASHTBL - Hash and search hash table
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine hashes the resource name and parent RSB address
+;	and then searches the hash table looking for a RSB with
+;	matching:
+;		o  resource names
+;		o  parent RSB addresses
+;		o  access modes
+;		o  name spaces (system or group)
+;		o  group numbers
+;	Resource name length, access mode, name space and group number
+;	are all collected into one longword to make the comparison easier.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	SEARCH_HASHTBL
+;	(Note: IPL must be at IPL$_SYNCH)
+;
+; INPUT PARAMETERS:
+;
+;	R7	Address of parent RSB (0 if no parent)
+;	R8	Address of RSB
+;	R10	Length of resource name
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	0 if match found
+;		1 if no match found
+;	R5	Address of matching RSB if a match was found
+;	R11	Address of last entry in hash chain if no match found
+;
+; SIDE EFFECTS:
+;
+;	R0 - R4 destroyed
+;--
+
+	.PSECT	LOCKMGR
+
+SEARCH_HASHTBL:
+	; Hash resource name and parent RSB address.  This code is
+	; currently optimized for 8 byte resource names.  This
+	; could be removed if the optimization doesn't payoff.
+
+	CMPL	R10,#8			; Is resource name 8 bytes?
+	BNEQ	20$			; No, do it the long way
+	ROTL	#9,RSB$T_RESNAM(R8),R2	; Yes, rotate first longword into R2
+	XORL	RSB$T_RESNAM+4(R8),R2	; and XOR in second longword
+	BRB	50$
+
+20$:	ASHL	#-2,R10,R3		; Divide size by 4
+	BICL3	#^C<3>,R10,R0		; Get remainder from 4
+	BEQL	40$			; Branch if multiple of 4
+	MOVAB	RSB$T_RESNAM(R8)[R10],R1 ; Get address of end of name
+30$:	CLRB	(R1)+			; Clear to next lonqword boundary
+	AOBLSS	#4,R0,30$
+	INCL	R3			; R3 = # of longwords in name
+
+40$:	CLRL	R1			; Clear loop index
+	MOVL	RSB$T_RESNAM(R8),R2	; Get first longword of resource
+	BRB	48$			; Branch into loop
+45$:	ROTL	#9,R2,R2		; Rotate hash value
+	XORL	RSB$T_RESNAM(R8)[R1],R2	; XOR next longword into hash value
+48$:	AOBLSS	R3,R1,45$		; Repeat for all longwords in name
+50$:	XORL	R7,R2			; XOR parent RSB address in too
+	XORL	R10,R2			; XOR length in too
+
+	; Have composite resource name and parent address in R2.
+	; Now hash it to a table index in R1.
+
+	MULL	#^XA53F19B7,R2		; Multiply by unusual number
+	CLRL	R3			; Clear register before shift
+	ASHQ	LCK$GL_HTBLCNT,R2,R0	; Shift high bits into R1
+
+; *** Alternate Hash function:
+;	CLRL	R3			; Clear high bits of dividend
+;	EDIV	LCK$GL_HTBLCNT,R2,R0,R1	; Divide by size of hash table
+; Also consider sorting hash chains by parent RSB address.  However,
+; this will cause inserts in the middle.
+
+	MOVAL	@LCK$GL_HASHTBL[R1],R5	; Get address of hash table entry
+
+	; R5 = hash table entry address.  Search hash table looking for
+	; a resource block with a matching resource name, parent RSB,
+	; access mode, name space (system or group), and group number.
+
+	ASSUME	RSB$L_HSHCHN  EQ  0
+	ASSUME	RSB$B_RMOD  EQ  RSB$W_GROUP+2
+	ASSUME  RSB$B_RSNLEN  EQ  RSB$B_RMOD+1
+
+	MOVL	RSB$W_GROUP(R8),R4	; Fetch composite group, access mode,
+					; name space, and res. name length
+60$:	MOVL	R5,R11			; R11 will point to previous entry and
+	MOVL	(R5),R5			; R5 will point to next RSB in hash chain
+	BEQL	90$			; End of chain - resource not found
+	CMPL	R7,RSB$L_PARENT(R5)	; Do parent RSB addresses match?
+	BNEQ	60$			; No, repeat loop
+	CMPL	R4,RSB$W_GROUP(R5)	; Do group number, access mode, name 
+					; space, and res. name length all match
+	BNEQ	60$			; No, repeat loop
+	CMPC3	R10,RSB$T_RESNAM(R5),-	; Yes, are the names the same?
+		RSB$T_RESNAM(R8)
+	BNEQ	60$			; No, but keep looking
+	RSB				; Yes, found a match; R0 = 0 from CMPC3
+
+90$:	MOVL	#1,R0			; No match found
+	RSB
+
+	.SBTTL	GRANT_LOCK - Grant a lock request
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine performs the actual granting of a lock.  This includes:
+;		o  Computing the new group grant mode
+;		o  Inserting the LKB on the granted queue
+;		o  Setting the event flag (if required)
+;		o  Delivering the completion AST (if required)
+;		o  Delivering the blocking AST (if required)
+;
+;	This routine gets called for both synchronous grants (in the context
+;	of the process requesting a lock) and asynchronous grants (in the
+;	context of another process that has just performed a dequeue or
+;	a conversion to a lower lock mode).
+;
+;	The alternate entry point GRANT_LOCK_ALT is used when the caller
+;	knows that there are no granted locks (or waiting conversions) for
+;	this resource.
+;
+;	The entry point LCK$REGRANTLOCK  is used to regrant an attempted
+;	conversion that was put on the conversion queue and then taken
+;	off due to deadlock.  Note that in this case the LKB$M_ASYNC
+;	bit must be set (even though we might be completing the request
+;	synchronously) in order to execute the code that moves the lock from
+;	the tail to the head of the PCB lock queue.
+;
+;	The QUEUE_AST entry point is used to just queue an AST when 
+;	dequeuing an ungranted lock (abort or deadlock).
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	GRANT_LOCK
+;	Note:  IPL must be at IPL$_SYNCH
+;
+; INPUT PARAMETERS:
+;
+;	All entry points:
+;
+;		R1	Lock mode to grant
+;		R6	Address of LKB
+;		R8	Address of RSB
+;
+;	GRANT_LOCK:
+;
+;		R5	Existing group grant mode
+;
+; IMPLICIT INPUTS:
+;
+;	LCK$REGRANTLOCK and QUEUE_AST:
+;
+;		LKB$L_LKST1 contains final completion status
+;		Also the LKB$M_ASYNC bit must be set
+;
+; OUTPUT PARAMETERS:
+;
+;	GRANT_LOCK and GRANT_LOCK_ALT:
+;
+;		R0	Request completion code
+;		R5	New group grant mode
+;
+; IMPLICIT OUTPUTS:
+;
+;	GRANT_LOCK and GRANT_LOCK_ALT:
+;
+;		SS$_NORMAL is stored in the 1st longword of the LKSB
+;
+; COMPLETION CODES:
+;
+;	SS$_SYNCH		Synchronous completion
+;	SS$_NORMAL		Normal completion
+;
+; SIDE EFFECTS:
+;
+;	R1 - R4 are destroyed
+;--
+
+	.PSECT	LOCKMGR
+
+	.ENABLE	LSB
+
+GRANT_LOCK:
+	CMPB	R1,R5			; Should there be a new group grant mode?
+	BLEQU	10$			; No
+
+GRANT_LOCK_ALT:
+	MOVB	R1,RSB$B_GGMODE(R8)	; Yes, store group grant mode
+	MOVL	R1,R5			; and in R5
+	MOVB	R1,RSB$B_CGMODE(R8)	; Store conversion grant mode
+
+10$:	MOVB	R1,LKB$B_GRMODE(R6)	; Store granted lock mode
+	MOVZWL	S^#SS$_NORMAL,-		; Store success in LKSB
+		LKB$L_LKST1(R6)
+LCK$REGRANTLOCK::
+	INSQUE	LKB$L_SQFL(R6),-	; Insert lock on granted queue
+		RSB$L_GRQFL(R8)
+	MOVB	#LKB$K_GRANTED,-	; Indicate lock is on granted queue
+		LKB$B_STATE(R6)
+
+	; Determine if this request wants a blocking AST.  If yes,
+	; then increment blocking AST count in RSB and determine if we 
+	; are blocking anyone.
+
+	ASSUME	RSB$L_WTQFL  EQ  RSB$L_CVTQFL+8
+
+	TSTL	LKB$L_BLKASTADR(R6)	; Blocking AST address specified?
+	BEQL	30$			; No
+	INCL	RSB$L_BLKASTCNT(R8)	; Incr. blocking AST count
+	MOVAL	RSB$L_CVTQFL(R8),R2	; Get address of conversion queue
+	MOVL	#2,R0			; Do this loop twice
+
+15$:	MOVL	R2,R3			; Save address of queue header
+20$:	MOVL	(R3),R3			; Get address of next element
+	CMPL	R2,R3			; Is it the header?
+	BEQL	25$			; Yes, done with this queue
+	MOVZBL	LKB$B_RQMODE-LKB$L_SQFL(R3),R4	; No, get requested lock mode
+	BBS	R1,LCK$COMPAT_TBL[R4],20$ ; Br. if compatible
+	BISW	#LKB$M_BLKASTQED!-	; Set blocking AST queued and
+		LKB$M_DBLKAST,LKB$W_STATUS(R6) ; deliver blocking AST status
+	BISB	#LKB$M_PKAST,-		; Set piggyback kernel AST bit
+		LKB$B_RMOD(R6)
+	MOVL	LKB$L_BLKASTADR(R6),-	; Store address of blocking AST routine
+		LKB$L_AST(R6)
+	BRB	30$			; Search no more
+25$:	ADDL	#8,R2			; Advance to wait queue
+	SOBGTR	R0,15$			; Repeat
+	
+30$:	; Determine if a completion AST should be queued
+
+	MOVZWL	#SS$_SYNCH,R0		; Assume synchronous completion
+	BBS	#LKB$V_ASYNC,-		; Branch if this request is being 
+		LKB$W_STATUS(R6),40$	; completed asynchronously
+	BBS	#LCK$V_SYNCSTS,-	; It's synchronous - branch if
+		LKB$W_FLAGS(R6),80$	; SYNCSTS bit is set
+
+	TSTL	LKB$L_CPLASTADR(R6)	; Did caller specify a completion AST?
+	BEQL	70$			; No, just set event flag
+	BRB	50$			; Yes, set appropriate bits
+
+40$:	; The request is being completed asynchronously so it is necessary
+	; to remove the lock from its current position in the PCB queue
+	; (around the tail) and reinsert it at the head of the PCB queue.
+
+	MOVZWL	LKB$L_PID(R6),R4	; Get process index
+	MOVL	G^SCH$GL_PCBVEC,R0	; *** Combine this and next inst. when 
+					;  PIC code is no longer needed ***
+	MOVL	(R0)[R4],R4		; Convert to PCB address
+	REMQUE	LKB$L_OWNQFL(R6),R0	; Remove lock from PCB lock queue
+	INSQUE	(R0),PCB$L_LOCKQFL(R4)	; Insert at head of lock queue
+
+QUEUE_AST:
+	; Request is being completed asynchronously so a kernel AST is
+	; required to store status.  This is also used as an entry point
+	; to queue an AST when dequeuing an ungranted lock.  (e.g. abort 
+	; or deadlock).  Status should already be in LKB$L_LKST1.  Note:
+	; The LKB$M_NODELETE bit may have been cleared before calling QUEUE_AST.
+
+	BBCC	#LKB$V_TIMOUTQ,-	; Remove lock from timeout queue
+		LKB$W_STATUS(R6),45$	; if it was on it
+	REMQUE	LKB$L_ASTQFL(R6),R0
+45$:	TSTL	LKB$L_CPLASTADR(R6)	; Did caller specify a completion AST?
+	BNEQ	50$			; Yes
+	BISB	#LKB$M_KAST,-		; No, set special kernel AST bit
+		LKB$B_RMOD(R6)
+	BRB	60$			; and deliver completion AST anyway
+
+50$:	; A completion AST was requested by the caller.
+
+	BISB	#LKB$M_PKAST,-		; Set piggyback kernel AST flag
+		LKB$B_RMOD(R6)
+	MOVL	LKB$L_CPLASTADR(R6),-	; Store completion AST address
+		LKB$L_AST(R6)
+60$:	BISW	#LKB$M_DCPLAST,-	; Set deliver completion AST flag
+		LKB$W_STATUS(R6)
+
+70$:	; Set the event flag
+
+	MOVL	LKB$L_PID(R6),R1	; Get PID
+	MOVZBL	#PRI$_RESAVL,R2		; Priority increment class
+	MOVZBL	LKB$B_EFN(R6),R3	; Event flag number
+	JSB	G^SCH$POSTEF		; Post event flag
+	MOVZWL	S^#SS$_NORMAL,R0	; Return success
+
+80$:	; Queue AST if either completion or blocking AST flags are set.
+
+	BITW	#LKB$M_DCPLAST!-	; Is either flag set?
+		LKB$M_DBLKAST,LKB$W_STATUS(R6)
+	BEQL	90$			; No
+	MOVAB	B^LOCK_KAST,-		; Store address of kernel AST routine
+		LKB$L_KAST(R6)
+	PUSHR	#^M<R0,R5>		; Save R0 and R5
+	MOVL	R6,R5			; R5 points to ACB
+	MOVZBL	#PRI$_RESAVL,R2		; Priority increment class
+	JSB	G^SCH$QAST		; Yes, queue AST
+	POPR	#^M<R0,R5>		; Restore regs
+
+90$:	RSB
+
+	.DSABL	LSB
+
+	.SBTTL	LOCK_KAST - Kernel AST routine
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is the special kernel AST routine.  It is called
+;	whenever completion or blocking ASTs are delivered.
+;	If a completion AST is being delivered and the request is being
+;	completed asynchronously, then the lock status block and
+;	optionally the value block are copied to the caller's LKSB.
+;	Then (synch. or async.) we see if a blocking AST is required.
+;	If it is then we requeue the LKB to deliver the blocking AST.
+;	If a blocking AST is being delivered then we just have to clear
+;	the bit that tells us to deliver a blocking AST.  Finally, if the
+;	LKB is not requeued for an AST we check to see if it should be
+;	deleted and if so, delete it.
+;
+; CALLING SEQUENCE:
+;
+;	JSB	LOCK_KAST (actually called by SCH$ASTDEL)
+;	Note:  This routine may be called as either a special kernel
+;	AST routine or piggyback kernel AST routine or both.
+;
+; INPUT PARAMETERS:
+;
+;	R4	Address of PCB
+;	R5	Address of LKB
+;	Note:  Only offsets up to LKB$K_ACBLEN may be used
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	???
+;--
+
+	.PSECT	LOCKMGR
+
+LOCK_KAST:
+	BBC	#LKB$V_DCPLAST,-	; Branch if no completion AST to deliver
+		LKB$W_STATUS(R5),40$
+	BBC	#LKB$V_ASYNC,-		; Branch if synchronous completion
+		LKB$W_STATUS(R5),20$
+
+	; Store status and value block, if requested
+
+	MOVL	LKB$L_LKSB(R5),R1	; Get address of LKSB
+	BBC	#LCK$V_VALBLK,-		; Branch if no value block
+		LKB$W_FLAGS(R5),10$
+	BLBC	LKB$L_LKST1(R5),10$	; Only store value block if request
+					; was successful
+	IFNOWRT	#24,(R1),20$		; Branch if LKSB is not writeable
+	MOVL	LKB$L_RSB(R5),R0	; R0 = address of RSB
+	MOVQ	RSB$Q_VALBLK(R0),8(R1)	; Store value block - Note:  the fact
+	MOVQ	RSB$Q_VALBLK+8(R0),16(R1) ; that we always store the value block
+					; is based on the assumption that $ENQs
+					; that fetch it are always synchronous.
+	BRB	15$
+10$:	IFNOWRT	#8,(R1),20$		; Branch if LKSB is not writeable
+15$:	MOVL	LKB$L_LKST1(R5),(R1)	; Store status
+
+20$:	; Requeue LKB if we have to deliver a blocking AST
+
+	SETIPL	#IPL$_SYNCH		; Raise IPL
+	BICW	#LKB$M_DCPLAST,-	; Clear deliver completion AST bit
+		LKB$W_STATUS(R5)
+	BBC	#LKB$V_DBLKAST,-	; Branch if no blocking AST to deliver
+		LKB$W_STATUS(R5),60$
+	MOVL	LKB$L_BLKASTADR(R5),-	; Store blocking AST address
+		LKB$L_AST(R5)
+	MOVZBL	#PRI$_RESAVL,R2		; Priority increment class
+	JSB	G^SCH$QAST		; Queue AST
+	BRB	80$
+
+40$:	; We must be delivering a blocking AST
+
+	SETIPL	#IPL$_SYNCH		; Raise IPL
+	BICW	#LKB$M_DBLKAST,-	; Clear deliver blocking AST bit
+		LKB$W_STATUS(R5)
+
+60$:	; Delete LKB if no longer needed.  Increment enqueue quota unless
+	; the quota accounting bit in the ACB is set.  In this case,
+	; AST quota has already been accounted for in the AST delivery code.
+
+	BBS	#LKB$V_NODELETE,-	; Branch if not deleting
+		LKB$B_RMOD(R5),80$
+	BBS	#LKB$V_QUOTA,-		; Branch if accounting taken care of
+		LKB$B_RMOD(R5),70$
+	MOVL	PCB$L_JIB(R4),R0	; Get JIB address
+	INCW	JIB$W_ENQCNT(R0)	; Add 1 to enqueue count
+70$:	MOVL	R5,R0
+	JSB	G^EXE$DEANONPAGED	; Deallocate it
+80$:	SETIPL	#IPL$_ASTDEL		; Lower IPL
+	RSB
+
+
+;
+; Synchronization notes:
+;
+;	1)  The clearing of the DCPLAST bit and the testing of the
+;	    DBLKAST bit (after label 20$) must be done at IPL$_SYNCH
+;	    in order to synchronize correctly with the queueing of a
+;	    blocking AST by routine QUEUE_BLOCKAST.  Otherwise, the AST
+;	    could be queued twice.
+;
+;	2)  Running the rest of the routine at IPL$_SYNCH (labels 40$ and
+;	    80$) is just done for safety's sake.  At this writing, it
+;	    is not believed to be necessary.
+;
+
+	.SBTTL	QUEUECVT - Insert a lock on conversion queue
+	.SBTTL	QUEUEWAIT - Insert a lock on wait queue
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	These routines handle lock requests when they cannot be granted
+;	immediately.  QUEUECVT handles conversion requests and
+;	QUEUEWAIT handles new lock requests.  These routines also
+;	queue the lock onto a timeout queue if deadlock checking is enabled.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	QUEUECVT (or QUEUEWAIT)
+;	(Note:  IPL must be at IPL$_SYNCH)
+;
+; INPUT PARAMETERS:
+;
+;	R4	Address of PCB 
+;	R5	Group grant mode without this lock (QUEUECVT only)
+;	R6	Address of LKB
+;	R8	Address of RSB
+;	R9	Flags
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	All registers except R6 may be clobbered.
+;
+;--
+
+	.PSECT	LOCKMGR
+
+	ASSUME	LKB$K_CONVERT  EQ  0
+
+QUEUECVT:
+	INSQUE	LKB$L_SQFL(R6),-	; Insert at end of conversion queue
+		@RSB$L_CVTQBL(R8)
+	BNEQ	10$			; Branch if not first in queue
+	MOVB	R5,RSB$B_CGMODE(R8)	; Store conversion grant mode
+10$:	CLRB	LKB$B_STATE(R6)		; Set state = conversion
+	REMQUE	LKB$L_OWNQFL(R6),R0	; Remove from PCB lock queue
+	BRB	QUEUE_COMMON		; Join common code
+
+QUEUEWAIT:
+	INSQUE	LKB$L_SQFL(R6),-	; Insert request at end of wait queue
+		@RSB$L_WTQBL(R8)
+	MOVB	#LKB$K_WAITING,-	; Set state = waiting
+		LKB$B_STATE(R6)
+
+QUEUE_COMMON:
+
+	.IF NE	CA$_MEASURE
+	INCL	G^PMS$GL_ENQWAIT
+	.ENDC
+
+	INSQUE	LKB$L_OWNQFL(R6),-	; Insert at end of PCB lock queue
+		@PCB$L_LOCKQBL(R4)
+	BISW	#LKB$M_ASYNC,-		; Set bit to indicate this request
+		LKB$W_STATUS(R6)	; will be satisfied asynchronously
+	CLRL	LKB$L_LKST1(R6)		; Clear 1st longword of LKSB
+
+	; Clear event flag and queue blocking ASTs
+
+	MOVZBL	LKB$B_EFN(R6),R3	; Get event flag number
+	JSB	G^SCH$CLREFR		; Clear the event flag
+	TSTL	RSB$L_BLKASTCNT(R8)	; See if anyone wants a blocking AST
+	BEQL	20$			; No
+	BSBB	QUEUE_BLOCKAST		; Yes, queue blocking ASTs
+
+20$:	; Insert this lock on timeout queue if deadlock checking is enabled.
+
+	ASSUME	LKB$L_DUETIME  EQ  LKB$L_KAST	; Note that these fields overlap
+
+	MOVL	G^LCK$GL_WAITTIME,R0	; Get lock wait time
+	BEQL	30$			; Deadlock checking is disabled
+	ADDL3	R0,G^EXE$GL_ABSTIM,-	; Add wait time to current time to
+		LKB$L_DUETIME(R6)	; get duetime
+; *** combine next two instructions when G^ goes away ***
+	MOVAL	G^LCK$GL_TIMOUTQ,R0
+	INSQUE	LKB$L_ASTQFL(R6),-	; Insert lock on end of timeout queue
+		@4(R0)
+	BISW	#LKB$M_TIMOUTQ,-	; Set timeout queue bit
+		LKB$W_STATUS(R6)
+30$:	RSB
+
+	.SBTTL	QUEUE_BLOCKAST - Queue blocking ASTs
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine queues a blocking AST to all locks that meet the
+;	following conditions:
+;		o  Are on the granted queue
+;		o  Have requested a blocking AST
+;		o  Have not already received a blocking AST
+;		o  Whose granted lock mode is incompatible with
+;		   the requested lock mode of the lock being placed in
+;		   the conversion or wait queue
+;
+;	This routine assumes that the caller has already determined
+;	that RSB$L_BLKASTCNT is non-zero, indicating that there is at least
+;	one lock requesting a blocking AST.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	QUEUE_BLOCKAST
+;	(Note: IPL must be at IPL$_SYNCH)
+;
+; INPUTS:
+;
+;	R6	Address of LKB (being placed on conversion or wait queue)
+;	R8	Address of RSB
+;
+; OUTPUTS:
+;
+;	None
+;
+; IMPLICIT OUTPUTS:
+;
+;	Possibly, a number of blocking ASTs are queued
+;
+; COMPLETION CODES:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 - R5, R7, R10, and R11 are destroyed
+;--
+
+	.PSECT	LOCKMGR
+
+QUEUE_BLOCKAST:
+	MOVZBL	LKB$B_RQMODE(R6),R10	; Get req. lock mode of blocked lock
+	MOVAL	RSB$L_GRQFL(R8),R11	; Get address of granted queue
+	MOVL	R11,R7			; Save address
+10$:	MOVL	(R7),R7			; Get address of next element in queue
+	CMPL	R7,R11			; Reached the end yet?
+	BEQL	90$			; Yes
+	SUBL3	#LKB$L_SQFL,R7,R5	; No, position to start of LKB
+	TSTL	LKB$L_BLKASTADR(R5)	; Blocking AST address specified?
+	BEQL	10$			; No
+	MOVZBL	LKB$B_GRMODE(R5),R0	; Get granted lock mode
+	BBS	R0,LCK$COMPAT_TBL[R10],10$ ; Branch if compatible
+	BBS	#LKB$V_BLKASTQED,-	; Branch if blocking ast already
+		LKB$W_STATUS(R5),10$	; queued
+	BSBB	QUEUE_BLKAST		; Actually queue it
+	BRB	10$			; Repeat for remaining locks
+
+90$:	RSB
+
+;++
+; Subroutine to actually queue the blocking AST.
+;
+; Input:
+;	R5	Address of LKB
+; Output:
+;	R0 - R4 not preserved
+;--
+
+QUEUE_BLKAST:
+
+	; Deliver a blocking AST to the process owning this lock (LKB in R5)
+
+	BISW	#LKB$M_BLKASTQED!-	; Set blocking AST queued and
+		LKB$M_DBLKAST,LKB$W_STATUS(R5) ; deliver blocking AST status
+	BISB	#LKB$M_PKAST,-		; Set piggyback kernel AST bit
+		LKB$B_RMOD(R5)
+	BBS	#LKB$V_DCPLAST,-	; Branch if the LKB is already queued
+		LKB$W_STATUS(R5),90$	; NOTE: This test is based on the
+					; assumption that the LKB$M_DBLKAST bit
+					; cannot be set since the
+					; LKB$M_BLKASTQED bit was not set.
+	MOVL	LKB$L_BLKASTADR(R5),-	; Store blocking AST address
+		LKB$L_AST(R5)
+	MOVAB	LOCK_KAST,LKB$L_KAST(R5); Store address of kernel AST routine
+	MOVZBL	#PRI$_RESAVL,R2		; Store priority increment class
+	JSB	G^SCH$QAST		; Queue the AST
+90$:	RSB
+
+	.SBTTL	COMPUTE_GGMODE - Compute group grant mode
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine computes the group grant mode for a particular
+;	resource.  It does this by maximizing the granted lock modes
+;	for all locks in the granted and conversion queues.  Note that
+;	this routine is often called with the lock of interest (to possibly
+;	be granted) not on any queue.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	COMPUTE_GGMODE
+;	(Note IPL must be at IPL$_SYNCH)
+;
+; INPUTS:
+;
+;	R8	Address of RSB
+;
+; OUTPUTS:
+;
+;	R5	Group grant mode
+;
+; COMPLETION CODES:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 and R2 are destroyed
+;	Note:  R1 must be preserved
+;--
+
+	.PSECT	LOCKMGR
+
+COMPUTE_GGMODE:
+
+	ASSUME	RSB$L_CVTQFL  EQ  RSB$L_GRQFL+8
+	
+	CLRL	R5			; Initialize group grant mode
+	MOVAL	RSB$L_GRQFL(R8),R0	; Get address of granted queue
+	BSBB	10$			; Compute g.g. mode for that queue
+	ADDL	#8,R0			; Get address of conversion queue
+					; fall through to ...
+
+; Subroutine to compute group grant mode for a single queue
+
+10$:	MOVL	R0,R2			; Address of queue header
+20$:	MOVL	(R2),R2			; Get address of next element
+	CMPL	R2,R0			; Reached queue header yet?
+	BEQL	30$			; Yes
+	CMPB	LKB$B_GRMODE-LKB$L_SQFL(R2),R5 ; Granted mode greater
+					; than group grant  mode?
+	BLEQU	20$			; No, continue down queue
+	MOVZBL	LKB$B_GRMODE-LKB$L_SQFL(R2),R5 ; Yes, granted mode becomes 
+					; group grant mode
+	BRB	20$			; Continue down queue
+30$:	RSB
+
+	.SBTTL	LCK$GRANTCVTS - Grant conversions
+	.SBTTL	LCK$GRANTWTRS - Grant waiters
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	These two routines try to grant waiting conversions or
+;	waiting new locks.  They are called when another lock
+;	is dequeued or converted if there is a possibility that a waiting
+;	lock request may be granted.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	LCK$GRANTCVTS (or LCK$GRANTWTRS)
+;	(Note: IPL must be at IPL$_SYNCH)
+;
+; INPUT PARAMETERS:
+;
+;	R5	Contains group grant mode
+;	R8	Address of RSB
+;
+; OUTPUT PARAMETERS:
+;
+;	None
+;
+; SIDE EFFECTS:
+;
+;	R0 - R4 are destroyed
+;--
+
+	.PSECT	LOCKMGR
+
+	.ENABL	LSB
+
+LCK$GRANTCVTS::
+	PUSHL	R6			; Save R6
+10$:	REMQUE	@RSB$L_CVTQFL(R8),R6	; Remove head of conversion queue
+	BVS	70$			; Nothing on conversion queue
+	SUBL	#LKB$L_SQFL,R6		; Position R6 to start of LKB
+	MOVZBL	LKB$B_RQMODE(R6),R1	; Get requested mode of conversion
+	BBS	R1,LCK$COMPAT_TBL[R5],40$ ; Branch if compat. to grant conversion
+	CMPB	LKB$B_GRMODE(R6),R5	; Is granted mode = g.g. mode?
+	BNEQ	60$			; No
+	BSBW	COMPUTE_GGMODE		; Yes, try recomputing g.g. mode
+	BBC	R1,LCK$COMPAT_TBL[R5],55$ ; Branch if not compatible
+40$:	BSBW	GRANT_LOCK		; Grant this conversion
+	BRB	10$			; Try the next conversion too
+55$:	MOVB	R5,RSB$B_CGMODE(R8)	; Store conversion grant mode
+60$:	INSQUE	LKB$L_SQFL(R6),-	; Insert lock at head of
+		RSB$L_CVTQFL(R8)	; conversion queue
+	POPL	R6			; Restore R6
+	RSB
+
+LCK$GRANTWTRS::
+
+	; Get here if the conversion queue is empty.
+	; Try granting waiting locks.  Group grant mode is in R5.
+
+	PUSHL	R6			; Save R6
+70$:	REMQUE	@RSB$L_WTQFL(R8),R6	; Remove lock at head of wait queue 
+	BVS	90$			; Nothing on the wait queue
+	SUBL	#LKB$L_SQFL,R6		; Position R6 to start of LKB
+	MOVZBL	LKB$B_RQMODE(R6),R1	; Get requested mode of this lock
+	BBC	R1,LCK$COMPAT_TBL[R5],80$ ; Branch if incompatible
+	BSBW	GRANT_LOCK		; Grant this lock
+	BRB	70$			; Try next waiting lock
+80$:	INSQUE	LKB$L_SQFL(R6),-	; Insert lock at head of wait queue
+		RSB$L_WTQFL(R8)
+90$:	POPL	R6			; Restore R6
+	RSB
+
+	.DSABL	LSB
+
+	.SBTTL	VERIFYLOCKID - Verify lock id
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine verifies a lock id for correct process ownership
+;	and access mode and then converts it into a LKB address.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	VERIFYLOCKID
+;	Note:  IPL must be at least at IPL$_ASTDEL to prevent
+;	a kernel AST from dequeuing a lock in the middle of verifying
+;	its lock id.
+;
+; INPUT PARAMETERS:
+;
+;	R4	Address of PCB
+;	R6	Lock id
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Completion code
+;	R6	Address of LKB
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL	Lock id was valid can converted to LKB address
+;	SS$_IVLOCKID	Invalid lock id
+;
+; SIDE EFFECTS:
+;
+;	R0 and R1 are destroyed
+;--
+
+	.PSECT	LOCKMGR
+
+	ASSUME	LKB$V_MODE  EQ  0
+	ASSUME	LKB$S_MODE  EQ  2
+
+VERIFYLOCKID:
+	CMPL	R6,G^LCK$GL_MAXID	; Is the lock id too big?
+	BGTRU	40$			; Yes
+	MOVL	@LCK$GL_IDTBL[R6],R6	; Get LKB address
+	BGEQ	40$			; Unallocated id
+	CMPL	LKB$L_PID(R6),-		; Compare LKB PID with current 
+		PCB$L_PID(R4)		; processes' PID
+	BNEQ	40$			; Somebody else's id
+	MOVPSL	R0			; Get current PSL
+	EXTZV	#PSL$V_PRVMOD,-		; Extract previous mode field
+		#PSL$S_PRVMOD,R0,R0
+	BICB3	#^C<3>,LKB$B_RMOD(R6),R1; Get LKB mode
+	CMPB	R0,R1			; Caller have privilege to access lock?
+	BGTRU	40$			; No
+	MOVZWL	S^#SS$_NORMAL,R0	; Yes
+	RSB
+
+40$:	MOVZWL	#SS$_IVLOCKID,R0	; Invalid lock id
+	RSB
+
+	.SBTTL	EXE$DEQ - Dequeue system service
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine handles the $DEQ system service
+;
+; CALLING SEQUENCE:
+;
+;	CALLS/G	EXE$DEQ  (Actually called through the system service
+;	dispatcher)
+;
+; INPUT PARAMETERS:
+;
+;	LOCKID(AP)	Lock id
+;	VALBLK(AP)	Address of value block
+;	DEQ_ACMODE(AP)	Access mode of locks to dequeue (only used if
+;			lock id is zero)
+;	DEQ_FLAGS(AP)	Flags
+;
+;	R4		Address of PCB
+;
+; OUTPUT PARAMETERS:
+;
+;	R0		Completion code
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL	Successful completion
+;	SS$_IVLOCKID	Invalid lock id
+;	SS$_ACCVIO	Access violation (on VALBLK)
+;	SS$_SUBLOCKS	Lock has sublocks
+;--
+
+	.PSECT	YEXEPAGED
+
+	.ENABL	LSB
+
+
+	.IF NDF	LOADSW
+	.ENTRY	EXE$DEQ,^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	.IFF
+	.ENTRY	EXE$$DEQ,^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	.ENDC
+
+	; First see if this is a dequeue of a specific lock or a dequeue
+	; of all locks at the specified access mode (maximized with caller's 
+	; access mode) and outer modes.
+
+	ASSUME	LCK$V_DEQALL  EQ  0
+
+	MOVL	LOCKID(AP),R6		; Get lock id
+	BLBS	DEQ_FLAGS(AP),DEQ_ALL	; Branch if dequeue all
+
+	; It's a dequeue of a specific lock
+
+	MOVL	VALBLK(AP),R9		; Get address of value block
+	BEQL	20$			; No value block
+	IFNORD	#16,(R9),25$		; Branch if value block not readable
+	MOVQ	8(R9),-(SP)		; Push value block onto stack
+	MOVQ	(R9),-(SP)
+	MOVL	SP,R9			; R9 points to value block
+20$:	SETIPL	95$			; Raise IPL to IPL$_SYNCH and 
+					; lock pages in memory
+	BSBW	VERIFYLOCKID		; Verify lock id and return LKB in R6
+	BLBC	R0,DEQ_EXIT		; Error
+
+	; LKB address is in R6.  Value block address (or 0) is in R9.
+	; Dequeue the lock and grant any waiting locks.
+
+	BSBW	LCK$DEQLOCKABO		; Dequeue the lock
+
+DEQ_EXIT:
+	; Exit $DEQ system service.  Status should already be in R0.
+
+	SETIPL	#0			; Lower IPL
+	RET
+
+
+25$:	MOVZWL	S^#SS$_ACCVIO,R0	; Access violation
+	BRB	DEQ_EXIT
+
+30$:	MOVZWL	#SS$_IVLOCKID,R0	; Invalid lock id.
+	BRB	DEQ_EXIT
+
+DEQ_ALL:
+	; Dequeue all locks at the specified access mode (maximized
+	; with caller's mode) and less privileged modes.  Since this list
+	; is normally kept in the order locks were taken out, one pass
+	; through the list will normally be able to dequeue all the
+	; specified locks.  However, two things may cause the list to
+	; be out of order.  First of all, waiting locks are kept at the
+	; end of list (for the convenience of deadlock detection) and
+	; secondly, if a lock with sublocks is converted (and must wait)
+	; it ends up out of order on the list.  If the list is out of order,
+	; the result is that we get SS$_SUBLOCKS errors when we try to
+	; dequeue out of order locks.  It is therefore necessary to count
+	; these errors and if there are any to repeat the loop, again
+	; trying to dequeue all the specified loops.  In order to guarantee
+	; eventual completion we make sure that each time the loop is repeated,
+	; the number of SS$_SUBLOCKS errors is less than the previous time.
+
+	TSTL	R6			; Make sure lock id. is zero
+	BNEQ	30$			; It's not - error
+	BICL3	#^C<3>,DEQ_ACMODE(AP),R0; Get specified access mode
+	JSB	G^EXE$MAXACMODE		; Maximize with previous mode
+	MNEGL	#1,-(SP)		; Initialize last error count to -1
+	PUSHL	#0			; Initialize current error count to 0
+	PUSHL	R0			; Save access mode
+	CLRL	R9			; Indicate no value block
+	SETIPL	#IPL$_ASTDEL		; Raise IPL to freeze PCB lock queue
+	MOVAL	PCB$L_LOCKQFL(R4),R10	; Get address of PCB lock queue head
+	MOVL	R10,R11			; Save in R11
+	MOVZWL	S^#SS$_NORMAL,R0	; Init status to normal (may change)
+
+50$:	; Process next LKB in list
+
+	MOVL	(R10),R6		; Get next LKB in list
+	CMPL	R6,R11			; Reached end of list?
+	BEQL	70$			; Yes
+	MOVAL	-LKB$L_OWNQFL(R6),R6	; Back up R6 to point to start of LKB
+	CMPZV	#LKB$V_MODE,#LKB$S_MODE,-; Is LKB's access mode < specified mode
+		LKB$B_RMOD(R6),(SP)
+	BLSSU	60$			; Yes, don't dequeue
+55$:	SETIPL	95$			; Raise IPL and lock pages in memory
+	BSBW	LCK$DEQLOCKABO		; Dequeue it
+	SETIPL	#IPL$_ASTDEL		; Lower IPL to allow system events
+	BLBS	R0,50$			; Branch on success
+
+	INCL	4(SP)			; Increment error count
+60$:	MOVL	(R10),R10		; Skip this LKB
+	BRB	50$
+
+70$:	; Completed a loop through all of the process's locks.  If the
+	; current error count is zero, then we're done.  If it's non-zero
+	; then we have to run through the list again as long as the error
+	; count this time was less than the error count last time.
+
+	TSTL	4(SP)			; Test current error count
+	BEQL	DEQ_EXIT		; Zero - all done.  Status still in R0.
+	CMPL	4(SP),8(SP)		; Compare current count with last one
+	BGEQU	90$			; Bugcheck if it didn't go down
+	MOVL	4(SP),8(SP)		; Current count becomes previous count
+	CLRL	4(SP)			; Zero current count
+	MOVL	R11,R10			; R10 now points to list head again
+	BRB	50$			; Repeat the loop
+
+
+90$:	BUG_CHECK	DEQSUBLCKS,FATAL
+
+95$:	.LONG	IPL$_SYNCH		; End of locked down code
+	ASSUME	.-20$  LE  512		; Must be on adjacent pages
+	ASSUME	.-55$  LE  512
+
+	.DSABL	LSB
+
+	.SBTTL	LCK$DEQLOCK - Dequeue a lock
+
+;++
+; FUNCTIONAL DESCRIPTION
+;
+;	This routine dequeues a specified (by LKB address) lock and
+;	grants any waiting locks, if possible.  If there are no
+;	waiters or holders of the lock, the RSB is deallocated.
+;
+;	An alternate entry point, LCK$DEQLOCKABO, stores the status
+;	SS$_ABORT in R7.  This is the final status to return
+;	if the lock is not granted.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	LCK$DEQLOCK
+;	Note:  This routine must be called at IPL$_SYNCH
+;
+; INPUT PARAMETERS:
+;
+;	R6	Address of LKB
+;	R7	Contains final status to store in LKB$L_LKST1 if lock
+;		is not granted (LCK$DEQLOCK only)
+;	R9	Address of value block or 0 if no value block
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Completion code
+;
+; COMPLETION CODES:
+;
+;	SS$_NORMAL	Successful completion
+;	SS$_SUBLOCKS	Lock has sublocks
+;
+; SIDE EFFECTS
+;
+;	R0 - R5, and R8 are clobbered
+;	R7 is also clobbered if LCK$DEQLOCKABO is called
+;--
+
+	.PSECT	LOCKMGR
+
+	.ENABL	LSB
+
+REFCNT_ERROR:
+	MOVZWL	#SS$_SUBLOCKS,R0
+	RSB
+
+LCK$DEQLOCKABO:
+	MOVZWL	S^#SS$_ABORT,R7		; Store abort status in case lock 
+					; is not granted
+
+LCK$DEQLOCK::
+	TSTL	LKB$L_REFCNT(R6)	; Are there any sub locks?
+	BNEQ	REFCNT_ERROR		; Yes - error
+
+	.IF NE	CA$_MEASURE
+	INCL	G^PMS$GL_DEQ
+	.ENDC
+
+	MOVL	LKB$L_RSB(R6),R8	; Get RSB address
+
+	; Now dispatch to one of three code paths depending on which
+	; queue the lock being dequeued is on.
+
+	ASSUME	LKB$K_GRANTED  EQ  1
+	ASSUME	LKB$K_CONVERT  EQ  0
+	ASSUME	LKB$K_WAITING  EQ  -1
+
+	TSTB	LKB$B_STATE(R6)		; Which queue is the lock on?
+	BGTR	DEQ_GRANTED		; Lock is on granted queue
+	BEQL	DEQ_CONVERT		; Lock is on conversion queue
+
+	; The lock is on the waiting queue.  Remove it from the queue and
+	; see if it was at the head of the queue.  If yes, then we may be
+	; able to grant some locks (but only if the conversion queue is empty).
+	; If no, then there is no possibility of granting some locks.
+
+	MOVL	RSB$L_WTQFL(R8),R0	; Get address of first LKB on queue
+	REMQUE	LKB$L_SQFL(R6),R1	; Remove this lock
+	CMPL	R1,R0			; Was it the first one on the queue?
+	BNEQ	5$			; No - can't grant any other locks
+	MOVAL	RSB$L_CVTQFL(R8),R0	; Yes,
+	CMPL	(R0),R0			; is conversion queue empty?
+5$:	BNEQ	30$			; No - can't grant any other locks
+	MOVZBL	RSB$B_GGMODE(R8),R5	; Yes, get group grant mode and
+	BRB	40$			; Try granting some waiters
+
+DEQ_CONVERT:
+	; The lock is on the conversion queue.  Remove it from the queue and
+	; see if it was at the head of the queue.  If no, we may be able to
+	; grant some locks due to the granted mode of this lock going away.
+	; If yes, we may be able to grant some locks for the same reason
+	; and for the additional reason of the head of the queue going away.
+
+	MOVL	RSB$L_CVTQFL(R8),R0	; Get address of first LKB on queue
+	REMQUE	LKB$L_SQFL(R6),R1	; Remove this lock
+	CMPL	R1,R0			; Was it the first one on the queue?
+	BEQL	50$			; Yes
+	BRB	45$			; No
+
+REFNZRO:
+	BUG_CHECK	RSBREFNZRO,FATAL
+REFNEG:	BUG_CHECK	RSBREFNEG,FATAL
+
+
+DEQ_GRANTED:
+	; The lock is on the granted queue.  Remove it from the queue
+	; and see if it was the only one on the queue.  If it was, then see
+	; if the conversion and wait queues are also empty, and if so then
+	; the resource block can be deallocated.  This situation is special cased
+	; because it is the normal case.  If this lock is not the only one on the
+	; queue, then see if its granted mode is equal to the group grant mode.
+	; If yes, we may be able to grant some locks if this lock (only) was
+	; responsible for the group grant mode.  If no, then we can't
+	; grant any more locks because the group grant mode won't change.
+
+	ASSUME	RSB$L_WTQFL  EQ  RSB$L_CVTQFL+8
+
+	TSTL	R9			; Value block specified?
+	BEQL	10$			; No
+	CMPB	LKB$B_GRMODE(R6),-	; Yes, is lock mode PW or higher?
+		#LCK$K_PWMODE
+	BLSSU	10$			; No
+	MOVQ	(R9)+,RSB$Q_VALBLK(R8)	; Yes, copy caller's value block to RSB
+	MOVQ	(R9),RSB$Q_VALBLK+8(R8)
+10$:	TSTL	LKB$L_BLKASTADR(R6)	; Blocking AST address specified?
+	BEQL	15$			; No
+	DECL	RSB$L_BLKASTCNT(R8)	; Decr. blocking AST count
+
+15$:	REMQUE	LKB$L_SQFL(R6),R0	; Remove lock from granted queue
+	BNEQ	45$			; Branch if queue not empty
+	MOVAL	RSB$L_CVTQFL(R8),R0	; Get address of conversion queue
+	CMPL	(R0),R0			; Is conversion queue empty?
+	BNEQ	50$			; No
+	ADDL	#8,R0			; Yes, get address of wait queue
+	CMPL	(R0),R0			; Is wait queue empty?
+	BNEQ	35$			; No, try granting waiters
+
+	; All queues are empty.  Deallocate RSB.  First adjust parent RSB's
+	; reference count.  The remove RSB from hash chain.  Finally
+	; deallocate it.
+
+	ASSUME	RSB$L_HSHCHN  EQ  0
+	ASSUME	RSB$L_HSHCHNBK  EQ  RSB$L_HSHCHN+4
+
+	TSTL	RSB$L_REFCNT(R8)	; Verify there are no sub RSB's
+	BNEQ	REFNZRO			; There are!
+	MOVL	RSB$L_PARENT(R8),R0	; Get parent RSB address
+	BEQL	20$			; No parent
+	DECL	RSB$L_REFCNT(R0)	; Decrement parent's sub RSB ref. count
+	BLSS	REFNEG			; Ref. count went negative
+20$:	MOVQ	RSB$L_HSHCHN(R8),R0	; Get hash chain pointers in R0 and R1
+	MOVL	R0,RSB$L_HSHCHN(R1)	; Store next pointer in previous RSB or
+					; hash table
+	BEQL	25$			; Branch if no next one
+	MOVL	R1,RSB$L_HSHCHNBK(R0)	; Store previous pointer in next one
+25$:	MOVL	R8,R0
+	JSB	G^EXE$DEANONPAGED	; Deallocate RSB
+30$:	BRB	60$			; Finish up
+
+	ASSUME	RSB$B_CGMODE  EQ  RSB$B_GGMODE+1
+
+35$:	CLRW	RSB$B_GGMODE(R8)	; Clear group and conversion grant mode
+	CLRL	R5			; Clear group grant mode in R5
+
+40$:	BSBW	LCK$GRANTWTRS		; Try granting waiters
+	BRB	60$
+
+45$:	; Determine if the lock dequeued was equal to the conversion
+	; grant mode.  If not, then no new locks can be granted.
+
+	CMPB	LKB$B_GRMODE(R6),-	; Is the granted mode of this lock
+		RSB$B_CGMODE(R8)	; equal to the conversion grant mode?
+	BNEQ	60$			; No, don't bother going further
+
+50$:	; Either we dequeued a lock equal to the conversion grant mode
+	; or we dequeued the head of the converson queue.  Either way,
+	; we must recompute the group grant mode.
+
+	BSBW	COMPUTE_GGMODE		; New group grant mode in R5
+	MOVB	R5,RSB$B_GGMODE(R8)	; Store in RSB
+	MOVB	R5,RSB$B_CGMODE(R8)	; Also store conversion grant mode
+	BSBW	LCK$GRANTCVTS		; Try granting conversions and waiters
+
+60$:	; Now finish cleaning up the lock we originally dequeued.  First
+	; remove LKB from owner's lock queue.  Then decrement parent LKB's 
+	; sub LKB reference count.
+
+	REMQUE	LKB$L_OWNQFL(R6),R0
+	MOVL	LKB$L_PARENT(R6),R0	; Get parent LKB address
+	BEQL	65$			; No parent
+	DECL	LKB$L_REFCNT(R0)	; Decrement parent's sub LKB ref. count
+	BLSS	95$			; Ref. count went negative
+
+65$:	; Deallocate lock id
+
+	MOVL	LKB$L_LKST2(R6),R0	; Get lock id
+	MOVL	G^LCK$GL_NXTID,-	; Store next id in this id's slot
+		@LCK$GL_IDTBL[R0]
+	MOVL	R0,G^LCK$GL_NXTID	; This id becomes the next one
+	MOVL	#RSN$_LOCKID,R0		; Set lock id resource number
+	JSB	G^SCH$RAVAIL		; Indicate resource available
+	
+	; If the lock was not granted yet, then complete the request
+	; (queue an AST and set event flag) with the status in R7.
+
+	ASSUME	LKB$K_GRANTED  EQ  1
+	ASSUME	LKB$K_CONVERT  EQ  0
+	ASSUME	LKB$K_WAITING  EQ  -1
+
+	TSTB	LKB$B_STATE(R6)		; Is the lock granted?
+	BGTR	80$			; Yes
+	MOVL	R7,LKB$L_LKST1(R6)	; No, store final status
+	BICB	#LKB$M_NODELETE,-	; Clear nodelete bit
+		LKB$B_RMOD(R6)
+	BSBW	QUEUE_AST		; Queue AST and set event flag;
+					; returns status on R0.  Kernel AST
+					; routine will delete LKB.
+	RSB
+
+80$:	; Increment the enqueue count and deallocate the LKB as long
+	; as it's not queued to deliver an AST.  If it is queued, then
+	; if it's queued to deliver a completion AST then let kernel AST
+	; routine delete the LKB.  If it's only queued for a blocking
+	; AST then remove it from the AST queue.
+
+	BITW	#LKB$M_DCPLAST!-	; Is the LKB queued for AST delivery?
+		LKB$M_DBLKAST,LKB$W_STATUS(R6)
+	BEQL	85$			; No
+	BICB	#LKB$M_NODELETE,-	; Yes, clear nodelete bit
+		LKB$B_RMOD(R6)
+	BICW	#LKB$M_DBLKAST,-	; Clear deliver blocking AST bit
+		LKB$W_STATUS(R6)
+	BBS	#LKB$V_DCPLAST,-	; Branch if queued for a completion AST
+		LKB$W_STATUS(R6),90$	; (will be deall. when AST is delivered)
+	MOVL	R6,R5			; Blocking AST only - remove from
+	JSB	G^SCH$REMOVACB		; AST queue
+
+85$:	; Deallocate LKB and increment enqueue quota
+
+	MOVZWL	LKB$L_PID(R6),R4	; Get process index
+	MOVL	G^SCH$GL_PCBVEC,R0	; *** Combine this and next inst. when 
+					;  PIC code is no longer needed ***
+	MOVL	(R0)[R4],R4		; Convert to PCB address
+	MOVL	PCB$L_JIB(R4),R0	; Get address of JIB
+	INCW	JIB$W_ENQCNT(R0)	; Increment enqueue count
+	MOVL	R6,R0			; Address of LKB
+	JSB	G^EXE$DEANONPAGED	; Deallocate it
+
+90$:	MOVZWL	S^#SS$_NORMAL,R0
+	RSB
+
+95$:	BUG_CHECK	LKBREFNEG,FATAL
+
+
+	.DSABL	LSB
+
+	.SBTTL	FREE_LKB - Free LKB (from AST queue)
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine is called to free an LKB that is currently
+;	queued as an ACB.  This should happen rarely, but when it does
+;	an ACB is allocated from pool, the ACB portion of the LKB is copied
+;	into the new ACB and the two ACBs are swapped on the AST queue.
+;	This frees up the LKB for another use (such as a lock conversion).
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	FREE_LKB
+;	(Note: IPL must be at 0)
+;
+; INPUT PARAMETERS:
+;
+;	R4	Address of PCB
+;	R6	Address of LKB
+;
+; OUTPUT PARAMETERS:
+;
+;	R0	Completion Code (returned to ERROR_EXIT - not caller)
+;	(Note that the normal path returns at IPL$_SYNCH)
+;
+; COMPLETION CODES:
+;
+;	SS$_INSFMEM		Insufficient memory
+;	SS$_EXASTLM		Exceeded AST quota
+;
+; SIDE EFFECTS:
+;
+;	The LKB is removed from the AST queue.  Note that all registers
+;	(including R0 and R1) must be preserved.
+;
+; NOTES:
+;
+;	This code makes two assumptions:
+;
+;	1)  That the LKB must be queued for a regular AST
+;	    (as opposed to just a special kernel AST).  This
+;	    is why AST quota is always deducted, not conditionally
+;	    on whether an AST address was specified.
+;	    
+;	2)  That the LKB$M_DCPLAST and LKB$M_DBLKAST bits cannot
+;	    become clear while we are at IPL 0.  Otherwise, it
+;	    is necessary to verify that the LKB is still in use
+;	    after the ACB is allocated from pool.  This assumption
+;	    is due to the fact that the AST must either be for
+;	    an outer mode or if for kernel mode then kernel mode
+;	    ASTs must be disabled.
+;--
+
+	.PSECT	YEXEPAGED
+
+FREE_LKB:
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>
+	TSTW	PCB$W_ASTCNT(R4)		; Test for enough AST quota
+	BLEQ	80$				; Error - not enough
+	MOVZWL	#LKB$K_ACBLEN,R1		; Size of ACB to allocate
+	JSB	G^EXE$ALLOCBUF			; Allocate ACB
+	BLBC	R0,90$				; Error - insuff. memory
+	MOVB	#DYN$C_ACB,ACB$B_TYPE(R2)	; Store data structure type
+	DECW	PCB$W_ASTCNT(R4)		; Decrement AST quota
+10$:	SETIPL	95$				; Raise to IPL$_SYNCH and 
+						; lock pages in memory
+	BICW	#LKB$M_DBLKAST,LKB$W_STATUS(R6)	; Clear deliver blocking AST bit
+	PUSHL	R2				; Save ACB address
+	MOVC3	#LKB$K_ACBLEN,(R6),(R2)		; Copy ACB portion of LKB
+	POPL	R2				; Restore ACB address
+	BISB	#ACB$M_QUOTA,ACB$B_RMOD(R2)	; Set quota accounting flag
+	BICB	#ACB$M_NODELETE,ACB$B_RMOD(R2)	; Clear nodelete flag
+	MOVL	R6,R5				; Address of LKB
+	JSB	G^SCH$SWAPACBS			; Swap ACBs
+	POPR	#^M<R0,R1,R2,R3,R4,R5>
+	RSB
+
+80$:	MOVZWL	#SS$_EXASTLM,R0
+90$:	BRW	ERROR_EXIT_R0
+
+95$:	.LONG	IPL$_SYNCH			; End of locked down code
+	ASSUME	.-10$  LE  512			; Must be on adjoining pages
+
+
+	.END

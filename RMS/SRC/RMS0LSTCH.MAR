@@ -1,0 +1,968 @@
+	$BEGIN	RMS0LSTCH,002,F$RMSCLOSERNDN1,<RMS ABORT I/O FOR PROCESS DELETE>
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; Facility:	RMS32.
+;
+; Abstract:	causes RMS32 write-accessed sequential f.o. disk files to have
+;		dirty buffers written and the eof recorded.
+;
+; Environment:	kernel or exec mode, asynchronous process deletion.
+;
+; Author: Leo Laverdure	,	 creation date: 21-FEB-1978
+;
+; Modified By:
+;
+;	V03-002	CDS0007		C Saether		 1-Apr-1982
+;		Set FRB$V_KRNLMODE flag in temp frb before calling
+;		RM$DEACSHARED so potential stall for inqueflg works.
+;
+;	V03-001	CDS0006		C Saether		15-Mar-1982
+;		Add checks specific to global buffers:
+;		1) Attempt to decrement use count on GBD if known
+;		2) Attempt to verify all GBD forward and back links
+;		and correct any partially modified.
+;
+;	V02-014	CDS0005		C Saether		29-Aug-1981
+;		Remove references to BCB's.  Bucket interlocking
+;		is now handled using the SYS$ENQ and SYS$DEQ services.
+;
+;	V02-013	KPL0007		Peter Lieberwirth	 6-May-1981
+;		Don't look for any RLBs off the SIFAB anymore, all
+;		record locks are local context with lock manager
+;		entries.
+;
+;	V02-012	KDM0037		Kathleen D. Morse	12-Feb-1981
+;		Change non-kernel mode references to SCH$GL_CURPCB to
+;		use CTL$GL_PCB instead.
+;
+;	V02-011	REFORMAT	Keith B. Thompson	29-Jul-1980
+;
+;	V010	RAN0008		R A Newell	23-Feb-1979	 9:00
+;		comment changes only to reflect new ast code
+;
+;	V009	CDS0004		C D Saether	21-Feb-1979	17:36
+;		fix bug checking for sifab owner shared rundown
+;
+;	V008	CDS0003		C D Saether	21-Feb-1979	13:47
+;		clear insque sifb flag when we own sifab also
+;
+;	V007	CDS0002		C D Saether	21-Feb-1979	10:30
+;		fix window where sfd owned by TEMP_FRB before taken by internal
+;
+;	V006	LFL0002		L F Laverdure	14-Feb-1979	17:30
+;		zero BCB$B_USECNT
+;
+;	V005	LFL0001		L F Laverdure	14-Feb-1979	14:15
+;		fix registers for shared ifab probing
+;
+;	V004	CDS0001		C Saether	13-Feb-1979	10:30
+;		bug fix
+;
+;	V003	RAN0007		R A Newell	12-Feb-1979	09:30
+;		changes to handle kernel mode ast's during file sharing
+;
+;	V002	RAN0003		R A Newell	21-Dec-1978	13:45
+;		file sharing code enhancements.
+;
+;--
+;
+
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+
+	$CMKRNLDEF			; change mode to kernel definitions
+	$ASBDEF				; rms asynchronous context block definitions
+	$ATRDEF				; file attribute code definitions
+	$BDBDEF				; rms buffer descriptor block definitions
+	$DEVDEF				; device characteristics definitions
+	$FIBDEF				; file information block definitions
+	$GBDDEF				; global buffer descriptors
+	$GBHDEF				; global buffer header
+	$GBPBDEF			; global buffer pointer blocks
+	$IFBDEF				; rms ifab definitions
+	$IMPDEF				; rms impure area definitions
+	$IODEF				; qio function code definitions
+	$IRBDEF				; rms irab definitions
+	$PSLDEF				; psl bit definitions
+	$QIODEF				; qio parameter definitions
+	$SIFBDEF			; shared ifab definitions
+	$SFDDEF				; shared file database definitions
+	$RLBDEF				; record lock block definitions
+	$FRBDEF				; file resource block definitions
+	$NRPDEF				; next record pointer definitions
+
+;
+; external symbols:
+;
+;
+; Macros:
+;
+;
+; Equated Symbols:
+;
+;
+; Own Storage:
+;
+
+
+	.SBTTL	RM$LAST_CHANCE - CLEAN UP WRITE ACCESSED SEQ. F.O. DISK FILES
+
+;++
+;
+;  RMS$LAST_CHANCE	-
+;
+;	this routine implements the "abort rms i/o" rms run down option
+;	(type=2).  it is called during asynchronous process deletion to
+;	allow RMS32 to write out the contents of dirty buffers and record
+;	the eof mark for sequential file org. disk files that are write accessed.
+;	because this routine's being called from kernel mode ast level violates
+;	rms synchronization and interlocking mechanisms, it is not guaranteed
+;	to succeed in writing out the file correctly.  it will do as good a
+;	job as possible and not fault.
+;
+;	the image and process ifab tables are scanned for files requiring
+;	cleanup.  if any are found the appropriate buffer writing and or
+;	file closing is performed.  there is no attempt to clean up the
+;	rms data base.  in fact, the only rms impure data written is the rearranging
+;	of the file attributes.  there should be no more calls to rms for
+;	this process.
+;
+;	any errors which occur are ignored, as there is no place to report
+;	them in any case.  in fact, this routine is almost paranoid about
+;	checking the validity and accessibility of the rms structures.
+;	this is required because this code is entered via kernel ast, which
+;	may have interrupted rms running in exec mode, thus leaving the
+;	rms structures in unknown states. because of this, a number of
+;	problems exist, some of which are:
+;
+;		1. the current vbn may have been decremented already
+;		   in the "buffer dirty but not valid" case, thus causing
+;		   one block too few to be written.
+;		2. the eof and high block longwords may have been swapped,
+;		   thus causing them to be wrong when written back to the
+;		   file.
+;		3. the file org byte might not yet have been initialized,
+;		   causing some other file org to be treated as the seq. fo.
+;		4. a record being updated in a buffer may only be partially
+;		   moved into that buffer, thus getting a mixture of old and
+;		   new data.  the same problem exists for updates on records
+;		   spanning block boundaries.
+;		5. i/o completion on mailboxes and magtape, as well as other
+;		   file organizations may not be finished properly, possibly
+;		   leading to file corruption.
+;
+;	the addition of the file sharing capability has magnified the problem
+;	of the kernel mode ast.  file sharing is based on the concept of owning
+;	various shared resources.  the method of ownership is to reach the top
+;	of a queue for the particular resource.  if rms receives a kernel mode
+;	ast while owning a shared resource, we must release that resource and
+;	issue an ast to the process who is waiting next in the queue.  however,
+;	if the process who is going away is in the queue waiting for a resource,
+;	its entry in the queue must be removed.  these two states are well
+;	defined and present no real problem to the last chance routine.
+;
+;	the problems occurs when rms has just removed a particular process from
+;	the head of a shared resource queue and is about to issue an ast to the
+;	next process in the queue.  if we receive a kernel mode ast at this
+;	point, last chance does not know that we owned the resource and will
+;	therefore not start up the next process.  to avoid this problem, and
+;	various others such as decrementing shared file access counts, the
+;	critical portions of the file sharing code are being run in kernel mode
+;	with ipl set to astdel (i.e., with kernel mode ast's disabled).  there-
+;	fore, if a kernel mode ast is sent to rms, we will not receive it
+;	immediately if we are processing some of these critical sections of the
+;	file sharing code.  these critical sections of code are mainly confined
+;	to the rm0share module of rms.
+;
+;	all of these and other unknown problems can be avoided by doing
+;	a supervisor-level ast and calling rms run down in the normal fashion.
+;	given all of the above uncertainties, this certainly makes good sense.
+;	this routine must be considered an emergency measure only!
+;
+; Calling sequence:
+;
+;	BRW	RM$LAST_CHANCE		;(from SYS$RMSRUNDWN (arg2=2))
+;		may be called from either exec or kernel mode.
+;		does a 'ret' when done.
+;
+; Input Parameters:
+;
+;	R7	caller's mode
+;
+; Implicit Inputs:
+;
+;	the contents of the process and image i/o segments
+;
+; Output Parameters:
+;
+;	R0-R11 are destroyed
+;
+; Implicit Outputs:
+;	none
+;
+; Completion Codes:
+;
+;	RMS$_NORMAL
+;
+; Side Effects:
+;
+;	see description above.
+;
+;--
+
+
+RM$LAST_CHANCE::
+	CMPB	R7,#PSL$C_EXEC		; caller sufficiently privileged?
+	BGTRU	EXIT			; branch if not
+
+;++
+;
+;  run down the image files
+;
+;--
+
+	MOVAL	@#PIO$GW_IIOIMPA,R11	; get iio impure area address
+	IFNORD	#1,(R11),EXIT,R7	; branch if page not readable
+	BSBB	RUNDWN			; do the run down
+
+;++
+;
+; now run down process-permanent files
+;
+;--
+
+	MOVAL	W^PIO$GW_PIOIMPA-PIO$GW_IIOIMPA(R11),R11
+					; point to process i/o impure area
+	BSBB	RUNDWN			; do the run down
+
+;++
+;
+;	now look to see if this process owns the sfd via the internal
+;	frb, and is so, give it up.  note that the access counts for
+;	all sifab's have already been handled since any access count
+;	needing decrementing would have had an frb and hence, we would
+;	have already run it down.
+;
+;--
+;
+;--
+
+	MOVL	@#RMS$GL_SFDBASE,R4		; get sfd addr
+	BEQL	EXIT				; eql not shared all done
+	MOVAL	SFD$L_TEMP_FRB(R4),R5		; get addr of internal frb
+	CMPL	SFD$L_RQ_FLNK(R4),R5		; owned via internal frb?
+	BNEQ	EXIT				; branch if not
+	MOVL	@#CTL$GL_PCB,R1			; get current pcb
+	CMPL	FRB$L_PID(R5),PCB$L_PID(R1)	; does its pid match?
+	BNEQ	EXIT				; branch if not
+5$:	BBCS	#SFD$V_INSQUEFLG,-		; interlock insque
+		SFD$B_FLGS(R4),6$
+	BSBW	RM$K_WAIT			; wait for it
+	BRB	5$				; try again
+6$:	REMQUE	(R5),R5				; remove it
+	MOVL	SFD$L_RQ_FLNK(R4),R0		; get owner of sfd
+	ASSUME	SFD$L_RQ_FLNK EQ 0
+	CMPL	R0,R4				; empty queue?
+	BEQL	9$				; branch if so
+	BSBW	RM$DECLARE_AST			; otherwise, declare an ast
+9$:	CSB	#SFD$V_INSQUEFLG,SFD$B_FLGS(R4)	; clear interlock bit
+EXIT:	MOVL	#RMS$_NORMAL,R0			; show success
+	RET					; back to caller
+
+
+;++
+;
+; run down subroutine:
+;
+; checks ifab table for write-accessed, seq. f.o. disk files.
+; if any found writes the current buffer, if dirty,
+; and then issues a $close request to record the eof mark.
+;
+; inputs:
+;	R11 - impure area addr
+;	R7 - caller's mode
+;
+; outputs:
+;	R0-R6, R8-R10 destroyed
+;--
+
+RUNDWN:
+	MOVL	IMP$L_IFABTBL(R11),R5		; get ifab table addr
+NXTSEG:	PUSHL	(R5)+				; save addr next table seg on stack
+	MOVZWL	IMP$W_ENTPERSEG(R11),R8		; get # entries/seg
+NXTENT:	MOVL	(R5)+,R10			; get ifab addr
+	BNEQ	RDIFAB				; branch if one
+NXTSOB:	SOBGTR	R8,NXTENT			; keep scanning segment
+
+;
+; no more ifabs this segment, try next
+;
+
+	MOVL	(SP)+,R5			; get next segment addr
+	BEQL	10$				; branch if no more
+	PROBER	R7,#<IMP$C_ENTPERSEG+1>*4,(R5)	; segment readable?
+	BNEQ	NXTSEG				; branch if yes
+10$:	RSB
+
+
+;
+;  found an ifab.
+;
+;  check that ifab is accessible and valid
+;
+
+RDIFAB:
+	IFNOWRT	#IFB$C_BLN,(R10),NXTSOB,R7	; branch if ifab not writeable
+	CMPB	IFB$B_BID(R10),#IFB$C_BID	; is it really an ifab?
+	BNEQ	NXTSOB				; ignore if not
+	CMPB	IFB$B_BLN(R10),#IFB$C_BLN/4	; at least right length?
+	BLSSU	NXTSOB				; ignore if bad
+
+;
+; check if sequential file org., write-accessed, disk file and ignore if not
+;
+
+	ASSUME	IFB$C_SEQ EQ 0
+	TSTB	IFB$B_ORGCASE(R10)		; seq. f.o.?
+	BNEQ	CHKSHR				; ignore if not
+	BBC	#IFB$V_ACCESSED,(R10),CHKSHR	; branch if not accessed
+	BBC	#IFB$V_WRTACC,(R10),CHKSHR	; branch if not write-accessed
+	BBC	#DEV$V_RND,-			; branch if not disk
+		IFB$L_PRIM_DEV(R10),NXTSOB
+	PUSHL	R5				; save r5
+	BSBW	CHECK_SHARED			; check for shared file
+	POPR	#^M<R5>				; restore r5
+
+;
+;  find irab, if one, and verify it
+;
+
+	MOVL	IFB$L_IRAB_LNK(R10),R9		; get irab address
+	BEQL	CLOSE_BR			; branch if none
+	IFNORD	#IRB$C_BLN_SEQ,(R9),NXTSOB,R7	; branch if not readable
+	CMPB	IRB$B_BID(R9),#IRB$C_BID	; is it really an irab?
+	BNEQ	NXTSOB				; branch if not an irab
+	CMPB	IRB$B_BLN(R9),-
+		#<IRB$C_BLN_SEQ+ASB$C_BLN_SEQ>/4; long enough?
+	BLSSU	NXTSOB				; branch if not
+
+
+;++
+;
+;  check for valid current bdb.  if found and dirty, write it.
+;
+;--
+
+	MOVL	IRB$L_CURBDB(R9),R4		; get bdb address
+	BEQL	CLOSE_BR			; brach if none
+	IFNORD	#BDB$C_BLN,(R4),CLOSE_BR,R7	; branch if not readable
+	ASSUME	BDB$B_BLN EQ BDB$B_BID+1
+	CMPW	BDB$B_BID(R4),-			; valid bdb?
+		#BDB$C_BID+<<BDB$C_BLN/4>@8>
+	BEQL	CHKDRT				; branch if yes
+CLOSE_BR:
+	BRW	CLOSE				; extended branch to close file
+CHKSHR:
+	PUSHL	R5				; save r5
+	BSBW	CHECK_SHARED			; check for shared file
+	POPR	#^M<R5>				; restore r5
+	BRB	NXTSOB				;
+CHKDRT:	BBC	#BDB$V_DRT,BDB$B_FLGS(R4),CLOSE	; branch if buffer not dirty
+
+;
+;  bdb marked dirty.
+;  compute size of buffer to be written.
+;
+
+	MOVZBL	BDB$B_REL_VBN(R4),R6		; get current vbn
+	ASSUME	BDB$V_VAL EQ 0
+	BLBS	BDB$B_FLGS(R4),10$		; branch if buffer valid
+
+;
+; buffer dirty but marked invalid.
+; decrement the current vbn data.
+;
+
+	DECL	R6
+
+;
+; compute byte count for transfer
+; (i.e., transfer all blocks thru current vbn or # val_vbns if greater)
+;
+
+10$:	INCW	R6				; get # vbns
+	CMPB	R6,BDB$B_VAL_VBNS(R4)		; is current greater than  # valid vbns?
+	BGEQU	20$				; branch if yes
+	MOVZBL	BDB$B_VAL_VBNS(R4),R6		; no - so use # valid vbns
+
+;
+;  check for extend of disk file
+;
+
+20$:	ADDL3	BDB$L_VBN(R4),R6,R1		; get end vbn+1
+	DECL	R1				; make it end vbn
+	SUBL2	IFB$L_HBK(R10),R1		; need to extend file?
+	BLEQ	WRITE				; branch if not
+
+
+;++
+;
+;  extend file (r1 = # blocks required)
+;
+;--
+;
+;  initialize an io status block and a fib on the stack
+;
+;--
+
+	CLRQ	-(SP)				; iosb
+	MOVL	SP,R2				; save iosb address
+	.REPT	<<FIB$C_EXTDATA+7>/8>
+	CLRQ	-(SP)				; initialize fib
+	.ENDM
+
+	MOVL	R1,FIB$L_EXSZ(SP)		; set # blocks required
+	MOVB	#FIB$M_EXTEND,FIB$W_EXCTL(SP)	; say it's an extend
+
+;
+; build the fib descriptor and qio parameters on the stack and do the extend.
+;
+
+	PUSHL	SP			; addr of fib
+	PUSHL	#FIB$C_EXTDATA		; length of fib
+	CLRQ	-(SP)			; p6=p5=0
+	CLRQ	-(SP)			; p4=p3=0
+	CLRL	-(SP)			; p2=0
+	PUSHAL	20(SP)			; p1=fib address
+	MOVL	#IO$_MODIFY,R0		; io function code
+	BSBW	DOQIO			; do the extend
+	BLBC	R0,30$			; branch on failure
+
+;
+; extend complete.
+; update ifab hi block field, deallocate the fib, and return
+;
+
+	ADDL3	FIB$L_EXSZ+8(SP),-
+		FIB$L_EXVBN+8(SP),-
+		IFB$L_HBK(R10)
+	DECL	IFB$L_HBK(R10)			; get # of highest allocated blk
+30$:	ADDL2	#16+<<FIB$C_EXTDATA+7>&^XF8>,SP	; clean stack
+
+
+;++
+;
+;  now write the buffer
+;
+;--
+
+WRITE:
+	CLRQ	-(SP)			; make iosb
+	MOVL	SP,R2			; save iosb addr
+	CLRQ	-(SP)			; p6=p5=0
+	CLRL	-(SP)			; p4=0
+	PUSHL	BDB$L_VBN(R4)		; p3=vbn
+	ROTL	#9,R6,-(SP)		; p2=# of bytes to write
+	PUSHL	BDB$L_ADDR(R4)		; p1=buffer addr
+	MOVL	#IO$_WRITEVBLK,R0	; i/o function code
+	BSBW	DOQIO			; do the write
+	POPR	#^M<R0,R1>		; clean stack
+
+
+;++
+;
+;  now close the file, writing the attributes
+;
+;--
+
+CLOSE:	CLRQ	-(SP)			; make iosb
+	MOVL	SP,R2			; save iosb addr
+
+;
+; build attribute list on stack to rewrite record attributes
+;
+
+	PUSHL	#0			; end of attribute list flag
+	PUSHAL	IFB$B_RFMORG(R10)	; write attributes from ifab
+	PUSHL	#<ATR$C_RECATTR@16>+<IFB$C_FHAEND-IFB$B_RFMORG>
+					; length & record attriubtes code
+
+;
+;  put org back into rfmorg byte
+;
+
+	INSV	IFB$B_ORGCASE(R10),-
+		#IFB$V_ORG,-
+		#IFB$S_ORG,-
+		IFB$B_RFMORG(R10)
+
+;
+;  swap the words of IFB$L_HBK and IFB$L_EBK to match files-11
+;  on-disk structure
+;
+
+	ROTL	#16,IFB$L_HBK(R10),IFB$L_HBK(R10)
+	ROTL	#16,IFB$L_EBK(R10),IFB$L_EBK(R10)
+
+;
+;  do the deaccess qio
+;
+
+	CLRL	-(SP)			; p6=0
+	PUSHAL	4(SP)			; p5=attribute list addr
+	CLRQ	-(SP)			; p4=p3=0
+	CLRQ	-(SP)			; p2=p1=0
+	MOVZBL	#IO$_DEACCESS,R0	; deaccess function code
+	BSBW	DOQIO			; do the deaccess
+	ADDL2	#20,SP			; clean stack
+	BRW	NXTSOB			; go handle next file
+
+
+;++
+;
+;  last chance clean up of shared files.
+;
+;  if the ifab has an frb pointer, it signifies that this process was working on
+;  a shared file.  however, if no sifab exists yet, the process was opening the
+;  file and had not yet allocated a sifab.  at this point, the sfd may be owned
+;  with either the temporary frb or the sfd internal frb.  last chance therefore
+;  removes any sfd queue entries which this process owns, returns the temporary
+;  frb page to the free page list, and returns, after which the sfd is released.
+;
+;  if a sifab exists, the process had opened the shared file and last chance
+;  performs the following processing.  the sfd resource queue is searched and
+;  any entries which are owned by this process are removed.  if we owned the
+;  sfd, we must issue an ast to the next process which is waiting for it.
+;  next, we get the sifab insque interlocking bit, which means that no other
+;  process can insque into the sifab resource queue until we are finished pro-
+;  cessing.  last chance then searches the sifab resource queue and removes any
+;  entry which belongs to this process.  if we don't already own the sifab, we
+;  go get ownership of it by calling the subroutine rm$take_sifab1.  if we
+;  happen to stall in this routine, we do so at kernel mode and our frb is set
+;  up to inform the process that wakes us that we require a kernel mode ast.
+;
+;  If global buffers are present, the BDB/GBPB list is scanned looking for
+;  any GBPB's currently accessed (usecnt neq 0) and the access count in the
+;  corresponding GBD is decremented for those found.  This does NOT guarantee
+;  that GBD's will always be correct, but the error is that one might not
+;  be decremented when it should, rather than decrementing one incorrectly.
+;  Because of the kernel ast, extraordinary measures are necessary to guarantee
+;  correctness, and the failure to decrement the GBD use count simply makes
+;  that buffer ineligible for replacement from the cache.  The window is fairly
+;  small is this is considered acceptable behavior.
+;
+;  After scanning for GBPB's, the GBD's are scanned to verify correctness of
+;  forward and back links.  This is because the queues are managed by hand
+;  in that the self relative queue instructions are incorrect in some of the
+;  installed base of customers as of V3.  Partially removed elements are
+;  completely removed from the list, invalidated, and reinserted at the end
+;  of the list.
+;
+;  Finally, we decrement the access
+;  counts on the shared file, return our frb, and go deaccess the shared file.
+;
+;  inputs:
+;
+;	R10	ifab address
+;	R7	caller's mode
+;
+;  outputs:
+;
+;	R0 - R6 destroyed
+;
+;--
+
+LEAVER:	RSB				; return
+
+;
+
+CHECK_SHARED:
+	MOVL	IFB$L_FRB_PTR(R10),R5		; get frb address
+	BEQL	LEAVER				; branch if not shared file
+	IFNOWRT	#FRB$C_BLN,(R5),LEAVER,R7	; probe frb
+	MOVL	FRB$L_SIFAB_PTR(R5),R3		; get sifab address
+	BEQL	3$				; may own sfd with temp_frb
+						; or sfd internal frb so
+						; scan to remove from wait list
+	IFNOWRT	#SIFB$C_BLN,(R3),LEAVER,R7	; probe sifab
+	CMPB	SIFB$B_BID(R3),#SIFB$C_BID	; make sure it's a sifab
+	BNEQ	LEAVER				; branch if not a sifab
+3$:	MOVAL	RM$KERNEL_AST,FRB$L_ASTADDR(R5)	; set ast address
+	SSB	#FRB$V_KRNLMODE,FRB$B_FLAGS(R5)	; set bit saying at kernel mode
+	MOVL	@#RMS$GL_SFDBASE,R4		; get sfd addr
+
+;
+;	remove all frb's for this process from sfd wait list
+;	At this point:
+;	R3 = SIFAB
+;	R4 = SFD
+;	R5 = FRB
+;
+
+5$:	BBCS	#SFD$V_INSQUEFLG,-
+		SFD$B_FLGS(R4),6$		; get sfd insque flag
+	BSBW	RM$K_WAIT			; stall for it
+	BRB	5$				; try it again
+6$:	ASSUME	SFD$L_RQ_FLNK EQ 0
+	MOVL	(R4),R0				; get owner of sfd
+	CMPL	R4,R0				; empty list?
+	BEQL	10$				; branch if sfd unowned?
+	IFNOWRT	#FRB$C_BLN,(R0),LEAVER,R7	; probe the frb
+	CMPL	FRB$L_PID(R0),FRB$L_PID(R5)	; do we own it?
+	BNEQ	8$				; branch if not
+
+;
+;	remove one or more frb's for this process from the front of
+;	the sfd wait list.  must send ast to first process whose frb
+;	pid does not match ours.
+;
+
+7$:	IFNOWRT	#8,@(R0),LEAVER,R7		; probe it
+	REMQUE	(R0),R0				; remove our frb
+	MOVL	(R4),R0				; get new first frb
+	CMPL	R4,R0				; empty queue?
+	BEQL	10$				; branch if yes
+	IFNOWRT	#FRB$C_BLN,(R0),LEAVER,R7	; probe frb
+	CMPL	FRB$L_PID(R0),FRB$L_PID(R5)	; are we the owner?
+	BEQL	7$				; branch if yes
+	PUSHL	R0				;
+	BSBW	RM$DECLARE_AST			; declare an ast for owner
+	POPL	R0				; restore r0
+
+;
+;	have sent an ast to new owner.  must simply remove any remaining
+;	frb's for this process from the sfd wait list.
+;
+
+8$:	MOVL	(R0),R0				; get next frb address
+	CMPL	R0,R4				; back at list head?
+	BEQL	10$				; branch if yes
+	IFNOWRT	#FRB$C_BLN,(R0),12$,R7		; probe the frb
+	CMPL	FRB$L_PID(R0),FRB$L_PID(R5)	; are we the owner?
+	BNEQ	8$				; branch if not
+	IFNOWRT	#8,@(R0),12$,R7			; probe it for remque
+	REMQUE	(R0),R0				; remove ourselves from queue
+	BRB	8$				; continue loop
+10$:	CSB	#SFD$V_INSQUEFLG,SFD$B_FLGS(R4)	; clear insque bit
+
+;
+;	if sifab_ptr eql 0 then deallocate temp frb and out
+;
+
+	TSTL	FRB$L_SIFAB_PTR (R5)	; any sifab addr
+	BNEQ	11$			; continue
+	MOVL	R5,R4			; set up for dealloc
+	BRW	RM$RET_TEMP_FRB		; and out
+
+;
+;	freeze state of sifab wait list.
+;
+
+11$:	BBCS	#SIFB$V_INQUEFLG,-	; get insque flag
+		SIFB$B_FLGS(R3),40$
+	BSBW	RM$K_WAIT		; stall for it
+	BRB	11$			; try it again
+12$:	RSB				; return
+
+;
+;	remove all our frb's from sifab wait list except for first if
+;	we own it.
+;
+
+40$:	MOVAL	SIFB$L_FRB_FLNK(R3),R0		; get sifab flnk addr
+	MOVL	(R0),R1				; get sifab owner
+50$:	CMPL	R0,R1				; no more frb's in list?
+	BEQL	150$				; branch if sifab unowned
+	IFNOWRT	#FRB$C_BLN,(R1),12$,R7		; probe frb
+	CMPL	FRB$L_PID(R5),FRB$L_PID(R1)	; are we the owner?
+	BNEQ	60$				; branch if we aren't
+	CMPL	(R0),R1				; is this at front of list?
+	BEQL	60$				; branch if yes
+	REMQUE	(R1),R1				; remove ourselves from queue
+60$:	MOVL	(R1),R1				; get next
+	BRB	50$				;  and check it out
+
+;
+;
+;	take sifab and clean up
+;
+
+150$:	MOVL	(R0),R1				; get sifab owner
+	CMPL	R0,R1				; unowned?
+	CSB	#SIFB$V_INQUEFLG,-		; clear insque bit
+		SIFB$B_FLGS(R3)
+	BEQL	160$				; branch if yes
+	CMPL	FRB$L_PID(R1),FRB$L_PID(R5)	; do we own it?
+	BEQL	170$				; branch if yes
+160$:
+	MOVL	R3,R0				; get sifab address into r0
+	BSBW	RM$TAKE_SIFAB1			; take sifab
+170$:
+	MOVL	IFB$L_GBH_PTR(R10), R6		; get ptr to gbh if present.
+	BNEQ	L1				; NEQ then chk gbl buffers.
+FINBR:	BRW	FINIS				; Branch to last part.
+
+;
+; There is a global buffer section present.
+; Check if section accessible and valid.
+; Scan GBPB's and deaccess appropriate GBD's if found.
+; Verify correctness of GBD queue and correct partial links.
+;
+
+L1:	IFNOWRT	#GBH$C_BLN, (R6), FINBR, R7	; skip over if not accessible.
+	ASSUME	<GBH$B_BID + 1> EQ GBH$B_BLN
+	CMPW	#<GBH$C_BID+<GBH$C_BLN/4@8>>,-	; check if it looks ok.
+		GBH$B_BID(R6)
+	BNEQ	FINBR				; NEQ the header is bad.
+	MOVAL	IFB$L_BDB_FLNK(R10), R0		; Get BDB queue header addr.
+	MOVL	R0, R1				; Save for end test.
+	ASSUME	BDB$L_FLINK EQ 0
+SCANGBPB:
+	MOVL	(R0), R0			; Get next element.
+	CMPL	R0, R1				; At end of list?
+	BEQL	CHKGBD				; EQL then at end.
+
+	IFNORD	#GBPB$C_BLN, (R0), CHKGBD, R7	; If not accessible, skip on.
+	ASSUME	GBPB$B_BID EQ BDB$B_BID
+	ASSUME	<GBPB$C_BID & 1> EQ 1
+	ASSUME	<BDB$C_BID & 1> EQ 0
+	BLBC	GBPB$B_BID(R0), SCANGBPB	; Cont scan if BDB.
+
+;
+; Seem to have a GBPB.  If it checks out and use count not zero,
+; fix count on corresponding GBD and mark GBD invalid in case the
+; buffer was partially modified.  This will force it to be read
+; from disk when the next accessor gains control.
+;
+
+	ASSUME	<GBPB$B_BID + 1> EQ GBPB$B_BLN
+	CMPW	#<GBPB$C_BID+<GBPB$C_BLN/4@8>>,- ; Is it legit GBPB?
+		GBPB$B_BID(R0)
+	BNEQ	CHKGBD				; NEQ then no good.
+	TSTW	GBPB$W_USERS(R0)		; Is it in use?
+	BEQL	SCANGBPB			; EQL no, so cont scan.
+
+	MOVL	GBPB$L_GBD_PTR(R0), R2		; Get addr of GBD.
+	IFNOWRT	#GBD$C_BLN, (R2), SCANGBPB, R7	; If not writeable, cont scan.
+	ASSUME	<GBD$B_BID+1> EQ GBD$B_BLN
+	CMPW	#GBD$C_BID+<GBD$C_BLN/4@8>,-	; Is it legit GBD?
+		GBD$B_BID(R2)
+	BNEQ	SCANGBPB			; Br if no good.
+	DECW	GBD$W_USECNT(R2)		; Adjust use count.
+	BICB2	#GBD$M_VALID, GBD$B_FLAGS(R2)	; Mark invalid.
+	BRB	SCANGBPB			; Continue scan of GBPB's.
+CHKGBD:
+
+;
+; Now scan all of the GBD's in the section to check all of the forward
+; and back links of the elements.  This is necessary because the links
+; are not manipulated with the self-relative queue instructions and
+; may be interupted by this rundown.
+; When an element is removed from the queue, the back link of the successor
+; is changed first.  When the element is reinserted, the back link of its
+; new successor is changed last.  Therefore, partial removal or insertion
+; can be detected by verifying that for every element X, with a forward
+; link to element Y, that's Y's back link points to X.  If that is not
+; the case, then with Y's back link pointing to Z, Z's forward link is
+; made to point to Y.  This removes X entirely from the queue.  It is then
+; reinserted at the end of the list and marked invalid.
+;
+; The only cases which will cause a GBD to be moved from one position to
+; another in the list are:
+;	1) To initialize a GBD for a new buffer prior to reading it
+;	from disk
+;	2) To invalidate a GBD because a local buffer has modified the
+;	same bucket.
+; In either case, no other process will have access to that GBD.
+;
+; At this point: R6 = addr of global buffer header.
+;
+
+	ADDL3	GBH$L_GBD_START(R6), R6, R1 ; Addr of first GBD.
+	ADDL3	GBH$L_GBD_END(R6), R6, R0 ; Addr of last GBD.
+	CMPL	R0, R1			; Make sure they make sense.
+	BLSSU	FINBR			; Skip rest of gbd checks if not.
+10$:	IFNOWRT	#GBD$C_BLN, (R1), FINBR, R7 ; Check for access to GBD.
+	ASSUME	<GBD$B_BID+1> EQ GBD$B_BLN
+	CMPW	#GBD$C_BID+<GBD$C_BLN/4@8>,-	; Is it legit GBD?
+		GBD$B_BID(R1)
+	BNEQ	FINIS			; NEQ then skip the rest.
+	ADDL3	(R1), R1, AP		; AP = successor.
+	CMPL	R6, AP			; Is succ the list head?
+	BEQL	20$			; EQL it is and is already checked.
+	IFNOWRT	#GBD$C_BLN, (AP), FINIS, R7 ; Check access to successor.
+	ASSUME	<GBD$B_BID+1> EQ GBD$B_BLN
+	CMPW	#GBD$C_BID+<GBD$C_BLN/4@8>,-	; Is it legit GBD?
+		GBD$B_BID(AP)
+	BNEQ	FINIS			; NEQ then skip the rest.
+	ASSUME	GBD$L_BLINK EQ GBH$L_GBD_BLNK
+20$:	MNEGL	GBD$L_BLINK(AP), R2	; Negation of succ back link.
+	ASSUME	GBD$L_FLINK EQ 0
+	CMPL	(R1), R2		; Are they pointing at each other?
+	BEQL	50$			; EQL they are. Go on to next GBD.
+
+;
+; The two aren't pointing at each other.  Make sure the successor and
+; its predecessor point to each other.  Place this GBD at the end of
+; the list.
+;
+
+	SUBL2	R2, AP			; Get successor's predecessor.
+	CMPL	R6, AP			; Is succ the list head?
+	BEQL	30$			; EQL it is and already checked it.
+	IFNOWRT	#GBD$C_BLN, (AP), FINIS, R7 ; Check access.
+	ASSUME	<GBD$B_BID+1> EQ GBD$B_BLN
+	CMPW	#GBD$C_BID+<GBD$C_BLN/4@8>,- ; Is it legit GBD?
+		GBD$B_BID(AP)
+	BNEQ	FINIS			; NEQ then skip the rest.
+30$:	ASSUME	GBD$L_FLINK EQ 0
+	MOVL	R2, (AP)		; Make sure they point to each other.
+
+	ASSUME	<GBD$B_FLAGS + 1> EQ GBD$B_CACHE_VAL
+	CLRW	GBD$B_FLAGS(R1)		; Clear flags, cache value.
+	CLRW	GBD$W_NUMB(R1)		; Clear bytes in use.
+	MNEGL	#1, GBD$L_VBN(R1)	; Set invalid VBN.
+
+;
+; Link the element just removed from the rest of the list to the
+; end of the list.
+;
+
+	ADDL3	GBH$L_GBD_BLNK(R6), R6, AP ; AP = my predecessor.
+	CMPL	R6, AP			; Is this the list head? (there
+					; was only 1 gbl buffer).
+	BEQL	40$			; EQL is listhd, already checked.
+
+	IFNOWRT	#GBD$C_BLN, (AP), FINIS, R7 ; Check access.
+	ASSUME	<GBD$B_BID+1> EQ GBD$B_BLN
+	CMPW	#GBD$C_BID+<GBD$C_BLN/4@8>,-	; Is it legit GBD?
+		GBD$B_BID(AP)
+	BNEQ	FINIS			; NEQ then skip the rest.
+
+40$:	SUBL3	R1, AP, R2		; R2 = offset from me to pred.
+	MOVL	R2, GBD$L_BLINK(R1)	; My blink points to pred.
+	ASSUME	GBD$L_FLINK EQ 0
+	SUBL3	R1, R6, (R1)		; Point my flink to list head.
+
+	SUBL3	R6, R1, GBH$L_GBD_BLNK(R6) ; List head blink points to me.
+
+	MNEGL	GBD$L_BLINK(R1), (AP)	; Pred flink points to me.
+
+50$:
+	ACBL	R0, #GBD$C_BLN, R1, 10$	; Go on to next GBD if there are more.
+
+
+;
+;	take the sfd and decrement the access counts.  if now zero,
+;	get rid of the sifab.
+;
+
+FINIS:	MOVL	R10,R9				; set up ifab address
+	MOVL	FRB$L_SIFAB_PTR(R5),R6		; get sifab addr
+	MOVAL	SIFB$L_TEMP_FRB(R6),R0		; get internal frb addr
+	CMPL	R5,R0				; do we own sifab with internal
+	BEQL	30$				; branch if yes
+	SSB	#FRB$V_KRNLMODE, FRB$B_FLAGS(R0) ; Note kernel mode.
+	INSQUE	SIFB$L_TEMP_FRB(R6),(R5)	; take sifab with internal
+	REMQUE	(R5),R3				; remove our real frb from queue
+	BSBW	RM$TAKE_SFD1			; take the sfd
+	BBC	#FRB$V_TEMP,FRB$B_FLAGS(R3),10$	; branch if not temp frb
+	MOVL	R3,R4				; set up for deallocation
+	BSBW	RM$RET_TEMP_FRB			; deallocate temp frb
+	BRB	20$				; branch
+10$:	BSBW	RM$RETURN_FRB			; return our frb
+20$:	BSBW	RM$DEACSHARED			; give back structures
+	BSBW	RM$RLS_SFD			; release the sfd
+	RSB					; return
+
+;
+;	got caught in a window in close pointing to internal sifab frb.
+;	we therefore have no frb to take the sfd.  can merely decrement
+;	the access counts and let future closers remove the sifab from
+;	the sifab list when it goes to zero (again perhaps).
+;
+
+30$:	BBC	#IFB$V_WRTACC,(R9),40$	; branch if not write access
+	DECW	SIFB$W_WACC_CNT(R6)	; decrement write access count
+40$:	DECW	SIFB$W_ACC_CNT(R6)	; decrement access count
+	MOVL	R0,R5			;
+	MOVL	R6,R0			; copy sifab address
+	BSBW	RM$RLS_SIFAB1		; release the sifab
+	RSB				; return
+
+
+;++
+;
+;  doqio subroutine to perform the qio
+;
+;  inputs:
+;
+;	R10	ifab address
+;	R2	iosb address
+;	R0	qio function code
+;	P1 thru P6 already on stack.
+;
+;  outputs:
+;
+;	R0,R1,R3	destroyed
+;
+;--
+
+DOQIO:	POPR	#^M<R3>				; get return pc
+	ASSUME	QIO$_ASTPRM EQ <QIO$_P1 - 4>
+	ASSUME	QIO$_ASTADR EQ <QIO$_ASTPRM - 4>
+	CLRQ	-(SP)				; no ast wanted
+	ASSUME	QIO$_IOSB EQ <QIO$_ASTADR - 4>
+	PUSHL	R2				; iosb addr
+	ASSUME	QIO$_FUNC EQ <QIO$_IOSB - 4>
+	PUSHL	R0				; i/o function code
+	ASSUME	QIO$_CHAN EQ <QIO$_FUNC - 4>
+	MOVZWL	IFB$W_CHNL(R10),-(SP)		; i/o channel
+	ASSUME	QIO$_EFN EQ <QIO$_CHAN - 4>
+	PUSHL	#IMP$C_IOREFN			; efn
+	ASSUME	QIO$_NARGS EQ 12
+	CALLS	#12,@#SYS$QIO			; do the qio
+	BLBC	R0,20$				; branch on failure
+10$:	MOVL	(R2),R0				; get status from iosb
+	BNEQ	20$				; and branch if io really done
+	$CLREF_S	#IMP$C_IOREFN		; clear qio event flag
+	TSTL	(R2)				; done now?
+	BNEQ	10$				; branch if yes
+	$WAITFR_S	#IMP$C_IOREFN		; wait for flag
+	BRB	10$				; go check if done
+20$:	JMP	(R3)				; return to caller
+RM$KERNEL_AST::
+	.WORD	0				; entry mask
+	$SETEF_S	#IMP$C_IOREFN		; set the ior event flag
+	RET					; return
+
+
+	.END

@@ -1,0 +1,433 @@
+%title 'INPUT - Analyze and Act on Input'
+	module input (
+			ident='V03-000') = begin
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! Facility:	VAX/VMS Telephone Facility, Analyze and Act on Input
+!
+! Abstract:	This module receives all of the terminal input from
+!		the user and decides what to do with it.  It handles
+!		both conversation text and commands.
+!
+!
+! Environment:
+!
+! Author: Paul C. Anagnostopoulos, Creation Date: 10 November 1980
+!
+! Modified By:
+!
+! , : Version
+! 01 -
+!--
+
+%sbttl 'Module Declarations'
+!
+! Libraries and Requires:
+!
+
+library 'sys$library:starlet.l32';
+library 'sys$library:tpamac.l32';
+require 'phonereq';
+
+!
+! Table of Contents:
+!
+
+forward routine
+	phn$kbd_route: novalue,
+	phn$cmd_parse: novalue;
+
+!
+! External References:
+!
+
+external routine
+	lib$tparse: addressing_mode(general),
+	phn$answer_cmd,
+	phn$break_call,
+	phn$conversing,
+	phn$dial_cmd,
+	phn$directory_cmd,
+	phn$exit_cmd,
+	phn$facsimile_cmd,
+	phn$fresh_screen,
+	phn$hangup_cmd,
+	phn$help_cmd,
+	phn$hold_cmd,
+	phn$inform,
+	phn$mail_cmd,
+	phn$queue_smb,
+	phn$reject_cmd,
+	phn$show_text,
+	phn$transcribe_cmd,
+	phn$unhold_cmd;
+
+external literal
+	lib$_syntaxerr;
+
+!
+! Own Variables:
+!
+
+
+%sbttl 'PHN$KBD_ROUTE - Initial Routing of Input'
+!++
+! Functional Description:
+!	This steering message routine is invoked after we collect
+!	a bit of input from the keyboard.  It splits up the input
+!	into conversation text and command text and routes these
+!	to the appropriate steering routine for further processing.
+!
+! Formal Parameters:
+!	input		Address of descriptor of input.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$kbd_route(input): novalue = begin
+
+bind
+	input_dsc = .input: descriptor;
+
+own
+	command_flag: byte initial(false);
+
+own
+	text_buf: vector[80,byte],		! These variables are OWN due
+	buf_i: long;				! up-level referencing.
+
+local
+	conversing: byte,
+	char: byte,
+	p: ref pub;
+
+bind
+	ctrl_w_cmd = describe(%string(%char(ctrl_u,ctrl_w,ret))),
+	exit_cmd   = describe(%string(%char(ctrl_u),'EXIT',%char(ret))),
+	hangup_cmd = describe(%string(%char(ctrl_u),'HANGUP',%char(ret)));
+
+
+! The following routine is called when a collection of characters is ready
+! to be queued to the appropriate steering message routine.  If the collection
+! is non-empty, we queue a steering message.  We also clear the buffer for the
+! next collection.
+
+routine queue_collection: novalue = begin
+
+local
+	collection_dsc: descriptor;
+
+if .buf_i gtru 0 then (
+	collection_dsc[len] = .buf_i;
+	collection_dsc[ptr] = text_buf;
+	phn$queue_smb(if .command_flag then smb__cmd_parse else smb__talk,
+		      collection_dsc);
+	buf_i = 0;
+);
+return;
+end;
+
+! The first thing we have to do is check to see what state the screen is in.
+! If the scroller flag is set, some scrolling-type command (e.g., HELP)
+! is in progress.  We need to reset the flag to cancel the command,
+! and refresh the screen.
+
+if .phn$gv_scroller then (
+	phn$gv_scroller = false;
+	if ch$find_ch(.input_dsc[len],.input_dsc[ptr],ctrl_w) eqla 0 then
+		phn$fresh_screen(true);
+);
+
+! Next thing we do is check to see if a message is sitting on the
+! message line.  If so, we want to clear it out.
+
+if .phn$gv_message then (
+	phn$gv_message = false;
+	phn$inform();
+);
+
+! Another thing we need to check for is whether the user is currently
+! ringing someone's phone.  If so, we cancel the call immediately.
+
+p = .phn$gq_pubhead[0];
+if .p[pub_v_calling] then
+	phn$break_call();
+
+! Finally, we have to see if a facsimile operation is in progress.
+! If so, we cancel it by turning off the flag.
+
+phn$gv_facsimile = false;
+
+! Now we are going to look at the input typed by the user.  We will split
+! it up into conversation text and command text.
+
+conversing = phn$conversing();
+buf_i = 0;
+
+while dec (input_dsc[len]) geq 0 do (
+
+	char = ch$rchar_a(input_dsc[ptr]);
+
+	command_flag = .command_flag or (not .conversing);
+	if .command_flag then
+		
+		! We are in the middle of a command.  Process each character:
+		!	return		Done with this command, back to talking
+		!	switch hook	Done with this command, start another.
+		!	CTRL/W		Flush current command & refresh screen.
+		!	CTRL/Z		Flush current command & force EXIT.
+		!	others		Add to current command.
+
+		selectoneu .char of set
+		[ret]:		(text_buf[.buf_i] = ret;
+				inc(buf_i);
+				queue_collection();
+				command_flag = false;);
+
+		[ch$rchar(.phn$gq_switch_hook[ptr])]:
+				(text_buf[.buf_i] = ret;
+				inc(buf_i);
+				queue_collection(););
+
+		[ctrl_w]:	(queue_collection();
+				phn$queue_smb(smb__cmd_parse,ctrl_w_cmd);
+				command_flag = false;);
+
+		[ctrl_z]:	(queue_collection();
+				phn$queue_smb(smb__cmd_parse,exit_cmd);
+				command_flag = false;);
+
+		[otherwise]:	(text_buf[.buf_i] = .char;
+				inc(buf_i););
+		tes
+
+	  else
+
+		! The user is entering some conversation text.  Process each
+		! character as follows:
+		!	switch hook	Suspend talking, start a new command.
+		!	CTRL/W		Suspend talking, refresh screen.
+		!	CTRL/Z		Suspend talking, force HANGUP command.
+		!	others		Add to conversation text.
+
+		selectoneu .char of set
+		[ch$rchar(.phn$gq_switch_hook[ptr])]:
+				(queue_collection();
+				command_flag = true;);
+
+		[ctrl_w]:	(queue_collection();
+				phn$queue_smb(smb__cmd_parse,ctrl_w_cmd););
+
+		[ctrl_z]:	(queue_collection();
+				phn$queue_smb(smb__cmd_parse,hangup_cmd););
+
+		[otherwise]:	(text_buf[.buf_i] = .char;
+				inc(buf_i););
+		tes;
+
+);
+
+! Make sure we queue any final collection we were in the process of building.
+
+queue_collection();
+return;
+
+end;
+
+%sbttl 'PHN$CMD_PARSE - Parse a Command'
+!++
+! Functional Description:
+!	This steering message routine is invoked when we have part
+!	or all of a command from PHN$KBD_ROUTE.  We collect characters
+!	until we have a complete command, and then we parse and execute it.
+!
+! Formal Parameters:
+!	cmd_text	Part or all of a command.  Never a null string and
+!			never parts of two commands.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$cmd_parse(cmd_text): novalue = begin
+
+bind
+	text_dsc = .cmd_text: descriptor;
+
+own
+	command_buf: vector[80,byte],
+	buf_i: long initial(0),
+
+	tparse_block: block[tpa$k_length0,byte]
+		initial(tpa$k_count0,
+			tpa$m_blanks + tpa$m_abbrev),
+	command_proc: long;
+
+local
+	status: long,
+	command_complete: byte,
+	char: byte,
+	in_quotes: byte, i: long;
+
+! The following is the parsing table used to analyze a command and
+! determine which command routine to call.
+! The TRANSCRIBE command has been more or less temporarily removed.
+
+$init_state(command_state,command_key);
+
+$state	(,
+		(tpa$_blank),
+		(tpa$_lambda)
+	);
+
+$state	(,
+		(tpa$_eos,tpa$_exit),
+		(ctrl_w,	noargs),
+		('ANSWER',	noargs,,phn$answer_cmd,		command_proc),
+		('DIAL',	  args,,phn$dial_cmd,		command_proc),
+		('DIRECTORY',	  args,,phn$directory_cmd,	command_proc),
+		('EXIT',	noargs,,phn$exit_cmd,		command_proc),
+		('FACSIMILE',	  args,,phn$facsimile_cmd,	command_proc),
+		('HANGUP',	noargs,,phn$hangup_cmd,		command_proc),
+		('HELP',	  args,,phn$help_cmd,		command_proc),
+		('HOLD',	noargs,,phn$hold_cmd,		command_proc),
+		('MAIL',	  args,,phn$mail_cmd,		command_proc),
+		('REJECT',	  args,,phn$reject_cmd,		command_proc),
+!		('TRANSCRIBE',	  args,,phn$transcribe_cmd,	command_proc),
+		('UNHOLD',	noargs,,phn$unhold_cmd,		command_proc),
+		(tpa$_lambda,	  args,,phn$dial_cmd,		command_proc)
+	);
+
+$state	(noargs,
+		(tpa$_blank),
+		(tpa$_lambda)
+	);
+$state	(,
+		(tpa$_eos,tpa$_exit)
+	);
+
+$state	(args,
+		(tpa$_blank,tpa$_exit),
+		(tpa$_lambda,tpa$_exit)
+	);
+
+! We begin by displaying the command fragment on the screen.
+
+phn$show_text(0,text_dsc);
+
+! We look at each character that has been passed to us.  Note that a
+! similar analysis has to be done in PHN$SHOW_TEXT.  There are the
+! following cases:
+!	normal		Add character to command.
+!	return		End of the command.  Parse & execute it.
+!	delete		Delete last character in command.
+!	CTRL/U		Flush entire command and start over.
+
+command_complete = false;
+while dec (text_dsc[len]) geq 0 do (
+
+	char = ch$rchar_a(text_dsc[ptr]);
+
+	selectoneu .char of set
+	[%x'20' to %x'7e']:
+			(command_buf[.buf_i] = .char;
+			buf_i = minu(.buf_i+1,79););
+
+	[ret]:		command_complete = true;
+
+	[delete]:	buf_i = max(.buf_i-1, 0);
+
+	[ctrl_u]:	buf_i = 0;
+	tes;
+
+);
+
+! If we have a complete command now, we can parse it.  All we are interested
+! in here is the command verb; all arguments will be passed on to the
+! command processing routine.
+
+if not .command_complete then
+	return;
+
+! We need to uppercase the command for comparison purposes.  However, any
+! quoted strings should be left alone.
+
+in_quotes = false;
+incr i from 0 to .buf_i-1 do (
+	if not .in_quotes and
+	   .command_buf[.i] gequ 'a' and .command_buf[.i] lequ 'z' then
+		command_buf[.i] = .command_buf[.i] and %b'11011111';
+	in_quotes = .in_quotes xor (.command_buf[.i] eqlu '"');
+);
+
+tparse_block[tpa$l_stringcnt] = .buf_i;
+tparse_block[tpa$l_stringptr] = command_buf;
+command_proc = 0;
+status = lib$tparse(tparse_block,command_state,command_key);
+
+! If we didn't get a syntax error, we can call the command procedure, passing
+! it a descriptor of the command arguments (which it can clobber).
+
+if .status eqlu lib$_syntaxerr then
+	phn$inform(phn$_badcmd)
+else (
+	check (.status);
+	if .command_proc neqa 0 then
+		(.command_proc) (tparse_block[tpa$l_stringcnt]);
+);
+
+! All done.  Clear out command line on screen and reset our buffer.
+
+phn$show_text(0,describe(%char(ctrl_u)));
+buf_i = 0;
+return;
+
+end;
+
+end eludom

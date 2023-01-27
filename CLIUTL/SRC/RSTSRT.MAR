@@ -1,0 +1,1142 @@
+.TITLE	RSTSRT	RSTS/E Remote Terminal Protocol
+.IDENT	'V03-000'
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY: DECnet remote terminals
+;
+; ABSTRACT:
+;
+;	Handles the RSTS/E DECnet remote terminal protocol.
+;
+; ENVIRONMENT: VMS - USER MODE
+;
+; AUTHOR: Mark Bramhall		 CREATION DATE: 29-Jan-1980
+;
+; MODIFICATION HISTORY:
+;
+;	V03-006		WMC0045		Wayne Cardoza		26-Feb-1982
+;			Add flag to detect spurious $WAKE
+;
+;	V03-005		MHB0080		M. H. Bramhall		25-Jan-1982
+;			Restore terminal characteristics upon exit.
+;
+;	V03-004		MHB0073		M. H. Bramhall		11-May-1981
+;			Make logging file be implied carriage control format.
+;
+;	V03-003		MHB0072		M. H. Bramhall		20-Apr-1981
+;			Added logging file capability.
+;
+;	V03-002		MHB0065		M. H. Bramhall		23-Sep-1980
+;			A large re-write to correct many problems.
+;			Added indirect file capability.
+;--
+
+.SBTTL	Declarations
+
+.DEFAULT DISPLACEMENT WORD
+
+	$DIBDEF				; Device information buffer defs
+	$DSCDEF				; Descriptor defs
+	$TTDEF				; Terminal characteristics defs
+
+.SBTTL	Macros
+
+	.MACRO	QUIT	STATUS
+	.IF	NB	<STATUS>
+		MOVL	STATUS, R0
+	.ENDC	; NB	<STATUS>
+		BRW	QUIT
+	.ENDM	QUIT
+
+	.MACRO	QUIT_NOT_ABORT	?OK
+		BLBS	R0, OK
+		BRW	ABORT_QUIT
+		OK:
+	.ENDM	QUIT_NOT_ABORT
+
+	.MACRO	QUIT_ON_ERROR	?OK
+		BLBS	R0, OK
+		QUIT
+		OK:
+	.ENDM	QUIT_ON_ERROR
+
+.SBTTL	R/W and R-O data areas
+
+.PSECT	_RSTSRT, LONG
+
+TOPS20:					; TOPS-20 flag
+	.BYTE	0
+
+CTRLC_CNT:				; Count -1 of pending CTRL/C's
+	.LONG	-1
+
+CTRLC_SENT:				; CTRL/C sent flag
+	.BYTE	0
+
+CTRLC_MATCH:				; Match string for CTRL/C's
+	.ASCII	/^C/
+
+OUTPUT_WAIT:				; Terminal output wait flag
+	.BYTE	0
+
+LINKBUFLEN	=	512		; Length of link read buffer
+
+LINKIOSB:				; Link read I/O status block
+	.BLKQ
+
+LINKBUFFER:				; Link read buffer
+	.BLKB	LINKBUFLEN
+
+TERBUFLEN	=	255		; Length of terminal read buffer
+
+TERIOSB:				; Terminal read I/O status block
+	.BLKQ
+
+	.BYTE	5			;  TYPE = 5 => terminal data
+	.BLKW				;  LENGTH = message's length
+	.BLKB				;  DATA = data's length
+TERBUFFER:				; Terminal read buffer
+	.BLKB	TERBUFLEN
+
+ECHOBUFFER:				; Terminal read echo buffer
+	.BLKB	2
+	.BYTE	13, 10
+
+READ_MODE:				; Terminal read mode
+	.WORD	IO$_READVBLK!IO$M_TRMNOECHO!IO$M_DSABLMBX
+
+TERMASK:				; Terminal read terminator mask
+	.LONG	0			;  Short form terminator mask:
+	.LONG	^C<<1@0>!<1@9>>		;   All of 0-31 except <NUL> and <TAB>
+
+ASCII_TRIM:				; Translation table for 7-bit ASCII
+	.REPT	256
+	.BYTE	<.-ASCII_TRIM>&127
+	.ENDR
+
+CTRLC_IOSB:				; CTRL/C message I/O status block
+	.BLKQ
+
+CTRLC_MSG:				; CTRL/C message
+10$:	.BYTE	5			;  TYPE = 5 => terminal data
+	.WORD	30$-10$			;  LENGTH = message's length
+	.BYTE	30$-20$			;  DATA = data's length
+20$:	.BYTE	^A/C/-64
+30$:
+
+CMDBUFLEN	=	256		; Length of command input buffer
+
+CMDIOSB:				; Command input I/O status block
+	.BLKQ
+
+CMDBUFFER:				; Command input buffer
+	.BLKB	CMDBUFLEN
+
+CMDMASK:				; Command read terminator mask
+	.LONG	20$-10$, 10$		;  Long form terminator mask:
+10$:	.LONG	^C<0>			;   All  of  0-31
+	.LONG	0			;   None of 32-63
+	.LONG	0			;   None of 64-95
+	.LONG	1@31			;   None of 96-127 except <DEL>
+20$:
+
+CMDPROMPT:				; Command input prompt
+	.LONG	<DSC$K_CLASS_D>@<DSC$B_CLASS*8>
+	.LONG	0
+
+CRLFPROMPT:				; <CR><LF> for utility string
+	.ASCID	<13><10>
+
+ERASEPROMPT:				; String to erase the prompting
+	.LONG	20$-10$, 10$
+10$:
+.REPT	<1+6+2>+5+CMDBUFLEN		; _nnnnnn::REM> command...
+	.BYTE	8, 32, 8
+.ENDR
+20$:
+
+CMDHELP:				; Command help message
+	.LONG	<DSC$K_CLASS_D>@<DSC$B_CLASS*8>
+	.LONG	0
+
+.ENABLE	LSB
+
+CNTLBF:					; CONTROL message
+10$:	.BYTE	2			;  TYPE = 2 => CONTROL
+	.WORD	40$-10$			;  LENGTH = message's length
+	.BYTE	30$-20$			;  MENU = menu's length
+20$:	.BYTE	1@0
+30$:
+CNTLBF_ECHOFLG:				; Echo flag ( <0> )
+	.BYTE	0
+40$:
+
+.DISABLE LSB
+
+LINKMBXBUFLEN	=	40		; Length of link mailbox buffer
+
+LINKMBXIOSB:				; Link mailbox I/O status block
+	.BLKQ
+
+LINKMBXBUFFER:				; Link mailbox buffer
+	.BLKB	LINKMBXBUFLEN
+
+TERMMBXBUFLEN	=	8		; Length of terminal mailbox buffer
+
+TERMMBXIOSB:				; Terminal mailbox I/O status block
+	.BLKQ
+
+TERMMBXBUFFER:				; Terminal mailbox buffer
+	.BLKB	TERMMBXBUFLEN
+
+RMSMSGVEC:				; Model $PUTMSG vector for RMS msg's
+	.LONG	2
+	.LONG	0, 0
+
+NETMBXVEC:				; $PUTMSG vector for mailbox msg's
+	.LONG	3
+	.LONG	REM$_NETMBX
+	.LONG	1
+	.LONG	0
+
+CONFBF:					; Initial CONFIG message
+	.BYTE	1			;  TYPE = 1 => CONFIG
+	.WORD	CONFBF_LEN		;  LENGTH = message's length
+CONFBF_LEN	=	.-CONFBF
+
+.ENABLE	LSB
+
+TTYPBF:					; Initial CONTROL message
+10$:	.BYTE	2			;  TYPE = 2 => CONTROL
+	.WORD	40$-10$			;  LENGTH = message's length
+	.BYTE	30$-20$			;  MENU = menu's length
+20$:	.BYTE	<1@2>!<1@3>!<1@4>
+30$:
+TTYPBF_WIDTH:				; Terminal's width ( <2> )
+	.WORD	0
+TTYPBF_TYPE:				; Terminal's type ( <3> )
+	.WORD	0
+TTYPBF_FILL:				; Terminal's fill factor ( <4> )
+	.WORD	0
+40$:
+
+.DISABLE LSB
+
+REMPROMPT:				; Main prompt for forming prompt string
+	.ASCID	/REM> /
+
+HELPPROMPT:				; Help text for forming help string
+	.ASCID -
+							<13><10>-
+	%       Valid commands:%			<13><10>-
+							<13><10>-
+	%^x         Send a CTRL/x to remote node%	<13><10>-
+	%CO[NTINUE] Return to terminal mode%		<13><10>-
+	%CL[OSE]    Close any logging file%		<13><10>-
+	%CT[RL/P]   Send a CTRL/P to remote node%	<13><10>-
+	%EX[IT]     Exit remote terminal session%	<13><10>-
+	%HE[LP]     Type this help message%		<13><10>-
+	%LO[G] file Create and use the logging file%	<13><10>
+
+RSTSHELP:				; Help text for RSTS/E only
+	.ASCID -
+	%NO[RMAL]   Restore NORMAL mode%		<13><10>-
+	%OD[T]      Enter ODT mode%			<13><10>
+
+HELLO:					; Login command start for RSTS/E
+	.ASCIC	/HELLO /
+
+LOGIN:					; Login command start for TOPS-20
+	.ASCIC	/LOGIN /
+
+CONNECT:				; Connection established message vector
+	.LONG	3
+	.LONG	REM$_REMOTE
+	.LONG	1
+	.LONG	FINALPATH
+
+LOGGING_FLAG:				; Logging file active flag
+	.BYTE	0
+
+LOGGING_FDEF:				; Logging file's defaults
+	.ASCII	/RTPAD.LOG/
+LOGGING_FDEF_LEN = .-LOGGING_FDEF
+
+	.ALIGN	LONG
+
+LOGGING_FAB:				; FAB for logging
+	$FAB -				; Allocate a FAB
+		DNA = LOGGING_FDEF, -	;  address of logging file defaults
+		DNS = LOGGING_FDEF_LEN, - ;  length of logging file defaults
+		FAC = PUT, -		;  we'll be doing PUT's
+		FOP = SQO, -		;  we'll only do sequential access
+		ORG = SEQ, -		;  it should be sequentially organized
+		RAT = CR, -		;  use implied carriage control format
+		RFM = VAR		;  use variable length records
+
+	.ALIGN	LONG
+
+LOGGING_RAB:				; RAB for logging
+	$RAB -				; Allocate a RAB
+		FAB = LOGGING_FAB, -	;  use the logging file FAB
+		RAC = SEQ, -		;  we'll do sequential accesses
+		ROP = WBH		;  we want write behind for speed
+
+LOGGING_MSGVEC:				; Logging file error $PUTMSG vector
+	.LONG	2, 0, 0
+
+LOGGING_BUFLEN = 255			; Logging file record buffer length
+
+LOGGING_BUFDESC:			; Logging file record buffer descriptor
+	.BLKQ
+
+LOGGING_BUFFER:				; Logging file record buffer
+	.BLKB	LOGGING_BUFLEN
+
+.SBTTL	Initialize RSTS/E Remote Terminal Protocol
+
+.SHOW	MEB
+
+.PSECT	PROTOTBL, BYTE, NOEXE
+
+	.WORD	1@0			; <0> => RSTS/E protocol
+	.LONG	RSTSRT			; This is our initialization entry
+
+.PSECT	RSTSRT, NOWRT
+
+RSTSRT::				; Initialize RSTS/E protocol
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	CLRL	RETSTATUS		; Pre-clear return status
+
+; Format and send CONFIG message
+
+	$QIOW_S -			; Send the initial CONFIG message
+		CHAN = LINKCHAN, -	;  on the link channel
+		FUNC = S^#IO$_WRITEVBLK, - ;  writing obviously
+		IOSB = LINKIOSB, -	;  use an IOSB
+		P1 = CONFBF, -		;  pre-built CONFIG message
+		P2 = #CONFBF_LEN	;   and its length
+	QUIT_ON_ERROR			; Quit on any error
+	MOVZWL	LINKIOSB, R0		; Get the I/O completion status
+	QUIT_ON_ERROR			;  and quit on any error
+
+; Format and send CONTROL message
+
+	MOVL	TERMCHAR+4, R1		; Address terminal characteristics
+	MOVW	DIB$W_DEVBUFSIZ(R1), TTYPBF_WIDTH ; Set terminal's width
+	BBC	S^#TT$V_LOWER, DIB$L_DEVDEPEND(R1), 10$ ; Lower case?
+	BISW	#<1@2>!<1@3>, TTYPBF_TYPE ; Yes, so say so
+10$:	BBC	S^#TT$V_SCOPE, DIB$L_DEVDEPEND(R1), 20$ ; Scope?
+	BISW	#1@0, TTYPBF_TYPE	; Yes, so say so
+20$:	BBC	S^#TT$V_MECHTAB, DIB$L_DEVDEPEND(R1), 30$ ; Tab?
+	BISW	#1@1, TTYPBF_TYPE	; Yes, so say so
+30$:	BBC	S^#TT$V_HOSTSYNC, DIB$L_DEVDEPEND(R1), 40$ ; XON?
+	BISW	#1@4, TTYPBF_TYPE	; Yes, so say so
+40$:	BBC	S^#TT$V_MECHFORM, DIB$L_DEVDEPEND(R1), 50$ ; Form feed?
+	BISW	#1@5, TTYPBF_TYPE	; Yes, so say so
+50$:	MOVZWL	TTYPBF+1, R0		; Get initial CONTROL message length
+	$QIOW_S -			; Send the message
+		CHAN = LINKCHAN, -	;  on the link channel
+		FUNC = S^#IO$_WRITEVBLK, - ;  writing obviously
+		IOSB = LINKIOSB, -	;  use an IOSB
+		P1 = TTYPBF, -		;  use filled in message
+		P2 = R0			;   and its extracted length
+	QUIT_ON_ERROR			; Quit on any error
+	MOVZWL	LINKIOSB, R0		; Get the I/O completion status
+	QUIT_ON_ERROR			;  and quit on any error
+	BRB	XXXRT			; Continue in common code
+
+.SBTTL	Initialize TOPS-20 Remote Terminal Protocol
+
+.PSECT	PROTOTBL, BYTE, NOEXE
+
+	.WORD	1@3			; <3> => TOPS-20 protocol
+	.LONG	TOPS20RT		; This is our initialization entry
+
+.PSECT	RSTSRT, NOWRT
+
+TOPS20RT::				; Initialize TOPS-20 protocol
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	CLRL	RETSTATUS		; Pre-clear return status
+	INCB	TOPS20			; Set the TOPS-20 flag
+	BISW	#IO$M_NOECHO!IO$M_NOFILTR, READ_MODE ; TOPS-20 read mode
+
+.SBTTL	Common protocol initialization
+
+XXXRT:					; Common protocol initialization
+
+; Form the command prompt and help strings
+
+	MOVL	#3, R0			; Guess at scope type prompt (3 args)
+	PUSHAQ	REMPROMPT		; Last Src is "REM> "
+	PUSHAQ	NODENAME		; Middle Src is the local node name
+	MOVL	TERMCHAR+4, R1		; Address terminal characteristics
+	BBS	S^#TT$V_SCOPE, DIB$L_DEVDEPEND(R1), 10$ ; Scope?
+	INCL	R0			; Nope, change to non-scope prompt
+	PUSHAQ	CRLFPROMPT		;  and use an initial a <CR><LF>
+	MOVQ	CRLFPROMPT, ERASEPROMPT	; Erasing is done with <CR><LF>
+10$:	PUSHAQ	CMDPROMPT		; Dst string is the real prompt
+	CALLS	R0, G^STR$CONCAT	; Go concatenate the strings
+	QUIT_ON_ERROR			; Quit on any error
+	MOVL	#2, R0			; Guess at TOPS-20 help text (2 args)
+	BLBS	TOPS20, 20$		; Good guess?
+	INCL	R0			; Nope, RSTS/E, add one more argument
+	PUSHAQ	RSTSHELP		; Last Src is RSTS/E specific help text
+20$:	PUSHAQ	HELPPROMPT		; First Src is general help text
+	PUSHAQ	CMDHELP			; Dst string is the real help msg
+	CALLS	R0, G^STR$CONCAT	; Go concatenate the strings
+	QUIT_ON_ERROR			; Quit on any error
+
+; Format initial command string(s)
+
+	MOVAB	TERBUFFER, R3		; Address terminal read buffer
+	MOVZWL	FINALACS, R6		; Was there a final ACS?
+	BEQL	50$			; Nope
+	MOVAB	HELLO, R1		; Yep, point to RSTS/E login command
+	BLBC	TOPS20, 30$		; Really RSTS/E?
+	MOVAB	LOGIN, R1		; TOPS-20, point to its login command
+30$:	MOVZBL	(R1)+, R0		; Get login command start size
+	MOVC	R0, (R1), (R3)		;  and move in start of login command
+	MOVL	R3, R7			;   then save pointer just beyond it
+	MOVC	R6, @FINALACS+4, (R3)	; Now move in the final ACS
+	MOVB	#13, (R3)+		;  terminated with a <CR>
+	BLBS	TOPS20, 50$		; Check for initial command if TOPS-20
+	LOCC	#32, R6, (R7)		; Find a <SP> in the ACS
+	BNEQ	40$			; Found, go change it
+	LOCC	#9, R6, (R7)		; No space, try to find a <TAB>
+	BEQL	60$			; None, done
+40$:	MOVB	#^A/;/, (R1)		; Change the <SP>/<TAB> to semi-colon
+	BRB	60$			; Now done
+
+50$:	TSTW	FIRSTCMD		; Is there an initial command line?
+	BEQL	60$			; Nope
+	MOVC	FIRSTCMD, @FIRSTCMD+4, (R3) ; Yep, move it in
+	MOVB	#13, (R3)+		;  terminated with a <CR>
+	CLRW	FIRSTCMD		; Say initial command used all up
+60$:	SUBL	#TERBUFFER, R3		; Calculate the size of the string
+	BGTRU	70$			; It exists, we'll send it soon
+	$PUTMSG_S -			; Announce the connection
+		MSGVEC = CONNECT	;  with the final path filled in
+
+; Set terminal to NOWRAP and FULLDUPLEX
+
+70$:	MOVL	TERMCHAR+4, R1		; Point to terminal characteristics
+	MOVQ	DIB$B_DEVCLASS(R1), -(SP) ; Copy the information to set
+	MOVAQ	(SP), R1		;  and get a pointer to it
+	BICL	#TT$M_HALFDUP!TT$M_WRAP, - ; Clear HALFDUPLEX and WRAP modes
+		DIB$L_DEVDEPEND-DIB$B_DEVCLASS(R1) ;  in the saved information
+	$QIOW_S -			; Force terminal characteristics
+		CHAN = CNTRLCHAN, -	;  using the control channel
+		FUNC = S^#IO$_SETMODE, - ;  with mode setting function
+		IOSB = TERIOSB, -	;  use an IOSB
+		P1 = (R1)		;  new characteristics are here
+	ADDL	#8, SP			; Clear up the stack
+	QUIT_ON_ERROR			; Quit on any error
+	MOVZWL	TERIOSB, R0		; Get the I/O completion status
+	QUIT_ON_ERROR			;  and quit on any error
+
+; Enable CTRL/C AST's on the terminal (CTRL/Y has been taken away)
+
+	BSBW	ENABLE_CTRLC		; Enable CTRL/C AST's on terminal
+
+; Ensure a restored carriage
+
+	$QIOW_S -			; Output <CR><LF> to restore carriage
+		CHAN = WRITECHAN, -	;  using the write channel
+		FUNC = S^#IO$_WRITEVBLK, - ;  writing obviously
+		P1 = ECHOBUFFER+2, -	;  buffer containing a <CR><LF>
+		P2 = #2			;   which is 2 characters
+
+; Set up for indirect file and/or initial command
+
+	TSTB	INDFLAG			; Indirect file active?
+	BEQL	80$			; Nope
+	MOVB	#1, INDFLAG		; Yep, ensure flag set to +1
+	MOVAB	TERBUFFER, SYSINRAB+RAB$L_UBF ; Set indirect file data address
+	MOVW	#TERBUFLEN-1, SYSINRAB+RAB$W_USZ ;  and maximum record length
+80$:	TSTW	FIRSTCMD		; Pending initial command line?
+	BEQL	90$			; Nope
+	MCOMB	INDFLAG, INDFLAG	; Yep, set flag to -1 (or -2)
+
+; Send the command string(s) or queue up a terminal read
+
+90$:	MOVW	R3, TERIOSB+2		; Set size of the command string(s)
+	BLEQ	100$			; No size, so no command(s) to do
+	MOVW	S^#SS$_NORMAL, TERIOSB	; Some size, set status to success
+	CLRL	TERIOSB+4		;  and no terminator
+	$DCLAST_S -			; Fake an AST
+		ASTADR = TERREADAST, -	;  for terminal read done
+		ASTPRM = #1		;  saying wait for output to continue
+	BRB	110$			; Continue
+
+100$:	BSBW	TERREAD			; Queue up a terminal read
+
+; Queue up reads on the link mailbox, link, and terminal mailbox
+
+110$:	BSBW	LINKMBXREAD		; Queue up a link mailbox read
+	BSBW	LINKREAD		; Queue up a link read
+	BSBW	TERMMBXREAD		; Queue up a terminal mailbox read
+	RET				; Return.
+
+.SBTTL	Terminal mailbox AST's
+
+TERMMBXAST:				; Terminal mailbox AST's
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	MOVZWL	TERMMBXIOSB, R0		; Get the I/O completion status
+	QUIT_ON_ERROR			;  and quit on any error
+	CMPW	TERMMBXBUFFER, #MSG$_TRMHANGUP ; Is it a terminal hangup?
+	BEQL	10$			; Yep, exit right now...
+	BSBB	TERMMBXREAD		; Else just queue up another read
+	RET				; Return.
+
+10$:	QUIT	S^#SS$_NORMAL		; Quit without any messages
+
+TERMMBXREAD:				; Queue up a terminal mailbox read
+	$QIO_S -			; Queue up a request
+		CHAN = TERMMBXCHAN, -	;  on the terminal mailbox channel
+		FUNC = S^#IO$_READVBLK, - ;  reading obviously
+		IOSB = TERMMBXIOSB, -	;  use an IOSB
+		ASTADR = TERMMBXAST, -	;  come here upon completion
+		P1 = TERMMBXBUFFER, -	;  read message into this buffer
+		P2 = #TERMMBXBUFLEN	;   which is this long
+	QUIT_ON_ERROR			; Quit on any error
+	RSB				; Exit.
+
+.SBTTL	Link mailbox AST's
+
+LINKMBXREAD:				; Queue up a link mailbox read
+	$QIO_S -			; Queue up a request
+		CHAN = MAILCHAN, -	;  on the link mailbox channel
+		FUNC = S^#IO$_READVBLK, - ;  reading obviously
+		IOSB = LINKMBXIOSB, -	;  use an IOSB
+		ASTADR = LINKMBXAST, -	;  come here upon completion
+		P1 = LINKMBXBUFFER, -	;  read message into this buffer
+		P2 = #LINKMBXBUFLEN	;   which is this long
+	QUIT_ON_ERROR			; Quit on any error
+	RSB				; Exit.
+
+LINKMBXAST:				; Link mailbox AST's
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	MOVZWL	LINKMBXIOSB, R0		; Get the I/O completion status
+	QUIT_ON_ERROR			;  and quit on any error
+	CMPW	LINKMBXBUFFER, #MSG$_CONFIRM ; Simply the confirmation?
+	BNEQ	10$			; Nope
+	BSBB	LINKMBXREAD		; Yep, just queue up another read
+	RET				; Return.
+
+10$:	CMPW	LINKMBXBUFFER, #MSG$_DISCON ; Is it a valid disconnect?
+	BEQL	30$			; Yep, exit right now...
+	CMPW	LINKMBXBUFFER, #MSG$_ABORT ; Is it a link abort?
+	BNEQ	20$			; Nope, other, go announce it
+	BLBS	TOPS20, 30$		; Yep, skip announcement if TOPS-20
+20$:	MOVZWL	LINKMBXBUFFER, NETMBXVEC+12 ; Store the mailbox code
+	$PUTMSG_S -			; Put out a message
+		MSGVEC = NETMBXVEC	;  with the mailbox error code
+30$:	QUIT	S^#SS$_NORMAL		; Quit without any messages
+
+.SBTTL	Image termination
+
+.ENABLE	LSB
+
+ABORT_QUIT:				; Possible image termination
+	CMPL	R0, S^#SS$_ABORT	; Is the link simply aborting?
+	BEQL	20$			; Yes, we'll wait for mailbox message
+QUIT:					; Image termination
+	TSTL	RETSTATUS		; Do we already have a return status?
+	BNEQ	10$			; Yep, don't overwrite it with another
+	MOVL	R0, RETSTATUS		; Set the final completion status
+10$:	BSBW	END_LOG			; Go close out the logging file if any
+	$CANCEL_S -			; Cancel any current terminal read
+		CHAN = READCHAN		;  on the read channel
+	$CANCEL_S -			; Cancel operation(s)
+		CHAN = CNTRLCHAN	;  so we can reset the terminal
+	MOVL	TERMCHAR+4, R1		; Point to terminal characteristics
+	MOVQ	DIB$B_DEVCLASS(R1), -(SP) ; Copy the information to set
+	MOVAQ	(SP), R1		;  and get a pointer to it
+	$QIOW_S -			; Force terminal characteristics
+		CHAN = CNTRLCHAN, -	;  using the control channel
+		FUNC = S^#IO$_SETMODE, - ;  with mode setting function
+		P1 = (R1)		;  new characteristics are here
+	ADDL	#8, SP			; Clear up the stack
+	INCB	WAKEFLAG		; INDICATE A LEGITIMATE $WAKE
+	$WAKE_S				; Wake up the mainline program
+20$:	RET				; Return from whatever level.
+
+.DISABLE LSB
+
+.SBTTL	CTRL/C AST's
+
+CTRLCAST:				; CTRL/C AST's
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	BSBB	ENABLE_CTRLC		; Re-enable CTRL/C's
+	INCL	CTRLC_CNT		; CTRL/C message already in-progress?
+	BNEQ	40$			; Yep
+10$:	MOVAB	CTRLC_MSG, R1		; Address the CTRL/C message
+	MOVZWL	1(R1), R0		; Get the CTRL/C message length
+	BLBC	TOPS20, 20$		; All set if RSTS/E
+	ADDL	#4, R1			; It's TOPS-20, skip the header
+	SUBL	#4, R0			;  and don't count it
+20$:	$QIO_S -			; Queue up a CTRL/C link send
+		CHAN = LINKCHAN, -	;  using the link channel
+		FUNC = S^#IO$_WRITEVBLK, - ;  writing obviously
+		IOSB = CTRLC_IOSB, -	;  use an IOSB
+		ASTADR = 30$, -		;  come here upon completion
+		P1 = (R1), -		;  this is the message
+		P2 = R0			;   with this size
+	QUIT_NOT_ABORT			; Quit on non-link-abort error
+	MOVB	#1, CTRLC_SENT		; Say a CTRL/C message was sent
+	RET				; Return pending CTRL/C completion.
+
+30$:					; CTRL/C message sent AST
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	MOVZWL	CTRLC_IOSB, R0		; Get the I/O completion status
+	QUIT_NOT_ABORT			; Quit on non-link-abort error
+	SOBGEQ	CTRLC_CNT, 10$		; Do it again if more CTRL/C's pending
+40$:	RET				; Return.
+
+.SBTTL	CTRL/C AST enable
+
+ENABLE_CTRLC:				; CTRL/C AST enable
+	$QIOW_S -			; Enable CTRL/C AST's
+		CHAN = CNTRLCHAN, -	;  using the control channel
+		FUNC = #IO$_SETMODE!IO$M_CTRLCAST, - ;  function for AST
+		P1 = CTRLCAST		;  come here on CTRL/C AST's
+	QUIT_ON_ERROR			; Quit on any error
+	RSB				; Exit.
+
+.SBTTL	Terminal read AST's
+
+.ENABLE	LSB
+
+10$:	TSTL	R0			; Anything to delete?
+	BEQL	20$			; Nope
+	SUBW	R1, CMDIOSB+2		; Yep, delete from the buffer
+	MULL	#3, R1			; Form the erase count
+	$QIOW_S -			; Write the screen deletion
+		EFN = #1, -		;  we really want to wait
+		CHAN = READCHAN, -	;  use the read channel
+		FUNC = S^#IO$_WRITEVBLK, - ;  writing obviously
+		P1 = @ERASEPROMPT+4, -	;  the erase sequence
+		P2 = R1			;  for this many characters
+20$:	MOVZWL	CMDIOSB+2, R0		; Get the updated data size
+	MOVW	R0, -(SP)		;  and save it
+	SUBL3	R0, #CMDBUFLEN-1, R1	; Form left over buffer size
+	ADDL	#CMDBUFFER, R0		;  and starting buffer address
+	$QIOW_S -			; Re-ask for a command to decode
+		EFN = #1, -		;  we really want to wait
+		CHAN = READCHAN, -	;  use the read channel
+		FUNC = <#IO$_READVBLK!IO$M_CVTLOW- ;  read uc
+			!IO$M_NOFILTR!IO$M_TRMNOECHO>, - ;  w/o filtering
+		IOSB = CMDIOSB, -	;  use an IOSB
+		P1 = (R0), -		;  into this part of the buffer
+		P2 = R1, -		;  with this remaining size
+		P4 = #CMDMASK		;  use the command terminator mask
+	ADDW	(SP)+, CMDIOSB+2	; Correct the data read size
+	BRB	40$			;  and go try, try again...
+
+CTRLP:					; CTRL/P intercept, command decode
+	MOVZWL	CMDPROMPT, R0		; Get length of the command prompt
+	MOVZWL	#IO$_READPROMPT!IO$M_CVTLOW!IO$M_TRMNOECHO, R1 ; Set func
+	CMPW	ERASEPROMPT, #2		; Doing fancy scope things?
+	BLEQU	30$			; Nope
+	BISW	#IO$M_NOFILTR, R1	; Yep, handle <DEL> ourselves
+30$:	$QIOW_S -			; Ask for a command to decode
+		EFN = #1, -		;  we really want to wait
+		CHAN = READCHAN, -	;  use the read channel
+		FUNC = R1, -		;  using the correct function
+		IOSB = CMDIOSB, -	;  use an IOSB
+		P1 = CMDBUFFER, -	;  read into command buffer
+		P2 = #CMDBUFLEN-1, -	;   which is this long less terminator
+		P4 = #CMDMASK, -	;  use the command terminator mask
+		P5 = CMDPROMPT+4, -	;  pointer to command prompt
+		P6 = R0			;   and its size
+40$:	BLBC	R0, 90$			; Quit on any error
+	CMPW	CMDIOSB, S^#SS$_NORMAL	; Normal completion?
+	BNEQ	90$			; Nope, quit
+	MOVZWL	CMDIOSB+2, R0		; Get size of data read
+	CMPB	CMDIOSB+4, #127		; Was terminator <DEL>?
+	BNEQ	60$			; Nope
+	MOVL	#1, R1			; Yep, set deletion size to one
+50$:	BRW	10$			; Go handle scope <DEL> and CTRL/U...
+
+60$:	CMPB	CMDIOSB+4, #^A/U/-64	; Was terminator CTRL/U?
+	BNEQ	70$			; Nope
+	MOVL	R0, R1			; Yep, is the CTRL/U the only thing?
+	BNEQ	50$			; Not the only, go do deletions
+	MOVB	#^A/X/-64, CMDBUFFER	; The only, replace it with a CTRL/X
+70$:	MOVW	ERASEPROMPT, R1		; Get string size that erases prompt
+	CMPW	R1, #2			; Is it the fancy scope erase?
+	BLEQU	80$			; Nope, use it as is
+	ADDW3	R0, CMDPROMPT, R1	; Yep, calculate erase size
+	MULW	#3, R1			; That *3 is the real erase string
+80$:	MOVZWL	R1, R1			; Extract size into a longword
+	$QIOW_S -			; Write out prompt erase
+		EFN = #1, -		;  we really want to wait
+		CHAN = READCHAN, -	;  using the read channel
+		FUNC = S^#IO$_WRITEVBLK, - ;  writing obviously
+		P1 = @ERASEPROMPT+4, -	;  pointer to prompt erase
+		P2 = R1			;  and its size
+	MOVAB	CMDBUFFER, R0		; Address command buffer
+	CMPW	(R0), #^A/EX/		; Is it EXIT?
+	BEQL	90$			; Yes, quit
+	CMPB	(R0), #^A/Z/-64		; CTRL/Z typed?
+	BNEQ	100$			; Nope, go decode real commands
+90$:	QUIT	S^#SS$_NORMAL		; Quit.
+
+93$:	BRW	START_LOG		; Go off to start logging
+
+97$:	BRW	END_LOG			; Go off to end logging
+
+100$:	CMPW	(R0), #^A/CO/		; Is it CONTINUE?
+	BEQL	130$			; Yes, so just continue
+	CMPB	(R0), #13		; <CR> typed?
+	BEQL	130$			; Yes, so just continue
+	CMPW	(R0), #^A/LO/		; Is it LOG?
+	BEQL	93$			; Yes, so go off to start logging
+	CMPW	(R0), #^A/CL/		; Is it CLOSE?
+	BEQL	97$			; Yes, so go off to end logging
+	BLBS	TOPS20, 150$		; No mode command decode if TOPS-20
+	MOVB	#1@0, CNTLBF_ECHOFLG	; Guess at ODT mode
+	CMPW	(R0), #^A/OD/		; Was that a good guess?
+	BEQL	110$			; Yes, it's ODT mode
+	MOVB	#1@1, CNTLBF_ECHOFLG	; Now guess at NORMAL mode
+	CMPW	(R0), #^A/NO/		; A good guess this time?
+	BNEQ	150$			; No, go decode other commands
+110$:	BICW	#IO$M_NOECHO!IO$M_NOFILTR, READ_MODE ; Set NORMAL read mode
+	BLBC	CNTLBF_ECHOFLG, 120$	; A good guess?
+	BISW	#IO$M_NOECHO!IO$M_NOFILTR, READ_MODE ; Set ODT read mode
+120$:	MOVZWL	CNTLBF+1, R0		; Else get the message's length
+	$QIO_S -			; Send the CONTROL message
+		CHAN = LINKCHAN, -	;  using the link channel
+		FUNC = S^#IO$_WRITEVBLK, - ;  writing obviously
+		P1 = CNTLBF, -		;  buffer is the CONTROL message
+		P2 = R0			;   which is this long
+	QUIT_NOT_ABORT			; Quit on non-link-abort error
+130$:	RSB				; Exit.
+
+140$:	MOVQ	CMDHELP, R0		; Get command help prompt descriptor
+	MOVZWL	R0, R0			;  and fix the help text's length
+	$QIOW_S -			; Write out some help
+		EFN = #1, -		;  we really want to wait
+		CHAN = READCHAN, -	;  using the read channel
+		FUNC = S^#IO$_WRITEVBLK, - ;  writing obviously
+		P1 = (R1), -		;  pointer to help text
+		P2 = R0			;  and its size
+	BRW	CTRLP			; Now go ask again...
+
+150$:	MOVZBL	(R0), R1		; Pick up the first character
+	CMPB	(R0), #32		; Is it a control character?
+	BLSSU	160$			; Yes, send the control character
+	MOVZBL	1(R0), R1		; Pick up next character for CTRL/x
+	CMPB	(R0), #^A/^/		; Is it CTRL/x?
+	BEQL	160$			; Yep, so send the "x" as a control
+	CMPW	(R0), #^A/CT/		; Is it CTRL/P?
+	BNEQ	140$			; Nope, go give some help...
+	MOVZBL	#^A/P/-64, R1		; Pick up a CTRL/P to send
+160$:	BICB3	#^C<31>, R1, (R0)	; Put control character in echo buffer
+	MOVL	#1, R1			;  and set echo size to one
+	MOVB	(R0), (R7)[R6]		; Add control character to message
+	INCL	R6			;  and count it
+	CMPB	(R0), #^A/P/-64		; Did we add a CTRL/P?
+	BNEQ	170$			; Nope
+	BBS	S^#IO$V_NOFILTR, READ_MODE, 170$ ; Are we in NORMAL mode?
+	MOVB	#13, (R7)[R6]		; Add a <CR> to message
+	INCL	R6			;  and count it
+	MOVW	#<10@8>!13, 2(R0)	; Put <CR><LF> in echo buffer
+	MOVL	#3, R1			;  and set echo size to three
+170$:	BBS	S^#IO$V_NOECHO, READ_MODE, 200$ ; Are we echoing?
+	CMPB	(R0), #7		; Less than <BEL>?
+	BLSSU	180$			; Yes, make into uparrow format
+	CMPB	(R0), #13		; <CR> or less?
+	BLEQU	190$			; Yes, <BEL> through <CR> echo same
+180$:	BISB3	#64, (R0)+, (R0)	; Make the control a graphic
+	MOVB	#^A/^/, -(R0)		;  and add an uparrow prefix
+	INCL	R1			; Add one to the echo count
+190$:	$QIOW_S -			; Write out the echo
+		EFN = #1, -		;  we really want to wait
+		CHAN = READCHAN, -	;  using the read channel
+		FUNC = S^#IO$_WRITEVBLK, - ;  writing obviously
+		P1 = (R0), -		;  the echo
+		P2 = R1			;  with its size
+200$:	RSB				; Exit.
+
+.DISABLE LSB
+
+.ENABLE	LSB
+
+TERREADAST:				; Terminal read done AST
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	BBC	S^#IO$V_NOFILTR, READ_MODE, 10$ ; Are we in ODT read mode?
+	CMPL	TERIOSB, #<1@16>!SS$_NORMAL ; Normal completion of 1 char?
+	BNEQ	10$			; Nope, just go process it
+	TSTL	TERIOSB+4		; Did we get any terminator?
+	BNEQ	10$			; Yep, also just go process it
+	$QIOW_S -			; Else get the remaining data (if any)
+		EFN = #1, -		;  we really want to wait
+		CHAN = READCHAN, -	;  using the read channel obviously
+		FUNC = <#IO$_READVBLK!IO$M_TRMNOECHO-
+			!IO$M_NOECHO!IO$M_NOFILTR-
+			!IO$M_TIMED>, -	;  using the read type ahead mode
+		IOSB = TERIOSB, -	;  (re-)use the IOSB
+		P1 = TERBUFFER+1, -	;  use remainder of terminal buffer
+		P2 = #TERBUFLEN-1-1, -	;   which is this long w/o terminator
+		P4 = #TERMASK		;  use the terminator mask
+	QUIT_ON_ERROR			; Quit on any error
+	INCW	TERIOSB+2		; Count the data character of 1st read
+10$:	MOVZWL	TERIOSB, R0		; Get the I/O completion status
+	CMPW	R0, #SS$_CONTROLY	; Completed under CTRL/Y?
+	BNEQ	20$			; Nope
+	MOVL	#<1@16>!<^A/Y/-64>, TERIOSB+4 ; Yep, set CTRL/Y terminator
+20$:	CMPW	R0, #SS$_CONTROLC	; Completed under CTRL/C?
+	BNEQ	30$			; Nope
+	CLRQ	TERIOSB			; Yep, force nothing read at all
+	CMPL	CTRLC_CNT, #5		; Too many pending CTRL/C's?
+	BLSS	30$			; Not yet
+	MOVL	#<1@16>!<^A/P/-64>, TERIOSB+4 ; Yep, set CTRL/P terminator
+30$:	MOVZWL	TERIOSB+2, R6		; Get amount of data read
+	MOVAB	TERBUFFER, R7		; Address the read data
+	MOVZBL	TERIOSB+4, R0		; Get the terminator if any
+	BEQL	40$			; There was none...
+	MOVB	R0, (R7)[R6]		; There is one, store it in the buffer
+	CMPB	R0, #^A/P/-64		; Is it CTRL/P?
+	BNEQ	50$			; Nope
+	BSBW	CTRLP			; Handle that as an intercept
+40$:	BRB	100$			; Continue
+
+50$:	BBS	S^#IO$V_NOECHO, READ_MODE, 90$ ; Are we echoing?
+	CMPB	R0, #^A/T/-64		; Is it CTRL/T?
+	BEQL	90$			; Yep, that's never echoed
+	CMPB	R0, #^A/Y/-64		; Is it CTRL/Y?
+	BEQL	90$			; Yep, that's never echoed
+	MOVZWL	#1, R1			; Set echo size to one initially
+	MOVW	#<10@8>!^A/$/, ECHOBUFFER ;  and load echo buffer w/ $<LF>
+	CMPB	R0, #27			; Is it <ESC>?
+	BEQL	80$			; Yes, that echoes as a dollar sign
+	MOVB	#13, ECHOBUFFER		; Now load echo buffer w/ <CR><LF>
+	CMPB	R0, #10			; Is it <LF>?
+	BEQL	70$			; Yes, that echoes as <CR><LF>
+	MOVB	R0, ECHOBUFFER		; Now load echo buffer w/ terminator
+	CMPB	R0, #7			; Less than <BEL>?
+	BLSSU	60$			; Yes, make into uparrow format
+	CMPB	R0, #13			; <CR> or less?
+	BEQL	70$			; It's <CR>, go echo as <CR><LF>
+	BLSSU	80$			; Less that <CR>, echo as itself
+60$:	MOVB	#^A/^/, ECHOBUFFER	; Put uparrow prefix into echo buffer
+	BISB3	#64, R0, ECHOBUFFER+1	;  then make the control a graphic
+	CMPB	R0, #^A/Z/-64		; A CTRL/Z?
+	BNEQ	70$			; Nope
+	ADDL	#2, R1			; Yep, echo as ^Z<CR><LF>
+70$:	INCL	R1			; Add one to the echo count
+80$:	$QIO_S -			; Queue up the echo
+		CHAN = WRITECHAN, -	;  on the write channel
+		FUNC = S^#IO$_WRITEVBLK, - ;  writing obviously
+		P1 = ECHOBUFFER, -	;  from the echo buffer
+		P2 = R1			;   with this size
+90$:	INCL	R6			; Count the terminator in data count
+100$:	TSTL	R6			; Any data at all?
+	BEQL	130$			; Nope
+	BLBS	TOPS20, 110$		; Yep, TOPS-20 mode?
+	MOVB	R6, -(R7)		; Set length of data
+ASSUME	TERBUFLEN LE 255
+	ADDL	#4, R6			; Calculate length of message
+	MOVW	R6, -(R7)		;  and set it
+	DECL	R7			; Back up to the TYPE byte
+110$:	$QIO_S -			; Queue up a link write
+		CHAN = LINKCHAN, -	;  using the link channel
+		FUNC = S^#IO$_WRITEVBLK, - ;  writing obviously
+		IOSB = TERIOSB, -	;  use an IOSB
+		ASTADR = 120$, 	-	;  come here upon completion
+		ASTPRM = 4(AP), -	;   forwarding the output wait flag
+		P1 = (R7), -		;  send this message buffer
+		P2 = R6			;   which is this long
+	QUIT_NOT_ABORT			; Quit on non-link-abort error
+	RET				; Return pending link write complete.
+
+120$:					; Link write done AST
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	MOVZWL	TERIOSB, R0		; Get the I/O completion status
+	QUIT_NOT_ABORT			; Quit on non-link-abort error
+	BLBC	4(AP), 130$		; Should we wait for output done?
+	MOVB	#1, OUTPUT_WAIT		; Yep, set output wait flag
+	BRB	140$			;  and wait for it...
+
+OUTPUTWAITAST:				; Output wait done AST
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+130$:	BSBB	TERREAD			; Do a terminal (re-)read
+140$:	RET				; Return.
+
+.DISABLE LSB
+
+.ENABLE	LSB
+
+10$:	TSTW	FIRSTCMD		; Initial command, have we used it?
+	BEQL	20$			; It's been used, go check indirect
+	MOVC	FIRSTCMD, @FIRSTCMD+4, TERBUFFER ; Move in command
+	CLRW	FIRSTCMD		;  then say it's been used up
+	SUBL3	#TERBUFFER, R3, TERIOSB+2 ; Calculate the command's size
+	BRB	30$			;  and go use it
+
+20$:	MCOMB	INDFLAG, INDFLAG	; Flip the flop
+	BEQL	70$			; No indirect, clear up and continue
+TERREAD:				; Queue up a terminal read
+	TSTB	INDFLAG			; Initial command or indirect file?
+	BEQL	80$			; Neither
+	BLSS	10$			; Initial command
+	$GET -				; Get next record
+		RAB = SYSINRAB		;  from the indirect file
+	BLBC	R0, 50$			; Go check out any error
+	MOVW	SYSINRAB+RAB$W_RSZ, TERIOSB+2 ; Set the data character size
+30$:	BBS	S^#IO$V_NOFILTR, READ_MODE, 40$ ; Already in ODT mode?
+	BSBW	100$			; Nope, go shift to ODT mode
+40$:	MOVW	S^#SS$_NORMAL, TERIOSB	; Set completion status as normal
+	MOVL	#<1@16>!13, TERIOSB+4	; Set length 1 terminator of <CR>
+	$DCLAST_S -			; Fake an AST
+		ASTADR = TERREADAST, -	;  for terminal read done
+		ASTPRM = #1		;  saying wait for output to continue
+	RSB				; Exit.
+
+50$:	CMPL	R0, #RMS$_EOF		; Are we just done with the indirect?
+	BEQL	60$			; Simple EOF, we're done
+	MOVL	R0, RMSMSGVEC+4		; Load status code into message vector
+	MOVL	SYSINRAB+RAB$L_STV, RMSMSGVEC+8 ;  and load the STV value
+	$PUTMSG_S -			; Put out a message
+		MSGVEC = RMSMSGVEC	;  to announce the RMS error
+60$:	$CLOSE -			; Close out
+		FAB = SYSINFAB		;  the indirect file
+70$:	CLRB	INDFLAG			; Say nothing special is active
+	BBC	S^#IO$V_NOFILTR, READ_MODE, 80$ ; Already in NORMAL mode?
+	BSBB	110$			; Nope, go shift (back) to NORMAL mode
+80$:	MOVZWL	#TERBUFLEN-1, R1	; Get buffer size w/o a terminator
+	BBC	S^#IO$V_NOFILTR, READ_MODE, 90$ ; All set unless ODT mode
+	MOVZWL	#1, R1			; Set buffer size to one of ODT mode
+90$:	$QIO_S -			; Queue up a terminal read
+		CHAN = READCHAN, -	;  using the read channel obviously
+		FUNC = READ_MODE, -	;  using the correct read mode
+		IOSB = TERIOSB, -	;  use an IOSB
+		ASTADR = TERREADAST, -	;  come here upon completion
+		ASTPRM = #0, -		;  saying no wait for output
+		P1 = TERBUFFER, -	;  read into this buffer
+		P2 = R1, -		;   which is this long this time
+		P4 = #TERMASK		;  use the terminator mask
+	QUIT_ON_ERROR			; Quit on any error
+	RSB				; Exit.
+
+100$:	BLBS	TOPS20, 130$		; Mode always correct if TOPS-20
+	BISW	#IO$M_NOECHO!IO$M_NOFILTR, READ_MODE ; Set ODT read mode
+	MOVB	#1@0, CNTLBF_ECHOFLG	;  and indicate ODT in CONTROL msg
+	BRB	120$			; Go send the message
+
+110$:	BLBS	TOPS20, 130$		; Mode always correct if TOPS-20
+	BICW	#IO$M_NOECHO!IO$M_NOFILTR, READ_MODE ; Set NORMAL read mode
+	MOVB	#1@1, CNTLBF_ECHOFLG	;  and indicate NORMAL in CONTROL msg
+120$:	MOVZWL	CNTLBF+1, R0		; Get the message's length
+	$QIO_S -			; Send the CONTROL message
+		CHAN = LINKCHAN, -	;  using the link channel
+		FUNC = S^#IO$_WRITEVBLK, - ;  writing obviously
+		P1 = CNTLBF, -		;  buffer is the CONTROL message
+		P2 = R0			;   which is this long
+	QUIT_NOT_ABORT			; Quit on non-link-abort error
+130$:	RSB				; Exit.
+
+.DISABLE LSB
+
+.SBTTL	Link read AST's
+
+LINKREADAST:				; Link read done AST
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+
+	MOVZWL	LINKIOSB, R0		; Get the I/O completion status
+	QUIT_NOT_ABORT			; Quit on non-link-abort error
+	MOVZWL	LINKIOSB+2, R6		; Get size of the read message
+	BEQL	50$			; No size??
+	MOVAB	LINKBUFFER, R7		; Get a pointer to read message
+	BLBS	TOPS20, 70$		; Always just data if TOPS-20
+	CMPB	(R7), #5		; Data message?
+	BEQL	60$			; Yep
+	CMPB	(R7), #2		; Control message?
+	BNEQ	50$			; Nope, other, punt on it
+	CMPW	1(R7), #6		; Yep, is size at least 6?
+	BLSSU	50$			; Too small, also punt on it
+	BBS	S^#IO$V_NOFILTR, READ_MODE, 50$ ; Also punt if in ODT mode
+	CMPB	5(R7), #1@0		; Which way is echo changing?
+	BEQL	10$			; Echo is turning off
+	BBCC	S^#IO$V_NOECHO, READ_MODE, 50$ ; Echo ON; is it already on?
+	BRB	20$			; Not already on, correct the read
+
+10$:	BBSS	S^#IO$V_NOECHO, READ_MODE, 50$ ; Echo OFF; is it already off?
+20$:	$CANCEL_S -			; Cancel the current terminal read
+		CHAN = READCHAN		;  on the read channel
+	BRB	50$			; Now queue up another link read
+
+30$:					; Terminal write completed AST
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+40$:	BBCC	#0, OUTPUT_WAIT, 50$	; Say terminal output is done
+	$DCLAST_S -			; Something waiting, fake an AST
+		ASTADR = OUTPUTWAITAST	;  for terminal output waiter
+50$:	BSBB	LINKREAD		; Queue up another link read
+	RET				; Return.
+
+60$:	ADDL	#4, R7			; Skip pointer over the header
+	SUBL	#4, R6			;  and don't count it in the size
+	BLEQU	50$			; Nothing left??
+70$:	TSTL	CTRLC_CNT		; Pending CTRL/C's?
+	BGEQ	50$			; Yep, toss this output...
+	MOVTC	R6, (R7), #0, ASCII_TRIM, R6, (R7) ; Form 7-bit ASCII
+	BSBW	DO_LOG			; Go do logging if logging is active
+	BBCC	#0, CTRLC_SENT, 80$	; A recent CTRL/C sent?
+	MATCHC	#2, CTRLC_MATCH, R6, (R7) ; Try to find the "^C" in text
+	BNEQ	80$			; Not there??
+	MOVQ	R2, R6			; Found, copy desc just beyond it
+	CMPL	R6, #1			; What's the remaining length?
+	BLSSU	40$			; It's zero, nothing remains, skip it
+	BEQL	80$			; It's one, just go do that character
+	CMPW	(R7), #<10@8>!13	; It's two or greater, is it <CR><LF>?
+	BNEQ	80$			; Nope
+	ADDL	#2, R7			; Yep, skip pointer over the <CR><LF>
+	SUBL	#2, R6			;  and don't count it
+	BEQL	40$			; Skip it if nothing now left
+80$:	$QIO_S -			; Queue up a terminal write
+		CHAN = WRITECHAN, -	;  on the write channel
+		FUNC = S^#IO$_WRITEVBLK, - ;  writing obviously
+		ASTADR = 30$, -		;  come here upon completion
+		P1 = (R7), -		;  use this for the data
+		P2 = R6			;   which is this long
+	QUIT_ON_ERROR			; Quit on any error
+	RET				; Return pending write completion.
+
+LINKREAD:				; Queue up a link read
+	$QIO_S -			; Queue up a link read
+		CHAN = LINKCHAN, -	;  using the link channel obviously
+		FUNC = S^#IO$_READVBLK, - ;  reading obviously
+		IOSB = LINKIOSB, -	;  use an IOSB
+		ASTADR = LINKREADAST, -	;  come here upon completion
+		P1 = LINKBUFFER, -	;  read into this buffer
+		P2 = #LINKBUFLEN	;   which is this long
+	QUIT_NOT_ABORT			; Quit on non-link-abort error
+	RSB				; Exit.
+
+.SBTTL	Logging file handling
+
+.ENABLE	LSB
+
+END_LOG:				; Close out logging file if any
+	TSTB	LOGGING_FLAG		; Is logging active?
+	BEQL	40$			; No
+	CLRB	LOGGING_FLAG		; Yes, but no longer
+	TSTW	LOGGING_BUFDESC		; Anything left in the buffer?
+	BEQL	5$			; Nope
+	BSBB	DUMP_LOG		; Yep, go dump last record in log
+5$:	$CLOSE -			; Close
+		FAB = LOGGING_FAB	;  the logging file
+	BLBS	R0, 40$			; Go exit if success
+10$:	MOVL	LOGGING_FAB+FAB$L_STV, LOGGING_MSGVEC+8 ; Set RMS FAB value
+	BRB	30$			;  and go announce the error
+
+DUMP_LOG:				; Dump the logging record buffer
+	MOVW	LOGGING_BUFDESC, LOGGING_RAB+RAB$W_RSZ ; Set record length
+	MOVAB	LOGGING_BUFFER, LOGGING_RAB+RAB$L_RBF ; Set buffer address
+	$PUT -				; Put a record
+		RAB = LOGGING_RAB	;  to the logging file
+	CLRL	LOGGING_BUFDESC		; Clear out the
+	MOVAB	LOGGING_BUFFER-1, LOGGING_BUFDESC+4 ;  buffer descriptor
+	BLBS	R0, 40$			; Go exit if success
+20$:	MOVL	LOGGING_RAB+RAB$L_STV, LOGGING_MSGVEC+8 ; Set RMS RAB value
+30$:	MOVL	R0, LOGGING_MSGVEC+4	; Set the error status in vector
+	$PUTMSG_S -			; $PUTMSG the error into real log file
+		MSGVEC = LOGGING_MSGVEC	;  using the built-up message vector
+40$:	RSB				; Exit.
+
+START_LOG:				; Start up a logging file
+	LOCC	#32, CMDIOSB+2, (R0)	; Isolate any specified file name
+	BEQL	50$			; Nothing there...
+	DECL	R0			; Else don't count the space
+	INCL	R1			;  and skip the pointer over it
+50$:	MOVB	R0, LOGGING_FAB+FAB$B_FNS ; Set the file name's size
+	MOVAB	(R1), LOGGING_FAB+FAB$L_FNA ;  and the file name's address
+	BSBW	END_LOG			; First close any old logging file
+	$CREATE -			; Try a create
+		FAB = LOGGING_FAB	;  of the logging file
+	BLBC	R0, 10$			; Forget logging if any error...
+	$CONNECT -			; Else connect
+		RAB = LOGGING_RAB	;  to the logging file
+	BLBC	R0, 20$			; Forget logging if any error...
+	MOVB	#1, LOGGING_FLAG	; All set, indicate logging active
+	CLRL	LOGGING_BUFDESC		; Set up an empty
+	MOVAB	LOGGING_BUFFER-1, LOGGING_BUFDESC+4 ;  buffer descriptor
+	BLBS	TOPS20, 60$		; All set if TOPS-20
+	MOVB	#1@0, CNTLBF_ECHOFLG	; Set ODT mode on CONTROL message
+	BISW	#IO$M_NOECHO!IO$M_NOFILTR, READ_MODE ; Set ODT read mode
+	MOVZWL	CNTLBF+1, R0		; Get the message's length
+	$QIO_S -			; Send the CONTROL message
+		CHAN = LINKCHAN, -	;  using the link channel
+		FUNC = S^#IO$_WRITEVBLK, - ;  writing obviously
+		P1 = CNTLBF, -		;  buffer is the CONTROL message
+		P2 = R0			;   which is this long
+	QUIT_NOT_ABORT			; Quit on non-link-abort error
+60$:	RSB				; Exit.
+
+.DISABLE LSB
+
+DO_LOG:					; Do logging if logging is active
+	TSTB	LOGGING_FLAG		; Is logging active?
+	BEQL	70$			; No
+	MOVQ	R6, R4			; Yes, copy the data descriptor
+10$:	MOVZBL	(R5)+, R2		; Get the next character
+	CMPB	R2, #10			; Is it a <LF>?
+	BNEQ	20$			; Nope
+	TSTW	LOGGING_BUFDESC		; Anything left in the record buffer?
+	BEQL	50$			; Nothing left, go dump the buffer
+	CMPB	@LOGGING_BUFDESC+4, #13	; Was the <LF> preceeded by a <CR>?
+	BNEQ	50$			; No, go dump the buffer
+	DECW	LOGGING_BUFDESC		; Yes, remove the <CR> from buffer
+	BRB	50$			;  and then go dump the buffer
+
+20$:	CMPB	R2, #13			; Is it a <CR>?
+	BNEQ	30$			; Nope
+	TSTW	LOGGING_BUFDESC		; Putting <CR> into an empty buffer?
+	BEQL	60$			; Would've, but don't, just ignore it
+30$:	CMPW	LOGGING_BUFDESC, #LOGGING_BUFLEN ; Room in buffer for another?
+	BLSSU	40$			; Room exists, go buffer character
+	BSBW	DUMP_LOG		; Else dump the partial record buffer
+40$:	INCW	LOGGING_BUFDESC		; Say one more character in buffer
+	INCL	LOGGING_BUFDESC+4	; Bump the record buffer pointer
+	MOVB	R2, @LOGGING_BUFDESC+4	;  and store the character in buffer
+	CMPB	R2, #12			; Did we just store a <FF>?
+	BNEQ	60$			; Nope
+50$:	BSBW	DUMP_LOG		; Dump record buffer to logging file
+60$:	SOBGTR	R4, 10$			; Loop for all of the data...
+70$:	RSB				; Exit.
+
+.END
+

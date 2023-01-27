@@ -1,0 +1,1401 @@
+MODULE DBGRST (	IDENT = 'V03-000') =
+BEGIN
+
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!	DEBUG
+!
+! ABSTRACT:
+!	Use the Runtime Symbol Table (RST) data structures.
+!
+!
+! ENVIRONMENT:
+!	This module runs on VAX under VAX/VMS, user mode, non-AST level.
+!
+! Author:
+!	Kevin Pammett, August 18, 1977.
+!
+! Version:  1.20
+!
+! MODIFIED BY:
+!	Reworked for DEBUG V2.3  1980 KAN
+!
+
+REQUIRE 'SRC$:DBGPROLOG.REQ';
+REQUIRE 'SRC$:BSTRUC.REQ';
+REQUIRE 'SRC$:DBGGEN.REQ';
+REQUIRE 'SRC$:SYSSER.REQ';
+
+FORWARD ROUTINE
+	DBG$ADD_NT_2_PV : NOVALUE,	! Build a pathanme vector by 
+					!   following an NT scope chain.
+	gbl_val_to_sat,			! Translate VALUE to global symbol.
+	DBG$SYM_TO_VAL,			! LOOK UP A FULLY QUALIFIED SYMBOL.
+	DBG$SYM_TO_VALU,		! Return more info than sym_to_val,
+					!   but otherwise do the same thing.
+	DBG$VAL_TO_SYM,			! Translate values to DEBUG-time symbols.
+	DBG$VAL_TO_SAT,			! Search the SAT.
+	DBG$SYMBOL_VALU,		! Associate symbols with corresponding values.
+	STD_SYM_EVAL,			! Evaluate dynamic symbols which use
+					!      a standard encoding for how to do
+					!      this evaluation.
+	SYMBOL_IS_PSECT,		! Determine whether a symbol is a PSECT
+	DBG$EVAL_CAD ,			! Evaluate dst with address commands
+	interp_coms;			! Interpret the address commands
+
+EXTERNAL
+	dbg$gb_no_globals : BYTE,
+	rst$start_addr	: REF rst$entry,
+	dbg$gl_runframe : REF BLOCK [, BYTE];	! users registers are here
+
+
+EXTERNAL ROUTINE
+	dbg$find_sym,			! Look up DEFine symbols.
+	DBG$IS_IT_ENTRY,		! See if an address is an entry point
+	dbg$reg_match,			! Compare a string to a register name.
+	dbg$gst_to_rst,
+	dbg$hash_find_setup : NOVALUE,
+	dbg$hash_find,
+	dbg$sta_symvalue : NOVALUE,
+	dbg$sta_getsymbol : NOVALUE,
+	dbg$sta_setcontext : NOVALUE,
+	dbg$rst_name_addr,
+	DBG$FREEZ,			! Get free space 
+	DBG$GET_NXT_GST;		! SCAN the global symbol table.
+
+GLOBAL ROUTINE DBG$ADD_NT_2_PV( NT_PTR, path_ptr ) : NOVALUE =
+!++
+! Functional Description:
+!
+!	Recur down thru an NT scope chain to build
+! a pathname vector to correspond to the pathname
+! implied by the scope chain.
+!
+! Formal Parameters:
+!
+!  NT_PTR	-a pointer to the NT record where
+!		 the symbol name is contained.  This is where the
+!		 so-called 'scope chain' BEGins, if you consider such
+!		 a pathname to go right to left.
+!  path_ptr	-a pointer to a pathname descriptor.
+!
+! Implicit Inputs:
+!
+!	NT scope chains end either when the NT type is MODULE,
+!	or when the UP_SCOPE pointer is 0.  (The latter is
+!	what we do for NT records which come in to DEBUG as global
+!	of DEFine symbols).
+!
+!	Scope chains, as built by simply chaining thru NT records,
+!	are 'reverse pathnames', as defined by pth$pathname.  This
+!	is why this routine is recursive - we must recurr down to
+!	the end of the NT chain before we can begin returning
+!	and filling in the pathname vector.
+!
+! Implicit Outputs:
+!
+!	None.
+!
+! Return Value:
+!
+!	The address (supposedly within the pathname vector)
+! of where the next cs_pointer should be stored.
+!
+! Side Effects:
+!
+! This routine will blow up if the NT chain implies a
+! pathname that is longer than is expected by the
+! pth$pathname declaration.
+!
+!--
+BEGIN
+	MAP
+		NT_PTR : REF rst$entry,
+		path_ptr : REF pth$pathname;
+	LOCAL
+		pv_ptr : REF VECTOR [],
+		pv_index;
+
+	pv_ptr = path_ptr[pth$a_pathvector];
+
+	! There's not much we can do till we've reached
+	! the end of the NT scope chain.
+
+	IF (.nt_ptr[rst$b_kind] NEQ rst$k_module AND NOT .nt_ptr[rst$v_global])
+	THEN
+		DBG$ADD_NT_2_PV( .NT_PTR[rst$l_upscopeptr],.path_ptr );
+
+	pv_index = .path_ptr[pth$b_pathcnt];
+	PV_PTR[.pv_index] = dbg$rst_name_addr(.NT_PTR);
+	path_ptr[pth$b_pathcnt] = path_ptr[pth$b_totcnt] = .pv_index + 1;
+
+
+	RETURN;
+END;
+
+ROUTINE GBL_VAL_TO_SAT( VALUE ) =
+!++
+! Functional Description:
+!	Search the GST for the closest global symbol match
+!	to the given value.  If found, build a temporary SAT
+!	and NT entry for this symbol so that the rest
+!	of the RST manipulating routine do not have to
+!	special-case globals.
+!
+! Formal Parameters:
+!	VALUE	-The key value to match to Global symbol.
+!
+! Implicit Inputs:
+!	We don't consult the GST if dbg$gb_no_globals is set.
+!	This happens because we normally want 
+!	to let VAL_TO_SYM consult globals, but to we need 
+!	to override this when PC_RULE calls it.
+!
+!	GET_NXT_GST is all set up to all us to
+!	read thru the (mapped) GST sequentially.
+!
+!	The first MC record is reserved for manipulating
+!	globals.  As such, it has two fields which permanently
+!	point to the 'fake' NT and SAT records which get
+!	filled by this routine (and others).
+!
+! Implicit Outputs:
+!	If a match is found, the MC_GBL NT and SAT records
+!	are filled in so that they are usable just like
+!	other NT/SAT pairs are.
+!
+! Return Value:
+!
+!	FALSE, when no candidate is found,
+!	a pointer to the SAT record for
+!	the found symbol, otherwise.
+!
+! Side Effects:
+!	The GST may be searched sequentially until either
+!	the end is encountered, or an exact match is found.
+!--
+
+BEGIN
+	LOCAL
+		rst_ptr : REF rst$entry,
+		nameptr,
+		gval,
+		rtnflag,
+		global_type,
+		name_cs : cs_pointer,
+				! Pointer to where a fetched GST record lives.
+		GST_RECRD : REF GST_RECORD,
+
+				! Pointers to the SAT and NT records we build.
+		GBL_SAT_PTR : REF SAT_RECORD,
+		GBL_NT_PTR : REF rst$entry,
+
+				! Pointer to so-far 'best' match found.
+		best_match : ref gst_record;
+
+
+	IF( .dbg$gb_no_globals )
+	THEN
+		RETURN(0);
+
+	! Process the GST records sequentially,
+	! giving up if some error occurs.
+	! First, do an INIT so that subsequent GETs
+	! return record pointers starting from the beginning.
+
+	dbg$GET_NXT_GST(1);
+	
+	best_match = 0;
+
+	! DBG$GET_NXT_GST returns 0 when there are
+	! no more GST records to process.
+
+	WHILE( (GST_RECRD = DBG$GET_NXT_GST(0)) NEQ 0 )
+		DO
+		BEGIN
+
+		! We process each record depending on its GST type.
+
+		CASE .GST_RECRD[ GST_ENTRY_TYPE ] FROM GST_LOWEST TO GST_HIGHEST OF
+		    SET
+
+		    [ GST_GLOBAL_DEFN ,		! Definition of a global symbol.
+		      GST_ENTRY_DEFN ,		! Definition of global ENTRY points.
+		      GST_PROC_DEFN]:	
+			BEGIN
+
+			! Note that the only two types we support can
+			! be handled together because the GST_VALUE
+			! field is in the same place in both records.
+
+			! First check for an exact match because then
+			! we can abandon any further looking.
+
+			IF( .VALUE EQLA .GST_RECRD[ GST_VALUE ] )
+			THEN
+				BEGIN
+				BEST_MATCH = .GST_RECRD;
+				EXITLOOP;
+				END;
+
+			! Inexact matches are still better than nothing.
+
+			IF( .VALUE GTRA .GST_RECRD[ GST_VALUE ] )
+			THEN
+				! A match.  See if we already have one.
+
+				IF( .BEST_MATCH EQL 0 )
+				THEN
+					! Any one is better than none.
+
+					best_match = .gst_recrd
+				else
+					! Take the new one only if this symbol
+					! is closer than the previous best one.
+
+					IF( .BEST_MATCH[ GST_VALUE ] LSSA .GST_RECRD[ GST_VALUE ] )
+					THEN
+						BEST_MATCH = .GST_RECRD;
+			END;
+
+		    [INRANGE, OUTRANGE]:	! Error.
+			BEGIN
+			return(false);
+			END;
+
+		    TES;
+
+		! Go back and process the next record.
+		END;
+
+	! If the above WHILE exits, then we encountered
+	! the normal end of GST processing.
+
+	! If we didn't find any possible match,
+	! return failure status.
+
+	IF( .BEST_MATCH EQL 0 )
+	THEN
+		RETURN(0);
+
+	! Success - a candidate has been found.
+
+	! Fill in the required SAT and NT records, and pass
+	! back a pointer to the former.
+
+	IF( .best_match[ gst_entry_type ] EQL gst_global_defn )
+	THEN
+		BEGIN
+		rtnflag = FALSE;
+		nameptr = best_match[gst_g_name_cs];
+	END
+	ELSE
+		BEGIN
+		rtnflag = TRUE;
+		nameptr = best_match[gst_e_name_cs];
+	END;
+	gval = .best_match[gst_value];
+
+	dbg$hash_find_setup(.nameptr);
+
+	WHILE (rst_ptr = dbg$hash_find(.nameptr)) NEQ 0
+	DO
+		IF .rst_ptr[rst$v_global]
+		THEN
+			EXITLOOP;
+
+	IF .rst_ptr EQL 0
+	THEN
+		rst_ptr = dbg$gst_to_rst(.nameptr, .gval, .rtnflag);
+
+
+	IF (gbl_sat_ptr = .rst$start_addr[rst$l_sat_ptr]) EQL 0
+	THEN
+		BEGIN
+		gbl_sat_ptr = dbg$freez(sat$k_entsize);
+		rst$start_addr[rst$l_sat_ptr] = .gbl_sat_ptr;
+		END;
+
+
+	GBL_SAT_PTR[ sat$l_start ] = .BEST_MATCH[ GST_VALUE ];
+	GBL_SAT_PTR[ sat$l_end ] = 0;
+	GBL_SAT_PTR[ sat$l_rstptr ] = .rst_ptr;
+
+
+	RETURN(.GBL_SAT_PTR);
+END;
+
+GLOBAL ROUTINE DBG$SYM_TO_VAL( PATHname_PTR, VALUE_PTR ) =
+!++
+! Functional Description:
+!
+!	Use the RST/GST data base to translate a given
+! symbol pathname to its corresponding value.
+!
+!	This routine is quite like DBG$SYM_TO_VALU,
+! except that it is called when ONLY the value is
+! required.  As this builds in less knowledge of
+! the RST and its data structures, this routine
+! should be called whenever possible.
+!
+! Formal Parameters:
+!
+!  PATH_VEC_PTR	-a pointer to the pathname vector which the user
+!		 input as the symbol name.
+!
+!  VALUE_PTR	-The address of where we are to 'stuff back' the
+!		 value which corresponds to the symbol pathname.
+!
+! Implicit Inputs:
+!
+!	The value to be passed back is a longword.
+!
+! Implicit Outputs:
+!
+!	None.
+!
+! Return Value:
+!	
+!	TRUE, if all goes OK,
+!	FALSE, otherwise.
+!
+! Side Effects:
+!
+!	The corresponding value is passed back
+! into the location we are passed a pointer to.
+!--
+
+BEGIN
+
+	MAP
+		PATHname_PTR : REF pth$pathname,
+
+		VALUE_PTR : REF VECTOR[,LONG];
+
+	LOCAL
+		VALU_DESC : VALU_DESCRIPTOR;
+
+	IF( DBG$SYM_TO_VALU( .PATHname_PTR, VALU_DESC ) )
+	THEN
+		BEGIN
+
+		! Success.  Simply pass back the value
+		! and completion code.
+
+		VALUE_PTR[0] = .VALU_DESC[ VALU_VALUE ];
+		RETURN(TRUE);
+		END;
+
+	RETURN(FALSE);
+END;
+
+GLOBAL ROUTINE DBG$VAL_TO_SYM( VALUE, NT_PTR_ADDR ) =
+!++
+! Functional Description:
+!
+!	Implement the search algorithm which DEBUG uses to
+!	correspond values with symbols.
+!
+! Formal Parameters:
+!
+!	VALUE		-The key we use in the lookup.
+!	NT_PTR_ADDR	-A pointer to where we should copy back
+!			 the NT_POINTER to the record we find
+!			 to correspond to the value.  The
+!			 contents of this location are not changed
+!			 if no such correspondence is discovered.
+! Implicit Inputs:
+!	None.
+!
+! Implicit Outputs:
+!
+!	The RESULT parameter via NT_PTR_ADDR.
+!	(see above.)
+!
+! Routine Value:
+!
+!	TRUE, if a match is found,
+!	FALSE, otherwise.
+!
+! Side Effects:
+!
+!	The SAT table is searched.
+!--
+BEGIN
+	MAP
+				! The NT pointer we return is an RST-pointer.
+		NT_PTR_ADDR : REF VECTOR[];
+	LOCAL
+		SAT_PTR : REF SAT_RECORD;
+
+	IF( DBG$VAL_TO_SAT( .VALUE, SAT_PTR ) )
+	THEN
+		BEGIN
+
+		! Make up for the fact that we are supposed to
+		! return an NT pointer, not the SAT pointer
+		! that VAL_TO_SAT gave us.
+
+		NT_PTR_ADDR[0] = .SAT_PTR[sat$l_rstptr];
+		RETURN(TRUE);
+		END;
+
+	RETURN FALSE;
+END;
+
+GLOBAL ROUTINE DBG$VAL_TO_SAT( VALUE, SAT_PTR_ADDR ) =
+!++
+! Functional Description:
+!
+!	Search the Static Address Table (SAT) for the "best match" for a value.
+!
+! Formal Parameters:
+!
+!	VALUE		- The value for which a match is desired.
+!
+!	SAT_PTR_ADDR	- The address of a longword which, if a match is found,
+!			  will be updated with a SAT_POINTER to the SAT record
+!			  which fulfills the "best match" criterion.  No value
+!			  will be stored if no match is found.
+!
+! Implicit Outputs:
+!
+!	The RESULT parameter, via SAT_PTR_ADDR, also points to a RST record
+!
+! Routine Value:
+!
+!	TRUE, if a match is found,
+!	FALSE, otherwise.
+!
+! Side Effects:
+!
+!	The SAT is searched.
+!--
+    BEGIN
+    LABEL sat_entry;
+    LOCAL
+	this_sat : REF sat_record,	! Pointers to current SAT record
+	this_rst : REF rst$entry,	!  and to corresponding RST entry
+	best_sat : REF sat_record,	! Pointers to best-match SAT record
+	best_rst : REF rst$entry,	!  and to corresponding RST entry
+	best_val,			! Value of corresponding symbol
+	modu_rst : REF rst$entry;	! Pointer to module containing symbol
+
+    ! In looking for the 'best' match, we consider at most two candidates
+    ! at the same time - the 'current' one, and the previous 'best' one.
+    ! There starts out being no 'previous' best, and no current match.
+
+    best_val = best_sat = this_sat = 0;
+
+    ! Get address of the pointer to the first module in the module-chain
+
+    modu_rst = .rst$start_addr;
+
+    WHILE  ((modu_rst = .modu_rst[rst$l_nxtmodptr]) NEQ 0) DO
+	BEGIN
+	IF ((this_sat = .modu_rst[rst$l_sat_ptr]) NEQ 0)
+	THEN
+	    DO		! Linearly search the SAT looking for an exact match.
+sat_entry:  BEGIN
+	    ! Once we get past the value we were searching for, we know there
+	    ! will be no other match candidates (because the SAT is sorted).
+	    !
+	    IF .this_sat[sat$l_start] GTRA .value THEN EXITLOOP;
+	    !
+	    !  Only try for an improvement if this value is at least as good as
+	    ! the best value we have seen so far, and this is not a zero-length
+	    ! PSECT.
+	    !
+	    IF .this_sat[sat$l_start] LSSA .best_val THEN LEAVE sat_entry;
+	    this_rst = .this_sat[sat$l_rstptr];
+	    IF (NOT .this_rst[rst$v_nonzlength]) AND symbol_is_psect(.this_rst)
+		THEN LEAVE sat_entry;
+	    
+	    IF .this_sat[sat$l_start] EQLA .value
+	    THEN
+		BEGIN
+		! An exact match is an improvement unless there is already an
+		! exact match, and the new match is to a PSECT name.
+
+		IF (.best_sat NEQ 0) AND (.best_val EQLA .value)
+			AND (symbol_is_psect(.this_rst))
+		    THEN
+			LEAVE sat_entry;	! Go look at next SAT entry
+		END
+
+	    ELSE	! .this_sat[sat$l_start] NEQA .value
+		BEGIN
+		! At this point we know that the current lower bound value is
+		! strictly less than the desired value.  Now we are concerned
+		! about the corresponding upper bound value. Normally this UB
+		! value is the address which is the upper extent to which the
+		! corresponding symbol is bound. Some symbols don't come with
+		! this info, though, so we handle these cases separately.
+
+		IF .this_rst[rst$v_nonzlength]
+		THEN
+		    BEGIN
+		    IF .this_sat[sat$l_end] LSSA .value THEN LEAVE sat_entry;
+		    END
+		ELSE
+		    BEGIN
+		    ! We must consider it to be a match when the upper bound is
+		    ! zero because we don't know that it isn't a match.
+		    ! It is certainly not a good match, though, and so we throw
+		    ! it away unless we don't have anything better.
+
+		    IF (.best_sat NEQ 0) AND (.this_sat[sat$l_start] EQLA .best_val)
+		    THEN
+			IF (NOT symbol_is_psect(.best_rst))
+			    AND (.best_rst[rst$v_nonzlength])
+			THEN
+			    LEAVE sat_entry;
+		    END;
+		END;
+
+	    .sat_ptr_addr = best_sat = .this_sat;
+	    best_rst = .this_rst;
+	    best_val = .this_sat[sat$l_start];
+	    IF (NOT symbol_is_psect(.this_rst))
+		AND .this_rst[rst$v_nonzlength]
+		AND .this_sat[sat$l_start] EQLA .value
+	    THEN
+		RETURN (TRUE);
+
+	    END		! End of block 'sat_entry'
+	UNTIL ((this_sat = .this_sat[sat$l_flink]) EQL 0 );
+	END;
+
+    ! If we fall out of the above loop, then there are no more candidates from
+    ! the RST to consider.  See if the answer we got was good enough, or if we
+    ! should try for a Global Symbol match by scanning the GST.
+
+    IF (.best_sat EQL 0) OR (.value NEQA .best_val)
+    THEN
+	IF (this_sat = gbl_val_to_sat(.value)) NEQ 0
+	THEN
+	    IF (.best_sat EQL 0) OR (.this_sat[sat$l_start] GTRA .best_val)
+	    THEN
+		.sat_ptr_addr = best_sat = .this_sat;
+
+    RETURN (.best_sat NEQ 0);
+    END;
+
+GLOBAL ROUTINE DBG$SYMBOL_VALU( NT_PTR, VALUE_PTR ) =
+!++
+! Functional Description:
+!	-Look up the value associated with a given
+!	 NT record.
+!	-Note that we refer to 'value' associated with a symbol
+!	 but really mean 'address', since that is as far as RST
+!	 manipulation handles symbol-value correlation.
+!
+! Formal Parameters:
+!	NT_PTR		-a pointer to the rst$entry that corresponds
+!			 to the symbol we want the value of.
+!	VALUE_PTR	-where we are to copy the value back to.
+!
+! Implicit Inputs:
+!
+!	NONE
+!
+! Implicit Outputs:
+!	An INFORMATIONAL message is signaled if the symbol is register based
+!	and the current PC is not within the scope of the routine that defined
+!	the symbol.
+!
+! Routine Value:
+!	TRUE	- If the symbol is found and a value is passed back.
+!	FALSE	otherwise
+!
+! Side Effects:
+!	The value gets passed back.
+!--
+
+BEGIN
+	MAP
+	    NT_PTR    : REF rst$entry;
+	LOCAL
+		dst_ptr : REF dst$record,
+		valptr : REF VECTOR[3],
+		vkind;
+
+	dbg$sta_setcontext(.nt_ptr);
+	dbg$sta_symvalue(.nt_ptr,valptr,vkind);
+	dst_ptr = .nt_ptr[rst$l_dstptr];
+	IF .vkind EQL dbg$k_val_literal
+	AND .dst_ptr[dst$b_type] NEQ dsc$k_dtype_fld
+	THEN
+		.value_ptr = .valptr[0]
+	ELSE
+		.value_ptr = .valptr;
+
+	RETURN TRUE;
+END;
+
+ROUTINE STD_SYM_EVAL( PASS_BACK_ADDR, ACCESS, IN_VALUE, REG_VECTOR ) =
+!++
+! Functional Description:
+!	Implement the algorithm which comes up with
+!	a symbol's value given the so-called ACCESS
+!	and VALUE fields taken from (various places within)
+!	the DST record for a symbol which uses
+!	'standard encoding'.
+!
+!	See CP0021.MEM, pgs 9-10 for this algorithm.
+!
+! Formal Parameters:
+!	PASS_BACK_ADDR	-The address of where we stuff back the
+!			 value the algorithm determines.
+!	ACCESS		-The 1-byte field which encodes the
+!			 3-element fields described in CP0021.MEM
+!			 for so-called 'standard encoding'.
+!	IN_VALUE	-The value field which may be used in
+!			 conjunction with ACCESS.
+!	REG_VECTOR	-The address of the user register vector to use
+!			 in passing back the value.
+!
+! Implicit Inputs:
+!	That the value bound to a symbol can be passed
+!	back in a longword.
+!
+!	The current context is used to do the evaluation.
+!
+! Implicit Outputs:
+!	The value which is currently associated with
+!	the symbol which presumably corresponds to
+!	the ACCESS and VALUE fields given, is passed back.
+!
+! Routine Value:
+!	1 - Symbol is bound to a static value
+!	3 - Symbol is register based
+!	2 - Indirection failed
+!
+! Side Effects:
+!	None.
+!--
+
+BEGIN
+	BUILTIN
+	    PROBER;		! Test read accessibiltiy of address.
+
+	MAP
+	    REG_VECTOR : REF VECTOR,		! Address of the users registers
+	    PASS_BACK_ADDR : REF VECTOR;	! The value we pass back is a longword.
+
+	LOCAL
+	    STATUS,
+	    RET_VALUE;
+
+	STATUS = 1;				! Initialize the routine value.
+
+	! The access field for this symbol from the DST
+	! contains the key to how we correspond symbols
+	! and values.
+
+	IF .ACCESS<0,2,0> EQL dst$k_valkind_reg	! Symbol bound to a register
+	THEN
+		BEGIN				! Value field is a register number
+		!+
+		! Return the address that holds the user's contents of
+		! this register.
+		!-
+		RET_VALUE = REG_VECTOR[ .IN_VALUE ];
+		STATUS = 3;			! Register based symbol
+		END
+	ELSE
+		BEGIN
+
+		RET_VALUE = .IN_VALUE;		! Start with value field from DST
+		IF .ACCESS<3,1,0>		! Based off register?
+		THEN
+		    BEGIN
+		    RET_VALUE = .RET_VALUE + .REG_VECTOR[ .ACCESS<4,4,0> ];
+		    STATUS = 3;			! Symbol is based off register
+		    END;
+
+		IF .ACCESS<2,1,0>		! Symbol's value indirect?
+		THEN
+		    BEGIN
+		    IF NOT PROBER( %REF(0), %REF(%UPVAL), .RET_VALUE)
+		    THEN
+			BEGIN
+			RETURN(2);
+			END;
+		    RET_VALUE = .(.RET_VALUE);
+		    END;
+
+		END;
+
+	PASS_BACK_ADDR[0] = .RET_VALUE;	! Pass back the value.
+
+	RETURN (.STATUS);
+END;
+
+GLOBAL ROUTINE DBG$SYM_TO_VALU( PATHname_PTR, VALUE_DESC_ADDR, fcode ) =
+!++
+! Functional Description:
+!
+!	Translate from pathname to value.
+!
+! Formal Parameters:
+!
+!  PATHname_PTR	-a pointer to the pathname vector which the user
+!		 input as the symbol name.  This can be a simple
+!		 "name", a compound "rout\rout1\...\name",
+!		 or a fully-qualified "module\...\name".
+!  VALU_DESC_ADDR - The address of a value descriptor which we are to fill in.
+!
+! Implicit Inputs:
+!	None.
+!
+! Implicit Outputs:
+!	None.
+!
+! Return Value:
+!	TRUE on success.
+!	FALSE on failure.
+!
+! Side Effects:
+!	None.
+!--
+BEGIN
+	MAP 
+		pathname_ptr : REF pth$pathname,
+		value_desc_addr : REF valu_descriptor;
+	LOCAL
+		symid : REF rst$entry,
+		valptr : REF VECTOR[2],
+		vkind,
+		dst_ptr : REF dst$record,
+		status;
+
+
+	status = 0;
+	value_desc_addr[valu_nt_ptr] = 0;
+
+	IF( .pathname_ptr[pth$b_pathcnt] EQL 1 )
+	THEN
+		BEGIN
+		LOCAL
+			cs_ptr : cs_pointer,
+			path_vec_ptr : REF VECTOR[],
+			def_sym_desc : BLOCK[8,byte];
+
+		! A 1-element pathname may be a register name
+		! or a DEFine symbol.  First build a string
+		! descriptor for the name (since this is what
+		! FIND_SYM and REG_MATCH want).
+
+		path_vec_ptr = pathname_ptr[pth$a_pathvector];
+		cs_ptr = .path_vec_ptr[0];
+		def_sym_desc[ DSC$W_LENGTH ] = .cs_ptr[0];
+		def_sym_desc[ DSC$A_POINTER ] = cs_ptr[1];
+		
+		! First, try for a match to a permanent symbol.
+
+		status = dbg$reg_match(def_sym_desc);
+		IF( .status GEQ 0 )
+		THEN
+			BEGIN
+			BIND
+				register_vector
+				= dbg$gl_runframe[ dbg$l_user_regs ]
+				: VECTOR;
+
+			! It is a register name.  The symbol is
+			! bound to the address of where we currently
+			! store the indicated register.  Pass back
+			! the address as the symbol's value.
+
+			value_desc_addr[valu_value]= register_vector[.status];
+			RETURN TRUE;
+			END
+		ELSE
+			BEGIN
+
+			! The symbol is not a permanent one.
+			! Now look it up in the linked list
+			! reserved for DEFine symbols.
+	
+			status = dbg$find_sym(def_sym_desc);
+			! If we found something, pass back the associated value
+			! and set STATUS to the standard success code.
+	
+			IF( .status NEQ 0 )
+			THEN
+				BEGIN
+				value_desc_addr[valu_value] =
+						.sym_value(.status);
+				RETURN TRUE;
+				END;
+			END;
+		END;
+
+
+	dbg$sta_getsymbol(.pathname_ptr, symid, .fcode);
+	IF .symid EQL 0
+	THEN
+		RETURN FALSE;
+	dbg$sta_setcontext(.symid);
+	dbg$sta_symvalue(.symid, valptr, vkind);
+	dst_ptr = .symid[rst$l_dstptr];
+	IF .vkind EQL dbg$k_val_literal
+	AND .dst_ptr[dst$b_type] NEQ dsc$k_dtype_fld
+	THEN
+		value_desc_addr[valu_value] = .valptr[0]
+	ELSE
+		value_desc_addr[valu_value] = .valptr;
+	value_desc_addr[valu_nt_ptr] = .symid;
+
+	RETURN TRUE;
+
+
+END;
+
+ROUTINE SYMBOL_IS_PSECT(RSTPTR) =
+!
+! FUNCTION
+!	This routine determines whether a given symbol is a PSECT or not.
+!	It accepts as input a SYMID (the given symbol's RST pointer), and it
+!	returns TRUE if that SYMID is the SYMID of a PSECT; it returns FALSE
+!	otherwise.  PSECTs are represented by Label RST Entries whose DST
+!	pointer points to a PSECT DST Record.
+!
+!	This routine is called by DBG$VAL_TO_SAT while symbolizing addresses.
+!	PSECT names are less desirable symbolizations of addresses than any
+!	other kind of label.
+!
+! INPUTS
+!	RSTPTR	- A pointer to the RST entry of the symbol whose identity as
+!		  a PSECT is to be established.
+!
+! OUTPUTS
+!	The routine returns TRUE if the RSTPTR symbol is a PSECT.  It returns
+!		  FALSE otherwise.
+!
+
+    BEGIN
+
+    MAP
+	RSTPTR: REF RST$ENTRY;		! Pointer to symbol's RST entry
+
+    LOCAL
+	DSTPTR: REF DST$RECORD;		! Pointer to symbol's DST record
+
+
+
+    ! If this is a Label RST Entry, see if its DST pointer points to a PSECT
+    ! DST record.  If so, return TRUE.
+    !
+    IF .RSTPTR[RST$B_KIND] EQL RST$K_LABEL
+    THEN
+	BEGIN
+	DSTPTR = .RSTPTR[RST$L_DSTPTR];
+	IF .DSTPTR[DST$B_TYPE] EQL DST$K_PSECT THEN RETURN TRUE;
+	END;
+
+
+    ! It is not a PSECT--return FALSE.
+    !
+    RETURN FALSE;
+
+    END;
+
+GLOBAL ROUTINE dbg$eval_cad(dst,reg_vec,val) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine will evaluate a dst with address calculation commands.
+!	By this we mean derive the value of the dst. If the item is being
+!	accessed via descriptor, a dummy descriptor will be built in free
+!	space and used by the debugger.  
+!
+! FORMAL PARAMETERS:
+!
+!	dst - pointer to the dst
+!	reg_vec - pointer to vector of register values to be used
+!	val - pointer to item to receive the value of the dst
+!
+! IMPLICIT INPUTS:
+!
+!	dbg$gl_dlishead - pointer to linked list of dummy descriptors
+!	dbg$gl_dlislast - pointer to last item in linked list of
+!		dummy descriptors
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	3 - item is register based and everything was okay
+!	2 - error in indirection
+!	0 - error in calculating address of item
+!	the status gotten back from std_sym_eval
+!
+! SIDE EFFECTS:
+!
+!	linked list of dummy descriptors may be modified
+!
+!--
+BEGIN
+    LOCAL
+	c,			! address of calculation commands
+	v,			! value of the interpretation of the commands
+	s,			! status from std_sym_eval
+	ds,			! descriptor size
+	oda: REF BLOCK[,BYTE],	! original descriptor
+	nda: REF BLOCK[,BYTE],	! new(dummy) descriptor
+	ll : REF VECTOR;	! linked list entry
+
+    MAP
+	dst : REF dst$record,	! dst entry to evaluate
+	reg_vec : REF VECTOR ;	! vector of registers
+	
+    EXTERNAL
+	dbg$gl_dlishead ,			! Head of linked list of dummy descriptors
+	dbg$gl_dlislast : REF VECTOR;   	! pointer to last item in the list
+
+!
+!  get the address of the commands in the dst
+
+    c = cad_commands(dst) ;
+
+
+!
+!  interpret the commands
+
+    v = interp_coms(.c,.reg_vec,s);		! value from commands in v
+
+!
+!  check for error in getting the address
+
+    IF .v EQL 0
+    THEN
+	BEGIN
+	.val = 0 ;
+	RETURN (.s) ;
+	END;
+
+!
+!  if this item has no descriptor all we have to do is return the value
+
+    IF .dst[dst$v_valkind] NEQ dst$k_valkind_desc
+    THEN
+	BEGIN
+        s = 3 ;
+	.val = .v ;				! pass back value
+	RETURN (.s) ;				! return the status
+	END;
+
+!
+!  item had a descriptor so we must do something about getting a descriptor
+!  with the correct addresses in it
+
+!  get the address of the original descriptor
+
+    IF (.dst[dst$v_disp] EQL 1) AND (.dst[dst$v_indirect] EQL 0)
+	AND (.dst[dst$v_regnum] EQL 15)
+	THEN
+	oda = .dst[dst$l_value] + dst[dst$l_value] + %UPVAL 
+    ELSE
+	BEGIN
+!
+!  use std_sym_eval to tell us where the descriptor is
+!  if it returns a bad status we will return that status with a value of 0
+
+	s = std_sym_eval(oda,.dst[dst$b_vflags],.dst[dst$l_value],.reg_vec);
+	IF NOT .s
+	THEN
+	    BEGIN
+	    .val = 0 ;
+	    RETURN (.s) ;
+	    END;
+	END;
+
+!  no we will need to know the size of this descriptor so we can get free
+!  space for building a duplicate
+!     NOTE   I am using 'c' for a flag at this point to keep from having to
+!	     check the class of the descriptor twice
+
+    c = false ;
+
+    IF .oda[dsc$b_class] EQL dsc$k_class_v OR
+	.oda[dsc$b_class] EQL dsc$k_class_sd
+    THEN
+	ds = 3 * %UPVAL				! gives us bytes
+    ELSE
+	IF .oda[dsc$b_class] EQL dsc$k_class_a OR
+	   .oda[dsc$b_class] EQL dsc$k_class_nca
+	THEN
+	    BEGIN
+	    c = true ;
+	    ds = 4 * %UPVAL + %UPVAL + 		! fixed portion + A0
+		 .dst[dsc$b_dimct] * %UPVAL	! multipliers
+		+ .dst[dsc$b_dimct] * %UPVAL * 2 ;  ! bounds
+	    END
+	ELSE
+	    ds = 2 * %UPVAL  ;		! all other descriptors
+
+!
+!  Now get the free space for the new descriptor and copy the original into
+!	it
+
+    nda = dbg$freez(rst_units(.ds));
+    ch$move(.ds,.oda,.nda);
+    nda[dsc$a_pointer] = .v ;		! set up address
+
+!
+! if it was an array then the A0 field must also be fixed.  Remember that
+! the A0 field in this type of descriptor will be a zero relative offset from
+! the pointer field. The language processor calculated this for us
+
+    IF .c
+    THEN
+	nda[dsc$a_a0] = .v + .nda[dsc$a_a0] ;
+
+!  Now is the time for adding this entry to the linked list of dummy
+! descriptors
+
+!
+! get the space for the linked list entry
+
+    ll = dbg$freez(rst_units(dlis_entry*%UPVAL)) ;	! need dlis_entry longwords
+    ll[dlis_pointer] = .nda ;				! point to the desc
+    ll[dlis_descsize] = .ds ;				! size of desc
+
+!  see if there are already some descriptors on the list
+
+    IF .dbg$gl_dlishead EQL 0
+    THEN						! this is first one
+	BEGIN
+	dbg$gl_dlishead = .ll ;
+	dbg$gl_dlislast = .ll ;
+	END
+    ELSE						! add to list
+	BEGIN
+	dbg$gl_dlislast[dlis_link] = .ll ;
+	dbg$gl_dlislast = .ll ;
+	END;
+
+!  we can't forget to pass back the address of the descriptor
+
+    .val = .nda ;
+    RETURN (3) ;				! good return status
+
+END;
+
+ROUTINE interp_coms(cs,reg_vector,s) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine will execute the command string contained in
+!	the dst and return the resulting value. This value is assumed
+!	to be the address of the data item.
+!
+! FORMAL PARAMETERS:
+!
+!	cs -  pointer to the command string
+!	reg_vector - address of vector of register values to be used
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	the value at the top of stack when the STOP command is executed
+!	or the value zero if the address cannot be calculated.  That is
+!	if there are commands we do not process yet, or the last thing
+!	in the list is not a stop command
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    STRUCTURE
+	command_stream[i,s] =			! used for access the command stream
+		(command_stream + i)<0,8*s,1> ;
+
+    LITERAL
+	four_bytes = 4,
+	two_bytes = 2,
+	one_byte = 1,
+	stack_size = 20 ;
+
+    MAP
+	cs : REF command_stream ,
+	reg_vector : REF VECTOR ;
+
+    LOCAL
+	delta,				! offset to next command
+	i,				! byte index into command stream
+	op1,op2,			! temporaries for operands
+	sp,				! stack pointer
+	stack : VECTOR[stack_size];	! The polish stack
+
+    BUILTIN
+	PROBER ;
+
+    MACRO
+	push(a) =	! value of a will be put on stack
+	  (	BEGIN
+		sp = .sp + 1 ;
+		IF .sp GTR stack_size -1
+		THEN
+		    SIGNAL(dbg$_debugbug,1,dbg$k_interp_coms_stack_err);
+		stack[.sp] = a ;
+		END ) %,
+
+	pop(a) =	! a is address to receive value
+	  (	BEGIN
+		IF .sp LSS 0
+		THEN
+		    SIGNAL(dbg$_debugbug,1,dbg$k_interp_coms_stack_err);
+		a = .stack[.sp] ;
+		sp = .sp -1 ;
+		END ) %;
+
+
+
+
+
+!
+!  Following is the main loop of code.  All we do is stay in the
+!  loop with a stop command causing a return from the return.
+!
+
+    .s = 0 ;		! Init return status
+    i = 0 ;
+    sp = -1 ;		! init stack pointer 
+
+    WHILE 1 		! go until we hit the stop command
+    DO
+	BEGIN
+	CASE .cs[.i,one_byte] from dst$k_locommand to dst$k_hicommand OF
+	SET
+
+	    [dst$k_opr_stop]:
+	    	BEGIN
+		pop(op1);
+		.s = 1 ;
+	    	RETURN .op1 ;
+	    	END;
+
+	    [dst$k_opr_add]:
+	     	BEGIN
+	    	pop(op1);
+	    	pop(op2);
+	   	op1 = .op1 + .op2 ;
+	    	push(.op1) ;
+	    	delta = one_byte ;
+	    	END;
+	
+	    [dst$k_sta_imm_b]:
+	    	BEGIN
+	    	push(.cs[.i+1,one_byte]);
+	    	delta = one_byte + one_byte ;
+	    	END;
+
+	    [dst$k_sta_imm_w]:
+	    	BEGIN
+	    	push(.cs[.i+1,two_bytes]);
+	    	delta = one_byte + two_bytes ;
+	    	END;
+
+            [dst$k_sta_imm_l]:
+	    	BEGIN
+	    	push(.cs[.i+1,four_bytes]);
+	    	delta = one_byte + four_bytes ;
+	    	END;
+
+	    [dst$k_sta_rep_b]:
+	    	BEGIN
+	        pop(op1) ;
+		IF NOT PROBER(%REF(0),%REF(1),.op1)
+		THEN
+		    BEGIN
+		    .S = 2 ;
+		    RETURN 0 ;
+		    END;
+	   	push(.(.op1)<0,8,1>);
+	    	delta = one_byte ;
+	    	END;
+
+	    [dst$k_sta_rep_w]:
+	    	BEGIN
+	    	pop(op1);
+		IF NOT PROBER(%REF(0),%REF(2),.op1)
+		THEN
+		    BEGIN
+		    .S = 2 ;
+		    RETURN 0 ;
+		    END;
+	    	push(.(.op1)<0,16,1>);
+	    	delta = one_byte ;
+	    	END;
+	
+	    [dst$k_sta_rep_l]:
+	    	BEGIN
+	    	pop(op1) ;
+		IF NOT PROBER(%REF(0),%REF(%UPVAL),.op1)
+		THEN
+		    BEGIN
+		    .S = 2 ;
+		    RETURN 0 ;
+		    END;
+	    	push(..op1);
+	    	delta = one_byte ;
+	    	END ;
+
+	    [dst$k_sta_r00]:
+	    	BEGIN
+	    	push(.reg_vector[0]);
+	    	delta = one_byte ;
+	    	END;
+
+	    [dst$k_sta_r01]:
+		BEGIN
+		push(.reg_vector[1]);
+		delta = one_byte ;
+		END;
+
+	    [dst$k_sta_r02]:
+		BEGIN
+		push(.reg_vector[2]);
+		delta = one_byte ;
+		END;
+
+	    [dst$k_sta_r03]:
+		BEGIN
+		push(.reg_vector[3]);
+		delta = one_byte ;
+		END;
+
+	    [dst$k_sta_r04]:
+		BEGIN
+		push(.reg_vector[4]);
+		delta = one_byte ;
+		END;
+
+	    [dst$k_sta_r05]:
+		BEGIN
+		push(.reg_vector[5]);
+		delta = one_byte ;
+		END;
+
+	    [dst$k_sta_r06]:
+		BEGIN
+		push(.reg_vector[6]);
+		delta = one_byte ;
+		END;
+
+	    [dst$k_sta_r07]:
+		BEGIN
+		push(.reg_vector[7]);
+		delta = one_byte ;
+		END;
+
+	    [dst$k_sta_r08]:
+		BEGIN
+		push(.reg_vector[8]);
+		delta = one_byte ;
+		END;
+
+	    [dst$k_sta_r09]:
+		BEGIN
+		push(.reg_vector[9]);
+		delta = one_byte ;
+		END;
+
+	    [dst$k_sta_r10]:
+		BEGIN
+		push(.reg_vector[10]);
+		delta = one_byte ;
+		END;
+
+	    [dst$k_sta_r11]:
+		BEGIN
+		push(.reg_vector[11]);
+		delta = one_byte ;
+		END;
+
+	    [dst$k_sta_r12]:
+		BEGIN
+		push(.reg_vector[12]);
+		delta = one_byte ;
+		END;
+
+	    [dst$k_sta_r13]:
+		BEGIN
+		push(.reg_vector[13]);
+		delta = one_byte ;
+		END;
+
+	    [dst$k_sta_r14]:
+		BEGIN
+		push(.reg_vector[14]);
+		delta = one_byte ;
+		END;
+
+	    [dst$k_sta_r15]:
+		BEGIN
+		push(.reg_vector[15]);
+		delta = one_byte ;
+		END;
+
+	    [INRANGE,OUTRANGE] :
+		BEGIN
+		RETURN 0 ;
+		END;
+
+	    TES;
+
+	i = .i + .delta ;
+
+
+	END;
+	
+    RETURN 0 ;		! catch all return
+
+    END;
+
+END				!End of module
+ELUDOM

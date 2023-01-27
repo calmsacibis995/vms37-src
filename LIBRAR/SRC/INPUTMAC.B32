@@ -1,0 +1,714 @@
+MODULE lib_inputmac (			! Get next macro input line
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  Library command processor
+!
+! ABSTRACT:
+!
+!	The VAX/VMS librarian is invoked by DCL to process the LIBRARY
+!	command.  It utilizes the librarian procedure set to perform
+!	the actual modifications to the library.
+!
+! ENVIRONMENT:
+!
+!	VAX native, user mode.
+!
+!--
+!
+!
+! AUTHOR:  Benn Schreiber,	 CREATION DATE:  22-June-1979
+!
+! MODIFIED BY:
+!
+!	V02-008		RPG44341	Bob Grosso	02-Mar-1982
+!		Fix routine scan_word to continue processing after
+!		a label is encountered, and correct the macro name 
+!		printing on all the messages that get the macro name
+!		from macnamptrtbl.
+!
+!	V02-007		RPG0047		Bob Grosso	7-Aug-1981
+!		lib$gl_ctlmsk now a quadword
+!
+!	V02-006		RPG0046		Bob Grosso	21-Jul-1981
+!		Check macro level in setmacroname.
+!
+!	V02-005		RPG0036		Bob Grosso	25-Jun-1981
+!		Continue inserting macros after an Lbr$_dupkey error.
+!
+!	V02-004		RPG0035		Bob Grosso	22-Apr-1981
+!		Record module names for library update history
+!
+!	V02-003	BLS0029	Benn Schreiber		23-Dec-1980
+!		Convert messages to message compiler
+!
+!	V02-002		Benn Schreiber		28-May-1980
+!		Correct scan_word to not look past end of line.
+!--
+
+
+
+LIBRARY
+	'SYS$LIBRARY:STARLET.L32';
+REQUIRE
+	'PREFIX';
+REQUIRE
+	'LIBDEF';
+REQUIRE
+	'LBRDEF';
+
+EXTERNAL ROUTINE
+    get_record,					!Read next input record
+    lib_log_op,					!Log insert operation
+    lib_log_upd,				!Log module names for Library History
+    lib_get_zmem,				!Allocate memory
+    lib_free_mem,				!Deallocate memory
+    lbr$delete_key : ADDRESSING_MODE (GENERAL),	!Delete key from index
+    lbr$delete_data : ADDRESSING_MODE (GENERAL),!Delete data
+    lbr$put_record : ADDRESSING_MODE (GENERAL),	!Write record to library
+    lbr$lookup_key : ADDRESSING_MODE (GENERAL),	!Lookup key in library
+    lbr$insert_key : ADDRESSING_MODE (GENERAL),	!Insert key in library
+    lbr$replace_key : ADDRESSING_MODE (GENERAL),!Replace or insert key
+    lbr$put_end : ADDRESSING_MODE (GENERAL);	!Finish writing to library
+
+EXTERNAL
+    lbr$gl_rmsstv : ADDRESSING_MODE (GENERAL),	!RMS STV from librarian
+    lib$gl_ctlmsk : BLOCK [2],
+    lib$gl_keysize,				!Max length of keys
+    lib$gl_libfdb : REF BBLOCK,
+    lib$gl_inpfdb : REF BBLOCK,
+    lib$gl_libctl;
+
+EXTERNAL LITERAL
+    lib$_nomacfound,				!No macro def found
+    lib$_nestlevel,				!Nesting level exceeded
+    lib$_nomtchendr,				!No matching .endr
+    lib$_toomnyendr,				!Too many .endr's
+    lib$_inserterr,				!Insert error
+    lib$_deldaterr,				!Delete data error
+    lib$_endwrngmac,				!Ends wrong macro
+    lib$_replaced,				!Module replaced
+    lib$_inserted,				!Module inserted
+    lib$_nomtchendm,				!No matching .endm
+    lib$_macnamlng,				!Macro name length illegal
+    lib$_dupmodule,				!Duplicate module
+    lib$_dupmod;				!Duplicate module
+
+FORWARD ROUTINE
+    setmacroname,
+    checkendmac,
+    scan_line,
+    scan_word,
+    skip_blanks,
+    skip_blnk_bkwds,
+    symbol_char,
+    elim_trail_blnk,
+    make_upper_case,
+    lookup_keyword;
+
+OWN
+    bufdesc : BBLOCK [dsc$c_s_bln],		! Descriptor for current line
+    token1desc : BBLOCK [dsc$c_s_bln],		! String descriptor for first token
+    token2desc : BBLOCK [dsc$c_s_bln],		! String descriptor for second token
+    curchar,					! Current character
+    dupseen,					! Flag set to skip duplicate module
+    tokenindex,					! Index for first token
+    lineptr,					! Current line pointer
+    endptr,					! Pointer to past end of line
+    nestinglevel,				! Current nesting level
+    reptnestlevel,				! nesting level for .rept/.endr
+    macrorfa : BBLOCK [rfa$c_length],		! RFA of macro module header
+    macnamptrtbl : REF BBLOCK,			! Pointer to macro descriptor table
+    macro_names : descriptor ('.MACRO'),
+    repeat_name : descriptor ('.REPEAT'),
+    rept_name   : descriptor ('.REPT'),
+    irp_name    : descriptor ('.IRP'),
+    irpc_name   : descriptor ('.IRPC'),
+    ending_names: descriptor ('.ENDM'),
+    endr_name   : descriptor ('.ENDR'),
+    warn_name   : descriptor ('.WARN'),
+    error_name  : descriptor ('.ERROR'),
+    print_name  : descriptor ('.PRINT'),
+    end_of_list : LONG INITIAL (0);
+LITERAL
+    key_macro = 0,				! Must parallel order of ascii names above
+    key_repeat = 1,
+    key_rept = 2,
+    key_irp = 3,
+    key_irpc = 4,
+    key_endm = 5,
+    key_endr = 6,
+    key_warn = 7,
+    key_error = 8,
+    key_print = 9,
+    lib$c_maxnest = lbr$c_pagesize/dsc$c_s_bln; ! Max nesting level
+
+BIND
+    token1len = token1desc [dsc$w_length] : WORD,
+    token1ptr = token1desc [dsc$a_pointer],
+    token2len = token2desc [dsc$w_length] : WORD,
+    token2ptr = token2desc [dsc$a_pointer],
+    linelen = bufdesc [dsc$w_length] : WORD,
+    lineaddr = bufdesc [dsc$a_pointer];
+
+GLOBAL ROUTINE lib_input_mac =
+BEGIN
+!
+! This routine reads macro source files, extracts the macro definitions
+! contained in them, and inserts them into the macro library.
+!
+
+ROUTINE put_record (linedesc, rfa) =
+BEGIN
+
+!++
+! Local routine to call lbr$put_record
+!
+!--
+
+IF NOT .dupseen 
+THEN
+    rms_perform (lbr$put_record (lib$gl_libctl, .linedesc, .rfa),
+		lib$_writeerr, .lbr$gl_rmsstv, 1, lib$gl_libfdb [fdb$l_namdesc]);
+RETURN true
+END;
+
+ROUTINE put_end =
+BEGIN
+
+!++
+!
+! Write end of module record
+!
+!--
+
+IF NOT .dupseen 
+THEN
+    rms_perform (lbr$put_end (lib$gl_libctl),
+		lib$_writeerr, .lbr$gl_rmsstv, 1, lib$gl_libfdb [fdb$l_namdesc]);
+RETURN true
+END;
+
+!
+! Main body of lib_input_mac
+!
+
+LOCAL
+    deltxtrfa : BBLOCK [rfa$c_length],
+    found_one,
+    status,
+    replacing,
+    get_status,
+    stop_flag;
+BIND
+    libdesc = lib$gl_libfdb [fdb$l_namdesc] : BBLOCK,
+    inpdesc = lib$gl_inpfdb [fdb$l_namdesc] : BBLOCK;
+
+found_one = false;
+dupseen = false;
+CH$FILL (0, rfa$c_length, macrorfa);
+!
+! Allocate macro name descriptor table if needed
+!
+IF .macnamptrtbl EQL 0
+THEN perform (lib_get_zmem (lbr$c_pagesize, macnamptrtbl));
+!
+! Loop reading whole input file until end of file
+!
+WHILE true						!Until eof
+DO BEGIN
+!
+! Look for ".MACRO"
+!
+WHILE ((get_status = get_record (bufdesc)) NEQ rms$_eof) !Until .MACRO found
+DO BEGIN
+    IF .linelen NEQ 0					!If non-null line
+    AND scan_line ()					!and something interesting
+    AND .tokenindex EQL key_macro			! and it is a .MACRO
+	THEN EXITLOOP;
+    END;
+IF .get_status EQL rms$_eof
+THEN IF .found_one 
+    THEN EXITLOOP
+    ELSE BEGIN
+	SIGNAL (lib$_nomacfound, 1, inpdesc);	!Otherwise done
+	RETURN lib$_nomacfound;
+	END;
+
+replacing = false;				!Not replacing yet
+nestinglevel = 1;				!Nesting level initially 1
+reptnestlevel = 0;
+found_one = true;				!.MACRO has been found
+perform (setmacroname ());			!Save the macro name away
+put_record (bufdesc, macrorfa);			!Write the record
+
+stop_flag = false;
+!
+! Read and write records until the matching .ENDM is seen
+!
+DO BEGIN
+    tokenindex = -1;
+    get_status = get_record (bufdesc);
+    IF .get_status EQL rms$_eof
+	THEN EXITLOOP;
+
+    IF .linelen NEQ 0					!non-null line
+    THEN IF scan_line ()				!and something interesting there
+    THEN CASE .tokenindex FROM key_macro TO key_print OF
+	SET
+
+    [key_macro] :
+		BEGIN
+		nestinglevel = .nestinglevel + 1;
+		IF .nestinglevel GEQU lib$c_maxnest
+		THEN
+		    BEGIN
+		    BIND
+			macro_nam = .macnamptrtbl [dsc$a_pointer];	! locates a counted ASCII string
+		    SIGNAL (lib$_nestlevel, 2, macro_nam, inpdesc);
+		    EXITLOOP;
+		    END;
+		IF NOT setmacroname ()
+		THEN EXITLOOP;
+		END;
+
+    [key_repeat, key_rept, key_irp, key_irpc] :
+		reptnestlevel = .reptnestlevel + 1;
+
+    [key_endm] :
+		BEGIN
+		IF .token2len EQL 0					!If no macro name
+		  AND .reptnestlevel GTRU 0			! and still in a repeat
+		THEN reptnestlevel = .reptnestlevel -1		! then assume its .endm on a repeat (should be illegal)
+		ELSE
+		    BEGIN
+		    checkendmac ();
+		    nestinglevel = .nestinglevel - 1;
+		    END;
+		END;
+
+    [key_endr] :
+		BEGIN
+		reptnestlevel = .reptnestlevel - 1;
+		END;
+
+    [INRANGE] : true;
+
+	TES;
+
+    IF .nestinglevel EQL 0
+    THEN
+	BEGIN
+	stop_flag = true;
+	IF .reptnestlevel GTR 0
+	THEN 
+	    BEGIN
+	    BIND
+		macro_nam = .macnamptrtbl [dsc$a_pointer];	! locates a counted ASCII string
+	    SIGNAL (lib$_nomtchendr, 3, .reptnestlevel, macro_nam, inpdesc)
+	    END
+	ELSE
+	    IF .reptnestlevel LSS 0
+	    THEN
+		BEGIN
+		BIND
+		    macro_nam = .macnamptrtbl [dsc$a_pointer];	! locates a counted ASCII string
+		SIGNAL (lib$_toomnyendr, 2, macro_nam, inpdesc);
+		END;
+	END;
+!
+! Squeeze out trailing blanks and comments if /SQUEEZE and line is non-zero
+! and the line is not .ERROR, .WARN or .PRINT (which contain semicolons
+! as part of the syntax).
+!
+    IF .lib$gl_ctlmsk [lib$v_squeeze]
+    AND .linelen GTRU 0
+    AND NOT ((.tokenindex GEQU key_warn)
+		AND (.tokenindex LEQU key_print)) 
+	THEN BEGIN
+	    elim_trail_blnk ();
+	    IF .linelen NEQ 0			!If line left after squeezing
+		THEN IF NOT put_record (bufdesc, macrorfa)
+			THEN EXITLOOP;
+	    END
+    	ELSE IF NOT put_record (bufdesc, macrorfa)
+		THEN EXITLOOP;
+
+    END
+    UNTIL .stop_flag;
+
+IF .stop_flag
+THEN
+    BEGIN
+    BIND
+	macrodesc = .macnamptrtbl : BBLOCK;
+    IF .dupseen 
+    THEN 
+	!
+	!   If a duplicate was seen, then then skip the insert_key call
+	!   and reset the dupseen flag.
+	!
+	dupseen = false
+    ELSE
+	BEGIN		! proceed with normal insertion/replace
+	put_end ();				!Write end of module record
+
+	macrodesc [dsc$a_pointer] = .macrodesc [dsc$a_pointer] + 1;
+	IF .lib$gl_ctlmsk [lib$v_replace]					!If requested to replace
+	THEN
+	    BEGIN
+	    replacing = lbr$lookup_key (lib$gl_libctl, .macnamptrtbl, deltxtrfa);
+	    rms_perform (lbr$replace_key (lib$gl_libctl, .macnamptrtbl, deltxtrfa, macrorfa),
+			lib$_inserterr, .lbr$gl_rmsstv, 2, .macnamptrtbl, libdesc);
+	    IF .replacing							!If we are replacing
+		THEN rms_perform (lbr$delete_data (lib$gl_libctl, deltxtrfa),	! then delete old text
+					lib$_deldaterr, .lbr$gl_rmsstv, 1, libdesc);
+	    END
+	ELSE 
+	    BEGIN
+	    rms_perform (lbr$insert_key (lib$gl_libctl, .macnamptrtbl, macrorfa),
+			lib$_inserterr, .lbr$gl_rmsstv, 2, .macnamptrtbl, libdesc ); 
+	    END;
+
+	lib_log_upd ( (IF .replacing THEN lhe$c_replaced
+			ELSE lhe$c_inserted), .macnamptrtbl );
+	lib_log_op ((IF .replacing THEN lib$_replaced
+			ELSE lib$_inserted), .macnamptrtbl, .lib$gl_libfdb);
+	END;
+    macrodesc [dsc$a_pointer] = .macrodesc [dsc$a_pointer] - 1;
+    END
+
+ELSE
+    BEGIN
+    BIND
+	macro_nam = .macnamptrtbl [dsc$a_pointer],	! locates a counted ASCII string
+	macrodesc = .macnamptrtbl : BBLOCK;
+
+    macrodesc [dsc$a_pointer] = .macrodesc [dsc$a_pointer] + 1;
+    IF .nestinglevel GTRU 0
+    THEN
+	SIGNAL (lib$_nomtchendm, 2, macro_nam, libdesc);
+    IF .macrorfa NEQ 0							!Need to clean up?
+    THEN
+	BEGIN
+	put_end ();							!Write end of module
+	lbr$delete_data (lib$gl_libctl, macrorfa);
+	END;
+    macrodesc [dsc$a_pointer] = .macrodesc [dsc$a_pointer] + 1;
+    EXITLOOP;								!And end this file now.
+    END;
+CH$FILL (0, rfa$c_length, macrorfa);
+END;									!Of loop reading source
+
+!
+! Deallocate the macro name descriptor table
+!
+INCRU i FROM 0 TO lib$c_maxnest-1
+DO BEGIN
+    BIND
+	curdesc = macnamptrtbl [.i * dsc$c_s_bln,0,0,0] : BBLOCK [dsc$c_s_bln];
+
+    IF .curdesc [dsc$a_pointer] NEQ 0
+    THEN lib_free_mem (lbr$c_maxkeylen+1, .curdesc [dsc$a_pointer]);
+    END;
+
+lib_free_mem (lbr$c_pagesize, .macnamptrtbl);
+macnamptrtbl = 0;
+
+RETURN true
+END;				!Of lib_inputmac
+
+ROUTINE scan_line =
+BEGIN
+!
+! This routine scans the line and determines if the line contains any
+! significant keyword and, if so, also attempts to scan the macro name,
+! if any.
+
+ROUTINE do_scan_line =
+BEGIN
+LOCAL
+        lastchar;				! Last character
+
+IF NOT skip_blanks () THEN RETURN false;	!If line all blank or comment, done
+token1ptr = .lineptr;				!Point to start of first token
+token1len = scan_word ();			!Scan to end of word and get length
+IF .token1len EQL 0 THEN RETURN false;		!If no word, return false
+lastchar = .curchar;				!Remember the character past
+						! call to skip_blanks
+IF skip_blanks ()				!If not end of line now,
+THEN
+    BEGIN
+    IF .lastchar EQL %ASCII':'			! but on a label
+    THEN 
+	BEGIN
+	lineptr = .lineptr - 1;			! back up one because subsequent call to skip_blanks will swallow first character
+	RETURN do_scan_line ();			! then rescan what is left
+	END
+    ELSE
+	IF .curchar EQL %ASCII'='		!If an assignment
+	THEN RETURN false;			! then all done
+    END
+ELSE RETURN lookup_keyword (token1desc, macro_names); !Nothing left
+							! on line, see if .endm/.endr
+token2ptr = .lineptr;
+token2len = scan_word ();
+RETURN lookup_keyword (token1desc, macro_names); !Lookup name and return
+END;				!Of do_scan_line
+!
+! Main body of scan_line
+!
+lineptr = .lineaddr - 1;			!Init moving line pointer
+endptr = .lineaddr + .linelen;
+token1len = 0;
+token2len = 0;
+RETURN do_scan_line ()
+END;				!Of scan_line
+
+ROUTINE scan_word =
+BEGIN
+!
+! This routine returns the length of the word which is pointed to currently
+! by lineptr and advances lineptr to the character past the end of the word.
+!
+LOCAL
+    startptr;
+
+startptr = .lineptr;
+WHILE CH$DIFF (.endptr, .lineptr + 1) GTR 0
+DO BEGIN
+    curchar = CH$A_RCHAR (lineptr);		!next character
+    IF NOT symbol_char () THEN RETURN .lineptr - .startptr;
+    END;
+RETURN .lineptr + 1 - .startptr;
+END;
+
+ROUTINE skip_blanks =
+BEGIN
+!
+! This routine skips blanks and tabs in the input line.
+! Returns true if skipped to non-blank, non-tab character.
+! Returns false if skipped to semi-colon or end-of-line.
+!
+WHILE CH$DIFF (.endptr, .lineptr + 1) GTR 0		! More input line?
+DO BEGIN
+    curchar = CH$A_RCHAR (lineptr);		! Read next character
+    IF .curchar EQL %ASCII';' THEN RETURN false;	!Return false if comment
+    IF .curchar NEQ %ASCII' ' AND .curchar NEQ %ASCII'	' !If character is not space/tab
+	THEN RETURN true;
+    END;
+RETURN false					!Return false for end of line
+END;				!Of skip_blanks
+
+ROUTINE symbol_char =
+BEGIN
+!
+! This routine returns true if curchar is a character that may be
+! in a symbol, and false if not.
+!
+OWN
+    symbolics : BBLOCK [68] INITIAL				!68 to pad to full word
+		('ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.$_');
+
+IF CH$FAIL (CH$FIND_CH (65, symbolics, .curchar))
+THEN RETURN false
+ELSE RETURN true
+END;				!Of symbol_char
+
+ROUTINE lookup_keyword (tokendesc, tableaddr) =
+BEGIN
+!
+! This routine looks up the token described by tokenptr and tokenlen
+! in the vector of string descriptors pointed to by tableaddr.
+!
+! Returns true with tokenindex set up if found, false if not.
+!
+MAP
+    tokendesc : REF BBLOCK,
+    tableaddr : REF BBLOCK;
+
+LOCAL
+    upcasename : VECTOR [lbr$c_pagesize,BYTE],
+    i;
+
+IF .tokendesc [dsc$w_length] EQL 0 THEN RETURN false;
+make_upper_case (.tokendesc, upcasename);		!upper case the name
+i = 0;
+WHILE .tableaddr [.i * dsc$c_s_bln,0,16,0] NEQ 0
+DO BEGIN
+    BIND
+	curdesc = tableaddr [.i * dsc$c_s_bln,0,0,0] : BBLOCK [dsc$c_s_bln];
+
+    IF CH$EQL (.tokendesc [dsc$w_length], upcasename, .curdesc [dsc$w_length],
+		.curdesc [dsc$a_pointer])
+	THEN BEGIN
+	    tokenindex = .i;
+	    RETURN true;
+	    END
+	ELSE i = .i + 1;
+    END;
+RETURN false					!Not found
+END;				!Of lookup_keyword
+
+ROUTINE make_upper_case (idesc, oname) =
+BEGIN
+!
+! This routine upper cases iname.
+!
+MAP
+    idesc : REF BBLOCK,
+    oname : REF VECTOR [,BYTE];
+BIND
+    namlen = idesc [dsc$w_length] : WORD,
+    iname = idesc [dsc$a_pointer] : REF VECTOR [,BYTE];
+
+IF .namlen GTRU 0
+THEN INCRU i FROM 0 TO .namlen-1
+DO IF .iname [.i] GEQU %ASCII'a'			!copy name and convert to upper case
+   AND .iname [.i] LEQU %ASCII'z'
+   THEN oname [.i] = .iname [.i] - (%ASCII'a' - %ASCII'A')
+   ELSE oname [.i] = .iname [.i];
+RETURN true
+END;
+
+ROUTINE elim_trail_blnk =
+BEGIN
+!
+! Eliminate trailing blanks from the line
+!
+lineptr = .endptr - 1;
+skip_blnk_bkwds ();
+linelen = CH$DIFF (.lineptr, .lineaddr) + 1;
+WHILE CH$DIFF (.lineptr, .lineaddr) GEQ 0
+DO IF (curchar = CH$RCHAR (.lineptr)) NEQ %ASCII';'
+THEN lineptr = CH$PLUS (.lineptr, -1)
+ELSE BEGIN
+    linelen = CH$DIFF (.lineptr, .lineaddr);
+    EXITLOOP;
+    END;
+
+lineptr = .lineaddr + .linelen - 1;
+skip_blnk_bkwds ();
+linelen = CH$DIFF (.lineptr, .lineaddr) + 1;
+RETURN true
+END;				!Of elim_trail_blnk
+
+ROUTINE skip_blnk_bkwds =
+BEGIN
+!
+! This routine skips blanks in an input line backwards.
+!
+WHILE CH$DIFF (.lineptr, .lineaddr) GEQ 0
+DO IF (curchar = CH$RCHAR (.lineptr)) EQL %ASCII' '
+	OR .curchar EQL %ASCII'	'
+    THEN lineptr = CH$PLUS (.lineptr, -1)
+    ELSE RETURN true;
+RETURN true
+END;				!Of skip_blnk_bkwds
+
+ROUTINE setmacroname =
+BEGIN
+!
+! This routine converts the macro name to upper case
+! and saves it for later checking on the .ENDM and for
+! entering the macro name into the library.
+!
+BIND
+    inpdesc = lib$gl_inpfdb [fdb$l_namdesc] : BBLOCK,
+    macrodesc = macnamptrtbl [(.nestinglevel - 1) * dsc$c_s_bln,0,0,0] : BBLOCK;
+
+IF .token2len GTRU .lib$gl_keysize
+THEN BEGIN
+    SIGNAL (lib$_macnamlng, 2, token2desc, inpdesc);
+    RETURN lib$_macnamlng;
+    END;
+
+IF .macrodesc [dsc$a_pointer] EQL 0
+THEN perform (lib_get_zmem (lbr$c_maxkeylen+1, macrodesc [dsc$a_pointer]));
+macrodesc [dsc$a_pointer] = .macrodesc [dsc$a_pointer] + 1;
+make_upper_case (token2desc, .macrodesc [dsc$a_pointer]);
+macrodesc [dsc$w_length] = .token2len;
+BEGIN
+    BIND
+	namlen = .macrodesc [dsc$a_pointer]-1 : VECTOR [,BYTE];	!Name first byte (length)
+
+    namlen [0] = .macrodesc [dsc$w_length];					!Set length into name
+    END;
+
+IF .nestinglevel EQL 1
+THEN
+    BEGIN
+    IF NOT .lib$gl_ctlmsk [lib$v_replace]		!if not replacing
+	AND lbr$lookup_key (lib$gl_libctl, macrodesc, macrorfa)
+    THEN
+	BEGIN
+	SIGNAL (lib$_dupmodule, 3, .macrodesc [dsc$a_pointer] - 1, lib$gl_inpfdb [fdb$l_namdesc],
+		lib$gl_libfdb [fdb$l_namdesc]);
+	dupseen = true;
+	END;
+    END;
+
+macrodesc [dsc$a_pointer] = .macrodesc [dsc$a_pointer] - 1;
+RETURN true
+END;
+
+ROUTINE checkendmac =
+BEGIN
+!
+! This routine checks that the name specified on the .ENDM
+! matches what is expected.
+!
+BIND
+    inpdesc = lib$gl_inpfdb [fdb$l_namdesc] : BBLOCK,
+    macrodesc = macnamptrtbl [(.nestinglevel - 1) * dsc$c_s_bln,0,0,0] : BBLOCK;
+
+LOCAL
+    endname : VECTOR [lbr$c_maxkeylen,BYTE];
+
+IF .token2len NEQ 0
+THEN BEGIN
+    IF .token2len GTRU .lib$gl_keysize
+    THEN SIGNAL (lib$_macnamlng, 2, token2desc, inpdesc);
+    make_upper_case (token2desc, endname);
+    IF NOT CH$EQL (.token2len, endname, .macrodesc [dsc$w_length],
+		.macrodesc [dsc$a_pointer] + 1)
+    THEN BEGIN
+	macrodesc [dsc$a_pointer] = .macrodesc [dsc$a_pointer] + 1;
+	SIGNAL (lib$_endwrngmac, 3, token2desc, macrodesc, inpdesc);
+	macrodesc [dsc$a_pointer] = .macrodesc [dsc$a_pointer] - 1;
+	END;
+    END;
+
+RETURN true
+END;
+
+END
+ELUDOM

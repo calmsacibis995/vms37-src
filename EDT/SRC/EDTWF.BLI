@@ -1,0 +1,1131 @@
+MODULE EDTWF(IDENT='V03-000') =
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY: EDT
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This module contains all routines associated with the work-file
+!	system.  The work-file system provides a means of handling sequential
+!	io on entities called text buffers.  A text buffer is described
+!	by a text buffer control block.  Text buffers may be accessed by
+!	a line range access block or racb.
+!
+! ENVIRONMENT: User mode, sharable
+!
+! AUTHOR: Bob Kushlis, CREATION DATE: 16-OCT-1978
+!
+! MODIFIED BY:
+!
+! Bob Kushlis, 28-JUN-1979
+!	Put out error message if unable to open input file.
+!
+! Bob Kushlis, 30-AUG-1979
+!	Make work file buffer a pointer instead of internal buffer.
+!
+! Bob Kushlis, 2-MAY-1980
+!	Decrement the insert count after reading a line from input.
+!	So substitute will not blow up (hack)
+!--
+
+
+BEGIN
+
+LIBRARY 'EDT';
+
+PSECTS
+
+
+EXTERNAL
+    W_AVAIL,			! Pointer to next available deleted bucket
+    W_CUR_BUKT,			! Number of the current bucket
+    W_GREATEST_BUKT,		! Largest bucket number in use
+    W_MODIFIED,			! Flag indicating bucket was modified
+    W_NEXT_NUM : LN_BLOCK,	! Line number following an insert
+    W_START_NUM : LN_BLOCK,	! Line number of line preceding an insert
+    W_I_COUNT : LN_BLOCK,	! The count of inserted lines
+    W_I_BUKT,			! The bucket number at start of insert
+    W_I_ADDR,			! The line address at start of insert
+    W_LINE : REF LIN_BLOCK,	! Pointer to current line
+    W_BUKT : 			! Pointer to current bucket
+    	REF BLOCK[WF_BUKT_SIZE,BYTE] FIELD(WFB_FIELDS);
+  
+EXTERNAL
+    E_TBCB : REF TBCB_BLOCK,	! Current text buffer control block
+    E_ABUF,			! Alternate text buffer control block
+    E_EXITED,			! Exit flag (on if we are exiting)
+    LNO_ZERO :  LN_BLOCK,
+    LNO_BIG : LN_BLOCK,
+    LNO_0 : LNOVECTOR[9],
+    IO_RHB;			! Record header buffer for fixed line nos.
+
+EXTERNAL ROUTINE
+    EXT_DECS
+    F_LITERAL,
+    F_PUT,
+    IO_GWF,
+    IO_PWF,
+    IO_GET,
+    IO_GNB,
+    IO_WT,
+    SY_EXIT,
+    X_NO_OPEN,
+    IO_OI;
+
+FORWARD ROUTINE
+    DELETE_BUKT : NOVALUE,
+    APPEND_BUKT : NOVALUE,
+    READ_BUKT : NOVALUE,
+    READ_INPUT,
+    RELEASE_BUKT : NOVALUE,
+    SPLIT_BUKT : NOVALUE,
+    WF_BOTTOM : NOVALUE,
+    WF_CLEAR : NOVALUE,
+    WF_COMP_LNO,
+    WF_DELETE_LINE : NOVALUE,
+    WF_END_INSERT : NOVALUE,
+    WF_EOB,
+    WF_INSERT_LINE : NOVALUE,
+    WF_LOCATE_LINE,
+    WF_OPEN_BUFFER : NOVALUE,
+    WF_TOP : NOVALUE,
+    WF_R_CURRENT : NOVALUE,
+    WF_R_BACKWRD,
+    WF_R_FORWARD,
+    WF_REPLACE_LINE : NOVALUE,
+    WF_RESEQUENCE : NOVALUE,
+    WF_START_INSERT : NOVALUE;
+
+
+! This literal is pointed to when we are at an end of buffer.
+
+BIND EOB_LINE = UPLIT BYTE(0, REP 4 OF (255), REP 9 OF (0));
+
+!+
+! This routine updates W_LINE to point to the line in the current bucket
+! at the offset taken from the text buffer control block.
+!-
+
+ROUTINE GET_LINE : NOVALUE =
+W_LINE = CH$PTR(.W_BUKT,.E_TBCB[TBCB_LINE_ADDR]);
+
+!+
+! This routine returns the number of the next bucket which will be allocated
+! by a call to get_new_bukt, but does not actually allocate the bucket.
+!-
+
+ROUTINE NEXT_BUKT =
+IF .W_AVAIL NEQ 0 THEN
+   .W_AVAIL
+ELSE
+   .W_GREATEST_BUKT;
+
+!+
+! This routine allocates a new bucket from the work-file.  If there
+! is a bucket available on the deleted bucket list, use it, otherwise
+! take the next higher numbered bucket.
+!-
+
+ROUTINE GET_NEW_BUKT : NOVALUE =
+IF .W_AVAIL NEQ 0 THEN
+    BEGIN
+    READ_BUKT(.W_AVAIL);
+    W_AVAIL = .W_BUKT[WFB_NEXT_BUKT];
+    END
+ELSE
+    BEGIN
+    !
+    ! Check for overflow
+    !
+    IF .W_GREATEST_BUKT EQL 0 OR
+       .W_GREATEST_BUKT GTRU 65535 THEN
+	BEGIN
+	F_LITERAL(UPLIT(%STRING('Work file overflow')),18); F_PUT();
+	SY_EXIT(1);
+	END;
+    !
+    ! Inform the caching routines that we are creating a new bucket.
+    !
+    IO_GNB(.W_GREATEST_BUKT,W_BUKT);
+    W_CUR_BUKT = .W_GREATEST_BUKT;
+    !
+    ! And bump the largest bucket number.
+    !
+    W_GREATEST_BUKT = .W_GREATEST_BUKT+1;
+    END;
+
+!+
+! This routine is called when all the text in a bucket has been deleted.
+! If this is not the only bucket in the text buffer, then update the links
+! of the previous and next bucket to point to each other, handling the
+! special case of the first and last bucket.
+!-
+
+ROUTINE DELETE_BUKT : NOVALUE =
+BEGIN
+LOCAL
+    NEXT,
+    PREV;
+!
+! Keep track of its previous and next bucket pointers.
+!
+NEXT = .W_BUKT[WFB_NEXT_BUKT];
+PREV = .W_BUKT[WFB_PREV_BUKT];
+!
+! If this is the only bucket in the text buffer just update
+! the W_LINE and get out.
+!
+IF (.NEXT OR .PREV) EQL 0 THEN
+    BEGIN
+    WF_R_FORWARD();
+    RETURN;
+    END;
+!
+! Release the bucket.
+!
+RELEASE_BUKT();
+!
+! Link the previous bucket to the next one.
+!
+IF .PREV EQL 0 THEN
+    E_TBCB[TBCB_FIRST_BUKT] = .NEXT
+ELSE
+    BEGIN
+    READ_BUKT(.PREV);
+    W_BUKT[WFB_NEXT_BUKT] = .NEXT;
+    W_MODIFIED = 1;
+    END;
+!
+! If this was the last bucket then update E_TBCB, otherwise
+! go to the next bucket and update it's pointers.
+!
+IF .NEXT EQL 0 THEN
+    BEGIN
+    E_TBCB[TBCB_LAST_BUKT] = E_TBCB[TBCB_CUR_BUKT] = .PREV;
+    E_TBCB[TBCB_LINE_ADDR] = .W_BUKT[WFB_END];
+    WF_R_FORWARD();
+    END
+ELSE
+    BEGIN
+    READ_BUKT(.NEXT);
+    W_BUKT[WFB_PREV_BUKT] = .PREV;
+    E_TBCB[TBCB_LINE_ADDR] = WFB_FIXED_SIZE;
+    GET_LINE();
+    W_MODIFIED = 1;
+    END;
+!
+! Update the current bucket field.
+!
+E_TBCB[TBCB_CUR_BUKT] = .W_CUR_BUKT;
+END;
+
+!+
+! This routine appends a new bucket to a text buffer.  The bucket is
+! linked into the chain.
+!
+! NEXT is the bucket which will follow the new bucket or 0 if it is at the end.
+!
+! PREV is the bucket which will precede the new bucket or 0 if it is the first.
+!-
+
+ROUTINE APPEND_BUKT(NEXT,PREV) : NOVALUE =
+BEGIN
+!
+! Is this the last bucket in the buffer?
+!
+IF .NEXT EQL 0 THEN
+    !
+    ! Yes, update last bucket field of the E_TBCB
+    !
+    E_TBCB[TBCB_LAST_BUKT] = NEXT_BUKT()
+ELSE
+    !
+    ! No, link the next bucket back to the one we are adding.
+    !
+    BEGIN
+    READ_BUKT(.NEXT);
+    W_BUKT[WFB_PREV_BUKT] = NEXT_BUKT();
+    W_MODIFIED = 1;
+    END;
+!
+! Write out the current bucket if it has been W_MODIFIED
+!
+IF .W_MODIFIED THEN IO_PWF(.W_CUR_BUKT);
+W_MODIFIED = 0;
+!
+! Get a new bukt.
+!
+GET_NEW_BUKT();
+!
+! Update the current bucket and next bucket info
+!
+E_TBCB[TBCB_CUR_BUKT] = .W_CUR_BUKT;
+!
+! Fill in the bucket info for the new bucket
+!
+W_BUKT[WFB_NEXT_BUKT] = .NEXT;
+W_BUKT[WFB_PREV_BUKT] = .PREV;
+W_BUKT[WFB_END] = WFB_FIXED_SIZE;
+!
+! Update the E_TBCB to point to first record in this new bucket
+!
+E_TBCB[TBCB_LINE_ADDR] = WFB_FIXED_SIZE;
+W_LINE = CH$PTR(.W_BUKT,WFB_FIXED_SIZE);
+!
+! Mark the new bucket as W_MODIFIED
+!
+W_MODIFIED = 1;
+END;
+
+!+
+! This routine insures that the bucket number passed as a parameter is the
+! current bucket.  If it is not already the current bucket, then write the
+! current one if it has been modified and read the new one.
+!
+! BUKT_NUM is the number of the bucket to read.
+!-
+
+ROUTINE READ_BUKT(BUKT_NUM) : NOVALUE =
+!
+! Do not read if we are reading the current bucket
+!
+IF .W_CUR_BUKT NEQ .BUKT_NUM THEN
+    BEGIN
+    !
+    ! Write the current bucket if it has been W_MODIFIED
+    !
+    IF .W_MODIFIED THEN IO_PWF(.W_CUR_BUKT);
+    !
+    ! Read the new bucket
+    !
+    W_CUR_BUKT = .BUKT_NUM;
+    IO_GWF(.W_CUR_BUKT,W_BUKT);
+    !
+    ! New bucket has not yet been W_MODIFIED
+    !
+    W_MODIFIED = 0;
+    END;
+
+!+
+! This routine attempts to read a new line from the input file.  If the
+! INPUT_RAB field is zero, or if the read fails return 0 to indicate that
+! there is no more input.  If the read succeeds, give the line the next
+! sequential number, and insert it at the end of the text buffer.
+!-
+
+ROUTINE READ_INPUT =
+BEGIN
+    LOCAL
+	REC_ADDR,
+	REC_LEN,
+	I,
+	NEW_BUKT;
+    ADDLINE(E_TBCB[TBCB_INPUT_LINE],LNO_0[5],E_TBCB[TBCB_INPUT_LINE]);
+    DIVLINE(LNO_0[5],E_TBCB[TBCB_INPUT_LINE],IO_RHB);
+    !
+    ! Try to read a record from the primary input
+    !
+    IF .E_TBCB[TBCB_INPUT_RAB] NEQ 0 AND
+       IO_GET(.E_TBCB[TBCB_INPUT_RAB],REC_ADDR,REC_LEN) THEN
+	!
+        ! The read suceeded, insert it at the end of the buffer
+	!
+	BEGIN
+	WF_INSERT_LINE(.REC_ADDR,.REC_LEN);
+	!
+	! In case we are doing an insert on another buffer (as in the
+	! case of a CUT command, do not screw up the insert count.
+	!
+	SUBLINE(LNO_0,W_I_COUNT,W_I_COUNT);
+        !
+        ! Give it a line number and an original line number
+        !
+	WF_R_BACKWRD();
+        MOVELINE(E_TBCB[TBCB_INPUT_LINE],W_LINE[LIN_NUM]);
+        MOVELINE(IO_RHB,W_LINE[LIN_ORIG_NUM]);
+	!
+	! And return sucess
+	!
+	RETURN 1
+	END
+    ELSE
+	!
+	! The read failed, indicate end of buffer.
+	!
+	BEGIN
+	W_LINE = EOB_LINE;
+        E_TBCB[TBCB_CHAR_POS] = 0;
+        E_TBCB[TBCB_INPUT_RAB] = 0;
+	!
+	! And return failure
+	!
+	RETURN 0
+	END
+END;
+
+!+
+! This routine is called when a bucket is deleted to make it available for
+! re-use.  The bucket is linked onto the front of the available bucket list
+! by putting the current avail number in it's NEXT_BUKT field, and marking
+! the bucket as modified.
+!-
+
+ROUTINE RELEASE_BUKT : NOVALUE =
+BEGIN
+W_BUKT[WFB_NEXT_BUKT] = .W_AVAIL;
+W_AVAIL = .W_CUR_BUKT;
+W_MODIFIED = 1;
+END;
+
+!+
+! This routine splits the current bucket at the current position into
+! two buckets.  In the special case that we are at the end of the bucket
+! this is done simply by appending a new bucket, otherwise, we must allocate
+! a new bucket and copy all the text from the current line to the end of the
+! bucket into the new bucket.
+!-
+
+ROUTINE SPLIT_BUKT : NOVALUE =
+BEGIN
+    LOCAL 
+	OLD_NEXT,
+	LEN,
+	ORIG_BUKT;
+    !
+    ! Remember the next bucket number, and the original one
+    !
+    OLD_NEXT = .W_BUKT[WFB_NEXT_BUKT];
+    ORIG_BUKT = .W_CUR_BUKT;
+    !
+    ! First check to see if we are at the end of a bucket.
+    !
+    IF .E_TBCB[TBCB_LINE_ADDR] EQL .W_BUKT[WFB_END] THEN
+	!
+	! We are at the end, just link a new bucket to this one
+	!
+	BEGIN
+	W_BUKT[WFB_NEXT_BUKT] = NEXT_BUKT();
+	W_MODIFIED = 1;
+	APPEND_BUKT(.OLD_NEXT,.ORIG_BUKT)
+	END
+    ELSE
+	BEGIN
+	!
+	! Split the bucket into two, at the beginning of the current line.
+	!
+	LOCAL 
+	    OLD_BUKT,
+	    NEW_BUKT;
+	LEN = .W_BUKT[WFB_END] - .E_TBCB[TBCB_LINE_ADDR];
+	W_BUKT[WFB_END] = .E_TBCB[TBCB_LINE_ADDR];
+	W_BUKT[WFB_NEXT_BUKT] = NEW_BUKT = NEXT_BUKT();
+	IO_PWF(.W_CUR_BUKT);
+	OLD_BUKT = .W_BUKT;
+	GET_NEW_BUKT();
+	W_BUKT[WFB_NEXT_BUKT] = .OLD_NEXT;
+	W_BUKT[WFB_PREV_BUKT] = .ORIG_BUKT;
+	CH$MOVE(.LEN,CH$PTR(.OLD_BUKT,.E_TBCB[TBCB_LINE_ADDR]),
+	    	CH$PTR(.W_BUKT,WFB_FIXED_SIZE));
+	W_BUKT[WFB_END] = .LEN + WFB_FIXED_SIZE;
+	W_MODIFIED = 1;
+	IF .OLD_NEXT EQL 0 THEN
+	    BEGIN
+	    IF .ORIG_BUKT EQL .E_TBCB[TBCB_LAST_BUKT] THEN
+		E_TBCB[TBCB_LAST_BUKT] = .NEW_BUKT
+	    END
+	ELSE
+	    BEGIN
+	    READ_BUKT(.OLD_NEXT);
+	    W_BUKT[WFB_PREV_BUKT] = .NEW_BUKT;
+	    W_MODIFIED = 1;
+	    END;
+	READ_BUKT(.ORIG_BUKT)
+	END
+END;
+
+!+
+! Move to the bottom of the current buffer.
+!-
+
+GLOBAL ROUTINE WF_BOTTOM : NOVALUE =
+BEGIN
+LOCAL LAST;
+!
+! Just read the last bucket in the buffer, then
+! read lines until we can't read any more.
+!
+E_TBCB[TBCB_CUR_BUKT] = LAST = .E_TBCB[TBCB_LAST_BUKT];
+READ_BUKT(.LAST);
+E_TBCB[TBCB_LINE_ADDR] = .W_BUKT[WFB_END];
+E_TBCB[TBCB_CHAR_POS] = 0;
+GET_LINE();
+WHILE WF_R_FORWARD() DO ;
+MOVELINE(E_TBCB[TBCB_LINE_COUNT],E_TBCB[TBCB_CUR_LIN]);
+END;
+
+!+
+! Clear the entire current bucket.  The first bucket of the buffer is
+! updated to be empty, and, if there is more than one, the rest of the
+! bucket is placed on the available bucket list.  Note that since the
+! buckets are already linked together, we need only link the last bucket
+! in the buffer to the current available bucket, then make avail the
+! first bucket we are releasing.
+!-
+
+GLOBAL ROUTINE WF_CLEAR : NOVALUE =
+BEGIN
+WF_TOP();
+!
+! Release remaining buckets if there are more than one.
+!
+IF .W_BUKT[WFB_NEXT_BUKT] NEQ 0 THEN
+    BEGIN
+    WF_BOTTOM();
+    W_BUKT[WFB_NEXT_BUKT] = .W_AVAIL;
+    W_MODIFIED = 1;
+    WF_TOP();
+    W_AVAIL = .W_BUKT[WFB_NEXT_BUKT];
+    END;
+E_TBCB[TBCB_LINE_ADDR] = WFB_FIXED_SIZE;
+W_BUKT[WFB_END] = WFB_FIXED_SIZE;
+W_BUKT[WFB_NEXT_BUKT] = 0;
+W_MODIFIED = 1;
+MOVELINE(LNO_ZERO,E_TBCB[TBCB_LINE_COUNT]);
+E_TBCB[TBCB_CHAR_COUNT] = 0;
+E_TBCB[TBCB_LAST_BUKT] = .W_CUR_BUKT;
+END;
+
+!+
+! This routine compares two lines numbers LIN1 and LIN2 and returns
+! -1, 0 or 1 depending on their relation.  On vax systems, we can do
+! a simple 32 bit compare, but on PDP-11's we must do multiple precision
+! arithmetic, hence the conditional code.
+!-
+
+%IF %BLISS(BLISS32) %THEN
+
+GLOBAL ROUTINE WF_COMP_LNO(LIN1,LIN2) =
+IF ..LIN1 LSSU ..LIN2 THEN RETURN -1
+ELSE
+    IF ..LIN1 GTRU ..LIN2 THEN RETURN 1
+    ELSE
+	RETURN 0;
+
+%ELSE %IF %BLISS(BLISS16) %THEN
+
+GLOBAL ROUTINE WF_COMP_LNO(LIN1,LIN2) =
+BEGIN
+MAP LIN1 : REF VECTOR[4,BYTE],
+    LIN2 : REF VECTOR[4,BYTE];
+DECR I FROM 3 TO 0 DO
+    IF .LIN1[.I] LSSU .LIN2[.I] THEN RETURN -1
+    ELSE IF .LIN1[.I] GTRU .LIN2[.I] THEN RETURN 1;
+RETURN 0
+END;
+
+%FI %FI
+
+!+
+! This routine deletes the current line from the buffer.  Close up the
+! gap in the block by moving any text following the deleted line.  If the
+! line is the only one in a bucket, then also delete the bucket.
+!-
+
+GLOBAL ROUTINE WF_DELETE_LINE : NOVALUE =
+BEGIN
+LOCAL 
+    SIZE,
+    SOURCE,
+    REMAINING;
+!
+! Test for end of buffer. (do not try to delete if at end of block)
+!
+IF .E_TBCB[TBCB_LINE_ADDR]  EQL .W_BUKT[WFB_END] THEN RETURN;
+!
+! Update the line and character count fields
+!
+SUBLINE(LNO_0,E_TBCB[TBCB_LINE_COUNT],E_TBCB[TBCB_LINE_COUNT]);
+E_TBCB[TBCB_CHAR_COUNT] = .E_TBCB[TBCB_CHAR_COUNT]-.W_LINE[LIN_LENGTH];
+!
+! Mark bucket as W_MODIFIED
+!
+W_MODIFIED = 1;
+!
+! Calculate the length of text to be deleted.
+!
+SIZE = .W_LINE[LIN_LENGTH] + LIN_FIXED_SIZE + 1;
+!
+! Source is a pointer to the following information.
+!
+SOURCE = CH$PLUS(.W_LINE,.SIZE);
+!
+! Calculate the number of used bytes left in the block.
+!
+REMAINING = .W_BUKT[WFB_END] - .E_TBCB[TBCB_LINE_ADDR] - .SIZE;
+!
+! Update the end of bucket information.
+!
+W_BUKT[WFB_END] = .W_BUKT[WFB_END] -.SIZE;
+!
+! And close up the hole we created.
+!
+IF .REMAINING NEQ 0 THEN
+    BEGIN
+    CH$MOVE(.REMAINING,.SOURCE,.W_LINE);
+    GET_LINE();
+    END
+ELSE
+    !
+    ! No text after the line, check to see if bucket is now empty.
+    !
+    IF .E_TBCB[TBCB_LINE_ADDR] EQL WFB_FIXED_SIZE THEN
+        DELETE_BUKT()
+    ELSE
+        WF_R_FORWARD();  ! position to first line in next bucket
+END;
+
+!+
+! This routine is called at the end of a series of insertions.  A line
+! number increment is computed and the new lines are resequenced.  At
+! this time, the variable W_I_COUNT is the number of lines which were
+! inserted, W_START_NUM and W_NEXT_NUM are the line numbers of the lines
+! preceding and following the inserted lines.  The line number increment
+! is determined as follows:  The diffence between the surrounding numbers
+! is divided by the number of lines inserted giving an increment which will
+! fit.  We then start with 1 and go down by powers of 10 until we find one
+! which is smaller than the required value.  The increment can be no smaller
+! than .00001 .
+!-
+
+GLOBAL ROUTINE WF_END_INSERT : NOVALUE =
+BEGIN
+LOCAL
+    DIF : LN_BLOCK,
+    INC : LN_BLOCK,
+    DIVISOR : LN_BLOCK;
+!
+! Don't do anything if count is zero.
+!
+IF WF_COMP_LNO(LNO_ZERO,W_I_COUNT) EQL 0 THEN RETURN;
+!
+! Position to the first inserted line.
+!
+WF_R_CURRENT();
+MOVELINE(LNO_ZERO,INC);
+DO  BEGIN
+    WF_R_BACKWRD();
+    ADDLINE(LNO_0,INC,INC);
+    END
+UNTIL WF_COMP_LNO(INC,W_I_COUNT) EQL 0;
+!
+! Compute the difference in line numbers between the lines surrounding
+! the inserted text.
+!
+SUBLINE(W_START_NUM,W_NEXT_NUM,DIF);
+!
+! If this is zero, we must be at the end of buffer, choose an increment of
+! 1.00000
+!
+IF WF_COMP_LNO(DIF,LNO_ZERO) EQL 0 THEN
+    MOVELINE(LNO_0[5],INC)
+ELSE
+    !
+    ! Compute an increment for numbering the lines.
+    !
+    BEGIN
+    ADDLINE(LNO_0,W_I_COUNT,DIVISOR);			! no of lines + 1
+    DIVLINE(DIVISOR,DIF,INC);				! divide into difference
+    IF WF_COMP_LNO(INC,LNO_ZERO) EQL 0 THEN		! if zero, use 1
+        MOVELINE(LNO_0,INC);
+    DECR I FROM 5 TO 0 DO
+        IF WF_COMP_LNO(INC,LNO_0[.I]) GEQ 0 THEN
+            BEGIN
+            MOVELINE(LNO_0[.I],INC);
+            EXITLOOP;
+            END;
+    END;
+!
+! Get the number of the first new line.
+!
+ADDLINE(INC,W_START_NUM,W_START_NUM);
+!
+! And resequence the range.
+!
+WF_RESEQUENCE(.W_I_COUNT,W_START_NUM,INC)
+END;
+
+!+
+! Check for end of buffer.  Return a 1 if we are positioned at the end
+! of the current buffer, 0 otherwise.
+!-
+
+GLOBAL ROUTINE WF_EOB =
+!
+! We are at EOB iff the line pointer is pointing at the EOB line.
+!
+.W_LINE EQL EOB_LINE;
+
+!+
+! Insert a new line in the text buffer.  If there is enough space in the
+! current bucket, text is moved around to make a hole and the new line is
+! inserted, otherwise, the bucket is split into two parts.
+!
+! REC_ADDR is the address of the new line
+!
+! REC_LEN is the length of the new line
+!-
+
+GLOBAL ROUTINE WF_INSERT_LINE(REC_ADDR,REC_LEN) : NOVALUE =
+BEGIN
+LOCAL 
+    OLD_NEXT,
+    INS_LEN;
+!
+! Update the line and character counts
+!
+ADDLINE(LNO_0,E_TBCB[TBCB_LINE_COUNT],E_TBCB[TBCB_LINE_COUNT]);
+E_TBCB[TBCB_CHAR_COUNT] = .E_TBCB[TBCB_CHAR_COUNT] + .REC_LEN;
+ADDLINE(LNO_0,E_TBCB[TBCB_CUR_LIN],E_TBCB[TBCB_CUR_LIN]);
+GET_LINE();
+!
+! Compute length of line to be inserted, including line no. info.
+!
+INS_LEN = .REC_LEN + LIN_FIXED_SIZE + 1;
+!
+! Will it fit in this bucket?
+!
+IF .W_BUKT[WFB_END] + .INS_LEN GTRU WF_BUKT_SIZE THEN
+    !
+    ! If we are at the beginning of a bucket and it is not the
+    ! first bucket, then check out the previous bucket.
+    !
+    IF .E_TBCB[TBCB_LINE_ADDR] EQL WFB_FIXED_SIZE AND
+       .W_BUKT[WFB_PREV_BUKT] NEQ 0 THEN
+	BEGIN
+	!
+	! Read the previous bucket and position to it's end.
+	!
+	READ_BUKT(.W_BUKT[WFB_PREV_BUKT]);
+	E_TBCB[TBCB_LINE_ADDR] = .W_BUKT[WFB_END];
+	E_TBCB[TBCB_CUR_BUKT] = .W_CUR_BUKT;
+	END;
+!
+! If it still doesn't fit, then split the bucket.  Note that
+! the while loop is here because it may not fit after the first
+! split.  In this case the second split is guaranteed to create
+! a new bucket and the line must fit.
+!
+WHILE .W_BUKT[WFB_END] + .INS_LEN GTRU WF_BUKT_SIZE DO
+    SPLIT_BUKT();
+!
+! Make a hole for the line to be inserted.
+!
+GET_LINE();    
+CH$MOVE(.W_BUKT[WFB_END] - .E_TBCB[TBCB_LINE_ADDR],
+    	.W_LINE,
+        CH$PLUS(.W_LINE,.INS_LEN));
+!
+! Update the end of bucket field to reflect new size.
+!
+W_BUKT[WFB_END] = .W_BUKT[WFB_END] + .INS_LEN;
+!
+! And move the line into the bucket buffer.
+!
+W_LINE[LIN_LENGTH] = .REC_LEN;
+CH$WCHAR(.REC_LEN,CH$MOVE(.REC_LEN,.REC_ADDR,W_LINE[LIN_TEXT]));
+!
+! Update the record pointer
+!
+E_TBCB[TBCB_LINE_ADDR] = .E_TBCB[TBCB_LINE_ADDR] + .INS_LEN;
+!
+! Set W_MODIFIED flag, and bump the count of inserted lines.
+!
+W_MODIFIED = 1;
+ADDLINE(W_I_COUNT,LNO_0,W_I_COUNT);
+!
+! Now make sure we are positioned correctly.
+!
+IF .E_TBCB[TBCB_LINE_ADDR] GEQ .W_BUKT[WFB_END] THEN
+    IF .W_BUKT[WFB_NEXT_BUKT] NEQ 0 THEN
+        BEGIN
+        READ_BUKT(.W_BUKT[WFB_NEXT_BUKT]);
+        E_TBCB[TBCB_LINE_ADDR] = WFB_FIXED_SIZE;
+        E_TBCB[TBCB_CUR_BUKT] = .W_CUR_BUKT;
+        END;
+GET_LINE();
+END;
+
+!+
+! This procedure searches for a specified line number.  If the line number
+! is found, the buffer is left postioned there, if not, the buffer is positioned
+! to the first line with a number larger than the line to be located.  The value
+! returned is 1 if the actual line was located and 0 otherwise.
+!
+! LINE_NUM is the address of the line number to be located.
+!-
+
+GLOBAL ROUTINE WF_LOCATE_LINE(LINE_NUM) = 
+BEGIN
+  MAP LINE_NUM : REF LN_BLOCK;
+
+  LOCAL RELAT1,RELAT2;
+  RELAT1 = 2;
+  DO BEGIN
+    RELAT2 = WF_COMP_LNO(W_LINE[LIN_NUM],.LINE_NUM);
+    IF .RELAT1 EQL .RELAT2 THEN EXITLOOP;
+    SELECTONE .RELAT2 OF
+    SET
+    [-1]: IF NOT WF_R_FORWARD() THEN RETURN 0;
+    [ 0]: RETURN 1;
+    [ 1]: IF NOT WF_R_BACKWRD() THEN RETURN 0;
+    TES;
+    RELAT1 = - .RELAT2;
+    END
+  UNTIL 0;
+  IF .RELAT2 EQL -1 THEN WF_R_FORWARD();
+  RETURN 0
+END;
+
+!-
+! This routine opens (or creates) a text buffer.  The text buffer
+! has originally no lines, but may have an associated input file.
+! The E_TBCB is initialized to reflect this state.
+!+
+
+GLOBAL ROUTINE WF_OPEN_BUFFER : NOVALUE =
+BEGIN
+E_TBCB[TBCB_FIRST_BUKT] = NEXT_BUKT();
+E_TBCB[TBCB_LAST_BUKT] = NEXT_BUKT();
+APPEND_BUKT(0,0);
+READ_INPUT();
+END;
+
+!+
+! Position to the top of the current buffer.
+!_
+
+GLOBAL ROUTINE WF_TOP : NOVALUE =
+BEGIN
+LOCAL FIRST;
+
+E_TBCB[TBCB_CUR_BUKT] = FIRST = .E_TBCB[TBCB_FIRST_BUKT];
+E_TBCB[TBCB_LINE_ADDR] = WFB_FIXED_SIZE;
+E_TBCB[TBCB_CHAR_POS] = 0;
+MOVELINE(LNO_ZERO,E_TBCB[TBCB_CUR_LIN]);
+WF_R_CURRENT();
+END;
+
+!+
+! Read a line backwards.  The line preceding the current line becomes the
+! current line.  If we are already at the top, return a 0 otherwise return
+! a 1.
+!-
+
+GLOBAL ROUTINE WF_R_BACKWRD = 
+BEGIN
+E_TBCB[TBCB_CHAR_POS] = 0;
+!
+! See if we are at the beginning of a bucket.
+!
+IF .E_TBCB[TBCB_LINE_ADDR] EQL WFB_FIXED_SIZE THEN 
+    IF .W_BUKT[WFB_PREV_BUKT] EQL 0 THEN
+        RETURN 0 ! cannot read backward at beginning of buffer.
+    ELSE
+        BEGIN
+        !
+        ! Read the previous bucket and position to it's end.
+        !
+        READ_BUKT(.W_BUKT[WFB_PREV_BUKT]);
+        E_TBCB[TBCB_LINE_ADDR] = .W_BUKT[WFB_END];
+        E_TBCB[TBCB_CUR_BUKT] = .W_CUR_BUKT;
+        END;
+!
+! Now, move back a line.
+!
+E_TBCB[TBCB_LINE_ADDR] = .E_TBCB[TBCB_LINE_ADDR] -
+    CH$RCHAR(CH$PTR(.W_BUKT,.E_TBCB[TBCB_LINE_ADDR]-1)) - 
+    LIN_FIXED_SIZE -1;
+SUBLINE(LNO_0,E_TBCB[TBCB_CUR_LIN],E_TBCB[TBCB_CUR_LIN]);
+!
+! Get the address of the current line.
+!
+GET_LINE();
+RETURN 1
+END;
+
+!+
+! Insure that the current line in the current buffer is accessable in
+! memory.  Read the current bucket and update the W_LINE pointer to the
+! current line in the bucket.
+!-
+
+GLOBAL ROUTINE WF_R_CURRENT : NOVALUE = 
+BEGIN
+!
+! Get the current bucket.
+!
+IF .W_CUR_BUKT NEQ .E_TBCB[TBCB_CUR_BUKT] THEN
+    READ_BUKT(.E_TBCB[TBCB_CUR_BUKT]);
+!
+! And update line point to point to the current line.
+!
+IF .E_TBCB[TBCB_LINE_ADDR] EQL .W_BUKT[WFB_END] THEN
+    WF_R_FORWARD()
+ELSE
+    GET_LINE()
+END;
+
+!+
+! Read the next line in the forward direction.  The line following the 
+! current line becomes the new line.  This routine may have the effect
+! of reading a line from the input file.  If we are already at the end
+! of the buffer, then return a 0 otherwise return a 1.
+!-
+
+GLOBAL ROUTINE WF_R_FORWARD = 
+BEGIN
+E_TBCB[TBCB_CHAR_POS] = 0;
+!
+! Point to the next line in the bucket.
+!
+IF .E_TBCB[TBCB_LINE_ADDR] NEQ .W_BUKT[WFB_END] THEN
+    BEGIN
+    E_TBCB[TBCB_LINE_ADDR] = .E_TBCB[TBCB_LINE_ADDR] +
+        .W_LINE[LIN_LENGTH] + LIN_FIXED_SIZE + 1;
+    GET_LINE();
+    ADDLINE(LNO_0,E_TBCB[TBCB_CUR_LIN],E_TBCB[TBCB_CUR_LIN]);
+    END;
+!
+! If this is out of the scope of the bucket, then we better read the
+! next bucket.
+!
+IF .E_TBCB[TBCB_LINE_ADDR] GEQ .W_BUKT[WFB_END] THEN
+    IF .W_BUKT[WFB_NEXT_BUKT] EQL 0 THEN
+	BEGIN
+	IF .E_EXITED NEQ 0 THEN ! return zero so we don't read any more.
+	    BEGIN
+	    W_LINE = EOB_LINE;
+	    RETURN 0;
+	    END;
+        RETURN READ_INPUT() ! end of buffer, try reading the next record.
+	END
+    ELSE
+        BEGIN
+        READ_BUKT(.W_BUKT[WFB_NEXT_BUKT]);
+        E_TBCB[TBCB_LINE_ADDR] = WFB_FIXED_SIZE;
+        E_TBCB[TBCB_CUR_BUKT] = .W_CUR_BUKT;
+        END;
+!
+! Update the current line pointer.
+!
+GET_LINE();
+RETURN 1
+END;
+
+!+
+! Replace the current line.  If the replacement line is the same size as
+! the current line, just copy the new one in its place, otherwise, delete
+! the current line and insert the new one.
+!
+! NEWLINE is a pointer to the new line
+!
+! LEN is its length
+!-
+
+GLOBAL ROUTINE WF_REPLACE_LINE(NEWLINE,LEN) : NOVALUE =
+BEGIN
+LOCAL
+    SAVE_LIN : LN_BLOCK,
+    SAVE_ORIG_NUM : LN_BLOCK;
+!
+! The next five lines insure that lines which do not change in length
+! will leave the work-file block structure unaltered, it is not done
+! only for speed, EDT will break if they are removed.
+!
+IF .W_LINE[LIN_LENGTH] EQL .LEN THEN
+    BEGIN
+    CH$MOVE(.LEN,.NEWLINE,W_LINE[LIN_TEXT]);
+    W_MODIFIED = 1;
+    END
+ELSE
+    BEGIN
+    MOVELINE(W_LINE[LIN_NUM],SAVE_LIN);
+    MOVELINE(W_LINE[LIN_ORIG_NUM],SAVE_ORIG_NUM);
+    WF_DELETE_LINE();
+    WF_INSERT_LINE(.NEWLINE,.LEN);
+    WF_R_BACKWRD();
+    MOVELINE(SAVE_LIN,W_LINE[LIN_NUM]);
+    MOVELINE(SAVE_ORIG_NUM,W_LINE[LIN_ORIG_NUM]);
+    SUBLINE(LNO_0,W_I_COUNT,W_I_COUNT);
+    END;
+END;
+
+!+
+! This routine resequences a range of lines.  The current line is
+! the first to be resequenced.  The line following the last line 
+! resequenced becomes the current line.  This routine works by assigning
+! the number START to the first line and adding INC to get the next line
+! number.  If when we have finished, the number of the following line is
+! less than the last one resequenced, then we continue resequencing until
+! this is no longer true.  
+!
+! COUNT is the number of lines to be resequenced
+!
+! START is the initial line number
+!
+! INC is the line number increment.
+!-
+
+GLOBAL ROUTINE WF_RESEQUENCE(COUNT,START,INC) : NOVALUE =
+BEGIN
+LOCAL
+    SAVE_POS : POS_BLOCK,
+    W_NEXT_NUM : LN_BLOCK,
+    PREV_NUM : LN_BLOCK;
+
+IF .COUNT EQL 0 THEN RETURN;
+MOVELINE(.START,W_NEXT_NUM);
+MOVELINE(.START,PREV_NUM);
+WHILE NOT WF_EOB() DO
+    BEGIN
+    IF .COUNT LSS 1 THEN
+        IF WF_COMP_LNO(W_LINE[LIN_NUM],PREV_NUM) GTR 0 THEN
+            EXITLOOP;
+    MOVELINE(W_NEXT_NUM,W_LINE[LIN_NUM]);
+    W_MODIFIED = 1;
+    WF_R_FORWARD();
+    COUNT = .COUNT -1;
+    IF .COUNT EQL 0 THEN
+        CH$MOVE(POS_SIZE,.E_TBCB,SAVE_POS);
+    MOVELINE(W_NEXT_NUM,PREV_NUM);
+    ADDLINE(.INC,W_NEXT_NUM,W_NEXT_NUM);
+    END;
+CH$MOVE(POS_SIZE,SAVE_POS,.E_TBCB);
+WF_R_CURRENT();
+END;
+
+!+
+! This routine is called to start the insertion of text. The new lines
+! will be inserted immediately before the current line.  The insert
+! count (W_I_COUNT) is set to zero, and the numbers of the current and
+! preceding lines are saved.
+!-
+
+GLOBAL ROUTINE WF_START_INSERT : NOVALUE =
+
+BEGIN
+!
+! Zero out the insert line counter
+!
+MOVELINE(LNO_ZERO,W_I_COUNT);
+!
+! Save the current line number, bucket number, and line address
+!
+!W_I_BUKT = .E_TBCB[TBCB_CUR_BUKT];
+!W_I_ADDR = .E_TBCB[TBCB_LINE_ADDR];
+MOVELINE(W_LINE[LIN_NUM],W_NEXT_NUM);
+!
+! Find the prevsious line number
+!
+IF WF_R_BACKWRD() THEN
+    BEGIN
+    MOVELINE(W_LINE[LIN_NUM],W_START_NUM);
+    WF_R_FORWARD()
+    END
+ELSE
+    !
+    ! Make previous line number 0 if at beginning of buffer
+    !
+    MOVELINE(LNO_ZERO,W_START_NUM)
+END;
+
+!+
+! These procedures are used to copy lines from one buffer to another.
+!-
+
+!+
+! Start copy.  Initialize for a copy operation.
+!
+! BUF is the buffer to which the lines will be copied at the present
+! location.
+!-
+
+GLOBAL ROUTINE WF_SCOPY(BUF) : NOVALUE =
+BEGIN
+LOCAL
+    SAVE_TBCB;
+SAVE_TBCB = .E_TBCB;
+E_TBCB = E_ABUF = .BUF;
+WF_R_CURRENT();
+WF_START_INSERT();
+E_TBCB = .SAVE_TBCB;
+WF_R_CURRENT();
+END;
+
+!+
+! Copy a line.  The delete parameter indicates that the line
+! should be deleted after copying.
+!-
+
+GLOBAL ROUTINE WF_COPY_LINE(DELETE) : NOVALUE =
+BEGIN
+LOCAL
+    SAVE_TBCB,
+    LINE : REF LIN_BLOCK;
+LINE = .W_LINE;
+SAVE_TBCB = .E_TBCB;
+E_TBCB = .E_ABUF;
+WF_R_CURRENT();
+WF_INSERT_LINE(LINE[LIN_TEXT],.LINE[LIN_LENGTH]);
+E_TBCB = .SAVE_TBCB;
+WF_R_CURRENT();
+IF .DELETE THEN WF_DELETE_LINE();
+END;
+
+!+
+! End copy.  The copy is terminated, and if the clear parameter is
+! specified, the source buffer is deleted.
+!-
+
+GLOBAL ROUTINE WF_ECOPY(CLEAR) : NOVALUE =
+BEGIN
+IF .CLEAR THEN
+    BEGIN
+    WF_BOTTOM();
+    W_BUKT[WFB_NEXT_BUKT] = .W_AVAIL;
+    W_MODIFIED = 1;
+    WF_TOP();
+    W_AVAIL = .W_CUR_BUKT;
+    END;
+E_TBCB = .E_ABUF;
+WF_R_CURRENT();
+WF_END_INSERT();
+END;
+
+END
+ELUDOM

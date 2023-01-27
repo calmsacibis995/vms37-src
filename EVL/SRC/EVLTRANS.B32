@@ -1,0 +1,2118 @@
+%TITLE	'Event Logging Transmitter'
+MODULE EVLTRANS	(IDENT = 'V03-000') =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	DECnet Event Logging (EVL)
+!
+! ABSTRACT:
+!
+!	This module contains the routines and data which control
+!	the filtering and transmission of events to sinks on the local
+!	or remote nodes.
+!
+! ENVIRONMENT:	VAX/VMS Operating System
+!
+! AUTHOR:	Darrell Duffy	, CREATION DATE:  13-June-1980
+!
+! MODIFIED BY:
+!
+!	V008	TMH0008		Tim Halvorsen	02-Feb-1982
+!		Add support for new events 0.8 and 0.9
+!		Remove code which translates raw form of counters
+!		since NETACP is now responsible for logging the
+!		events in DNA format.
+!		Remove code which translates raw VMS device names
+!		into DNA line/circuit names, since NETACP is now
+!		responsible for specifying the source ID in DNA format.
+!
+!	V007	TMH0007		Tim Halvorsen	04-Sep-1981
+!		Enhance raw event format checking to detect an
+!		invalid data length in the first two bytes, to
+!		prevent a stack overflow when copying the data.
+!
+!	V006	TMH0006		Tim Halvorsen	23-Aug-1981
+!		Use new ACP control QIO interface.
+!
+!	V005	TMH0005		Tim Halvorsen	10-Aug-1981
+!		Remove temporary definition of MSG$_EVTAVL since
+!		it has now been added to $MSGDEF.
+!
+!	V004	TMH0004		Tim Halvorsen	28-Jul-1981
+!		Reference EVCDEF.L32 library in addition to EVLIBRARY.
+!
+!	V003	TMH0003		Tim Halvorsen	25-Jun-1981
+!		Fix QIOW to use an specific event flag, to avoid
+!		conflict with asynchronous QIO's using the same flag.
+!
+!	V002	TMH0002		Tim Halvorsen	12-Dec-1980
+!		Fix deallocation of sink blocks which contain a non-zero
+!		number of events hooked into its queue.  It was deallocating
+!		from the wrong listhead.
+!		Increase delay between attempts to open a logical link to
+!		a remote receiver from 10 seconds to 1 minute.
+!
+!	V001	TMH0001		Tim Halvorsen	19-Nov-1980
+!		Fix merging of sink masks.  It was expecting the source
+!		data structure to contain a sink mask (1,2,4), whereas NML
+!		was passing a sink number (1,2,3).
+!		Fix access violation when updating the source database
+!		many times in a short period of time (CLEAR K LOG ALL)
+!		because it was queuing a delete sink more than once.
+!--
+
+%SBTTL	'Definitions'
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+
+	EVL$TRANSMIT	: NOVALUE,	! Initialize event transmitter
+	EVL$BLDFILTERS	: NOVALUE,	! Build sink and filter database
+	EVL$BLDSOURCES	: NOVALUE,	! Build source block on sink block
+	EVL$ALLOCSNK	: NOVALUE,	! Allocate a sink block
+	EVL$DEALLOCSNK	: NOVALUE,	! Deallocate a sink block
+	EVL$OBTAINEVTS	: NOVALUE,	! Wait on events available from NETACP
+	EVL$READEVTS	: NOVALUE,	! Read raw events from NETACP
+	EVL$PROCESSEVTS	: NOVALUE,	! Process raw event buffer
+	EVL$FILTEREVT	: NOVALUE,	! Filter a single raw event
+	EVL$FILTERSRC	:,		! Check filters with a matching source
+	EVL$QUEUEVT	: NOVALUE,	! Translate and queue an event to sink
+	EVL$BLDLOSTEVENT : NOVALUE,	! Build and queue a lost event event
+	EVL$NETERROR	:,		! Report an error in network io
+	EVL$WRITEVT	: NOVALUE,	! Write an event to sink
+	EVL$WRITEDONE	: NOVALUE,	! Complete io to sink
+	EVL$OPENSNK	: NOVALUE,	! Open a link to sink node
+	EVL$OPENDONE	: NOVALUE,	! Complete open of link
+	EVL$CLOSESNK	: NOVALUE,	! Close and possibly delete sink block
+	EVL$ALLOCDBK,			! Allocate a data block
+	EVL$DEALLOCDBK	: NOVALUE,	! Deallocate a data block
+	EVL$ASTWORK	: NOVALUE	! AST routine to queue work request
+	;
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';		! VMS common definitions
+LIBRARY 'SHRLIB$:NET';			! Network ACP interface
+LIBRARY 'LIB$:EVLIBRARY';		! EVL definitions
+LIBRARY 'LIB$:EVCDEF';			! Event record definitions
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+	EVL$C_EVTMBXSIZE = 64,			! Size of event mailbox
+	EVL$C_EVTBFRSIZE = 512 - ASP$C_SIZE	! Size of event buffer
+	;
+
+
+BIND
+    EVL$Q_CLOSEDELAY =				! Delay before closing link
+	UPLIT (-120*10*1000*1000, -1)		! to event receiver
+	;
+
+
+!
+! OWN STORAGE:
+!
+
+GLOBAL
+    EVL$GQ_SNKHEAD	: VECTOR [2]		! Head of sink node list
+    		INITIAL (EVL$GQ_SNKHEAD, EVL$GQ_SNKHEAD),
+    EVL$GT_LOCALNODE	: VECTOR [10, BYTE],	! Buffer for local node info
+    EVL$GB_LOCALNODE	: BYTE,			! Length of data in buffer
+    EVL$GQ_ASPHEAD	: VECTOR [2]		! Head of ASP queue
+    		INITIAL (EVL$GQ_ASPHEAD, EVL$GQ_ASPHEAD),
+    EVL$GB_TRANSDONE	: BYTE INITIAL(TRUE)	! True for transmitter done
+    ;
+
+OWN
+    EVL$W_NETEVTCHAN	: WORD,			! Network channel for events
+    EVL$W_MBXEVTCHAN	: WORD			! Mailbox channel for events
+    ;
+
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL LITERAL
+
+	EVL$_NETASN,		! Error assigning to NET
+	EVL$_OBTEVT,		! Error obtaining raw events
+	EVL$_RAWFMT,		! Invalid format for raw event
+	EVL$_WRTEVT,		! Error writing events to sink node
+	EVL$_OPNSNK,		! Error opening sink node link
+	EVL$_NETDAS,		! Error deassigning NET channel
+	EVL$_INSFVM,		! Unable to obtain virtual memory
+	EVL$_EVTSIZ,		! Invalid size of event
+	EVL$_WKQERR,		! Error returned from work queue routines
+	EVL$_LOGDBUT,		! Log of data base updates by transmitter
+	EVL$_LOGOPNT,		! Log of open links by transmitter
+	EVL$_NETSHUT		! Network is shutting down
+	;
+
+EXTERNAL
+	EVL$GL_LOGMASK : BBLOCK	! Log control mask
+	;
+
+EXTERNAL ROUTINE
+
+	EVL$JULIAN		: NOVALUE,	! Convert time to julian
+	WKQ$ADD_WORK_ITEM	: ,		! Add element to work queue
+	WKQ$ADD_TIMED_WORK	: ,		! Add scheduled work to queue
+	WKQ$CANCEL_TIMED_WORK	: ,		! Cancel timed work item
+	EVL$QUEUE_EVENT		: NOVALUE,	! Queue event to local receiver
+	EVL$NETSHOW		: ,		! Show data from NETACP
+	EVL$PRINTLOG		: NOVALUE,	! Print message to log
+	EVL$INITLOCALNODE 	: NOVALUE	! Initialize local node name
+	;
+
+!
+!	Library routines
+!
+
+EXTERNAL ROUTINE
+
+	LIB$GET_VM : ADDRESSING_MODE (GENERAL),
+	LIB$FREE_VM : ADDRESSING_MODE (GENERAL),
+	LIB$ASN_WTH_MBX : ADDRESSING_MODE (GENERAL)
+	;
+
+%SBTTL	'EVL$TRANSMIT  Main Initialization'
+GLOBAL ROUTINE EVL$TRANSMIT :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Main initialization routine for event logging transmitter.
+!	Calls the routines to initialize the data base here for the
+!	transmitter and start the event logging.  After this routine
+!	returns to its caller, work queue elements are on the work queue
+!	to continue the event logging.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	STATUS,				! Local status
+	IOSB	: VECTOR [2],		! Iosb for simple qio
+	MBXMODES : VECTOR [2]		! Enable mailbox modes
+	;
+
+    EVL$INITLOCALNODE ();	! Initialize the local node name
+
+    IF NOT
+	( STATUS = LIB$ASN_WTH_MBX	! Get some channels for use
+	    (
+	    %ASCID '_NET:',		! To network
+	    0, %REF (EVL$C_EVTMBXSIZE),	! Size of mailbox
+	    EVL$W_NETEVTCHAN,		! Network channel
+	    EVL$W_MBXEVTCHAN		! Mailbox channel
+	    )
+	)
+    THEN
+	SIGNAL_STOP (EVL$_NETASN, 0, .STATUS)	! Stop right now
+    ;
+
+    MBXMODES [0] = 0;			! Enable all modes
+    MBXMODES [1] = -1;
+
+    STATUS = $QIOW			! Set mailbox modes
+	(
+	EFN = EVL$C_SYNCH_EFN,
+	CHAN = .EVL$W_NETEVTCHAN,
+	FUNC = IO$_SETMODE,
+	IOSB = IOSB,
+	P1 = MBXMODES
+	);
+
+    EVL$NETERROR (EVL$_OBTEVT, .STATUS, IOSB);	! Analyse errors
+    
+    EVL$BLDFILTERS ();		! Build our filter database
+    EVL$OBTAINEVTS (0)		! Obtain the events and start processing
+
+    END;
+
+%SBTTL	'EVL$BLDFILTERS  Build Our Local Database'
+ROUTINE EVL$BLDFILTERS :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Update the local database for the event transmitter.  If a sink node
+!	is not present it is added to the queue.  All source filters on all
+!	sinks are replaced with the latest data.  Sinks that are not present
+!	are either deallocated outright, or if there are events in the queue,
+!	marked for later close and deallocate.
+!
+!	If at the end of this routine, there are no sink blocks on the queue,
+!	we set a flag saying we have no work to do.  Otherwise we set the
+!	flag saying that we have work to do.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NETACP logging database
+!
+! IMPLICIT OUTPUTS:
+!
+!	Sink node queue updated
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LITERAL
+	SNKBFRSIZE = 512		! Size of sink buffer
+	;
+
+    LOCAL
+	SNKQUE,				! Pointer to sink queue head
+	POSITION:VECTOR [NFB$C_P2STRTLNG,BYTE],	! Current EFI position
+	SNKBFR : BBLOCK [SNKBFRSIZE],	! Buffer for sink data
+	SNKDSC : VECTOR [2],		! Descriptor of buffer
+	SNKPTR : REF BBLOCK;		! Pointer to sink block
+
+    SNKQUE = EVL$GQ_SNKHEAD;		! Head of sink queue
+    SNKPTR = ..SNKQUE;			! Setup pointer
+
+    WHILE .SNKPTR NEQ .SNKQUE		! Scan current queue
+    DO
+	BEGIN
+	SNKPTR [SNK$V_STS_DEL] = TRUE;	! Set deleted bit in all
+	SNKPTR = .SNKPTR [SNK$L_FL]	! Link to next
+	END
+    ;
+
+    POSITION <0,16> = 0;		! Start at first EFI record
+
+    SNKDSC [0] = SNKBFRSIZE;		! Descriptor of return buffer
+    SNKDSC [1] = SNKBFR;
+
+    WHILE				! As long as there are more nodes
+	EVL$NETSHOW(			! Obtain a sink node
+	    NFB$C_DB_EFI,		! Event information
+	    NFB$C_WILDCARD, 0,		! No search key
+	    NFB$C_COLLATE, POSITION,	! Get next record, update position
+	    2, UPLIT (NFB$C_EFI_SIN, NFB$C_EFI_EVE),
+	    SNKDSC)			! buffer descriptor
+    DO
+	BEGIN
+	SNKPTR = ..SNKQUE;		! Scan the queue for the new sink
+	IF
+	    BEGIN
+	    WHILE .SNKPTR NEQ .SNKQUE	! Scan to the end
+	    DO
+		BEGIN
+		IF .SNKBFR [0,0,32,0] EQL .SNKPTR [SNK$L_SNKADR]	! Do the addresses
+		THEN					! match?
+		    BEGIN
+		    SNKPTR [SNK$V_STS_DEL] = FALSE;	! Its here, so keep it
+		    SNKPTR [SNK$V_STS_CLS] = FALSE;
+		    EVL$BLDSOURCES (.SNKPTR, SNKBFR+4);	! Build rest of data
+		    EXITLOOP FALSE			! Do not create one
+		    END
+		;
+		SNKPTR = .SNKPTR [SNK$L_FL]		! Link to next
+		END
+	    END
+	THEN
+	    BEGIN
+	    EVL$ALLOCSNK (.SNKQUE, SNKPTR);		! Allocate a new snk
+	    SNKPTR [SNK$L_SNKADR] = .SNKBFR [0,0,32,0];	! Save the sink addr
+	    SNKPTR [SNK$L_SNKLEN] = SNK$S_SNKNCB;	! Build ncb dsc
+	    SNKPTR [SNK$A_SNKNCB] = SNKPTR [SNK$T_SNKNCB];
+	    $FAOL					! Build the ncb
+		(					! in the sink block
+		CTRSTR = %ASCID '!UL::"26="',		! Use the address form
+		OUTLEN = SNKPTR [SNK$L_SNKLEN],		! of the connect
+		OUTBUF = SNKPTR [SNK$L_SNKLEN],
+		PRMLST = SNKBFR
+		);
+	    EVL$BLDSOURCES (.SNKPTR, SNKBFR+4)		! and fill it in
+	    END
+	END
+    ;
+
+!
+!	Scan the snk list and remove deleted nodes
+!
+
+    SNKPTR = ..SNKQUE;
+    WHILE .SNKPTR NEQ .SNKQUE			! Scan the list
+    DO
+	BEGIN
+	IF .SNKPTR [SNK$V_STS_DEL]		! If deleted,
+	    AND NOT .SNKPTR [SNK$V_STS_CLS]	! and not already being closed,
+	THEN
+	    BEGIN
+	    SNKPTR [SNK$V_STS_CLS] = TRUE;	! Set close as true
+	    WKQ$ADD_WORK_ITEM(EVL$WRITEVT,.SNKPTR); ! Make sure I/O going
+						! (will delete if I/O done)
+	    IF .EVL$GL_LOGMASK [ELG$V_DBUPDAT]	! Log data base updates?
+	    THEN
+		SIGNAL (EVL$_LOGDBUT, 1, 0)	! Log that it occurred
+	    END;
+	SNKPTR = .SNKPTR [SNK$L_FL];		! Next snk in list
+	END;
+
+    END;
+
+%SBTTL	'EVL$BLDSOURCES  Build List of Sources in SNK Block'
+ROUTINE EVL$BLDSOURCES (SNKBLK, SRCDATA) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Build source filter list on sink block.  All present source blocks
+!	are removed first.
+!
+! FORMAL PARAMETERS:
+!
+!	SNKBLK		Address of sink block
+!	SRCDATA		Address of source data list
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	SNK : REF BBLOCK,		! Pointer to sink block
+	SRC : REF BBLOCK,		! Pointer to source block
+	SRCPTR,				! Pointer to source data
+	SRCSIZE,			! Size of a source block
+	SRCEND				! End of source data
+	;
+
+    SNK = .SNKBLK;			! Deallocate all current sources
+    UNTIL SNK [SNK$L_SRCFL] EQL .SNK [SNK$L_SRCFL]
+    DO
+	EVL$DEALLOCDBK (.SNK [SNK$L_SRCFL] )
+    ;
+
+    SRCEND = .SRCDATA + .(.SRCDATA) <0, 16>; ! Word counted string
+    SRCPTR = .SRCDATA + 2;		! Skip the count
+
+    WHILE .SRCPTR LSSU .SRCEND		! For as long as there is data
+    DO
+	BEGIN
+	SRCSIZE = .(.SRCPTR) <0, 16>;	! Size of source block
+	EVL$ALLOCDBK			! Build a block for the source data
+	    (
+	    .SRCSIZE + 8,		! Size of source block and links
+	    .SNK [SNK$L_SRCBL],		! Link it in here
+	    SRC				! Return its address here
+	    );
+	CH$MOVE				! Copy the data into the source block
+	    (
+	    .SRCSIZE,
+	    .SRCPTR,
+	    SRC [SRC$W_SIZE]
+	    );
+	SRCPTR = .SRCPTR + .SRCSIZE	! Next source block
+	END
+
+    END;
+
+%SBTTL	'EVL$ALLOCSNK  Allocate and Initialize a SNK Block'
+GLOBAL ROUTINE EVL$ALLOCSNK (PRED, SNKRTN) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Allocate and initialize a sink block.  The block is linked into the
+!	correct place in the sink queue.
+!
+! FORMAL PARAMETERS:
+!
+!	PRED		Address of predecessor in list
+!	SNKRTN		Address to return address of snk block
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	SNK : REF BBLOCK
+	;
+
+    EVL$ALLOCDBK (SNK$C_SIZE, .PRED, SNK);	! Allocate the block
+    SNK [SNK$L_SRCFL] = SNK [SNK$L_SRCFL];	! Fill in the queue headers
+    SNK [SNK$L_SRCBL] = SNK [SNK$L_SRCFL];
+    SNK [SNK$L_EVTFL] = SNK [SNK$L_EVTFL];
+    SNK [SNK$L_EVTBL] = SNK [SNK$L_EVTFL];
+    .SNKRTN = .SNK;				! Return the sink address
+
+    EVL$GB_TRANSDONE = FALSE;			! Mark transmitter active
+
+    END;
+
+%SBTTL	'EVL$DEALLOCSNK  Deallocate Sink Block'
+ROUTINE EVL$DEALLOCSNK (SNKBLK) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Deallocate a sink block.  Remove and deallocate all the entries
+!	on the src and evt queues as well.
+!
+! FORMAL PARAMETERS:
+!
+!	SNKBLK		Address of the sink block
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	SNK : REF BBLOCK			! Local pointer to snk
+	;
+
+    SNK = .SNKBLK;				! Set the pointer
+    WHILE
+	.SNK [SNK$L_SRCFL]			! Watch for empty queue
+	NEQ
+	SNK [SNK$L_SRCFL]
+    DO
+	EVL$DEALLOCDBK (.SNK [SNK$L_SRCFL] )	! Deallocate each source
+    ;
+
+    WHILE					! Watch for end of queue
+	.SNK [SNK$L_EVTFL]
+	NEQ
+	SNK [SNK$L_EVTFL]
+    DO
+	EVL$DEALLOCDBK (.SNK [SNK$L_EVTFL] )	! Deallocate each event
+    ;
+
+    EVL$DEALLOCDBK (.SNK);			! Deallocate snk block
+
+    EVL$GB_TRANSDONE = (.EVL$GQ_SNKHEAD EQL EVL$GQ_SNKHEAD); ! Mark done if empty
+
+    END;
+
+%SBTTL	'EVL$OBTAINEVTS  Obtain Raw Events'
+ROUTINE EVL$OBTAINEVTS (ASPBLK) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads a message from the mailbox associated with the
+!	net channel.  We complete the io in the readevts routine and
+!	then either try again for another mailbox message, or read
+!	events from the NETACP.	If no aspblk is available, then we
+!	allocate one.
+!
+! FORMAL PARAMETERS:
+!
+!	ASPBLK		Address of aspblk or zero if none
+!
+! IMPLICIT INPUTS:
+!
+!	EVL$W_MBXEVTCHAN
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	ASP 	: REF BBLOCK,			! Ast Paramter block
+	STATUS
+	;
+
+    IF .ASPBLK EQL 0
+    THEN
+	EVL$ALLOCDBK				! Allocate a block if we need
+	    (					! One
+	    EVL$C_EVTBFRSIZE + ASP$C_SIZE,
+	    .EVL$GQ_ASPHEAD [1],
+	    ASP
+	    )
+    ELSE
+	ASP = .ASPBLK				! Use old block if we have one
+    ;
+
+    ASP [ASP$L_ROUTINE] = EVL$READEVTS;		! Setup the routine address
+
+    STATUS = $QIO				! Start a read from the
+	(					! mailbox to findout when
+	CHAN = .EVL$W_MBXEVTCHAN,		! events are available
+	EFN = EVL$C_ASYNCH_EFN,
+	FUNC = IO$_READVBLK,
+	IOSB = ASP [ASP$W_IOSB],
+	ASTADR = EVL$ASTWORK,
+	ASTPRM = .ASP,
+	P1 = ASP [ASP$T_DATA],
+	P2 = EVL$C_EVTMBXSIZE			! Size of mailbox messages
+	);
+
+    EVL$NETERROR (EVL$_OBTEVT, .STATUS, 0)	! Analyse errors
+
+    END;
+
+%SBTTL	'EVL$READEVTS  Read Events from NETACP'
+ROUTINE EVL$READEVTS (ASPBLK) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Routine called to obtain a buffer of raw events from NETACP.
+!	The input asp has a mailbox message in it which has been read
+!	from a net channel mailbox.  The mailbox code is MSG$_EVTAVL for
+!	events are available; MSG$_NETSHUT for the network is shutting down.
+!	Other codes are ignored.
+!	The events are read into an ASP buffer and then schedule work for
+!	EVL$PROCESSEVTS.
+!
+! FORMAL PARAMETERS:
+!
+!	ASPBLK		Address of an asp block
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	ASP 	: REF BBLOCK,			! Ast Paramter block
+	NFB	: VECTOR [5, BYTE],		! Network function block
+	NFBDSC	: VECTOR [2],			! Descriptor of same
+	RSLDSC	: VECTOR [2],			! Descriptor of result buffer
+	STATUS
+	;
+
+    ASP = .ASPBLK;				! Use old block if we have one
+
+    IF NOT EVL$NETERROR				! Analyse the error
+	(
+	EVL$_OBTEVT,				! Unable to obtain events
+	TRUE,
+	ASP [ASP$W_IOSB]
+	)
+    THEN
+	BEGIN
+	EVL$OBTAINEVTS (.ASP);			! Try again
+	RETURN
+	END
+    ;
+
+    SELECTONE CH$RCHAR (ASP [ASP$T_DATA] ) OF	! Dispatch on message types
+    SET
+
+    [MSG$_EVTAVL] :				! Just continue with work
+	0;
+
+    [MSG$_NETSHUT] :				! Network shut down happening
+	BEGIN
+	LOCAL SNKPTR: REF BBLOCK;
+	SNKPTR = .EVL$GQ_SNKHEAD;
+	WHILE .SNKPTR NEQ EVL$GQ_SNKHEAD	! Scan the list
+	DO
+	    BEGIN
+	    SNKPTR [SNK$V_STS_CLS] = TRUE;	! Set close as true
+	    WKQ$ADD_WORK_ITEM(EVL$WRITEVT,.SNKPTR); ! Make sure I/O going
+						! (will delete when I/O done)
+	    SNKPTR = .SNKPTR [SNK$L_FL];	! Next snk in list
+	    END;
+	RETURN;					! Do not reissue mailbox read
+	END;
+
+    [OTHERWISE] :				! Ignore the code and
+	BEGIN
+	EVL$OBTAINEVTS (.ASP);			! try again
+	RETURN
+	END;
+
+    TES;
+
+
+    ASP [ASP$L_ROUTINE] = EVL$PROCESSEVTS;	! Setup the routine address
+
+    NFBDSC [0] = 5;				! Set up the nfb to readevents
+    NFBDSC [1] = NFB;
+    NFB [0] = NFB$C_READEVENT;
+    RSLDSC [0] = EVL$C_EVTBFRSIZE;		! Set up the result buffer dsc
+    RSLDSC [1] = ASP [ASP$T_DATA];
+    STATUS = $QIOW				! Perform the qio
+	(
+	EFN = EVL$C_SYNCH_EFN,
+	CHAN = .EVL$W_NETEVTCHAN,		! The channel
+	FUNC = IO$_ACPCONTROL,			! function
+	IOSB = ASP [ASP$W_IOSB],
+	P1 = NFBDSC,				! Network function block
+	P3 = RSLDSC,				! Return result length here
+	P4 = RSLDSC				! Result buffer
+	);
+
+    ASP [ASP$W_IOSB1] = .RSLDSC [0];		! *TEMP* Set length in IOSB
+
+    IF NOT .STATUS				! Report an error
+    THEN
+	SIGNAL_STOP (EVL$_OBTEVT, 0, .STATUS)
+    ;
+
+    WKQ$ADD_WORK_ITEM(EVL$PROCESSEVTS,.ASP);	! Process the events
+
+    END;
+
+%SBTTL	'EVL$PROCESSEVTS  Process Raw Events'
+ROUTINE EVL$PROCESSEVTS (ASPBLK) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Process raw events and queue them to the various sink nodes.
+!	If an error occurred on the read of raw events, signal it and
+!	perform another request for raw events.  If no error, scan
+!	the raw event buffer and filter each raw event in the buffer.
+!
+! FORMAL PARAMETERS:
+!
+!	ASPBLK		Address of the ASP block of raw events
+!
+! IMPLICIT INPUTS:
+!
+!	EVL$GQ_SNKHEAD	Head of sink list
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	ASP : REF BBLOCK,		! Pointers to various blocks we need
+	RAW : REF BBLOCK,
+	SNK : REF BBLOCK,
+	RAWPTR,				! Pointer to a raw event
+	RAWEND,				! End of all of them
+	RAWDSC : VECTOR [2]		! Descriptor of raw event
+	;
+
+
+    ASP = .ASPBLK;			! If some error then,
+    IF NOT EVL$NETERROR (EVL$_OBTEVT, TRUE, ASP [ASP$W_IOSB] )
+    THEN
+	BEGIN
+	EVL$OBTAINEVTS (.ASP);		! Just try again for some events
+	RETURN
+	END
+    ;
+
+    RAWPTR = ASP [ASP$T_DATA];		! Set start pointer and
+    RAWEND = .RAWPTR + .ASP [ASP$W_IOSB1]; ! end pointer
+
+    WHILE .RAWPTR LSSA .RAWEND		! Scan the whole list of raw events
+    DO
+	BEGIN
+	RAW = .RAWPTR;			! Point to this event
+	RAWPTR = .RAWPTR + .RAW [RAW$W_BYTES]; ! and the next one
+	IF .RAWPTR GTRA .RAWEND		! Is this event too long??
+	THEN
+	    BEGIN
+	    SIGNAL (EVL$_RAWFMT);	! Signal some error and
+	    EXITLOOP			! then stop
+	    END
+	;
+
+	RAWDSC [0] = .RAW [RAW$W_BYTES]; ! Build descriptor of raw event
+	RAWDSC [1] = .RAW;
+	EVL$PRINTLOG			! Log the raw event if required
+	    (
+	    $BITPOSITION (ELG$V_RAWEVT), ! Bit number of responsible bit
+	    %ASCID 'Raw event',		! Header text
+	    0,				! No extra text
+	    RAWDSC			! Descriptor of data
+	    );
+
+	IF  .RAW [RAW$W_EVTCODE]	! Data base change event?
+	    EQL
+	    EVC$C_VMS_DBC
+	THEN
+	    EVL$BLDFILTERS ()		! Just rebuild the filters
+	ELSE
+	    BEGIN
+	    SNK = .EVL$GQ_SNKHEAD [0];	! Scan the sink queue and
+	    WHILE .SNK NEQA EVL$GQ_SNKHEAD
+	    DO
+		BEGIN
+		EVL$FILTEREVT (.RAW, .SNK);	! filter each raw event
+		SNK = .SNK [SNK$L_FL]	! look at next sink
+		END
+	    END
+	END
+    ;
+
+    EVL$OBTAINEVTS (.ASP)		! Back for some raw events
+
+    END;
+
+%SBTTL	'EVL$FILTEREVT  Filter Events with a Sink'
+ROUTINE EVL$FILTEREVT (RAWEVT, SNKBLK) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Filter a single event with a single sink.  If the event matches
+!	for any of the sources or the global filters, then its translated and
+!	queued for this sink.
+!
+! FORMAL PARAMETERS:
+!
+!	RAWEVT		Address of the raw event in the buffer
+!	SNKBLK		Address of the sink control block
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	RAW : REF BBLOCK,		! Pointer to a raw event
+	SNK : REF BBLOCK,		! Pointer to the sink block
+	SRC : REF BBLOCK,		! Pointer to a source descriptor
+	SINKMASK : BYTE,		! Sink mask (console, file, monitor)
+	SRCFOUND : BYTE			! Bool for source found
+	;
+
+    RAW = .RAWEVT;				! Set pointer for raw event
+    SNK = .SNKBLK;				! Set pointer to sink block
+    SINKMASK = 0;				! No sinks indicated yet
+    SRCFOUND = FALSE;				! Specific filter not found
+
+    SRC = .SNK [SNK$L_SRCFL];			! Scan the source dsc from
+    WHILE .SRC NEQ SNK [SNK$L_SRCFL]		! the head of the list
+    DO
+	BEGIN
+	IF  .RAW [RAW$B_SRCTYP]			! If source types match
+	    EQL
+	    .SRC [SRC$B_SRCTYP]
+	    AND
+	    BEGIN				! and the sources themselves
+	    SELECTONEU .RAW [RAW$B_SRCTYP] OF	! match according to the type
+	    SET
+	    [EVC$C_SRC_NON] : TRUE ;		! No source type, always match
+	    [EVC$C_SRC_LIN,EVC$C_SRC_CIR] :	! Compare ASCIC strings
+		BEGIN
+		CH$EQL
+		    (
+		    CH$RCHAR (SRC [SRC$T_SRCID] ), ! Line in the source block
+		    SRC [SRC$T_SRCID] + 1,	! size and address
+		    CH$RCHAR (RAW [RAW$T_SRCID]),  ! Counted string
+		    RAW [RAW$T_SRCID] + 1,	! from the raw event
+		    0				! fill
+		    )
+		END;
+	    [EVC$C_SRC_NOD] :			! Compare node id's
+		BEGIN
+		.( RAW [RAW$T_SRCID] ) <0, 16>	! Compare only the node
+		EQL				! addresses
+		.( SRC [SRC$T_SRCID] ) <0, 16>
+		END;
+	    TES
+	    END
+	THEN
+	    BEGIN
+	    SRCFOUND = TRUE;			! They match, so we found it
+	    SINKMASK = .SINKMASK OR		! Add its sink contribution
+		EVL$FILTERSRC (.RAW, .SRC)	! to the growing mask
+	    END
+	;
+	SRC = .SRC [SRC$L_FL]			! Link to the next source dsc
+	END
+    ;
+
+    IF NOT .SRCFOUND				! If we did not find a source
+    THEN
+	BEGIN
+	SRC = .SNK [SNK$L_SRCFL];		! Scan the source list
+	WHILE .SRC NEQ SNK [SNK$L_SRCFL]	! and look for global filters
+	DO
+	    BEGIN
+	    IF  .SRC [SRC$B_SRCTYP]		! Consider only global filters
+		EQL
+		EVC$C_SRC_NON
+	    THEN
+		BEGIN
+		SINKMASK = .SINKMASK OR		! Combine its contribution
+		    EVL$FILTERSRC (.RAW, .SRC)
+		END
+	    ;
+	    SRC = .SRC [SRC$L_FL]		! And look at remainder of
+	    END					! source descriptors
+	END
+    ;
+
+    IF .SINKMASK NEQ 0				! If we have any sinks
+    THEN
+	EVL$QUEUEVT (.RAW, .SNK, .SINKMASK)	! Queue the event to the sink
+
+    END;
+
+%SBTTL	'EVL$FILTERSRC  Filter an Event with one Source'
+ROUTINE EVL$FILTERSRC (RAWEVT, SRCBLK) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Scan the filters with one source block and if the raw event is
+!	passed by the filters, return the sink mask value as the value
+!	of the routine.
+!
+! FORMAL PARAMETERS:
+!
+!	RAWEVT		Address of the raw event
+!	SRCBLK		Address of the source descriptor block
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	If the event is passed by the filters, return the sinkmask from the
+!	source.  Otherwise return zero.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	RAW	: REF BBLOCK,			! Pointer to raw event
+	SRC	: REF BBLOCK,			! Pointer to source descriptor
+	FLT	: REF BBLOCK,			! Pointer to filter
+	CLASS,					! Class from raw event
+	TYPE					! Type number from raw event
+	;
+
+    RAW = .RAWEVT;				! Setup useful pointers
+    SRC = .SRCBLK;
+    FLT = SRC [SRC$T_FILTERS];			! First filter is here
+    CLASS = .RAW [RAW$V_EVTCLS];		! Event code from raw event
+    TYPE = .RAW [RAW$V_EVTTYP];			! Obtain type number
+
+    DECRU FLTS FROM .SRC [SRC$W_FILTERS] TO 1	! Look at all the filters
+    DO
+	BEGIN
+	IF					! Compare according to filter
+	    BEGIN				! class and wild codes
+	    SELECTONE .FLT [FLT$V_WLDCOD] OF
+	    SET
+	    [EVC$C_WLDCLS_KNO] :		! Known events
+		TRUE;
+	    [EVC$C_WLDCLS_ALL] :		! All types of a class
+		BEGIN
+		IF .CLASS EQL .FLT [FLT$V_CLASS]
+		THEN TRUE
+		ELSE FALSE
+		END;
+	    [0] :				! Class and type must match
+		BEGIN
+		IF .CLASS EQL .FLT [FLT$V_CLASS]
+		    AND				! Check both type masks
+		    .BBLOCK [FLT [FLT$Q_TYPESLOG], 0, .TYPE, 1, 0]
+		    AND
+		    NOT .BBLOCK [FLT [FLT$Q_TYPESFIL], 0, .TYPE, 1, 0]
+		THEN TRUE
+		ELSE FALSE
+		END;
+	    TES
+	    END
+	THEN RETURN 1^(.SRC [SRC$B_SNKTYPE]-1);	! Return the sink mask
+	FLT = .FLT + FLT$C_SIZE			! Next filter
+	END
+    ;
+    RETURN 0					! No sink found
+
+    END;
+
+%SBTTL	'EVL$QUEUEVT  Translate and Queue an Event'
+ROUTINE EVL$QUEUEVT (RAWEVT, SNKBLK, SNKMASK) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Translate the raw event to DNA standard form, queue it to the
+!	sink block and call the EVL$WRITEVT routine to start the
+!	output process to the sink node.
+!
+! FORMAL PARAMETERS:
+!
+!	RAWEVT		Address of the raw event
+!	SNKBLK		Address of the sink block
+!	SNKMASK		Value of the sink mask to use
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LITERAL
+	EVTSIZE = 300				! Size of temp event buffer
+	;
+
+    LOCAL
+	EVTBFR	: VECTOR [EVTSIZE, BYTE],	! Place to build DNA event
+	RAW	: REF BBLOCK,			! Pointer to raw event
+	SNK	: REF BBLOCK,			! Pointer to sink block
+	EVQ	: REF BBLOCK,			! Pointer to event block
+	PTR,					! Pointer to build event
+	PTRADR,					! Pointer in memory for parm
+	SIZE,					! Size of event
+	EVTDSC	: VECTOR [2],			! Descriptor of event
+	DATAPTR,				! Pointer to data of event
+	HALFDAY,				! Julian half days
+	SECS,					! Seconds in half day
+	MSECS					! Milliseconds in second
+	;
+
+    RAW = .RAWEVT;				! Set pointer to raw event
+    PTR = EVTBFR;				! Pointer to build DNA event
+    SNK = .SNKBLK;				! Point to the sink
+
+    IF .SNK [SNK$W_EVTCNT] GTRU EVL$C_MAXEVTCNT	! Event queue too long?
+    THEN
+	BEGIN
+	IF (					! If sink has not been lost
+	    NOT .SNK [SNK$B_SNKLOS]		! of this type yet
+	    AND .SNKMASK
+	    )
+	    NEQ 0
+	THEN
+	    BEGIN
+	    EVL$BLDLOSTEVENT			! Build lost event message
+		(				! For the correct sinks
+		.SNKMASK AND NOT .SNK [SNK$B_SNKLOS],
+		.SNK [SNK$L_EVTBL],		! Link in at tail of queue
+		EVQ				! Return address here
+		);
+	    SNK [SNK$B_SNKLOS] =		! Remember the sinks we lost
+		.SNK [SNK$B_SNKLOS] OR .SNKMASK; ! So only one message
+	    SNK [SNK$W_EVTCNT] =		! Count another event
+		.SNK [SNK$W_EVTCNT] + 1;
+	    EVTDSC [0] = .EVQ [EVQ$W_EVTSIZE];	! Build descriptor of event
+	    EVTDSC [1] = EVQ [EVQ$T_EVENT];
+	    EVL$PRINTLOG			! Log event if requested
+		(
+		$BITPOSITION (ELG$V_QUEEVT),
+		%ASCID 'Events Lost',
+		SNK [SNK$L_SNKLEN],
+		EVTDSC
+		)
+	    END
+	;
+	RETURN					! We lost the event, so done
+	END
+    ELSE
+	SNK [SNK$B_SNKLOS] = FALSE		! No events lost now
+    ;
+
+
+    IF .RAW [RAW$W_BYTES]			! Quick check of raw size
+	    GTRU EVTSIZE - (-27+37)		! to see if it fits in buffer
+	OR .RAW [RAW$W_BYTES]			! Or if too small
+	    LSSU $BYTEOFFSET(RAW$T_DATA)
+    THEN
+	BEGIN
+	SIGNAL (EVL$_EVTSIZ);			! Signal some thing bad wrong
+	RETURN					! and ignore event
+	END
+    ;
+
+    EVL$JULIAN					! Convert raw time to DNA
+	(					! format
+	RAW [RAW$T_SYSTIM],			! 64 bit systime
+	HALFDAY, SECS, MSECS			! Julian halfdays, seconds, ..
+	);
+
+!
+!	Build the DNA format event in the buffer
+!
+
+    CH$WCHAR_A (1, PTR);			! Just a code byte for event
+    CH$WCHAR_A (.SNKMASK, PTR);			! The sink mask byte
+    PTR = CH$COPY				! Build more of the header
+	(
+	2, RAW [RAW$W_EVTCODE],			! Event code
+	2, HALFDAY,				! Date and time in dna format
+	2, SECS,
+	2, MSECS,
+	0,					! Just a dummy fill char
+	8, .PTR					! Place to put it
+	);
+
+    PTR = CH$MOVE				! Put in the source node
+	(					! in node id format
+	.EVL$GB_LOCALNODE,			! from a special buffer
+	EVL$GT_LOCALNODE,			! Built in advance
+	.PTR
+	);
+
+    CH$WCHAR_A (.RAW [RAW$B_SRCTYP], PTR);	! Copy the source type
+
+    SELECTONEU .RAW [RAW$B_SRCTYP] OF		! and id depending on type
+    SET
+    [EVC$C_SRC_NON] : (0);			! Nothing for no source id
+    [EVC$C_SRC_LIN,EVC$C_SRC_CIR] :		! Copy ASCIC string
+	BEGIN
+	PTR = CH$MOVE				! Line id is a counted string
+	    (
+	    CH$RCHAR (RAW [RAW$T_SRCID]) + 1,
+	    RAW [RAW$T_SRCID],
+	    .PTR
+	    )
+	END;
+    [EVC$C_SRC_NOD] :				! Copy node id from raw
+	BEGIN					! its word (adr) ascic (name)
+	PTR = CH$MOVE
+	    (
+	    CH$RCHAR (RAW [RAW$T_SRCID] + 2) + 3, ! Count and address with str
+	    RAW [RAW$T_SRCID],
+	    .PTR
+	    )
+	END;
+    TES;
+
+!
+!	Copy the associated data with the event.
+!
+
+    PTR = CH$MOVE(
+	    .RAW [RAW$W_BYTES] - $BYTEOFFSET(RAW$T_DATA),
+	    RAW [RAW$T_DATA],
+	    .PTR);
+
+!
+!	Compute size of event in dna format, allocate a dbk for it
+!	and copy it to the block.  The dbk is queued at the end of the
+!	list in sink block for transmission.
+!
+
+    SIZE = .PTR - EVTBFR;			! Size of event
+    EVL$ALLOCDBK				! Allocate a buffer
+	(
+	.SIZE + EVQ$C_SIZE,			! size of buffer
+	.SNK [SNK$L_EVTBL],			! Queue at end of queue
+	EVQ					! Return address here
+	);
+    EVQ [EVQ$W_EVTSIZE] = .SIZE;		! Set its size
+    CH$MOVE					! Copy the event to buffer
+	(
+	.SIZE,
+	EVTBFR,
+	EVQ [EVQ$T_EVENT]
+	);
+    SNK [SNK$W_EVTCNT] =			! Count another event
+	.SNK [SNK$W_EVTCNT] + 1;
+
+    EVTDSC [0] = .EVQ [EVQ$W_EVTSIZE];		! Build descriptor of event
+    EVTDSC [1] = EVQ [EVQ$T_EVENT];
+    EVL$PRINTLOG				! Log event if requested
+	(
+	$BITPOSITION (ELG$V_QUEEVT),		! Bit controlling logging
+	%ASCID 'Queued event',			! Header text
+	SNK [SNK$L_SNKLEN],			! Ncb is extra info
+	EVTDSC					! Descriptor of event
+	);
+
+    EVL$WRITEVT (.SNK)				! Start the output if needed
+
+    END;
+
+%SBTTL	'EVL$BLDLOSTEVENT  Build a Lost Event Event'
+ROUTINE EVL$BLDLOSTEVENT (SNKMASK, PRED, EVQRTN) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Build a lost event event and queue it to a sink block.  The sink
+!	mask for the lost event is passed here.  The current system time
+!	is included in the event.
+!
+! FORMAL PARAMETERS:
+!
+!	SNKMASK		Value of sink mask for event
+!	PRED		Predecessor for insert into queue
+!	EVQRTN		Address to return address of event block
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	EVQ	: REF BBLOCK,			! Pointer to event block
+	PTR,					! Pointer into event block
+	SYSTIM	: VECTOR [2],			! 64 bit system time (now)
+	HALFDAY,				! Julian half day for now
+	SECS,					! and the rest
+	MSECS					! of the dna time
+	;
+
+    EVL$ALLOCDBK				! Obtain an event block
+	(
+	EVQ$C_SIZE + 22,			! Thats big enough
+	.PRED,					! In correct queue
+	EVQ					! Return address here
+	);
+
+    $GETTIM					! When is now
+	(
+	TIMADR = SYSTIM
+	);
+
+    EVL$JULIAN					! When is it really according
+	(					! to DECnet.
+	SYSTIM,					! 64 bit time
+	HALFDAY, SECS, MSECS			! Dna time
+	);
+
+    PTR = EVQ [EVQ$T_EVENT];			! Point to place to build evt
+
+    CH$WCHAR_A (1, PTR);			! Just a code byte for event
+    CH$WCHAR_A (.SNKMASK, PTR);			! The sink mask byte
+    PTR = CH$COPY				! Build more of the header
+	(
+	2, UPLIT WORD (EVC$C_NMA_LOS),		! Event code
+	2, HALFDAY,				! Date and time in dna format
+	2, SECS,
+	2, MSECS,
+	0,					! Just a dummy fill char
+	8, .PTR					! Place to put it
+	);
+
+    PTR = CH$MOVE				! Put in the source node
+	(					! in node id format
+	.EVL$GB_LOCALNODE,			! from a special buffer
+	EVL$GT_LOCALNODE,			! Built in advance
+	.PTR
+	);
+
+    CH$WCHAR_A (EVC$C_SRC_NON, PTR);		! Specify the source type
+
+    EVQ [EVQ$W_EVTSIZE] = .PTR - EVQ [EVQ$T_EVENT]; ! Set the size
+    .EVQRTN = .EVQ				! Return the address
+
+    END;
+
+%SBTTL	'EVL$NETERROR  Check and Report a Network Error'
+ROUTINE EVL$NETERROR (CODE, STATUSVAL, IOSBADR) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Check the status value and/or the iosb status code of
+!	an io request to the network.  If anything is amiss then
+!	signal the error to the log and return failure.  If all is
+!	well, return success.
+!
+! FORMAL PARAMETERS:
+!
+!	CODE		Value of the EVL condition code to signal
+!	STATUSVAL	Value of status from a network request
+!	IOSBADR		Address of the iosb of a network request
+!			a value of zero implies do not check the iosb
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Success if no error, failure otherwise.
+!	Any errors are signaled so they will be logged.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    MAP
+	IOSBADR : REF BBLOCK			! Its the address of a block
+	;
+
+    LOCAL
+	IOSBSTS					! Hold its value here
+	;
+    IF NOT .STATUSVAL				! Signal any error here
+    THEN
+	SIGNAL (.CODE, 0, .STATUSVAL)
+    ;
+
+    IOSBSTS =					! Obtain the value
+	BEGIN
+	IF .IOSBADR EQL 0			! Unless there is no block
+	THEN
+	    SUCCESS				! in which case use success
+	ELSE
+	    .IOSBADR [0, 0, 16, 0]		! Status value of iosb
+	END;
+
+    IF NOT .IOSBSTS				! If its bad, signal it
+    THEN
+	SIGNAL (.CODE, 0, .IOSBSTS)
+    ;
+
+    RETURN .STATUSVAL AND .IOSBSTS AND SUCCESS	! and return problems
+
+    END;
+
+%SBTTL	'EVL$WRITEVT  Write an Event to a Sink Node'
+ROUTINE EVL$WRITEVT (SNKBLK) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	If a write is in progress, just return from here.
+!	If the event queue is empty, close and delete the sink
+!	if the status bits are set, but in any case return from here.
+!	If the sink is not open, open it.  We will return here when
+!	the open completes.
+!	If everything is go, then start the write on the open logical
+!	link to the event receiver and check for any errors on the qio.
+!	The remainder of the write is handled in the WRITEDONE routine
+!	which is activated as work when the AST completes.
+!
+!	When we find the event queue empty, we set a timer which
+!	will activate the close routine.  The link will be reopened
+!	when an event is requeued.  If an event is written we cancel the
+!	timer entry.
+!
+! FORMAL PARAMETERS:
+!
+!	SNKBLK		Address of the sink block
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	SNK	: REF BBLOCK,			! Pointer to sink block
+	EVQ	: REF BBLOCK,			! Pointer to event queue block
+	STATUS					! Local status value
+	;
+
+    SNK = .SNKBLK;				! Point to sink block
+
+    IF .SNK [SNK$V_STS_BSY]			! If some action in progress
+    THEN
+	RETURN					! Go away and wait for done
+    ;
+
+    IF  .SNK [SNK$L_EVTFL]			! If event list is empty
+	EQL
+	SNK [SNK$L_EVTFL]
+    THEN
+	BEGIN
+	IF  .SNK [SNK$V_STS_DEL]		! If delete or close set
+	    OR
+	    .SNK [SNK$V_STS_CLS]
+	THEN
+	    EVL$CLOSESNK (.SNK)			! Close and deallocate sink
+	ELSE
+	    BEGIN
+	    SNK [SNK$V_STS_TMR] = TRUE;		! Set bit for timer active
+	    WKQ$ADD_TIMED_WORK			! Set work to perform close
+		(
+		EVL$CLOSESNK,			! Close after the delay
+		.SNK, 0,			! Sink is the parameter
+		EVL$Q_CLOSEDELAY,		! Time delay
+		.SNK				! Request id is sink address
+		)
+	    END
+	;
+	RETURN					! and we are done here
+	END
+    ;
+
+    IF .SNK [SNK$V_STS_TMR]			! If close timer is active
+    THEN
+	BEGIN
+	WKQ$CANCEL_TIMED_WORK (.SNK);		! Cancel the work element
+	SNK [SNK$V_STS_TMR] = FALSE		! Clear the bit
+	END
+    ;
+
+    EVQ = .SNK [SNK$L_EVTFL];			! Point to the first event
+    SNK [SNK$L_ROUTINE] = EVL$WRITEDONE;	! Setup the routine to go to
+
+    IF .SNK [SNK$L_SNKADR] EQL .EVL$GT_LOCALNODE<0,16>	! If to local receiver,
+    THEN
+	BEGIN
+	SNK [SNK$V_STS_BSY] = TRUE;		! Write is in progress
+	WKQ$ADD_WORK_ITEM(EVL$QUEUE_EVENT,	! Queue event to local receiver
+	    .EVQ [EVQ$W_EVTSIZE], EVQ [EVQ$T_EVENT]);
+	SNK [SNK$W_IOSB] = TRUE;		! Set write successful
+	EVL$ASTWORK(.SNK);			! and simulate I/O completion
+	RETURN;
+	END;
+
+    IF NOT .SNK [SNK$V_STS_OPN]			! If sink is not open
+    THEN
+	BEGIN
+	EVL$OPENSNK (.SNK);			! Open the sink node link
+	RETURN					! we will come back here later
+	END;
+
+    STATUS = $QIO				! Do the write
+	(
+	EFN = EVL$C_ASYNCH_EFN,
+	CHAN = .SNK [SNK$W_NETCHAN],		! Channel in sink block
+	FUNC = IO$_WRITEVBLK,			! Write data to link
+	IOSB = SNK [SNK$W_IOSB],		! Leave status here
+	ASTADR = EVL$ASTWORK,			! Our general ast routine
+	ASTPRM = .SNK,				! Sink block is parameter
+	P1 = EVQ [EVQ$T_EVENT],			! Address of event
+	P2 = .EVQ [EVQ$W_EVTSIZE]		! Size of event in bytes
+	);
+
+    IF NOT EVL$NETERROR (EVL$_WRTEVT, .STATUS, 0) ! Report any error
+    THEN
+	EVL$CLOSESNK (.SNK)			! Close the sink on an error
+    ELSE
+	SNK [SNK$V_STS_BSY] = TRUE		! Write is in progress
+
+    END;
+
+%SBTTL	'EVL$WRITEDONE  Finish Up an Event Write'
+ROUTINE EVL$WRITEDONE (SNKBLK) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is queued as work by the ast completion of
+!	a write of an event to a sink.  The parameter is the sink block.
+!	Check for an error on the write and if there was none, then
+!	dequeue the event.  If there was an error, close the sink.
+!	This will cause the sink to be reopened, creating a new logical
+!	link and a retransmission will occur.
+!
+! FORMAL PARAMETERS:
+!
+!	SNKBLK		Address of the sink block of concern
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	SNK	: REF BBLOCK			! Pointer to the sink block
+	;
+
+    SNK = .SNKBLK;				! Set the pointer
+    SNK [SNK$V_STS_BSY] = FALSE;		! Write is not in progress
+
+    IF EVL$NETERROR 				! Check for an error
+	(EVL$_WRTEVT, TRUE, SNK [SNK$W_IOSB] )
+    THEN
+	BEGIN
+	EVL$DEALLOCDBK (.SNK [SNK$L_EVTFL] );	! No error, dump that event
+	SNK [SNK$W_EVTCNT] =			! Reduce count of queued evts
+	    .SNK [SNK$W_EVTCNT] - 1;
+	EVL$WRITEVT (.SNK)			! and write the next one
+	END
+    ELSE
+	BEGIN
+	EVL$CLOSESNK (.SNK)			! Close the sink to try again
+	END
+
+    END;
+
+%SBTTL	'EVL$OPENSNK  Open a Link to a Sink Node'
+ROUTINE EVL$OPENSNK (SNKBLK) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Open a logical link to the event receiver on the sink node.
+!	If an error occurs here, close and delete the sink.  Something
+!	is drastically wrong if there is an error here and we do not retry.
+!	The access function for the link finishes up in EVL$OPENDONE
+!	and further errors are handled there.
+!
+! FORMAL PARAMETERS:
+!
+!	SNKBLK		Address of the sink block
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	SNK	: REF BBLOCK,			! Pointer to a sink block
+	STATUS					! Status return
+	;
+
+    SNK = .SNKBLK;				! Set local pointer
+    IF .SNK [SNK$V_STS_OPN]			! If its already open,
+	OR
+	.SNK [SNK$V_STS_BSY]			! or somethings going on
+    THEN
+	RETURN					! Just ignore this call
+    ;
+
+    IF .EVL$GL_LOGMASK [ELG$V_SNKOPN]		! Log open events?
+    THEN
+	BEGIN
+	SIGNAL					! Log this open attempt
+	    (
+	    EVL$_LOGOPNT, 2,			! Message and 2 parms
+	    SNK [SNK$L_SNKLEN],			! Ncb address
+	    0					! and zero for current time
+	    )
+	END
+    ;
+
+    STATUS = $ASSIGN				! Assign a channel to net
+	(
+	DEVNAM = %ASCID '_NET:',
+	CHAN = SNK [SNK$W_NETCHAN]		! Place channel in sink block
+	);
+
+    IF .STATUS					! If that worked
+    THEN
+	BEGIN
+	SNK [SNK$V_STS_OPN] = TRUE;		! We have a channel tied up
+	SNK [SNK$L_ROUTINE] = EVL$OPENDONE;	! Set the work routine
+	STATUS = $QIO				! and open the logical link
+	    (
+	    EFN = EVL$C_ASYNCH_EFN,
+	    CHAN = .SNK [SNK$W_NETCHAN],	! The channel
+	    FUNC = IO$_ACCESS,			! access a link
+	    IOSB = SNK [SNK$W_IOSB],		! Place status here
+	    ASTADR = EVL$ASTWORK,		! Use the command ast routine
+	    ASTPRM = .SNK,			! and the sink block is param
+	    P2 = SNK [SNK$L_SNKLEN]		! The ncb is in the sink block
+	    )
+	END
+    ;
+
+    IF NOT EVL$NETERROR (EVL$_OPNSNK, .STATUS, 0) ! If any error
+    THEN
+	BEGIN
+	SNK [SNK$V_STS_CLS] = TRUE;		! Mark for delete and
+	EVL$CLOSESNK (.SNK)			! Close the link
+	END
+    ELSE
+	SNK [SNK$V_STS_BSY] = TRUE;		! Mark as busy
+
+    END;
+
+%SBTTL	'EVL$OPENDONE  Finish Up the Sink Open'
+ROUTINE EVL$OPENDONE (SNKBLK) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This is the work routine which handles the completion of an
+!	access function on a logical link to an event receiver on a
+!	sink node.  If any error occurred, then wait for a while before
+!	trying the open again.  All errors are logged by signalling them.
+!	If no error occurred, then call the write event routine to
+!	start writing events to the sink node if any have been queued.
+!
+! FORMAL PARAMETERS:
+!
+!	SNKBLK		Address of the sink block
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    BIND
+	OPENWAITTIME =				! Time to wait before trying
+	    UPLIT (-60*10*1000*1000, -1)	! open again = 1 minute
+	;
+
+    LOCAL
+	SNK	: REF BBLOCK,			! Local pointer to sink block
+	STATUS					! Local status
+	;
+
+    SNK = .SNKBLK;				! Set the local pointer
+    IF NOT					! If there was an error
+	EVL$NETERROR 				! Report it and
+	    (EVL$_OPNSNK, TRUE, SNK [SNK$W_IOSB] )
+    THEN
+	BEGIN
+	IF NOT
+	    (STATUS = WKQ$ADD_TIMED_WORK	! Schedule close to reopen
+		(				! sink later
+		EVL$CLOSESNK,			! Routine to activate
+		.SNK,				! Its parameters
+		0,				! Dummy parm
+		OPENWAITTIME,			! Time to wait
+		.SNK				! Timer Request id
+		)
+	    )
+	THEN
+	    SIGNAL (EVL$_WKQERR, 0, .STATUS)	! Signal something wrong
+	END
+    ELSE
+	BEGIN
+	SNK [SNK$V_STS_BSY] = FALSE;		! Link is not busy
+	EVL$WRITEVT (.SNK)			! No error, so write events
+	END
+    END;
+
+%SBTTL	'EVL$CLOSESNK  Close Link to a Sink Node'
+ROUTINE EVL$CLOSESNK (SNKBLK) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Close the logical link to a sink block by deassigning the channel
+!	to net.  This causes an abort.  This is preferrable to a deaccess
+!	function to the netacp and is certainly much simpler for us.
+!	There are evidently theoretical problems associated with synchronous
+!	disconnects on logical links.  The abort is guaranteed to work
+!	correctly.  The outstanding read in the receiver gets an ABORT
+!	status on its read and simply breaks the link.
+!
+!	When the link is broken, if the sink block has DELete or CLoSe status
+!	set, deallocate the sinkblock since we are done with it.  Otherwise
+!	call writevt to reopen the link if any events are waiting.
+!	This mechanism allows us to temporarily close down links to sink nodes
+!	which are very seldom used.  If a link has not been used in some time,
+!	simply calling closesnk will close it until events are queued to it.
+!
+!	If the last sink block is closed, we set a flag to indicate we are not
+!	doing any work now.  The main line may elect to exit if nobody is
+!	doing any work.
+!
+! FORMAL PARAMETERS:
+!
+!	SNKBLK		Address of the sink block
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	SNK	: REF BBLOCK,			! Pointer to sink block
+	STATUS					! Local status return
+	;
+
+    SNK = .SNKBLK;				! Set pointer to sink
+    IF .SNK [SNK$V_STS_OPN]			! If sink is open
+    THEN
+	BEGIN					! Deassign channel to net
+	STATUS = $DASSGN 			! to close logical link
+	    (
+	    CHAN = .SNK [SNK$W_NETCHAN]		! Channel is in snk block
+	    );
+	EVL$NETERROR (EVL$_NETDAS, .STATUS, 0);	! Report but ignore error
+	SNK [SNK$V_STS_OPN] = FALSE		! Link is not open
+	END
+    ;
+
+!
+!	The close could have been called by a timed work or for other
+!	reasons such as the database entry for the sink went away.
+!	If the timer bit is set, the timer may be running.  We cannot
+!	findout if it was the timer that called us or not, so we must
+!	try to cancel the timer entry.  If one is outstanding and we
+!	deallocate the sink block, bad news when it goes off.
+!
+
+    IF .SNK [SNK$V_STS_TMR]			! If the timer is running
+    THEN					! Cancel the work item even
+	BEGIN
+	WKQ$CANCEL_TIMED_WORK (.SNK);		! if it is what called us.
+	SNK [SNK$V_STS_TMR] = FALSE		! Clear the bit
+	END
+    ;
+
+    IF  .SNK [SNK$V_STS_DEL]			! If link is to be deleted
+	OR
+	.SNK [SNK$V_STS_CLS]			! or closed
+    THEN
+	EVL$DEALLOCSNK (.SNK)			! Deallocate the sink block
+    ELSE
+	BEGIN
+	SNK [SNK$V_STS_BSY] = FALSE;		! Nothing active now
+	EVL$WRITEVT (.SNK)			! Otherwise check for events
+	END					! and if so open link to write
+    ;						! them out
+
+    END;
+
+%SBTTL	'EVL$ALLOCDBK  Allocate a Data Block'
+GLOBAL ROUTINE EVL$ALLOCDBK (DBKSIZE, PRED, DBKRTN) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Allocate a data block with a specified size and link it into a
+!	queue in a specified place.  If there is an error, signal it and
+!	then exit.
+!
+! FORMAL PARAMETERS:
+!
+!	DBKSIZE		Size of data block
+!	PRED		Predecessor in the queue
+!	DBKRTN		Address to return address of allocated dbk
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Routine returns true if entry is first in the queue
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    BUILTIN INSQUE ;
+
+    LOCAL
+	STATUS,					! Hold on to status here
+	DBK : REF BBLOCK			! Local for the data block
+	;
+
+    IF NOT
+	(STATUS = LIB$GET_VM (DBKSIZE, DBK) )	! Obtain a block of data
+    THEN
+	BEGIN
+	SIGNAL (EVL$_INSFVM, 0, .STATUS);	! Unable to obtain memory,
+	$EXIT (CODE = EVL$_INSFVM)		! Its fatal so exit.
+	END
+    ;
+
+    CH$FILL (0, .DBKSIZE, .DBK);		! Zero the area
+    DBK [DBK$W_SIZE] = .DBKSIZE;		! Set the size in the block
+    .DBKRTN = .DBK;				! Return the address
+    INSQUE (.DBK, .PRED)			! Place on the queue
+
+    END;
+
+%SBTTL	'EVL$DEALLOCDBK  Deallocate Data Block'
+GLOBAL ROUTINE EVL$DEALLOCDBK (DBKADR) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Deallocate a data block.  This size is in the data block.
+!	The data block is removed from the queue first.
+!
+! FORMAL PARAMETERS:
+!
+!	DBKADR		Address of the dbk
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+
+    BUILTIN REMQUE ;
+
+    LOCAL
+	SIZE,				! Size of the data block
+	DBK : REF BBLOCK		! Local pointer to block
+	;
+
+    REMQUE (.DBKADR, DBK);		! Unlink the block
+    SIZE = .DBK [DBK$W_SIZE];		! Save its size
+    LIB$FREE_VM (SIZE, DBK)		! Free its memory
+
+    END;
+
+%SBTTL	'EVL$ASTWORK  General AST Routine to Queue Work'
+ROUTINE EVL$ASTWORK (ASP) :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called as an AST routine on the completion of
+!	an I/O request of some kind.  The parameter is an ASP block
+!	or a SNK block (these have the same header format).  This block
+!	has a routine address in the header which is the address of the
+!	routine to queue as work.  The ASP block is passed as a parameter
+!	to the routine.  No processing or error checking is done at AST
+!	level.   This synchronizes all operations and avoids any possibility
+!	of race conditions with AST routines.
+!
+! FORMAL PARAMETERS:
+!
+!	ASP		Address of ASP block
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    MAP
+	ASP : REF BBLOCK
+	;
+
+    LOCAL
+	STATUS
+	;
+
+    IF .ASP [ASP$L_ROUTINE] LSSU 512
+    THEN
+	SIGNAL (EVL$_WKQERR, 0, SS$_ACCVIO) 	! Some error occurred
+    ;
+    IF NOT
+	( STATUS = WKQ$ADD_WORK_ITEM	! Add item to work queue
+	    (
+	    .ASP [ASP$L_ROUTINE],	! Routine address
+	    .ASP,			! First parameter
+	    0				! Second parameter
+	    )
+	)
+    THEN
+	SIGNAL (EVL$_WKQERR, 0, .STATUS) ! Some error occurred
+
+    END;
+
+END				!End of module
+ELUDOM

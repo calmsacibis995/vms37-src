@@ -1,0 +1,405 @@
+MODULE CREHDR (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This routine creates a new file ID by allocating a file number from the
+!	index file bitmap. It returns an empty file header, verified for use.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  28-Mar-1977  13:49
+!
+! MODIFIED BY:
+!
+!	A0101	ACG0117		Andrew C. Goldstein,	16-Jan-1980  17:07
+!		Return true I/O status on I/O errors
+!
+!	A0100	ACG00001	Andrew C. Goldstein,  10-Oct-1978  20:02
+!	Previous revision history moved to F11A.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	CREATE_HEADER,			! create file ID and header
+	UPDATE_IBVBN	: NOVALUE,	! update index bitmap scan start
+	READ_NEW_HEADER,		! read new file header block
+	HANDLER;			! local condition handler
+
+GLOBAL ROUTINE CREATE_HEADER =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine creates a new file ID by searching the volume's index
+!	file bitmap for the first free file number. It also checks that a header
+!	for the file number is present in the index file. It reads the old
+!	header and establishes the file sequence number for the new one.
+!
+! CALLING SEQUENCE:
+!	CREATE_HEADER ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: address of volume's VCB
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	address of buffer containing new header
+!
+! SIDE EFFECTS:
+!	VCB and index file bitmap altered, header block read
+!
+!--
+
+BEGIN
+
+LOCAL
+	VCB		: REF BBLOCK,	! local copy of VCB address
+	VBN,				! relative block number in bitmap
+	BUFFER		: REF BITVECTOR, ! address of index file bitmap buffer
+	ADDRESS		: REF BITVECTOR, ! address of byte in buffer
+	BITPOS,				! bit positon of free bit within byte
+	FILE_NUMBER,			! file number allocated
+	IDX_FCB		: REF BBLOCK,	! FCB of index file
+	LBN,				! LBN of new file header
+	HEADER		: REF BBLOCK,	! address of header buffer
+	SAVE_STATUS;			! save I/O status during CHECK_HEADER call
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume
+	NEW_FID,			! pending file ID
+	HEADER_LBN,			! LBN of created file header
+	USER_STATUS	: VECTOR;	! I/O status block of user
+
+EXTERNAL ROUTINE
+	READ_BLOCK,			! read block from disk
+	WRITE_BLOCK,			! write block to disk
+	EXTEND_INDEX,			! extend the index file
+	MAP_VBN,			! map virtual to logical block
+	CHECK_HEADER;			! verify file header
+
+
+! The outer loop performs retries if blocks in the index file are bad.
+! Bad header blocks are simply left marked in use in the index file bitmap;
+! they will show up in a verify but are otherwise harmless.
+!
+
+VCB = .CURRENT_VCB;
+WHILE 1 DO
+    BEGIN
+
+! We scan the index file bitmap for the first free (zero) bit. This is done
+! by starting with the block recorded in the VCB and looking at each block
+! with a character scan.
+!
+
+    VBN = .VCB[VCB$B_IBMAPVBN];
+
+    IF
+	BEGIN
+	UNTIL .VBN GEQ .VCB[VCB$B_IBMAPSIZE] DO
+	    BEGIN
+	    BUFFER = READ_BLOCK (.VBN + .VCB[VCB$L_IBMAPLBN], 1, INDEX_TYPE);
+	    IF NOT CH$FAIL (ADDRESS = CH$FIND_NOT_CH (512, .BUFFER, 255))
+	    THEN EXITLOOP 0;
+	    VBN = .VBN + 1;
+	    END
+	END
+
+! If we fall through the loop, the entire bitmap is full.
+!
+
+	THEN ERR_EXIT (SS$_IDXFILEFULL);
+
+! Having found a byte containing a zero bit, scan for the bit.
+!
+
+    FFC (%REF (0), %REF (8), .ADDRESS, BITPOS);
+
+! Compute the file number and check it against the maximum files allowed
+! on the volume. Also check if the corresponding file header is present in
+! the index file. If not, extend the index file and re-read the bitmap
+! block, which may have been kicked out in the process.
+!
+
+    FILE_NUMBER = .VBN*4096 + (.ADDRESS-.BUFFER)*8 + .BITPOS + 1;
+
+    IF .FILE_NUMBER GTR .VCB[VCB$L_MAXFILES]
+    THEN ERR_EXIT (SS$_IDXFILEFULL);
+
+    IDX_FCB = .VCB[VCB$L_FCBFL];
+    IF .FILE_NUMBER + .VCB[VCB$B_IBMAPSIZE] + 2 GTR .IDX_FCB[FCB$L_FILESIZE]
+    THEN
+	BEGIN
+	ADDRESS = .ADDRESS - .BUFFER;
+	EXTEND_INDEX (.FILE_NUMBER);
+	BUFFER = READ_BLOCK (.VBN + .VCB[VCB$L_IBMAPLBN], 1, INDEX_TYPE);
+	ADDRESS = .ADDRESS + .BUFFER;
+	END;
+
+! All is in order. Set the bit and rewrite the block. Also update the
+! scan point in the VCB for the next create. Note that if the file number was
+! from the last bit in the block, we will start the scan at the next block to
+! avoid wasting a read.
+!
+
+    ADDRESS[.BITPOS] = 1;
+    WRITE_BLOCK (.BUFFER);
+
+    IF .FILE_NUMBER<0,12> EQL 0
+    THEN VBN = .VBN + 1;
+    KERNEL_CALL (UPDATE_IBVBN, .VBN);
+    NEW_FID = .FILE_NUMBER;		! record file ID for cleanup
+
+! Now read the old file header. If the block contained an old file header,
+! bump the file sequence number; else assign 1.
+!
+
+    VBN = .FILE_NUMBER + .VCB[VCB$B_IBMAPSIZE] + 2;
+    IDX_FCB = .VCB[VCB$L_FCBFL];
+    LBN = MAP_VBN (.VBN, .IDX_FCB[FCB$L_WLFL]);
+    IF .LBN EQL -1 THEN BUG_CHECK (HDRNOTMAP, FATAL, 'Allocated file header not mapped');
+    HEADER = READ_NEW_HEADER (.LBN);
+    IF .HEADER NEQ 0 THEN EXITLOOP;
+    END;				! end of file number allocation loop
+
+HEADER_LBN = .LBN;			! record LBN of new header
+
+SAVE_STATUS = .USER_STATUS[0];
+IF CHECK_HEADER (.HEADER, UPLIT WORD (0, 0, 0)) NEQ 0
+THEN HEADER[FH1$W_FID_SEQ] = .HEADER[FH1$W_FID_SEQ] + 1
+ELSE HEADER[FH1$W_FID_SEQ] = 1;
+HEADER[FH1$W_FID_NUM] = .FILE_NUMBER;
+USER_STATUS[0] = .SAVE_STATUS;		! restore status, bashed by CHECK_HEADER
+
+RETURN .HEADER;
+
+END;					! end of routine CREATE_HEADER
+
+GLOBAL ROUTINE UPDATE_IBVBN (VBN) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine writes back the starting VBN for the index file bitmap
+!	scan into the vcb. This routine must be called in kernel mode.
+!
+! CALLING SEQUENCE:
+!	UPDATE_VBN (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: new start VBN
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	VBN written into VCB
+!
+!--
+
+BEGIN
+
+EXTERNAL
+	CURRENT_VCB	: REF BBLOCK;	! VCB of volume
+
+CURRENT_VCB[VCB$B_IBMAPVBN] = .VBN;
+
+END;					! end of routine UPDATE_VBN
+
+ROUTINE READ_NEW_HEADER (LBN) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads the block about to be used for a new file header.
+!	It uses a local condition handler to fix up errors.
+!
+!
+! CALLING SEQUENCE:
+!	READ_NEW_HEADER (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: LBN of block to read
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	address of buffer containing block or 0 if bad
+!
+! SIDE EFFECTS:
+!	block read and/or written
+!
+!--
+
+BEGIN
+
+LOCAL
+	HEADER		: REF BBLOCK;	! address of block read
+
+EXTERNAL ROUTINE
+	READ_BLOCK,			! read a block
+	WRITE_BLOCK,			! write a block
+	INVALIDATE,			! invalidate a buffer
+	CREATE_BLOCK;			! create a new block buffer
+
+! Under control of the condition handler, we read the block. If the read
+! fails, we attempt to rewrite the block and then read it again. If either
+! of the latter fails, we return failure.
+!
+
+ENABLE HANDLER;
+
+HEADER = READ_BLOCK (.LBN, 1, HEADER_TYPE);
+
+IF .HEADER EQL 0
+THEN
+    BEGIN
+    HEADER = CREATE_BLOCK (.LBN, 1, HEADER_TYPE);
+    WRITE_BLOCK (.HEADER);
+    INVALIDATE (.HEADER);
+    HEADER = READ_BLOCK (.LBN, 1, HEADER_TYPE);
+    END;
+
+RETURN .HEADER;
+
+END;					! end of routine READ_NEW_HEADER
+
+ROUTINE HANDLER (SIGNAL, MECHANISM) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is the condition handler for the initial header read.
+!	On surface errors, it unwinds and causes a return of 0 to the caller
+!	of the I/O routine to indicate error. Hard drive errors cause the
+!	usual error exit.
+!
+! CALLING SEQUENCE:
+!	HANDLER (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of signal array
+!	ARG2: address of mechanism array
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	SS$_RESIGNAL or none if unwind
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+
+BEGIN
+
+MAP
+	SIGNAL		: REF BBLOCK,	! signal arg array
+	MECHANISM	: REF BBLOCK;	! mechanism arg array
+
+EXTERNAL
+	IO_STATUS	: VECTOR;	! I/O status block of last operation
+
+
+! If the condition is change mode to user (error exit) and the status is
+! read error, zero the return R0 and unwind to the the establisher. On
+! most write errors, zero the return R0 and unwind to the caller.
+! Otherwise, just resignal the condition.
+!
+
+IF .SIGNAL[CHF$L_SIG_NAME] EQL SS$_CMODUSER
+THEN
+    BEGIN
+    MECHANISM[CHF$L_MCH_SAVR0] = 0;
+
+    IF .SIGNAL[CHF$L_SIG_ARG1] EQL SS$_PARITY
+    OR .SIGNAL[CHF$L_SIG_ARG1] EQL SS$_DATACHECK
+    OR .SIGNAL[CHF$L_SIG_ARG1] EQL SS$_FORMAT
+    THEN
+	$UNWIND (DEPADR = MECHANISM[CHF$L_MCH_DEPTH])
+    END;
+
+RETURN SS$_RESIGNAL;			! status is irrelevant if unwinding
+
+END;					! end of routine HANDLER
+
+END
+ELUDOM

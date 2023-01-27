@@ -1,0 +1,2600 @@
+MODULE DBGNPNP (IDENT = 'V03-000') =
+
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:
+!
+!	DEBUG
+!
+! ABSTRACT:
+!
+!	This module contains routines which collectively permform pathname
+!	parsing according to the DEBUG syntax for pathnames. The lexical
+!	scanner used by the parser is language dependent and is provided by
+!	the caller of dbg$npathname_parser.
+!
+!	The method of parsing is that of ATNs.
+!
+!	This module also contains a routine which parses the objects of a
+!	SET SCOPE command. This routine invokes the pathname parser, supplying
+!	the address of a kernel lexical scanner routine.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS
+!
+! AUTHOR:
+!
+!	David Plummer
+!
+! CREATION DATE:
+!
+!	9-SEPT-80
+!
+! VERSION:
+!
+!	V03-004
+!
+! MODIFIED BY:
+!
+!	John Francis	  3-Jun-81
+!
+! EDIT HISTORY
+!
+! 002	13-Mar-81	JF	Change max length to 255 (not 511)
+! 003	30-Apr-81	JF	Add support for %NAME construct
+! 004	 3-Jun-81	JF	Print A\B.C rather than A\B\C!
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	DBG$NPATHNAME_PARSER,				! Entry point to parse network
+	PARSE_PATHNAME,					! PN parse network
+	FIRST_LINE,					! Parse first line reference
+	LINE_LOOKAHEAD,					! Resolves line number -
+							! numeric scope conflict
+	FIRST_LABEL,					! Parses first label reference
+	LABEL_LOOKAHEAD,				! Resolves label num - n.s.
+	GLOBAL_ITEM,					! Parses global id
+	NUMERIC_PATHNAME,				! Parses numeric pathnames
+	LINE_ITEM,					! Parses line references
+	LABEL_ITEM,					! Parses label references
+	QNAME_ITEM,					! Parses %NAME construct
+	ID_ITEM,					! Parses ID references
+	INTEGER_ITEM,					! Parses dangling line or
+							! label numbers
+	SHORT_SCOPE,					! Parses global and numeric scopes
+	CHECK_PATHNAME 		: NOVALUE,		! Sets value state by scanning pathname desc
+	DBG$NPATHDESC_TO_CS 	: NOVALUE,		! Translates a p.n. desc to a c.s.
+	SCOPE_SCANNER 		: NOVALUE,		! Kernel scanner for parsing scopes
+	DBG$NPARSE_SCOPE_LIST;				! Parses scopes list
+
+!
+! INCLUDE FILES:
+!
+
+REQUIRE 'SRC$:DBGPROLOG.REQ';
+
+!
+! MACROS:
+!
+
+MACRO	! These are parsing and semantic action macros
+
+
+    ! ADVANCE updates the input descriptor to reflect the ingestion
+    ! of the current lexical string. In addition, a copy of the lexical string
+    ! descriptor is made.
+    !
+    ADVANCE =
+	BEGIN
+
+	ch$move (8, lex_string_desc, last_token_desc);
+
+        input_desc [dsc$w_length] = .input_desc [dsc$w_length] -
+				    (.lex_string_desc [dsc$a_pointer] - 
+				    .input_desc [dsc$a_pointer] +
+				    .lex_string_desc [dsc$w_length]);
+	input_desc [dsc$a_pointer] = .lex_string_desc [dsc$a_pointer] +
+				     .lex_string_desc [dsc$w_length];
+
+	last_token = .token;
+
+	END %,
+
+
+    ! GET_TOKEN calls the lexical scanner for a token
+    !
+    GET_TOKEN =
+	BEGIN
+
+	BIND
+	    ROUTINE LEXICAL_SCANNER = .token_scanner_addr; ! Lexical analyzer
+
+    	lexical_scanner (.input_desc, lex_string_desc, token);
+
+	
+	! Check for an integer with a length GTR than 9. If this is the case,
+	! change token to invalid.
+	!
+	IF .token EQL dbg$k_tok_int
+	THEN
+	    IF .lex_string_desc [dsc$w_length] GTR 9
+	    THEN
+		token = dbg$k_tok_inval;
+
+    	END %,
+
+
+    ! SAVE extracts and saves the values of the present input descriptor
+    !
+    SAVE (LEN, PTR) =
+	BEGIN
+
+	len = .input_desc [dsc$w_length];
+	ptr = .input_desc [dsc$a_pointer];
+
+	END %,
+
+
+    ! RESTORE sets the present input descriptor values to the ones supplied
+    !
+    RESTORE (LEN, PTR) =
+	BEGIN
+
+	input_desc [dsc$w_length] = len;
+	input_desc [dsc$a_pointer] = ptr;
+
+	END %,
+
+
+    ! ADD_TO_LIST adds a counted string to the name list. If there is no room
+    ! to add the name, a string truncation message is issued. The count fields
+    ! of the pathname vector are updated.
+    !
+    ADD_TO_LIST (COUNTED_STRING) =
+	BEGIN
+
+	IF .name_index GEQ dbg$k_max_pathname
+	THEN
+	    SIGNAL (dbg$_pathtlong)  ! No return
+	ELSE
+	    BEGIN
+	    name_vect [.name_index] = counted_string;
+	    name_index = .name_index + 1;
+	    END;
+
+
+	! Update the count fields
+	!
+	pathname_desc [pth$b_totcnt] = .pathname_desc [pth$b_totcnt] + 1;
+	pathname_desc [pth$b_pathcnt] = .pathname_desc [pth$b_totcnt];
+
+	END %,
+
+
+    ! ADD_ID adds a non_null name to the name vector. The contents of the lexical
+    ! string buffer is copied into a new buffer.
+    !
+    ADD_ID =
+	BEGIN
+
+	LOCAL
+	    NAME_STRING : REF VECTOR [,BYTE];	! Vector for counted string
+
+	! Determine how large a buffer is needed and allocate it.
+	!
+	IF NOT dbg$nlist_freez ((.lex_string_desc [dsc$w_length] / %UPVAL) + 1,
+				name_string,
+				dummy)
+	THEN
+	    RETURN sts$k_severe;
+
+
+	! Copy the buffer pointed to by the lexical string into the name buffer.
+	!
+	ch$move (.lex_string_desc [dsc$w_length],
+	         .lex_string_desc [dsc$a_pointer],
+		 name_string [1]);
+
+	name_string [0] = .lex_string_desc [dsc$w_length];
+
+
+	! Add the buffer to the name vector
+	!
+	add_to_list (.name_string);
+
+	END %,
+
+
+    ! ADD_INVOCATION_NUMBER attaches an invocation number to the last name added
+    ! to the name list. The invocation number augmentation is set.
+    !
+    ADD_INVOCATION_NUMBER =
+	BEGIN
+
+	LOCAL
+	    POINTER,					! Temporary pointer
+	    NUMBER_DESC 	: dbg$stg_desc,		! Descriptor for number
+	    NUM_BUF	 	: REF VECTOR [,BYTE],	! Number buffer
+	    NUMBER;					! Translated number
+
+	augmentations [invocation_found] = true;
+
+
+	! A copy of the present lexical string descriptor must be made which
+	! contains a terminating character (<CR>).
+	!
+	number_desc [dsc$w_length] = .lex_string_desc [dsc$w_length] + 1;
+
+
+	! Allocate storage for the number string and terminator
+	!
+	IF NOT dbg$nlist_freez ((.number_desc [dsc$w_length] / %UPVAL) + 1,
+				num_buf,
+				dummy)
+	THEN
+	    RETURN sts$k_severe;
+
+
+	! Copy over the number string and place the terminator
+	!
+	pointer = ch$move (.lex_string_desc [dsc$w_length], 
+			   .lex_string_desc [dsc$a_pointer],
+			   .num_buf);
+	ch$move (1, UPLIT BYTE (dbg$k_car_return), .pointer);
+	number_desc [dsc$a_pointer] = .num_buf;
+
+
+	! The descriptor has been set up. Now convert the number.
+	!
+	IF NOT dbg$nsave_decimal_integer (number_desc, number, dummy)
+	THEN
+	    RETURN sts$k_severe;
+
+
+	! Store the invocation number and the index
+	!
+	pathname_desc [pth$b_locinvoc] = .name_index;
+	pathname_desc [pth$l_invocnum] = .number;
+
+	END %,
+
+
+    ! ADD_NULL_ID adds a null name string to the name vector to represent a
+    ! global reference or numeric scope. The null string is always the first name.
+    !
+    ADD_NULL_ID =
+	BEGIN
+
+	! Write in the address of the null name into the first name spot
+	!
+	name_vect [0] = null_string;
+	pathname_desc [pth$b_totcnt] = .pathname_desc [pth$b_totcnt] + 1;
+	pathname_desc [pth$b_pathcnt] = .pathname_desc [pth$b_totcnt];
+	name_index = 1;
+
+	END %,
+
+
+    ! ADD_GLOBAL_ID inserts the null string into the name list, followed by the
+    ! present id (in the lexical string)
+    !
+    ADD_GLOBAL_ID =
+	BEGIN
+
+	add_null_id;
+	add_id;
+
+	END %,
+
+
+    ! ADD_NUMERIC_SCOPE places the null string into the name list and sets up an
+    ! invocation number for it (corresponding to the numeric scope). The invocations
+    ! augmentation is set by add_invocation_number.
+    !
+    ADD_NUMERIC_SCOPE =
+	BEGIN
+
+	add_null_id;
+	add_invocation_number;
+
+	END %,
+
+
+    ! ADD_LINE inserts a '%LINE' followed by the line number into the name list.
+    ! LINE augmentations are set.
+    !
+    ADD_LINE =
+	BEGIN
+
+	LOCAL
+	    LINE_ITEM : REF VECTOR [,BYTE];
+
+	augmentations [line_found] = true;
+	augmentations [line_pending] = false;
+
+
+	! Get storage for the string
+	!
+	IF NOT dbg$nlist_freez (((.number_buffer [0] + 6) / %UPVAL) + 1,
+				  line_item,
+				  dummy)
+	THEN
+	    RETURN sts$k_severe;
+
+
+	! Copy in the 'LINE'
+	!
+	ch$move (6, UPLIT BYTE ('%LINE '), line_item [1]);
+
+
+	! Copy over the number
+	!
+	ch$move (.number_buffer [0], number_buffer [1], line_item [7]);
+
+
+	! Fill in the count
+	!
+	line_item [0] = 6 + .number_buffer [0];
+
+
+	! Add the string to the name list
+	!
+	add_to_list (.line_item);
+
+	END %,
+
+
+    ! ADD_LABEL adds '%LABEL' followed by the label number to the name list and
+    ! sets the label found augmentation.
+    !
+    ADD_LABEL =
+	BEGIN
+
+	LOCAL
+	    LABEL_ITEM : REF VECTOR [,BYTE];
+
+	augmentations [label_found] = true;
+	augmentations [label_pending] = false;
+
+
+	! Get storage for the string
+	!
+	IF NOT dbg$nlist_freez (((.number_buffer [0] + 7) / %UPVAL) + 1,
+				  label_item,
+				  dummy)
+	THEN
+	    RETURN sts$k_severe;
+
+
+	! Copy in the 'LABEL'
+	!
+	ch$move (7, UPLIT BYTE ('%LABEL '), label_item [1]);
+
+
+	! Copy over the number
+	!
+	ch$move (.number_buffer [0], number_buffer [1], label_item [8]);
+
+
+	! Fill in the count
+	!
+	label_item [0] = 7 + .number_buffer [0];
+
+
+	! Add the string to the name list
+	!
+	add_to_list (.label_item);
+
+	END %,
+
+
+    ! ADD_TO_L_NUMBER adds pieces of a line or label number to the number buffer.
+    ! An augmentation is used to check if this is the first part of the number or
+    ! a continuation.
+    !
+    ADD_TO_L_NUMBER =
+	BEGIN
+
+	LOCAL
+	    NUMBER_DESC : dbg$stg_desc,
+	    TEMP : REF VECTOR [,BYTE];
+
+	number_desc [dsc$a_pointer] = .lex_string_desc [dsc$a_pointer];
+	number_desc [dsc$w_length] = .lex_string_desc [dsc$w_length];
+
+
+	! Delete leading '0's
+	!
+	WHILE .number_desc [dsc$w_length] GTR 1
+	DO
+	    BEGIN
+	    IF ch$rchar (.number_desc [dsc$a_pointer]) NEQ '0'
+	    THEN
+		EXITLOOP;
+
+	    number_desc [dsc$w_length] = .number_desc [dsc$w_length] - 1;
+	    number_desc [dsc$a_pointer] = .number_desc [dsc$a_pointer] + 1;
+	    END;	! End of loop
+
+
+	! Check for new number or continuation
+	!
+	IF .augmentations [l_number_started]
+	THEN
+	    BEGIN
+
+	    ! Add the new number to what we already have
+	    !
+	    temp = .number_buffer;
+
+	    IF NOT dbg$nlist_freez (((.temp [0] + .number_desc [dsc$w_length]) / %UPVAL) + 1,
+				    number_buffer,
+				    dummy)
+	    THEN
+		RETURN sts$k_severe;
+
+
+	    ! concatenate the old string with the new
+	    !
+	    ch$move (.temp [0],  temp [1], number_buffer [1]);
+	    ch$move (.number_desc [dsc$w_length], 
+		     .number_desc [dsc$a_pointer],
+		     number_buffer [.temp [0] + 1]);
+	    
+	    number_buffer [0] = .temp [0] + .number_desc [dsc$w_length];
+	    END
+	ELSE
+	    BEGIN
+
+	    ! Start a new number buffer
+	    !
+	    augmentations [l_number_started] = true;
+
+	    IF NOT dbg$nlist_freez (((.number_desc [dsc$w_length] / %UPVAL) + 1),
+				    number_buffer,
+				    dummy)
+	    THEN
+		RETURN sts$k_severe;
+
+	    ch$move (.number_desc [dsc$w_length], 
+		     .number_desc [dsc$a_pointer],
+		     number_buffer [1]);
+
+	    number_buffer [0] = .number_desc [dsc$w_length];
+	    END;
+
+	END %;
+
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+
+	! These are augmentation literals
+
+	LINE_PENDING		= 0,
+	LINE_FOUND		= 1,
+	LABEL_PENDING		= 2,
+	LABEL_FOUND		= 3,
+	INVOCATION_FOUND	= 4,
+	L_NUMBER_STARTED	= 5,
+	TERMINAL_PENDING	= 6,
+	TERMINAL_STATE		= 7;
+
+!
+! OWN STORAGE:
+!
+
+OWN
+	LAST_TOKEN_DESC : dbg$stg_desc,			! Copy of last lex string desc
+							! accepted during parsing
+	LAST_TOKEN,					! Last token found
+	DUMMY,						! Dummy variable
+	INPUT_DESC 	: REF dbg$stg_desc,		! Input string descriptor
+	PATHNAME_DESC 	: REF pth$pathname,		! Path name descriptor
+	NAME_VECT	: REF VECTOR,			! Name vector for pathname descriptor
+	NAME_INDEX,					! Index into name vector
+	VALUE_STATE,					! Return state value
+	NUMBER_BUFFER	: REF VECTOR [,BYTE],		! Buffer for l number
+	AUGMENTATIONS   : BITVECTOR [8],		! Augmentation vector
+	TOKEN,						! Lexical token
+	TOKEN_SCANNER_ADDR,				! Address of lexical scanner
+	LEX_STRING_DESC : dbg$stg_desc;			! Descriptor of string for token
+
+BIND
+	NULL_STRING 	= UPLIT BYTE (0);		! Null string
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL ROUTINE
+	SYS$FAO 	: ADDRESSING_MODE (ABSOLUTE),	! System service
+	DBG$NNEXT_WORD,					! Returns next word of input
+	DBG$NSYNTAX_ERROR,				! Constructs a syntax error
+	DBG$NMATCH,					! Matches input to counted strings
+	DBG$NOUT_INFO,					! Outputs an informational message
+	DBG$NMAKE_ARG_VECT,				! Constructs a message argument vector
+	DBG$NLIST_FREEZ,				! Gets listed dynamic storage
+	DBG$NSAVE_DECIMAL_INTEGER;			! Converts ascii to integer
+
+
+GLOBAL ROUTINE DBG$NPATHNAME_PARSER (INPUT, SCANNER, PATHNAME, VALUE, LAST_DESC) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Top level parse network for DEBUG pathname parsing. This network
+!	accepts valid DEBUG pathnames and constructs a partial pathname descriptor.
+!	Upon return, the caller of this routine must analyze the pathname descriptor
+!	in conjunction with the return value, and complete the pathname descriptor.
+!
+!	This routine will not terminate the collection of a pathname until a
+!	null or invalid token has been returned by the scanner routine, or an
+!	invalid pathname construct has been encountered. This means
+!	that the collected pathname may include part or all of a data item reference.
+!
+!	This routine expects to have the address of a language specific lexical
+!	analyzer routine passed to it. This lexical analyzer supplies tokens to
+!	the parser. The tokens recognized are:
+!
+!	dbg$k_tok_null		-  end of input
+!
+!	dbg$k_tok_line		- '%LINE'
+!
+!	dbg$k_tok_label		- '%LABEL'
+!
+!	dbg$k_tok_bs		- '\' (back slash)
+!
+!	dbg$k_tok_id		- language specific symbolic identifier
+!
+!	dbg$k_tok_int		- unsigned integer
+!
+!	dbg$k_tok_dot		- '.'
+!
+!	dbg$k_tok_reg		- '%register'
+!
+!	dbg$k_tok_qname		- '%NAME'
+
+!	dbg$k_tok_inval		- any other string
+!
+!	
+!	In conjunction with a token, the scanner routine returns a lexical string
+!	which contains the ascii characters associated with the token. Note that
+!	integers are not translated into binary values by the scanner.
+!
+!	The pathname parser assumes the responsibility of updating the input string
+!	to reflect the acceptance of a lexical string corresponding to a token.
+!
+!	Upon success or failure, the input string descriptor is updated to reflect
+!	the point at which processing stopped. That is, the dsc$a_pointer field
+!	contains the address of the first character not accepted.
+!
+!
+! FORMAL PARAMETERS:
+!
+!	INPUT			- The address of a VAX standard string descriptor
+!				  representing the input string
+!
+!	SCANNER			- The address of a language specific lexical analyzer
+!
+!	PATHNAME		- The address of a longword to contain the address
+!				  of a pathname descriptor
+!
+!	VALUE			- The address of a longword to contain an unsigned
+!				  integer encoding of the type of pathname collected:
+!	
+!				dbg$k_line	- pathname describes %LINE entity,
+!						  NOT a data item
+!
+!				dbg$k_label	- pathname describes %LABEL entity,
+!						  NOT a data item
+!	
+!				dbg$k_pn_reg    _ pathname qualified register (not
+!						  supported yet), or unqualified
+!						  register reference (supported).
+!						  In both cases, the register name
+!						  is NOT written into the pathname
+!						  descriptor, but is left as the
+!						  first token in the input buffer.
+!						  This means that the pathname
+!						  descriptor for an unqualified register
+!						  will have an item count of 0.
+!
+!				dbg$k_pn	- pathname may describe a data or
+!						  lexical entity
+!
+!	LAST_DESC		- The address of a longword to contain the address
+!				  of a standard string descriptor. This descriptor
+!				  is a copy of the last lexical string descriptor
+!				  accepted during parsing
+!
+!	[SCOPE_FLAG]		- Optional parameter. If supplied, and if true,
+!				  then accept global and numeric scopes as well
+!				  as regular pathnames.
+!				  
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS		- Success. Some flavor of pathname returned
+!
+!	STS$K_SEVERE		- Failure. Syntax error encountered. VALUE parameter
+!				  not defined. Input descriptor returned to original state.
+!
+! SIDE EFFECTS:
+!
+!	The input string descriptor is updated to reflect one character beyond the
+!	last character accepted.
+!--
+
+    BEGIN
+
+    BUILTIN
+	ACTUALCOUNT,
+	ACTUALPARAMETER;
+
+    LOCAL
+	SCOPE_FLAG;			! Optional parameter value
+
+    ! Set the scope flag
+    !
+    scope_flag = (IF actualcount () GTR 5 THEN actualparameter (6) ELSE 0);
+
+
+    ! All this routine does is to initialize the control variables and call the
+    ! the real parse network.
+    !
+    input_desc = .input;
+    token_scanner_addr = .scanner;
+
+    lex_string_desc [dsc$b_class] = dsc$k_class_s;
+    lex_string_desc [dsc$b_dtype] = dsc$k_dtype_t;
+    lex_string_desc [dsc$w_length] = 0;
+    lex_string_desc [dsc$a_pointer] = 0;
+
+    last_token_desc [dsc$a_pointer] = .input_desc [dsc$a_pointer];
+    last_token_desc [dsc$w_length] = .input_desc [dsc$w_length];
+
+
+    ! Obtain storage for the pathname descriptor and line up the name vector
+    !
+    IF NOT dbg$nlist_freez (dbg$k_pathname_size, pathname_desc, dummy)
+    THEN
+	RETURN sts$k_severe;
+
+    name_vect = pathname_desc [pth$a_pathvector];
+    name_index = 0;
+
+
+    ! Initialize the fields of the pathname descriptor.
+    !
+    pathname_desc [pth$b_totcnt] = 0;
+    pathname_desc [pth$b_locinvoc] = 0;
+    pathname_desc [pth$l_invocnum] = 0;
+
+
+    ! Initialize the augmentation vector and set the value state
+    !
+    augmentations [line_pending] 	= false;
+    augmentations [line_found]		= false;
+    augmentations [label_pending]	= false;
+    augmentations [label_found]		= false;
+    augmentations [invocation_found]	= false;
+    augmentations [l_number_started]	= false;
+    augmentations [terminal_pending]	= false;
+    augmentations [terminal_state] 	= false;
+
+    value_state = -1;
+
+
+    ! Variables are initialized. Try to do the parsing.
+    ! Check for scope acceptance.
+    !
+    IF .scope_flag
+    THEN
+	BEGIN
+	IF short_scope ()
+	THEN
+	    BEGIN
+	    .pathname = .pathname_desc;
+	    RETURN sts$k_success;
+	    END
+	ELSE
+	    BEGIN
+	    IF parse_pathname ()
+	    THEN
+		BEGIN
+		.pathname = .pathname_desc;
+		RETURN sts$k_success;
+		END
+	    ELSE
+		RETURN sts$k_severe;
+	    END;
+        END
+    ELSE
+	BEGIN
+	IF NOT parse_pathname () THEN RETURN sts$k_severe;
+	END;
+	    
+
+    ! Set the value state
+    !
+    check_pathname ();
+
+
+    ! Return all the expected values.
+    !
+    .pathname = .pathname_desc;
+    .value = .value_state;
+    .last_desc = last_token_desc;
+
+    RETURN sts$k_success;
+
+    END;			!End of DBG$NPATHNAME_PARSER
+
+
+ROUTINE PARSE_PATHNAME =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine recognizes legal DEBUG pathnames. All special cases are
+!	trapped first, then the routine goes into a loop to accept the remaining
+!	elements of the pathname. Augmentations are used to assure the the '%L'
+!	constructs appear only one time, as well as to check the validity of
+!	invocation numbers and numeric pathnames.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	Numerious MODULE LEVEL OWN'ed variables.
+!
+! IMPLICIT OUTPUTS:
+!
+!	The pathname descriptor is constructed for valid pathname references.
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS	(1)	- Success. Pathname constructed.
+!
+!	STS$K_SEVERE    (4)	- Failure. Illegal pathname.
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    ! Get the first token and check for all the legal pathname beginnings
+    !    
+    get_token;
+
+    CASE .token FROM dbg$k_tok_lowest TO dbg$k_tok_highest
+	OF
+	SET
+
+	[dbg$k_tok_line] :
+	    IF NOT first_line () THEN RETURN sts$k_severe;
+
+	[dbg$k_tok_label] :
+	    IF NOT first_label () THEN RETURN sts$k_severe;
+
+	[dbg$k_tok_bs] :	! Looking for a global reference
+	    IF NOT global_item () THEN RETURN sts$k_severe;
+
+	[dbg$k_tok_id] :	! starting with an id
+	    IF NOT id_item () THEN RETURN sts$k_severe;
+
+	[dbg$k_tok_int] :	! Numeric scope
+	    IF NOT numeric_pathname () THEN RETURN sts$k_severe;
+
+	[dbg$k_tok_reg] :
+	    RETURN sts$k_success;
+
+	[dbg$k_tok_qname] :
+	    IF NOT qname_item () THEN RETURN sts$k_severe;
+
+	[INRANGE, OUTRANGE] :	! Error
+	    RETURN sts$k_severe;
+
+	TES;
+
+    !
+    ! Loop, collecting the rest of the pathname
+    !
+    get_token;
+    WHILE .token EQL dbg$k_tok_bs AND NOT .augmentations [terminal_state]
+    DO
+	BEGIN
+	! Check for one more trip through loop
+	!
+	IF .augmentations [terminal_pending]
+	THEN
+	    augmentations [terminal_state] = true;
+
+	advance;
+	get_token;
+
+	CASE .token FROM dbg$k_tok_lowest TO dbg$k_tok_highest
+	    OF
+	    SET
+
+	    [dbg$k_tok_line] :	! '%LINE'
+		IF NOT line_item () THEN RETURN sts$k_severe;
+
+	    [dbg$k_tok_label] :	! '%LABEL'
+		IF NOT label_item () THEN RETURN sts$k_severe;
+
+	    [dbg$k_tok_id] :	! ID found. May have an invocation number.
+		IF NOT id_item () THEN RETURN sts$k_severe;
+
+	    [dbg$k_tok_int] :	! LINE or LABEL number
+		IF NOT integer_item () THEN RETURN sts$k_severe;
+
+	    [dbg$k_tok_qname] :	! %NAME 'name'
+		IF NOT qname_item () THEN RETURN sts$k_severe;
+
+	    [INRANGE, OUTRANGE] :	! Error
+		RETURN sts$k_severe;
+
+	    TES;
+
+	! Obtain the next token
+	!
+	get_token;
+
+	END;		! End of loop
+
+    !
+    ! Must end parsing on eol
+    !
+    IF .token NEQ dbg$k_tok_null
+		AND
+       .token NEQ dbg$k_tok_inval
+		AND
+       .token NEQ dbg$k_tok_id
+		AND
+      (.token NEQ dbg$k_tok_dot OR .last_token NEQ dbg$k_tok_id)
+    THEN
+	RETURN sts$k_severe;
+
+
+    ! See if a '%LINE' or '%LABEL' has been left dangling
+    !
+    IF .augmentations [line_pending] OR .augmentations [label_pending]
+    THEN
+	RETURN sts$k_severe;
+
+    RETURN sts$k_success;
+
+    END;		! End of parse_pathname
+
+
+ROUTINE FIRST_LINE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is called when the pathname begins with '%LINE'. Special
+!	handling is given to the resolution of line numbers vs. numeric pathnames.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	Augmentations and MODULE OWN'ed variables.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS		- Success. Part or all of pathname parsed.
+!
+!	STS$K_SEVERE		- Failure. Illegal construct encountered.
+!
+! SIDE EFFECTS:
+!
+!	All or part of the pathname descriptor may be constructed.
+!
+!--
+    BEGIN
+
+    augmentations [line_pending] = true;
+    advance;
+
+    ! Get the next token. If it is an integer, we are going to have to
+    ! do some lookahead to see if it is a line number or numeric scope.
+    !
+    get_token;
+
+    CASE .token FROM dbg$k_tok_lowest TO dbg$k_tok_highest
+	OF
+	SET
+
+	[dbg$k_tok_bs] :	! Do nothing
+	    BEGIN
+	    0;
+	    END;
+
+	[dbg$k_tok_id] :	! ID followed by possible invocation number
+	    IF NOT id_item () THEN RETURN sts$k_severe;	    ! Save the id and advance
+
+	[dbg$k_tok_int] : ! Here we must do lookahead to see if we have a line number
+	    IF NOT line_lookahead () THEN RETURN sts$k_severe;
+
+	[INRANGE,OUTRANGE] :	! Error
+	    RETURN sts$k_severe;
+
+	TES;
+
+    RETURN sts$k_success;
+
+    END;		! End of FIRST_LINE
+
+
+ROUTINE LINE_LOOKAHEAD =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Distinguishes between line numbers and numeric pathname items when '%LINE'
+!	is encountered first in pathname parsing.
+!
+!	If the numeric pathname item is found, the entire pathname descriptor is
+!	completed.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	MODULE OWN'ed variables
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS		- Success. Valid entire or partial pathname parsed.
+!
+!	STS$K_SEVERE		- Failure. Illegal pathname found.
+!
+! SIDE EFFECTS:
+!
+!	Part or all of the pathname descriptor may be constructed.
+!
+!--
+    BEGIN
+    LOCAL
+	LENGTH,
+	POINTER;
+
+    augmentations [line_pending] = true;
+
+    save (length, pointer);
+    advance;
+    get_token;
+
+    CASE .token FROM dbg$k_tok_lowest TO dbg$k_tok_highest
+	OF
+	SET
+
+	! We appear to have a properly terminated line number.  Note that we
+	! must accept a line number terminated by an ID as valid because the
+	! ID could be "DO" (as in "SET BREAK %LINE 20 DO(.....)").
+	!
+	[dbg$k_tok_null,
+	 dbg$k_tok_inval,
+	 dbg$k_tok_id]:
+	    BEGIN
+	    restore (.length, .pointer);
+	    get_token;
+
+	    IF NOT integer_item () THEN RETURN sts$k_severe;
+
+	    END;
+
+	[dbg$k_tok_bs] :  ! Lookahead one more time
+	    BEGIN
+	    advance;
+	    get_token;
+
+	    IF .token EQL dbg$k_tok_int
+	    THEN
+		BEGIN
+
+		! The first integer we found was a numeric scope
+		!
+		restore (.length, .pointer);
+		get_token;
+
+		IF NOT numeric_pathname () THEN RETURN sts$k_severe;
+		END
+	    ELSE
+		BEGIN
+
+		! The integer was a line number
+		!
+		restore (.length, .pointer);
+		get_token;
+
+		IF NOT integer_item () THEN RETURN sts$k_severe;
+
+		END;
+	    END;
+
+	[dbg$k_tok_dot] :	! Line number with a dot
+	    BEGIN
+	    restore (.length, .pointer);
+	    get_token;
+
+	    IF NOT integer_item () THEN	RETURN sts$k_severe;
+	    END;
+
+	[INRANGE,OUTRANGE] :	! Error
+	    RETURN sts$k_severe;
+
+	TES;
+
+    RETURN sts$k_success;
+
+    END;		! End of LINE_LOOKAHEAD
+
+
+ROUTINE FIRST_LABEL =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Invoked when the pathname begins with '%LABEL'. Lookahead may be needed to
+!	distinguish a numeric pathname item from a label number.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	MODULE level OWN'ed variables
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS		- Success. Part or all of a valid pathname parsed.
+!
+!	STS$K_SEVERE		- Failure. Illegal pathname encountered.
+!
+! SIDE EFFECTS:
+!
+!	Part or all of the pahtname descriptor may be constructed
+!
+!--
+    BEGIN
+
+    augmentations [label_pending] = true;
+    advance;
+
+
+    ! Get the next token. If it is an integer, we are going to have to
+    ! do some lookahead to see if it is a label number or numeric scope.
+    !
+    get_token;
+
+    CASE .token FROM dbg$k_tok_lowest TO dbg$k_tok_highest
+	OF
+	SET
+
+	[dbg$k_tok_bs] :	! Do nothing
+	    0;
+
+	[dbg$k_tok_id] :	! ID followed by possible invocation number
+	    IF NOT id_item () THEN RETURN sts$k_severe;
+
+	[dbg$k_tok_int] : ! Here we must do lookahead to see if we have
+			  ! a label number or a numeric scope
+	    IF NOT label_lookahead () THEN RETURN sts$k_severe;
+
+	[INRANGE,OUTRANGE] :	! Error
+	    RETURN sts$k_severe;
+
+	TES;
+
+    RETURN sts$k_success;
+
+    END;		! End of FIRST_LABEL
+
+
+ROUTINE LABEL_LOOKAHEAD =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Performs lookahead to distinguish a numeric pathname item from a label number.
+!
+!	If a numeric pathname item is found, the entire pathname wiil be parsed.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	MODULE level OWN'ed variables, including the augmentation vector.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS		- Success. Part or all of a valid pathname parsed.
+!
+!	STS$K_SEVERE		- Failure. Invalid pathname found.
+!
+! SIDE EFFECTS:
+!
+!	Part or all of the pathname descriptor may be constructed.
+!
+!--
+    BEGIN
+
+    LOCAL
+	LENGTH,
+	POINTER;
+
+    augmentations [label_pending] = true;
+    save (length, pointer);
+    advance;
+    get_token;
+
+    CASE .token FROM dbg$k_tok_lowest TO dbg$k_tok_highest
+	OF
+	SET
+
+	[dbg$k_tok_null,
+	 dbg$k_tok_inval,
+	 dbg$k_tok_id]:
+	    BEGIN
+	    restore (.length, .pointer);
+	    get_token;
+
+	    IF NOT integer_item () THEN	RETURN sts$k_severe;
+
+	    END;
+
+	[dbg$k_tok_bs] :  ! Lookahead one more time
+	    BEGIN
+	    advance;
+	    get_token;
+
+	    IF .token EQL dbg$k_tok_int
+	    THEN
+		BEGIN
+
+		! The first integer we found was a numeric scope
+		!
+		restore (.length, .pointer);
+		get_token;
+
+		IF NOT numeric_pathname () THEN RETURN sts$k_severe;
+		END
+	    ELSE
+		BEGIN
+
+		! The integer was a label number
+		!
+		restore (.length, .pointer);
+		get_token;
+
+		IF NOT integer_item () THEN RETURN sts$k_severe;
+
+		END;
+	    END;
+
+	[INRANGE,OUTRANGE] :	! Error
+	    RETURN sts$k_severe;
+
+	TES;
+
+    RETURN sts$k_success;
+
+    END;		! End of LABEL_LOOKAHEAD
+
+
+ROUTINE GLOBAL_ITEM =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Invoked when the pathname begins with '\'. The entire pathname correspoding
+!	to the global reference will be parsed.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	MODULE level OWN'ed variables.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS		- Success. Global reference parsed.
+!
+!	STS$K_SEVERE		_ Failure. Invalid pathname detected.
+!
+! SIDE EFFECTS:
+!
+!	All of the pathname descriptor will be constructed for a valid global
+!	reference.
+!
+!--
+    BEGIN
+
+    advance;
+    get_token;
+
+	    
+    ! This must be an id or an id followed by an invocation number
+    !
+    IF .token NEQ dbg$k_tok_id THEN RETURN sts$k_severe;
+
+    add_global_id;
+    advance;
+    get_token;
+
+    CASE .token FROM dbg$k_tok_lowest TO dbg$k_tok_highest
+	OF
+	SET
+
+	! Success and end.
+	!
+   	[dbg$k_tok_null,
+	 dbg$k_tok_inval,
+	 dbg$k_tok_id]:
+	    BEGIN
+	    0;
+	    END;
+
+   	[dbg$k_tok_int] : ! Invocation number
+	    BEGIN
+	    add_invocation_number;
+	    advance;
+	    END;
+
+   	[INRANGE,OUTRANGE] :
+	    BEGIN
+	    RETURN sts$k_severe;
+	    END;
+
+	TES;
+
+    augmentations [terminal_state] = true;
+
+    RETURN sts$k_success;
+
+    END;	! End of GLOBAL_ITEM
+
+
+ROUTINE NUMERIC_PATHNAME =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Parse the entire pathname when a numeric pathname item is encountered at
+!	the start of a pathname.
+!
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	MODULE level OWN'ed variables.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS		- Success. Valid numeric pathname parsed.
+!
+!	STS$K_SEVERE		- Failure. Invalid pathname found.
+!
+! SIDE EFFECTS:
+!
+!	The entire pathname descriptor for a valid numeric pathname is constructed.
+!
+!--
+    BEGIN
+
+    add_numeric_scope;
+    advance;
+    get_token;
+
+
+    ! Looking for backslash
+    !
+    IF .token NEQ dbg$k_tok_bs THEN RETURN sts$k_severe;
+
+    advance;
+    get_token;
+
+
+    ! The data item or '%line', '%label' must immediately follow the numeric scope
+    !
+    CASE .token FROM dbg$k_tok_lowest TO dbg$k_tok_highest
+	OF
+	SET
+
+	[dbg$k_tok_line] :	! %line
+	    IF NOT line_item () THEN RETURN sts$k_severe;
+
+	[dbg$k_tok_label] : ! '%LABEL'
+	    IF NOT label_item () THEN RETURN sts$k_severe;
+
+	[dbg$k_tok_id] : 	! Data reference
+	    IF NOT id_item () THEN RETURN sts$k_severe;
+
+	[dbg$k_tok_int] :	! Possible line or label number
+	    IF NOT integer_item () THEN RETURN sts$k_severe;
+
+	[INRANGE, OUTRANGE] :	! Error
+	    RETURN sts$k_severe;
+
+	TES;
+
+    augmentations [terminal_state] = true;
+
+    RETURN sts$k_success;
+
+    END;	! End of NUMERIC_PATHNAME
+
+
+ROUTINE LINE_ITEM =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Accepts a '%LINE' line_number construct.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	MODULE level OWN'ed variables.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS		- Success. Line item parsed.
+!
+!	STS$K_SEVERE		- Failure. Invalid line item.
+!
+! SIDE EFFECTS:
+!
+!	The '%LINE' reference is added to the pathname descriptor
+!
+!--
+    BEGIN
+
+    ! Check to see if we have already encountered '%LINE' or '%LABEL'
+    !		
+    IF .augmentations [line_pending] OR .augmentations [label_pending]
+				     OR
+       .augmentations [line_found]   OR .augmentations [label_found]
+
+    THEN
+        RETURN sts$k_severe;
+
+    augmentations [line_pending] = true;
+    advance;
+    get_token;
+
+
+    ! Accept the line number
+    !
+    IF .token NEQ dbg$k_tok_int THEN RETURN sts$k_severe;
+
+    IF NOT integer_item () THEN RETURN sts$k_severe;
+
+    RETURN sts$k_success;
+
+    END;	! END of LINE_ITEM
+
+
+ROUTINE LABEL_ITEM =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Parses a '%LABEL' item.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	The augmentation vector.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS		- Success. Label item parsed.
+!
+!	STS$K_SEVERE		- Failure. Invalid label item.
+!
+! SIDE EFFECTS:
+!
+!	The label reference is added to the pathname descriptor.
+!
+!--
+    BEGIN
+
+    ! See if '%LINE' or '%LABEL' has already been found
+    !
+    IF .augmentations [line_pending] OR .augmentations [label_pending]
+				     OR
+       .augmentations [line_found]   OR .augmentations [label_found]
+
+    THEN
+        RETURN sts$k_severe;
+
+    augmentations [label_pending] = true;
+    advance;
+    get_token;
+
+
+    ! Accept the label number
+    !
+    IF .token NEQ dbg$k_tok_int THEN RETURN sts$k_severe;
+
+    IF NOT integer_item () THEN RETURN sts$k_severe;
+
+    RETURN sts$k_success;
+
+    END;	! End of LABEL_ITEM
+
+
+ROUTINE QNAME_ITEM =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Parses an QNAME item.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	The augmentation vector.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS		- Success. Valid QNAME item parsed.
+!
+!	STS$K_SEVERE		- Failure. Invalid QNAME item found.
+!
+! SIDE EFFECTS:
+!
+!	An ID item is added to the pathname descriptor.
+!
+!--
+    BEGIN
+    LOCAL
+	character : BYTE,
+	terminal  : BYTE;
+
+    BIND ROUTINE lexical_scanner = .token_scanner_addr;
+    BIND
+	lexeme_length	= lex_string_desc[dsc$w_length]	: WORD,
+	lexeme_pointer	= lex_string_desc[dsc$a_pointer]: LONG;
+
+    ! First advance over '%NAME' and any following blanks
+    !
+    advance;
+
+    IF .input_desc[dsc$w_length] GTRU 0
+    THEN
+	BEGIN
+	character = ch$rchar(.input_desc[dsc$a_pointer]);
+	WHILE .character EQL ' ' AND .input_desc[dsc$w_length] GTRU 0
+	DO
+	    BEGIN
+	    input_desc[dsc$w_length] = .input_desc[dsc$w_length] - 1;
+	    input_desc[dsc$a_pointer] = ch$plus(.input_desc[dsc$a_pointer],1);
+	    character = ch$rchar(.input_desc[dsc$a_pointer]);
+	    END;
+	END;
+
+    IF .input_desc[dsc$w_length] LEQU 0 THEN RETURN sts$k_severe;
+
+    IF .character EQL '(' OR .character EQL '"' OR .character EQL dbg$k_quote
+    THEN	! Name is enclosed in delimiters
+	BEGIN
+	IF .input_desc[dsc$w_length] LEQU 2 THEN RETURN sts$k_severe;
+	terminal = (IF .character EQL '(' THEN ')' ELSE .character);
+	lexeme_length  = 0;
+	lexeme_pointer = ch$plus(.input_desc[dsc$a_pointer],1);
+	character = ch$rchar(ch$plus(.lexeme_pointer,.lexeme_length));
+	WHILE (.character NEQ .terminal)
+	DO
+	    BEGIN
+	    IF .character EQL dbg$k_car_return THEN RETURN sts$k_severe;
+	    lexeme_length = .lexeme_length + 1;
+	    IF .lexeme_length + 1 GEQU .input_desc[dsc$w_length]
+	    THEN
+		RETURN sts$k_severe;
+	    character = ch$rchar(ch$plus(.lexeme_pointer,.lexeme_length));
+	    END;
+	END
+    ELSE
+	BEGIN
+	lexical_scanner(.input_desc,lex_string_desc,token);
+	IF .token NEQ dbg$k_tok_id AND .token NEQ dbg$k_tok_int
+	THEN
+	    RETURN sts$k_severe;
+	terminal = 0;
+	END;
+
+    token = dbg$k_tok_id;
+    add_id;
+    advance;
+    IF .terminal NEQ 0
+    THEN
+	BEGIN
+	input_desc[dsc$w_length]  = .input_desc[dsc$w_length] - 1;
+	input_desc[dsc$a_pointer] = ch$plus(.input_desc[dsc$a_pointer],1);
+	END;
+
+    get_token;
+
+    ! Check for invocation number
+    !		
+    IF .token EQL dbg$k_tok_int
+    THEN
+        BEGIN	! See if an invocation number has already been found.
+        IF .augmentations [invocation_found] THEN RETURN sts$k_severe;
+        add_invocation_number;
+        advance;
+        END;
+
+    RETURN sts$k_success;
+
+    END;	! End of QNAME_ITEM
+
+
+ROUTINE ID_ITEM =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Parses an ID item.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	The augmentation vector.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS		- Success. Valid ID item parsed.
+!
+!	STS$K_SEVERE		- Failure. Invalid ID item found.
+!
+! SIDE EFFECTS:
+!
+!	The ID item is added to the pathname descriptor.
+!
+!--
+    BEGIN
+
+    add_id;
+    advance;
+    get_token;
+
+
+    ! Check for invocation number
+    !		
+    IF .token EQL dbg$k_tok_int
+    THEN
+        BEGIN	! See if an invocation number has already been found.
+        IF .augmentations [invocation_found] THEN RETURN sts$k_severe;
+        add_invocation_number;
+        advance;
+        END;
+
+    RETURN sts$k_success;
+
+    END;	! End of ID_ITEM
+
+
+ROUTINE INTEGER_ITEM =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Parses a dangling line or label number.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	The augmentation vector.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS		- Success. LINE or LABEL number parsed.
+!
+!	STS$K_SEVERE		- Failure. Invalid integer item found.
+!
+! SIDE EFFECTS:
+!
+!	The line or label number is added to the pathname descriptor.
+!
+!--
+    BEGIN
+
+    ! Determine if looking for line or label number
+    !
+    SELECTONE true
+        OF
+        SET
+
+        [.augmentations [line_pending]] :	! Line number
+      	    BEGIN
+	    add_to_l_number;
+	    advance;
+	    get_token;
+
+
+	    ! See if more line number follows
+	    !
+	    IF .token EQL dbg$k_tok_dot
+	    THEN
+	        BEGIN
+	        add_to_l_number;
+	        advance;
+	        get_token;
+
+	        IF .token NEQ dbg$k_tok_int THEN RETURN sts$k_severe;
+
+		add_to_l_number;
+		add_line;
+		advance;
+		END
+	    ELSE
+	        add_line;
+	    END;
+
+	[.augmentations [label_pending]] :	! LABEL number
+	    BEGIN
+	    add_to_l_number;
+	    add_label;
+	    advance;
+	    END;
+
+	[OTHERWISE] :
+	    RETURN sts$k_severe;
+
+	TES;
+
+    augmentations [terminal_pending] = true;
+
+    RETURN sts$k_success;
+
+    END;	! End of INTEGER_ITEM
+
+
+ROUTINE SHORT_SCOPE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Parses global or numeric scopes. On failure, resets input to original state.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS		- Success. Global or numeric scope accepted.
+!
+!	STS$K_SEVERE		- Failure. Input not a numeric or global scope
+!
+! SIDE EFFECTS:
+!
+!	If successful, produces a complete pathname descriptor for global
+!	or numeric scope.
+!
+!--
+    BEGIN
+
+    LOCAL
+	LENGTH,			! Original input length
+	POINTER;		! Original input pointer
+
+    ! Save the original input
+    !
+    save (length, pointer);
+
+
+    ! Obtain the first token and check for integer or backslash
+    !
+    get_token;
+
+    CASE .token FROM dbg$k_tok_lowest TO dbg$k_tok_highest
+	OF
+	SET
+
+	[dbg$k_tok_bs] : ! Global scope ?
+	    BEGIN
+	    advance;
+	    get_token;
+
+	    IF .token EQL dbg$k_tok_null OR .token EQL dbg$k_tok_inval
+	    THEN
+		BEGIN
+
+		! Yes, global scope.
+		!
+		add_null_id;
+		END
+	    ELSE
+		BEGIN
+
+		! No. Restore input.
+		!
+		restore (.length, .pointer);
+		RETURN sts$k_severe;
+		END;
+	    END;
+
+	[dbg$k_tok_int] : 	! Numeric scope ?
+	    BEGIN
+	    advance;
+	    get_token;
+
+	    IF .token EQL dbg$k_tok_inval OR .token EQL dbg$k_tok_null
+	    THEN
+		BEGIN
+
+		! Yes, numeric scope
+		!
+	    	restore (.length, .pointer);
+		get_token;
+		add_numeric_scope;
+		advance;
+		END
+	    ELSE
+		BEGIN
+
+		! No, restore and fail
+		!
+		restore (.length, .pointer);
+		RETURN sts$k_severe;
+		END;
+	    END;
+
+	[INRANGE, OUTRANGE] :
+	    BEGIN
+	    RETURN sts$k_severe;
+	    END;
+
+	TES;
+
+    RETURN sts$k_success;
+
+    END;	! End of short_scope
+	
+
+GLOBAL ROUTINE CHECK_PATHNAME  : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine examines a completed pathname descriptor and classifies its
+!	type by setting the value state to:
+!
+!	dbg$k_reg	:	register reference (item count is 0)
+!
+!	dbg$k_line	:	line number reference (not a data item)
+!
+!	dbg$k_label	:	numeric label reference (not a data item)
+!
+!	dbg$k_pn	:	data or lexical item reference
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	The pathname descriptor constructed by parse_pathname.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NOVALUE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	The value state is set according to the type of pathname descriptor examined.
+!
+!--
+    BEGIN
+
+    BIND
+	LINE_STG	= UPLIT BYTE ('%LINE'),
+	LABEL_STG	= UPLIT BYTE ('%LABEL');
+
+    LOCAL
+	STRING		: REF VECTOR [,BYTE];	! String vector
+
+    ! Set the value state by examining the completed pathname descriptor
+    !
+    string = .name_vect [.pathname_desc [pth$b_totcnt] - 1];
+
+    SELECTONE true
+	OF
+	SET
+
+	[.pathname_desc [pth$b_totcnt] EQL 0] : value_state = dbg$k_reg;
+
+        [ch$find_sub (.string [0], string [1], 5, line_stg) NEQA 0] : value_state = dbg$k_line;
+
+    	[ch$find_sub (.string [0], string [1], 6, label_stg) NEQA 0] : value_state = dbg$k_label;
+
+	[OTHERWISE] : value_state = dbg$k_pn;
+
+	TES;
+
+    RETURN;
+
+    END;		! End of check_pathname   
+
+
+GLOBAL ROUTINE DBG$NPATHDESC_TO_CS (PATHNAME_DESC, COUNTED_STRING) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine accepts a pathname descriptor and translates the contents ot
+!	the descriptor into a printable form. That is, the names and optional
+!	invocation number contained within the pathname descriptor are formatted
+!	into one long counted string.
+!
+!	This routine will produce the translation for any pathname descriptor which
+!	describes a legal scope including '\' and numeric scopes.
+!
+!	Pathnames in which the first two names are the same are modified to
+!	output the name only once (situations where routine and module names
+!	are the same).
+!
+! FORMAL PARAMETERS:
+!
+!	PN_DESC			- A longword containing the address of a pathnaem
+!				  descriptor
+!
+!	COUNTED_STRING		- The address of a longword to contain the address
+!				  of a counted string representing the translation
+!				  of the contents of the pathname descriptor
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	The translated pathname string
+!
+! ROUTINE VALUE:
+!
+!	NOVALUE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	This routine will produce a SIGNAL for certain circumstances.
+!
+!--
+    BEGIN
+
+    MAP
+	PATHNAME_DESC   : REF pth$pathname;
+
+    LOCAL
+	SAVE_STRING,				! Pointer to original string
+	PATH_STRING 	: REF VECTOR [,BYTE],	! Result buffer
+	NAME_VECT 	: REF VECTOR,		! Vector of pointers to name strings
+	NAME 		: REF VECTOR [,BYTE],	! Name counted string
+	INDEX,					! Index into name_vect
+	SOURCE_DESC 	: dbg$stg_desc,		! Source descriptor
+	TARGET_DESC 	: dbg$stg_desc,		! Target descriptor
+	RESULT_LENGTH 	: WORD,			! Length of string after FAOing
+	NEXT_CHAR,				! Pointer into result string
+	SIZE;					! Number of bytes needed for result buffer
+
+    save_string = 0;
+
+    ! Line up the name vector
+    !
+    name_vect = pathname_desc [pth$a_pathvector];
+
+
+    ! Look for an invocation number. If there is one, go ahead and add the number
+    ! to the correct name string. We save the original name string so that we may restore it.
+    !
+    IF .pathname_desc [pth$b_locinvoc] NEQ 0
+    THEN
+	BEGIN
+
+	! Recover the name string
+	!
+	name = .name_vect [.pathname_desc [pth$b_locinvoc] - 1];
+	save_string = .name;
+
+
+	! Allocate enough storage to concatenate the number to the string
+	!
+	IF NOT dbg$nlist_freez ((.name [0] + 24) / %UPVAL, path_string, dummy)
+	THEN
+	    BEGIN
+	    SIGNAL (dbg$_nofree);
+	    RETURN;
+	    END;
+
+
+	! Copy the name string
+	!
+	IF .name [0] NEQ 0
+	THEN
+	    BEGIN
+	    next_char = ch$move (.name [0], name [1], path_string [1]);
+	    source_desc [dsc$a_pointer] = UPLIT BYTE (' !UL');
+	    source_desc [dsc$w_length] = 4;
+	    END
+	ELSE
+	    BEGIN
+	    next_char = path_string [1];
+	    source_desc [dsc$a_pointer] = UPLIT BYTE ('!UL');
+	    source_desc [dsc$w_length] = 3;
+	    END;
+
+
+	! Append the invocation number
+	!
+	target_desc [dsc$a_pointer] = .next_char;
+	target_desc [dsc$w_length] = 23;
+
+	sys$fao (source_desc, result_length, target_desc, .pathname_desc [pth$l_invocnum]);
+
+
+	! Update the copie's length
+	!
+	path_string [0] = .name [0] + .result_length;
+
+
+	! Point to the copy
+	!
+	name_vect [.pathname_desc [pth$b_locinvoc] - 1] = .path_string;
+	END;
+
+
+    ! Figure out how much space will be needed to hold the entire string
+    !
+    size = 0;
+    INCR index FROM 0 TO .pathname_desc [pth$b_totcnt] - 1
+    DO
+	BEGIN
+	name = .name_vect [.index];
+	size = .size + .name [0] + 1;	! One for '\'
+	END;
+
+
+    ! Allocate enough storage to hold the string plus one byte for the length
+    !
+    IF NOT dbg$nlist_freez ((.size / %UPVAL) + 2, path_string, dummy)
+    THEN
+	BEGIN
+	SIGNAL (dbg$_nofree);
+	RETURN;
+	END;
+
+
+    ! Now we're ready to append all the name strings into one string. First
+    ! check for the special case of the global scope, '\'.
+    !
+    name = .name_vect [0];
+    IF .name [0] EQL 0 AND .pathname_desc [pth$b_locinvoc] EQL 0
+    THEN
+	BEGIN
+
+	! Global scope or global reference
+	!
+	ch$move (1, UPLIT BYTE ('\'), path_string [1]);
+	result_length = 1;
+	IF .pathname_desc [pth$b_totcnt] GTR 1
+	THEN
+	    BEGIN
+	    name = .name_vect [1];
+	    ch$move (.name [0], name [1], path_string [2]);
+	    result_length = .result_length + .name [0];
+	    END;
+	END
+    ELSE
+	BEGIN
+	LOCAL
+	    I,
+	    NAME_1	: REF VECTOR [,BYTE],
+	    NAME_2	: REF VECTOR [,BYTE];
+
+	! Loop, adding all the name strings.
+	!
+	result_length = 0;
+	next_char = path_string [1];
+
+
+	! We do not want to ouput the same name twice. Check to see if the
+	! first name and the second name are the same. If they are, skip over
+	! the first name.
+	!
+	i = 0;
+	IF .pathname_desc [pth$b_totcnt] GEQ 2
+	THEN
+	    BEGIN
+	    name_1 = .name_vect [0];
+	    name_2 = .name_vect [1];
+	    IF ch$eql (.name_1 [0], name_1 [1], .name_2 [0], name_2 [1])
+	    THEN
+		i = 1;
+	    END;
+
+	INCR index FROM .i TO .pathname_desc [pth$b_totcnt] - 1
+	DO
+	    BEGIN
+	    name = .name_vect [.index];
+	    next_char = ch$move (.name [0], name [1], .next_char);
+	    result_length = .result_length + .name [0];
+
+
+	    ! If there is another name string, we add a '\'
+	    !
+	    IF .index LSS .pathname_desc [pth$b_totcnt] - 1
+	    THEN
+		BEGIN
+		IF .index LSS .pathname_desc[pth$b_pathcnt] - 1
+		THEN
+		    next_char = ch$move (1, UPLIT BYTE ('\'), .next_char)
+		ELSE
+		    next_char = ch$move (1, UPLIT BYTE ('.'), .next_char);
+		result_length = .result_length + 1;
+		END;
+	    END;
+	END;
+
+
+    ! Fill in the count byte. Check for overflow.
+    !
+    path_string [0] = (IF .result_length GTR 255 THEN 255 ELSE .result_length);
+
+
+    ! Restore the saved string if there is one.
+    !
+    IF .save_string NEQA 0
+    THEN
+	name_vect [.pathname_desc [pth$b_locinvoc] - 1] = .save_string;
+
+
+    ! Return the counted string
+    !
+    .counted_string = .path_string;
+
+    RETURN;
+
+    END;		! End of DBG$NPATHDESC_TO_CS
+    
+
+ROUTINE SCOPE_SCANNER (INPUT_DESC, LEX_DESC, TOKEN) : NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Lexical scanner for the parsing of scopes. This routine supplies
+!	tokens to the pathname parser when a scope is to be parsed. It plays
+!	the part of a language specific lexical scanner and its address is
+!	supplied to the pathname parser by dbg$nparse_scope_list.
+!
+!	The tokens returned by this routine are limited to:
+!
+!	dbg$k_tok_null, dbg$k_tok_inval, dbg$k_tok_line, dbg$k_tok_label,
+!	dbg$k_tok_int, dbg$k_tok_id, dbg$k_tok_dot, and dbg$k_tok_bs.
+!
+!	Note that unlike the acutual language specific scanners, this routine does
+!	not return a token for %register since these are invalid in a scope.
+!
+!	The input line is NOT updated after a token is recognized. The caller
+!	of this routine is responsible for updating the input line by
+!	using the information in the lexical string descriptor.
+!
+!	The input line is assumed to be terminated with a <CR>.
+!
+! FORMAL PARAMETERS:
+!
+!	INPUT_DESC		- A longword containing the address of a standard
+!				  ascii string descriptor representing the input line
+!
+!	LEX_DESC		- A longword containing the address of a standard
+!				  ascii string descriptor. The length and a_pointer
+!				  fields of this descriptor are filled in to reflect
+!				  the portion of the input which represents the token
+!				  recognized.
+!
+!	TOKEN			- The address of a longword to contain the value
+!				  of the token recognized
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	Token value is returned and the lexical string descriptor is updated.
+!
+! ROUTINE VALUE:
+!
+!	NOVALUE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+    BEGIN
+
+    MAP
+	INPUT_DESC	: REF dbg$stg_desc,
+	LEX_DESC	: REF dbg$stg_desc;
+
+    LOCAL
+	CHAR		: BYTE,			! Input character
+	POINTER,				! Pointer to input char
+	TOKEN_START,				! Pointer to start of lexical string
+	TOKEN_END;				! Pointer to one char beyond lex string
+
+    pointer = ch$ptr (.input_desc [dsc$a_pointer]);
+
+
+    ! Skip over leading white space
+    !
+    char = ch$rchar (.pointer);
+    WHILE .char EQL ' ' DO char = ch$a_rchar (pointer);
+
+
+    ! Pointer now points to the first character of the token string
+    !
+    token_start = .pointer;
+
+
+    ! Case off of the character to begin acceptance of the token
+    !
+    SELECTONE true
+	OF
+	SET
+
+	[.char EQL dbg$k_car_return] :	! Null input line, <CR>
+	    BEGIN
+	    token_end = .token_start;
+	    .token = dbg$k_tok_null;
+	    END;
+
+	[.char EQL '\'] :   
+	    BEGIN
+	    token_end = ch$plus (.token_start, 1);
+	    .token = dbg$k_tok_bs;
+	    END;
+
+	[.char EQL '.'] :
+	    BEGIN
+	    token_end = ch$plus (.token_start, 1);
+	    .token = dbg$k_tok_dot;
+	    END;
+
+	[.char EQL '%'] :	! '%LINE' or '%LABEL'
+	    BEGIN
+	    LOCAL
+		STRING_DESC : dbg$stg_desc;
+
+	    string_desc [dsc$a_pointer] = ch$plus (.pointer, 1);
+	    string_desc [dsc$w_length] = .input_desc [dsc$w_length] -
+					 (.pointer + 1 - .input_desc [dsc$a_pointer]);
+	    
+	    SELECTONE true 
+		OF
+		SET
+
+		[dbg$nmatch (string_desc, UPLIT BYTE (%ASCIC 'LINE'), 2)] :
+		    .token = dbg$k_tok_line;
+
+		[dbg$nmatch (string_desc , UPLIT BYTE (%ASCIC 'LABEL'), 2)] :
+		    .token = dbg$k_tok_label;
+
+		[dbg$nmatch (string_desc , UPLIT BYTE (%ASCIC 'NAME'), 1)] :
+		    .token = dbg$k_tok_qname;
+
+		[OTHERWISE] :
+		    .token = dbg$k_tok_inval;
+
+		TES;
+
+	    token_end = .string_desc [dsc$a_pointer];
+	    END;
+
+	[.char GEQ '0' AND .char LEQ '9'] :	! Integer
+	    BEGIN
+	    WHILE .char GEQ '0' AND .char LEQ '9' DO char = ch$a_rchar (pointer);
+
+
+	    token_end = .pointer;
+	    .token = dbg$k_tok_int;
+	    END;
+
+	[.char GEQ 'A' AND .char LEQ 'Z'] :	! ID
+	    BEGIN
+	    WHILE .char NEQ ','
+		      AND
+		  .char NEQ '\'
+		      AND
+		  .char NEQ ' '
+		      AND
+		  .char NEQ dbg$k_car_return
+	    DO
+		BEGIN
+		pointer = ch$plus (.pointer, 1);
+		char = ch$rchar (.pointer);
+		END;
+
+	    token_end = .pointer;
+	    .token = dbg$k_tok_id;
+	    END;
+
+	[OTHERWISE] :
+	    BEGIN
+	    .token = dbg$k_tok_inval;
+	    END;
+
+	TES;
+
+
+    ! Now fill in the lexical string descriptor
+    !
+    lex_string_desc [dsc$a_pointer] = .token_start;
+    lex_string_desc [dsc$w_length] = .token_end - .token_start;
+
+    RETURN;
+
+    END;	! End of SCOPE_SCANNER
+	    
+	    
+
+GLOBAL ROUTINE DBG$NPARSE_SCOPE_LIST (INPUT_DESC, SCOPE_LIST, MESSAGE_VECT) =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine parses the objects of a SET SCOPE command. The pathname
+!	parser is called within a loop to parse each scope item. A longword vector
+!	is constructed which contains the number of scope items in the first cell
+!	with the addresses of pathname descriptors in the subsequent cells.
+!
+!	A limit of 50 scope items per SET SCOPE command is observed.
+!
+!	This routine supplies the address of SCOPE_SCANNER as the lexical
+!	analyzer for the pathname parser.
+!
+! FORMAL PARAMETERS:
+!
+!	INPUT_DESC		- A longword containing the address of a standard
+!				  character string descriptor reflecting the input
+!
+!	SCOPE_LIST		- The address of a longword to contain the address
+!				  of the pathname descriptor vector
+!
+!	MESSAGE_VECT		- The address of a longword to contain the address
+!				  of a message argument vector on error
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	On success, the pathname descriptor vector is obtained.
+!
+!	On failure, a message argument vector is constructed and returned.
+!
+! ROUTINE VALUE:
+!
+!	An unsigned integer longword completion code
+!
+! COMPLETION CODES:
+!
+!	STS$K_SUCCESS (1)	- Success. Pathname descriptor vector formed.
+!
+!	STS$K_SEVERE  (4)	- Failure. Error detected. Message argument vector
+!				  constructed.
+!
+! SIDE EFFECTS:
+!
+!	If more than 50 scopes are collected, this routine will issue a string
+!	truncation message.
+!
+!--
+    BEGIN
+
+    MAP
+	INPUT_DESC 		: REF dbg$stg_desc;
+
+    LITERAL
+	SCOPE_VECT_SIZE		= 51,
+	MAX_NUM_SCOPES		= 50;
+
+    LOCAL
+	SCOPE_VECT		: REF VECTOR,	! Pathname descriptor vector
+	INDEX,					! Index into the vector
+	DUMMY1,					! Dummy parameter
+	DUMMY2;					!   "       "
+
+    ! Allocate space for 50 pathname descriptor pointers, plus one for the count.
+    !
+    IF NOT dbg$nlist_freez (scope_vect_size, scope_vect, .message_vect)
+    THEN
+	RETURN sts$k_severe;
+
+
+    ! Loop and collect the pathname descriptors
+    !
+    index = 1;
+    WHILE true
+    DO
+	BEGIN
+
+	! Try to parse a scope
+	!
+	IF NOT dbg$npathname_parser (.input_desc, 
+				     scope_scanner,
+				     scope_vect [.index],
+				     dummy1,
+				     dummy2,
+				     true)
+	THEN
+	    BEGIN
+	    .message_vect = dbg$nsyntax_error (dbg$nnext_word (.input_desc));
+	    RETURN sts$k_severe;
+	    END;
+
+
+	! Look for a comma that separates scopes
+	!
+	IF NOT dbg$nmatch (.input_desc, UPLIT BYTE (%ASCIC ','), 1)
+	THEN
+	    EXITLOOP;
+
+    	! Check for end of line
+    	!
+    	IF dbg$nmatch (.input_desc, UPLIT BYTE (1, dbg$k_car_return), 1) 
+    	THEN
+    	    BEGIN
+    	    .message_vect = dbg$nmake_arg_vect (dbg$_needmore);
+    	    RETURN sts$k_severe;
+    	    END;
+
+	! There is atleast one more scope. Check for exceeding the limit.
+	!
+	IF .index GEQ max_num_scopes
+	THEN
+	    BEGIN
+
+	    ! Issue a truncation message.
+	    !
+	    dbg$nout_info (dbg$_stgtrunc);
+
+
+	    ! Set up a phony input descriptor and exit the loop
+	    !
+	    input_desc [dsc$a_pointer] = UPLIT BYTE (dbg$k_car_return);
+	    input_desc [dsc$w_length] = 1;
+	    EXITLOOP;
+	    END;
+
+
+	! Update the index
+	!
+	index = .index + 1;
+
+	END;		! End of loop
+
+
+    ! The scopes have been collected. Set the count.
+    !
+    scope_vect [0] = .index;
+
+
+    ! Return the scope list and success
+    !
+    .scope_list = .scope_vect;
+
+    RETURN sts$k_success;
+
+    END;
+
+END				!End of module
+ELUDOM

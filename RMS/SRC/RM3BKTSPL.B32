@@ -1,0 +1,573 @@
+
+MODULE RM3BKTSPL (LANGUAGE (BLISS32) ,
+		IDENT = 'V03-001'
+		) =
+BEGIN
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:	RMS32 INDEX SEQUENTIAL FILE ORGANIZATION
+!
+! ABSTRACT:
+!                Routine to move out data in case of a split
+!
+!
+! ENVIRONMENT:
+!
+!		VAX/VMS OPERATING SYSTEM
+!
+!--
+
+!
+! AUTHOR:        Wendy Koenig     	17-Jul-1978
+!
+! MODIFIED BY:
+!
+!	V03-001 LJA0007		Laurie Anderson 	25-Mar-1982
+!		Change KBUFSZ to reference a macro when computing buffer 
+!		size and make IFB$B_KBUFSZ a word, now: IFB$W_KBUFSZ.
+!
+!	V02-014	KPL0001		Peter Lieberwirth	19-Aug-1981
+!		Preserve NEW_BKT NXTRECID field as it was set up by
+!		RM$ALLOC_BKT instead of resetting it to 1.  This
+!		permits space reclamation to work by not reusing old
+!		IDs in any new incarnations of the bucket.
+!
+!	V02-013 MCN0012		Maria del C. Nasr	07-Jul-1981
+!		Recompress key of record which follows record inserted.
+!		Also, fix some problems with 4-bucket splits and significant
+!		characters.
+!
+!	V02-012	MCN0011		Maria del C. Nasr	26-May-1981
+!		Add support for prologue 3 files.
+!
+!	V02-011	MCN0006		Maria del C. Nasr	16-Mar-1981
+!		Increase size of record identifier to a word in NRP.
+!
+!	V02-010	REFORMAT	Frederick E. Deen, Jr.	    23-Jul-1980
+!		This code was reformatted to adhere to RMS standards
+!
+!
+! REVISION HISTORY:
+!
+!   Wendy Koenig, 	21-Sep-1978
+!   X0002 - Don't zero NRP list for each new bucket
+!
+!   Wendy Koenig, 	25-Sep-1978
+!   X0003 - Don't update RP on split -- it's an RRV
+!
+!   Christian Saether, 	4-Oct-1978
+!   X0004 - Modifications for UPDATE
+!
+!   Wendy Koenig, 	12-Oct-1978
+!   X0005 - Take all the NRP stuff out of here
+!
+!   Wendy Koenig, 	19-Oct-1978
+!   X0006 - Make some changes for the NEW_VBN entry in the NRP list
+!
+!   Wendy Koenig, 	24-Oct-1978
+!   X0007 - Make changes caused by sharing conventions
+!
+!   Christian Saether, 	19-Dec-1978
+!   X0008 - Bliss does not like using AP as block structure
+!
+!   Wendy Koenig, 	25-Jan-1979
+!   X0009 - Get rid of setting valid
+!
+!*****
+
+LIBRARY 'RMSLIB:RMS';
+
+REQUIRE 'RMSSRC:RMSIDXDEF';
+
+! define default psects for code
+!
+
+PSECT
+    CODE = $$RMSSPLIT3(PSECT_ATTR),
+    PLIT = $RMSSPLIT3(PSECT_ATTR);
+
+! Linkages
+!
+
+LINKAGE
+    L_BLDUDR,
+    L_BKT_SPL,
+    L_CODE_VBN,
+    L_EXPAND_KEY,
+    L_GETNEXT_REC,
+    L_REC_OVHD,
+    L_RECOMPR_KEY,
+    L_SET_UPDATE,
+    L_SIG_CHARS;
+
+! External Routines
+!
+EXTERNAL ROUTINE
+    RM$BLDUDR		: RL$BLDUDR,
+    RM$CODE_VBN		: RL$CODE_VBN,
+    RM$EXPAND_KEY	: RL$EXPAND_KEY,
+    RM$GETNEXT_REC	: RL$GETNEXT_REC,
+    RM$REC_OVHD		: RL$REC_OVHD,
+    RM$RECOMPR_KEY	: RL$RECOMPR_KEY,
+    RM$SET_UPDATE	: RL$SET_UPDATE NOVALUE,
+    RM$SIG_CHARS	: RL$SIG_CHARS;
+
+
+
+GLOBAL ROUTINE RM$BKT_SPL(RECSZ) : RL$BKT_SPL NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	Move data records out a bucket that's splitting
+!	and begin the process of updating the NRP list.
+!
+! CALLING SEQUENCE:
+!	bsbw rm$bkt_spl
+!
+! INPUT PARAMETERS:
+!	RECSZ - record size of record to be inserted
+!
+! IMPLICIT INPUTS:
+!	IRAB -- SPLIT, SPLIT_1, SPLIT_2, POS_INS,
+!		NEW_BKTS, BKT_NO, REC_W_LO,
+!		CURBDB -- ORIGINAL BUCKET, NXTBDB -- NEW BUCKET
+!	IN NEW BUCKET, NXTRECID
+!	IFAB -- pointer to NRP list, and prologue version number
+!	RAB for RSZ, RBF
+!
+! OUTPUT PARAMETERS:
+!	None
+!
+! IMPLICIT OUTPUTS:
+!	BKT_NO is decremented
+!	FREESPACE and NXTID in new bkt is set
+!
+! ROUTINE VALUE:
+!	nothing
+!
+! SIDE EFFECTS:
+!	Data records are moved from one bucket to another.
+!	The records are assigned new ids, in numerical order.
+!	The NEW_NRP (new id) fields and the NEW_VBN (new vbn) fields of the NRP list
+!	are filled in for appropriate entries (those records that are moving).
+!	Mark new bucket dirty and valid.
+!	If the primary key is compressed, the key in the first record of the
+!	  new bucket undergoes expansion.
+!	AP is clobbered.
+!	NOTE: this routine does not use RM$CODE_VBN to get the value for
+!	NEW_VBN in the NRP list. It makes the decision itself
+!	so if these values ever change, it must also.
+!
+!--
+
+    BEGIN
+
+    EXTERNAL REGISTER
+	R_REC_ADDR_STR,
+	R_IDX_DFN_STR,
+	R_IFAB_STR,
+	R_IRAB_STR,
+	R_RAB_STR;
+
+    LOCAL
+	NEW_BKT	: REF BBLOCK,
+	OLD_BKT	: REF BBLOCK,
+	NEXT_REC: REF BBLOCK,
+	EOB,
+	SPLIT_PT	: WORD,
+	FLAG	: BLOCK [1];
+
+    BUILTIN
+	AP;
+
+    MACRO
+	NEW_VBN = 0,0,2,0 %,
+	ALONE = 0,2,1,0 %;
+
+    BUILTIN
+	TESTBITCC;
+
+    ! set up new_bkt and old_bkt addresses
+    !
+    NEW_BKT = .BBLOCK[.IRAB[IRB$L_NXTBDB], BDB$L_ADDR];
+    OLD_BKT = .BBLOCK[.IRAB[IRB$L_CURBDB], BDB$L_ADDR];
+
+    ! Set up SPLIT_PT and EOB for this move. Also set up AP to signal if the new
+    ! record belongs by itself. If this is the only new bucket, the new record
+    ! may be positioned at the end of the new bucket w/o REC_W_LO being set.
+    ! Therefore we can set it.
+    !
+    FLAG = 1;			! one indicates VBN_RIGHT ( " the default")
+
+    CASE .IRAB[IRB$V_BKT_NO] FROM 1 TO 3 OF
+	SET
+
+	[3] :
+
+	    BEGIN
+	    SPLIT_PT = .IRAB[IRB$W_SPLIT_2];
+	    REC_ADDR = .OLD_BKT + BKT$C_OVERHDSZ;
+	    EOB = .OLD_BKT + .OLD_BKT[BKT$W_FREESPACE];
+
+	    DO
+		BEGIN
+
+		IF .REC_ADDR[IRC$V_RRV]
+		THEN
+		    EXITLOOP;
+
+		RM$GETNEXT_REC()
+		END
+	    UNTIL .REC_ADDR GEQU .EOB;
+
+	    EOB = .REC_ADDR - .OLD_BKT;
+	    END;
+	[2] :
+	    BEGIN
+		SPLIT_PT = .IRAB[IRB$W_SPLIT_1];
+	        EOB = .IRAB[IRB$W_SPLIT_2];
+
+		BEGIN
+
+	    	    IF .SPLIT_PT EQLU .IRAB[IRB$W_POS_INS]
+		    AND
+		    .SPLIT_PT EQLU .IRAB[IRB$W_SPLIT]
+	    	    THEN
+			FLAG[ALONE] = 1;
+		END;
+
+	    IF .IRAB[IRB$L_VBN_MID] NEQ 0
+	    THEN
+		FLAG[NEW_VBN] = 3;
+	    END;
+
+	[1] :
+
+	    BEGIN
+	    SPLIT_PT = .IRAB[IRB$W_SPLIT];
+	    EOB = .IRAB[IRB$W_SPLIT_1];
+
+	    IF .IRAB[IRB$L_VBN_MID] NEQ 0
+	    THEN
+		FLAG[NEW_VBN] = 2;
+
+	    IF (.EOB<0, 16> EQLU .IRAB[IRB$W_POS_INS])
+		AND
+		(.SPLIT_PT NEQU .EOB<0, 16>)
+		AND
+		( NOT .IRAB[IRB$V_BIG_SPLIT])
+	    THEN
+		IRAB[IRB$V_REC_W_LO] = 1;
+	    END;
+
+	TES;
+
+    ! If the new record belongs in the middle of the new bucket, we have to do
+    ! the move in three pieces; 1) Move out the "hi set", 2) build record in
+    ! the new bucket, and 3) move out "lo set". Note that the hi set and / or
+    ! lo set may be non-existent.
+    !
+    NEXT_REC = 0;			! assume record does not go in this bucket
+
+    IF .SPLIT_PT LEQU .IRAB[IRB$W_POS_INS]
+	AND
+	.IRAB[IRB$W_POS_INS] LEQU .EOB<0, 16>
+    THEN
+	BEGIN
+	REC_ADDR = CH$MOVE(.IRAB[IRB$W_POS_INS] - .SPLIT_PT,
+	    .SPLIT_PT + .OLD_BKT, .NEW_BKT + BKT$C_OVERHDSZ);
+	BEGIN
+
+	LABEL
+	    BUILD;
+
+	GLOBAL REGISTER
+	    COMMON_IOREG;
+
+	BKT_ADDR = .NEW_BKT;
+	BDB = .IRAB[IRB$L_NXTBDB];
+BUILD :
+
+	! If so desired, now is the time to build the user data record in the
+	! new bkt.  But, zero the ID assigned to the new record, so that the code
+	! to update the NRP list doesn't have to distinquish between the new
+	! and old records i.e., so that there is no chance of accidentally
+	! updating a record that hasn't moved.
+	!
+	BEGIN
+
+	IF .SPLIT_PT EQLU .IRAB[IRB$W_POS_INS]
+	THEN
+	    BEGIN
+
+	    IF NOT .IRAB[IRB$V_REC_W_LO]
+		AND
+		NOT .FLAG[ALONE]
+	    THEN
+		BEGIN
+		NEXT_REC = 1;
+		RM$BLDUDR(.RECSZ);
+		END;
+
+	    LEAVE BUILD
+
+	    END;
+
+	IF .EOB<0, 16> EQLU .IRAB[IRB$W_POS_INS]
+	THEN
+	    BEGIN
+
+	    IF .IRAB[IRB$V_REC_W_LO]
+	    THEN
+		BEGIN
+		NEXT_REC = 1;
+		RM$BLDUDR(.RECSZ);
+		END;
+
+	    LEAVE BUILD;
+
+	    END;
+
+	! At this point the only case is that POS_INS is in the middle of the
+	! bucket so we always want to insert the new record.
+	!
+	NEXT_REC = 1;
+	RM$BLDUDR(.RECSZ);
+	END;					! {end of build }
+	END;
+
+	! If the record was written to this bucket, and there will be a hi set
+	! to move, then set the flag to the address of the record after the one
+	! inserted.  Otherwise, clear indicator.
+	!
+
+	IF .NEXT_REC
+	  AND (.EOB<0,16> - .IRAB[IRB$W_POS_INS]) NEQU 0
+	THEN
+	    NEXT_REC = .REC_ADDR
+	ELSE
+	    NEXT_REC = 0;
+	REC_ADDR = CH$MOVE(.EOB<0, 16> - .IRAB[IRB$W_POS_INS],
+			   .IRAB[IRB$W_POS_INS] + .OLD_BKT,
+			   .REC_ADDR);
+	END
+    ELSE
+
+	! The new record does not go into new bucket so just move data out in
+	! one chunk.
+	!
+	REC_ADDR = CH$MOVE(.EOB<0, 16> - .SPLIT_PT,
+			   .SPLIT_PT + .OLD_BKT,
+	 		   .NEW_BKT + BKT$C_OVERHDSZ);
+
+    ! Re-allocate the ID's, in numerical order, for the new bucket. While we're
+    ! doing that, we have all the information to make the preliminary updates
+    ! to the NRP list -- the new and old vbn, the new and old id.
+    !
+    BEGIN
+
+    EOB = .REC_ADDR;
+
+    ! If the record was inserted into this bucket, BLDUDR incremented NXTRECID.
+    ! Renumber the IDs in the new bucket.  Do it differently, depending on
+    ! prologue version number.
+    !
+
+    IF .IFAB[IFB$B_PLG_VER] LSSU PLG$C_VER_3
+    THEN
+	BEGIN
+	REC_ADDR = .NEW_BKT + BKT$C_OVERHDSZ;
+
+	WHILE .REC_ADDR LSSU .EOB
+	DO
+	    BEGIN
+
+	    ! Scan through the whole NRP list, looking for this VBN.  If we find
+	    ! entries that point to records that are moving, do the preliminary
+	    ! updates.
+	    !
+
+	    IF .REC_ADDR[IRC$B_ID] NEQ 0
+	    THEN
+		BEGIN
+		AP = .FLAG;
+		RM$SET_UPDATE(.NEW_BKT)
+		END
+
+		! If the ID of the record is 0, then it is the new record. In this
+		! case, the ID of the RRV also has to be set and also the ID in the
+		! record pointer field has to be reset.
+		!
+	    ELSE
+		BEGIN
+		(.REC_ADDR + IRC$C_DATOVHDSZ)<0, 8> = .NEW_BKT[BKT$B_NXTRECID];
+		BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$W_RP_ID] = .NEW_BKT[BKT$B_NXTRECID];
+		END;
+
+	    REC_ADDR[IRC$B_ID] = .NEW_BKT[BKT$B_NXTRECID];
+	    NEW_BKT[BKT$B_NXTRECID] = .NEW_BKT[BKT$B_NXTRECID] + 1;
+	    RM$GETNEXT_REC()
+	    END;				! end of while loop
+	END
+    ELSE
+	BEGIN
+	REC_ADDR = .NEW_BKT + BKT$C_OVERHDSZ;
+
+	WHILE .REC_ADDR LSSU .EOB
+	DO
+	    BEGIN
+
+	    ! Scan through the whole NRP list, looking for this VBN.  If we find
+	    ! entries that point to records that are moving, do the preliminary
+	    ! updates.
+	    !
+
+	    IF .REC_ADDR[IRC$W_ID] NEQ 0
+	    THEN
+		BEGIN
+		AP = .FLAG;
+		RM$SET_UPDATE(.NEW_BKT)
+		END
+
+		! If the ID of the record is 0, then it is the new record. In this
+		! case, the ID of the RRV also has to be set and also the ID in the
+		! record pointer field has to be reset.
+		!
+	    ELSE
+		BEGIN
+		(.REC_ADDR + IRC$C_DATOVHSZ3)<0, 16> = .NEW_BKT[BKT$W_NXTRECID];
+		BBLOCK[.IRAB[IRB$L_NRP_PTR], NRP$W_RP_ID] = .NEW_BKT[BKT$W_NXTRECID];
+		END;
+
+	    REC_ADDR[IRC$W_ID] = .NEW_BKT[BKT$W_NXTRECID];
+	    NEW_BKT[BKT$W_NXTRECID] = .NEW_BKT[BKT$W_NXTRECID] + 1;
+	    RM$GETNEXT_REC()
+	    END;			! end of while loop
+	END;
+
+    END;				! { end of block redefining eob }
+
+    BBLOCK[.IRAB[IRB$L_NXTBDB], BDB$V_DRT] = 1;
+    NEW_BKT[BKT$W_FREESPACE] = .REC_ADDR - .NEW_BKT;
+
+    ! If the record was inserted in this bucket followed by another record
+    ! which is not an RRV, and the key is compressed, then recompress the key
+    ! of the record which follows the inserted record.
+    !
+
+    IF .NEXT_REC NEQU 0
+      AND .IDX_DFN[IDX$V_KEY_COMPR]
+    THEN
+
+	IF NOT .NEXT_REC[IRC$V_RRV]
+	THEN
+	    BEGIN
+
+	    GLOBAL REGISTER
+		R_REC_SIZE,
+		R_BKT_ADDR;
+
+	    LOCAL
+		TMP_REC_ADDR;
+
+	    BKT_ADDR = .NEW_BKT;
+	    TMP_REC_ADDR = .REC_ADDR;
+	    REC_ADDR = .NEXT_REC;
+	    REC_SIZE = 0;
+	    RM$RECOMPR_KEY ( .IRAB[IRB$L_RECBUF], .REC_ADDR + RM$REC_OVHD() );
+	    REC_ADDR = .TMP_REC_ADDR;
+	    END;
+
+    BEGIN
+
+    LOCAL
+	SIG_FLG,
+	KEY_ADDR1,
+	KEY_ADDR2;
+
+    ! Determine which key buffer contains the last key of the previous bucket.
+    ! If we are allocating bucket 2 or 3 of a big split, then keybuffer3 (and
+    ! keybuffer5) contains the key.  Otherwise, it is in keybuffer2.
+    !
+
+    IF .IRAB[IRB$V_BKT_NO] GTRU 1
+    THEN
+	BEGIN
+	SIG_FLG = 0;
+	KEY_ADDR1 = KEYBUF_ADDR(5);
+	KEY_ADDR2 = KEYBUF_ADDR(3);
+	END
+    ELSE
+	BEGIN
+	SIG_FLG = 2;
+	KEY_ADDR1 = KEY_ADDR2 = KEYBUF_ADDR(2);
+	END;
+
+    ! If the primary key is compressed, we must expand the first key of the
+    ! new bucket, since it cannot be front end compressed.  Base this expansion
+    ! on what will be the last key of the previous bucket, obtained from the
+    ! right key buffer.
+    !
+
+    IF .IDX_DFN[IDX$V_KEY_COMPR]
+    THEN
+	RM$EXPAND_KEY ( .KEY_ADDR1, .NEW_BKT );
+
+    ! If the index is compressed, we must determine the number of significant
+    ! characters between the last key of the previous bucket, and the first
+    ! key of the new bucket.  The amount and the characters are stored in the
+    ! key buffer to be passed for index level updating.  However, skip this
+    ! calculation for the left middle bucket in a 4-bucket split, since it has
+    ! been done already.
+    !
+
+    IF .IDX_DFN[IDX$V_IDX_COMPR]
+      AND ( .IRAB[IRB$V_BKT_NO] NEQU 2
+	OR .IRAB[IRB$L_VBN_MID] EQLU 0 )
+    THEN
+	RM$SIG_CHARS ( .KEY_ADDR2, .NEW_BKT, .SIG_FLG );
+
+    END;		! end of local definition for KEY_ADDR
+
+    ! Since I know that BKT_NO is a 2-bit digit ranging from 1 to 3, I can
+    ! optimize the decr desired, so bear with me. Note: BKT_NO_LO refers to
+    ! the low bit of BKT_NO.
+    !
+
+    IF TESTBITCC(IRAB[IRB$V_BKT_NO_LO])
+    THEN
+	IRAB[IRB$V_BKT_NO] = 1;
+
+    RETURN;
+
+    END;					! { end of rm$bkt_spl }
+
+END
+
+ELUDOM

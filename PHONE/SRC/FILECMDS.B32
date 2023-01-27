@@ -1,0 +1,457 @@
+%title 'FILECMDS File-Oriented Phone Commands'
+	module filecmds (
+			ident='V03-000') = begin
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! Facility:	VAX/VMS Telephone Facility, File-Oriented Phone Commands
+!
+! Abstract:	This module handles the following user commands:
+!			FACSIMILE	Include file contents in conversation.
+!			TRANSCRIBE	Make a transcript of conversation.
+!
+!
+! Environment:
+!
+! Author: Paul C. Anagnostopoulos, Creation Date: 6 November 1980
+!
+! Modified By:
+!
+! , : Version
+! 01 -
+!--
+
+%sbttl 'Module Declarations'
+!
+! Libraries and Requires:
+!
+
+library 'sys$library:starlet.l32';
+require 'phonereq';
+
+!
+! Table of Contents:
+!
+
+forward routine
+	phn$facsimile_cmd: novalue,
+	phn$facsimile2: novalue,
+	phn$transcribe_cmd: novalue;
+
+!
+! The following macro is used in PHN$TRANSCRIBE_CMD:
+!
+
+macro transcribe(length,address) =
+	if dec(line_counter) lss 0 then
+		page_headings();
+	trans_rab[rab$w_rsz] = length;
+	trans_rab[rab$l_rbf] = address;
+	status = $put(rab=trans_rab);
+	check(.status);
+%;
+
+!
+! External References:
+!
+
+external routine
+	phn$conversing,
+	phn$fresh_screen,
+	phn$inform,
+	phn$kill_ctl,
+	phn$queue_smb,
+	phn$talk;
+
+!
+! Own Variables:
+!
+
+own
+	facs_fab: $fab(	fac=get,	! RMS FAB for facsimile file.
+			shr=get),
+	facs_buffer: block[79,byte],	! Buffer for getting file records.
+	facs_rab: $rab(	fab=facs_fab,	! RMS RAB for facsimile file.
+			rac=seq,
+			rop=loc,
+			ubf=facs_buffer,
+			usz=79);
+
+%sbttl 'PHN$FACSIMILE_CMD - Include File in Conversation'
+!++
+! Functional Description:
+!	This routine handles the FACSIMILE command, which is used to
+!	include the contents of a file into the conversation.
+!
+! Formal Parameters:
+!	facs_spec	Address of descriptor of file specification.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$facsimile_cmd(facs_spec): novalue = begin
+
+bind
+	spec_dsc = .facs_spec: descriptor;
+
+local
+	status: long;
+
+
+! Check to make sure we are currently talking to someone.  Otherwise facsing
+! makes no sense.
+
+if not phn$conversing() then (	
+	phn$inform(phn$_notconv);
+	return;
+);
+
+! Now we have to open the file we are going to facs.  It is also necessary to
+! connect the RAB so we can read records.  If either of these operations fails,
+! tell the user why.
+
+facs_fab[fab$b_fns] = .spec_dsc[len];
+facs_fab[fab$l_fna] = .spec_dsc[ptr];
+status = $open(fab=facs_fab);	
+if .status nequ rms$_normal then (
+	phn$inform(.status);
+	return;
+);
+status = $connect(rab=facs_rab);
+if .status nequ rms$_normal then (
+	$close(fab=facs_fab);
+	phn$inform(.status);
+	return;
+);
+
+! Tell the user how to cancel the operation.
+
+phn$inform(phn$_facscan);	
+
+! Set the "facsimile in progress" flag so it can be cancelled if necessary.
+
+phn$gv_facsimile = true;		
+
+! Talk a carriage return so the file will start on a new line.  Queue a
+! steering message that will force us to facs the first record.
+
+phn$talk(describe(%char(ret)));	
+phn$queue_smb(smb__facsimile2);
+return;
+
+end;
+
+%sbttl 'PHN$FACSIMILE2 - Facsimile a Record'
+!++
+! Functional Description:
+!	This steering message routine is called to facsimile the next record
+!	from the file.
+!
+! Formal Parameters:
+!	none
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$facsimile2: novalue = begin
+
+local
+	status: long,
+	record_dsc: descriptor;
+
+
+! If the facsimile operation has been cancelled, talk a little message to
+! that effect and bag the operation.
+
+if not .phn$gv_facsimile then (		
+	phn$talk(describe(%string('(CANCELLED)',
+				%char(ret))));
+	$close(fab=facs_fab);
+	return;
+);
+
+! Read the next record from the file.  There are three cases:
+!	1.	We get a record (even if it is truncated).  Build a descriptor
+!		for it and talk it into the conversation, with a carriage
+!		return.  Queue a steering message for the next record.
+!
+!	2.	We get end of file.  Talk a little message to that effect and
+!		cancel the operation.
+!
+!	3.	We get an I/O error.  Talk a little message and cancel.
+
+status = $get(rab=facs_rab);	
+
+selectoneu .status of set	
+[rms$_normal,
+ rms$_rtb]:	(record_dsc[len] = .facs_rab[rab$w_rsz];
+		record_dsc[ptr]  = .facs_rab[rab$l_rbf];
+		phn$talk(record_dsc);			
+		phn$talk(describe(%char(ret)));		
+		phn$queue_smb(smb__facsimile2););	
+
+[rms$_eof]:	(phn$talk(describe(%string('(EOF)',	
+				%char(ret))));	
+		$close(fab=facs_fab);		
+		phn$gv_facsimile = false;);	
+	
+[otherwise]:	(phn$talk(describe(%string('(FILE ERROR)',
+				%char(ret))));		
+		$close(fab=facs_fab);			
+		phn$gv_facsimile = false;);
+tes;
+
+return;
+end;
+
+%sbttl 'PHN$TRANSCRIBE_CMD - Handle TRANSCRIBE Command'
+!++
+! Functional Description:
+!	This routine handles the TRANSCRIBE command, which is used to make a
+!	transcript of the conversation.  We record the conversation that
+!	has taken place UP TO THIS POINT, but only for people we are currently
+!	talking to.
+!
+! Formal Parameters:
+!	trans_spec	The address of the descriptor of the file to receive
+!			the transcript.
+!
+! Implicit Inputs:
+!	global data
+!
+! Implicit Outputs:
+!	global data
+!
+! Returned Value:
+!	none
+!
+! Side Effects:
+!
+!--
+
+
+global routine phn$transcribe_cmd(trans_spec): novalue = begin
+
+bind
+	spec_dsc = .trans_spec: descriptor;
+own
+	trans_fab: $fab(dnm='.PHN',
+			fac=put,
+			mrs=132,
+			org=seq,
+			rat=cr,
+			rfm=var,
+			shr=nil),
+	trans_rab: $rab(fab=trans_fab,
+			rac=seq);
+
+own					! These variables are OWN because
+	page_number: long,		! of up-level referencing.
+	line_counter: long;
+literal
+	array_size = 20/pub_k_minlines;
+local
+	status: long,
+	pub_array:   vector[array_size,long],
+	ctl_array: vector[array_size,long],
+	p: ref pub, cur_p: ref pub,
+	min_stamp: long,
+	i: long, min_i: long,
+	c: ref ctl,
+	line_buf: block[132,byte];
+
+! This little routine is called when we get to the bottom of a page and
+! we need to start a new one.  It ejects the page and prints some headings.
+
+routine page_headings: novalue = begin
+
+local
+	status: long;
+local
+	local_described_buffer(fao_buf,132);
+
+
+line_counter = 55;			
+
+if .page_number gtru 0 then		
+	transcribe(1,uplit byte(%char(formfeed)));
+inc (page_number);			
+
+status = $fao(describe(
+	'PHONE CONVERSATION TRANSCRIPT!_!_!_!_!_!_!%D!_!_!_Page !2<!UL!>'),
+	      fao_buf,
+	      fao_buf,
+	      0,
+	      .page_number);
+check (.status);
+transcribe(.fao_buf[len],.fao_buf[ptr]);
+transcribe(1,uplit byte(%char(ret)));
+
+return;
+end;
+
+! We begin by opening a new file in which to place the transcript.  We also
+! have to connect the RAB so we can write records.  If either of these actions
+! fails, tell the user why.
+
+trans_fab[fab$b_fns] = .spec_dsc[len];
+trans_fab[fab$l_fna] = .spec_dsc[ptr];
+status = $create(fab=trans_fab);
+if .status nequ rms$_normal then (
+	phn$inform(.status);	
+	return;
+);
+status = $connect(rab=trans_rab);
+if .status nequ rms$_normal then (
+	phn$inform(.status);	
+	$close(fab=trans_fab);
+	return;
+);
+
+! Now we inform all of the people that we are going to record them.
+
+phn$talk(describe(%string(%char(ret),
+	'I AM NOW RECORDING THE CONVERSATION UP TO THIS POINT.',
+	%char(ret))));
+
+! Now we are going to set up two arrays, containing entries for each person
+! we are recording.  The pub_array contain the address of the person's PUB.
+! The ctl_array contains the address of the oldest CTL on their CTL chain.
+
+ch$fill(0,%allocation(pub_array),pub_array);
+ch$fill(0,%allocation(ctl_array),ctl_array);
+p = .phn$gq_pubhead[0];			
+i = 0;					
+
+until .p eqla phn$gq_pubhead do (	
+	if not .p[pub_v_temporary] and
+	   not .p[pub_v_uhaveheld] and
+	   not .p[pub_v_hasuheld]	then (
+
+		pub_array[.i] = .p;	
+		ctl_array[.i] = .p[pub_q_ctlhead1];
+		inc (i);
+	);
+	p = .p[pub_l_flink];		
+);
+
+! Now we go into our merging loop.  On each pass, we find the oldest stamp -
+! that will merge the conversation text in the most accurate order.  For
+! each line we print one line in the transcript.  It contains the converstion
+! text and also the speaker's name unless it's the same speaker as the
+! previous line.
+
+page_number = 0;		
+line_counter = 0;		
+cur_p = 0;			
+
+loop (				
+
+	! Loop through arrays and find minimum stamp.  If there are no
+	! CTLs left to merge, we're done.
+
+	min_stamp = -1;
+	incru i from 0 to array_size-1 do	
+		if .ctl_array[.i] nequ 0 then (
+			bind
+				c = .ctl_array[.i]: ctl;
+
+			if .c[ctl_l_stamp] lssu .min_stamp then (
+				min_stamp = .c[ctl_l_stamp];
+				min_i = .i;
+			);
+		);
+
+exitif (.min_stamp eqlu -1);
+
+	! If this is a different person from the last line, then put the
+	! person's name on the beginning of the line.  Otherwise just clear
+	! the beginning of the line.
+
+	if .pub_array[.min_i] neqa .cur_p then (
+		cur_p = .pub_array[.min_i];
+		transcribe(1,uplit byte(%char(ret)));
+		begin
+		bind
+			new_tsb = cur_p[pub_b_tsb]: tsb,
+			new_dsc = new_tsb[tsb_q_tkndsc,0]: descriptor;
+
+		ch$copy(.new_dsc[len],.new_dsc[ptr],' ',40,line_buf);
+		end;
+	) else
+		ch$fill(' ',40,line_buf);
+
+	! Move the conversation text into the line.
+
+	c = .ctl_array[.min_i];
+	begin
+	bind
+		line_dsc = c[ctl_q_line]: descriptor;
+
+	ch$move(.line_dsc[len],.line_dsc[ptr],line_buf+40);
+	transcribe(40+.line_dsc[len],line_buf);
+	end;
+
+	! Now we move to the previous CTL on this person's chain.  If
+	! there isn't one, then zero the ctl_array entry.
+
+	ctl_array[.min_i] = (if .c[ctl_l_blink] eqlu cur_p[pub_q_ctlhead0]
+					then 0
+					else .c[ctl_l_blink]);
+);
+
+! All done.  Close the transcription file and refresh the screen.
+
+$close(fab=trans_fab);
+phn$fresh_screen(false);
+return;
+
+end;
+
+end eludom

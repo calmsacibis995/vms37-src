@@ -1,0 +1,1116 @@
+MODULE rename ( IDENT = 'V03-000', 
+		ADDRESSING_MODE (EXTERNAL = GENERAL),
+		MAIN = rename) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+! FACILITY:  RENAME Command
+!
+! ABSTRACT:
+!
+!	This utility renames files and directories.
+!
+! ENVIRONMENT:
+!
+!	VAX/VMS operating system. unprivileged user mode,
+!
+! AUTHOR:  Greg Robert, Nov 1979
+!
+! Modified by:
+!
+!	V205	GRR2005		G. R. Robert		18-Nov-1981
+!		Fixed handling of network filespecs to use expanded
+!		name when resultant not available, and to insure that
+!		password strings are suppressed in messages.
+!
+!	V204	GRR2004		G. R. Robert		16-Nov-1981
+!		Made all external references addressing mode general.
+!
+!	V203	GRR2003		G. R. Robert		14-Sep-1981
+!		Fixed improper descriptor initialization in confirm_action
+!		by making them OWN instead of LOCAL.
+!
+!	V202	GRR2002		G. R. Robert		29-Aug-1981
+!		New logic to clarify nature of error when user attempts
+!		to rename file from one device to another.
+!
+!	V201	GRR2001		G. R. Robert		12-JUN-1981
+!		Made RENAMEDEF.REQ a permanent part of this file to
+!		clean up the master disk.
+!--
+
+!
+! Include files
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET.L32';	! VAX/VMS common definitions
+
+LIBRARY	'SYS$LIBRARY:CLIMAC.L32';	! CLI macros
+
+!
+! Common definitions for the RENAME command
+!
+
+!
+!	DEFINE VMS BLOCK STRUCTURES
+!
+
+STRUCTURE
+	BBLOCK [O, P, S, E; N] =
+		[N]
+		(BBLOCK+O)<P,S,E>;
+
+MACRO
+!
+! A) Macro to describe a string
+! B) Macro to generate a quadword string descriptor
+! C) Macro to generate the address of a string descriptor
+
+    PRIMDESC (str) = %CHARCOUNT (str), UPLIT (%ASCII str)%,
+    INITDESC (str) = BBLOCK [DSC$C_S_BLN] INITIAL (PRIMDESC (str))%,
+    ADDRDESC (str) = UPLIT (PRIMDESC (str))%,
+
+!
+!	Macro to signal a condition to the handler
+!
+
+    write_message(msg) =
+	SIGNAL(msg			! Pass the message code
+	%IF %LENGTH GTR 1		! and if more than 1 arg
+	    %THEN ,%REMAINING %FI) %,	! then the rest too
+
+!
+! $SHR_MESSAGES - a macro which defines facility-specific message codes
+!	which are based on the system-wide shared message codes.
+!
+!	$SHR_MESSAGES( name, code, (msg,severity), ... )
+!
+!	where:
+!	    "name" is the name of the facility (e.g., COPY)
+!	    "code" is the corresponding facility code (e.g., 103)
+!	    "msg" is the name of the shared message (e.g., BEGIN)
+!	    "severity" is the desired message severity (e.g., 1, 0, 2)
+!
+
+    $SHR_MESSAGES( FACILITY_NAME, FACILITY_CODE ) =
+	LITERAL
+	SHR$MSG_IDS( FACILITY_NAME, FACILITY_CODE, %REMAINING ); %,
+
+    SHR$MSG_IDS( FACILITY_NAME, FACILITY_CODE) [ VALUE ] =
+	SHR$MSG_CALC( FACILITY_NAME, FACILITY_CODE, %REMOVE(VALUE) ) %,
+
+    SHR$MSG_CALC( FACILITY_NAME, FACILITY_CODE, MSG_ID, SEVERITY ) =
+	%NAME(FACILITY_NAME,'$_',MSG_ID) = %NAME('SHR$_',MSG_ID) + FACILITY_CODE*65536 +
+	    %IF %DECLARED(%NAME('STS$K_',SEVERITY))
+		%THEN %NAME('STS$K_',SEVERITY)
+		%ELSE SEVERITY %FI %;
+
+!
+!	Define message codes.
+!
+
+$shr_messages(msg,144,
+	(openin,error),		! Problem with user input file
+	(openout,error),	! Problem with user output file
+	(renamed,info),		! File renamed
+	(searchfail,error),	! Could not find file
+	);
+
+!
+!	EQUATED SYMBOLS
+!
+
+LITERAL
+    TRUE	= 1,			! BOOLEAN TRUE
+    FALSE	= 0,			! BOOLEAN FALSE
+    OK		= 1,			! SUCCESS RETURN CODE
+    ERROR	= 2;			! ERROR RETURN CODE
+
+
+
+!
+!	Define CLI qualifier bit flag numbers (see rename$flags)
+!
+
+LITERAL
+    $EQULST (QUAL_,,0,1,
+	(confirm,),		! /CONFIRM
+	(new_version,),		! /NEW_VERSION
+	(log,));		! /LOG
+
+EXTERNAL LITERAL
+    rename$_notrenamed,		! Error message - file not renamed
+    rename$_notsamedev;		! Error message - can't rename across devices
+
+!
+! Table of contents
+!
+
+FORWARD ROUTINE
+    rename,				! Main rename routine
+    rename_action,			! Called for each file
+    get_next_file,			! Get next file
+    confirm_action,			! Interrogate user
+    log_results,			! Inform user of results
+    get_renameqls,			! Get command qualifiers
+    handler,				! Condition handler
+    fab_error,				! FAB error handler
+    search_error,			! search error handler
+    cli_error;				! Handler for CLI errors
+
+
+!
+! External routines
+!
+
+EXTERNAL ROUTINE
+    sys$fao,				! Formats ascii output
+    lib$get_command,			! Reads from SYS$COMMAND
+    lib$file_scan;			! Handles stickiness etc
+
+
+!
+! Storage definitions
+!
+
+OWN
+    rename$cli_util,			! Address of CLI service rout.
+    rename$flags	: BITVECTOR[32]	! General DCL flagword
+	INITIAL(0),			! Initially none present
+    qualifier$flags	: BITVECTOR[32] ! Qualifier presence bitmap
+	INITIAL(0),			! Initially clear
+    rename$cli_work:
+	VECTOR [cli$c_workarea,BYTE],	! CLI work area
+    worst_error: BBLOCK[4]		! Worst error encountered
+		INITIAL(ss$_normal);	! Initially normal status
+
+!
+! DEFINE RMS BLOCKS (NOTE: All RMS blocks are defined twice. The
+! second set of definitions are prefixed with the tag 'RMS'. This
+! is because the RMS $RENAME service does not allow any wildcarding.
+! Therefore LIB$FILE_SCAN and $PARSE use the original FAB's etc and
+! $RENAME uses the prefixed definitions which have fully parsed file
+! names defined for them.
+!
+
+OWN
+
+    old_nam_result:			! Resultant old name
+		VECTOR [nam$c_maxrss,BYTE],
+
+    old_nam_expanded:			! Expanded old name
+		VECTOR [nam$c_maxrss,BYTE],
+
+    old_rlf:	$NAM	(		! Related old file name
+		),
+
+    old_nam:	$NAM(			! Old file name block
+	RLF = old_rlf,			! Point to related name block
+	ESA = old_nam_expanded,		! File name before open
+	ESS = nam$c_maxrss,
+	RSA = old_nam_result,		! File name after open
+	RSS = nam$c_maxrss),
+
+    old_fab:	$FAB(			! FAB for old name
+	CTX = msg$_openin,		! Initialize error message
+	NAM = old_nam),			! Address of name block
+
+    rms_old_nam_result:			! Resultant rms_old name
+		VECTOR [nam$c_maxrss,BYTE],
+
+    rms_old_nam_expanded:		! Expanded rms_old name
+		VECTOR [nam$c_maxrss,BYTE],
+
+    rms_old_rlf:	$NAM	(	! Related rms_old file name
+		),
+
+    rms_old_nam:	$NAM(		! rms_old file name block
+	RLF = rms_old_rlf,		! Point to related name block
+	ESA = rms_old_nam_expanded,	! File name before open
+	ESS = nam$c_maxrss,
+	RSA = rms_old_nam_result,	! File name after open
+	RSS = nam$c_maxrss),
+
+    rms_old_fab:	$FAB(		! FAB for rms_old name
+	NAM = rms_old_nam,
+	CTX = msg$_openin),		! Initialize error message
+
+!
+! Continue RMS block definitions for the new file name
+!
+
+    new_nam_result:			! Resultant new name
+		VECTOR [nam$c_maxrss,BYTE],
+
+    new_nam_expanded:			! Expanded new name
+		VECTOR [nam$c_maxrss,BYTE],
+
+    new_rlf:	$NAM	(		! Related new file name
+		),
+
+    new_nam:	$NAM(			! New file name block
+	RLF = old_nam,			! Get defaults from input name
+	ESA = new_nam_expanded,		! File name before open
+	ESS = nam$c_maxrss,
+	RSA = new_nam_result,		! File name after open
+	RSS = nam$c_maxrss),
+
+    new_fab:	$FAB(			! FAB for new name
+	CTX = msg$_openout,		! Initialize error message
+	NAM = new_nam),			! Address of name block
+
+    rms_new_nam_result:			! Resultant rms_new name
+		VECTOR [nam$c_maxrss,BYTE],
+
+    rms_new_nam_expanded:		! Expanded rms_new name
+		VECTOR [nam$c_maxrss,BYTE],
+
+    rms_new_rlf:	$NAM	(	! Related rms_new file name
+		),
+
+    rms_new_nam:	$NAM(		! rms_new file name block
+	RLF = old_nam,			! Get wildcard stuff from old name
+	ESA = rms_new_nam_expanded,	! File name before open
+	ESS = nam$c_maxrss,
+	RSA = rms_new_nam_result,	! File name after open
+	RSS = nam$c_maxrss),
+
+    rms_new_fab:	$FAB(		! FAB for rms_new name
+	FOP = OFP,			! Output file parse
+	CTX = msg$_openout,		! Initialize error message
+	NAM = rms_new_nam);		! Address of name block
+
+!
+!	Define CLI qualifier flags (see qualifier$flags)
+!
+
+$CLIQUALCODES (rename,
+		confirm,
+		new_version,
+		log);
+
+!
+! Command qualifier descriptor list
+!
+
+OWN
+
+    log_desc:
+	$CLIQUALDESC(QDCODE = log,
+		     SETLST = qual_log),
+
+    confirm_desc:
+	$CLIQUALDESC(QDCODE = confirm,
+		     SETLST = qual_confirm),
+
+    new_version_desc:
+	$CLIQUALDESC(QDCODE = new_version,
+		     SETLST = qual_new_version),
+
+    end_qual_desc:
+	$CLIQUALEND;
+
+!
+! CLI control blocks and work areas
+!
+
+
+OWN
+    initial_desc:			! CLI initialization descriptor
+	$CLIREQDESC(RQTYPE = initprs,
+		    RQFLGS = absadr,
+		    ERRACT = cli_error),
+
+    qual_desc:				! Parse all command qualifiers
+	$CLIREQDESC(RQTYPE = getqual,
+		    RQFLGS = absadr,
+		    ERRACT = cli_error,
+		    QUALST = log_desc),
+
+    old_desc:				! Get old file name
+	$CLIREQDESC(RQTYPE = input1,
+		    RQFLGS = absadr,
+		    ERRACT = cli_error),
+
+    new_desc:				! Get new file name
+	$CLIREQDESC(RQTYPE = input2,
+		    RQFLGS = absadr,
+		    ERRACT = cli_error),
+
+    cleanup_old_desc:			! End parameter 1 (old name)
+	$CLIREQDESC(RQTYPE = endprm1,
+		    RQFLGS = absadr,
+		    ERRACT = cli_error),
+
+    cleanup_new_desc:			! End parameter 2 (new name)
+	$CLIREQDESC(RQTYPE = endprm2,
+		    RQFLGS = absadr,
+		    ERRACT = cli_error);
+
+ROUTINE rename =			! rename Main routine
+
+!++
+! Functional description
+!
+!	This is the main control routine for the rename command.
+!	It is called from the command language interpreter to 
+!	rename files and directories.
+!
+! Calling sequence
+!
+!	rename() from the Command Language Interpreter
+!
+! Input parameters
+!
+!	AP = Address of argument list passed from CLI
+!
+! Output parameters
+!
+!	None
+!
+! Routine value
+!
+!	Worst error encountered during processing or SS$_NORMAL.
+!
+!----
+
+BEGIN
+
+LOCAL
+    status;				! Status return
+
+BUILTIN
+    AP,					! Define register AP
+    FP;					! Define register FP
+
+BIND cli_params = AP: REF BBLOCK;	! Define parameter block
+
+!
+!	Declare signal handler in order to record the most severe
+!	error message issued, to be returned on exit of image.
+!
+.fp = handler;				! Set condition handler
+!
+!	Save the address of the CLI call-back service routine
+!
+rename$cli_util = .cli_params[cli$a_utilserv];
+
+!
+!	Parse command qualifiers
+!
+
+get_renameqls();			! Get command qualifiers
+
+!
+!	Initialize for file processing loop
+!
+
+old_desc[cli$v_concatinp] = true;	! Initialize get_file routine
+new_desc[cli$v_concatinp] = true;	!   for input and output params
+
+!
+! Begin the main loop of the program
+! Process each file in the input list
+!
+
+WHILE get_next_file () DO		! For each file
+    BEGIN
+	lib$file_scan (			! Search directory
+		old_fab,		!  -using this file name
+		rename_action,		!  -here for each match
+		search_error);		!  -here if an error
+
+    END;	! End of WHILE domain
+
+RETURN .worst_error;
+
+END;
+
+
+ROUTINE rename_action (fab) =
+
+!----
+!
+! Functional description
+!
+!	This routine is called from lib$file_scan whenever
+!	a file name is matched
+!
+! Input parameters
+!
+!	fab = Address of block describing the file
+!	fab$l_nam = pointer to name block
+!
+! Output parameters
+!
+!	None
+!
+!----
+
+BEGIN
+
+MAP fab: REF BBLOCK;			! Define fab block format
+BIND nam = .fab[fab$l_nam]: BBLOCK;	! Define name block
+
+LOCAL
+    status;				! Recieves status
+
+!
+! Handle the output version number:  If the user specified
+! /NONEW_VERSION or included a wild card in the old file version
+! number field then the output version number (if blank) should
+! be explicity copied from the input.  This is done by establishing
+! a default file name string of ';*' for the output file.
+! If neither of the above conditions is met then we will clear
+! the default file name.
+!
+
+IF	(.nam[nam$v_wild_ver]) OR		! If version # was wild
+	NOT (.qualifier$flags[qual_new_version])! or /NONEW was set
+THEN BEGIN
+	new_fab[fab$l_dna] = UPLIT (';*');	! Initialize address
+	new_fab[fab$b_dns] = %CHARCOUNT (';*');	! Initialize size
+     END
+ELSE BEGIN
+	new_fab[fab$l_dna] = 0;			! Clear address
+	new_fab[fab$b_dns] = 0;			! Clear size
+     END;
+!
+! Call RMS to PARSE the new file name.  We must do two parses, the first,
+! with OFP (output file parse) CLEAR, to copy any and all fields left blank
+! in the new name from the old name (which is in the related file block),
+! and the second, with OFP SET, to substitute any names which have been
+! explicitly wildcarded in the output name as these have been ignored
+! during the first parse. 
+! 
+
+!
+! Check to see that we got a resultant name -- if not, then copy the
+! expanded name to the resultant.
+!
+
+IF .old_nam[nam$b_rsl] EQL 0		! If the resultant string is null
+THEN BEGIN				! then copy expanded to resultant:
+   CH$MOVE (.old_nam[nam$b_esl],	!  - expanded length
+	.old_nam[nam$l_esa],		!  - expanded address
+	.old_nam[nam$l_rsa]);		!  - resultant address
+   old_nam[nam$b_rsl]=.old_nam[nam$b_esl]; ! Copy size into NAM$ block
+   END;
+
+
+! Output file parse is OFF in the new_fab block
+
+IF NOT (status =
+$PARSE	(				! Call RMS with
+	FAB = new_fab,			!  -new name fab address
+	ERR = fab_error)		!  -action routine for errors
+) THEN return (.status);		! Return immediately if error
+
+rms_new_fab[fab$l_fna] = .new_nam[nam$l_esa];! Copy the expanded name address
+rms_new_fab[fab$b_fns] = .new_nam[nam$b_esl];! - and size
+
+! Output file parse is ON in the rms_new_fab block
+IF NOT (status =
+$PARSE	(				! Call RMS with
+	FAB = rms_new_fab,		!  -rms new name fab address
+	ERR = fab_error)		!  -action routine for errors
+) THEN return (.status);		! Return immediately if error
+
+!
+! If /CONFIRM was set by the user then interrogate him to see if 
+! this file is to be renamed
+!
+
+IF (.qualifier$flags[qual_confirm])	! If confirmation requested
+THEN
+	IF NOT (confirm_action (	! Call confirmation rout. with
+		.fab,			!  -address of old fab
+		rms_new_fab))		!  -address of new fab
+	   THEN return(false);		! If not confirmed then exit
+
+!
+! Call RMS to RENAME the file using the old file and
+! new file name contained in old_fab and rms_new_nam which must
+! be transfered to the extra set of RMS blocks prefixed 'RMS'
+!
+
+rms_old_fab[fab$b_fns] = .nam[nam$b_rsl];	! Move in name size
+rms_old_fab[fab$l_fna] = .nam[nam$l_rsa];	! Move in name addr.
+
+rms_new_fab[fab$l_fna] = .rms_new_nam[nam$l_esa];	! Move the address
+rms_new_fab[fab$b_fns] = .rms_new_nam[nam$b_esl];	! Move the size
+
+IF NOT (status =
+$RENAME (				! Call RMS RENAME service
+	OLDFAB = rms_old_fab,		!  -with old name
+	ERR    = fab_error,		!  -error routine
+	NEWFAB = rms_new_fab)		!  -and new name
+) THEN return (.status);		! Exit immediately if error
+
+
+!
+! Now call the logging subroutine if requested by the user
+!
+
+IF (.qualifier$flags[qual_log])		! If logging requested
+THEN log_results (			! then call the logger with
+	rms_old_fab,			!  -old name
+	rms_new_fab);			!  -new name
+
+RETURN (true);
+
+END;
+
+
+ROUTINE get_next_file =
+
+!----
+! Functional Description
+!
+!	Obtain the next file specification from the file
+!	list and perform the initial parsing to ensure legality.
+!
+! Input Parameters
+!
+!	rename$cli_util = Address of CLI call-back routine
+!
+! Output Parameters
+!
+!	old_fab = FAB initialized for old file name
+!	old_nam = NAM block associated with FAB
+!
+!	new_fab = FAB initialized for new file name
+!	new_nam = NAM block associated with FAB
+!----
+
+BEGIN
+
+!
+!	If the file list is depleted, then call back
+!	CLI to perform cleanups and exit without filename.
+!
+
+IF NOT .old_desc[cli$v_concatinp]
+THEN
+    BEGIN
+    (.rename$cli_util)(cleanup_old_desc,	! End parameter 1
+		    rename$cli_work,
+		    rename$flags);
+
+    (.rename$cli_util)(cleanup_new_desc,	! End parameter 2
+		    rename$cli_work,
+		    rename$flags);
+    RETURN false;
+    END;
+
+!
+!	Get the next old file name from CLI
+!
+
+(.rename$cli_util)(old_desc,		! Call CLI for parameter #1.
+		rename$cli_work,
+		rename$flags);
+
+!
+!	Initialize the FAB for initial parsing
+!
+
+old_fab[fab$l_fna] = .old_desc[cli$a_rqaddr];
+old_fab[fab$b_fns] = .old_desc[cli$w_rqsize];
+
+!
+!	If there are more name remaining then get the next
+!	new file name from CLI.  If not, then the last file
+!	name supplied will be used.
+!
+
+IF .new_desc[cli$v_concatinp]		! If new name list depleted
+THEN
+   BEGIN
+
+   (.rename$cli_util)(new_desc,		! Call CLI for parameter #2.
+		rename$cli_work,
+		rename$flags);
+
+!
+!	Initialize the FAB for initial parsing
+!
+
+   new_fab[fab$l_fna] = .new_desc[cli$a_rqaddr];
+   new_fab[fab$b_fns] = .new_desc[cli$w_rqsize];
+
+   END;
+
+RETURN true;
+
+END;
+
+ROUTINE confirm_action (old_fb2,new_fb2) =
+
+!----
+!
+! Functional description
+!
+!	This routine is called from the main loop whenever
+!	confirmation is requested.
+!
+! Input parameters
+!
+!	old_fb2 = Address of block describing the old file
+!	new_fb2 = Address of block describing the new file
+!
+! Output parameters
+!
+!		TRUE	--> Action should be taken
+!		FALSE	--> Action should be cancelled
+!
+!
+!----
+
+BEGIN
+
+MAP
+    old_fb2:	REF BBLOCK,		! Define fab block format
+    new_fb2:	REF BBLOCK;
+
+BIND
+    old_nm2 = .old_fb2[fab$l_nam]: BBLOCK, ! Define name block format
+    new_nm2 = .new_fb2[fab$l_nam]: BBLOCK;
+
+
+OWN
+    old_desc:	BBLOCK[dsc$c_s_bln],	! descriptor for old_file name
+    new_desc:	BBLOCK[dsc$c_s_bln],	! descriptor for new_file name
+    fao_desc:	BBLOCK[dsc$c_s_bln],	! FAO work area descriptor
+    reply_desc:	BBLOCK[dsc$c_s_bln]	! Buffer desc. for reply
+		INITIAL (
+		WORD (0),		!  -size = 0
+		BYTE (dsc$k_dtype_t),	!  -arguement type = ascii
+		BYTE (dsc$k_class_d),	!  -class = dynamic
+		LONG (0));		!  -pointer = 0
+
+LOCAL
+    status:	BLOCK[1],		! Recieves status
+    length : 	WORD,			! Length of resultant message
+    char,				! Character work area
+    fao_buffer:	VECTOR[512,BYTE];	! FAO work area
+
+
+!
+! Initialize descriptors with:
+!	1) old file name	-->	old_desc
+!	2) new file name	-->	new_desc
+!	3) FAO buffer		-->	fao_desc
+!
+
+old_desc[dsc$w_length] = .old_nm2[nam$b_rsl];	! Resultant file name length
+old_desc[dsc$a_pointer] = .old_nm2[nam$l_rsa];	! Resultant file name address
+
+!
+! If no resultant name then use the expanded name instead
+!
+
+IF .old_nm2[nam$b_rsl] EQL 0			! If no resultant name
+THEN BEGIN
+  old_desc[dsc$w_length] = .old_nm2[nam$b_esl];	! Expanded file name length
+  old_desc[dsc$a_pointer] = .old_nm2[nam$l_esa];! Expanded file name address
+  END;
+
+new_desc[dsc$w_length] = .new_nm2[nam$b_esl];	! Expanded file name length
+new_desc[dsc$a_pointer] = .new_nm2[nam$l_esa];	! Expanded file name address
+
+fao_desc[dsc$w_length] = 512;			! FAO work area size
+fao_desc[dsc$a_pointer] = fao_buffer;		! FAO work area address
+
+!
+! Now call SYS$FAO to expand message
+!
+
+IF NOT (status = SYS$FAO (		! Call system service with
+					!  -messages desc. address
+		addrdesc('!AS --> !AS ? (Y or N): '),
+		length,			!  -place to put result length
+		fao_desc,		!  -descriptor of a work area
+		old_desc,		!  -first FAO arguement
+		new_desc))		!  -second FAO arguement
+   THEN
+	BEGIN
+	write_message (.status);	! Tell the user
+	return (.status);		! Return to caller
+	END;
+
+
+!
+! Now question user by calling LIB$GET_COMMAND using the result
+! of the FAO call as a prompt string
+!
+
+fao_desc[dsc$w_length] = .length;	! Move in prompt string size
+
+IF NOT (status = LIB$GET_COMMAND (	! Call library routine with
+		reply_desc,		!  -reply buffer desc. addr.
+		fao_desc))		!  -prompt string desc. addr.
+   THEN
+	BEGIN
+	IF (.status EQL rms$_eof)	! If this was end of file then
+	THEN status[sts$v_severity] =	!  make it a severe (i.e. non-
+		sts$k_severe;		!  returnable) error
+	write_message (.status);	! Tell the user
+	return (.status);		! Return to caller
+	END;
+
+!
+! Now retrieve one charater from the buffer and set the return 
+! status depending on its value
+!
+
+IF (.reply_desc[dsc$w_length] EQL 0)	! Did user hit <CR>?
+THEN return (false);			! Yes, return false
+
+char = CH$RCHAR (CH$PTR (.reply_desc[dsc$a_pointer]));
+
+IF (.char EQL 'Y' OR			! If user responded 'Y'
+    .char EQL 'y' OR			!    or 'y'
+    .char EQL 'T' OR			!    or 'T' (TRUE)
+    .char EQL 't')			!    or 't'
+THEN return (true)			! Return 'TAKE ACTION'
+ELSE return (false);			! Return 'CANCEL ACTION'
+
+END;
+
+ROUTINE log_results (old_fb1,new_fb1) =
+
+!----
+!
+! Functional description
+!
+!	This routine is called from the main loop whenever
+!	logging is requested
+!
+! Input parameters
+!
+!	old_fb1 = Address of block describing the old file name
+!	new_fb1 = Address of block describing the new file name
+!	fab$l_nam = pointer to name blocks for each fab
+!
+! Output parameters
+!
+!	None
+!
+!----
+
+BEGIN
+
+MAP old_fb1: REF BBLOCK,		! Define RMS FAB block formats
+    new_fb1: REF BBLOCK;
+
+BIND					! Now locate the name blocks
+    old_nm1 = .old_fb1[fab$l_nam]: BBLOCK,
+    new_nm1 = .new_fb1[fab$l_nam]: BBLOCK;
+
+LOCAL					! Create temporary storage for
+    old_desc: VECTOR[2],		!  name descriptors
+    new_desc: VECTOR[2];
+
+old_desc[0] = .old_nm1[nam$b_rsl];	! Get resultant name length
+old_desc[1] = .old_nm1[nam$l_rsa];	! Get resultant name address
+
+new_desc[0] = .new_nm1[nam$b_rsl];	! Ditto for new name
+new_desc[1] = .new_nm1[nam$l_rsa];
+
+write_message(				! Now notify the user with
+	msg$_renamed,			!  -'RENAMED' message
+	2,				!  -two FAO arguements
+	old_desc,			!  -old name
+	new_desc);			!  -new name
+
+
+RETURN true;
+
+END;
+
+ROUTINE get_renameqls =
+
+!----
+!
+! Functional description
+!
+!	This routine calls CLI to obtain the command line and
+!	then all command qualifiers.
+!
+! Input parameters
+!
+!	None
+!
+! Output parameters
+!
+!	qualifier$flags	= Bitmap indicating which qualifiers are present
+!
+!----
+
+BEGIN
+
+!
+!	Initialize CLI for result parsing
+!
+
+(.rename$cli_util)(initial_desc,	! Request result parsing
+	rename$cli_work,
+	qualifier$flags);
+
+!
+!	Parse the command qualifiers
+!
+
+(.rename$cli_util)(qual_desc,		! Parse command qualifiers
+	 rename$cli_work,		! with a work area, and
+	 qualifier$flags);		! the address of a bitmap
+
+return true;
+END;
+
+ROUTINE handler (signal_args, mechanism_args) =
+
+!---
+!
+!	This condition handler gets control on any signalled
+!	condition in order to save the highest severity error
+!	to be returned by exit from the image.
+!
+! Inputs:
+!
+!	signal_args = Address of signal argument list
+!	mechanism_args = Address of mechanism argument list
+!
+! Outputs:
+!
+!	worst_error is updated with highest severity error.
+!
+!---
+
+BEGIN
+
+MAP
+    signal_args: REF BBLOCK,			! Adr of signal arg list
+    mechanism_args: REF BBLOCK;			! Adr of mech. arg list
+
+LOCAL
+    code: BBLOCK [LONG];			! Condition code (longword)
+
+code = .signal_args [chf$l_sig_name];		! Get condition code
+
+IF .code [sts$v_severity] GTR .worst_error [sts$v_severity]
+THEN
+    worst_error = .code OR sts$m_inhib_msg;	! Set new worst error
+
+ss$_resignal					! Continue signalling
+
+END;
+
+ROUTINE fab_error (fab) =
+
+!----
+!
+! Functional description
+!
+!	This routine is called from RMS whenever an error
+!	occurs during an RMS file function call.
+!
+! Input parameters
+!
+!	fab = Address of block used in the RMS call.
+!	fab$l_nam = pointer to name block
+!	fab$l_ctx = error message to be used
+!
+! Output parameters
+!
+!	None
+!
+!----
+
+BEGIN
+
+MAP fab: REF BBLOCK;			! Define fab block format
+BIND nam = .fab[fab$l_nam]: BBLOCK;	! Define name block
+
+LOCAL
+    fabptr:	REF BBLOCK,		! Pointer to fab block
+    namptr:	REF BBLOCK,		! Pointer to nam block
+    desc:	VECTOR[2];		! Temporary string descriptor
+
+namptr = nam;
+fabptr = .fab;
+
+!
+! If the error is "FILE ALREADY EXISTS" then check to see if
+! this is a rename-to-self operation.  If so, supress the message
+!
+
+! Also: RMS does not ever return the new_fab for any RENAME errors.
+! So, for now, if the message is FEX (which is a frequent error) we
+! will change FABPTR and NAMPTR to indicate the new name.
+!
+
+IF (.fab[fab$l_sts] EQL rms$_fex)	! If its a file-exists msg
+   THEN BEGIN
+
+	namptr = rms_new_nam;			! Reassign name pointer
+	fabptr = rms_new_fab;			! Reassign fab pointer
+
+	IF CH$EQL (				! Compare the names
+		.old_nam[nam$b_rsl],		!  -Old name length
+		CH$PTR (.old_nam[nam$l_rsa]),	!  -Old name pointer
+		.rms_new_nam[nam$b_esl],	!  -New name length
+		CH$PTR (.rms_new_nam[nam$l_esa])!  -New name pointer
+			) THEN RETURN (true);	! Exit immediately
+    END;
+
+
+IF .namptr[nam$b_rsl] NEQ 0		! IF result string nonblank,
+THEN BEGIN
+    desc[0] = .namptr[nam$b_rsl];	! then display it
+    desc[1] = .namptr[nam$l_rsa];
+    END
+ELSE IF .namptr[nam$b_esl] NEQ 0	! Or if expanded name nonblank
+THEN BEGIN
+    desc[0] = .namptr[nam$b_esl];	! then display it
+    desc[1] = .namptr[nam$l_esa];
+    END
+ELSE BEGIN
+    desc[0] = .fabptr[fab$b_fns];	! Otherwise, use original
+    desc[1] = .fabptr[fab$l_fna];	! name string in fabptr
+    END;
+
+!
+! Check for an "illegal device" error, if so see if the
+! old and new device names are different.  If that's the
+! problem (you can't rename from one device to another) then
+! issue a claifiying error message.  Otherwise issue the
+! error message returned from RMS.
+!
+
+IF (.fab[fab$l_sts] EQL rms$_dev)	! If illegal device error
+AND  CH$NEQ (				! and the device names are different
+	.old_nam[nam$b_dev],		!  -old name length
+	CH$PTR (.old_nam[nam$l_dev]),	!  -old name pointer
+	.rms_new_nam[nam$b_dev],	!  -new name length
+	CH$PTR(.rms_new_nam[nam$l_dev]))!  -new name pointer
+THEN write_message (rename$_notrenamed,	! Inform the user
+		1,			!  -1 FAO arguement
+		DESC,			!  -filename
+		rename$_notsamedev)	!  -reason for failure
+ELSE write_message(.fabptr[fab$l_ctx],1,DESC,! Output an error message
+		.fab[fab$l_sts],	! with original fab error code
+		.fab[fab$l_stv]);	! and secondary code
+
+
+RETURN (.fabptr[fab$l_sts]);
+
+END;
+
+ROUTINE search_error (fab) =
+
+!----
+!
+! Functional description
+!
+!	This routine is called from RMS whenever an error
+!	occurs during an RMS file function call.
+!
+! Input parameters
+!
+!	fab = Address of block used in the RMS call.
+!	fab$l_nam = pointer to name block
+!
+! Output parameters
+!
+!	None
+!
+!----
+
+BEGIN
+
+MAP fab: REF BBLOCK;			! Define fab block format
+BIND nam = .fab[fab$l_nam]: BBLOCK;	! Define name block
+
+LOCAL desc: VECTOR[2];			! Temporary string descriptor
+
+IF .nam[nam$b_rsl] NEQ 0		! IF result string nonblank,
+THEN BEGIN
+    desc[0] = .nam[nam$b_rsl];		! then display it
+    desc[1] = .nam[nam$l_rsa];
+    END
+ELSE IF .nam[nam$b_esl] NEQ 0		! Or if expanded name nonblank
+THEN BEGIN
+    desc[0] = .nam[nam$b_esl];		! then display it
+    desc[1] = .nam[nam$l_esa];
+    END
+ELSE BEGIN
+    desc[0] = .fab[fab$b_fns];		! Otherwise, use original
+    desc[1] = .fab[fab$l_fna];		! name string in FAB
+    END;
+
+write_message(msg$_searchfail,1,DESC,	! Output an error message
+		.fab[fab$l_sts],	! with fab error code
+		.fab[fab$l_stv]);	! and secondary code
+
+RETURN (.fab[fab$l_sts]);
+
+END;
+
+ROUTINE cli_error (cli_block,error): =
+
+!----
+!
+! Functional description
+!
+!	This routine is called as an error handler for
+!	CLI errors.
+!
+! Input parameters
+!
+!	cli_block = Address of CLI request block
+!	error = CLI error message
+!
+! Output parameters
+!
+!	None
+!
+!----
+
+BEGIN
+
+MAP cli_block: REF BBLOCK;		! Define CLI request block
+
+signal_stop(.error);
+
+RETURN (.error);
+
+END;
+
+END
+ELUDOM

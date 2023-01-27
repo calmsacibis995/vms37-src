@@ -1,0 +1,653 @@
+	.TITLE	PAGEFILE - ALLOCATE / DEALLOCATE PAGING FILE
+	.IDENT	'V03-002'
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+
+;++
+; FACILITY:	EXECUTIVE, MEMORY MANAGEMENT SUBROUTINES
+;
+; ABSTRACT:
+;
+;	THIS MODULE CONTAINS THE ROUTINES FOR ALLOCATING AND DEALLOCATING
+;	PAGES FROM A PAGING FILE.
+;
+; ENVIRONMENT:
+;
+;	THESE ROUTINES RUN IN KERNEL MODE AND MUST BE CALLED WITH
+;	IPL AT SYNCH OR HIGHER.
+;
+;--
+;
+	.SBTTL	HISTORY			; DETAILED
+;
+; AUTHOR: PETER H. LIPMAN	, CREATION DATE: 29-OCT-76
+;
+; MODIFIED BY:
+;
+;	V03-002	HRJ0060		Herb Jacobs		20-Mar-1982
+;		Add back PAGEFILE control block 0 being shell.
+;
+;	V03-001	HRJ0059		Herb Jacobs		15-Mar-1982
+;		Fix return code on SWAPFILE full path.
+;
+;	V02-024	HRJ0052		Herb Jacobs		08-Feb-1982
+;		Add code to support dynamic write cluster size requests.
+;
+;	V02-023	HRJ0041		Herb Jacobs		29-Dec-1981
+;		Add console messages indicating page file full conditions.
+;
+;	V02-022	HRJ0038		Herb Jacobs		11-Dec-1981
+;		Add entry point to allow less than 8 block allocations.
+;
+;	V02-021	HRJ0035		Herb Jacobs		27-Nov-1981
+;		Allow a swapfile index of 0 and separate swap file
+;		resource from page file resource.
+;
+;	V02-020	LJK0086		Lawrence J. Kenah	13-Nov-1981
+;		Change PFL control flag name to PFL$V_PAGFILFUL.
+;
+;	V02-019	LJK0080		Lawrence J. Kenah	5-Nov-1981
+;		Begin search for swap slot at index 0. Change upper
+;		limit of page and file allocation to MMG$GL_MAXPFIDX.
+;
+;	V02-018	LJK0079		Lawrence J. Kenah	5-Nov-1981
+;		Remove SWAPFILE.MAR from system build. Move data 
+;		structures for the page file vector to this module.
+;
+;	V02-017	WMC0007		Wayne Cardoza		19-Oct-1981
+;		Restore registers properly if checkpoint bit was set.
+;
+;	V02-016	HRJ0028		Herb Jacobs		24-Aug-1981
+;		Remove counters, fix bug of losing R0 in allocation failure.
+;
+;	V02-015	HRJ0026		Herb Jacobs		13-Aug-1981
+;		Fix losing R3 over SCH$RAVAIL call.
+;
+;	V02-014	LJK0044		Lawrence J. Kenah	13-Aug-1981
+;		Change references from PGFLVBN to MAXVBN to reflect
+;		new name of this field in PFL.
+;
+;	V02-013 WMC001		Wayne Cardoza		07-Aug-1981
+;		Don't deallocate a page if the checkpoint bit is set and
+;		it is a short page file.
+;
+;	V02-012	HRJ0025		Herb Jacobs		19-Jul-1981
+;		Remove reserve logic.  Added MMG$ALLOCSWPAREA routine.
+;
+;	V02-011	HRJ0023		Herb Jacobs		29-Jun-1981
+;		Rewrite to change allocate and deallocate to first fit
+;		algorithm to allow for swap file space allocation in the
+;		pagefile.
+;
+;	V02-010	LJK0010		Lawrence J. Kenah	13-Mar-1981
+;		Incorporate mask field from PFL into reservation and
+;		deallocation routines. Add routine that allows blocks
+;		to be allocated by VBN. (Both of these features
+;		support the checkpoint facility.)
+;
+;	V02-009	PHL0002		Peter H. Lipman		23-Jan-1981
+;
+;		An allocate request should always succeed if there are
+;		any free pages to allocate.  The reservation count was
+;		incorrectly being used to bound what would be allocated.
+;		It is never the case that an allocation could be
+;		requested without a reservation before it.
+;
+;	V02-008	KDM0015		Kathleen D. Morse	13-Jun-1980
+;		Fix bitmap scanner to search a section of bitmap larger
+;		than FFFF bytes.
+;**
+
+
+	.SBTTL	DECLARATIONS
+
+;
+; INCLUDE FILES:
+;
+	$PFLDEF				;PAGE FILE CONTROL BLOCK DEFINITIONS
+	$PTEDEF				;PAGE TABLE ENTRY DEFINITIONS
+	$RSNDEF				;RESOURCE NAME DEFINITIONS
+;
+; EXTERNAL SYMBOLS:
+;
+
+;
+; MACROS:
+;
+
+;
+; EQUATED SYMBOLS:
+;
+
+;
+; OWN STORAGE:
+;
+
+	.PSECT	$$$220,LONG		; SWAPPER/SCHEDULER DATA
+	.ALIGN	LONG			;
+
+MMG$GL_NULLPFL::			; NULL PFL SERVES AS PLACEHOLDER
+	.LONG	0			; BITMAP POINTER, 0 IF TABLE NOT IN USE
+	.LONG	0			; ADDRESS OF MPW_WRTCLUSTER SIZE AREA
+	.WORD	PFL$C_LENGTH
+	.BYTE	DYN$C_PFL
+	.BYTE	0			; PAGE FAULT CLUSTER
+	.LONG	0			; WINDOW POINTER, *** FILLED IN BY INIT
+	.LONG	0			; VBN,		  *** FILLED IN BY INIT
+	.LONG	0			; BITMAP SIZE
+	.LONG	0			; FREE PAGE COUNT IN THIS FILE
+	.LONG	PTE$M_PGFLVB		; PAGE FILE VBN MASK
+	.LONG	0			; ACCOUNT FOR EXTENDED LENGTH
+;
+; POINTER TO VECTOR OF PAGE/SWAP FILE CONTROL BLOCKS
+;
+
+MMG$GL_PAGSWPVC::
+	.LONG	0
+
+;
+; MAXIMUM PAGE FILE INDEX CURRENTLY IN USE
+;
+
+MMG$GL_MAXPFIDX::
+	.LONG	0
+
+MMG$GW_MINPFIDX::
+SGN$GW_SWPFILCT::			; Count of swapfile slots
+	.WORD	0
+
+;
+; Most of the routines in this module are permanently resident
+;
+	.PSECT	$MMGCOD
+
+	.SBTTL	ALLOCSWPAREA - ALLOCATE A SWAP AREA IN A PAGE FILE
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	THIS ROUTINE ALLOCATES A CLUSTER OF PAGES FROM THE SPECIFIED PAGE FILE.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	MMG$ALLOCSWPAREA
+;
+; INPUT PARAMETERS:
+;
+;	r0 = VBN in paging file representing start of current allocation
+;	r1 = current allocation size
+;	r2 = new request size
+;
+; IMPLICIT INPUTS:
+;
+;	none
+;
+; OUTPUT PARAMETERS:
+;
+;	r0 = page file vbn (greater than 0) if successful
+;	r2 = number of pages allocated
+;	r1,r3 destroyed
+;
+; IMPLICIT OUTPUTS:
+;
+;	none
+;
+; COMPLETION CODES:
+;
+;	positive condition code indicates success
+;	negative condition code indicates failure
+;	zero condition code indicates failure because request too early in boot
+;
+; SIDE EFFECTS:
+;
+;	none
+;
+;--
+
+mmg$allocswparea::
+	pushr	#^m<r4,r5>		; save work registers
+	clrl	r5			; indicator for no paging files at all
+	movl	#1,r4			; start scan at file index 1
+10$:	movl	@w^mmg$gl_pagswpvc[r4],r3 ; get address of next page file block
+	bbs	#pfl$v_inited,pfl$b_flags(r3),30$ ;branch if this one inited
+20$:	aobleq	g^mmg$gl_maxpfidx,r4,10$ ; loop through all page files
+	mnegl	#1,r2			; assume unlimited growth size
+	movl	r5,r0			; set flag indicating if we are booting
+	brb	40$			; use common exit
+30$:	decl	r5			; indicate valid paging file exists
+	pushr	#^m<r4,r5,r6,r7,r8,r9,r10,r11> ;save volatile registers
+	bsbb	mmg$allocpagfil1	; allocate new area in page file
+	popr	#^m<r4,r5,r6,r7,r8,r9,r10,r11> ;restore volatile registers
+	beql	20$			; try next page file
+	insv	r4,#24,#8,r0		; save swap file index
+40$:	popr	#^m<r4,r5>		; restore registers
+	rsb				; return to caller
+
+	.SBTTL	ALLOCPAGFIL - ALLOCATE A PAGING FILE SPACE
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	THIS ROUTINE ALLOCATES A CLUSTER OF PAGES FROM THE SPECIFIED PAGE FILE.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	MMG$ALLOCPAGFIL1
+;
+; INPUT PARAMETERS:
+;
+;	r0 = VBN in paging file representing start of current allocation
+;	r1 = current allocation size
+;	r2 = new request size
+;	r3 = page file index
+;
+; IMPLICIT INPUTS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	R0 = PAGE FILE VBN (GREATER THAN 0) IF SUCCESSFUL
+;	R2 = NUMBER OF PAGES ALLOCATED
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	Z-BIT SET IF FAILURE
+;	Z-BIT 0 IF SUCCESS
+;
+; SIDE EFFECTS:
+;
+;	MMG$ALLOCPAGFIL2 has register content dependencies on this routine!
+;
+;	This routine depends on allocation sizes to be multiples of 8 for
+;	reasonable search times now that this is first fit.  This implies
+;	that the modified page writer cluster size should be equal to
+;	the swap space allocation increment, to allow the local "memory"
+;	to work reasonably.  Also the minimum modified page writer cluster size
+;	should be at least 16 blocks for correct resource failure continuation,
+;	this allows some emergency 8 byte blocks to be allocated.
+;
+;--
+
+MMG$ALLOCPAGFIL1::
+	movl	pfl$l_bitmap(r3),r6	;address of start of map
+	movl	pfl$l_bitmapsiz(r3),r7	;number of bytes in map
+	addl3	r6,r7,r10		;get end of map address
+	mnegl	#1,r11			;materialize a minus for use
+20$:	pushr	#^m<r0,r1,r2,r3>	;save the inputs, (r3 is now address)
+	ashl	#-3,r2,r8		;make size into byte count
+	extzv	#24,#8,r0,r9		;get the page file index
+	cmpl	@w^mmg$gl_pagswpvc[r9],r3 ;is this in the same page file?
+	bneq	60$			;branch if not, try for simple allocate
+	extzv	#0,#24,r0,r0		;get the input VBN
+	beql	60$			;branch if not holding current space
+	addl3	r0,r1,r9		;get ending block
+	ashl	#-3,r9,r9		;get byte offset of area after this one
+					;r0+r1 always yield (multiple of 8)+1
+	ashl	#-3,r1,r4		;current size in groups of 8
+	subl3	r4,r8,r5		;number of additional needed blocks
+	bgtr	30$			;branch if this is an expansion
+	bsbw	mmg$deallocpagfil	;free current holding if contraction
+	popr	#^m<r0,r1,r2,r3>	;restore regs
+	clrq	r0			;indicate holding freed
+	brb	20$			;now do the allocation
+;
+; The end of map condition is handled by having a non-allocatable byte at
+; the end of the map.  This allows the skpc to failure terminate.
+;
+30$:	skpc	r11,r5,(r6)[r9]		;find additional contiguous free space
+	bneq	60$			;branch if non-free blocks in area
+	movc5	#0,(r1),#0,r5,(r6)[r9]	;mark these blocks allocated
+;
+; It is safe not to update STARTBYTE down this path since this is an allocate.
+; This is also probably desirable to lessen start of map searches.
+;
+	popr	#^m<r0,r1,r2,r3>	;restore regs
+					;note input VBN is output VBN
+	subl	r2,r1			;get additionally allocated blocks
+					;(count is negative)
+	addl	r1,pfl$l_frepagcnt(r3)	;update count of available pages
+	bicpsw	#4			;indicate success
+	rsb				;return VBN in R0, count in R2, z-bit=0
+;
+; allocation failure return
+;
+40$:	popr	#^m<r0,r1,r2,r3>	;restore regs
+	bisb	#pfl$m_swpfilful,pfl$b_flags(r3) ;set flag indicating file full
+	bispsw	#4			;indicate failure, no deallocation!
+	rsb				;z-bit set
+;
+; new allocation
+;
+60$:	movzwl	r11,r5			;set up for 65536 byte locate
+	cmpb	r2,pfl$b_allocsiz(r3)	;is this standard request size?
+	blss	70$			;branch if not, search from start
+	movl	pfl$l_startbyte(r3),r1	;set up to start from first known free
+	bneq	80$			;branch if we know where
+70$:	movl	r6,r1			;set up to scan map from start
+
+80$:	subl3	r1,r10,r7		;calc number of bytes remaining to scan
+	beql	40$			;branch if at end of map
+	cmpl	r7,r5			;less than 65536 bytes to scan?
+	bgeq	90$			;branch if not
+	movl	r7,r5			;set scan amount to what's left
+90$:	locc	r11,r5,(r1)		;find a byte aligned area with 8 blocks
+	beql	80$			;branch if no free clusters in area
+;
+; The end of map condition is handled by having a non-allocatable byte at
+; the end of the map.  This allows the skpc to failure terminate.
+;
+	skpc	r11,r8,(r1)		;is this sequence long enough?
+	bneq	80$			;branch if not, look for another
+	subl	r8,r1			;get back start address of field
+	movc5	#0,(r1),#0,r8,(r1)	;allocate area, preserve r1 address
+	subl3	r6,r1,r7		;save start byte to return it
+	movl	r3,r9			;save address of end of this area
+	popr	#^m<r0,r1>		;restore regs for deallocations, if any
+	extzv	#24,#8,r0,r3		;get the page file index
+	extzv	#0,#24,r0,r0		;get the input VBN
+	beql	95$			;branch if no previous holding
+	movl	@w^mmg$gl_pagswpvc[r3],r3 ;get page file control block address
+	bsbw	mmg$deallocpagfil	;free up the space
+95$:	popr	#^m<r2,r3>		;restore the request size, PFL addr
+	cmpb	r2,pfl$b_allocsiz(r3)	;was this for current request size
+	bneq	100$			;branch if not, don't affect memory
+	movl	r9,pfl$l_startbyte(r3)	;update memory for future reference
+100$:	subl	r2,pfl$l_frepagcnt(r3)	;update count of available pages
+	ashl	#3,r7,r0		;multiply byte number*8 to get VBN
+	incl	r0			;VBN's need to be based at 1
+	rsb				;return, z-bit=0
+
+BADALLOC:
+	BUG_CHECK BADPAGFILA,FATAL	;BAD PAGE FILE ADDRESS ALLOCATED
+	.SBTTL	ALLOCPAGFIL - ALLOCATE A PAGING FILE SPACE
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	THIS ROUTINE ALLOCATES THE FIRST CONTIGOUS SET OF BLOCKS FROM
+;	THE SPECIFIED PAGE FILE.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	MMG$ALLOCPAGFIL2	; must occur just after a call
+;					; to MMG$ALLOCPAGFIL
+;
+; INPUT PARAMETERS:
+;
+;	r3 = page file control block address
+;	r6 = address of start of bitmap
+;	r10= end address of bitmap
+;	r11= 65536 (maximum size for a string instruction length)
+;
+; IMPLICIT INPUTS:
+;
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;
+;	R0 = PAGE FILE VBN (GREATER THAN 0) IF SUCCESSFUL
+;	R2 = NUMBER OF PAGES ALLOCATED
+;
+; IMPLICIT OUTPUTS:
+;
+;	NONE
+;
+; COMPLETION CODES:
+;
+;	Z-BIT SET IF FAILURE
+;	Z-BIT 0 IF SUCCESS
+;
+; SIDE EFFECTS:
+;
+;	none
+;--
+
+fragmsg:
+	.long	20$-10$
+	.long	10$
+10$:
+	.ascii	<13><10>-
+	\%SYSTEM-W-PAGEFRAG, Page file 65% full, system continuing\-
+		<13><10>
+20$:
+critmsg:
+	.long	40$-30$
+	.long	30$
+30$:	.ascii	<13><10>-
+	\%SYSTEM-W-PAGECRIT, Page file 90% full, system trying to continue\-
+		<13><10>
+40$:
+
+MMG$ALLOCPAGFIL2::
+	movzwl	r11,r5			;set up for 65536 byte locate
+	movl	r6,r1			;set up to scan map from start
+
+10$:	subl3	r1,r10,r7		;calc number of bytes remaining to scan
+	beql	50$			;branch if at end of map
+	cmpl	r7,r5			;less than 65536 bytes to scan?
+	bgeq	20$			;branch if not
+	movl	r7,r5			;set scan amount to what's left
+20$:	skpc	#0,r5,(r1)		;find any free blocks
+	beql	10$			;branch if no free clusters in area
+	ffs	#0,#8,(r1),r0		;find the free block
+	subl3	#1,r0,r2		;save start offset
+30$:	incl	r2			;account for block
+	bbsc	r2,(r1),30$		;loop through contiguous portion of map
+	subl	r0,r2			;set r2 number of blocks allocated
+	subl	r2,pfl$l_frepagcnt(r3)	;update count of available pages
+	subl	r6,r1			;get byte number of free blocks
+	movaq	1(r0)[r1],r0		;form 8*byte number + bit number + 1
+	ashl	#1,pfl$l_bitmapsiz(r3),r1 ;find 1/4 point of VBN's in bitmap
+	cmpl	r0,r1			;is this allocation past 1/4 point?
+	blssu	50$			;branch if not, no message needed yet
+	bbss	s^#exe$v_pgflfrag,w^exe$gl_flags,40$ ;branch if reported
+	pushr	#^m<r0,r1,r2>		;save registers
+	movq	fragmsg,r1		;set up message to output
+	bsbb	sendmsg			;output the message
+	popr	#^m<r0,r1,r2>		;restore registers
+40$:	addl3	r1,r1,r4		;find 3/4 mark in file
+	addl	r1,r4			;now have 3/4 VBN
+	cmpl	r0,r4			;is this allocation past 3/4 point
+	blssu	50$			;branch if not
+	bbss	s^#exe$v_pgflcrit,w^exe$gl_flags,50$ ;branch if reported
+	pushr	#^m<r0,r1,r2>		;save registers
+	movq	critmsg,r1		;set up message to output
+	bsbb	sendmsg			;output the message
+	popr	#^m<r0,r1,r2>		;restore registers
+	bicpsw	#4			;indicate success
+50$:	rsb				;return, z-bit=0 success, else failure
+
+sendmsg:
+	movab	w^opa$ucb0,r5		;set console terminal for broadcast
+	brw	ioc$broadcast		;assume message will get to console
+
+	.SBTTL	DALCPAGFIL - DEALLOCATE PAGE IN PAGING FILE
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	THIS ROUTINE DEALLOCATES A SPECIFIED PAGE IN THE SPECIFIED
+;	PAGING FILE.
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	MMG$DALCPAGFIL
+;
+; INPUT PARAMETERS:
+;
+;	R0 = PAGE FILE VBN TO DEALLOCATE
+;	R3 = PAGE FILE INDEX
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	R0,R1,R2 DESTROYED
+;	R3 = ADDRESS OF PAGE FILE CONTROL BLOCK
+;
+; IMPLICIT OUTPUTS:
+;
+;	IF THE SPECIFIED PAGING FILE BECOMES NON-EMPTY, THE RESOURCE
+;	AVAILABLE SIGNAL IS ISSUED FOR THE RSN$_PGFILE RESOURCE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+	.ENABLE	lsb
+
+5$:	;check for checkpoint bit
+	bbc	#pte$v_chkpnt,r0,10$	;checkpoint bit set?
+	bbs	#pte$v_chkpnt,pfl$l_maxvbn(r3),10$  ;branch if not a small file
+	popr	#^m<r0,r1>		;clean up
+	rsb				;ignore the deallocation request
+
+10$:	BUG_CHECK BADPAGFILD,FATAL	;BAD PAGE FILE ADDRESS DEALLOCATED
+
+; r0 = VBN of block to return
+; r3 = page file index
+
+MMG$DALCPAGFIL::
+	movl	@w^mmg$gl_pagswpvc[r3],r3 ;get page file control block address
+	movl	#1,r1			;set count to 1
+					;fall through
+; r0 = VBN of start block to return
+; r1 = count
+; r3 = address of page file control block
+
+MMG$DEALLOCPAGFIL::
+	decl	r0			;get VBN to base 0
+	blss	10$			;branch if VBN passed was 0
+	pushr	#^m<r0,r1>		;save for later
+	addl3	r0,r1,r2		;high mark for deallocation
+	decl	r2			;account for count in 0 origin
+	ashl	#-3,r2,r2		;byte # in map
+	cmpl	r2,pfl$l_bitmapsiz(r3)	;legal page file VBN?
+	bgequ	5$			;branch if illegal
+	movl	#32,r2			;max number single insv can set
+30$:	cmpl	r2,r1			;free more than 32?
+	bleq	40$			;branch if yes
+	movl	r1,r2			;set max number to free
+40$:	cmpv	r0,r2,@pfl$l_bitmap(r3),#0 ;temp check for safety
+	bneq	10$			;bugcheck if any of these bit set
+	insv	#-1,r0,r2,@pfl$l_bitmap(r3) ;set the bits
+	addl	r2,r0			;update to next VBN sequence
+	addl	r2,pfl$l_frepagcnt(r3)	;count free pages
+	subl	r2,r1			;number of blocks to still free
+	bneq	30$			;loop through entire set
+	popr	#^m<r0,r1>		;get back VBN and free count
+	ashl	#-3,r0,r0		;set up to check for 8 block unit freed
+	addl	#14,r1			;round count for worst case crossing
+	ashl	#-3,r1,r1		;number of bytes to check
+	locc	#-1,r1,@pfl$l_bitmap(r3)[r0] ;any whole cluster become free?
+	beql	60$			;branch if not
+	cmpl	r1,pfl$l_startbyte(r3)	;is freed cluster earlier in map?
+	bgtru	60$			;branch if not, note bgtru not bgequ
+50$:	mcomb	-(r1),r0		;find start byte of free area
+	beql	50$			;loop
+	addl3	#1,r1,r2		;set start of area
+	movzbl	pfl$b_allocsiz(r3),r1	;get current cluster size for this file
+	ashl	#-3,r1,r1		;get it in bytes rather than blocks
+	skpc	#-1,r1,(r2)		;does this area qualify?
+	bneq	60$			;branch if not
+	movl	r2,pfl$l_startbyte(r3)	;save new starting pointer
+	cmpb	pfl$b_allocsiz(r3),w^mpw$gw_mpwpfc ;are we at maximum size
+					;we should ever try allocations for?
+	beql	55$			;branch if at maximum
+	addb	#8,pfl$b_allocsiz(r3)	;try next higher size next time
+55$:	bbcc	#pfl$v_swpfilful,pfl$b_flags(r3),60$ ;branch if not transition
+	pushr	#^m<r3>			;save pfl address
+	movl	#rsn$_swpfile,r0	;set up to return swap file available
+	bsbw	sch$ravail		;signal resource available
+	popr	#^m<r3>			;restore pfl address
+60$:	rsb				;return
+
+	.DISABLE lsb
+
+	.SBTTL	ALC_PGFLVBN	Allocate specific blocks in paging file
+
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+;	This routine allocates a specific set of blocks in a paging file
+;
+; CALLING SEQUENCE:
+;
+;	BSBW	MMG$ALC_PGFLVBN
+;
+; INPUT PARAMETERS:
+;
+;	R0 = VBN of first block to be allocated
+;	R1 = Page file index
+;	R2 = Number of consecutive blocks to be allocated
+;
+; IMPLICIT INPUTS:
+;	none
+;
+; OUTPUT PARAMETERS:
+;	none
+;
+; IMPLICIT OUTPUTS:
+;	none
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+	.PSECT	Y$LOWUSE		;This code can page
+
+MMG$ALC_PGFLVBN::
+	MOVL	@L^MMG$GL_PAGSWPVC[R1],R1 ;Get base address from index
+	PUSHL	R3			;Get a scratch regtster
+	DECL	R0			;Bit # is base 0
+10$:	ASHL	#-3,R0,R3		;Byte # in bit map
+	CMPL	R3,PFL$L_BITMAPSIZ(R1)	;Legal page file vbn?
+	BGEQU	20$			;Branch if illegal
+	BBSC	R0,@PFL$L_BITMAP(R1),30$ ;Free the page and branch
+20$:
+	BUG_CHECK BADPAGFILD,FATAL	;Bad page file address specified
+30$:
+	DECL	PFL$L_FREPAGCNT(R1)	;Count another free page
+	INCL	R0			;Point to next VBN in file
+	SOBGTR	R2,10$			;Go back if not done yet
+	DECL	R2			;Form a minus 1
+	CMPL	PFL$L_FREPAGCNT(R1),R2	;Insure that counts still consistent
+	BLSS	20$			;Bugcheck if not
+	POPL	R3			;Restore scratch
+	RSB				; and return
+
+	.END

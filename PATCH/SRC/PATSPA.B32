@@ -1,0 +1,744 @@
+MODULE PATSPA (%IF %VARIANT EQL 1
+		%THEN
+			ADDRESSING_MODE (EXTERNAL = LONG_RELATIVE,
+					NONEXTERNAL = LONG_RELATIVE),
+		%FI
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	PATCH
+!
+! ABSTRACT:	THIS ROUTINE HANDLES FREE PATCH AREA, ALIGNMENT, ALLOCATION, AND EXPANSION.
+!
+! ENVIRONMENT:	VAX/VMS
+!
+! AUTHOR: K.D. MORSE	, CREATION DATE: 17-NOV-77
+!
+! MODIFIED BY:
+!
+!	V03-000	MTR0001		Mike Rhodes		15-Mar-1982
+!		Modify routine PAT$EXP_AREA to allow PIC SHR images to be
+!		patched using default patch area which may be expanded as
+!		needed.  Also, removed the old 50% growth area logic which
+!		has been made obsolete by the above change.
+!
+!	V02-008	MTR0001		Mike Rhodes		15-Sep-1981
+!		Modify routine PAT$BUILD_ISE.  The location algorithm
+!		for placing the PATCH ISE/ISD pair in the ISE list is
+!		as follows:
+!			The PATCH ISE/ISD pair are located in the ISE list
+!			FOLLOWING the last "Normal" ISD and PRECEDING the
+!			first Non-Based Global or Stack ISDs.
+!
+!		Included in the modification is the definition of two new
+!		variables,  PREV_ISE_PTR - Pointer to Previous ISE,  and
+!			    TEMP         - Holds the FLINK from the previous
+!					   ISE till its put into the new ISE.
+!
+!	V02-007	PCG0001		Peter George		02-FEB-1981
+!		Add require statement for LIB$:PATDEF.REQ
+!
+!	V0206	CNH0038		Chris Hume		 4-Oct-1980	16:00
+!		Last Cluster will now remain set when new Patch Area is added.
+!		Patch Area will be allocated at a distance one half the size of
+!		the Last Cluster (beyond its end).
+!
+!	V0105	CNH0023		Chris Hume		16-Nov-1979	14:00
+!		Turn off ISD$V_LASTCLU for all ISD's when PATCH Area is added
+!		to an image.  Also unrecognized languages will now be processed
+!		as though they were MACRO.  (PATBLD.B32 V0117, PATMAI.B32 V0228)
+!
+!	V0104	CNH0015		Chris Hume		27-Sep-1979	11:30
+!		Changed GBLWARN message from a warning to an informational.
+!		Added section name to the signal.  Added EXPSHRPAT error.
+!		(PATMAI.B32 V0225, PATMSG.MDL V0203, PATARI.B32 V0112)
+!
+! MODIFICATIONS:
+!
+!  NO	DATE		PROGRAMMER	PURPOSE
+!  --	----		----------	-------
+!
+!  01	07-MAR-78	K.D. MORSE	ADD ROUTINES PAT$ADD_PAL.
+!  02	25-APR-78	K.D. MORSE	CONVERT TO NATIVE COMPILER.
+!  03	13-JUN-78	K.D. MORSE	ADD FAO COUNTS TO SIGNALS.
+!
+!--
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	PAT$ALIGN_CMD : NOVALUE,				! Executes align command
+	PAT$BUILD_ISE : NOVALUE,				! Builds an image section descriptor
+	PAT$EXP_AREA : NOVALUE,					! Expands patch area
+	PAT$ADD_PAL : NOVALUE;					! Adds entry to PAL
+
+!
+! INCLUDE FILES:
+!
+LIBRARY 'SYS$LIBRARY:LIB.L32';					! System structure definitions
+REQUIRE 'SRC$:PATPCT.REQ';					! Defines PSECTs
+REQUIRE 'SRC$:PATGEN.REQ';					! Defines context bits
+REQUIRE 'SRC$:VXSMAC.REQ';					! Defines common macros
+REQUIRE 'SRC$:PREFIX.REQ';					! Defines structure macros
+REQUIRE 'SRC$:PATPRE.REQ';					! Defines PATCH structures
+REQUIRE 'LIB$:PATDEF.REQ';				! Defines literals
+REQUIRE 'LIB$:PATMSG.REQ';					! Defines error message codes
+REQUIRE 'SRC$:BSTRUC.REQ';					! Defines basic structures
+REQUIRE 'SRC$:LISTEL.REQ';					! Defines list structures
+REQUIRE 'SRC$:DLLNAM.REQ';					! Defines symbol table entry offsets
+REQUIRE 'SRC$:SYSSER.REQ';					! Defines FAO output macros
+
+!
+! MACROS:
+!
+
+!
+! EQUATED SYMBOLS:
+!
+
+!
+! OWN STORAGE:
+!
+OWN
+	PAT_AREA_NAME : VECTOR[4,BYTE] INITIAL(%ASCIC 'PAA'),	! Next patch area name
+	PA_NAME_DSC : VECTOR[2,LONG] INITIAL(A_LONGWORD-A_BYTE, CH$PTR(PAT_AREA_NAME, 1)); ! String descriptor for next patch area n
+
+!
+! EXTERNAL REFERENCES:
+!
+EXTERNAL
+	PAT$GL_PAL_LHD : REF BLOCK[,BYTE],			! Patch area listhead
+	PAT$GL_ERRCODE,						! Error code
+	PAT$GL_CONTEXT : BITVECTOR,				! Context bits
+	PAT$GL_IMGHDR : REF BLOCK[,BYTE],			! Pointer to image header
+	PAT$GL_PATAREA : REF BLOCK[,BYTE],			! Free patch area descriptor pointer
+	PAT$GL_IHPPTR : REF BLOCK[,BYTE],			! Pointer to patch area of image header
+	PAT$GL_ISELHD,						! ISE List Head
+	PAT$GL_ISETAIL : REF BLOCK[,BYTE],			! Pointer to tail of ISE table
+	PAT$GL_NEWVPNMX,					! Max VPN of image sections in new image
+	PAT$GL_NEWVBNMX,					! Max VBN of image sections in new image
+	PAT$GL_IMGBLKS,						! Number of blocks in new image
+	PAT$GL_ISVADDR : VECTOR[,LONG],				! Addresses of last image section mapped
+	PAT$GL_HEAD_LST,					! Head of command argument list
+	PAT$GL_SYMTBPTR,					! Pointer to current default symbol table
+	PAT$GL_SYMHEAD;						! Pointer to listhead entry for user-defined symbol table
+
+EXTERNAL ROUTINE
+	PAT$ALLOBLK : NOVALUE,					! Allocates free storage
+	PAT$CREMAP : NOVALUE,					! Creates and maps image sections
+	PAT$DEFINE_SYM : NOVALUE,				! Defines a symbol
+	PAT$FIND_SYM,						! Find symbol definition
+	PAT$FREEZ,						! Allocates and zeros free storage
+	PAT$MAP_ADDR : NOVALUE;					! Maps an image address
+
+GLOBAL ROUTINE PAT$ALIGN_CMD  : NOVALUE =			! Performs align commands
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine aligns a free patch area to the requested boundary,
+!	word, longword, quadword, or page.  The patch area bytes between the
+!	old address and the rounded address are lost for patching purposes.
+!	The symbol name provided in the command is entered into the symbol list
+!	with a value of the patch area address.  If the free patch area is not
+!	large enough to be rounded to the appropriate boundary, an error is
+!	SIGNALed and the alignment does not take place.  The free area 
+!	descriptor remains unchanged.
+!
+!	If the symbol name was previously defined, a message is produced and
+!	the name is redefined to the new patch area address.
+!
+!	Aligning the patch area to a byte boundary will merely cause the
+!	symbol to be defined as the next free byte of patch area.
+!
+! FORMAL PARAMETERS:
+!
+!	none
+!
+! IMPLICIT INPUTS:
+!
+!	The symbol name descriptor is set up by the parser.
+!	The context bits have already been set up for the command.
+!	The user-defined symbol table has been initialized as has the
+!	free memory handler.
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! COMPLETION CODES:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	The default patch area is aligned to the appropriate boundary.
+!	If there is not enough patch area to align, a new patch area is
+!	created.
+!
+!--
+
+BEGIN
+
+LITERAL
+	ONE_BLOCK = 1;						! Number of blocks to expand patch area by
+
+LOCAL
+	TEMP_SYMTB,						! Temporary symbol table pointer
+	ALIGN_FACTOR,						! Alignment boundary
+	DESC_PTR : REF BLOCK[,BYTE],				! String descriptor pointer
+	SYM_ENTRY_PTR,						! Pointer to symbol entry
+	PATCH_AREA_ADR,						! Address of aligned patch area
+	PATCH_AREA_SIZ;						! Size of aligned patch area
+
+!++
+! Output current patch area statistics before alignment.
+!--
+$FAO_TT_OUT('old patch area size:     !XL', .PAT$GL_PATAREA[DSC$W_LENGTH]);
+$FAO_TT_OUT('old patch area address:  !XL', .PAT$GL_PATAREA[DSC$A_POINTER]);
+
+!++
+! Check for conflicting patch area requests and set up alignment factor.
+! The alignment factor is set to the number of bytes in a longword, word,
+! byte, page, or quadword.
+IF .PAT$GL_CONTEXT[ALIGN_BYTE]
+THEN
+	ALIGN_FACTOR = A_BYTE;
+IF .PAT$GL_CONTEXT[ALIGN_WORD]
+THEN
+	ALIGN_FACTOR = A_WORD;
+IF .PAT$GL_CONTEXT[ALIGN_LONG]
+THEN
+	ALIGN_FACTOR = A_LONGWORD;
+IF .PAT$GL_CONTEXT[ALIGN_QUAD]
+THEN
+	ALIGN_FACTOR = A_QUADWORD;
+IF .PAT$GL_CONTEXT[ALIGN_PAGE]
+THEN
+	ALIGN_FACTOR = A_PAGE;
+
+!++
+! Now round up image header patch area address and alter patch area
+! size to reflect any lost bytes.
+!--
+PATCH_AREA_ADR = ((.PAT$GL_PATAREA[DSC$A_POINTER] + (.ALIGN_FACTOR-1))/.ALIGN_FACTOR) * .ALIGN_FACTOR;
+IF (.PATCH_AREA_ADR NEQA .PAT$GL_PATAREA[DSC$A_POINTER]) 	! If rounding actually occurred
+	OR (.PAT$GL_PATAREA[DSC$W_LENGTH] EQL 0)		! or no patch space exists
+THEN
+	BEGIN
+	PATCH_AREA_SIZ = .PAT$GL_PATAREA[DSC$W_LENGTH] +
+			.PAT$GL_PATAREA[DSC$A_POINTER] - .PATCH_AREA_ADR;
+	IF (.PATCH_AREA_SIZ LEQ 0)				! Check no patch area left
+	THEN
+		BEGIN
+		IF (.PAT$GL_PATAREA[DSC$A_POINTER] EQLA .PAT$GL_IHPPTR[IHP$L_RW_PATADR])
+		THEN
+			PAT$EXP_AREA (ONE_BLOCK)		! Get another block
+		ELSE
+			SIGNAL(PAT$_NOPATAREA, 2, .PAT$GL_PATAREA[DSC$A_POINTER],
+				 .PAT$GL_PATAREA[DSC$W_LENGTH]);
+		PATCH_AREA_ADR = ((.PAT$GL_PATAREA[DSC$A_POINTER] + 
+			(.ALIGN_FACTOR-1))/.ALIGN_FACTOR) * .ALIGN_FACTOR;
+		PATCH_AREA_SIZ = .PAT$GL_PATAREA[DSC$W_LENGTH] +
+				.PAT$GL_PATAREA[DSC$A_POINTER] - .PATCH_AREA_ADR;
+		END;
+	PAT$GL_PATAREA[DSC$A_POINTER] = .PATCH_AREA_ADR;	! Set rounded address in header
+	PAT$GL_PATAREA[DSC$W_LENGTH] = .PATCH_AREA_SIZ;		! Set rounded size in header
+	END;
+
+!++
+! Output current patch area after alignment.
+!--
+$FAO_TT_OUT('new patch area size:     !XL', .PAT$GL_PATAREA[DSC$W_LENGTH]);
+$FAO_TT_OUT('new patch area address:  !XL', .PAT$GL_PATAREA[DSC$A_POINTER]);
+
+!++
+! Now enter the symbol into the user-defined symbol table with a value equal
+! to the aligned patch area address.
+!--
+!SYM_ENTRY_PTR = PAT$FIND_SYM(.LIST_ELEM_EXP1(.PAT$GL_HEAD_LST)); ! Check for previously defined symbol
+!IF .SYM_ENTRY_PTR NEQA 0					! Yes, was previously defined
+!THEN								! Output informational message
+!	BEGIN
+!	SIGNAL(PAT$_REDEFSYM, 4, .SYM_CHCOUNT(.SYM_ENTRY_PTR), SYM_NAME(.SYM_ENTRY_PTR),
+!		.SYM_VALUE(.SYM_ENTRY_PTR), .PATCH_AREA_ADR);
+!	SYM_VALUE(.SYM_ENTRY_PTR) = .PATCH_AREA_ADR;		! Set new value
+!	END
+!ELSE
+TEMP_SYMTB = .PAT$GL_SYMTBPTR;
+PAT$GL_SYMTBPTR = .PAT$GL_SYMHEAD;
+PAT$DEFINE_SYM(.LIST_ELEM_EXP1(.PAT$GL_HEAD_LST), .PATCH_AREA_ADR, TRUE); ! Enter into list
+PAT$GL_SYMTBPTR = .TEMP_SYMTB;
+
+
+RETURN;
+END;								! End of PAT$ALIGN_CMD
+
+GLOBAL ROUTINE PAT$BUILD_ISE (ISE_PTR,VPN,VBN,PAGE_CNT) : NOVALUE =	! Builds an ISD and enters it into ISE table
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine builds a new image section descriptor.  It is a normal
+!	type image section with read-write, copy-on-reference attributes.
+!	The virtual page number, virtual block number, and the page count
+!	are input parameters.  The address of the image section table entry,
+!	built around the image section descriptor, is returned.  The image
+!	section entry is linked into the table.
+!
+! FORMAL PARAMETERS:
+!
+!	ISE_PTR - Pointer to image section entry built
+!	VPN - Virtual page number of image section
+!	VBN - Virtual block number of image section
+!	PAGE_CNT - Number of pages in image section
+!
+! IMPLICIT INPUTS:
+!
+!	The image section table is set up.
+!
+! IMPLICIT OUTPUTS:
+!
+!	A new image section descriptor is built.
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! COMPLETION CODES:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	none
+!
+!--
+
+BEGIN
+
+LOCAL
+	PREV_ISE_PTR : REF BLOCK[,BYTE],			! Pointer to previous Image Section table entry
+	TEMP : REF BLOCK[,BYTE],				! Holds the FLINK from previous ISE
+	LOCAL_ISE_PTR : REF BLOCK[,BYTE],			! Image section table entry pointer
+	ISD_PTR : REF BLOCK[,BYTE];				! Image section descriptor pointer
+
+!++
+! Allocate space for new image section table entry.
+! ***** UNTIL SYSTEM IS UPDATED TO CONTAIN AN IDENT PERFORM TEST ON WHAT
+! ***** SIZE TO USE.
+!--
+IF PAT$K_LENPRIV GTR ISD$K_LENPRIV
+THEN
+	PAT$ALLOBLK(ISE$C_SIZE+PAT$K_LENPRIV, .ISE_PTR)
+ELSE
+	PAT$ALLOBLK(ISE$C_SIZE+ISD$K_LENPRIV, .ISE_PTR);
+
+!++
+! Now link the new entry into the table.
+! This is accomplished by traversing the Image Section Table Entries, looking for any
+! Non-Based Global or Stack ISDs which follow the last "Normal" ISD.  When this location
+! is found, the links in the affected ISEs are modified to include the new PATCH ISE.
+!--
+LOCAL_ISE_PTR = .PAT$GL_ISELHD;					! Get the list head.
+PREV_ISE_PTR = .LOCAL_ISE_PTR;					! Set PREV = Current for first pass.
+ISD_PTR = CH$PTR (.LOCAL_ISE_PTR, ISE$C_SIZE);			! Point to the first ISD in the list.
+
+UNTIL ( (.LOCAL_ISE_PTR EQL 0) OR 
+	(.ISD_PTR[ISD$B_TYPE] EQL ISD$K_USRSTACK) OR
+	(.ISD_PTR[ISD$V_GBL] AND NOT .ISD_PTR[ISD$V_BASED]) ) DO
+	BEGIN
+	PREV_ISE_PTR = .LOCAL_ISE_PTR;				! Save the address of the just checked ISE.
+	LOCAL_ISE_PTR = .LOCAL_ISE_PTR[ISE$L_NXTISE];		! Advance the pointer to the next ISE.
+	ISD_PTR = CH$PTR (.LOCAL_ISE_PTR, ISE$C_SIZE);		! Point to the next ISD also.
+	END;
+
+!++
+! At this point we should be positioned to the location for inserting the new PATCH ISE/ISD pair.
+!--
+LOCAL_ISE_PTR = CH$PTR (..ISE_PTR, 0);				! Pick up the address of the new ISE.
+TEMP = .PREV_ISE_PTR[ISE$L_NXTISE];				! Save the FLINK to next ISE.
+PREV_ISE_PTR[ISE$L_NXTISE] = .LOCAL_ISE_PTR;			! Set FLINK to the new ISE.
+LOCAL_ISE_PTR[ISE$L_NXTISE] = .TEMP;				! Remember to point to the next ISE.
+
+!++
+! Initialize the image section table information.
+!--
+LOCAL_ISE_PTR[ISE$L_MAPVST] = 0;
+LOCAL_ISE_PTR[ISE$L_MAPVEND] = 0;
+LOCAL_ISE_PTR[ISE$L_IMGVST] = 0;
+LOCAL_ISE_PTR[ISE$L_IMGVEND] = 0;
+
+!++
+! Now build the image section descriptor.
+!--
+ISD_PTR = CH$PTR(.LOCAL_ISE_PTR, ISE$C_SIZE);			! Point to ISD
+! ****** THIS SHOULD CHANGE WHEN IDENT FIELD IS DEFINED FOR PROCESS PRIVATE IMAGE SECTIONS.
+! ISD_PTR[ISD$W_SIZE] = (IF (PAT$K_LENPRIV GTR ISD$K_LENPRIV) THEN PAT$K_LENPRIV ELSE ISD$K_LENPRIV);
+! *****
+ISD_PTR[ISD$W_SIZE] = ISD$K_LENPRIV;
+ISD_PTR[ISD$W_PAGCNT] = .PAGE_CNT;
+ISD_PTR[ISD$L_VPNPFC] = .VPN;
+ISD_PTR[ISD$B_PFC] = 0;
+ISD_PTR[ISD$L_FLAGS] = 0;
+ISD_PTR[ISD$V_CRF] = TRUE;
+ISD_PTR[ISD$V_WRT] = TRUE;
+ISD_PTR[ISD$V_MATCHCTL] = ISD$K_MATNEV;
+ISD_PTR[ISD$B_TYPE] = ISD$K_NORMAL;
+ISD_PTR[ISD$L_VBN] = .VBN;
+ISD_PTR[ISD$L_IDENT] = 0;
+
+RETURN;
+
+END;								! End of PAT$BUILD_ISE
+
+GLOBAL ROUTINE PAT$EXP_AREA (NUM_BLKS) : NOVALUE =		! Expands patch area
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine expands the read-write patch area defined in the image
+!	header.  If there is no patch area, then an image section descriptor
+!	is created for it.  In either case, the image header is updated to 
+!	describe the expanded patch area.
+!
+!	If the patch area is mapped to the highest address used during this
+!	patch session, then the patch area can be expanded contiguously.
+!	In this case, the image section descriptor is updated to hold a new
+!	page count and the patch area size in the image header is increased.
+!	If the patch area is not the highest address used, then the patch area
+!	must be relocated to another area, which will be contiguous.  This
+!	involves expanding the program region, copying in the old patch area,
+!	and then changing the image section table entry to point to a new
+!	mapped address.  The image header and image section descriptor counts
+!	are incremented as above.
+!
+!	NOTE:  The patch area must be mapped contiguously in order for
+!	the mapping of addresses to work.  It could also be accomplished
+!	if two image section table entries were created.  However, this
+!	would require an extra, unneccessary image section descriptor.
+!
+!	Some of the PATCH commands which deposit symbolic instructions do an
+!	PAT$EXPAREA just to force the address to be non-zero so that
+!	the symbolic instruction encoder can correctly encode operands.
+!
+! FORMAL PARAMETERS:
+!
+!	NUM_BLKS - Number of blocks to be allocated for the patch area
+!
+! IMPLICIT INPUTS:
+!
+!	The image header and image section entry table must be set up.
+!
+! IMPLICIT OUTPUTS:
+!
+!	none
+!
+! ROUTINE VALUE:
+!
+!	none
+!
+! COMPLETION CODES:
+!
+!	none
+!
+! SIDE EFFECTS:
+!
+!	A new patch area is set up.  The image header is updated to
+!	describe the new patch area.
+!
+!--
+
+BEGIN
+
+LITERAL
+	START_OFF = 0,						! Offset to starting address
+	END_OFF = 1;						! Offset to ending address
+
+LOCAL
+	ISE_PTR : REF BLOCK[,BYTE],				! Pointer to image section table entry
+	ISD_PTR : REF BLOCK[,BYTE],				! Pointer to image section descriptor
+	MAPPED_ADDR;						! Mapped address
+
+!++
+! If this is a non-PIC shareable image we do not expand the patch area to protect images
+! previously linked against having inconsistent Global Section Descriptors.  Else, if it
+! is a PIC shareable image, we may without reservation, expand the patch area.
+!--
+IF ((.PAT$GL_IMGHDR[IHD$B_IMGTYPE] EQLU IHD$K_LIM) AND (NOT .PAT$GL_IMGHDR[IHD$V_PICIMG]))
+THEN
+	SIGNAL(PAT$_EXPSHRPAT+MSG$K_SEVERE);
+
+!++
+! If there is no patch area defined yet, then build an image section table
+! entry and an image section descriptor for it.
+!--
+IF (.PAT$GL_IHPPTR[IHP$L_RW_PATADR] EQLA 0)
+THEN
+	BEGIN
+	!++
+	! Build an Image Section table entry as no Patch Area was defined.
+	!--
+	PAT$BUILD_ISE(ISE_PTR, .PAT$GL_NEWVPNMX+1, .PAT$GL_NEWVBNMX+1, .NUM_BLKS);
+	ISD_PTR = CH$PTR(.ISE_PTR, ISE$C_SIZE);
+	END
+ELSE
+	BEGIN
+	!++
+	! Find the image section table entry which describes the patch area.
+	!--
+	PAT$MAP_ADDR(.PAT$GL_IHPPTR[IHP$L_RW_PATADR], MAPPED_ADDR, ISE_PTR);
+	ISD_PTR = CH$PTR(.ISE_PTR, ISE$C_SIZE);
+	ISD_PTR[ISD$W_PAGCNT] = .ISD_PTR[ISD$W_PAGCNT] + .NUM_BLKS; ! Expand size of image section
+	END;
+
+!++
+! Update the VPN and VBN for the last ones used in the new image for
+! the image section.
+!--
+PAT$GL_NEWVPNMX = .PAT$GL_NEWVPNMX + .NUM_BLKS;
+PAT$GL_NEWVBNMX = .PAT$GL_NEWVBNMX + .NUM_BLKS;
+
+!++
+! Now create the patch area, i.e., map it into the image.  This is done
+! with an expand region instead of a create and map as the area is not defined
+! in the old image.
+!--
+PAT$GL_ERRCODE = $EXPREG(PAGCNT = .ISD_PTR[ISD$W_PAGCNT]
+			, RETADR = PAT$GL_ISVADDR);
+IF NOT .PAT$GL_ERRCODE
+THEN
+	SIGNAL(PAT$_EXPREG, 1, .PAT$GL_ERRCODE);
+
+!++
+! If the patch area was expanded, and not created, then copy in the old
+! patch area part.
+!--
+IF (.ISD_PTR[ISD$W_PAGCNT] NEQ .NUM_BLKS)
+THEN
+	CH$MOVE((.ISD_PTR[ISD$W_PAGCNT] - .NUM_BLKS) * A_PAGE,
+		 .ISE_PTR[ISE$L_MAPVST], .PAT$GL_ISVADDR[START_OFF]);
+
+!++
+! Initialize the image section table entry.
+!--
+ISE_PTR[ISE$L_MAPVST] = .PAT$GL_ISVADDR[START_OFF];
+ISE_PTR[ISE$L_MAPVEND] = .PAT$GL_ISVADDR[END_OFF];
+ISE_PTR[ISE$L_IMGVST] = .ISD_PTR[ISD$V_VPN] ^9;
+ISE_PTR[ISE$L_IMGVEND] = ((.ISD_PTR[ISD$V_VPN] + .ISD_PTR[ISD$W_PAGCNT]) ^9) - 1;
+
+!++
+! Increment the number of blocks in the new image.
+!--
+PAT$GL_IMGBLKS = .PAT$GL_IMGBLKS + .NUM_BLKS;
+
+!++
+! Update the patch area descriptor in the image header.
+!--
+PAT$GL_PATAREA[DSC$W_LENGTH] = .PAT$GL_PATAREA[DSC$W_LENGTH] + (.NUM_BLKS * A_PAGE);
+IF (.PAT$GL_PATAREA[DSC$A_POINTER] EQLA 0)
+THEN
+	PAT$GL_PATAREA[DSC$A_POINTER] = .ISE_PTR[ISE$L_IMGVST];
+
+!++
+! Now update the patch area list entry for the default patch area.
+!--
+PAT$ADD_PAL(.ISE_PTR[ISE$L_IMGVST], .ISE_PTR[ISE$L_IMGVEND], PAL$K_EXP_PAREA);
+
+RETURN;
+
+END;								! END OF PAT$EXP_AREA
+
+GLOBAL ROUTINE PAT$ADD_PAL (START_ADR, END_ADR, PAT_AREA_FLAG) : NOVALUE =	! EXPANDS PATCH AREAS
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	THIS ROUTINE MAINTAINS THE PATCH AREA LIST (PAL).  THIS INCLUDES
+!	UPDATING THE ENTRY FOR THE DEFAULT PATCH AREA WHENEVER PATCH EXPANDS
+!	IT AND CREATING ENTRIES WHENEVER THE USER ISSUES A "SET PATCH_AREA"
+!	COMMAND.  THE FIRST ENTRY ON THE LIST IS ALWAYS THE DEFAULT PATCH AREA.
+!
+!	THE PATCH AREA LIST IS USED TO CORRECTLY OUTPUT ADDRESSES FOR
+!	PATCH AREA TO THE OUTPUT COMMAND FILE.  THESE ADDRESSES MUST BE
+!	WRITTEN TO THE FILE AS SYMBOLIC NAMES PLUS OFFSETS BECAUSE THE
+!	IMAGES IN THE FIELD MAY HAVE BEEN PATCHED BY CUSTOMERS ( THUS 
+!	CHANGING THE NEXT FREE PATCH AREA ADDRESS ).  BY OUTPUTING PATCH
+!	AREA ADDRESSES AS SYMBOLIC NAMES, PATCH WILL PERMIT PATCHES TO
+!	USE DIFFERENT PATCH AREA ADDRESSES.
+!
+!	AN ENTRY IN THE PATCH AREA LIST HAS THE FOLLOWING FORMAT:
+!
+!		+----------------------------+
+!		|        FORWARD LINK        |	PAL$L_FLINK
+!		+----------------------------+
+!		|      STARTING ADDRESS      |	PAL$L_ST_ADR
+!		+----------------------------+
+!		|       ENDING ADDRESS       |	PAL$L_END_ADR
+!		+----------------------------+
+!		|      PATCH AREA NAME       |	PAL$L_CS_NAME
+!		+----------------------------+
+!
+!	THE PATCH AREA NAME CONSISTS OF AN ASCIC STRING, WHICH IS ALWAYS A
+!	COUNT OF THREE FOLLOWED BY THE ASCII CHARACTERS "P", "A", AND A THIRD
+!	CHARACTER RANGING FROM "A" TO "Z".  THIS NAME IS USED TO OUTPUT
+!	SYMBOLIC REFERENCES TO THE OUTPUT COMMAND FILE FOR ALL ADDRESSES WITHIN
+!	THE PATCH AREAS INSTEAD OF ABSOLUTE VALUES.
+!
+!	THIS ROUTINE ALSO CAUSES A SYMBOL TO BE DEFINED FOR THE STARTING ADDRESS
+!	OF THE PATCH AREA.
+!
+! FORMAL PARAMETERS:
+!
+!	START_ADR - STARTING ADDRESS OF THE PATCH AREA
+!	END_ADR - ENDING ADDRESS OF THE PATCH AREA
+!	PAT_AREA_FLAG - INDICATOR FOR TYPE OF PAL UPDATE
+!			PAL$K_EXP_PAREA = 1  - EXPANDING DEFAULT PATCH AREA
+!			PAL$K_ADD_PAREA = 0  - ADDING NEW PATCH AREA ENTRY
+!
+! IMPLICIT INPUTS:
+!
+!	THE FREE STORAGE ROUTINES MUST HAVE BEEN INITIALIZED.
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+!
+!	NONE
+!
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	THE PATCH AREA LIST IS UPDATED.  EITHER AN ENTRY IS MODIFIED OR
+!	A NEW LINK IS CREATED.  IN THE LATTER CASE, THE NEXT PATCH AREA NAME
+!	IS ALSO UPDATED.  THE NEXT PATCH AREA NAME IS ALSO UPDATED.
+!
+!--
+
+BEGIN
+
+LOCAL
+	TEMP_SYMTB,						! Temporary symbol table pointer
+	NEW_PTR : REF BLOCK[,BYTE],				! POINTER TO NEW PAL ENTRY
+	TEMP_PTR : REF BLOCK[,BYTE],				! POINTER TO CURRENT PAL ENTRY
+	NAME_DESC : BLOCK[8,BYTE];				! STRING DESCRIPTOR FOR DEFAULT PATCH AREA NAME
+
+!++
+! FIRST, LOOP THROUGH THE PATCH AREA LIST TRYING TO FIND AN ENTRY FOR THIS
+! PATCH AREA, I.E., HAS THIS PATCH AREA JUST BEEN EXPANDED.  IF SO, UPDATE
+! THE PAL ENTRY AND RETURN.  IF NOT, FALL THROUGH TO CREATE A NEW PAL ENTRY.
+!--
+TEMP_SYMTB = .PAT$GL_SYMTBPTR;					! Remember current label symbol table
+IF (TEMP_PTR = CH$PTR(.PAT$GL_PAL_LHD, 0)) NEQ 0		! GET FIRST ENTRY IN LIST
+THEN
+	REPEAT
+		BEGIN
+		!++
+		! IF THE DEFAULT PATCH AREA WAS CREATED, THEN BOTH THE STARTING
+		! AND ENDING ADDRESSES MUST BE RESET.  IF THE DEFAULT PATCH
+		! AREA WAS EXPANDED, THEN THE STARTING ADDRESS REMAINS THE
+		! SAME AND THE ENDING ADDRESS IS UPDATED.  THIS WILL NEED
+		! SOME NEW INVENTION WHEN READ-ONLY PATCH AREAS ARE
+		! ALSO ADDED.
+		!--
+		IF .PAT_AREA_FLAG EQL PAL$K_EXP_PAREA
+		THEN
+			BEGIN
+			TEMP_PTR[PAL$L_END_ADR] = .END_ADR;
+			IF .TEMP_PTR[PAL$L_START_ADR] EQLA 0
+			THEN
+				BEGIN
+				TEMP_PTR[PAL$L_START_ADR] = .START_ADR;
+				NAME_DESC[DSC$W_LENGTH] = .PAT_AREA_NAME[0];
+				NAME_DESC[DSC$A_POINTER] = CH$PTR(TEMP_PTR[PAL$L_CS_NAME], 1);
+				PAT$GL_SYMTBPTR = .PAT$GL_SYMHEAD;
+				PAT$DEFINE_SYM(NAME_DESC, .START_ADR, FALSE);
+				PAT$GL_SYMTBPTR = .TEMP_SYMTB;
+				END;
+			RETURN;
+			END;
+		IF (.START_ADR GEQA .TEMP_PTR[PAL$L_START_ADR]) AND
+		   (.END_ADR EQLA .TEMP_PTR[PAL$L_END_ADR])
+		THEN
+			RETURN;
+		IF .TEMP_PTR[PAL$L_FLINK] NEQA 0
+		THEN
+			TEMP_PTR = .TEMP_PTR[PAL$L_FLINK]
+		ELSE
+			EXITLOOP;
+		END;
+
+!++
+! THERE WAS NO CORRESPONDING PAL ENTRY.  THEREFORE A NEW ENTRY MUST BE CREATED.
+!--
+NEW_PTR = PAT$FREEZ((PAL$C_SIZE + A_LONGWORD - 1)/A_LONGWORD);	! ALLOCATE SPACE FOR NEW ENTRY
+IF .TEMP_PTR EQLA 0
+THEN
+	PAT$GL_PAL_LHD = CH$PTR(.NEW_PTR, 0)			! SET THE LIST HEAD
+ELSE
+	TEMP_PTR[PAL$L_FLINK] = .NEW_PTR;			! LINK IN NEW ENTRY
+NEW_PTR[PAL$L_START_ADR] = .START_ADR;				! SET STARTING PATCH AREA ADDRESS
+NEW_PTR[PAL$L_END_ADR] = .END_ADR;				! SET ENDING PATCH AREA ADDRESS
+CH$MOVE(A_LONGWORD, PAT_AREA_NAME, NEW_PTR[PAL$L_CS_NAME]);	! SET PATCH AREA NAME
+PAT$GL_SYMTBPTR = .PAT$GL_SYMHEAD;				! Use user-defined symbol table
+PAT$DEFINE_SYM(PA_NAME_DSC, .NEW_PTR[PAL$L_START_ADR], FALSE);	! DEFINE SYMBOL AS START OF PATCH AREA
+PAT$GL_SYMTBPTR = .TEMP_SYMTB;				! Restore label symbol table
+PAT_AREA_NAME[3] = .PAT_AREA_NAME[3] + 1;			! SET NEW PATCH AREA NAME
+
+!++
+! NOW CHECK THAT THE NEXT PATCH AREA NAME IS BETWEEN "PAA" AND "PAZ".  IF
+! IT IS NOT, THE RESET THE THIRD CHARACTER OF THE NAME TO AN "A" AND
+! INCREMENT THE SECOND LETTER OF THE NAME.  THIS WILL ALLOW THE USER TO DEFINE
+! UP TO 676 PATCH AREAS.
+!--
+IF .PAT_AREA_NAME[3] GTRU (%ASCII'Z')				! CHECK FOR OVERFLOW OF PATCH AREA NAMES
+THEN
+	BEGIN
+	PAT_AREA_NAME[2] = .PAT_AREA_NAME[2] + 1;		! INCREMENT THE "A" OF "PAZ"
+	PAT_AREA_NAME[3] = (%ASCII'A');				! CHANGE THE "Z" TO AN "A"
+	END;
+
+RETURN;
+
+END;								! END OF PAT$ADD_PAL
+
+END								! End of module
+ELUDOM

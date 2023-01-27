@@ -1,0 +1,603 @@
+MODULE ENTER (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This routine creates a new directory entry for the given file.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  11-Jan-1978  16:50
+!
+! MODIFIED BY:
+!
+!	V02-012	ACG0264		Andrew C. Goldstein,	12-Feb-1982  15:21
+!		Allow negative version numbers (and treat like zero)
+!
+!	V02-011	ACG0259		Andrew C. Goldstein,	26-Jan-1982  19:17
+!		Fix autopurge when version limit is 1
+!
+!	V02-010	ACG0238		Andrew C. Goldstein,	10-Dec-1981  14:22
+!		Invalidate RMS directory cache when dir is superseded
+!
+!	V02-009	ACG0208		Andrew C. Goldstein,	28-Oct-1981  20:44
+!		Add segmented directory record support
+!
+!	V02-008	ACG34341	Andrew C. Goldstein,	3-Mar-1981  17:06
+!		Fix remove cleanup when first block has been squished
+!
+!	V02-007	ACG0167		Andrew C. Goldstein,	16-Apr-1980  19:26
+!		Previous revision history moved to F11B.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	ENTER		: NOVALUE,	! main ENTER routine
+	MAKE_ENTRY	: NOVALUE,	! build new directory entry
+	RESTORE_DIR	: NOVALUE;	! restore directory context
+
+GLOBAL ROUTINE ENTER (ABD, FIB, RESULT_LENGTH, RESULT) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine enters the given file name in the specified directory.
+!
+! CALLING SEQUENCE:
+!	ENTER (ARG1, ARG2, ARG3, ARG4)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of buffer descriptor packet
+!	ARG2: address of FIB of operation
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	ARG3: address of longword to receive length of result string
+!	ARG4: address of result string buffer
+!
+! IMPLICIT OUTPUTS:
+!	DIR_BUFFER: buffer address of current directory block
+!	DIR_ENTRY: address of directory record
+!	DIR_VERSION: address of directory version entry
+!	DIR_END: end of directory data
+!	PREV_VERSION: version number of superseded entry
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	directory altered, result string and length written into buffer packet
+!
+!--
+
+BEGIN
+
+MAP
+	ABD		: REF BBLOCKVECTOR [,ABD$C_LENGTH],
+					! descriptor list arg
+	FIB		: REF BBLOCK,	! FIB argument
+	RESULT		: REF VECTOR [,BYTE]; ! result string arg
+
+LOCAL
+	NAME_DESC	: BBLOCK [FND_LENGTH], ! file name descriptor block
+	NAME_BUFFER	: VECTOR [FILENAME_LENGTH, BYTE], ! buffer for file name
+	STATUS,				! result of directory search
+	P,				! string pointer
+	VBN,				! current VBN of directory file
+	NAME_LENGTH;			! length of file name, rounded even
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	USER_STATUS	: VECTOR [,WORD], ! user's I/O status block
+	DIR_CONTEXT	: BBLOCK,	! directory context block
+	DIR_RECORD,			! directory entry counter within block
+	PREV_VERSION,			! version number of superseded entry
+	SUPER_FID	: BBLOCK;	! file ID of superseded file
+
+DIR_CONTEXT_DEF;
+
+EXTERNAL ROUTINE
+	PMS_START_SUB,			! start subfunction metering
+	PMS_END_SUB,			! end subfunction metering
+	DIR_ACCESS,			! access the directory
+	PARSE_NAME,			! parse file string
+	DIR_SCAN,			! search the directory
+	UPDATE_DIRSEQ,			! update directory sequence count in UCB
+	APPLY_RVN,			! default to current RVN
+	DEFAULT_RVN,			! use 0 if RVN is current
+	NEXT_DIR_REC,			! advance to next matching record
+	RETURN_DIR,			! return data to buffer packet
+	MARK_DIRTY;			! mark buffer for rewrite
+
+
+! Start metering for this subfunction.
+!
+
+PMS_START_SUB (PMS_ENTER);
+
+! The file ID to be entered must be non-zero.
+!
+
+IF .FIB[FIB$W_FID_NUM] EQL 0
+THEN ERR_EXIT (SS$_BADPARAM);
+
+! Find the name string in the buffer packet. Parse the string into the
+! name descriptor block. Mask out the wild card bits, since they are
+! not permitted. Check the version number; it must be positive.
+!
+
+PARSE_NAME (NAME_DESC, NAME_BUFFER, .ABD[ABD$C_NAME, ABD$W_COUNT],
+	    .ABD[ABD$C_NAME, ABD$W_TEXT] + ABD[ABD$C_NAME, ABD$W_TEXT] + 1,
+	    .FIB[FIB$W_NMCTL] AND FIB$M_NEWVER);
+IF .NAME_DESC[FND_WILD]
+THEN ERR_EXIT (SS$_BADFILENAME);
+IF .NAME_DESC[FND_VERSION] LSS 0
+THEN NAME_DESC[FND_VERSION] = 0;
+NAME_LENGTH = .NAME_DESC[FND_COUNT] + 1 AND NOT 1;
+
+! Access the directory.
+!
+
+DIR_ACCESS (.FIB, 1);
+
+! Search the directory for the indicated name. If the search succeeds,
+! we have a duplicate entry. If supersede is enabled, do it; otherwise,
+! take an error exit. If the search failed, make a new entry.
+!
+
+DIR_RECORD = 0;
+LAST_ENTRY[0] = 0;
+STATUS =  DIR_SCAN (NAME_DESC, 0, 0, 0, 0, 0, -1);
+IF .DIR_VERSION NEQ 0
+THEN FIB[FIB$W_VERLIMIT] = .VERSION_LIMIT;
+
+IF .STATUS
+AND NOT .NAME_DESC[FND_MAX_VER]
+AND .NAME_DESC[FND_VERSION] NEQ 0
+THEN
+    BEGIN
+    IF NOT .FIB[FIB$V_SUPERSEDE]
+    THEN ERR_EXIT (SS$_DUPFILENAME);
+
+    DIR_END = .DIR_VERSION;
+    PREV_VERSION = .DIR_VERSION[DIR$W_VERSION];
+    CH$MOVE (FIB$S_FID, DIR_VERSION[DIR$W_FID], SUPER_FID);
+    APPLY_RVN (SUPER_FID[FID$W_RVN]);
+    CH$MOVE (FIB$S_FID, FIB[FIB$W_FID], DIR_VERSION[DIR$W_FID]);
+    DEFAULT_RVN (DIR_VERSION[DIR$W_FID_RVN]);
+    USER_STATUS[0] = SS$_SUPERSEDE;
+    CLEANUP_FLAGS[CLF_SUPERSEDE] = 1;
+
+! Determine if the entry being superseded is of the form xxx.DIR;1. If
+! so, bump the directory sequence count in the UCB to invalidate RMS caches.
+!
+
+    IF .DIR_VERSION[DIR$W_VERSION] EQL 1	! simple tests first
+    THEN
+	BEGIN
+	P = CH$FIND_SUB (.DIR_ENTRY[DIR$B_NAMECOUNT], DIR_ENTRY[DIR$T_NAME],
+			 4, UPLIT BYTE ('.DIR'));
+	IF NOT CH$FAIL (.P)
+	AND .P + 4 EQL DIR_ENTRY[DIR$T_NAME] + .DIR_ENTRY[DIR$B_NAMECOUNT]
+	THEN KERNEL_CALL (UPDATE_DIRSEQ);
+	END;
+    END
+
+! The operation is not a supersede. Create the new directory entry.
+!
+
+ELSE
+    MAKE_ENTRY (NAME_DESC, .FIB);
+
+! Determine whether higher or lower versions exist of the new entry.
+! This is deduced from the relative position of the new version in the record.
+!
+
+IF .VERSION_COUNT GTRU 0
+THEN FIB[FIB$V_HIGHVER] = 1;
+
+IF .DIR_VERSION LSSA .DIR_ENTRY + .DIR_ENTRY[DIR$W_SIZE] + 2 - DIR$C_VERSION
+OR
+    BEGIN
+    VBN = .DIR_VBN;
+    NEXT_DIR_REC (.DIR_ENTRY, VBN) NEQ 0
+    END
+THEN FIB[FIB$V_LOWVER] = 1;
+
+FIB[FIB$W_VERLIMIT] = .VERSION_LIMIT;
+
+! Write out the modified directory block and
+! return the resultant directory string to the caller.
+!
+
+KERNEL_CALL (RETURN_DIR, .RESULT_LENGTH, .RESULT, .ABD);
+
+MARK_DIRTY (.DIR_BUFFER);
+
+PMS_END_SUB ();
+
+END;					! end of routine ENTER
+
+GLOBAL ROUTINE MAKE_ENTRY (NAME_DESC, FIB) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine makes a new directory entry, either for a new file
+!	name or for a new version of an existing file.
+!
+!
+! CALLING SEQUENCE:
+!	MAKE_ENTRY (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of file name descriptor block
+!	ARG2: address of user FIB
+!
+! IMPLICIT INPUTS:
+!	DIR_VBN: VBN of current directory block
+!	DIR_BUFFER: buffer address of current directory block
+!	DIR_ENTRY: address of directory record
+!	DIR_VERSION: address of directory version entry
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	DIR_END: end of directory data
+!	PREV_VERSION: version number of superseded entry
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	directory buffer altered, directory may be extended
+!
+!--
+
+BEGIN
+
+MAP
+	NAME_DESC	: REF BBLOCK,	! file name descriptor block
+	FIB		: REF BBLOCK;	! user FIB
+
+LOCAL
+	STATUS,				! misc status value
+	EOF,				! entering at end of file flag
+	DN		: REF BBLOCK,	! local pointer to name descriptor
+	NAME_LENGTH,			! length of file name, rounded even
+	NEW_SIZE,			! size in bytes of new record
+	VERSIONS,			! version limit for new directory record
+	SAVE_VERSION,			! saved version number of new entry
+	SAVE_DIR_CONTEXT : BBLOCK [DCX_LENGTH]; ! saved context of enter
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	USER_STATUS	: VECTOR [,WORD], ! user's I/O status block
+	DIR_FCB		: REF BBLOCK,	! FCB of directory file
+	DIR_CONTEXT	: BBLOCK,	! directory context block
+	PREV_VERSION,			! version number of superseded entry
+	PREV_NAME	: VECTOR [,BYTE], ! name string of superseded entry
+	SUPER_FID	: BBLOCK;	! file ID of superseded file
+
+DIR_CONTEXT_DEF;
+
+EXTERNAL ROUTINE
+	DIR_SCAN,			! scan directory file
+	READ_BLOCK,			! read a disk block
+	REMOVE,				! remove a directory entry
+	SHUFFLE_DIR,			! extend the directory
+	NEXT_REC,			! get next directory record
+	APPLY_RVN,			! default to current RVN
+	DEFAULT_RVN,			! use 0 if RVN is current
+	UPDATE_IDX;			! update directory FCB index
+
+
+! Set up the position for the insert. If DIR_ENTRY came back zero, either
+! we scanned off the end of the directory, or this is a cleanup from a REMOVE
+! in which the block DIR_VBN got squished out. We read back the previous
+! block, and set up to append the entry, unless it was the first, in which
+! case we read the first and enter at its beginning. Scan to the end of the
+! records in the block.
+!
+
+EOF = 0;
+DN = .NAME_DESC;
+NAME_LENGTH = .DN[FND_COUNT] + 1 AND NOT 1;
+DIR_END = .DIR_ENTRY;
+IF .DIR_ENTRY EQL 0
+THEN
+    BEGIN
+    IF .DIR_VBN GTRU 1
+    THEN
+	BEGIN
+	EOF = .EOF + 1;
+	DIR_VBN = .DIR_VBN - 1;
+	END;
+    DIR_ENTRY = DIR_END = DIR_BUFFER = READ_BLOCK (.DIR_VBN+.DIR_FCB[FCB$L_STLBN]-1,
+						   1, DIRECTORY_TYPE);
+    END;
+
+UNTIL .DIR_END[DIR$W_SIZE] EQL 65535
+DO DIR_END = NEXT_REC (.DIR_END);
+IF .EOF
+THEN DIR_ENTRY = .DIR_END;
+DIR_END = .DIR_END + 2;
+
+! If there was not a name match, we are constructing a whole new record.
+! Compute the record size and see if there is enough space. If not, extend
+! the directory. Then shuffle down the rest of the records and build the
+! new entry. We update the directory index if this is a new last record
+! in the block.
+!
+
+IF .DIR_VERSION EQL 0
+THEN
+    BEGIN
+    IF .DN[FND_VERSION] EQL 0
+    THEN DN[FND_VERSION] = .DN[FND_VERSION] + 1;
+
+    NEW_SIZE = DIR$C_LENGTH + DIR$C_VERSION + .NAME_LENGTH;
+    IF .NEW_SIZE GTRU .DIR_BUFFER + 512 - .DIR_END
+    THEN SHUFFLE_DIR (1);
+
+    IF .DIR_ENTRY[DIR$W_SIZE] EQL 65535
+    THEN KERNEL_CALL (UPDATE_IDX, .DIR_VBN-1, CH$RCHAR (.DN[FND_STRING]));
+    CH$MOVE (.DIR_END-.DIR_ENTRY, .DIR_ENTRY, .DIR_ENTRY+.NEW_SIZE);
+
+    DIR_ENTRY[DIR$W_SIZE] = .NEW_SIZE - 2;
+    VERSIONS = .FIB[FIB$W_VERLIMIT];
+    IF .VERSIONS EQL 0
+    THEN VERSIONS = .DIR_FCB[FCB$W_VERSIONS];
+    IF .VERSIONS EQL 0
+    THEN VERSIONS = 32767;
+    DIR_ENTRY[DIR$W_VERLIMIT] = .VERSIONS;
+    VERSION_LIMIT = .VERSIONS;
+
+    DIR_ENTRY[DIR$B_FLAGS] = DIR$C_FID;
+    DIR_ENTRY[DIR$B_NAMECOUNT] = .DN[FND_COUNT];
+    CH$COPY (.DN[FND_COUNT], .DN[FND_STRING],
+		0, .NAME_LENGTH, DIR_ENTRY[DIR$T_NAME]);
+
+    DIR_VERSION = .DIR_ENTRY + .NEW_SIZE - DIR$C_VERSION;
+    END
+
+
+! Otherwise we are adding a new version to an existing entry. If the
+! version limit is less than maximal, check for version overflow. If
+! so, move out the oldest version to be superseded. We do this by
+! saving the current directory position and scanning to the lowest
+! version of the file. If the scan for lowest version comes back with
+! an error, this indicates that we were already at the lowest version;
+! if so, give an error.
+!
+
+ELSE
+    BEGIN
+    IF  .DN[FND_VERSION] EQL 0
+    OR (.DN[FND_MAX_VER] AND .DN[FND_VERSION] LEQU .DIR_VERSION[DIR$W_VERSION])
+    THEN DN[FND_VERSION] = .DIR_VERSION[DIR$W_VERSION] + 1;
+    IF .DN[FND_VERSION] LSS 0
+    THEN ERR_EXIT (SS$_BADFILEVER);
+
+    IF .VERSION_LIMIT LSSU 32767
+    THEN
+	BEGIN
+	SAVE_VERSION = .DN[FND_VERSION];
+	DN[FND_FLAGS] = 0;
+	DN[FND_VERSION] = 32768;
+	CH$MOVE (DCX_LENGTH, DIR_CONTEXT, SAVE_DIR_CONTEXT);
+	STATUS = DIR_SCAN (.DN, 0, .DIR_VBN-1, .DIR_ENTRY, .DIR_VERSION, .DIR_PRED, -1);
+	IF .STATUS
+	THEN
+	    BEGIN
+	    IF .VERSION_COUNT + 1 GEQU .VERSION_LIMIT
+	    THEN
+		BEGIN
+		PREV_VERSION = .DIR_VERSION[DIR$W_VERSION];
+		CH$MOVE (.DIR_ENTRY[DIR$B_NAMECOUNT]+1,
+			  DIR_ENTRY[DIR$B_NAMECOUNT], PREV_NAME);
+		CH$MOVE (FIB$S_FID, DIR_VERSION[DIR$W_FID], SUPER_FID);
+		APPLY_RVN (SUPER_FID[FID$W_RVN]);
+		USER_STATUS[0] = SS$_FILEPURGED;
+		CLEANUP_FLAGS[CLF_SUPERSEDE] = 1;
+		REMOVE (.DIR_VBN EQL .SAVE_DIR_CONTEXT[DCX_VBN]
+			AND .DIR_ENTRY EQL .SAVE_DIR_CONTEXT[DCX_ENTRY]);
+		END;
+	    END
+	ELSE
+	    IF .VERSION_COUNT GEQU .VERSION_LIMIT
+	    THEN ERR_EXIT (SS$_TOOMANYVER);
+
+! Now reposition to the point of the enter to make the new entry.
+!
+
+	DN[FND_VERSION] = .SAVE_VERSION;
+	RESTORE_DIR (SAVE_DIR_CONTEXT);
+	END;
+
+! Check available space and extend if necessary. If we are out of space
+! in the block, the version is going to the front of the record, the
+! record is the only one in its block, and the record has a
+! predecessor, we backspace to the previous record and try to append
+! the entry. This prevents pathological directory fragmentation when
+! new versions are inserted in descending order, as might happen during
+! a wild card copy. If this gambit fails or is not applicable, we have
+! to split the block.
+!
+
+    IF DIR$C_VERSION GTRU .DIR_BUFFER + 512 - .DIR_END
+    THEN
+	BEGIN
+	IF  .DIR_ENTRY EQL .DIR_BUFFER
+	AND .DIR_VBN GTRU 1
+	AND .DIR_VERSION EQL .DIR_ENTRY + .NAME_LENGTH + DIR$C_LENGTH
+	AND .BBLOCK [NEXT_REC (.DIR_ENTRY), DIR$W_SIZE] EQL 65535
+	AND CH$EQL (.DIR_ENTRY[DIR$B_NAMECOUNT]+1,
+		     DIR_ENTRY[DIR$B_NAMECOUNT],
+		    .DIR_ENTRY[DIR$B_NAMECOUNT]+1,
+		     LAST_ENTRY)
+	THEN
+	    BEGIN
+	    DIR_VBN = .DIR_VBN - 1;
+	    DIR_BUFFER = DIR_END = READ_BLOCK (.DIR_VBN-1+.DIR_FCB[FCB$L_STLBN], 1, DIRECTORY_TYPE);
+	    DO
+		BEGIN
+		DIR_ENTRY = .DIR_END;
+		DIR_END = NEXT_REC (.DIR_END);
+		END
+	    UNTIL .DIR_END[DIR$W_SIZE] EQL 65535;
+	    DIR_VERSION = .DIR_END;
+	    DIR_END = .DIR_END + 2;
+	    IF DIR$C_VERSION GTRU .DIR_BUFFER + 512 - .DIR_END
+	    THEN SHUFFLE_DIR (1);
+	    END
+	ELSE
+	    SHUFFLE_DIR (1);
+	END;
+
+    DIR_ENTRY[DIR$W_SIZE] = .DIR_ENTRY[DIR$W_SIZE] + DIR$C_VERSION;
+    CH$MOVE (.DIR_END-.DIR_VERSION, .DIR_VERSION, .DIR_VERSION+DIR$C_VERSION);
+    END;
+
+! Now insert the version number and file ID into the version slot.
+!
+
+CLEANUP_FLAGS[CLF_REMOVE] = 1;
+DIR_VERSION[DIR$W_VERSION] = .DN[FND_VERSION];
+CH$MOVE (FIB$S_FID, FIB[FIB$W_FID], DIR_VERSION[DIR$W_FID]);
+DEFAULT_RVN (DIR_VERSION[DIR$W_FID_RVN]);
+
+END;				! end of routine MAKE_ENTRY
+
+GLOBAL ROUTINE RESTORE_DIR (CONTEXT) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine repositions a directory to the location specified
+!	in the context block and copies the context back into the
+!	main context block.
+!
+! CALLING SEQUENCE:
+!	RESTORE_DIR (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of context block to use
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	DIR_CONTEXT: receives contents of supplied context
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	directory block read
+!
+!--
+
+BEGIN
+
+MAP
+	CONTEXT		: REF BBLOCK;	! directory context arg
+
+EXTERNAL
+	DIR_FCB		: REF BBLOCK,	! address of directory FCB
+	DIR_CONTEXT	: BBLOCK;	! main directory context
+
+DIR_CONTEXT_DEF;
+
+EXTERNAL ROUTINE
+	READ_BLOCK;			! read a disk block
+
+
+! We have to reread the block if either the supplied context is the
+! main context (indicating a required reposition) or the supplied
+! context points to a different block than the main context (indicating
+! that we have actually moved).
+!
+
+IF .CONTEXT EQL DIR_CONTEXT
+OR .CONTEXT[DCX_VBN] NEQ .DIR_VBN
+OR .CONTEXT[DCX_BUFFER] NEQ .DIR_BUFFER
+THEN
+    BEGIN
+    DIR_VBN = .CONTEXT[DCX_VBN];
+    DIR_ENTRY = .CONTEXT[DCX_ENTRY] - .CONTEXT[DCX_BUFFER];
+    IF .CONTEXT[DCX_VERSION] NEQ 0
+    THEN DIR_VERSION = .CONTEXT[DCX_VERSION] - .CONTEXT[DCX_BUFFER];
+    IF .CONTEXT[DCX_END] NEQ 0
+    THEN DIR_END = .CONTEXT[DCX_END] - .CONTEXT[DCX_BUFFER];
+    IF .CONTEXT[DCX_PRED] NEQ 0
+    THEN DIR_PRED = .CONTEXT[DCX_PRED] - .CONTEXT[DCX_BUFFER];
+    DIR_BUFFER = READ_BLOCK (.DIR_VBN+.DIR_FCB[FCB$L_STLBN]-1, 1, DIRECTORY_TYPE);
+    DIR_ENTRY = .DIR_ENTRY + .DIR_BUFFER;
+    IF .DIR_VERSION NEQ 0
+    THEN DIR_VERSION = .DIR_VERSION + .DIR_BUFFER;
+    IF .DIR_END NEQ 0
+    THEN DIR_END = .DIR_END + .DIR_BUFFER;
+    IF .DIR_PRED NEQ 0
+    THEN DIR_PRED = .DIR_PRED + .DIR_BUFFER;
+    VERSION_LIMIT = .CONTEXT[DCX_VERLIMIT];
+    VERSION_COUNT = .CONTEXT[DCX_VERCOUNT];
+    CH$MOVE (FILENAME_LENGTH+1, CONTEXT[DCX_NAME], LAST_ENTRY);
+    END
+ELSE
+    CH$MOVE (DCX_LENGTH, .CONTEXT, DIR_CONTEXT);
+
+END;					! End of routine RESTORE_DIR
+
+END
+ELUDOM

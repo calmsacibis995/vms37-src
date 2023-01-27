@@ -1,0 +1,1172 @@
+	.TITLE	NETCNF	- Configuration data base access routines
+	.IDENT	'V03-003'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;
+; FACILITY:	NETWORK ACP
+;
+; ABSTRACT:
+;		This module provides access to the NETACP configuration
+;		database.
+;
+; ENVIRONMENT:
+;		Kernel mode 
+;
+; AUTHOR:	A.Eldridge	14-JAN-80
+;
+; MODIFIED BY:
+;
+;	V003	TMH0003		Tim Halvorsen		25-Mar-1982
+;		Fix routine which compresses a CNF block to correctly
+;		initialize the amount of space used for strings, to
+;		prevent a continual increase in the block size for
+;		each block compression.
+;
+;	V02-002	ADE0050		A.Eldridge		19-Jan-1982
+;		Added call to NET$APPLY_DFLT which applies default values
+;		to selected CNF parameters when an entry is about to
+;		inserted into the database.
+;
+;	V02-001	ADE0007		A.Eldridge		
+;		General cleanup.
+;--
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+	$CNRDEF			; Configuration Root Block
+	$CNFDEF			; Configuration Data Block
+	$NETSYMDEF		; Miscellaneous symbol definitions
+	$NFBDEF			; ACP control QIO definitions
+
+
+;
+; EQUATED SYMBOLS:
+;
+STR_OFF = 0		; String descriptor string self-relative offset
+STR_LNG = 2		; String descriptor string size
+
+;
+; Configuration Data Block (CNF)
+;
+; The CNF provides a general information storage using linked lists and is used
+; for most of the internal data bases.  It allows general subroutines to be 
+; written for much of the work done by the ACP such as key-directed scanning 
+; of the data base, control QIO processing, etc.
+;
+; The format of each  CNF  is as follows:
+;
+;  *** tbs ***
+;
+;   *** CNR description is also t.b.s. ***
+;
+
+	.PSECT	NET_LOCK_CODE,NOWRT,EXE,LONG
+
+;+
+; CNF$PRE_SHOW	- Pre-process CNF for a "show" QIO
+;
+; Dispatch to database specific action routine to pre-process a CNF entry
+; before a "show" QIO is processed for that entry.
+;
+; INPUTS:	R11	CNR pointer
+;		R10	CNF pointer
+;		R9-R7	Scratch
+;		R5-R0	Scratch
+;
+; OUTPUTS:	R11,R10	Preserved
+;		R6	Preserved
+;
+;		All other regs are clobbered.
+;-
+CNF$PRE_SHOW::				; "Show" QIO pre-processing
+	PUSHL	R6			; Save reg
+	JSB	@CNR$L_ACT_SHOW(R11)	; Call action routine
+	POPL	R6			; Restore reg
+	RSB				; Done
+
+;+
+; CNF$PRE_QIO	- Pre-process database to prepare it for a QIO
+;
+; Dispatch to database specific action routine to pre-process a CNF entry
+; before a "show" QIO is processed for that entry.
+;
+; INPUTS:	R11	CNR pointer
+;		
+; OUTPUTS:	R11	Unchanged
+;		R0	SS$_...	  (may return this code as QIO status if low
+;				   bit is clear)
+;
+;		All other regs are preserved
+;
+;-
+CNF$PRE_QIO::				; QIO pre-processing for database
+
+	PUSHR	#^M<R1,R2,R3,R4,R5,R6,R7,R8,R9>	; Save regs
+	JSB	@CNR$L_ACT_QIO(R11)		; Setup database
+	POPR	#^M<R1,R2,R3,R4,R5,R6,R7,R8,R9>	; Restore regs
+	RSB					; Done
+
+
+;+
+; CNF$DELETE	  - Attempt to delete CNF entry
+;
+; The CNF is checked to see if it is delete-able.  If so, it is marked 
+; temporary.  If the CNF$V_FLG_ACP bit is set then the CNF does not exist in
+; the linked list portion of the database and the operation is considered to
+; be a no-op (these CNF's are sometimes referred to as "phantom" CNF's and
+; are used to reference things known to NETACP but never inserted into the
+; database: for instance, a node which was never defined but which is
+; reachable by the Transport layer).
+;
+;
+; INPUTS:	R11	CNR pointer
+;		R10	CNF pointer
+;
+; OUTPUTS:	R0	SS$_WRITLCK if the item was not delete-able
+;			SS$_NORMAL  otherwise
+;
+;		All other regs are preserved.
+;-
+CNF$DELETE::					; Mark CNF for delete
+	PUSHR	#^M<R1,R2,R3,R4,R5,R7,R8,R9>	; Save regs
+	BBS	#CNF$V_FLG_ACP,CNF$B_FLG(R10),30$; If BS then this is a no-op
+	PUSHL	#SS$_WRITLCK			; Assume not delete-able
+	CMPL	R10,R11				; Is the CNF actually the CNR?
+	BEQL	50$				; If EQL then cannot delete
+	JSB	@CNR$L_ACT_DELETE(R11)		; Call action routine for
+						; special processing
+	BLBC	R0,50$				; If LBC then cannot delete it
+10$:	BISB	#CNF$M_FLG_DELETE,CNF$B_FLG(R10); Mark it for delete
+	BISW	#NET$M_PURGE,W^NET$GL_FLAGS	; Remember to purge the database
+30$:	MOVL	#SS$_NORMAL,(SP)		; Overlay status code
+50$:	POPR	#^M<R0,R1,R2,R3,R4,R5,R7,R8,R9>	; Restore regs
+	RSB
+
+;+
+; CNF$PURGE	  - Drain temporary entries from CNF queue
+;
+; The CNF is queue is scanned, starting at the root, and all CNFs which
+; are marked temporary are deleted.
+;
+;
+; INPUTS:	R11	CNR pointer
+;
+; OUTPUTS:	All regs are preserved.
+;
+;-
+CNF$PURGE::					; Deallocate all temporary CNFs
+	PUSHR	#^M<R0,R1>			; Save reg
+	MOVL	R11,R1				; Start at head of queue
+	BRB	30$				; Continue
+	ASSUME	CNR$L_FLINK  EQ  CNF$L_FLINK
+20$:	MOVL	CNF$L_FLINK(R1),R1		; Advance the pointer
+30$:	MOVL	CNF$L_FLINK(R1),R0		; Advance to next CNF
+	BBS	#CNF$V_FLG_CNR,CNF$B_FLG(R0),40$; If BS then at root -- done
+	BBC	#CNF$V_FLG_DELETE,-		;
+		 CNF$B_FLG(R0),20$		; If BC not marked for delete
+	REMQUE	@CNF$L_FLINK(R1),R0		; Remove this entry
+	PUSHL	R1				;&Save R1 (should use R10)
+	JSB	@CNR$L_ACT_REMOVE(R11)		; Call action routine
+	POPL	R1				;&Restore R1
+	;
+	;   Deallocate the CNF block
+	;
+	BSBW	NET$DEALLOCATE			; Deallocate the block
+	BRB	30$
+40$:	POPR	#^M<R0,R1>			; Restore reg
+	RSB
+
+;+
+; CNF$INSERT	- Insert/Replace a database CNF entry
+;
+; Build a copy of the new CNF from the process pool and insert it into
+; the database.
+;
+; NOTE:
+;	***  The database scan co-routine dialogue  ***
+;	***  below must be abortable via a RET.	    ***
+;
+; INPUT:	R11	CNR pointer
+;		R10 	Points to the utility buffer with new image in it
+;		R6  	Pointes to old CNF entry if any
+;
+; OUTPUT:	R11	CNR pointer
+;		R10 	Points to new CNF if successful
+;		 	Contains original R6 otherwise
+;		R9	Field i.d. which qualifies the error code in R0
+;		R0	Status
+;
+;		All other regs contain garbage
+;-
+CNF$INSERT::				; Insert/Replace a database entry
+	PUSHL	W^NET$GL_FLAGS		; Save current flags
+	BISW	#NET$M_INTRNL,W^NET$GL_FLAGS ; Setup for "internal" access
+	;
+	;   Apply default values to selected parameters
+	;
+	PUSHL	R6			; Save reg
+	BSBW	NET$APPLY_DFLT		; Apply defaults
+	POPL	R6			; Restore reg
+	BLBC	R0,17$			; If LBC then error encountered
+	;
+	;   Make sure all required fields are active
+	;
+	MOVAB	CNR$L_VEC_MAND(R11),R2	; Get pointer to list of field i.d.s
+10$:	MOVL	(R2)+,R9		; Get next field i.d.
+	BEQL	20$			; If EQL then done
+	BSBW	GET_DSC_1		; Get descriptor of field
+	BBC	#CNR$V_SEM_RT,(R3),15$	; Br if "real" CNF field
+	JSB	(R4)			; Else get the info from action routine
+	INSV	R0,R5,#1,CNF$T_MASK(R10); LBS in R0 if field is active
+15$:	BBS	R5,CNF$T_MASK(R10),10$	; If BS then field is active
+	MOVZWL	#SS$_INSFARG,R0		; Setup error status
+17$:	BRW	40$			; Take common exit
+20$:	;
+	;   Build a list of all parameters required to be unique and scan the
+	;   database to see if they are in fact unique.  This list is built in
+	;   the CNF pointed to by R10 since this is expected to be the utility
+	;   buffer and should be large enough (this eliminates the need for
+	;   another rather large buffer).
+	;
+	MOVZWL	CNF$W_OFF_FREE(R10),R2	; Get self-relative offset
+	MOVAB	CNF$W_OFF_FREE(R10)[R2],R3 ; Get ptr to free space
+	MOVL	R3,R5			; Save copy of pointer
+	MOVZWL	CNF$W_SIZ_FREE(R10),R2	; Get amount of free space
+	SUBW	#4,R2			; Account for end of list flag
+	BLSS	32$			; If LSS then no space left
+	MOVAB	CNR$L_VEC_UNIQ(R11),R4	; Get pointer to list of field i.d.s
+30$:	MOVL	#0,(R3)			; Mark end of list
+	MOVL	(R4)+,R9		; Get next field i.d.
+	BEQL	35$			; If EQL then at end of list
+	BSBW	CNF$GET_FIELD		; Get the field value
+	BLBC	R0,30$			; If not active then ignore it
+	SUBW	#12,R2			; Need 12 more bytes
+	BLSS	32$			; If LSS the no space left
+	MOVL	R9,(R3)+		; Enter field i.d.
+	MOVQ	R7,(R3)+		; Enter field value/descriptor
+	BRB	30$			; Loop
+32$:	MOVZWL	#SS$_INSFMEM,R0		; Setup status code
+	BRB	40$			; Take common exit
+
+35$:	DLIST = 4			; Offset for dynamic field lis pointer
+	SLIST = 8			; Offset for static field list pointer
+	PUSHR	#^M<R4,R5>		; Dynamic pointer is garbage,
+					; Static pointer is in R5
+	CALLS	#2,SCAN			; Scan for field already in use
+	BLBC	R0,40$			; If LBC then something's not unique
+	;
+	;  Create a copy of the new CNF
+	;
+	BSBW	CNF$CLONE		; Create a copy - clone returns in R10
+	BLBC	R0,40$			; If LBC then error
+	PUSHR	#^M<R6,R10,R11>		; Save critical regs
+	JSB	@CNR$L_ACT_INSERT(R11)	; Perform any pre-insertion processing
+	POPR	#^M<R6,R10,R11>		; Restore regs
+	BLBS	R0,45$			; If LBS then successful
+	INSQUE	(R10),@W^NET$GQ_TMP_BUF	; Else queue "new" CNF for deallocation
+40$:	;
+	;   Since the insert operation has failed, copy the old CNF pointer to
+	;   R10 since R10 is used to return the CNF representing this entry
+	;   which is linked into the database regardless of the success or
+	;   failure of the attmepted insertion.  R10 will return the value
+	;   zero if there was no old CNF pointer.
+	;
+	MOVL	R6,R10			; Copy the "old" CNF pointer
+	BRB	70$			; Take common exit
+	;
+	;   Insert the new CNF into the database
+	;
+45$:	MOVL	CNR$L_FLD_COLL(R11),R9	; Get the collating field i.d.
+	BSBW	CNF$GET_FIELD		; Get the field value/descriptor
+	MOVL	R10,R5			; Save ptr to "new" CNF
+	CLRL	R10			; Start search form head of list
+	MOVL	S^#NFB$C_OP_FNDPOS,R1	; Search database to find the CNF after
+	BSBW	CNF$KEY_SEARCH		; which to insert the new CNF
+	BLBS	R0,50$			; If LBS then successful
+	MOVL	CNR$L_BLINK(R11),R10	; Else locate last CNF in the queue
+50$:	INSQUE	(R5),CNF$L_FLINK(R10)	; Insert after item found
+	MOVL	R5,R10			; Point to the "new" CNF
+	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+	TSTL	R6			; Is there an "old" CNF ?
+	BEQL	70$			; If EQL no
+	BBS	#CNF$V_FLG_ACP,-	; If BS then CNF is not linked into the
+		     CNF$B_FLG(R6),70$	; CNF queue
+	REMQUE	(R6),R5			; Remove "old" CNF from database
+60$:	INSQUE	(R5),@W^NET$GQ_TMP_BUF	; Queue CNF block for deallocation
+70$:	POPL	W^NET$GL_FLAGS		; Restore flags
+	BLBC	R0,80$			; If LBC then error
+	BBC	#CNF$V_FLG_DELETE,-	; If BC then no need to delete new
+		    CNF$B_FLG(R10),80$	; entry
+	BISW	#NET$M_PURGE,-		; Else remember to purge it from the
+		    W^NET$GL_FLAGS	; database
+80$:	RSB				; Done
+
+
+
+
+;
+;  Make sure those fields whose value should be unique are unique
+;
+SCAN:	.WORD	^M<R10>			;
+	MOVL	#NFB$C_OP_EQL,R2	; Get action routine index
+	MOVL	R11,R10			; Start at begining of list
+	JSB	@CNR$L_SCANNER(R11)	; Call scanner to prepare scan
+60$:	;
+	;   Get next CNF block
+	;
+	MOVL	#CNF$_ADVANCE,R0	; Say "Give me the next CNF"
+	JSB	@(SP)+			; Tell co-routine, he calls us back
+					; with a JSB @(SP)+ and status in R0
+	BLBC	R0,100$			; If LBC there was none
+	CMPL	R10,R6			; Is this the CNF being replaced?
+	BEQL	60$			; If EQL yes, ignore it
+	MOVL	SLIST(AP),DLIST(AP)	; Start at the top of parameter list
+70$:	;
+	;   See if any fields in the list match the any of the fields in the
+	;   CNF already in the database.
+	;
+	MOVL	DLIST(AP),R0		; Get pointer to next parameter
+	MOVL	(R0)+,R9		; Get parameter i.d.
+	BEQL	60$			; If EQL then done with this CNF block
+	MOVQ	(R0)+,R7		; Get parameter value/descriptor
+	MOVL	R0,DLIST(AP)		; Store pointer
+	BSBW	GET_DSC_1		; Get field semantics
+					;&the output here could be stored in
+					;&the vector eliminating the call for
+					;&every CNF.  Actually, a call to GET
+					;&above would be quicker than a call
+					;&to CNF$GET_FIELD
+	ADDL3	R10,R4,R1		; Get address of parameter
+	BBC	#CNR$V_SEM_RT,(R3),80$	; Br if "real" CNF field
+	JSB	(R4)			; Else get the info from action routine
+	INSV	R0,R5,#1,CNF$T_MASK(R10); LBS in R0 if field is active
+80$:	BBC	R5,CNF$T_MASK(R10),70$	; If BC then field is not active
+	BSBW	COMPARE			; Make field comparison
+	BLBC	R0,70$			; If no match, loop on next field
+
+100$:	;
+	;   We are done.  The RET instruction aborts the scanner co-routine.
+	;
+	BBCS	#0,R0,110$		; If BC in R0 then no unique field
+					; violations were detected
+	MOVZWL	#SS$_DEVACTIVE,R0	; Indicate unique field violation
+110$:	RET				; Return status in R0
+
+;+
+; CNF$COPY	  - Copy one CNF entry into another
+;
+; The contents of a source CNF block are copied to the destination CNF block.
+; No string storage compression takes place, but any additional storage space
+; in the destination CNF block are reflected in its CNF$W_SIZ_FREE field.
+;
+; INPUTS:	R11	CNR pointer
+;		R10	Destination CNF pointer
+;		R8	Source CNF pointer
+;
+; OUTPUTS:	R0	SS$_NORMAL  if successful
+;			SS$_INSFMEM if destination CNF is too small
+;
+;		All other registers are preserved.
+;-
+CNF$COPY::
+	PUSHR	#^M<R1,R2,R3,R4,R5,R6>	  ; Save regs
+	MOVZWL	#SS$_INSFMEM,R0		  ; Assume destination CNF is too small
+	MOVZWL	CNF$W_SIZE(R10),R6	  ; Save size of target CNF
+	CMPW	R6,CNF$W_SIZE(R8)	  ; Is it big enough?
+	BLSSU	10$			  ; If LSS then too small
+	MOVC3	CNF$W_SIZE(R8),(R8),(R10) ; Copy CNF
+	MOVW	R6,CNF$W_SIZE(R10)	  ; Restore original size
+	SUBW	CNF$W_SIZE(R8),R6	  ; Get difference in size
+	ADDW	R6,CNF$W_SIZ_FREE(R10)	  ; Update the amount of free space
+	BICB	#CNF$M_FLG_CNR!-	  ; Block is not a CNR
+		 CNF$M_FLG_DELETE!-	  ; Block is a temporary CNF or marked for delete
+		 CNF$M_FLG_ACP,-	  ; Block is a catch-all used by the ACP
+		 CNF$B_FLG(R10)		  ; Init flags
+	MOVL	S^#SS$_NORMAL,R0	  ; Indicate success
+10$:	POPR	#^M<R1,R2,R3,R4,R5,R6>	  ; Restore regs
+	RSB				  ; Done
+
+;+
+; CNF$CLONE	  - Create a compressed version of a CNF entry
+;
+; A resultant CNF block is allocated and initialized.  The contents of a source
+; CNF block are copied to it such that the string storage space is 
+; unfragmented.
+;
+; INPUTS:	R11	CNR pointer
+;		R10	Source CNF pointer -- usually NET$AB_UTLBUF
+;
+; OUTPUTS:	R10	New CNF address -- the old R10 value is lost
+;		R0	SS$_NORMAL  if successful
+;			SS$_INSFMEM otherwise
+;
+;		All other registers are preserved.
+;-
+CNF$CLONE::				; Create a compressed copy of a CNF
+	PUSHR	#^M<R1,R2,R3,R4,R5,R6>	; Save regs
+	MOVL	R10,R6			; Save a pointer to the old CNF
+	;
+	;   Allocate new CNF block and initialize its fixed portion
+	;
+	MOVZWL	#SS$_INSFMEM,R0		; Assume destination CNF is too small
+	CLRL	R10			; Zero pointer to the new CNF
+	MOVZWL	CNR$W_SIZ_CNF(R11),R1	; Get minimum block size
+	ADDW	CNF$W_SIZ_USED(R6),R1	; Add in string space used
+	BVS	10$			; If VS the >65K
+	BSBW	NET$ALLOCATE		; Allocate block from ACP pool
+	BLBC	R0,100$			; Br on error
+	MOVL	R2,R10			; Copy block pointer
+	PUSHL	R1			; Save size
+	MOVC5	CNR$W_SIZ_CNF(R11),-	; Copy the fixed portion of the block
+		(R6),#0,R1,(R2)		; and zero the remainder
+	CVTLW	(SP)+,CNF$W_SIZE(R10)	; Store size for deallocation
+	BICB	#CNF$M_FLG_CNR!-	; Block is not a CNR
+		 CNF$M_FLG_DELETE!-	; Block is a temporary CNF or marked for delete
+		 CNF$M_FLG_ACP,-	; Block is a catch-all used by the ACP
+		 CNF$B_FLG(R10)		; Init flags
+	BSBW	CNF$INIT		; Init remainder of CNF
+	MOVZWL	CNR$W_MAX_INX(R11),R5	; Get max field index
+	BRB	40$			; Jump to the end of the loop
+10$:	;
+	;   Find the next string field
+	;
+	MOVAL	CNR$T_SEM_TAB(R11)[R5],R3 ; Get address of field semantics
+	CMPZV	#CNR$V_SEM_TYP,-	; Is it for strings ?
+		#CNR$S_SEM_TYP,(R3),-	;
+		#CNR$C_SEM_STR		;
+	BNEQ	40$			; If not branch to try next field
+	;
+	;   Move the string if its active.  Clear the mask bit before the call
+	;   to PUT_STR so that the CNF$W_SIZ_USED is not erroneously updated.
+	;
+	BBCC	R5,CNF$T_MASK(R10),40$	; Br if field is not active
+	BBS	#CNR$V_SEM_RT,(R3),40$	; Br if "field" is actually a routine
+	EXTZV	#CNR$V_SEM_OFF,-	; Get byte offset from top of
+		#CNR$S_SEM_OFF,(R3),R1	; CNF to the field
+	ADDL3	R6,R1,R0		; Get source CNF field address
+	ADDL	R10,R1			; Get dest.  CNF field address
+	;
+	;   Move the string to the new CNF
+	;
+	MOVZWL	STR_OFF(R0),R8		; Get self-relative offset to string
+	ADDL	R0,R8			; Make it a pointer
+	MOVZWL	STR_LNG(R0),R7		; Get its size
+	BSBW	PUT_STR			; Store it
+	BLBC	R0,100$			; If LBC then error
+	BBSS	R5,CNF$T_MASK(R10),40$	; Mark the field valid
+40$:	SOBGEQ	R5,10$			; Loop for each field
+	;
+	;   Done
+	;
+	MOVZWL	S^#SS$_NORMAL,R0	; Indicate success
+100$:	POPR	#^M<R1,R2,R3,R4,R5,R6>	; Restore regs
+	RSB
+
+;+
+; CNF$INIT	  - Initialize CNF entry
+; CNF$INIT_UTL	  - Initialize the utility buffer as a CNF entry
+;
+; A CNF block is initialized.
+;
+; INPUTS:	R11	CNR pointer
+;		R10	If CNF$INIT then ptr to CNF block to be initialized.
+;			If CNF$INIT_UTL then scratch
+;
+; OUTPUTS:	R10	If CNF$INIT then unchanged.
+;			If CNF$INIT_UTL then ptr to NET$AB_UTLBUF
+;		R0	SS$_NORMAL  if successful
+;			SS$_INSFMEM if CNF block is too small
+;
+;		All other registers are preserved.
+;-
+CNF$INIT_UTL::				; Init NET$AB_UTLBUF as a CNF BLOCK
+	MOVAB	W^NET$AB_UTLBUF,R10	; Point to the utility buffer
+	MOVW	#NET$C_UTLBUFSIZ,-	; Setup its size
+		     CNF$W_SIZE(R10)
+
+	ASSUME	CNR$C_MAX_INX  EQ  95	; One bit in mask for each parameter
+					; index (95 (zero indexed) => 3 lwords)
+	CLRQ	CNF$T_MASK(R10)		; Clear first 2 mask longwords
+	CLRL	CNF$T_MASK+8(R10)	; Clear third mask longword
+	CLRW	CNF$W_ID(R10)		; Init CNF i.d. data
+	CLRB	CNF$B_FLG(R10)		; Zero all flags
+
+
+CNF$INIT::				; Initialize a CNF block
+	MOVZWL	#SS$_INSFMEM,R0		; Assume error
+	CMPW	CNR$W_SIZ_CNF(R11),-	; Is block big enough ?
+		    CNF$W_SIZE(R10)	;
+	BGTRU	10$			; If GTRU then CNF is too small
+	MOVB	#DYN$C_NET,-		;
+		    CNF$B_TYPE(R10) 	; Enter type
+	CLRW	CNF$W_SIZ_USED(R10)	; Init free spaced used for strings
+	SUBW3	#CNF$W_OFF_FREE,-	; Setup self-relative offset to free
+		    CNR$W_SIZ_CNF(R11),-; space
+		    CNF$W_OFF_FREE(R10)	;
+	SUBW3	CNR$W_SIZ_CNF(R11),-	; Setup amount of free space available 
+		    CNF$W_SIZE(R10),-	;
+		    CNF$W_SIZ_FREE(R10)	;
+	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+10$:	RSB
+
+;+
+; CNF$KEY_SRCH_EX  - External find CNF via match of supplied parameter
+; CNF$KEY_SEARCH   - Internal find CNF via match of supplied parameter
+;
+; The CNF list is search until a block is found in which the supplied key
+; matches the appropriate field.  A match is determined by dispatching to the
+; compare routine identified by R1.
+;
+; If R10 is zero on input then the search begins at the CNR (root), else R10
+; is assumed to be the address of a CNF and the search begins with the CNF
+; following the R10 CNF.
+;
+; INPUTS:	R11 = CNR address
+;		R10 = CNF address or zero
+;		R9  = FLD # in bits 0-15, Mask ID in bits 16-23
+;		R8  = Key value if bit, byte, word, or longword parameter type
+;		      Key pointer if key is a string
+;		R7  = Key length if key is a string
+;		R1  = Search function
+;		R0  = Error code to be returned if CNF is not found
+;
+; OUTPUTS:	R10 = Address of matching CNF if search is successful, else 0
+;		R1  = Garbage
+;		R0  = Low bit set if search is successful
+;		      Unchanged otherwise (SS$_ENDOFFILE if entered with LBS)
+;
+;		All other registers are preserved
+;
+;-
+CNF$KEY_SRCH_EX::			; Locate CNF via key
+	PUSHL	W^NET$GL_FLAGS		; Save current flags
+	BICW	#NET$M_INTRNL,-		;
+		    W^NET$GL_FLAGS	; Indicate external access rights
+	BRB	SRCH
+
+CNF$KEY_SEARCH::			; Locate CNF via key
+	PUSHL	W^NET$GL_FLAGS		; Save current flags
+	BISW	#NET$M_INTRNL,-		;
+		    W^NET$GL_FLAGS	; Indicate internal access rights
+
+	ASSUME	CNF$V_FLG_CNR  EQ  0
+	ASSUME	CNF$L_FLINK    EQ  CNR$L_FLINK
+	ASSUME	CNF$B_FLG      EQ  CNR$B_FLG
+
+
+SRCH:	BISW	#NET$M_READ,W^NET$GL_FLAGS	; Access will be for read
+	BLBC	R0,10$			; Invalid error code if LBS
+	MOVZWL	#SS$_ENDOFFILE,R0	; Make it a valid error code
+10$:	PUSHR	#^M<R1,R2,R3,R4,R5,R6>	; Save regs
+	MOVL	R0,R6			; Save default error status
+	MOVL	R1,R2			; Copy search function code
+	;
+	;   Call co-routine to prepare for scan
+	;
+	JSB	@CNR$L_SCANNER(R11)	; Call scanner co-routine
+	BSBW	GET_DSC			; On return:
+	BLBC	R0,70$			;  R10 = addr of CNF ptr 
+					;  R5  = bit offset to bit from the 
+					;	 top of mask vector
+					;  R4  = offset to parameter from top
+					;	 of CNF, or routine address
+					;  R3  = ptr to field semantics
+					;  R0  = LBS if successful
+20$:	MOVZBL	#CNF$_ADVANCE,R0	; Say "Give me the next CNF"
+	JSB	@(SP)+			; Tell co-routine, he calls us back
+					; with a JSB @(SP)+ and status in R0
+	BLBC	R0,70$			; If LBC there was none
+	BBC	#CNR$V_SEM_RT,(R3),30$	; Br "real" CNF field
+	JSB	(R4)			; Else go get the info, return with:
+					;
+					;  R1 = address of longword str desc,
+					;	or "field" value
+					;  R0 = LBS if and only if success
+					;	or value of field if type=bit
+					;
+	INSV	R0,R5,#1,CNF$T_MASK(R10); Remember validity of field
+	BRB	40$			; Continue in common
+30$:	ADDL3	R10,R4,R1		; Get address of parameter
+40$:	BSBB	COMPARE			; Make field comparison
+50$:	BLBC	R0,20$			; If key doesn't match, loop
+60$:	MOVL	S^#SS$_NORMAL,R6	; Setup success status code
+	MOVL	#CNF$_TAKE_CURR,R0	; Say "I want this one"
+	CMPL	R2,S^#NFB$C_OP_FNDPOS	; Should we back up?
+	BNEQ	80$			; If NEQ then no
+	MOVL	S^#CNF$_TAKE_PREV,R0	; Say "I want the previous block"
+	BRB	80$			; Continue
+70$:	MOVZBL	#CNF$_QUIT,R0		; Say "I quit without finding CNF"
+80$:	JSB	@(SP)+			; Tell co-routine, returns clean stack
+	MOVL	R6,R0			; Setup status code
+	POPR	#^M<R1,R2,R3,R4,R5,R6>	; Restore regs
+	POPL	W^NET$GL_FLAGS		; Restore flags
+	RSB
+
+COMPARE:
+	;
+	;   The "BSBB COMPARE_ACT"  cannot be called to setup the condition 
+	;   codes prior to the dispatch since the $DISPATCH macro expansion
+	;   includes a CASE instruction which modifies the condition codes.
+	;
+
+	;& this is getting a little ragged.... recode
+
+	$DISPATCH  R2,<-
+
+	    <NFB$C_OP_FNDNEXT,MATCH>	-; Match on any KEY value
+	    <NFB$C_OP_FNDMIN, KEY_MIN>	-; Find the minimum KEY value
+	    <NFB$C_OP_FNDMAX, KEY_MAX>	-; Find the maximum KEY value
+	    <NFB$C_OP_EQL,    KEY_EQL>	-; Match if EQL
+	    <NFB$C_OP_NEQ,    KEY_NEQ>	-; Match if KEY NEQ  CNF field
+	    <NFB$C_OP_GTRU,   KEY_GTRU>	-; Match if KEY GTRU CNF field
+	    <NFB$C_OP_LSSU,   KEY_LSSU>	-; Match if KEY LSSU CNF field
+	    <NFB$C_OP_FNDPOS, KEY_LSSU>	-; Match if KEY LSSU CNF field
+	>
+	BUG_CHECK    NETNOSTATE,FATAL	; Index is unknown
+
+KEY_EQL:	BSBB	COMPARE_ACT	; Compare the fields
+		BEQL	MATCH		; Br if KEY is EQL CNF field
+		BRB	NO_MA
+
+KEY_NEQ:	BSBB	COMPARE_ACT	; Compare the fields
+		BNEQ	MATCH		; Br if KEY is EQL CNF field
+		BRB	NO_MA
+
+KEY_GTRU:	BSBB	COMPARE_ACT	; Compare the fields
+		BGTRU	MATCH		; Br if KEY is GTRU CNF field
+		BRB	NO_MA
+
+KEY_LSSU:	BSBB	COMPARE_ACT	; Compare the fields
+		BLSSU	MATCH		; Br if KEY is LSSU CNF field
+		BRB	NO_MA
+
+KEY_MAX:	BSBB	COMPARE_ACT	; Compare the fields
+		BGEQU	NO_MA		; If GEQU current KEY is still maximum
+		BRB	UPD		; Else update to new max value
+
+KEY_MIN:	BSBB	COMPARE_ACT	; Compare the fields
+		BLEQU	NO_MA		; If LEQU current KEY is still minimum
+
+UPD:		MOVQ	R0,R7		; Update the current KEY value
+NO_MA:		CLRB	R0		; Indicate the search is to continue
+		RSB
+
+MATCH:		MOVB	#1,R0		; Indicate search is over
+		RSB
+
+
+;
+;   Action routines for comparisons
+;
+COMPARE_ACT:				; 
+	BBC	R5,CNF$T_MASK(R10),210$	; Br if field is invalid
+	EXTZV	#CNR$V_SEM_TYP,-	; Get parameter type
+		#CNR$S_SEM_TYP,(R3),-(SP)
+	$DISPATCH  (SP)+,TYPE=L,<-	; Dispatch by paramater type
+
+		<CNR$C_SEM_B,   100$>,-	; Byte
+		<CNR$C_SEM_W,   110$>,-	; Word
+		<CNR$C_SEM_L,   120$>,-	; Longword
+		<CNR$C_SEM_BIT, 130$>,-	; Bit
+		<CNR$C_SEM_STR, 160$>,-	; String descriptor
+	>
+	BUG_CHECK NETNOSTATE,FATAL	; Type is undefined
+
+100$:	MOVZBL	(R1),R1			; Get field
+	BRB	150$			;
+110$:	MOVZWL	(R1),R1			; Get field
+	BRB	150$			;
+120$:	MOVL	(R1),R1			; Get field
+	BRB	150$			;
+130$:	BBC	#CNR$V_SEM_RT,(R3),140$	; Br if "real" CNF field
+	EXTZV	#0,#1,(R1),R1		; Else get low bit of value setup by
+					; action routine
+	BRB	150$			; Continue
+140$:	SUBL	R10,R1			; Subtract out CNF address
+	EXTZV	R1,#1,(R10),R1		; Get the bit value
+150$:	CMPL	R8,R1			; Setup condition codes
+	BRB	200$			; Dispatch
+
+160$:	PUSHR	#^M<R2,R3>		; Save regs
+	MOVZWL	STR_LNG(R1),R0		; Get string length
+	MOVZWL	STR_OFF(R1),R2		; Get offset to string
+	ADDL	R2,R1			; Get string pointer
+	PUSHR	#^M<R0,R1>		; Save descriptor
+	CMPC5	R7,(R8),#0,R0,(R1)	; Setup condition codes
+	POPR	#^M<R0,R1,R2,R3>	; Doesn't affect condition codes
+200$:	RSB
+
+210$:	CLRB	R0			; Indicate no match
+	TSTL	(SP)+			; Pop caller's address
+	RSB				; Return to caller's caller
+
+;+
+; CNF$GET_FLD_EX - External get zero extended value or descriptor of CNF field
+; CNF$GET_FIELD  - Internal get zero extended value or descriptor of CNF field
+;
+; INPUTS:	R11	Address of CNR
+;		R10	Address of CNF
+;		R9	FLD # in bits 0:15, Mask I.D. in bits 16:23
+;		R0	Error code to be returned if field not active
+;
+; OUTPUTS:	R9	Unmodified
+;		R8	Parameter value if type bit, byte, word, or longword
+;			Pointer to string if type string
+;		R7	Size of string if type string
+;		R0	Low bit set if field was active
+;			Unchanged otherwise (0 if entered with LBS)
+;
+;		NOTE:	R7 and R8 are zeroed at the start of the
+;			routine.  If the routine returns with LBC in R0
+;			then R7 and R8 will equal zero implying a null
+;			field.
+;-
+CNF$GET_FLD_EX::			; Get CNF field
+	PUSHL	W^NET$GL_FLAGS		; Save current flags
+	BICW	#NET$M_INTRNL,-		;
+		    W^NET$GL_FLAGS	; Indicate external access rights
+	CLRL	R0			; No pre-set error code
+	BRB	GETFLD			; Continue
+
+CNF$GET_FIELD::				; Get CNF field
+	PUSHL	W^NET$GL_FLAGS		; Save current flags
+	BISW	#NET$M_INTRNL,-		;
+		    W^NET$GL_FLAGS	; Indicate internal access rights
+GETFLD:	BISW	#NET$M_READ,-		;
+		    W^NET$GL_FLAGS	; Indicate read access intended
+	BLBC	R0,10$			; Br if valid error code
+	CLRL	R0			; Else make it valid
+10$:	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save regs
+	CLRQ	R7			; Zero value/descriptor
+	BSBW	GET_DSC			; Get description of field
+	BLBC	R0,40$			; If LBC then no field
+	BBC	#CNR$V_SEM_RT,(R3),20$	; Br if "real" CNF field
+	JSB	(R4)			; Else go get the info, return with:
+					;
+					;  R1 = address of longword str desc,
+					;	or "field" value
+					;  R0 = LBS if and only if success
+					;	or value of field if type=bit
+	INSV	R0,R5,#1,CNF$T_MASK(R10); Remember validity of field
+	BRB	30$			; Continue
+20$:	ADDL3	R10,R4,R1		; Get pointer to parameter
+30$:	BSBB	GET			; Get the field value
+40$:	BLBS	R0,50$			; If LBS then success
+	TSTL	(SP)			; Has caller pre-set the error code?
+	BNEQ	60$			; If NEQ then yes
+50$:	MOVZWL	R0,(SP)			; Reset the return status
+60$:	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore regs, restore R0
+	POPL	W^NET$GL_FLAGS		; Restore flags
+	RSB
+
+;
+;  Get Field action routines
+;
+GET:	CLRB	R0			; Assume field is invalid
+	BBC	R5,CNF$T_MASK(R10),160$	; Br if CNF field is invalid
+	EXTZV	#CNR$V_SEM_TYP,-	; Get parameter type
+		#CNR$S_SEM_TYP,(R3),-(SP)
+	$DISPATCH  (SP)+,TYPE=L,<-	; Dispatch by paramater type
+
+		<CNR$C_SEM_BIT, 100$>,-	; Bit
+		<CNR$C_SEM_B,   110$>,-	; Byte
+		<CNR$C_SEM_W,   120$>,-	; Word
+		<CNR$C_SEM_L,   140$>,-	; Longword
+		<CNR$C_SEM_STR, 130$>,-	; String descriptor
+	>
+	BUG_CHECK NETNOSTATE,FATAL	; Bug if type is unknown
+100$:	BBC	#CNR$V_SEM_RT,(R3),105$	; Br if "real" CNF field
+	EXTZV	#0,#1,(R1),R8		; Else get low bit of value setup by
+					; action routine
+	BRB	150$			; Continue
+105$:	SUBL	R10,R1			; Subtract out CNF address
+	EXTZV	R1,#1,(R10),R8		; Get the bit value
+	BRB	150$			;
+110$:	MOVZBL	(R1),R8			; Get byte parameter
+	BRB	150$			;
+120$:	MOVZWL	(R1),R8			; Get word parameter
+	BRB	150$			;
+140$:	MOVL	(R1),R8			; Get longword parameter
+	BRB	150$			;
+130$:	BBS	#CNR$V_SEM_RT,(R3),180$	; Br if the string was obtained from
+					; and action routine
+	MOVZWL	STR_OFF(R1),R8		; Get offset to string 
+	ADDL	R1,R8			; Get pointer to string
+	MOVZWL	STR_LNG(R1),R7		; Get size of string
+150$:	MOVB	#1,R0			; Indicate field is valid
+160$:	RSB
+
+	;
+	;   The string was obtained from an action routine and is hence sitting
+	;   in the common action routine buffer.  Since this buffer is in 
+	;   jeapordy of being re-used, it is necessary to allocate a temporary
+	;   buffer and move the string to it.  This buffer is inserted on the
+	;   NET$GQ_TMP_BUF queue -- all buffers on this queue are deallocated
+	;   eventually by one of the higher level routines.
+	;
+180$:	MOVL	R1,R7			; Copy the string descriptor address
+	MOVZWL	STR_LNG(R1),R1		; Get the string length
+	ADDL	#12,R1			; Copy size of buffer header
+	BSBW	NET$ALLOCATE		; Allocate the buffer from the ACP pool
+	BLBC	R0,190$			; Br on error
+	INSQUE	(R2),@W^NET$GQ_TMP_BUF	; Insert buffer on tmp_buf queue.
+	MOVW	R1,CNR$W_SIZE(R2)	; Store size for deallocation.
+	ADDL	#12,R2			; Point to string storage area
+	MOVL	R2,R8			; Make copy for return
+	MOVZWL	STR_OFF(R7),R1		; Get self-relative offset
+	ADDL	R7,R1			; Make it a pointer
+	MOVZWL	STR_LNG(R7),R7		; Get size for return
+	MOVC3	R7,(R1),(R8)		; Move the string
+	MOVL	#1,R0			; Set success
+190$:	RSB
+
+
+;+
+; CNF$PUT_FLD_EX - External insert CNF field
+; CNF$PUT_FIELD  - Internal insert CNF field
+;
+;
+; INPUTS:	R11	Address of CNR
+;		R10	Address of CNF
+;		R9	FLD # in bits 0:15, Mask I.D. in bits 16:23
+;		R8	Parameter value if type byte, word, or longword
+;			Pointer to string if type string
+;		R7	Size of string if type string
+;		R0	Error code to be returned upon failure
+;
+; OUTPUTS:	R0	Low bit set if successful
+;			Unchanged otherwise (0 if entered with LBS)
+;
+;-
+CNF$PUT_FLD_EX::			; Store CNF field
+	PUSHL	W^NET$GL_FLAGS		; Save current flags
+	BICW	#NET$M_INTRNL,-		;
+		    W^NET$GL_FLAGS	; Indicate external access
+	BRB	PUTFLD_1		; No pre-set error code
+
+CNF$PUT_FIELD::				; Store CNF field
+	PUSHL	W^NET$GL_FLAGS		; Save current flags
+	BISW	#NET$M_INTRNL,-		; Indicate external access
+		    W^NET$GL_FLAGS	;
+	BLBC	R0,PUTFLD_1		; Br if valid error code
+PUTFLD:	CLRL	R0			; No pre-set error code
+PUTFLD_1:
+	BICW	#NET$M_READ,-		; Indicate write access
+		    W^NET$GL_FLAGS	;
+	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save regs
+	BSBW	GET_DSC			; Get description of field
+	BLBC	R0,40$			; If LBC then no field
+	MOVZWL	#SS$_WRITLCK,R0		; Assume action routine
+	BBS	#CNR$V_SEM_RT,(R3),40$	; Br unless "real" CNF field
+	ADDL3	R10,R4,R1		; Get pointer to parameter
+	BSBB	PUT			; Store the field
+40$:	BLBS	R0,50$			; If LBS then success
+	TSTL	(SP)			; Has caller pre-set the error code?
+	BNEQ	60$			; If NEQ then yes
+50$:	MOVZWL	R0,(SP)			; Reset the return status
+60$:	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore regs, restore R0
+	POPL	W^NET$GL_FLAGS		; Restore flags
+	RSB
+;
+;  Put Field action routines
+;
+PUT:
+	EXTZV	#CNR$V_SEM_TYP,-	; Get parameter type
+		#CNR$S_SEM_TYP,(R3),R0	;
+	CMPL	R0,#CNR$C_SEM_STR	; String?
+	BNEQ	50$			; If NEQ no, br to check value range
+	CMPZV	#CNR$V_SEM_SMX,-	; Range check required?
+		#CNR$S_SEM_SMX,(R3),#0	;
+	BEQL	40$			; If EQL then no
+	CMPZV	#CNR$V_SEM_SMX,-	; String length within range?
+		#CNR$S_SEM_SMX,(R3),R7	;
+	BLSSU	80$			; If LSSU then out of range
+40$:	TSTL	R7			; Is string null?
+	BRB	70$			; Continue in commone
+50$:	CMPL	#CNR$C_SEM_L,R0		; Longword value ?
+	BEQL	60$			; If EQL skip range check
+	CMPZV	#CNR$V_SEM_MAX,-	; Range check required?
+		#CNR$S_SEM_MAX,(R3),#0	;
+	BEQL	60$			; If EQL then no
+	CMPZV	#CNR$V_SEM_MAX,-	; Within range?
+		#CNR$S_SEM_MAX,(R3),R8	;
+	BLSSU	80$			; If LSSU then param value too large
+60$:	TSTL	R8			; Is the value zero ?
+70$:	BNEQ	90$			; If not continue
+	BBS	#CNR$V_SEM_Z,(R3),90$	; If BS then zero is okay
+80$:	MOVZWL	#SS$_BADPARAM,R0	; Indicate bad parameter value
+	RSB				; Return status in R0
+
+90$:	$DISPATCH  R0,<-		; Dispatch by paramater type
+
+	    <CNR$C_SEM_BIT, 100$>,-	; Bit
+	    <CNR$C_SEM_B,   110$>,-	; Byte
+	    <CNR$C_SEM_W,   120$>,-	; Word
+	    <CNR$C_SEM_L,   130$>,-	; Longword
+	    <CNR$C_SEM_STR, 140$>,-	; String descriptor
+	>
+	BUG_CHECK NETNOSTATE,FATAL	; Bug if type is unknown
+100$:	SUBL	R10,R1			; Subtract out CNF address
+	INSV	R8,R1,#1,(R10)		; Insert bit value
+	BRB	150$			;
+110$:	MOVB	R8,(R1)			; Insert byte parameter
+	BRB	150$			;
+120$:	MOVW	R8,(R1)			; Insert word parameter
+	BRB	150$			;
+130$:	MOVL	R8,(R1)			; Insert longword parameter
+	BRB	150$			;
+140$:	BSBB	PUT_STR			; Insert the string
+	BLBC	R0,170$			; If LBC then didn't fit
+150$:	MOVB	#1,R0			; Indicate success
+	BBSS	R5,CNF$T_MASK(R10),170$	; Mark field valid
+170$:	RSB
+
+
+PUT_STR:				; Insert string into CNF block
+	;
+	;   If string is already active then subtract its size from 
+	;   CNF$W_SIZ_USED before storing the string.  Store the string and
+	;   update CNF$W_SIZ_USED and CNF$W_SIZ_FREE to account for storage
+	;   taken.
+	;
+	;   INPUTS:	R10 = CNF block pointer
+	;		R8  = Pointer to string
+	;		R7  = Length of string
+	;		R5  = Bit offset from CNF mask to field active flag
+	;		R1  = Address of CNF string descriptor
+	;		R0  = Scratch
+	;
+	;   OUTPUTS:	R1  = Garbage
+	;		R0  = SS$_NORMAL  if successful
+	;		      SS$_INSFMEM otherwise
+	;
+	PUSHR	#^M<R2,R3,R4,R5>	; Save regs
+	MOVZWL	#SS$_INSFMEM,R0		; Assume no space left
+	CMPW	R7,CNF$W_SIZ_FREE(R10)	; Enough free space left ?
+	BGTRU	10$			; If GTRU then no
+	MOVAB	CNF$W_OFF_FREE(R10),R3	; Prepare to calc. ptr
+	MOVZWL	(R3),R2			; Get offset to free space
+	ADDL2	R2,R3			; Calculate ptr to free space
+	ASSUME	STR_OFF EQ 0
+	SUBW3	R1,R3,STR_OFF(R1)	; Enter self-relative offset
+	BBC	R5,CNF$T_MASK(R10),5$	; If BC then field currently inactive
+	SUBW	STR_LNG(R1),-		; Adjust space used (note that we are
+		     CNF$W_SIZ_USED(R10); return it to CNF$W_SIZ_FREE)
+5$:	MOVW	R7,STR_LNG(R1)		; Enter string size
+	SUBW	R7,CNF$W_SIZ_FREE(R10)	; Account for space taken
+	ADDW	R7,CNF$W_SIZ_USED(R10)	; Account for space taken
+	ADDW	R7,CNF$W_OFF_FREE(R10)	; Advance free space offset
+	MOVC3	R7,(R8),(R3)		; Move it
+	MOVZBL	#SS$_NORMAL,R0		; Indicate success
+10$:	POPR	#^M<R2,R3,R4,R5>	; Restore regs
+	RSB
+
+;+
+; CNF$CLR_FLD_EX - External insert CNF field
+; CNF$CLR_FIELD  - Internal insert CNF field
+;
+; INPUTS:	R11	CNR pointer
+;		R10	CNF pointer (CNF$CLEAR only)
+;		R9	Field i.d.
+;
+; OUTPUTS:	R0	LBS if successful, LBC otherwise
+;
+;		All other registers are preserved.
+;-
+CNF$CLR_FLD_EX::			; Clear bit in CNF mask
+	PUSHL	W^NET$GL_FLAGS		; Save current flags
+	BICW	#NET$M_INTRNL,-		;
+		    W^NET$GL_FLAGS	; Indicate external access
+	BRB	CLRFLD
+
+CNF$CLR_FIELD::				; Clear CNF field
+	PUSHL	W^NET$GL_FLAGS		; Save current flags
+	BISW	#NET$M_INTRNL,-		; Indicate external access
+		    W^NET$GL_FLAGS	;
+CLRFLD:	BICW	#NET$M_READ,-		; Indicate write access
+		    W^NET$GL_FLAGS	;
+	BLBC	R0,5$			; Br if valid error code
+	CLRL	R0			; Else make it valid
+5$:	PUSHR	#^M<R0,R1,R2,R3,R4,R5>	; Save regs
+	BSBW	GET_DSC			; Get field semantics
+	BLBC	R0,10$			; Br if not defined
+	BBCC	R5,CNF$T_MASK(R10),10$	; Clear the bit
+	BBS	#CNR$V_SEM_RT,(R3),10$	; Br if "field" is an action routine
+	CMPZV	#CNR$V_SEM_TYP,-	; Is this a string field ?
+		#CNR$S_SEM_TYP,(R3),-	;
+		#CNR$C_SEM_STR		;
+	BNEQ	10$			; If NEQ no, we're done
+	EXTZV	#CNR$V_SEM_OFF,-	; Get offset from top of CNF to field
+		#CNR$S_SEM_OFF,(R3),R2	;
+	ADDL	R10,R2			; Make it a pointer
+	SUBW	STR_LNG(R2),-		; Update amount of space used
+		    CNF$W_SIZ_USED(R10)	; 
+10$:	BLBS	R0,20$			; If LBS then success
+	TSTL	(SP)			; Has caller pre-set the error code?
+	BNEQ	30$			; If NEQ then yes
+20$:	MOVZWL	R0,(SP)			; Reset the return status
+30$:	POPR	#^M<R0,R1,R2,R3,R4,R5>	; Restore regs
+	POPL	W^NET$GL_FLAGS		; Restore flags
+	RSB
+
+;+
+; CNF$GET_ADDR	- Get field address
+;
+; The CNF field address of the field specified in R9 is returned.
+;
+; INPUTS:	R11	CNR address
+;		R10	CNF address
+;		R9	Field i.d.
+;		R1	Scratch
+;		R0	Scratch
+;
+; OUTPUTS:	R1	Field address if R0 has LBS
+;		R0	Low bit set if field is set in the CNF
+;			Low bit clear if the field semantics are undefined, the
+;			field is not set, or if the "field" value must be found
+;			by calling an action routine.
+;
+;		All other registers are preserved.
+;-
+CNF$GET_ADDR::				; Get field address
+	PUSHR	#^M<R2,R3,R4,R5>	; Save regs
+	BSBW	GET_DSC_1		; Get field info
+	BLBC	R0,10$			; Br if undefined
+	MOVZWL	#SS$_DEVINACT,R0	;&(better code?) Assume action routine
+	BBS	#CNR$V_SEM_RT,(R3),10$	; Br if action routine
+	BBC	R5,CNF$T_MASK(R10),10$	; If BC then field is not set
+	INCL	R0			; Else indicate success
+	ADDL3	R10,R4,R1		; Get field address
+10$:	POPR	#^M<R2,R3,R4,R5>	; Save regs
+	RSB
+
+
+;+
+; CNF$VERIFY  - See if field semantics are defined
+;
+; INPUTS:	R11	CNR pointer
+;		R10	CNF pointer 
+;		R9	Field i.d.
+;
+; OUTPUTS:	R0	LBS if successful, LBC otherwise
+;
+;		All other registers are preserved.
+;-
+CNF$VERIFY::				; Are field semantics defined?
+	PUSHR	#^M<R1,R2,R3,R4,R5>	; Save critical regs
+	BSBW	GET_DSC_1		; Get field semantics
+10$:	POPR	#^M<R1,R2,R3,R4,R5>	; Restore regs
+	RSB
+
+;+
+; GET_DSC	- Get descriptor of CNF field and check access rights
+; GET_DSC_1	- Get descriptor of CNF field
+;
+; inputs:	R11  Address of CNR
+;		R9   FLD number in bits 0-15, mask id in bits 16-23
+;
+; outputs:	R11  Address of CNR
+;		R9   Unmodified
+;		R5   Bit offset from top of CNF mask vector to bit in R9
+;		R4   Byte offset from top of CNF to parameter or
+;		     pointer to action routine (depending upon semanitics)
+;		R3   Address of field semantics longword
+;		R0   LBS if successful
+;		     LBC otherwise
+;-
+GET_DSC:				; Get descriptor and check access rights
+	BSBB	GET_DSC_1		; Get the descriptor
+	BLBC	R0,50$			; Br on error
+	EXTZV	#CNR$V_SEM_ACC,-	; Get access protection
+		#CNR$S_SEM_ACC,(R3),R0	;
+	BBS	#NET$V_READ,-		; Br if read access is intended
+		     W^NET$GL_FLAGS,20$
+	;
+	;   Write access is intended.  The boolean equation for NOT allowing
+	;   write access is:
+	;			-W = RO + ER*(-INTRNL) + CW*LOCKED
+	;
+	CMPB	R0,#CNR$C_ACC_RO	; Read only ?
+	BEQL	60$			; If EQL no access permitted
+	CMPB	R0,#CNR$C_ACC_ER	; External read only ?
+	BNEQ	10$			; If NEQ then continue
+	BBC	#NET$V_INTRNL,-		; If BC then not internal access
+		     W^NET$GL_FLAGS,60$	;
+10$:	CMPB	R0,#CNR$C_ACC_CW	; Is field conditionally writeable?
+	BNEQ	30$			; If NEQ then access is allowed
+	BBC	#NET$V_CNFLCK,-		; If BC then okay to write the field
+		     W^NET$GL_FLAGS,30$	;
+	BRB	60$			; Else cannot write it
+	;
+	;   Read access intended.  The boolean equation for allowable read
+	;   access is:
+	;		R = -WO + WO*INTRNL + WO*BYPASS
+	;
+20$:	BBS	#NET$V_INTRNL,-		; Br if internally accessed
+		     W^NET$GL_FLAGS,30$	;
+	BBS	#NET$V_BYPASS,-		; Br if user has bypass privilege
+		     W^NET$GL_FLAGS,30$	;
+	CMPB	R0,#CNR$C_ACC_WO	; Is field "write-only"
+	BEQL	40$			; If EQL then no access allowed
+30$:	MOVB	#1,R0			; Set success
+	RSB				;
+
+40$:	CLRL	R0			; No read access allowed
+50$:	RSB				;
+
+60$:	MOVZWL	#SS$_WRITLCK,R0		; No write access allowed
+	RSB				;
+
+
+
+GET_DSC_1:
+	MOVZBL	CNR$B_TYPE(R11),R0	; Get database i.d.
+	CMPZV	#NFB$V_DB,#NFB$S_DB,R9,R0 ; Is if for this database ?
+	BNEQ	40$			; If NEQ then no
+
+	ASSUME	NFB$V_INX  EQ  0
+	ASSUME	NFB$S_INX  EQ  16
+
+	MOVZWL	R9,R5			; Get field index
+	MOVZWL	#SS$_BADPARAM,R0	;& (better code needed?) Assume error
+	CMPL	R5,CNR$W_MAX_INX(R11)	; Is it within range ?
+	BGTRU	50$			; If GTRU then out of range
+	MOVAL	CNR$T_SEM_TAB(R11)[R5],R3 ; Point to semantic longword
+	EXTZV	#CNR$V_SEM_OFF,-	; Get byte offset to field from
+		#CNR$S_SEM_OFF,(R3),R4	; top of CNF (or routine index)
+	BBC	#CNR$V_SEM_RT,(R3),30$	; Br if "field" is not a routine 
+	ADDL	R11,R4			; Get address of pointer to routine
+	MOVL	(R4),R4			; Get address of routine
+30$:	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+	RSB
+
+40$:	MOVZWL	#SS$_BADPARAM,R0	;& (better code needed?) Indicate error
+50$:	RSB
+
+
+.END
+

@@ -1,0 +1,380 @@
+%TITLE	'Network ACP Control Routines'
+MODULE	NCPRUNACP (IDENT = 'V03-000',
+		ADDRESSING_MODE(EXTERNAL=GENERAL),
+		ADDRESSING_MODE(NONEXTERNAL=GENERAL)) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+!
+
+!++
+! FACILITY:	Network Control Program (NCP)
+!
+! ABSTRACT:
+!
+!	This module contains the routines and data to start the network.
+!	Starting the network consists of creating the NETACP process and
+!	waiting for the acp to mount the net device.  Then the NML
+!	object is started as a detached process to receive the first
+!	connect.  There is also a routine here which can stop a
+!	partially configured network.
+!
+! ENVIRONMENT:	VAX/VMS Operating System
+!
+! AUTHOR:	Darrell Duffy	, CREATION DATE:  20-May-1980
+!
+! MODIFIED BY:
+!
+!	V005	TMH0005		Tim Halvorsen	01-Feb-1982
+!		Fix list of privileges needed to create NETACP to only
+!		those required to get it going.  OPER, DIAG and SYSPRV
+!		are not needed by NETACP since it once it gets going,
+!		it gives itself all the privileges.
+!
+!	V004	TMH0004		Tim Halvorsen	22-Jul-1981
+!		Remove DISMOUNT NETACP code.  Do not initiate NML as
+!		a detached process during network initialization, since
+!		we now can invoke NMLSHR directly without any need for
+!		logical links.  Use general addressing.
+!
+!	V003	TMH0003		Tim Halvorsen	22-Jun-1981
+!		Add additional quotas to NETACP process, to ensure
+!		reasonable working set quota.
+!
+!	V02-002	LMK0001		Len Kawell	18-Dec-1980
+!		Change list of required privileges.
+!
+!	V001	TMH0001		Tim Halvorsen	25-Sep-1980
+!		Change name of ACP to NETACP.EXE from NET.EXE
+!--
+
+%SBTTL	'Definitions'
+
+!
+! TABLE OF CONTENTS:
+!
+
+FORWARD ROUTINE
+	NCP$STARTNETACP		: NOVALUE,	! Start the network
+	NCP$CREACP		: NOVALUE,	! Create netacp process
+	NCP$CHKPRIVS		: NOVALUE	! Check privileges
+	;
+
+!
+! INCLUDE FILES:
+!
+
+LIBRARY 'SYS$LIBRARY:STARLET';
+LIBRARY 'LIB$:NCPLIBRY';
+LIBRARY 'LIB$:NMALIBRY';
+LIBRARY 'SHRLIB$:NET';
+
+!
+! EQUATED SYMBOLS:
+!
+
+LITERAL
+    NCP$C_SHOBFRSIZE = 200			! Size of buffer for show
+    ;						! return
+
+PSECT PLIT = $OWN$;				! Make these plit's writable
+						! so system services are happy
+
+BIND
+    NCP$Q_NETACPTRM  = ASCID ('SYS$NETACPTRM'),	! Device for acp sys io
+    NCP$Q_NETQUOTAS =				! Quota list for netacp
+	UPLIT BYTE
+	(
+	BYTE (PQL$_ASTLM), LONG (100),		! Ast limit
+	BYTE (PQL$_BIOLM), LONG (65535),	! Buffered i/o limit
+	BYTE (PQL$_DIOLM), LONG (100),		! Direct i/o limit
+	BYTE (PQL$_BYTLM), LONG (65535),	! Buffered byte limit
+	BYTE (PQL$_CPULM), LONG (0),		! Infinite CPU limit
+	BYTE (PQL$_FILLM), LONG (10),		! 10 open files at a time
+	BYTE (PQL$_TQELM), LONG (16),		! 16 timer requests at a time
+	BYTE (PQL$_PGFLQUOTA), LONG (2048),	! 2048 pages from paging file
+	BYTE (PQL$_WSQUOTA), LONG (250),	! Maximum working set size
+	BYTE (PQL$_LISTEND)
+	),
+    NCP$Q_NETDEV = ASCID ('_NET:'),		! Net device name
+    NCP$Q_PROBEDEV = ASCID (':::');		! Device to probe net with
+
+PSECT PLIT = $PLIT$;				! Make plit's nowrite again
+
+!
+! OWN STORAGE:
+!
+
+OWN
+    NCP$W_NETCHAN	: WORD,			! Place for channel to net
+    NCP$L_NETACPPID	: LONG,			! Place for pid of netacp
+    NCP$Q_IOSB		: BBLOCK [8];		! IO status block
+
+!
+! EXTERNAL REFERENCES:
+!
+
+EXTERNAL LITERAL
+	NCP$_NONET,			! No net device
+	NCP$_MOUCHK,			! Unable to tell if NETACP is mounted
+	NCP$_CREACP,			! Error creating netacp process
+	NCP$_ACPMOU,			! Error during mount of net device
+	NCP$_INSFPRV			! Insufficient privileges
+	;
+
+%SBTTL	'NCP$STARTNETACP  Start the Network'
+GLOBAL ROUTINE NCP$STARTNETACP :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Check to see if the NET device is mounted.  If so then just return.
+!	If it is not mounted.  Then create the ACP process, and spin for
+!	upto 30 seconds waiting for it to mount.  When the acp mounts itself,
+!	Create a detached process running NML to receive the first connect
+!	from NCP.  Remember that at this stage the acp does not know any
+!	objects or anything else so we are bootstrapping the network.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Errors signaled
+!
+! SIDE EFFECTS:
+!
+!	Network acp and nml running
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	STATUS				! Some local status
+	;
+
+    STATUS = $ASSIGN			! See if net is viable
+	(
+	DEVNAM = NCP$Q_NETDEV,		! Net device name
+	CHAN = NCP$W_NETCHAN		! Place for the channel
+	);
+
+    IF NOT .STATUS			! If that failed
+    THEN
+	SIGNAL_STOP (NCP$_NONET, 0, .STATUS)
+    ;
+
+    STATUS = $QIOW			! Do a bogus connect to see if the
+	(				! netacp is alive and well
+	CHAN = .NCP$W_NETCHAN,		! The channel
+	FUNC = IO$_ACCESS,		! Create a logical link
+	IOSB = NCP$Q_IOSB,		! Return status here
+	P2 = NCP$Q_PROBEDEV		! Invalid node name
+	);
+
+    $DASSGN (CHAN = .NCP$W_NETCHAN);	! Drop net channel
+
+    IF .STATUS				! If qio status is ok, use IOSB status
+    THEN
+	STATUS = .NCP$Q_IOSB [0, 0, 16, 0] ! First word of iosb
+    ;
+    IF .STATUS NEQ SS$_IVDEVNAM		! Is the netacp mounted, this is
+    THEN				! the expected return
+	BEGIN
+	IF .STATUS NEQ SS$_DEVNOTMOUNT	! If something else is wrong with net
+	THEN
+	    SIGNAL (NCP$_MOUCHK, 0, .STATUS) ! we cannot handle it,
+	ELSE			     	! suggest connecting the driver
+	    NCP$CREACP ()		! Start the acp
+	END;
+
+    END;
+
+%SBTTL	'NCP$CREACP  Create the NETACP Process'
+ROUTINE NCP$CREACP :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Create the acp process and wait for it to mount.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	NONE
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	STATUS
+	;
+
+    NCP$CHKPRIVS ();			! Check for adaquate privileges
+
+    STATUS = $CREPRC			! Create the NETACP process
+	(
+	PIDADR = NCP$L_NETACPPID,	! Place for the pid
+	IMAGE = ASCID ('SYS$SYSTEM:NETACP'), ! The image name
+	INPUT = NCP$Q_NETACPTRM,	! Process wide I/O
+	OUTPUT = NCP$Q_NETACPTRM,
+	ERROR = NCP$Q_NETACPTRM,
+	PRVADR = UPLIT (-1, -1),	! Every privilege that it can have
+	QUOTA = NCP$Q_NETQUOTAS,	! The special quota list
+	PRCNAM = ASCID ('NETACP'),	! The name of the network acp
+	BASPRI = 8,			! Expect it to run at high priority
+	UIC = 1^16 OR 3,		! [1,3] for a uic, to detach it
+	STSFLG = 0
+	);
+
+    IF NOT .STATUS			! Check for immediate error
+    THEN
+	SIGNAL_STOP (NCP$_CREACP, 0, .STATUS)
+    ;
+
+    DECRU CTR FROM 30 TO 1		! Watch for 30 seconds for mount
+    DO
+	BEGIN
+	IF  (
+	    (
+	    STATUS = $ASSIGN		! Try assign channel to check mount
+		(
+		DEVNAM = NCP$Q_PROBEDEV, ! Bad device for network (:::)
+		CHAN = NCP$W_NETCHAN	! Place for channel
+		)
+	    )
+	    NEQ
+	    SS$_DEVNOTMOUNT		! Wait for anything else
+	    )
+	    OR
+	    NOT $SETIMR			! Wait for one second
+		(
+		EFN = 1,
+		DAYTIM = UPLIT (- 1*10*1000*1000, -1)
+		)
+	THEN
+	    EXITLOOP			! out on any error
+	;
+	$WAITFR (EFN = 1)		! Wait for time up
+	END
+    ;
+
+    IF .STATUS NEQ SS$_IVDEVNAM		! Check for success
+    THEN
+	SIGNAL_STOP (NCP$_ACPMOU, 0, .STATUS)
+    ;
+    $DASSGN (CHAN = .NCP$W_NETCHAN)	! Deassign channel
+
+    END;
+
+%SBTTL	'NCP$CHKPRIVS  Check for Appropriate Privileges'
+ROUTINE NCP$CHKPRIVS :NOVALUE =
+
+!++
+! FUNCTIONAL DESCRIPTION:
+!
+!	Check for appropriate privileges to create NETACP or NML.
+!	Signal an error if insufficient.
+!
+! FORMAL PARAMETERS:
+!
+!	NONE
+!
+! IMPLICIT INPUTS:
+!
+!	Process privileges
+!
+! IMPLICIT OUTPUTS:
+!
+!	NONE
+!
+! ROUTINE VALUE:
+! COMPLETION CODES:
+!
+!	Signal if insufficient privileges
+!
+! SIDE EFFECTS:
+!
+!	NONE
+!
+!--
+
+    BEGIN
+
+    LOCAL
+	PRVMSK : BBLOCK [8]			! Hold the privilege mask
+	;
+
+    $SETPRV					! Obtain the current priv mask
+	(
+	PRMFLG = 1,
+	PRVPRV = PRVMSK
+	);
+
+    IF						! Do we have enough privs
+	NOT
+	(
+	(
+	.PRVMSK [PRV$V_DETACH] AND		! Create NETACP process
+	.PRVMSK [PRV$V_CMKRNL]			! Gets NETACP into kernel mode
+	)
+	OR
+	.PRVMSK [PRV$V_SETPRV]			! All powerful
+	)
+    THEN
+	SIGNAL_STOP (NCP$_INSFPRV)		! User is not cool enough
+
+    END;
+
+END				!End of module
+ELUDOM

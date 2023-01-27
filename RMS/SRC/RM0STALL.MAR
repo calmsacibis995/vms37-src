@@ -1,0 +1,800 @@
+	$BEGIN	RM0STALL,023,$RMSZ,<STALL FOR I/O COMPLETION>,<NOWRT,QUAD>
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; Facility: rms32
+;
+; Abstract:
+;		this module includes the various routines to
+;		handle required i/o stalls and the restarting
+;		of a thread upon i/o completion.
+;
+; Environment:
+;		star processor running starlet exec.
+;
+; Author: l f laverdure,	 creation date: 4-FEB-1977
+;
+; Modified By:
+;
+;	V02-023	CDS0001		C Saether		 9-Dec-1981
+;		Add RM$BLKFINCHK to check for AST's inhibited.  This
+;		is used by the deferred writeback completion routine.
+;
+;	V02-022	TMK0017		Todd M. Katz		12-Nov-1981
+;		When RMS must stall waiting for I/O to complete or a 
+;		file/record lock to be released, the RMS_STALL bit within
+;		the IFAB/IRAB is set. When the I/O completes or the lock is
+;		released, and RMS recieves control back at RM$THREADGO,
+;		this same bit is cleared as RMS's thread is no longer stalled.
+;		NOTE: Just because RMS's thread is stalled does not 
+;		necessairly mean that the user is stalled as he/she may 
+;		have requested asynchronous I/O, and RMS may be stalled 
+;		waiting for I/O to complete. These bits will be used as
+;		sanity checks during RMS rundown so that the situation
+;		never arises that RMS is waiting for an I/O operation to
+;		complete which does not exist.
+;
+;	V02-021	KDM0037		Kathleen D. Morse	12-Feb-1981
+;		Change non-kernel mode references to SCH$GL_CURPCB
+;		to CTL$GL_PCB instead.
+;
+;	V02-020	REFORMAT	R Schaefer	23-Jul-1980	15:50
+;		Reformat the source.
+;
+;	V019	CDS0055		C D Saether	20-NOV-1979	19:40
+;		don't bugcheck when user structure has disappeared
+;		during stall - just point r8 at asb
+;
+;	V018	DMB0001		D M Bousquet	30-MAR-1979	 9:50
+;		init event flag field for file sharing operations
+;
+;	V017	RAN0014		R A Newell	12-MAR-1979	 8:40
+;		clear async bit for ifab operation in appropriate place.
+;
+;	V016	CDS0001		C D Saether	22-FEB-1979	17:30
+;		always clear async when ifab operation
+;
+;	V015	LFL0001 	L F Laverdure	14-FEB-1979	17:30
+;		file sharing mod for 0 frb$l_sifab_ptr
+;
+;	V014	RAN0003		R A Newell	20-DEC-1978	9:45
+;		file sharing code enhancements
+;
+;--
+;
+
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+
+;
+; Macros:
+;
+
+	$CMKRNLDEF			; change mode to kernel argument defs
+	$SETEFDEF			; system service $setef definitions
+	$FRBDEF				; file resource block definitions
+	$SIFBDEF
+	$IFBDEF
+	$IRBDEF
+	$ASBDEF
+	$FABDEF
+	$RABDEF
+	$BDBDEF
+	$PIODEF
+	$IMPDEF
+	$RMSDEF
+
+;
+; equated symbols
+;
+
+	BKP=IRB$L_BKPBITS*8		; bit offset to bookkeeping bits
+
+	.SBTTL	RM$STALL - STALL FOR I/O COMPLETION ROUTINE
+
+;++
+; RM$STALL:	  stall for I/O completion routine
+; RM$STALL_SIFAB: alternate entry point for stall for sifab
+; RM$ENBAST:	  re-enable ASTs
+;
+; this routine is called whenever a stream must stall for either an i/o
+; completion or for access to the shared file database (or part thereof).
+;
+; this routine first checks if the stalling stream is for a shared file
+; and if so, the shared ifab is released.  next it checks to see whether
+; an asb (asynchronous context block) exists, and if not, the stalling stream
+; is for a fab function, and it allocates an asb, saving its address in the
+; ifab.
+; if this is an asychronous rab operation, copies the argument list into
+; the asb, changes the arglist pointer to point to the saved copy, and sets
+; the status code to rms$_pending.
+; if not an asychronous rab operation, sets the status code to rms$_stall.
+;
+; the routine then saves registers r4 thru r11, the stack along
+; with the return pc, and the stack size in the asb.
+;
+; finally the routine checks for running at exec ast level,
+; and if so, merely returns (i.e., it exits from the ast), otherwise
+; it re-enables asts, sets the status code into r0, and returns to the
+; rms user possibly waiting at user's access mode).
+;
+;	return sequence depends upon following registers not being
+;	destroyed by the return thru the change mode dispatcher to
+;	the rms synchronization code:
+;
+;		r8	structure address
+;		r4	$wait type flag (0=same rab, 1=different rab)
+;		r3	efn to synchronize on
+;
+; Calling sequence:
+;
+;	BSBW	RM$STALL
+;
+; Input Parameters:
+;
+;	r11	impure area address
+;	r10	ifab address if r9 is an irab address
+;	r9	ifab/irab address
+;
+; Implicit Inputs:
+;
+; the contents of the ifab/irab and impure area.
+;
+; Output Parameters:
+;
+; this routine does not return directly to the caller,
+; exiting from rms instead. return occurs via the routine
+; rm$stallast, which is entered via the ast signaling the
+; completion of the i/o being awaited by rm$stall. upon
+; return to the caller his entire context with the exception of
+; r0 thru r3 and ap is restored.
+;
+; Implicit Outputs:
+;
+;	an asb is allocated, if required, and filled in.
+;	the rms event flag may be cleared.
+;
+; Completion Codes:
+;
+;	if returning to caller of rms, r0 will be set to
+; 	either rms$_pending (async) of rms$_stall (sync).
+;	if rms$_stall, this code is intercepted by rms
+;	code running in the caller's mode which awaits the
+;	completion of the rms operation.
+;
+;	if exiting from an ast, r0 is undefined.
+;
+; Side Effects:
+;
+; rms asts are reenabled.
+;
+;--
+
+
+
+;++
+;  note: the following code is not an entry point into this routine
+;
+;  must allocate an asb for a stalled fab operation.
+;  first check for release of sifab.
+;  point r11 to pio segment so that if a free page is requred it will be
+;  allocated there.
+;--
+
+STALLAL:
+	$TSTPT	STALLAL
+	PUSHL	R11			; save impure area addr
+	MOVAL	@#PIO$GW_PIOIMPA,R11	; point to process i/o segment
+	MOVL	R11,R1			; allocate space in control page
+	MOVZBL	#ASB$C_BLN_FAB/4,R2	; size required
+	BSBW	RM$GETBLK		; go allocate space (r1=addr)
+	MOVL	(SP)+,R11		; restore impure area addr
+	BLBC	R0,ERRDME
+	MOVL	R1,R2			; copy address to right reg
+	MOVL	R1,IFB$L_ASBADDR(R9)	; save the asb address
+	BRB	SYNCOP			; join sync operation code
+
+;
+; couldn't allocate space for an asb
+;
+
+ERRDME:	RMSTBUG	FTL$_ASBALLFAIL
+
+;
+; save arglist for async rab operation (first stall only)
+;
+
+ASYNCOP:
+	MOVL	IRB$L_ARGLST(R9),AP	; restore arglist addr
+
+;
+; (note: already probed)
+;
+
+	MOVZBL	(AP),R1			; get arg count
+	CMPB	R1,#3			; at most 3
+	BLEQU	5$			; branch if o.k.
+	MOVL	#3,R1			; so we cut back to 3
+5$:	MOVL	R2,IRB$L_ARGLST(R9)	; point to saved arg list
+10$:	MOVL	(AP)+,(R2)+		; copy arglist
+	SOBGEQ	R1,10$
+	MOVL	#RMS$_PENDING,AP	; async status code
+	MOVL	IRB$L_ASBADDR(R9),R2	; restore asb address
+	BRB	CTXSAV
+
+
+;++
+;
+;  alternate entry point for stall for sifab
+;
+;--
+
+RM$STALL_SIFAB::
+	$TSTPT	STALLSIFB		;
+	MOVQ	R4,-(SP)		; save r4,r5
+	BSBW	RM$SETEFN		; initialize event flag field
+	POPR	#^M<R0>			; get efn off stack
+	BRB	CHKASB			; check for asb
+
+;++
+;
+;  entry point for this routine
+;
+;--
+
+RM$STALL::
+	$TSTPT	STALL
+	MOVQ	R4,-(SP)		; save r4,r5
+
+;
+;  check for release of shared file sifab.
+;
+
+	ASSUME	<IFB$C_BID&1> EQ 1
+	ASSUME	<IRB$C_BID&1> EQ 0
+	ASSUME	IFB$B_BID EQ IRB$B_BID
+	BLBC	IRB$B_BID(R9),2$	; branch if an irab
+	MOVL	IFB$L_FRB_PTR(R9),R5	; get frb addr from ifab
+	BRB	4$			; continue
+2$:	MOVL	IFB$L_FRB_PTR(R10),R5	; get frb address
+4$:	BEQL	CHKASB			; branch if none
+	BSBW	RM$RLS_SIFAB		; go release sifab
+CHKASB:	MOVL	IFB$L_ASBADDR(R9),R2	; get asb address
+	BNEQ	10$			; continue if we have one
+	BRW	STALLAL			; stallal if we don't
+10$:
+
+;
+; check for asynchronous rab operation and if so copy arglist into the asb
+;
+
+	ASSUME	IMP$W_RMSSTATUS EQ 0
+	BBS	#IMP$V_AST,(R11),CTXSAV	; branch if at ast level
+	ASSUME	IFB$V_ASYNC EQ IRB$V_ASYNC
+	BBS	#IRB$V_ASYNC,(R9),ASYNCOP ; branch if async operation
+
+;
+; synchronous operation first stall  -  set stall i/o status code
+;
+
+SYNCOP:	RMSSUC	STALL,AP		; i/o stall status code
+
+;
+; save stack size, registers, and stack (including return pc)
+;
+
+CTXSAV:	SUBL3	SP,IMP$L_SAVED_SP(R11),R0; get stack size
+
+	.IF	NE $$RMSTEST&$$RMS_TBUGCHK
+
+;
+;  verify stack fits into asb
+;
+
+	ASSUME	IRB$C_BID&1 EQ 0
+	ASSUME	IFB$C_BID&1 EQ 1
+	ASSUME	IRB$B_BID EQ IFB$B_BID
+	BLBC	IRB$B_BID(R9),10$	; branch if struct is irab
+	CMPL	R0,#<ASB$C_BLN_FAB-16-<5*4>> ; does stack fit?
+	BRB	20$			; continue test below
+10$:	MOVAB	ASB$L_REGS+<5*4>(R2)[R0],R1 ; compute end addr stack save area
+	CMPL	R1,R9			; must be leq irab addr since
+
+;
+; asb immediately preceeds it
+;
+
+20$:	BGTRU	ERRBUG			; branch if bad
+
+	.ENDC
+
+	MOVB	R0,ASB$B_STKSIZ(R2)	; save the size
+	ADDL2	#ASB$L_REGS,R2		; move past arg list
+	MOVL	R6,(R2)+		; save r6
+	MOVQ	R7,(R2)+		; save r7 & r8
+
+;
+; note: r9 saved as ast parameter
+;
+
+	MOVQ	R10,(R2)+		; save r10 & r11
+	MOVC3	R0,(SP),(R2)		; copy the stack including
+
+;
+; set the bit in the IFAB/IRAB which indicates that this RMS thread is
+; currently stalled. This bit is cleared within RM$STALLAST, when the
+; stalled RMS thread resumes.
+;
+
+	ASSUME	IFB$V_RMS_STALL EQ IRB$V_RMS_STALL
+	SSB	#IFB$V_RMS_STALL,(R9)	; set rms stall bit in IRAB/IFAB
+
+;
+; if really there (just return)
+;
+
+	BBSC	#IMP$V_AST,(R11),RETURN	; clear at ast level and branch
+	BBS	#IRB$V_ASYNC,(R9),30$	; branch if asynchronous i/o
+	ASSUME	IRB$B_EFN EQ IFB$B_EFN
+	MOVZBL	IRB$B_EFN(R9),R3	; set event flag on which to wait
+	BNEQ	30$			; branch if non-zero (not rah/wbh)
+	ASSUME	IFB$V_ASYNC EQ IRB$V_ASYNC
+	ASSUME	IFB$V_ASYNCWAIT EQ IRB$V_ASYNCWAIT
+	BISB2	#<1@<IRB$V_ASYNC-BKP>>!<1@<IRB$V_ASYNCWAIT-BKP>>,-
+		IRB$L_BKPBITS(R9)	; show waiting on async efn
+	MOVL	#IMP$C_ASYEFN,R3	; and wait on it
+30$:
+
+;++
+;
+;  at non-ast level  -  re-enable asts
+;  entry here from $wait with ap=status, r8=rab address, r4=$wait type flag,
+;			      r3=efn
+;--
+
+RM$ENBAST::
+	BBCC	#PIO$V_INHAST,@#PIO$GW_STATUS,ENBAST ; clear ast inhibit
+
+;
+; branching if clear
+;
+
+SETSTS:	MOVL	AP,R0			; restore status code
+RETURN: RET				; exit rms
+ENBAST:	$SETAST_S	#1		; must re-enable asts
+	BRB	SETSTS
+
+;
+; not enough space in asb for stack
+;
+
+ERRBUG:	RMSTBUG	FTL$_STKTOOBIG
+
+	.SBTTL	RM$STALLAST - AST ENTRY POINT FOR I/O COMPLETE
+
+;++
+; RM$STALLAST:	AST entry point for I/O complete
+; RM$RAHWBHAST:	For read ahead/write behind via ast
+; RM$THREADGO:	With r9 already set (for multi buffering).
+; RM$STALL_SETEFN: Set the event flag for stalls incurred by file sharing code
+;
+; this routine is entered as a result of an ast delivery for i/o
+; completion.  its function is to restart the associated
+; thread which stalled as a result of calling rm$stall.  the
+; following processing is performed:
+;
+;	1. checks for asts inhibited, and if so disables asts,
+;	   redeclares the current ast, sets a flag to cause
+;	   asts to be re-enabled, and exits.
+;	2. otherwise, restores r9 (ifab or irab address) from
+;	   the ast parameter value, checking for a valid ifab
+;	   or irab.
+;	3. the asb address is retrieved and the saved
+;	   registers (r4-r11) and stack are restored.
+;	4. the user structure (fab or rab) is reprobed.
+;	5. the indicators imp$l_saved_sp and imp$v_ast are set
+;	   appropriately
+;	6. if this is a shared file, an ast block is allocated
+;	   for the frb, if needed, and the shared file resource
+;	   is retaken for the stream
+;	7. return is made to the routine that called rm$stall
+;	   with nearly full context restored (r0-r3 and ap are
+;	   destroyed, secondary user structures must be
+;	   reprobed, absolute stack addresses are different)
+;
+; Calling sequence:
+;
+;	entered at rm$stallast via an ast.
+;	alternate entry at rm$rahwbhast for read ahead/write behind via ast
+;	alternate entry at rm$threadgo with r9 already set (for multi buffering).
+;
+; Input Parameters:
+;
+;	astprm	- the ifab or irab address
+;	(for rm$rahwbhast astprm = bdb address)
+;
+; Implicit Inputs:
+;
+;	the contents of the ifab or irab and related structures.
+;
+; Output Parameters:
+;
+;	r4-r11	contents before stall
+;	sp	addr of stack having same contents as before stall
+;	pc	restored to return in line after call to rm$stall
+;	r1-r3,ap destroyed
+;	r0	set to contents of 1st word of i/o status block
+;
+; Implicit Outputs:
+;
+;	imp$v_ast		set
+;	imp$l_saved_sp		set appropriately for new stack
+;
+; Completion Codes:
+;
+;	none
+;
+; Side Effects:
+;
+;	running at ast level.
+;	secondary user structures require re-probing.
+;	absolute stack addresses different.
+;
+;--
+
+
+
+;++
+;
+; entry here via ast for rah/wbh io completion
+;
+;--
+
+	.ALIGN	QUAD
+	$ENTRY	RM$RAHWBHAST,^/^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>/
+
+	MOVL	4(AP),R4		; get bdb addr (astprm)
+	BBCS	#BDB$V_AST_DCL,BDB$B_FLGS(R4),10$; set i/o done, branching
+
+;
+; if no one waiting
+;
+
+	MOVL	BDB$L_WAIT(R4),4(AP)	; change astprm to irab
+	BRB	CHECKAST		; go join common code to restart
+
+;
+; stalled stream
+;
+
+10$:	RET				; dismiss ast
+
+;++
+;
+; entry here via normal i/o completion ast
+;
+;--
+
+	.ALIGN	QUAD
+	$ENTRY	RM$STALLAST,^/^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>/
+
+
+CHECKAST:
+	BSBW	RM$CHKAST		; check for asts inhibited
+
+;
+; (note this must be a bsbw and
+; must immediately follow the entry mask.)
+;
+
+RM$THREADGO::
+					; sets r9 = ifab or irab addr
+	$TSTPT	STALAST
+
+;
+; clear the bit within the IRAB/IFAB indicating that this thread of RMS is
+; stalled, as it no longer is, and allow it to continue
+;
+
+	ASSUME	IFB$V_RMS_STALL EQ IRB$V_RMS_STALL
+	CSB	#IFB$V_RMS_STALL,(R9)	; clear rms stall bit in IRAB/IFAB
+
+	ASSUME	IFB$L_ASBADDR EQ IRB$L_ASBADDR
+	MOVL	IFB$L_ASBADDR (R9),R1	; get asb addr
+
+	.IF	NE $$RMSTEST&$$RMS_TBUGCHK
+
+	BEQL	ERRASB			; error if none
+	ASSUME	IFB$V_BUSY EQ IRB$V_BUSY
+	BBC	#IRB$V_BUSY,(R9),ERRASB	; branch if stream not busy
+
+	.ENDC
+
+	MOVZBL	ASB$B_STKSIZ(R1),R0	; get size of stack
+	ADDL2	#ASB$L_REGS,R1		; move to register save area
+
+	MOVL	(R1)+,R6		; restore r6
+	MOVQ	(R1)+,R7		; restore r7/r8
+
+;
+; note r9 already restored
+;
+
+	MOVQ	(R1)+,R10		; restore r10/r11
+	MOVL	SP,IMP$L_SAVED_SP(R11)	; save stack entry value
+	SUBL2	R0,SP			; allocate required size
+	MOVC3	R0,(R1),(SP)		; copy stack including return pc
+	ASSUME	IMP$W_RMSSTATUS EQ 0
+	BISB2	#<1@IMP$V_AST>,(R11)	; set flag for at ast level
+
+;
+; reprobe user structure (user could have deleted it from ast or async operation)
+;
+
+	ASSUME	IFB$B_MODE EQ IRB$B_MODE
+	ASSUME	<IFB$C_BID&1> EQ 1
+	ASSUME	<IRB$C_BID&1> EQ 0
+	ASSUME	IFB$B_BID EQ IRB$B_BID
+
+	BLBS	IFB$B_BID(R9),IFB	; branch if ifab
+
+;
+; irab operation - check for shared file and if so, take shared ifab
+;
+
+	MOVL	IFB$L_FRB_PTR(R10),R5	; get frb address
+	BEQL	2$			; branch if none
+	BSBB	TAKE_SIFAB		; take the sifab
+2$:	ASSUME	IFB$B_MODE EQ IRB$B_MODE
+	IFNOWRT	#RAB$C_BLN,(R8),ERRSTRUCT,IRB$B_MODE(R9)
+
+;
+; branch if not writable
+;
+
+	ASSUME	RAB$C_BLN LE FAB$C_BLN	; (because of forced disconnect)
+	CMPB	RAB$B_BID(R8),#RAB$C_BID ; it must be a rab
+	BNEQ	CHKFAB			; branch if not
+
+;
+; (it could be a forced
+; disconnect, hence a fab)
+;
+
+;
+;  set r0 to status from i/o status block and return to thread
+;
+
+GETBACK:
+	MOVQ	(SP)+,R4		; restore r4 and r5
+	ASSUME	IRB$L_IOS EQ IFB$L_IOS
+	MOVZWL	IRB$L_IOS(R9),R0	; pick up i/o completion status
+	RSB				; restart thread
+
+;
+; ifab operation - check for shared file and if so, take shared ifab
+;
+
+IFB:
+	MOVL	IFB$L_FRB_PTR(R9),R5	; get frb address
+	BEQL	CHKFAB			; branch if none
+	BSBB	TAKE_SIFAB
+CHKFAB:	IFNOWRT	#FAB$C_BLN,(R8),ERRSTRUCT,IFB$B_MODE(R9)
+
+;
+; branch if not writeable
+;
+
+	CMPB	FAB$B_BID(R8),#FAB$C_BID; it must be a fab
+	BEQL	GETBACK			; branch if ok.
+
+;
+;  handle errors
+;
+
+;
+; the user has been playing funny games with memory
+;
+
+ERRSTRUCT:
+	ADDL3	#ASB$L_REGS,IFB$L_ASBADDR(R9),R8; point r8 into asb
+	ASSUME	<ASB$C_BLN_FAB - ASB$L_REGS> GE FAB$C_BLN
+	ASSUME	FAB$C_BLN GE RAB$C_BLN
+	PUSHR	#^M<R1,R2,R3>		; save regs clobbered by mov
+	MOVC5	#0,(SP),#0,#FAB$C_BLN,(R8) ; clear out fake fab/rab
+	POPR	#^M<R1,R2,R3>		; restore regs
+	BRB	GETBACK			; return to thread
+
+;
+; no asb found in ifab/irab or stream not busy
+;
+
+ERRASB:	RMSTBUG	FTL$_NOASB
+
+;
+; shared file restart after stall
+;
+;	r5 - frb address
+;
+;	if no astblk, allocate one.  if stream does not already own
+;	shared ifab, retake it.  (note:  may stall again).
+;
+
+TAKE_SIFAB:
+	MOVL	@#CTL$GL_PCB,R0		; get process' pcb addr
+	MOVL	PCB$L_PID(R0),FRB$L_PID(R5) ; set pid into frb
+	MOVAL	RM$STALLAST,FRB$L_ASTADDR(R5) ; set ast addr into frb
+	BBS	#FRB$V_QUE_STALL,FRB$B_FLAGS(R5),20$ ; wake up if in que_stall
+	MOVL	FRB$L_SIFAB_PTR(R5),R0	; get sifab address
+	BEQL	20$			; branch if none (open window)
+	CMPL	SIFB$L_FRB_FLNK(R0),R5	; do we own sifab?
+	BEQL	20$			; branch if yes
+	ASSUME	IRB$C_BID&1 EQ 0
+	ASSUME	IFB$C_BID&1 EQ 1
+	ASSUME	IFB$B_BID EQ IRB$B_BID
+	BLBC	IRB$B_BID(R9),15$	; branch if irab
+	BBS	#IFB$V_SIFB_OWND,(R9),20$ ; branch to omit retaking sifab
+
+;
+; if sifab implicitly owned
+; (for sfd stall in rms0close)
+;
+
+15$:	BSBW	RM$TAKE_SIFAB1		; go take the sifab
+20$:
+
+
+;++
+;
+;  subroutine to set the event flag for stalls incurred by file sharing code
+;
+;--
+
+RM$STALL_SETEFN::
+	ASSUME	SETEF$_NARGS EQ 1
+	ASSUME	IRB$V_ASYNC EQ IFB$V_ASYNC
+	ASSUME	IRB$B_EFN EQ IFB$B_EFN
+	BBS	#IRB$V_ASYNC,(R9),30$	; branch if asynchronous
+	MOVZBL	IRB$B_EFN(R9),-(SP)	; push efn onto stack
+	CALLS	#1,@#SYS$SETEF		; set event flag
+30$:	RSB				; return to caller
+
+	.SBTTL	RM$CHKAST - CHECK FOR ASTS INHIBITED
+
+;++
+; RM$CHKAST:	Check for ASTs inhibited
+; RM$BLKFINCHK:
+;
+; This routine checks for asts inhibited, and if so disables
+; asts, redeclares the current ast, clears the flag
+; pio$v_inhast to cause asts to be reenabled when the
+; active non-ast code exits, and exits.
+;
+; If asts are not disabled, sets r9 to the value of the
+; ast parameter and checks that it is a valid ifab of
+; irab address, and returns to the caller.
+;
+; The RM$BLKFINCHK entry point does not validate the AST parameter.
+;
+; calling sequence
+;
+;	BSBW	RM$CHKAST
+;	BSBW	RM$BLKFINCHK
+;
+;
+; Input Parameters:
+;
+;	ap	ast argument list address
+;
+; Implicit Inputs:
+;
+;	it is assumed that rm$chkast was called via bsbw as
+;	the first instruction of the ast routine.
+;
+; Output Parameters:
+;
+;	If return is made to caller,
+;	R9 = AST parameter, which is
+;		ifab or irab address for RM$CHKAST, or
+;		BLB address for RM$BLKFINCHK entry.
+;
+; Implicit outputs:
+;
+;	may requeue the ast if currently inhibited.
+;
+; Condition Codes:
+;
+;	none.
+;
+; Side Effects:
+;
+;	asts may be disabled.
+;
+;--
+
+	.ALIGN	QUAD
+
+RM$CHKAST::
+	MOVL	4(AP),R9		; get ifab/irab address
+	BBSC	#PIO$V_INHAST,@#PIO$GW_STATUS,DSBLAST ; branch if inhibited
+
+;
+; o.k. to receive ast
+; check r9 ifab or irab address for validity
+;
+
+	.IF	NE $$RMSTEST&$$RMS_TBUGCHK
+
+	ASSUME	IFB$B_BID EQ IRB$B_BID
+	CMPB	IRB$B_BID(R9),#IRB$C_BID; is it an irab?
+	BNEQ	20$			; branch if not
+10$:	RSB				; yes - return
+20$:	CMPB	IFB$B_BID(R9),#IFB$C_BID; then it must be an ifab?
+	BEQL	10$			; i knew i was right!
+	RMSTBUG	FTL$_BADASTPRM		; oops!
+
+	.IFF
+
+	RSB
+
+	.ENDC
+
+;
+; asts are inhibited
+; disable asts and redeclare the current ast
+;
+
+DSBLAST:
+	$TSTPT	ASTDSA
+	$SETAST_S	#0		; disable asts
+	SUBL3	#5,(SP)+,R1		; compute ast address
+
+;
+; (return pc - 3-byte bsw
+; - 2-byte entry mask)
+;
+
+	$DCLAST_S	ASTADR=(R1),ASTPRM=R9; re-declare the ast
+	BLBC	R0,ERRAST
+	RET				; and exit
+
+;
+; no space to declare an ast
+;
+
+ERRAST:	RMSTBUG	FTL$_CANTDOAST
+
+	.ALIGN	QUAD
+RM$BLKFINCHK::
+	MOVL	4(AP),R9		; get AST parameter.
+	BBSC	#PIO$V_INHAST,@#PIO$GW_STATUS,DSBLAST ; branch if inhibited
+	RSB				; Return to caller if not inhibited.
+
+	.END

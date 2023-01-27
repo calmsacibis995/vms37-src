@@ -1,0 +1,713 @@
+	.title	SYSGETMSG - Get message text from message code
+	.ident	'V03-004'
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;
+;   Author
+;
+;	Tim Halvorsen, Nov 1979
+;
+;   Modified by
+;
+;	V03-004	DWT0040		David Thiel		14-Apr-1982
+;		Temporarily remove check for fixup vector after
+;		activating image.  This avoids problems with message
+;		files linked as executables.
+;
+;	V03-003	DWT0037		David Thiel		5-Apr-1982
+;		Return a message even if a bad message section is
+;		found.
+;
+;	V03-002	DWT0035		David Thiel		31-Mar-1982
+;		Thoroughly probe all accesses to message sections
+;		against user mode.
+;
+;	V03-001	DWT0033		David Thiel	       25-Mar-1982
+;		Fix PROBEing problems and adapt to being an all-mode
+;		service.  Fix attempt to write a possibly read-only
+;		message section.  Start checking message sections.
+;
+;	V02-007	LJK0062		Lawrence J. Kenah	5-Oct-1981
+;		Add call to $IMGFIX_S after successful return from SYS$IMGACT
+;		to allow activation-time address relocation.
+;
+;	V02-006	TMH0006		Tim Halvorsen		13-Feb-1981
+;		Special case shared message number 0 (SS$_NORMAL)
+;		so that NOMSG is returned if the severity is anything
+;		other than zero.  This is so that when someone returns
+;		from an image with R0=0, a more appropriate message is
+;		displayed.
+;
+;	V02-005	TMH0005		Tim Halvorsen		30-May-1980
+;		Save R5 over binary search routine.
+;
+;---
+
+;
+;	Define system definitions
+;
+ 
+	$ssdef				; Define system status values
+	$stsdef				; Define format of a message code
+	$psldef				; Processor status longword definitions
+	$plvdef				; Privileged vector format
+	$mscdef				; Message section format
+	$midxdef			; Message index format
+	$mrecdef			; Message definition record
+	$mfacdef			; Facility definition record
+	$opdef				; Opcode definitions
+	$iacdef				; Image activator flags
+
+;
+; Argument list offset definitions
+; (5 arguments to system service)
+; 
+	msgid	= 4			; Message code to retrieve
+	msglen	= 8			; Address to store message length
+	bufadr	= 12			; Address of buffer descriptor
+	flags	= 16			; Flags for selection of:
+	 txtind	= 0			; Include text portion
+	 idind	= 1			; Include ID portion of message
+	 sevind	= 2			; Include severity portion
+	 subind = 3			; Include subsystem name
+	outadr	= 20			; Place to store longword with:
+	 level	= 0			; Detail level of message
+	 faoarg	= 1			; Number of FAO arguments
+	 user	= 2			; User defined value
+
+;
+; Opcode definitions for code interpreter
+;
+at_r5_mode	= ^X65			; Mode is (r5)
+absolute_mode	= ^X9F			; Mode is @#
+jsb_absolute	= <absolute_mode@8> ! op$_jsb	; Beginning of JSB @#...
+jsb_r5		= <at_r5_mode@8> ! op$_jsb	; JSB (R5)
+;
+; Local data
+;
+
+	.PSECT	YEXEPAGED,BYTE		; Paged PSECT
+;
+; Default message if not found (ss$_msgnotfnd)
+;
+
+dfac:	.ascic	'NONAME'		; Facility if not found
+dident:	.ascii	'NOMSG'			; Ident if not found
+didentlen = .-dident
+dmsg:	.ascic	'Message number !XL'
+
+fakereclen = 80				; # bytes for fake message record
+					; if message not found
+inddefnam:
+	.ascic	'SYS$MESSAGE:.EXE'	; Default name string for IND
+ 
+;
+; Severity table
+;
+sevtab:	.ascii	'W'			; Warning
+	.ascii	'S'			; Success
+	.ascii	'E'			; Error
+	.ascii	'I'			; Informational
+	.ascii	'F'			; Fatal error
+	.ascii	'?'
+	.ascii	'?'
+	.ascii	'?'
+
+	.sbttl	Get message
+;---
+;
+; This service provides the capability to retrieve message text from
+; the system message file.
+;
+; Inputs:
+;
+;	msgid(ap)  = Message code of message to be retrieved.
+;	msglen(ap) = Address to store length of result message.
+;	bufadr(ap) = Address of message buffer descriptor.
+;	flags(ap)  = Input flags indicating parts of message wanted.
+;	outadr(ap) = Address to store message associated information.
+;
+; Outputs:
+;
+;	r0 = ss$_normal		- Normal completion.
+;	r0 = ss$_accvio		- Access violation
+;	r0 = ss$_msgnotfnd	- Message not in file, default message given
+;	r0 = ss$_bufferovf	- Output buffer too small for message
+;
+; This is an all-mode service.  Therefore, arguments are not checked to
+; prevent access violations; rather, an exception handler turns these into
+; the appropriate return status.
+; Further, this service does not assume valid message vectors.  Since
+; message vector entries must be available to user mode calls to $GETMSG,
+; all accesses to message vectors are probed against user mode.
+;
+;---
+ 
+exe$getmsg::
+	.word	^m<r2,r3,r4,r5,r6,r7,r8,r9,r10,r11>
+
+;
+;	This is an all-mode service, so arguments are not PROBEd and access
+;	violations can happen.
+;
+	movab	g^exe$sigtoret,(fp)	; Establish handler
+
+;
+;	Preset section address for emit_facility in case no sections found.
+;
+	clrl	r11			; Preset section address to zero
+;
+;	If the message is SS$_NORMAL and the severity is anything but 1,
+;	then output NOMSG rather than "normal successful completion".
+;
+	cmpzv	#sts$v_cond_id,#sts$s_cond_id,msgid(ap),#0 ; SS$_NORMAL?
+	bneq	5$			; branch if not
+	cmpzv	#sts$v_severity,#sts$s_severity,msgid(ap),#sts$k_success
+	bneq	20$			; if not SS$_NORMAL(S), issue NOMSG
+
+;
+;	Search all message sections in the current image
+;
+5$:	movl	g^ctl$gl_getmsg,r0	; Address of message vector
+6$:	cmpw	(r0)+,#jsb_absolute	; Expect JSB @#
+	bneq	8$			; Something else
+	movl	(r0)+,r8		; Address of JSB @# target
+	pushl	r0			; Save search context
+	bsbb	search_vector		; Do search
+					;  returns only if not found
+	popl	r0			; Get back simulated PC
+	brb	6$			; Iterate until RSB
+
+8$:	cmpb	-2(r0),#op$_rsb		; RSB signals end of list
+	bneq	badsec0			; Bad vector
+	
+;
+;	Search all process permanent message sections
+;
+	movl	g^ctl$gl_ppmsg,r8	; Get address of proc. perm. section
+	beql	10$			; branch if none
+	movab	plv$l_msgdsp+6(r8),r8	; Simulated PC
+	bsbb	search_vector		; Search the vector
+					; returns only if not found
+;
+;	Search the system-wide message section in system space
+;
+10$:	movl	g^exe$gl_sysmsg,r8	; Get address of system-wide section
+	beql	20$			; branch if none
+	movab	plv$l_msgdsp+6(r8),r8	; Simulated PC
+	bsbb	search_vector		; Search the vector
+					; returns only if not found
+20$:
+
+;
+;	The message was not found in any message sections.  Return
+;	a default message which says that no message was found and
+;	gives the actual message code.
+;	R11 = address of message section containing facility name
+;
+nomsg:	movab	-fakereclen(sp),sp	; Allocate fake mrec buffer
+	movl	sp,r9			; r9 = Address of fake message record
+	clrq	mrec$b_type(r9)		; clear next 8 bytes of record
+	movb	#didentlen,mrec$b_identlen(r9)	; Set length of ident string
+	movc	#didentlen,dident,mrec$t_ident(r9) ; sets r3 for later use
+	pushab	mrec$c_fixedlen+didentlen+2(r9)	; Descriptor of text portion
+	movzbl	#fakereclen-mrec$c_fixedlen-didentlen-2,-(sp)
+	movab	dmsg,r1
+	movzbl	(r1)+,r0
+	movq	r0,-(sp)		; Descriptor of FAO control string
+	pushl	msgid(ap)		; Entire message code
+	pushab	3*4(sp)			; Address to return length
+	pushl	(sp)			; Address of buffer descriptor
+	pushab	3*4(sp)			; Address of default message string
+	calls	#6,g^sys$fao		; Create text of message
+	movb	(sp),(r3)+		; Move count byte of message text
+					; (actual text already there from fao)
+	bsbw	output_info		; Output the information
+					; using r11 as last section searched
+	movzwl	#ss$_msgnotfnd,r0	; return 'not found' status (success)
+	ret				; Exit with status
+
+badsec0:				; Problem with message vector
+	brb	badsec			; Assist with long branch
+
+	.sbttl	search_vector, Search a given message vector
+;---
+;
+;	This routine is called by the dispatch code in a message
+;	vector.  This may be called multiple times if there is
+;	more than one image section in the program region.
+;
+; Inputs:
+;
+;	r8 = Address of message section JSB (R5)
+;	(sp) = Return address
+;
+; Outputs:
+;
+;	None
+;
+;	Return via RSB if not found, RET if found.
+;---
+
+search_vector:
+	ifnord	#2,(r8),badsec,#psl$c_user ; branch if unable to read next address
+	cmpw	(r8)+,#jsb_r5		; Expect JSB (R5)
+	bneq	badsec			; Bad vector
+10$:	ifnord	#4,(r8),badsec,#psl$c_user ; branch if unable to read next address
+	movl	(r8)+,r0		; Get self-relative offset value
+	beql	90$			; branch if end of list
+	movab	-4(r8)[r0],r11		; Get address of next section to search
+	bsbb	search_section		; Search the section, RET if found
+	brb	10$			; and keep going until end of list
+90$:	rsb				; done with vector, message not found
+
+;
+;	Unable to read message vector address list
+;	or error activating message section image
+;
+badsec:	clrl	r11			; no message section
+	brb	nomsg			; output default message
+
+	.sbttl	search_section, Search a given message section
+;---
+;
+;	This subroutine searches a given message section for
+;	the specified message code.  If the code is found, the
+;	information is returned to the GETMSG caller and the
+;	service is exited.  If the message is not found, return
+;	via RSB.
+;
+; Inputs:
+;
+;	r11 = Address of message section to search
+;
+; Outputs:
+;
+;	None
+;
+;	RSB is message not found, RET if message found.
+;---
+	.enabl	lsb
+
+search_section:
+;
+;	Verify validity of message section
+;
+	ifnord	#msc$c_length,(r11),badsec,#psl$c_user	; Branch if cannot read header
+	cmpw	msc$w_sanity(r11),#msc$c_sanity	; Check if sanity word matches
+	bneq	badsec				; branch if illegal
+
+	assume	msc$c_msg eq 0
+	assume	msc$c_ind eq 1
+	case	msc$b_type(r11),type=b,<-	; case on section type
+		10$,-				; normal section
+		5$>				; indirect section
+	brb	badsec				; Illegal message section
+
+;
+;	Process indirect message sections.  The message section
+;	merely contains the name of the message file to be mapped
+;	into user space.  If the secion has already been mapped,
+;	then ignore the section completely.
+;
+5$:	bsbw	map_indirect			; map the indirect file
+	rsb
+;
+;	Process normal message sections.  Search the section
+;	for the desired message code.
+;
+10$:
+
+;
+;	Compute the message number to be searched for in
+;	the message sections
+;
+	movl	msgid(ap),r7			; get message code
+	bicl	#sts$m_control!sts$m_severity,r7 ; clear severity (0 in index)
+						; and control bits on top
+	bbs	#sts$v_fac_sp,r7,25$		; branch if facility specific
+	movzwl	r7,r7				; if not, use fac. 0 for search
+;
+;	Verify the validity of the primary subindex
+;
+25$:	movl	msc$l_index_off(r11),r10	; Get offset to primary index
+30$:	addl	r11,r10				; Get address of index
+	ifnord	#midx$c_length,(r10),badsec,#psl$c_user ; Must be user readable
+	movzwl	midx$w_size(r10),r6		; Length of index
+	movl	#psl$c_user,r3			; specify access mode to maximize
+	movl	r6,r1				; get length
+	movl	r10,r0				; get address of buffer
+	jsb	exe$prober			; test for read access
+	blbc	r0,badsec			; if lbc, no access
+	cmpb	midx$b_sanity(r10),#midx$c_sanity ; Check sanity byte
+	bneq	badsec				; branch if not valid
+;
+;	Search the index for the message code
+;
+	bsbw	binary_search			; Perform binary search
+	blbs	r1,40$				; branch if subindex pointer
+	blbs	r0,50$				; branch if found
+	rsb					; exit, message not found
+;
+;	If offset points to a subindex, then go off to that
+;	subindex regardless of whether the key was matched or
+;	not, and search it as this must be a higher level index.
+;
+40$:	bicl3	#1,r1,r10			; Compute offset to subindex
+	brb	30$				; and start over
+;
+;	Key found - return data
+;
+50$:	addl3	r1,r11,r9			; Address of MSG record
+	assume	mrec$b_identlen eq mrec$c_fixedlen
+	ifnord	#mrec$c_fixedlen+1,(r9),badsec,#psl$c_user	; branch if not readable
+	bsbb	output_info			; Output the information
+	movl	#1,r0				; success
+	ret
+
+	.sbttl	output_info, Return information to caller's buffer
+;---
+;
+;	This routine returns the information from a given
+;	message record to the caller's buffer.
+;
+; Inputs:
+;
+;	r9 = Address of message record (fixed part already probed)
+;	r11 = Address of message section
+;
+; Outputs:
+;
+;	Information is output
+;---
+	.enabl	lsb
+
+output_info:
+	movl	outadr(ap),r0			; Does user want assoc. info?
+	beql	60$				; branch if not
+	movl	mrec$b_level(r9),(r0)		; Move 4 byte fields
+;
+;	Initialize output buffer registers
+;
+60$:	movl	bufadr(ap),r0			; Get address of descriptor
+	movzwl	(r0),r6				; Get length of buffer
+	movl	4(r0),r3			; Get address of buffer
+;
+;	If flags argument zero, then use process default flags.
+;
+65$:	movzbl	flags(ap),r7			; get user flags
+	bneq	68$				; branch if non-zero
+	movzbl	g^ctl$gb_msgmask,r7		; if zero, use process flags
+;
+;	Special case when only text indicator is set (all others off).
+;	In this case, do not return any leading punctuation.
+;
+68$:	cmpl	r7,#1@txtind			; Only wants text?
+	beql	95$				; if so, skip all leading punc.
+	movzbl	#^a'%',r0			; Output a leading '%'
+	bsbb	put_char
+;
+;	Output facility name
+;
+	bbc	#subind,r7,70$			; Branch if don't want facility
+	bsbw	emit_facility			; Emit facility name
+	movzbl	#^a'-',r0			; Output a delimiter
+	bsbb	put_char
+;
+;	Output severity character
+;
+70$:	bbc	#sevind,r7,80$			; Branch if don't want severity
+	extzv	#sts$v_severity,#sts$s_severity,msgid(ap),r0 ; Get severity
+	movzbl	sevtab[r0],r0			; Get character corresp. to it
+	bsbb	put_char			; and output it
+	movzbl	#^a'-',r0			; Output a delimiter
+	bsbb	put_char
+;
+;	Output message identification name
+;
+80$:	bbc	#idind,r7,90$			; Branch if don't want ident
+	movab	mrec$b_identlen(r9),r1		; Address of ASCIC ident
+	bsbb	put_string
+	brb	92$				; skip adding and then removing
+						; the delimiter
+;
+;	Output the message text
+;
+90$:	decl	r3				; remove previous delimiter
+	incl	r6
+92$:	assume	txtind eq 0
+	blbc	r7,return_msglen		; Branch if don't want text
+	movzbl	#^a',',r0			; Output a comma
+	bsbb	put_char
+	movzbl	#^a' ',r0			; Output a space
+	bsbb	put_char
+95$:	movzbl	mrec$b_identlen(r9),r1		; Length of ident string
+	movab	mrec$t_ident(r9)[r1],r1		; Address of ASCIC text
+	bsbb	put_string			; Output it
+;
+;	Return length of string in buffer (r6)
+;
+return_msglen:
+	movl	msglen(ap),r1			; Result length desired?
+	beql	110$				; branch if not wanted
+	subw3	r6,@bufadr(ap),(r1)		; Return the length used
+110$:	rsb
+	.dsabl	lsb
+
+	.sbttl	put_char, Output a single character
+;---
+;
+;	Output a single character to the output buffer.
+;
+; Inputs:
+;
+;	r6 = Number of bytes left in buffer
+;	r3 = Address of next available byte in buffer
+;	r0 = Character to output
+;
+; Outputs:
+;
+;	r6 and r3 are updated.
+;	If buffer overflows, return via RET
+;---
+
+put_char:
+	tstl	r6			; Any room left in buffer?
+	bleq	bufovf			; branch if not
+	movb	r0,(r3)+		; Insert character in buffer
+	decl	r6			; and decrement space left
+	rsb
+
+	.sbttl	put_string, Output a string
+;---
+;
+;	Output a string to the output buffer.
+;
+; Inputs:
+;
+;	r6 = Number of bytes left in buffer
+;	r3 = Address of next available byte in buffer
+;	r1 = Address of counted string to be output
+;
+; Outputs:
+;
+;	r6 and r3 are updated.
+;	If buffer overflows, return via RET
+;---
+
+put_string:
+	ifnord	#1,(r1),badsec1,#psl$c_user ; Count must be accessible
+	movzbl	(r1)+,r0		; Get count field
+	ifnord	r0,(r1),badsec1,#psl$c_user ; Text must be accessible
+	cmpl	r0,r6			; Enough room in buffer?
+	bgtr	50$			; branch if not
+	subl	r0,r6			; Decrement space left
+	movc	r0,(r1),(r3)		; Move string into buffer
+	rsb
+
+50$:	movc	r6,(r1),(r3)		; overflow, only do what we can
+	clrl	r6			; and decrement length used
+
+bufovf:	bsbb	return_msglen		; return string length
+	movzwl	#ss$_bufferovf,r0	; set error status
+	ret				; and exit service
+
+badsec1:				; invalid message section
+	brw	badsec			; long branch
+
+	.sbttl	emit_facility, Emit the facility name
+;---
+;
+;	Output the facility name to the output buffer.
+;
+; Inputs:
+;
+;	msgid(ap) = Message code
+;	r11 = Address of message section (0 if none)
+;	r6/r3 = Descriptor of buffer space left
+;
+; Outputs:
+;
+;	r6/r3 are updated.
+;	r0-r2 destroyed.
+;	If buffer overflows, return via RET
+;---
+
+emit_facility:
+	pushr	#^m<r4,r5>		; save registers
+	tstl	r11			; any section found yet?
+	beql	20$			; branch if none at all
+	addl3	msc$l_fac_off(r11),r11,r0 ; Address of facility table
+	addl3	msc$l_size(r11),r11,r2	; Address of end of section
+	extzv	#sts$v_fac_no,#sts$s_fac_no,-	; Get facility number of msg
+		msgid(ap),r5
+	ifnord	#2,(r0),badsec1,#psl$c_user ; Must be user readable
+	movzwl	(r0)+,r4		; Get size of table
+	beql	20$			; branch if empty table
+10$:	cmpl	r0,r2			; Exceeded end of section?
+	bgequ	20$			; branch if so
+	assume	mfac$w_number le mfac$b_namelen
+	ifnord	#mfac$b_namelen,(r0),badsec1,#psl$c_user ; Must be user readable
+	cmpw	r5,mfac$w_number(r0)	; Does number match?
+	beql	30$			; branch if match found
+	movzbl	mfac$b_namelen(r0),r1	; get length of facility name
+	movab	mfac$t_name(r1),r1	; get length of entire entry
+	addl	r1,r0			; skip to next facility definition
+	subl	r1,r4			; decrement length of table left
+	bneq	10$			; branch if more to go
+20$:	movab	w^dfac,r1		; Name not found - use default
+	brb	40$
+30$:	movab	mfac$b_namelen(r0),r1	; Address of ASCIC facility name
+40$:	bsbb	put_string		; Output the string
+	popr	#^m<r4,r5>		; restore registers
+	rsb
+
+	.sbttl	binary_search, Perform binary search on index
+;---
+;
+;	Perform a binary search on the specified message index
+;	searching for the given message code.
+;
+; Inputs:
+;
+;	r10 = Address of message (sub)index
+;	r6 = Length of message (sub)index
+;	r7 = Desired message code
+;
+; Outputs:
+;
+;	r0 = Success/failure flag
+;	r1 = Offset to message definition record
+;		(actually, the contents of the second longword of the entry)
+;
+;	r2-r4 destroyed.
+;
+;	If the entry is not found, and the bottom bit of r1 is set, then
+;	the offset points to a subindex rather than the definition record
+;	and the search should be continued with that subindex.
+;---
+
+binary_search:
+	pushl	r5			; save register
+	clrl	r2			; low limit = 0
+	subl3	#midx$c_length+8,r6,r3	; Compute index length minus overhead
+					; also minus 1 entry (the 8)
+	ashl	#-3,r3,r3		; Convert to number of entries - 1
+	movl	r3,r5			; save maximum entry #
+	clrl	r1			; preset r1 to lbc in case of empty
+					; index, you don't get subindex ptr
+10$:	addl3	r2,r3,r4		; average low and high bounds
+	ashl	#-1,r4,r4		; and divide by two
+	cmpl	r2,r3			; if low>high, end of search
+	bgtr	40$			; branch if end of search
+	movq	midx$c_entries(r10)[r4],r0	; Get entire entry in r0/r1
+	subl3	r0,r7,r0		; check if key matches
+					; save comparison result in r0
+	beql	50$			; branch if found
+	bgtru	20$			; branch if in upper half, set new low
+	subl3	#1,r4,r3		; set new upper limit
+	brb	10$			; and continue
+20$:	addl3	#1,r4,r2		; set new lower limit
+	brb	10$			; and continue
+;
+;	Key not found.  If the last comparison shows that
+;	the desired key falls before the key we are sitting on,
+;	then return the following key value.  We guarantee that
+;	the entry we return will always have a key value greater
+;	than the desired key.  This is because the index is structured
+;	so that an index which points to subindices use a key value
+;	of the highest key on that subindex.  In order to follow the
+;	tree down successfully, we must return the subindex with the
+;	higher key.
+;
+40$:	tstl	r0			; if desired key is GTR key tested
+	bleq	45$			; then execute following code
+	incl	r4			; use entry of maximal key value
+	cmpl	r4,r5			; off the end of the index?
+	bgeq	45$			; if so, leave on last entry in index
+	movq	midx$c_entries(r10)[r4],r0 ; return offset assoc. with entry
+45$:	clrl	r0			; failure - key not found
+					; return with r1 of closest entry
+	brb	90$
+;
+;	Key found - return success.
+;
+50$:	movl	#1,r0			; success - key found
+90$:	popl	r5			; restore register
+	rsb
+
+	.sbttl	map_indirect, Map an indirect message file
+;---
+;
+;	This routine processes an indirect message section.
+;	It attempts to map the message file named in the
+;	message section into user space and marks the section
+;	processed so that the file will not be mapped twice.
+;	When the message file is mapped via $IMGACT, the
+;	addresses of the message sections contained in the
+;	file will be added to the end of the message vector
+;	list and will be processed later in the search.
+;
+; Inputs:
+;
+;	r11 = Address of message section
+;
+; Outputs:
+;
+;	None, return via RET if any fatal errors
+;---
+
+map_indirect:
+	ifnowrt	#msc$c_length,msc$b_flags(r11),70$,#psl$c_user	; check access
+	bbss	#msc$v_mapped,msc$b_flags(r11),40$ ; skip if already mapped
+	movab	msc$b_indnamlen(r11),r3 ; Address of ASCIC string
+	movzbl	(r3)+,r2		; Descriptor in r2/r3
+	movab	inddefnam,r1		; address of default name string
+	movzbl	(r1)+,r0		; get length of string
+	movab	-512(sp),sp		; allocate image activator work area
+	movq	r0,-(sp)		; put default descriptor on stack
+	movq	r2,-(sp)		; put input descriptor on stack
+	clrq	-(sp)			; specify program region 0
+	movl	sp,r1			; get address of stack
+	$imgact_s name=8(r1),-		; merge image into address space
+		dflnam=16(r1),-		; using default name string
+		inadr=(r1),-		; using dummy inadr (to give region)
+		retadr=(r1),-		; return address here also
+		hdrbuf=24(r1),-		; address of work area
+		imgctl=#iac$m_merge!iac$m_expreg ; merge into address space
+	movab	24+512(sp),sp		; deallocate descriptors and work page
+	blbc	r0,80$			; branch if error
+	rsb				; *** temp fix to avoid errors ***
+	tstl	g^ctl$gl_fixuplnk	; fix-up vector in image?
+	bneq	70$			; branch if yes (invalid message section)
+40$:	rsb				; and exit
+;
+;	Error accessing mapped bit or mapping message file
+;
+70$:
+80$:	brw	badsec			; exit with default message
+
+
+	.end

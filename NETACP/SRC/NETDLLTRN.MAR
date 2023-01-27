@@ -1,0 +1,3340 @@
+	.TITLE	NETDLLTRN  - Control data link layer
+	.IDENT	'V03-016'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+
+;++
+; FACILITY:	NETWORK ACP
+;
+; ABSTRACT:
+; 
+;
+; ENVIRONMENT:
+;
+;	Kernel mode 
+;
+; AUTHOR:	A.Eldridge, CREATION DATE: 11-APR-80
+;
+; MODIFIED BY:
+;
+;	V016	TMH0016		Tim Halvorsen	21-Apr-1982
+;		Fix parsing of Phase II and Phase III node addresses so
+;		that an error condition doesn't crash the system.
+;
+;	V015	TMH0015		Tim Halvorsen	08-Mar-1982
+;		Add calls to GET_VEC2 and GET_VEC3.
+;
+;	V03-14	ADE0018		A.Eldridge	25-Jan-1982
+;		When starting up a circuit, get the "input packet limiter"
+;		value - and the number of receive buffers for DMC circuits -
+;		from the PLI database instead of the CRI database.  
+;
+;	V03-13	ADE0017		A.Eldridge	19-Jan-1982
+;		Generate "line down" rather than "init failure" if a received
+;		routing message has a changed node address.  Generate 
+;		"verification reject" event if verification is required but the
+;		node is not in the data base.
+;
+;	V03-12	ADE0016		A.Eldridge	13-Jan-1982
+;		Fix bugs in datalink receive buffer failure code.
+;
+;	V03-11	ADE0015		A.Eldridge	26-Dec-1981
+;		Return SS$_NOLICENSE on attempted circuit definition if
+;		the user doesn't have a decnet license.
+;
+;	V03-10	ADE0014		A.Eldridge	26-Dec-1981
+;		Change version number sent in initialization message to use
+;		binary rather than ascii.
+;
+;	V03-09	ADE0013		A.Eldridge	26-Dec-1981
+;		Add support for the NFB$C_CRI_XPT parameter used to force a
+;		particular (Phase II, Phase III, etc.) Transport protocol to be
+;		selected in the initialization message sent over a given 
+;		circuit.
+;
+;	V03-08	ADE0012		A.Eldridge	26-Dec-1981
+;		Add support for datalinks which do buffered I/O on transmits.
+;
+;	V03-07	ADE0011		A.Eldridge	22-Dec-1981
+;		Add support for "software key" used to verify the user's
+;		DECnet license.
+;
+;	V03-06	ADE0010		A.Eldridge	17-Dec-1981
+;		Don't bump initialization failure count on a circuit that's
+;		timed out before receiving its first message.
+;
+;	V03-05	ADE0009		A.Eldridge	?
+;		General cleanup.
+;
+;	V03-04	A.ELDRIDGE	21-Jul-1981
+;		Convert to circuit/line model
+;
+;	V001	TMH0001		Tim Halvorsen	04-Sep-1980
+;		Pass circuit name to NML (in SYS$NET) for auto-service.
+;-
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+	$CCBDEF
+	$CNRDEF
+	$CNFDEF
+	$CXBDEF
+	$NFBDEF
+	$NMADEF
+	$DDBDEF
+	$DDTDEF
+	$DEVTRNDEF
+	$DLLQIODEF
+	$EVCDEF
+	$IRPDEF
+	$LPDDEF
+	$MSGDEF
+	$NDBDEF
+	$NETMSGDEF
+	$NETSYMDEF
+	$NETUPDDEF
+	$RCBDEF
+	$UCBDEF
+	$WQEDEF
+ 	$XMDEF
+	$XWBDEF
+
+;
+;  EQUATED SYMBOLS
+;
+FDT_LEGAL  = 0			; FDT offset to legal functions
+FDT_IOTYPE = 8			; FDT offset to function type (buffer/direct)
+
+
+
+;
+;  MACROS
+;
+.MACRO	$LOG  code,qual1,qual2,reg		; Setup logging info
+
+			_$log = evc$c_'code'
+	.IIF NB,qual1,	_$log = _$log + <<evc$c_'qual1'>@16>
+	.IIF NB,qual2,	_$log = _$log + <<evc$c_'qual2'>@24>
+
+	MOVL	#_$log,WQE$W_EVL_CODE(reg)
+.ENDM	$LOG
+
+
+
+.MACRO	$EVT  event,reg
+
+	MOVB	S^#LEV$C_'event',WQE$B_EVT(reg)	; Setup event code
+
+.ENDM	$EVT
+
+
+
+.MACRO	$DSP_TABLE  list			; Setup dispatch table
+
+	.MACRO	$dspent	_$dspinx,_$dspact
+
+		.IIF GT,  <_$dspinx-_$maxinx>,	_$maxinx = _$dspinx
+		.	 = _$tmp + <4 * _$dspinx>
+		.address   _$dspact
+	.ENDM	$dspent
+
+	_$tmp	 = .
+	_$maxinx = 0
+	.IRP	a,<LIST>
+	$dspent	a
+	.ENDR
+
+. = _$tmp + <4 * _$maxinx> + 4
+
+.ENDM	$DSP_TABLE
+
+
+LEV$C_STATES   = 16				; Number of columns in the table
+LEV$C_MAX_EVT  = -1 				; Init the number of rows
+
+.MACRO	$LEV  event, s,w,x,y, m, a,b,c,d,j, r 	; Create state table entries  
+						; for the specified circuit event
+
+	LEV$C_MAX_EVT = LEV$C_MAX_EVT + 1	; Bump max event value
+	LEV$C_'event' = LEV$C_MAX_EVT		; Define circuit event symbol
+
+		$ENT	s,_s			; Create table entry
+		$ENT	w,_w
+		$ENT	x,_x
+		$ENT	y,_y
+
+		$ENT	m,_m
+
+		$ENT	a,_a
+		$ENT	b,_b
+		$ENT	c,_c
+		$ENT	d,_d
+		$ENT	j,_j
+
+		$ENT	r,_r
+
+		$ENT	?,_s			; Pad so that each row in the
+		$ENT	?,_s			; table is a multiple of 16
+		$ENT	?,_s			; so that the state table
+		$ENT	?,_s			; journal file is easy to read
+		$ENT	?,_s
+.ENDM	$LEV
+
+
+
+.MACRO	$ENT	entry,def_sta			; Create state table entry
+
+		_$ent = %LENGTH(entry)-1
+		lev$c_sta_. = lev$c_sta'def_sta'; Define default next state
+
+	.IF IDN,entry,?				; ? => bug 
+	    .BYTE  lev$c_sta_.			; Use current state
+	    .BYTE  4				; Action is bug-check
+	.IFF
+	    .BYTE  lev$c_sta_%EXTRACT(0,1,entry); Setup next state
+	    .BYTE  %EXTRACT(1,_$ent,entry)	; Setup action routine index
+
+	.ENDC
+.ENDM	$ENT
+
+;
+;  Circuit LPD States (LPD$B_STI values)
+;
+$EQULST LEV$C_STA_,,0,1,<-;
+
+		-;   DATA LINK LAYER INITIALIZATION
+		-;
+		-;
+	<S> 	-; Stopping: There is an active channel to the device but has
+	 	-;	     either been stopped or has been given a command to
+		-;	     stop. There may be timer or I/O ast's pending.
+	<W> 	-; Waiting:  The device is about to undergo a startup sequence
+	 	-; 	     but its outstanding AST count is not yet zero.
+	<X>	-; Clearing: The device has been given a command to shutdown so
+	 	-;	     that it is in a known state prior to being started.
+	<Y> 	-; Starting: The device has been given a command to startup and
+	 	-; 	     the startup QIO AST is still outstanding.
+		-;
+	<M>	-; Maintenance: In use by another process for service functions
+	 	-;
+		-;
+		-;   TRANSPORT LAYER INITIALIZATION
+	 	-;
+	<A> 	-; Waiting for:  xmt idle, rcv verf, rcv init
+	<B> 	-; Waiting for:  xmt idle, rcv verf
+	<C> 	-; Waiting for:  xmt idle
+	<D> 	-; Waiting for:  	   rcv verf
+		-;
+	<J>	-; Undergoing circuit acceptance testing
+	<R> 	-; Running:  Available for normal traffic.
+>
+
+		.PSECT	NET_PURE,NOWRT,NOEXE,LONG
+
+LEV_AL_ACTTAB:
+
+    $DSP_TABLE  -
+    <-
+	< 0, ACT_NOP>		-; Nop action routine
+	<32, ACT_EXIT>		-; Exit state table processing
+	< 4, ACT_BUG>		-; Bugcheck
+	<11, ACT_NYI>		-; Not yet implemented
+	< 2, ACT_QIO_STRT>	-; Issue startup QIO,  reset i/o timer
+	< 1, ACT_QIO_SHUT>	-; Issue shutdown QIO, reset i/o timer
+	< 7, ACT_CND_SHUT>	-; If LPD$B_ASTCNT=0 
+				-; then	shutdown QIO,  reset i/o timer
+				-; else	abort the event
+	< 6, ACT_RUN_SYNC>	-; Synchronization lost in run state
+	< 8, ACT_RUN_UXPK>	-; Unexpected packet rcv'd in run state
+	<16, ACT_RUN_SHUT>	-; Shut down from RUN state
+				-;
+	<18, ACT_DLL_UP>	-; The datalink has initialized, begin next
+				-; phase (Transport or DLE) of activity
+	<10, ACT_ENT_RUN>	-; Setup OL vector
+	<22, ACT_ENT_MPR>	-; Circuit entered MOP mode while in RUN state
+	< 9, ACT_ENT_MOP>	-; Circuit entered MOP mode
+	<26, ACT_ENT_DLE>	-; The circuit has become available for use by
+				-; a server process for direct-line access
+				-;
+	<19, ACT_XMT>		-; Send a message if possible
+	<30, ACT_RCV_2STR>	-; Respond to second rcvd "start" msg
+	<12, ACT_RCV_STR>	-; Respond to rcvd "start" msg
+	<13, ACT_RCV_VRF>	-; Respond to rcvd "verification" msg
+	<20, ACT_RCV_RT>	-; Respond to rcvd Routing msg
+	<29, ACT_RCV_RTA>	-; Receive Routing msg while acceptance testing
+				-;
+	< 3, ACT_RCV_STRTIM>	-; Process expired "start suppression" timer
+	< 5, ACT_RUN_DOWN>	-; Cancel all timers, etc.
+	<31, ACT_SET_OPER>	-; Simulate a "set operators state" event
+	<15, ACT_EXI_SERV>	-; Exit service state if needed
+				-;
+	<14, ACT_IRP_EVT>	-; Determine IRP event
+	<21, ACT_TST_DL>	-; Run acceptance algorithm
+	<23, ACT_REQ_UPDATE>	-; Update routing tables
+				-;
+	<24, ACT_LOG_FTE>	-; Log fatal error
+	<25, ACT_LOG_NFE>	-; Log non-fatal error
+				-;
+	<27, ACT_SYN_FAIL>	-; The circuit failed to synchronize
+	<28, ACT_INI_FAIL>	-; I/O failure during transport initialization
+   >
+
+;
+; OWN STORAGE:
+;
+		.PSECT	NET_PURE_TAB,NOWRT,NOEXE,PAGE
+
+LEV$AW_STA_TAB::
+;
+;                 S   W   X   Y     M     A   B   C   D   J     R
+;       ----------+---+---+---+-----+-----+---+---+---+---+-----+--
+$LEV  NO_EVT	  .5  .32 .32 .32   .19   .19 .19 .19 .32 .21  .19
+$LEV  EXIT	  .   .   .   .     .     .   .   .   .   .     .
+$LEV  BUG	  ?   ?   ?   ?     .     ?   ?   ?   ?   ?     ? 
+$LEV  UNJAM	  .   .27 W27 W27   W27   W1  W1  W1  W1  W1    W6
+
+$LEV  OPR_OFF	  .   S27 S27 S27   S27   S1  S1  S1  S1  S1    W6
+$LEV  OPR_ON	  W1  .   .15 .15   .15   .   .   .   .   .     .23
+$LEV  OPR_SRV	  W1  .   .   .     .     W1  W1  W1  W1  W1    W6
+
+$LEV  RCV_UNK	  .   .   .   .     .     .   .   .   .   .     .
+$LEV  RCV_STR	  .   .   .   .     .     B12 .30 W1  B30 W1    W8
+$LEV  RCV_VRF	  .   .   .   .     .     W1  .13 W1  .13 W1    W8
+$LEV  RCV_VVF	  .   .   .   .     .     ?   C19 ?   J21 W1    ?
+$LEV  RCV_RT	  .   .   .   .     .     .   .   .   .   .29   .20
+
+$LEV  XMT_IDLE	  .   .   .   .	    .     ?   D   J21 .32 R10   .32
+
+$LEV  LIN_UP	  .   .   .   .     .     ?   ?   ?   ?   R10   .
+$LEV  LIN_DWN     .   W7  W27 W27   W27   W1  W1  W1  W1  W1    W16
+
+$LEV  TIM_IO	  .31 W27 W27 W27   .     W27 W28 W28 W28 W28   W6
+$LEV  TIM_STRT	  .3  .3  .3  .3    .3    .3  .3  .3  .3  .3    .3
+
+$LEV  AST_FAIL	  .   X7  Y2  W27   W27   W27 W28 W28 W28 W28   W6
+$LEV  AST_IO	  .   X7  Y2  A18   .9    .   .   .   ?   .     .
+$LEV  AST_STIM	  .   .   Y2  .     .     .   .   .   .   .     .
+
+$LEV  ENT_DLE	  ?   ?   ?   M26   ?     ?   ?   ?   ?   ?     ?
+$LEV  ACCESS	  W1  .7  W1  W1    .26   W1  W1  W1  W1  W1    W6
+$LEV  CANCEL	  .31 W27 W27 W27   W27   .   .   .   .   .     .
+$LEV  DEACCESS	  .31 .   .   W27   W27    .   .   .   .   .     .
+
+$LEV  IRP_EVT	  .14 .14 .14 .14   .14   .14 .14 .14 .14 .14   .14
+$LEV  IRP_DOWN	  .   X7  W27 W27   W27   W27 W28 W28 W28 W28   W6
+$LEV  IRP_MM 	  S9  S9  S9  S9    W27   S9  S9  S9  S9  S9    W22
+
+$LEV  CNF_CRI	  ?   ?   ?   ?     ?     ?   ?   ?   ?   ?     ? 
+
+$LEV  LOG_NFE	  .25 .25 .25 .25   .25   .25 .25 .25 .25 .25   .25
+$LEV  LOG_FTE	  .24 .24 .24 .24   .24   .24 .24 .24 .24 .24   .24
+
+LEV$C_EVENTS  = LEV$C_MAX_EVT+1
+
+;
+; NOTE:	Action routines which are dispatched to upon the LEV$C_NO_EVT event
+;	must not exit with the LEV$C_NO_EVT; if no events are to be chained 
+;	to then these routines must exit with LEV$C_EXIT.  Failure to adhere
+;	to this rule will result in an infinite loop in the state table.
+;
+;	If an action routine is never dispatched to upon the LEV$C_NO_EVT
+;	event then it must never exit with LEV$C_EXIT; if no events are to
+;	be chained to then these routines must exit with LEV$C_NO_EVT.
+;	Failure to adhere to this rule could result in failure to deallocate
+;	an LPD which is no longer needed.
+;
+
+		.PSECT	NET_PURE,NOWRT,NOEXE,LONG
+;
+;  Define Phase III Transport message symbols
+;
+TR3C_MSG_STR	=	^X<01>	; Start message type code
+TR3C_STR_LNG	=	   10	; Fixed start message length
+TR3C_STR_RSXL	=	    9	;!RSX work around
+TR3V_REQ_NTY	=	    0	; Start of TLINFO field specifying node type
+TR3S_REQ_NTY	=	    2	; Length of the field
+TR3C_NTY_PH3	=	    2	; Field value for routing nodes
+TR3C_NTY_PH3N	=	    3	; Field value for non-routing nodes
+TR3V_REQ_VRF	=	    2	; TLINFO bit - set if verification is requested
+TR3C_STR_INFO	=	^X<06>	; TLINFO field value for "verification message
+				; requested" and "I'm a Phase III routing node"
+
+TR3C_MSG_VRF	=	^X<03>	; Verification message type code
+TR3C_VRF_LNG	=	    4	; Length of fixed portion of verfication msg
+TR3C_VRF_MXL	=	   68	; Verification message max length
+TR3C_MAX_PSW	=	   64	; Maximum password text length
+
+TR3C_MSG_RT	=	^X<07>	; Routing message type code
+TR3C_RT_LNG	=	    5	; Length of fixed portion of routing message
+TR3V_RT_COST	=	    0	; Begining of COST field
+TR3S_RT_COST	=	   10	; Size of COST field
+TR3V_RT_HOPS	=	   10	; Begining of HOPS field
+TR3S_RT_HOPS	=	    5	; Size of HOPS field
+
+TR3C_MSG_TST	=	^X<05>	; Test (hello) message type code
+;!TR3C_TST_MAX	=	  128	; Maximum size of test data field
+TR3C_TST_MAX	=	  127	;!RSX work-around
+TR3C_NUM_TST	=	    3	; Number of test messages to send during 
+				; acceptance testing.
+;
+;  Define Phase II Transport message symbols
+;
+TR2C_MAX_PNA	=	  241	; Maximum Phase II parnter node address
+
+TR2C_MSG_NOP	=	^X<08>	; NOP message type code
+TR2C_NOP_LNG	=	    1	; Mininum NOP message length
+TR2C_NUM_NOP	=	    0	; Number of NOP message to send to test the
+				; circuit during initialization
+
+TR2C_MSG_INI	=	^X<58>	; Initialization message type code
+
+TR2C_INI_STR	=	^X<01>	; Initialization start sub-type code
+TR2C_STR_LNG	=	   10	; Length of fixed portion of start message  ;!
+TR2C_STR_MXL	=	   80	; Max length of start message		    ;!
+TR2C_STR_FCT	= 	^X<00>	; Expected start message "function" field value
+TR2C_STR_REQ	=	^X<06>	; Expected start message "request" field value
+TR2V_REQ_VRF	=	    0	; "request" field modifier to request a 
+TR2M_REQ_VRF	=	^X<01>	;   verification message
+TR2M_FCT_INT	=	^X<02>	; "function" field modifier to show that the 
+				; node does intercept functions
+
+TR2C_INI_VRF	=	^X<02>	; Initialization verification sub-type code
+TR2C_VRF_LNG	=	    2	; Length of verf msg minus password length
+TR2C_PSW_LNG	=	    8	; Length of verf msg password
+;
+;  Define common Phase II and Phase III constants
+;
+TR_C_VRF_LNG	= TR3C_VRF_MXL	; Maximum verification msg size
+TR_C_MAX_PSW	= TR3C_MAX_PSW	; Maximum size of verification password
+
+TR_C_SOCKET	= 1		; Transport's socket/protocol number
+
+NML_OBJ_NUM	= 19		; Object number for NML
+
+;
+;  Define message mapping table
+;
+.MACRO	MSGTAB	  parser,min_siz,msg_typ	
+
+	.ADDRESS  parser
+	.WORD     min_siz
+	.WORD     msg_typ
+
+.ENDM	MSGTAB
+;
+MSG_MAP_TABLE:
+
+    MSGTAB	RCV_STR2,  TR2C_STR_LNG,  <<TR2C_INI_STR@8>!TR2C_MSG_INI>
+    MSGTAB	RCV_VRF2,  TR2C_VRF_LNG,  <<TR2C_INI_VRF@8>!TR2C_MSG_INI>
+    MSGTAB	RCV_STR3,  TR3C_STR_RSXL,		    TR3C_MSG_STR
+    MSGTAB	RCV_VRF3,  TR3C_VRF_LNG,		    TR3C_MSG_VRF
+    MSGTAB	RCV_RT,	   TR3C_RT_LNG, 		    TR3C_MSG_RT
+    MSGTAB	0,	   0,		    0
+
+
+;
+;  Setup mapping from CRI states to operator events
+;
+	ASSUME	NMA$C_STATE_ON  EQ 0
+	ASSUME	NMA$C_STATE_OFF EQ 1
+	ASSUME	NMA$C_STATE_SER EQ 2
+
+OPR_EVT_MAP:	.BYTE	LEV$C_OPR_ON
+		.BYTE	LEV$C_OPR_OFF
+		.BYTE	LEV$C_OPR_SRV
+		.BYTE	0
+
+
+	.PSECT	NET_IMPURE,WRT,NOEXE,LONG
+;
+;  Define miscellaneous storage
+;
+NET$GL_INITVER::.LONG	0	; For saving received Init Message version
+LEV_Q_CRI:	.QUAD	0	; For saving CRI CNF and CNR
+LEV_L_LPD:	.LONG	0	; For saving LPD
+LEV_W_PNA:	.LONG	0	; For saving partner's address
+LEV_W_BLKSIZE:	.LONG	0	; Partner's receive block size
+LEV_Q_PSWDESC:	.QUAD	0	; For saving descriptor of rcvd password
+MAX_HOPS:	.LONG	0	; Max total hops allowed
+MAX_COST:	.LONG	0	; Max total path cost allowed
+XMTFLG:		.LONG	0	; For LPD$B_XMTFLG image
+STS:		.LONG	0	; For LPD$W_STS image
+NULL:		.LONG	0	; For dummy node name
+
+	.PSECT	____IMPURE,EXE,WRT,PAGE		; Load PSECT last (hence the
+						; "____" prefix and the EXE
+						; attribute
+NUM_NODES = NET$C_MAX_NODES + 1			; Use zero indexed structures
+NUM_CIRCS = NET$C_MAX_LINES + 1
+
+
+REACH_EVT:	  .BYTE	0[<NUM_NODES+7>/8]	; Bit vector used to monitor
+						; node reachability changes
+
+NET$AB_PH2_OL::	  .BYTE	0[NUM_NODES]		; OL vector for Phase II nodes
+		  .EVEN
+NET$AW_DLL_COST:: .BLKW	NUM_CIRCS		; Cost vector
+NET$AW_MIN_C_H::  .BLKW	NUM_NODES		; Minimum Cost/Hops vector
+
+NET$GL_PTR_CHM::  .LONG 0			; Pointer to Cost/Hops matrix
+
+
+
+;+
+; Relationship between DLI and LPD data structures
+;
+;
+; The DLI (Data Link Information Block) is part of the NETACP's  "volatile
+; data base".  It is used to store network management information such as
+; the number of receive buffers, associated cost, etc.   There is a DLI for
+; each datalink.  It is allocated as a consequence of a IO$_ACPCONTROL 'set'
+; Qio and deallocated as a consequence of a 'clear Qio.  The actual DLI address
+; may change during its lifetime if subsequent 'set' Qio's are issued to modify
+; its content.
+;
+; The LPD (Logical Path Descriptor) is part of the non-paged pool data base.
+; It is used by NETDRIVER to locate the data link UCB when queueing internal
+; IRP's for I/O and to store traffic statistics and current queue length
+; information.  Currently, each LPD is a cell of a large LPD vector.  This
+; vector is allocated once during ACP initialization and is deallocated when
+; the ACP dismounts.  A vector of LPD cells was chosen instead of a table of
+; pointers to individual LPD blocks in order to save pool and to reduce the
+; time NETDRIVER spends locating the proper LPD.  One disadvantage of this
+; approach is that the LPD vector cannot be easily be replaced with a larger
+; LPD vector since LPD cell addresses are stored in internal IRP's queued to
+; various data links.  Hence, once the maximum number of data links is 
+; specified it cannot be modified without first dismounting and then
+; remounting the NETACP.
+;
+; There is an LPD associated with every DLI whether or not the datalink in
+; question is in use by the network.  This is the simplest mechanism which
+; guarentees that an LPD will be available when the datalink is subsequently
+; put into use for network traffic of for miscellaneos use (such as downline
+; loading a remote system).  At the time of the association, a channel is
+; assigned to the datalink in order to guarentee that the device actually
+; exists, that the ACP has enough channels left, and to prevent some other
+; process from allocating the device.
+;
+; The LPD/DLI association lasts as long as the DLI remains in the data base.
+;
+
+	.PSECT	NET_CODE,EXE,NOWRT,LONG
+;+
+; NET$DLLUPDLNI - Update Data Link Control Layer 
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is called from module NETACPTRN whenever the LNI data base has
+; been updated.  It must return success.
+;
+; INPUTS:	R11	LNI CNR ptr
+;		R10	LNI CNF ptr
+;
+; OUTPUTS:	R0	Low bit set
+;
+;		All other registers may be clobbered
+;-
+NET$DLLUPDLNI::				; Update datalink control layer
+UPDATE_ALL:				; Update all routing databases
+	PUSHR	#^M<R4,R5,R6,R10,R11>	; Restore regs
+	MOVL	W^NET$GL_PTR_VCB,R4	; Get RCB pointer
+	;
+	;   Calculate the maximum datalink queue length.  The formula
+	;   dictated by the Transport Archictecture is the number of
+	;   buffers divided by the square root of the number of circuits.
+	;
+	MOVZBL	RCB$B_MAX_SNK(R4),R0	; Setup R0 in case no active circuits
+	MOVZBL	RCB$B_ACT_DLL(R4),R1	; Get total number of active circuits
+	BEQL	20$			; Done if EQL
+	MOVZWL	RCB$W_MAX_PKT(R4),R2	; Get the total number of buffers
+	MULL	R2,R2			; Square it
+	DIVL	R1,R2			; Divide by the number of circuits
+	MOVL	#1,R0			; Establish tentative value
+	MOVL	#1,R1			; Square of this value
+10$:	CMPL	R1,R2			; Compare square of value to
+					; (buffs**2)/circuits
+	BGEQU	20$			; If GEQU then we're done
+	ADDL	R0,R1			; Begin (n+1)**2 calculation
+	INCL	R0			;  n = n+1
+	ADDL	R0,R1			; (n+1)**2 = n**2 + 2*n + 1
+	BRB	10$
+	;
+	;   Update the maximum output queue lengths
+	;
+20$:	MOVZBL	RCB$B_MAX_SNK(R4),R1	; Get old max queue length	
+	MOVB	R0,RCB$B_MAX_SNK(R4)	; Update it
+	SUBL	R1,R0			; Get difference (could be negative)
+	MOVZBL	RCB$B_MAX_LPD(R4),R5	; Get number of cells
+	BEQL	50$			; If EQL then none
+	MOVL	RCB$L_PTR_LPD(R4),R6	; Get LPD pointer
+	MOVAB	12(R6),R6		; Point to first cell
+	DSBINT	W^NET_IPL		; Synch with NETDRIVER and lock pages
+30$:	BBC	#LPD$V_RUN,-		;
+		 LPD$W_STS(R6),40$	; Adjust only if in run state
+	ADDB	R0,LPD$B_AVL_XMT(R6)	; Adjust max queue length (could go
+					; negative until some I/O completes!)
+40$:	MOVAB	LPD$C_LENGTH(R6),R6	; Advance to next cell
+	SOBGTR	R5,30$			; Loop for each cell
+	ENBINT				; Restore IPL
+50$:	;
+	;   Reset the automatic update timer to go off in 1 second
+	;
+	MOVZWL	#<<WQE$C_QUAL_RTG>@8>!-	; Set routing update timer i.d.
+		NET$C_TID_XRT,R1
+	MOVAB	W^NET$TIMER_XRT,R2	; Setup action routine
+	MOVQ	#10*1000*1000,R3	; Timer value is one second
+	BSBW	WQE$RESET_TIM		; Reset the routing update timer
+	MOVL	#1,R0			; Indicate success
+	POPR	#^M<R4,R5,R6,R10,R11>	; Restore regs
+	RSB
+
+NET_IPL: 	.LONG	NET$C_IPL	; Sync with NETDRIVER and provide
+					; boundary for locking pages
+
+;+
+; NET$DLL_ALL_OFF - Turn off all circuits
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; Each CRI entry is forced to the OFF state and an operator event is generated.
+;
+; INPUTS:	None
+;
+; OUTPUTS:	All registers are destroyed
+;
+;-
+NET$DLL_ALL_OFF::			; Turn off all circuits
+	MOVL	L^NET$GL_PTR_VCB,R4	; Get the RCB address
+	MOVZBL	RCB$B_MAX_LPD(R4),R5	; Get number of cells
+	BEQL	50$			; If EQL then none
+30$:	MOVL	R5,R8			; Get LPD i.d.
+	BSBW	NET$GET_LPD_CRI		; Get LPD and CRI blocks
+	BLBC	R0,40$			; If LBC then not active
+	MOVL	#NMA$C_STATE_OFF,R8	; Setup new state value
+	$PUTFLD	cri,l,sta		; Stuff it into the CRI CNF
+	MOVZBL	OPR_EVT_MAP(R8),R0	; Get corresponding event
+	BSBW	SET_DLL_EVT		; Queue the event - always succeeds
+40$:	SOBGTR	R5,30$			; Loop for each cell
+50$:	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+	RSB
+
+;+
+; NET$DLL_OPR_SET - Setup operator generated event
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The CRI has been updated and is about to be inserted in the database.  Since
+; the circuit "state" may have changed, schedule an event.
+;
+; INPUTS:	R11	CRI root block pointer
+;		R10	CRI block pointer
+;		R9	Scratch
+;		R8	Value of <cri,l,sta> (operater state)
+;		R7-R0	Scratch
+;
+; OUTPUTS:	R11,R10	 are preserved
+;		R0	Low bit set if successful
+;			VMS status code otherwise
+;
+;		All other registers are destroyed.
+;
+;-
+NET$DLL_OPR_SET::			; Setup operator generated event
+	PUSHL	R8			; Save state
+	CLRL	W^LEV_L_LPD		; No LPD allocated yet
+	BSBW	NET$GET_VEC		; Prepare the line
+	BLBC	R0,2$			; If LBC then error
+	BSBW	NET$LOCATE_LPD		; Locate associated LPD
+					; R6 = 0 on return if none
+	BSBW	NET$GET_VEC3		; Check the line state
+	BLBC	R0,2$			; If LBC then error
+	CMPB	(SP),#NMA$C_STATE_OFF	; Is the STATE OFF ?
+	BNEQ	5$			; If NEQ then no
+	TSTL	R6			; Is there an LPD
+	BNEQ	3$			; If NEQ yes, generate state table event
+	BRW	90$			; Else just return
+2$:	BRW	100$			; Exit
+3$:	BRW	80$			; Generate state table event
+5$:	;
+	;   STATE is not OFF.  LPD is needed.  COST is needed if STATE is ON.  
+	;
+	MOVZWL	#SS$_INSFARG,R0		; Assume COST value needed but missing
+	$GETFLD	cri,l,cos		; Get the COST value
+	BLBS	R0,10$			; If LBS then cost was valid
+	CMPB	(SP),#NMA$C_STATE_ON	; Is new STATE ON ?
+	BEQL	100$			; If EQL then exit with error
+10$:	MOVW	R8,2(SP)		; Save COST on stack
+	TSTL	R6			; Is there an LPD ?
+	BNEQ	20$			; If NEQ then yes
+	BSBW	ALLOC_LPD		; Else allocate one
+	BLBC	R0,100$			; If LBC then failed
+	MOVL	R6,W^LEV_L_LPD		; Save new LPD pointer
+20$:	;
+	;   If ASTCNT=0 then circuit parameters may be sent to the circuit
+	;   driver.  Else, the CRI is "locked" so that driver level parameters
+	;   could not have been changed and there is no need to pass the 
+	;   parameters again.
+	;
+	TSTB	LPD$B_ASTCNT(R6)	; Any I/O outstanding?
+	BNEQ	50$			; If NEQ yes
+	$CNFFLD	cri,s,chr,R9		; Identify characteristics buffer
+	MOVZWL	LPD$W_CHAN(R6),R2	; Get I/O channel
+	CLRL	R1			; Clear illegal I/O modifier mask
+	BSBW	NET$SET_QIOW		; Get buffer and issue $QIOW
+	BLBC	R0,100$			; If LBC then failed
+50$:	MOVZBL	LPD$B_PTH_INX(R6),R1	; Get circuit's index
+	MOVW	2(SP),W^NET$AW_DLL_COST[R1]; Update circuit's cost
+	;
+	;   Setup hello and listen timers
+	;
+	$GETFLD cri,l,het		; Get the hello timer
+	BLBS	R0,60$			; If LBS then it parameter was found
+	MOVL	#13,R8			; Else set the default
+	BSBW	CNF$PUT_FIELD		; Store it in the PLI
+60$:	MOVW	R8,LPD$W_INT_TLK(R6)	; Setup the talker interval
+	$GETFLD	cri,l,lit		; Get the listen timer
+	BLBS	R0,70$			; If LBS then parameter was found
+	MOVL	#30,R8			; Else setup the default
+	BSBW	CNF$PUT_FIELD		; Store it in the PLI
+70$:	MOVW	R8,LPD$W_INT_LSN(R6)	; Setup listen interval
+	;
+	;   Generate an event to drive the circuit's state table
+	;
+80$:	MOVZBL	(SP),R8			; Get new STATE value
+	MOVZBL	OPR_EVT_MAP(R8),R0	; Get corresponding event
+	BSBW	SET_DLL_EVT		; Queue the event - always succeeds
+
+90$:	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+100$:	TSTL	(SP)+			; Cleanup stack
+	BLBS	R0,110$			; Exit if success
+	TSTL	W^LEV_L_LPD		; Was LPD just allocated ?
+	BEQL	110$			; If EQL then no
+	PUSHL	R0			; Remember status
+	BSBW	DEAL_LPD		; Deallocate the LPD
+	POPL	R0			; Restore status
+110$:	RSB
+
+;+
+;
+; ALLOC_LPD	- Allocate and initialize an LPD cell
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; A free LPD cell is allocated and initialized.  A channel is assigned to it.
+;
+;
+; INPUTS:	R11	CRI CNR address
+;		R10	CRI CNF address
+;		R9-R0	Scratch
+;
+; OUTPUTS:	R11,R10	Unchanged
+;		R8	Assigned path i.d.
+;		R6	Path's LPD address
+;		R0	Low bit set if path was found (or assigned)
+;			Low bit clear otherwise
+;-
+ALLOC_LPD:				; Allocate/init an LPD cell
+	MOVL	W^NET$GL_PTR_VCB,R8	; Get RCB address
+	BEQL	120$			; None if EQL
+	ADDL3	#12,RCB$L_PTR_LPD(R8),R6; Get LPD vector cell #1
+	BGTR	120$			; If GTR then no LPD
+	;
+	;   Find a free LPD cell
+	;
+100$:	MOVZBL	RCB$B_MAX_LPD(R8),R4	; Get max path index
+	BEQL	120$			; Report failure if EQL
+110$:	BBC	#LPD$V_INUSE,-		;
+		    LPD$W_STS(R6),130$	; Br if cell not in use
+	ADDL2	#LPD$C_LENGTH,R6	; Advance to next LPD cell
+	SOBGTR	R4,110$			; Loop 
+120$:	MOVZWL	#SS$_INSFMEM,R0		; Indicate failure
+	BRW	300$			; Take common exit
+	;
+	;   Initialize the LPD cell
+	;
+130$:	ADDW3	#^X<100>,-		;
+		    LPD$W_PTH(R6),R7 	; Get updated path i.d.
+	MOVC5	#0,(SP),#0,-		;
+		    #LPD$C_LENGTH,(R6)	; Zero the entire LPD cell
+	MOVW	R7,LPD$W_PTH(R6)	; Reset the path i.d.
+	MOVB	#1,LPD$B_AVL_SLT(R6)	; Setup queue length control
+	MOVB	RCB$B_MAX_SNK(R8),-	;
+		    LPD$B_AVL_XMT(R6)	;
+	ASSUME	LPD$Q_REQ_WAIT EQ 0	;
+	MOVL	R6,(R6)			; Init the queue header
+	MOVL	R6,4(R6)		;
+	MOVL	G^EXE$GL_ABSTIM,-	;
+		    LPD$L_ABS_TIM(R6)	; Time counters were zeroed
+	;
+	;    Assign a channel to the device
+	;
+	MOVZWL	#SS$_NOSUCHDEV,R0	; Indicate error
+	$GETFLD	cri,s,vmsnam		; Get device name descriptor
+	BLBC	R0,155$			; Br on error
+	MOVQ	R7,-(SP)		; Save name descriptor
+	MOVL	SP,R0			; $ASSIGN_S modifies the SP
+	$ASSIGN_S  -			; Get a channel to the device
+		DEVNAM = (R0),-		;
+		CHAN   = LPD$W_CHAN(R6)	;
+	CLRQ	(SP)+			; Cleanup the stack
+	BLBC	R0,300$			; Br on error
+	;
+	;   Find associated LINE (PLI, PLVEC) with this device UCB
+	;
+	MOVZWL	LPD$W_CHAN(R6),R0	; Get channel for call
+	JSB	G^IOC$VERIFYCHAN	; Get the CCB, ignore errors --
+					; CCB is returned anyway
+	MOVL	CCB$L_UCB(R1),R0	; Get the UCB pointer
+	MOVZBL	L^PLVEC$GB_MAX,R8	; Get max PLVEC index
+150$:	CMPL	L^PLVEC$AL_UCB[R8],R0	; Is this it ?
+	BEQL	160$			; If EQL then yes
+	SOBGTR	R8,150$			; Else loop (index 0 is not used)
+	$DASSGN_S  CHAN = LPD$W_CHAN(R6); Deassign the channel
+	MOVZWL	#SS$_NOSUCHDEV,R0	; Indicate error
+155$:	BRB	300$			; Take common exit
+160$:	;
+	;   Claim the LPD, finish LPD setup
+	;
+	INCB	L^PLVEC$AB_REFC(R8)	; Another PLVEC cell reference
+	MOVB	R8,LPD$B_PLVEC(R6)	; Setup PLVEC index
+	MOVW	#LPD$M_INUSE,LPD$W_STS(R6) ; Mark LPD cell as "in use"
+	MOVL	R0,LPD$L_UCB(R6)	; Setup the UCB pointer
+	MOVL	UCB$L_DDT(R0),R0	; Get DDT address
+	MOVL	DDT$L_FDT(R0),R0	; Get FDT
+	BBC	#IO$_READLBLK,-		; If BC then direct I/O function
+		FDT_IOTYPE(R0),180$	;
+	BISW	#LPD$M_RBF,LPD$W_STS(R6); Mark for buffered receives
+180$:	BBC	#IO$_WRITELBLK,-	; If BC then direct I/O function
+		FDT_IOTYPE(R0),200$	; 
+	BISW	#LPD$M_XBF,LPD$W_STS(R6); Mark for buffered transmissions
+200$:	MOVZWL	LPD$W_PTH(R6),R8	; Get path i.d.
+	MOVW	R8,CNF$W_ID(R10)	; Link CNF to LPD
+	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+300$:	RSB				; Return status in R0
+
+;++
+; COND_DEAL_LPD	- Conditionally deallocate LPD
+; DEAL_LPD	- Unconditionally deallocate LPD
+;
+; The LPD$V_INUSE bit is cleared, the I/O channel is $DEASSGN'd and the
+; the LPD is unhooked from the CRI CNF.
+;
+; INPUTS:	R11	CRI CNR pointer
+;		R10	CRI CNF pointer
+;		R6	LPD pointer
+;
+; OUPUTS:	R11,R10	Unchanged
+;		R6	Zero
+;		R0	LBS if successful
+;			LBC otherwise
+;
+;		All other registers are destroyed
+;--
+COND_DEAL_LPD:				; Conditionally deallocate LPD
+	$GETFLD	cri,l,sta		; Get the operater state
+	BLBC	R0,10$			; If LBC then assume "off"
+	CLRL	R0			; Assume can't deallocate
+	CMPB	R8,#NMA$C_STATE_OFF	; Is the state "off"
+	BNEQ	20$			; If NEQ then can't deallocate
+10$:	TSTB	LPD$B_ASTCNT(R6)	; Has LPD run-down?
+	BNEQ	20$			; If NEQ no, return error
+	BBS	#LPD$V_ACCESS,-		; If accessed for "service" then
+		    LPD$W_STS(R6),20$	; cannot deallocate
+	BSBB	DEAL_LPD		; Deallocate LPD
+20$:	RSB				; Done
+
+DEAL_LPD:				; Deallocate LPD
+	MOVZBL	LPD$B_PLVEC(R6),R0	; Get PLVEC index
+	BEQL	10$			; If EQL then none
+	DECB	L^PLVEC$AB_REFC(R0)	; No longer referencing it
+	CLRL	L^PLVEC$AL_UCB(R0)	; Init the UCB pointer
+	CLRB	LPD$B_PLVEC(R6)		; Init the PLVEC index
+10$:	$DASSGN_S  CHAN = LPD$W_CHAN(R6); De-assign channel
+	CLRW	LPD$W_CHAN(R6)		; Clear the channel
+	CLRW	LPD$W_STS(R6)		; Free the LPD
+	CLRW	CNF$W_ID(R10)		; Unbind LPD from CRI
+	CLRL	R6			; Invalidate LPD pointer
+	MOVL	#SS$_NORMAL,R0		; Setup status
+	RSB
+
+;++
+; NET$DLL_ACCESS - Associate (access) circuit with user I/O channel
+;
+;
+; INPUTS:	R8,R7	Circuit name descriptor
+;
+; OUTPUTS:	R1	LPD index
+;		R0	Status
+;
+;		All other registers are clobbered
+;
+;--
+NET$DLL_ACCESS::			; Change circuit service substate
+	MOVL	L^NET$GL_CNR_CRI,R11	; Point to the CRI root block
+	CLRL	R10			; Start from the begining of the list
+	MOVZWL	#SS$_NOSUCHDEV,R0	; Pre-set error code
+	$SEARCH	eql,cri,s,nam		; Locate the CRI's CNF block
+	BLBC	R0,200$			; If LBC then not found
+	$GETFLD	cri,l,sta		; Get the circuit's operator state
+	MOVZWL	#SS$_DEVINACT,R0	; Assume state is OFF
+	CMPL	#NMA$C_STATE_OFF,R8	; Is the state OFF
+	BEQL	200$			; If EQL yes, report device inactive
+	BSBW	NET$LOCATE_LPD		; Get the associated LPD
+	BLBC	R0,200$			; If LBC, report "device inactive"
+	$GETFLD	cri,v,ser		; Are service functions disabled
+					;&X.25 circuits should always have
+					;&this set
+	MOVZWL	#SS$_IVMODE,R0		; Report "invalid mode" if disabled
+	BLBS	R8,200$			; If LBS then disabled
+	MOVZWL	#SS$_DEVALLOC,R0	; Assumed "circuit already owned"
+	BBS	#LPD$V_ACCESS,-		; If BS then already owned
+		    LPD$W_STS(R6),200$	;
+	MOVL	W^NET$GL_SAVE_IRP,R3	; Get IRP address
+	$GETFLD	cri,l,owpid		; Get circuit's owner PID
+					;&consider setting OWPID when circuit
+					;&watcher gets started
+	BLBC	R0,50$			; Br if none - first time
+	CMPL	R8,IRP$L_PID(R3)	; Does caller own the circuit?
+	BEQL	150$			; If EQL then okay to access
+50$:	;
+	;  Setup process as owner of circuit
+	;
+	MOVL	IRP$L_PID(R3),R8	; Get caller's PID
+	BSBW	CNF$PUT_FIELD		; Store owner process PID
+					;
+150$:	BISW	#LPD$M_ACCESS!-		;
+		 LPD$M_DLE,LPD$W_STS(R6); Mark circuit in use for service fct
+	MOVL	#LEV$C_ACCESS,R0	; Setup event code
+	BSBW	SET_DLL_EVT		; Queue the request
+	MOVZBL	LPD$B_PTH_INX(R6),R1	; Setup LPD index
+	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+200$:	RSB
+
+;+
+; NET$DLL_PRC_EXIT - Direct-line Server Process Exit
+;
+; This routine is called whenever the ACP detects that a process created to
+; service a circuit has exited.  Assocated circuit (if any) is found, the LPD
+; is marked as no longer being "accessed" and is restarted.
+;
+; INPUTS:	R1	PID of process
+;
+; OUTPUTS:	All register contents are destroyed
+;-
+NET$DLL_PRC_EXIT::			; Server process exit
+	MOVL	W^NET$GL_CNR_CRI,R11	; Setup CRI root block
+	CLRL	R10			; Say "start at head of list"
+10$:	$SEARCH	eql,cri,l,owpid		; Find associated CRI
+	BLBC	R0,50$			; If LBC then none left
+	MOVL	#LEV$C_CANCEL,R0	; Setup event
+	BSBW	SET_DLL_EVT		; Queue the request
+	BRB	10$			; Loop
+50$:	RSB				; Done
+
+;+
+; NET$DLL_CANCEL - Cancel I/O on Direct-line Server channel
+;
+; This routine is called whenever the ACP detects an accessor of a circuit
+; cancelling I/O on the associated channel.  The LPD is marked as no longer
+; being "accessed" and is restarted.
+;
+; INPUTS:	R8	LPD index
+;		R5	PID of issuing cancel
+;		R3	IRP address
+;
+; OUTPUTS:	All register contents are destroyed
+;-
+NET$DLL_CANCEL::			; Relinquish server ownership
+	BSBB	CHK_ACCESS		; Check if process is accessing circuit
+	BLBC	R0,50$			; If LBC then no
+	MOVL	#LEV$C_CANCEL,R0	; Setup event
+	BSBW	SET_DLL_EVT		; Queue the request
+50$:	MOVL	S^#SS$_NORMAL,R0	; Allow state change
+	RSB
+
+
+;+
+; NET$DLL_DEACCESS - Relinquish server ownership
+;
+; This routine is called whenever the ACP dequeues an IO$_DEACCESS IRP for
+; a direct-accessed circuit.  The action it free the LPD for normal operation
+; and to restart it.
+;
+; INPUTS:	R8	LPD index
+;		R5	PID of process issuing QIO
+;		R3	IRP address
+;
+; OUTPUTS:	All register contents are destroyed
+;-
+NET$DLL_DEACCESS::			; Relinquish server ownership
+	BSBB	CHK_ACCESS		; Check if process is accessing circuit
+	BLBC	R0,50$			; If LBC then no
+	BSBB	STOP_ACCESS		;
+	MOVL	#LEV$C_DEACCESS,R0	; Get corresponding event
+	BSBW	SET_DLL_EVT		; Queue the request
+50$:	MOVL	S^#SS$_NORMAL,R0	; Allow state change
+	RSB
+
+
+CHK_ACCESS:				; Check if this is accessor of circuit
+	CLRL	R0			; Assume failure
+	TSTB	R8			; Is the LPD index null?
+	BEQL	50$			; If EQL yes, done
+	BSBW	NET$GET_LPD_CRI		; Get LPD and CRI
+	BLBC	R0,200$			; Bug if error detected
+	$GETFLD	cri,l,owpid		; Get the LPD accessor process i.d.
+	BLBC	R0,200$			; Bug if error detected
+	CMPL	R5,R8			; Is this it ?
+	BNEQ	200$			; If NEQ then bug
+50$:	RSB
+
+200$:	BUG_CHECK  NETNOSTATE,FATAL	; Signal the bug
+
+STOP_ACCESS:
+	MOVB	#NMA$C_LINSS_SYN,-	; Enter "synchronizing" substate
+		    LPD$B_SUB_STA(R6)	;
+	MOVZBL	LPD$B_PTH_INX(R6),R8	; Get LPD index
+	BSBW	NET$STOP_DLE		; Tell access module
+	BICW	#LPD$M_DLE!-		; No longer used for direct-line service
+		 LPD$M_ACCESS,-		; no longer being accessed
+		 LPD$W_STS(R6)		; 
+	$CLRFLD	cri,l,owpid		; Clear PID field
+	RSB
+
+;+
+; NET$DLL_RCV - Process block received from the Transport layer
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; Received messages are passed to the ACP from NETDRIVER by queuing the non-
+; paged DYN$C_NET buffer directly to the ACP's AQB.  The WQE header and the
+; body of the message are stored within the same buffer.  The message is
+; scanned to determine its type, an event code is generated, and the event is 
+; dispatched.
+;
+; When a datalink is initialized, NETDRIVER allocates a single IRP for queuing
+; receives to the datalink.  Post processing for this IRP takes place in 
+; NETDRIVER which detaches the received buffer and recycles the IRP by queuing
+; it again to the same datalink.  However, prior to recycling the IRP, if the
+; XM$B_STS_ACTIVE bit in IRP$L_IOST2 is clear then NETDRIVER realizes that the
+; device has shutdown and passes the IRP to the ACP instead of the datalink.
+; The ACP comes here to process this returned IRP.  The eventual action should
+; be to read the entire IRP$L_IOST2 image to detect such things as device
+; entering maintenance mode and to log this event.  For now, the IRP is assumed
+; to be a signal that the device has shutdown.
+;
+; On return, the block is eventually deallocated.
+;
+; INPUTS:	R5	WQE ptr
+;
+;		All others are scratch.
+;
+; OUTPUTS:	All registers are clobbered.
+;
+;-
+
+;
+;  The expected messages have the following format:
+;
+;
+; Phase 2 init	<0101 1000><1K_1><EX2_add><I6_nam><1B_fct><1B_req>-
+;			         <2B_blksiz><2B_nspsiz><2B_maxlnk>-
+;				 <3b_rtver><3b_comver><I32_sysid>
+; Phase 2 verf	<0101 1000><1K_2><8B_psw>
+; 
+;			<1B_fct>    ::== <1k_0>		no intercept functions
+;					 <1k_7>		intercept functions
+;
+;			<1B_req>    ::== low bit = 0 => verf requested
+;					 low bit = 1 => no verf requested
+;					 ignore other requests
+;
+;			<3B_rtver>  ::== <1K_3><1K_1><1K_0>
+;			<3B_comver> ::== <1K_3><1K_1><1K_0>
+;
+;
+; Phase 3 init	<0000 0001><2B_srcnode><1B_tlinfo><2B_blksiz>-
+;			   	       <3b_tlver><I64_seed>
+; Phase 3 verf	<0000 0011><2B_srcnode><I64_psw>
+; Phase 3 test	<0000 0101><2B_srcnode><I128_data>
+; Phase 3 rout	<0000 0111><2B_srcnode><rtginfo>
+;
+;
+; 			<1B_tlinfo> ::== <00000nnv>  nn = 00 reserved
+;							= 01 reserved
+;							= 10 routing
+;							= 11 nonrouting
+;						      v =  0 no verf requested
+;						        =  1 verf requested
+;
+;			<3B_tlver>  ::== <1K_3><1K_1><1K_0>
+;			<64I_seed>  ::== <1K_0>
+;
+;
+NET$DLL_RCV::				; Process received message
+	;
+	;   Establish the context for the event
+	;
+	CLRB	W^XMTFLG		; Clear all xmit flags
+	CLRB	W^STS			; Clear all status flags
+	CLRL	W^LEV_L_LPD		; Clear the LPD pointer
+	CLRQ	W^LEV_Q_CRI		; Clear the CRI CNF,CNR ptrs
+	CLRW	W^LEV_W_PNA		; Clear partner's node address
+	CLRW	W^LEV_W_BLKSIZE		; Clear partner's block size
+	CLRQ	W^LEV_Q_PSWDESC		; Clear init password descriptor
+	MOVZWL	WQE$L_PM2(R5),R1	; Get offset to message
+	ADDL	R5,R1			; Convert to pointer
+	MOVL	R1,WQE$L_EVL_PKT(R5)	; Store ptr in case packet header 
+					; is logged
+	CLRL	W^NET$GL_INITVER	; Nullify recevied INIT message version
+	BSBB	DISPATCH		; Dispatch to determine the event
+	MOVL	WQE$B_EVT(R5),R1	; Get standard event longword
+	BSBW	PROC_EVT		; Process the event
+	;
+	;   If LPD's receiver is suspended waiting for a buffer then pass this
+	;   this buffer back to NETDRIVER.  Else, deallocate it.
+	;
+	PUSHAB	B^30$			; Setup return address
+	MOVL	W^LEV_L_LPD,R6		; Get the LPD
+	BEQL	20$			; If EQL then none
+	MOVL	LPD$L_RCV_IRP(R6),R0	; Is there a waiting Recevie IRP?
+	BEQL	20$			; If EQL then none
+	MOVL	R5,IRP$L_SVAPTE(R0)	; Attach buffer to it
+	CLRL	R5			; ...and erase our pointer to it
+	MOVL	S^#NETUPD$_REACT_RCV,R0	; Fct code is "reactivate receiver"
+	BRW	TELL_NETDRIVER		; Give the buffer back to NETDRIVER
+20$:	BRW	KILL_WQE		; Else, deallocate the buffer
+30$:	RSB
+
+DISPATCH:
+	;
+	;   Determine the event, pre-process where necessary (e.g. initial
+	;   message parsing), and setup the WQE.
+	;
+	MOVB	WQE$B_EVT(R5),R3	; Get Transport layer event code
+	MOVL	W^NET$GL_PTR_VCB,R4	; Get the RCB pointer
+	$DISPATCH  TYPE=B,R3,-
+	<-
+		<NETMSG$C_IRP,   IRP>,-	; IRP event
+		<NETMSG$C_UNK,	 UNK>,-	; Possibly transport control message
+		<NETMSG$C_APL,   APL>,-	; Aged packet
+		<NETMSG$C_OPL,	 OPL>,-	; Oversized packet loss
+		<NETMSG$C_NOL,	 NOL>,-	; Packet for out-of-range node
+		<NETMSG$C_NUL,	 NUL>,-	; Packet for unreachable node
+		<NETMSG$C_PFE,	 PFE>,-	; Packet with format error
+		<NETMSG$C_LSN,	 LSN>,-	; Listener timeout
+	>
+	BUG_CHECK  NETNOSTATE,FATAL	; Bug if unknown
+
+IRP:	$EVT	IRP_EVT,R5		; IRP event
+	RSB
+
+	;
+	;   Determine the type of message received, dispatch to parse it
+	;
+UNK:	MOVAB	W^MSG_MAP_TABLE,R9	; Setup the message mapping table ptr
+	MOVZBL	(R1)+,R3		; Get the message type
+	CMPB	R3,#TR2C_MSG_INI 	; Is this a Phase II init message?
+	BNEQ	70$			; If not, branch
+	TSTB	-(R1)			; Backup
+	MOVZWL	(R1)+,R3		; Get the type and subtype
+70$:	$EVT	RCV_UNK,R5		; Assume event is 'unknown message'
+80$:	MOVL	(R9)+,R0		; Get message parser routine address
+	BEQL	90$			; If EQL then at end of table
+	MOVZWL	(R9)+,R2		; Get minimum msg size
+	CMPW	R3,(R9)+		; Is this it ?
+	BNEQ	80$			; If not, loop
+	SUBW	R2,WQE$L_PM2+2(R5)	; Update bytes left
+	BLSS	PFE		   	; If LSS then packet format error
+	JSB	(R0)			; Parse the message
+90$:	RSB
+
+LSN:					; Listener timeout
+	$LOG	TPL_LDF,TPL_PRSN_LTMO,,R5 ; Store logging info in WQE
+	BRB	RCV_FATAL
+PFE:					; Packet format error
+	BUMP	B,RCB$B_CNT_PFE(R4)	; Increment packet format error count
+	$LOG	TPL_PFM,,,R5		; Store logging info in WQE
+RCV_FATAL:
+	$EVT	LOG_FTE,R5		; Setup for "log fatal event"
+	RSB
+
+
+OPL:					; Oversized packet loss
+	$LOG	TPL_OPL,,,R5		; Store logging info into WQE
+	BRB	NON_FATAL		; Take common exit
+APL:					; Aged packet loss
+	BUMP	B,RCB$B_CNT_APL(R4)	; Increment aged packet loss count
+	$LOG	TPL_APL,,,R5		; Store logging info in WQE
+	BRB	NON_FATAL		; Take common exit
+NUL:					; Node unreachable packet loss
+	BUMP	W,RCB$W_CNT_NUL(R4)	; Increment node unreachable loss count
+	$LOG	TPL_UPL,,,R5		; Store logging info in WQE
+	BRB	NON_FATAL		; Take common exit
+NOL:					; Node out-of-range packet loss
+	BUMP	B,RCB$B_CNT_NOL(R4)	; Increment node out of range loss count
+	$LOG	TPL_RPL,,,R5		; Store logging info in WQE
+NON_FATAL:				; Common non-fatal event exit
+	$EVT	LOG_NFE,R5		; Setup for "log non-fatal event"
+	RSB
+
+
+;+
+; RCV_STR2  - Process received Phase II Transport Initialization Start message
+; RCV_STR3  - Process received Phase III Transport Initialization Start message
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; The message is parsed to determine correctness, node address, and the 
+; database is checked to determine whether a verification message needs to be
+; sent.
+;
+; The possible events returned in WQE$B_EVT are:
+;
+;		LEV$C_RCV_STR	- Rcv Transport Layre "start" msg
+;		LEV$C_RCV_ILL	- Rcv illegally formed message
+;		LEV$C_LOG_FTE	- Fatal event
+;
+;
+; INPUTS:	R5	Ptr to WQE
+;		R4	RCB address
+;		R1	Ptr to next byte in the message
+;
+;		All others are scratch
+;
+; OUTPUTS:	R5	Unchanged
+;
+;		All other regs may be clobbered.
+;
+;-
+RCV_STR2:				; Process rcvd phase II Start msg
+	;
+	;   Parse the node address. If the node is already reachable then we
+	;   must abort the initialization because only one circuit may be
+	;   connected to any given Phase II node.
+	;
+	BSBW	PARSE_PH2_ADDR		; Parse Phase II node address
+	BLBC	R0,50$			; If LBC error, chain to event setup
+					; by PARSE_PH2_ADDR
+	TSTB	@RCB$L_DSP_OL(R4)[R8]	; Is the node already reachable ?
+	BEQL	10$			; If NEQ then cannot allow connection
+	$LOG	TPL_IOF,TPL_PRSN_ADJR,,R5 ; Say "already reachable"
+					  ;& need a better event code
+	BRB	40$			; Return to log fatal event
+
+10$:	;
+	;   Process the nodename field.  The size is checked but the name text
+	;   itself is ignored (this is consistent with not knowing the name of
+	;   a Phase III node and allows the rules for Phase II and Phase III
+	;   nodes to be the same with respect to whether or not there needs
+	;   to be an NDI in the database for that node -- i.e., an NDI is
+	;   needed only if "verification" is required for the circuit which
+	;   connects to the node).
+	;
+	MOVZBL	(R1)+,R0		; Get bytes in node name
+	SUBW	R0,WQE$L_PM2+2(R5)	; Account for them
+	BLSS	100$			; If LSS then msg is too small
+	ADDL	R0,R1			; Advance past name
+	;
+	;   Ignore the FUNCTIONS field
+	;
+20$:	TSTB	(R1)+			; If LSS then field is extended
+	BGEQ	22$			; If GEQ then okay
+	DECW	WQE$L_PM2+2(R5)		; Account for next (optional) byte
+	BLSS	100$			; If LSS then format error
+	BRB	20$			; Loop
+22$:	;
+	;   Process the REQUESTS field
+	;
+	BBC	#TR2V_REQ_VRF,(R1),25$	; If LBC verification not required
+	BISB	#LPD$M_XMT_VRF,W^XMTFLG	; Indicate verification required
+25$:	TSTB	(R1)+			; If LSS then field is extended
+	BGEQ	27$			; If GEQ then okay
+	DECW	WQE$L_PM2+2(R5)		; Account for next (optional) byte
+	BLSS	100$			; If LSS then format error
+	BRB	25$			; Loop
+27$:	;
+	;   Get the partner's block size and version
+	;
+	MOVW	(R1)+,LEV_W_BLKSIZE	; Save partner's block size
+	TSTL	(R1)+			; Skip over partner's NSP block size
+					; and his MAX LINKS specifier
+	BISB	#LPD$M_PH2,W^STS	; Setup node type
+	BISB	#LPD$M_XMT_STR,W^XMTFLG	; Need to rexmit start msg (the start
+					; msg we already sent was Phase III)
+	BRW	STRT_COM		; Nothing else can go wrong, continue
+					; in common
+
+40$:	$EVT	LOG_FTE,R5		; Event is "log fatal error"
+50$:	RSB				; Return (R0 not used for status)
+
+100$:	BRW	PFE			; Packet format error
+
+
+		.ENABL	LSB
+RCV_STR3:				; Process rcvd phase III Start msg
+	BSBW	PARSE_PH3_ADDR		; Parse phase III node address field
+	BLBC	R0,30$			; Br on error with new event setup by
+					; PARSE_PH3_ADDR
+	BBC	#TR3V_REQ_VRF,(R1),10$	; Br unless verification is requested
+	BISB	#LPD$M_XMT_VRF,W^XMTFLG	; Need to send verif. msg
+10$:	EXTZV	#TR3V_REQ_NTY,-		; Get node type
+		#TR3S_REQ_NTY,(R1)+,R0	;
+	CMPB	R0,#TR3C_NTY_PH3	; Is it a routing node?
+	BEQL	20$			; If EQL then no bit to set in STS
+	BISB	#LPD$M_PH3N,W^STS	; Assume 'non-routing' node
+	CMPB	R0,#TR3C_NTY_PH3N	; Is it a non-routing node?
+	BEQL	20$			; If EQL yes, continue
+	BRW	PFE			; Else report "packet format error"
+20$:	MOVW	(R1)+,W^LEV_W_BLKSIZE	; Store partner's block size
+
+STRT_COM:
+	MOVW	(R1)+,NET$GL_INITVER	; Save INIT version (3 bytes)
+	MOVB	(R1)+,NET$GL_INITVER+2	
+	;
+	;   Ignore the remainder of the message
+	;
+	$EVT	RCV_STR,R5		; Event is 'rcvd start msg'
+30$:	RSB				; Done (R0 not used for status
+
+		.DSABL	LSB
+
+
+;+
+; RCV_VRF2 - Process received Transport Phase II Verification message
+; RCV_VRF3 - Process received Transport Phase III Verification message
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;
+; INPUTS:	R5	WQE ptr
+;		R4	RCB pointer
+;		R1	Ptr to next byte in the message
+;
+;		All others are scratch
+;
+; OUTPUTS:	R5	Unchanged
+;
+;		All other registers may be clobbered.
+;
+;-
+			.ENABL	LSB
+RCV_VRF2:				; Preprocess rcv'd Phase II Verf msg
+	BISB	#LPD$M_PH2,W^STS	; This is a Phase II message
+	CMPW	S^#TR2C_PSW_LNG,-	; Is the msg size correct?
+		WQE$L_PM2+2(R5)		; 
+	BEQL	5$			; If EQL yes, save password
+	BRW	PFE			; Else report "packet format error"
+
+RCV_VRF3:
+	BSBW	PARSE_PH3_ADDR		; Get partner's address
+	BLBC	R0,10$			; If LBC error, exit with event setup
+					; by PARSE_PH3_ADDR
+	MOVZBL	(R1)+,R0		; Get count of password text
+	CMPW	R0,WQE$L_PM2+2(R5)	; Does it match bytes left?
+	BNEQ	20$			; If not, illegal message
+	CMPB	R0,#TR3C_MAX_PSW	; Is it too large
+	BGTRU	20$			; If so, illegal message
+	;
+	;   Store the password descriptor
+	;
+5$:	$EVT	RCV_VRF,R5			; Setup event code
+	MOVZBL	WQE$L_PM2+2(R5),W^LEV_Q_PSWDESC	; Save password size
+	MOVL	R1,W^LEV_Q_PSWDESC+4		; Save password pointer
+10$:	RSB
+
+20$:	BRW	PFE			; Report "packet format error"
+			.DSABL	LSB
+
+;+
+; RCV_RT - Routing message received
+;
+; FUNCTIONAL DESCRIPTION:
+;
+;	Verify the routing message header and checksum and queue a 
+;	routing update event.
+;
+; INPUTS:	R5	WQE ptr
+;		R4	RCB pointer
+;		R1	Ptr to next byte in the message
+;
+;		All others are scratch
+;
+; OUTPUTS:	R5	Unchanged
+;
+;		All other registers may be clobbered.
+;
+;-
+RCV_RT:					; Process a routing message
+	BSBW	PARSE_PH3_ADDR		; Parse the node address
+	BLBC	R0,15$			; If LBC then error
+	SUBW3	R5,R1,WQE$L_PM2(R5)	; Save offset to current msg byte
+	MOVZWL	WQE$L_PM2+2(R5),R7	; Get msg bytes remaining
+	BLBS	R7,13$			; Must be an even number
+	DIVL	#2,R7			; Get number of words
+	BEQL	13$			; Illegal msg if EQL
+	;
+	;   Calculate checksum  --  R7 does not include the checksum. 
+	;   The highest node address associated with a non-infinite cost/hops
+	;   message cell is determined.  If that address is greater than
+	;   our current "max address" then it is reported as an event.
+	;
+	MOVL	#1,R0			; Setup loop counter	
+	CLRQ	R2			; Init check sum (R2) and highest node
+					; (R3) reachable by partner
+10$:	CMPW	(R1),#^X<7FFF>		; Compare to infinite "cost,hops"
+	BGTRU	13$			; If GTRU then field is invalid
+	BEQL	11$			; If EQL then not reachable by partner
+	MOVL	R0,R3			; Save highest reachable address
+11$:	ADDW	(R1)+,R2		; Calculate checksum via 1's complement
+	ADWC	#0,R2			;   add - needs "end around carry"
+	INCL	R0			; Advance to next node address
+	CMPL	R0,R7			; At end of message?
+	BLEQU	10$			; If LEQU then no
+	$EVT	RCV_RT,R5		; Set up event assuming valid checksum
+	CMPW	R2,(R1)			; Check sum valid ?
+	BEQL	15$			; If EQL then  valid
+13$:	$LOG	TPL_LDF,TPL_PRSN_RUCS,,R5 ; due to "routing update checksum"
+	BRW	RCV_FATAL		; Report fatal event
+	;
+	;   The message is okay.  Log "partial routing update loss" if needed.
+	;
+15$:	CMPW	R3,RCB$W_MAX_ADDR(R4)	; Is partner's highest reachable node
+					; address within range?
+	BLEQU	50$			; If LEQU then yes
+	BUMP	B,RCB$B_CNT_RUL(R4)	; Inc count for this event
+					;&change to RCB$B_CNT_PRU
+	$LOG	TPL_PRU,,,R5		; Setup event logging code
+
+	ASSUME	WQE$B_EVL_DT2-WQE$B_EVL_DT1 EQ 1
+
+	MOVW	R3,WQE$B_EVL_DT1(R5)	; Store partner's highest reachable
+					; node address
+	MOVZBL	WQE$W_REQIDT(R5),R8	; Get LPD index
+	BSBW	NET$GET_LPD_CRI		; Find LPD and CRI for this index
+	BLBC	R0,50$			; If LBC then none
+	BSBW	NET$EVT_INTRAW		; Log the event
+50$:	RSB
+
+SET_DLL_EVT:
+	PUSHR	#^M<R0,R1,R2>		; Save regs
+	CLRL	R1			; Indicate no addition WQE space needed
+	MOVL	#WQE$C_SUB_ACP,R0	; Indicate WQE subtype
+	BSBW	WQE$ALLOCATE		; Allocate WQE (always succeeds!)
+	MOVL	R2,R0			; Transfer WQE address
+	CVTLB	(SP)+,WQE$B_EVT(R0)	; Enter event code
+	MOVQ	(SP)+,R1		; Recover R1,R2 and cleanup stack
+	MOVW	LPD$W_PTH(R6),-		; Enter event context i.d.
+		    WQE$W_REQIDT(R0)	;
+	MOVL	R1,WQE$L_PM2(R0)	; Enter optional parameter
+	MOVAB	B^NET$DLL_PRC_WQE,-	; Enter action routine address
+		    WQE$L_ACTION(R0)	;
+	BSBW	WQE$INSQUE		; Queue the WQE
+10$:	MOVB	#1,R0			; Indicate success
+	RSB
+
+
+;+
+; NET$DLL_PRC_WQE  - Process Work Queue Element
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; This routine is called by the work queue dispatcher after the WQE is 
+; dequeued from the work queue.  The WQE is deallocated below once it has
+; been processed.
+;
+; INPUTS:	R5	WQE address
+;		R2	WQE$L_PM2 value
+;		R1	WQE$L_PM1 value - standard event longword
+;
+;		All other registers are scratch.
+;
+; OUTPUTS:	All registers are clobbered.
+;
+;-
+NET$DLL_TIMER::				; Process timer event
+	CLRL	R2			; Nullify optional parameter
+NET$DLL_PRC_WQE::			; Process DLL WQE event
+	BSBB	PROC_EVT		; Process the event longword in R1
+KILL_WQE:				; Deallocate WQE if its there
+	MOVL	R5,R0			; Get WQE for deallocation
+	BEQL	20$			; If EQL then none
+	CLRL	R5			; Nullify normal pointer to it
+	BSBW	WQE$DEALLOCATE		; Deallocate the WQE
+20$:	RSB				; Done
+
+;+
+; PROC_EVT	- Process DLL event
+;
+; This routine processes all Data Link Layer events and is state table driven.
+; Action routines are called until the null event is detected.  Each action
+; routine generates a new event, which it returns in R1, and returns with the 
+; low bit set in R0 only if the indicated state change is to be performed.
+;
+; INPUTS:	R5	WQE ptr or zero
+;		R2	Optional event parameter
+;		R1	Standard event longword
+;
+;		All other registers are scratch.
+;
+; OUTPUTS:	R5	Preserved
+;
+;		All other registers are clobbered
+;-
+PROC_EVT:				; Process all DLL events
+	;
+	;   Find the LPD and CRI
+	;
+	MOVZBL	R1,R3			; Get event code
+	EXTZV	#16,#16,R1,R8		; Get WQE$W_REQIDT - path i.d.
+	TSTB	R8			; Is this the "local" LPD
+	BGTR	3$			; If GTR then no (EQL never happens)
+	BSBW	NET$LOCLPD_DOWN		; Report it's shutting down
+	BRB	20$			; done
+3$:	BSBW	NET$GET_LPD_CRI		; Find LPD and CRI for this path 
+	BLBC	R0,20$			; If LBC then none
+	MOVL	R6,W^LEV_L_LPD		; Save the LPD pointer
+	MOVQ	R10,W^LEV_Q_CRI		; Save the CRI CNF and CNR ptrs
+	;
+	;   Find appropriate state table entry
+	;
+	MOVZBL	R3,R1			; Get the event code
+5$:	MOVZBL	LPD$B_STI(R6),R3	; Get LPD internal state
+	CMPL	S^#LEV$C_MAX_EVT,R1	; Is event within range ?
+	BLSSU	30$			; If LSSU then bug exists
+	MULL	S^#LEV$C_STATES,R1	; Bias for current event
+	ADDL	R3,R1			; Add current state offset
+	MOVAW	W^LEV$AW_STA_TAB[R1],R3	; Address state table entry
+	;
+	;
+	;
+	;   Dispatch to the action routine with the following:
+	;
+	;   INPUTS:	R11	CRI CNR ptr
+	;		R10	CRI CNF ptr
+	;		R6	LPD ptr
+	;		R4	RCB address
+	;		R5	WQE ptr or zero 
+	;
+	;   ON RETURN:	R5	Unchanged
+	;		R1	Next event to be processed
+	;		R0	Low bit set if state change is permitted,
+	;			Low bit clear to avoid state change
+	;
+	;		All other regs may be clobbered
+	;
+	BSBW	NET$JNX_CO		; Log this event into the journal
+					; Clobbers R0; stack is uncertain if
+					; successful; R0,R1 used on call-back
+	BLBC	R0,14$			; If LBC journalling is inactive
+	BSBW	FILL_JNL		; Fill the journal
+	JSB	@(SP)+			; Return to journal co-routine for
+					; cleanup
+14$:
+	PUSHAB	(R3)+			; Save table address
+	MOVZBL	(R3),R3			; Get action routine index
+	MOVL	W^LEV_AL_ACTTAB[R3],R3	; Get action routine address
+	MOVL	W^NET$GL_PTR_VCB,R4	; Get RCB pointer
+	JSB	(R3)			; Dispatch
+	POPL	R3			; Get next state, cleanup stack
+	MOVL	W^LEV_L_LPD,R6		; Get LPD pointer
+	BEQL	20$			; If EQL then its been deallocated
+	BLBC	R0,15$			; Avoid state change if LBC
+	MOVB	(R3),LPD$B_STI(R6)	; Change state
+15$:	MOVQ	W^LEV_Q_CRI,R10		; Recover CRI context
+	CMPL	S^#LEV$C_EXIT,R1	; Are we done ?
+	BNEQ	5$			; If NEQ then process next event
+	BSBW	COND_DEAL_LPD		; Clean-up if necessary
+20$:	RSB
+
+30$:	BUG_CHECK  NETNOSTATE,FATAL	; Signal the bug
+
+
+FILL_JNL:
+	MOVB	#^X<CC>,(R1)+		; Enter journal record type
+	MOVB	LPD$B_PTH_INX(R6),(R1)+	; Enter circuit index
+	SUBL3	#LEV$AW_STA_TAB,R3,(R1)+; Enter the state table offset
+	MOVW	(R3),(R1)+		; Enter table contents
+	MOVW	LPD$W_STS(R6),(R1)+	; Enter current status
+	MOVB	LPD$B_XMTFLG(R6),(R1)+	; Enter xmit flags
+	MOVB	LPD$B_ASTCNT(R6),(R1)+	; Enter asynch activity count
+	MOVW	LPD$W_PTH(R6),(R1)+	; Enter path i.d.
+	MOVW	LPD$W_PNA(R6),(R1)+	; Enter the partner's address
+	MOVW	LPD$W_XMTBUFSIZ(R6),(R1)+ ; Enter partner's block size
+	MOVW	W^LEV_W_BLKSIZE,(R1)+	  ; (from here too to find bug)
+	RSB
+
+;+
+; ACT_BUG	- Bugcheck failure
+; ACT_NYI	- Not-yet-implemented error
+; ACT_NOP	- No-operation
+; ACT_IRP_EVT	- I/O Request Packet returned to ACP
+; ACT_LOG_FTE	- Log a fatal error
+; ACT_LOG_NFE	- Log a non-fatal error
+;
+;
+; Various "simple" data link state transition action routines.
+;
+;
+;   INPUTS:	R11	CRI CNR ptr
+;		R10	CRI CNF ptr
+;		R6	LPD ptr
+;		R5	WQE ptr or zero 
+;		R4	RCB address
+;
+;   OUTPUTS:	R5	Unchanged
+;		R1	Next event to be processed
+;		R0	Low bit set if state change is permitted,
+;			Low bit clear to avoid state change
+;
+;		All other regs may be clobbered
+;
+ACT_BUG:
+	BUG_CHECK  NETNOSTATE,FATAL	; Signal the bug
+ACT_NYI:
+	BUG_CHECK  NETNOSTATE,FATAL	; Signal the bug
+
+ACT_EXIT:				; Exit state table processing
+	MOVL	S^#LEV$C_EXIT,R1	; Signal last event
+	MOVB	#1,R0			; Allow state transition
+	RSB
+
+ACT_NOP:				; Nop action routine
+	MOVL	S^#LEV$C_NO_EVT,R1	; Signal last event
+	MOVB	#1,R0			; Allow state transition
+	RSB
+
+ACT_IRP_EVT:				; Determine IRP event
+	DECB	LPD$B_ASTCNT(R6)	; IRP has returned
+5$:	MOVL	S^#LEV$C_IRP_MM,R1	; Assume device entered "maintenance
+					; mode
+	BBS	#XM$V_ERR_MAINT,-	; Br if we were right
+		IRP$L_IOST2(R5),10$	;
+	MOVL	S^#LEV$C_IRP_DOWN,R1	; Assume device has shut down
+10$:	MOVB	#1,R0			; Allow state transition
+	RSB
+
+
+ACT_LOG_FTE:				; Log fatal error
+	BSBW	NET$EVT_INTRAW		; Call internal raw event logger
+	MOVL	S^#LEV$C_LIN_DWN,R1	; Generate circuit down event
+	MOVB	#1,R0			; Allow state change
+	RSB
+
+ACT_LOG_NFE:				; Log non-fatal error
+	BSBW	NET$EVT_INTRAW		; Call internal raw event logger
+	MOVL	S^#LEV$C_NO_EVT,R1	; No new events
+	MOVB	#1,R0			; Allow state change
+	RSB
+
+;+
+; ACT_RCV_STR - Start message received
+; ACT_RCV_VRF - Verification message received
+;
+; INPUTS:	R11	CRI CNR ptr
+;		R10	CRI CNF ptr
+;		R9-R7	Scratch
+;		R6	LPD ptr
+;
+; OUTPUTS:	R6	Preserved
+;		R1	Next event to be processed
+;		R0	Low bit set if state change is permitted,
+;			Low bit clear to avoid state change.
+;
+;		All other regs may be clobbered.
+;-
+ACT_RCV_2STR:					; Second start msg received
+	BISB	#LPD$M_XMT_STR!LPD$M_XMT_VRF,-	; Set xmit flags
+		LPD$B_XMTFLG(R6)		;
+
+ACT_RCV_STR:
+	;
+	;   If the LPD$V_PH2 bit is already set in the LPD then this circuit
+	;   has been marked via the ACP's QIO control interface to initialize
+	;   as if the local node were Phase II.  If that is the case, we do
+	;   not need to re-xmit a Phase II Start message; however, we must
+	;   ignore the received message if it were a Phase III start message
+	;
+	CLRB	R0				; Assume no state change
+	BBC	#LPD$V_PH2,LPD$W_STS(R6),5$	; If BC then circuit has not
+						; been marked to force Phase II
+	BICB	#LPD$M_XMT_STR,W^XMTFLG		; Clear flag to re-xmit START
+	BBC	#LPD$V_PH2,W^STS,40$		; If BC then ignore the message
+5$:	$LOG	TPL_IOF,TPL_PRSN_ADJB,,R5 	; Assume buffer size too small
+	MOVL	S^#LEV$C_LOG_FTE,R1		; Buffer size too small is fatal
+	CMPW	W^LEV_W_BLKSIZE,#NET$C_MINBUFSIZ; At least as big as minimum?
+	BLSSU	50$				; If LSSU then no
+	MOVB	#TR2C_NUM_NOP,LPD$B_TSTCNT(R6)	; Setup # of NOP msgs to send
+						; to test the circuit
+	BBS	#LPD$V_PH2,W^STS,10$		; If BS partner is Phase II
+	BBS	#LPD$V_PH3N,W^STS,20$		; If BS partner is non-routing
+	;
+	;   Partner is a Phase III routing node.  Determine if his receive 
+	;   buffer size is adequate to receive a maximum sized routing message.
+	;
+	MOVZWL	RCB$W_MAX_ADDR(R4),R7		; Get max node address
+	MULL	#NET$C_TRCTL_CEL,R7		; Cell size for node in 
+						; routing message
+	ADDL	#NET$C_TRCTL_OVR,R7		; Routing message overhead
+	CMPW	W^LEV_W_BLKSIZE,R7		; Can partner receive rtg msg?
+	BLSSU	50$				; If LSSU buffer is too small
+	;
+	;   Store partner's block size, set flags to schedule initialization
+	;   message transmission.  Setup number of test messages to send during
+	;   acceptance testing.
+	;
+10$:	MOVB	#TR3C_NUM_TST,LPD$B_TSTCNT(R6)	; Setup number of test messages
+20$:	MOVW	W^LEV_W_BLKSIZE,LPD$W_XMTBUFSIZ(R6) ; Setup partner's buff size
+	MOVW	W^LEV_W_PNA,LPD$W_PNA(R6)	; Setup partner's node address
+	BISB	W^XMTFLG,LPD$B_XMTFLG(R6)	; Setup xmit flags
+	BISW	W^STS,LPD$W_STS(R6)		; Setup status bits
+	BBS	#LPD$V_XMT_VRF,W^XMTFLG,30$	; Br if verification msg needed
+	BICB	#LPD$M_XMT_VRF,LPD$B_XMTFLG(R6)	; Clear flag to send the msg
+30$:	MOVB	#1,R0				; Allow state change
+40$:	MOVL	S^#LEV$C_NO_EVT,R1		; No further events
+50$:	RSB
+
+ACT_RCV_VRF:
+	MOVZWL	 LPD$W_PNA(R6),R8	; Get partner's address
+	;
+	;   Is phase of verification message the same as that of the Init msg?
+	;
+	$LOG	TPL_ISF,TPL_PRSN_UXPK,,R5 ; Assume phase change
+					
+	BBC	#LPD$V_PH2,-		; Br if Phase III expected
+		 LPD$W_STS(R6),5$	;
+	BBS	#LPD$V_PH2,W^STS,10$	; Br if rcv'd msg was Phase II also
+	BRB	30$			; Else phase change
+5$:	BBS	#LPD$V_PH2,W^STS,30$	; If BS then phase change
+	;
+	;   Did the operator change the adjacent node's address?
+	;
+	$LOG	TPL_IOF,TPL_PRSN_ADJC,,R5 ; Assume address change
+	CMPW	R8,W^LEV_W_PNA		; Is the address the same as it was?
+	BNEQ	30$			; If NEQ then not the same
+	;
+	;   Receive password match?
+	;
+10$:	$GETFLD	cri,v,ver		; Is verification required ?
+	ASSUME	NMA$C_CIRVE_ENA  EQ  0
+	ASSUME	NMA$C_CIRVE_DIS  EQ  1
+	BLBS	R8,20$			; If LBC no
+	MOVZWL	W^LEV_W_PNA,R8		; Get node address
+	MOVL	L^NET$GL_CNR_NDI,R11	; Setup the root pointer
+	BSBW	NET$NDI_BY_ADD		; Find the matching NDI
+	BLBS	R0,15$			; If LBS then found
+	$EVT	LOG_FTE,R5		; Event is "log fatal error"
+	$LOG	TPL_VFR,TPL_PRSN_ADJR,,R5 ; - due to "node not in database"
+					;! need to get better code from DRG"
+	BRB	30$			; Chain to "log fatal error"
+15$:	$GETFLD	ndi,s,rpa		; Get the receive password 
+	BLBC	R0,20$			; If LBC then no password match needed
+	$LOG	TPL_VFR,,,R5 		; Assume password mismatch
+	CMPC5	R7,(R8),#0,-		;
+		W^LEV_Q_PSWDESC,-	; Does it match ?
+		@W^LEV_Q_PSWDESC+4	;
+	BNEQ	30$			; If NEQ no - verification failure
+20$:	MOVL	S^#LEV$C_RCV_VVF,R1	; Indicate "valid verification"
+	MOVB	#1,R0			; Allow state change
+	BRB	40$			; Take common exit
+
+30$:	MOVL	S^#LEV$C_LOG_FTE,R1	; Verification msg is invalid
+	CLRB	R0			; Don't allow state change
+40$:	RSB
+
+ACT_RCV_RT:				; React to rcv'd routing message
+	BSBB	PROC_RT			; Do common processing
+	BLBC	R0,10$			; If LBC then something's wrong
+	BSBW	ACT_REQ_UPDATE		; Request running of update algorithm
+10$:	RSB				; Return state table control in R0/R1
+
+ACT_RCV_RTA:				; Receive routing message while running
+					; the acceptance algorithm
+	BSBB	PROC_RT			; Do common processing
+	BLBC	R0,10$			; If LBC then something's wrong
+	;
+	;   Terminate the acceptance testing and generate a "circuit up"
+	;   event.  This is necessary since we've just updated the matrix.
+	;
+	CLRB	LPD$B_TSTCNT(R6)	; Don't send any more test messages
+	MOVL	#LEV$C_LIN_UP,R1	; Signal "circuit up"
+10$:	RSB				; Return state table control in R0/R1
+
+PROC_RT:				; Common Routing message processing
+	;
+	;   Did the operator change the adjacent node's address?
+	;
+	MOVL	#LEV$C_LOG_FTE,R1	  ; Assume fatal error
+	CLRL	R0			  ; Disallow state change on fatal error
+	$LOG	TPL_LDO,TPL_PRSN_ADJC,,R5 ; Assume address change
+	CMPW	LPD$W_PNA(R6),W^LEV_W_PNA ; Is the address the same as it was?
+	BNEQ	30$			  ; If NEQ then not the same
+	;
+	;   Update the matrix
+	;
+	MOVZBL	LPD$B_PTH_INX(R6),R3	; Get the circuit index
+	MULL	#NUM_NODES,R3		; Get offset to circuit's matrix row
+;&	MOVAW	W^NET$AW_COST_HOP[R3],R3; Convert to pointer
+	MOVL	W^NET$GL_PTR_CHM,R1	; Get pointer to Cost/Hops matrix
+	BEQL	20$			; If EQL then none
+	MOVAW	(R1)[R3],R3		; Convert to pointer
+	MOVZWL	WQE$L_PM2(R5),R1	; Get msg offset to node #1's cost/hops
+	ADDL	R5,R1			; Convert to pointer
+	MOVQ	R4,-(SP)		; Save regs
+	MOVC5	WQE$L_PM2+2(R5),(R1),-	; Update the matrix
+		#-1,-			;  - pad with infinite cost/hops value
+		#<NUM_NODES-1>*2,2(R3)	;  - first entry in matrix is for
+					;    for node #0 and is not updated
+	MOVQ	(SP)+,R4		; Restore regs
+20$:	MOVL	#1,R0			; Indicate success
+30$:	RSB
+
+
+NET$TIMER_RUS:				; Update suppression timer has fired
+	BSBW	KILL_WQE		; Deallocate the timer block
+	MOVL	L^NET$GL_PTR_VCB,R4	; Get the RCB pointer
+	BICB	#RCB$M_STS_RUS,-	; Clear flag that says timer is ticking
+		 RCB$B_STATUS(R4)	;
+	BBC	#RCB$V_STS_UPD,-	; If BS then update has been requested
+		 RCB$B_STATUS(R4),10$	;
+	BSBB	ACT_REQ_UPDATE		; Perform the update
+10$:	RSB
+
+NET$TIMER_XRT:				; Entered when the routing timer fires
+	BSBW	KILL_WQE		; Deallocate the timer block
+	;
+	;   Set the XRT bit in the RCB to force the propagation of routing
+	;   messages when the suppression timer permits.
+	;
+	MOVL	L^NET$GL_PTR_VCB,R4	; Get the RCB pointer
+	BISB	#RCB$M_STS_XRT,-	; Force propagation of routing messages
+		 RCB$B_STATUS(R4)	;
+	BSBB	ACT_REQ_UPDATE		; Request routing table update
+	RSB
+
+ACT_REQ_UPDATE:				; Process request to send routing messages
+	;
+	;   If the suppression timer is not already ticking exit and wait for 
+	;   it to fire.  Otherwise reset it and run the update algorithm.
+	;
+	BISB	#RCB$M_STS_UPD,-	; Remember request to update the data-
+		 RCB$B_STATUS(R4)	; in case suppression timer is ticking
+	BBSS	#RCB$V_STS_RUS,-	; If BS then the 'routing update
+		 RCB$B_STATUS(R4),20$	; suppression' timer is ticking
+	MOVZWL	#<<WQE$C_QUAL_RTG>@8>!-	; Setup suppression timer i.d.
+		NET$C_TID_RUS,R1	;
+	MOVAB	B^NET$TIMER_RUS,R2	; Setup action routine
+	MOVQ	#TR$C_TIM_RUS*-		; Setup timer interval
+		10*1000*1000,R3		;
+	BSBW	WQE$RESET_TIM		; Reset the routing suppression timer
+	MOVL	L^NET$GL_PTR_VCB,R4	; Get the RCB pointer
+
+	;
+	;   Run the update algorithm on the data base.
+	;
+	BSBB	UPDATE			; Update the routing data base
+20$:	MOVL	#LEV$C_NO_EVT,R1	; Setup event code
+	MOVL	#1,R0			; Always return success
+	RSB
+
+;+
+; UPDATE - Update the routing data base
+;
+; Run the routing algorithm, update the routing data base, and
+; schedule routing message transmission to all Phase III routing nodes.
+;
+; INPUTS:	
+;
+; OUTPUTS:
+;
+;-
+UPDATE:					; Update the routing data base
+	BICB	#RCB$M_STS_UPD,-	; Clear the work bit
+		 RCB$B_STATUS(R4)
+	MOVQ	R10,-(SP)		; Save R10,R11
+	;
+	;   Establish MAX_HOPS and MAX_COST
+	;
+	MOVL	L^NET$GL_CNR_LNI,R11	; Get LNI root
+	MOVL	L^NET$GL_PTR_LNI,R10	; Get LNI CNF
+	$GETFLD	lni,l,mho		; Fetch max hops field
+	BLBC	R0,10$			; Br on error
+	MOVZBL	R8,W^MAX_HOPS		; Store it
+	$GETFLD	lni,l,mco		; Fetch max cost field
+	BLBC	R0,10$			; Br on error
+	MOVZWL	R8,W^MAX_COST		; Store it
+	;
+	;   Establish MIN_COST/MIN_HOPS and the OL (output circuit) pointers
+	;
+	MOVZWL	RCB$W_MAX_ADDR(R4),R8	; Get max node address
+	INCL	R8			; Get number of node addresses counting
+					; address #0
+	MOVAB	@RCB$L_DSP_OL(R4)[R8],R10 ; Point past last OL entry
+	MOVAW	W^NET$AW_MIN_C_H[R8],R11  ; Point past last Cost/Hops entry
+	TSTB	RCB$B_MAX_LPD(R4)	; Any circuits?
+	BEQL	10$			; If EQL then nothing to do
+	BSBB	NODE			; Update the data base
+10$:	BBCC	#RCB$V_STS_XRT,-	; If BS then we need to send routing
+		 RCB$B_STATUS(R4),20$	; messages
+	BSBW	UPD_NEIGHBORS
+20$:	MOVQ	(SP)+,R10		; Restore regs
+	RSB
+
+;+
+;
+; INPUTS:	R11	Points past last Cost/Hops entry in NET$AW_MIN_C_H
+;		R10	Points past last entry in the OL vector
+;		R9	Scratch
+;		R8	Number of node addresses including address #0
+;
+; OUTPUTS:	***TBS***
+;
+NODE:	PUSHR	#^M<R4,R5>		; Save regs
+	BRW	100$			; Advance to the end of the loop
+	;
+	;   Update MIN_COST/MIN_HOPS and OL vectors
+	;
+10$:	BSBW	CIRCUIT			; Find hops, costs, and circuit
+	CMPB	R1,W^MAX_HOPS		; Is the node within range?
+	BGTRU	30$			; If GTRU then no
+	CMPW	R2,W^MAX_COST		; Is the node within range?
+	BLEQU	40$			; If LEQU then yes
+	;
+	;   Build the packed cost/hops field
+	;
+30$:	CLRL	R0			; Node is unreachable
+40$:	ASSUME	TR3V_RT_COST  EQ  0
+	INSV	R1,#TR3V_RT_HOPS,-
+		#TR3S_RT_HOPS,R2	; Merge hops/cost
+	ASSUME	TR3S_RT_HOPS+TR3S_RT_COST EQ 15
+	BICW	#^X<8000>,R2		; The high bit must be zero (Transport
+					; architectural requirement)
+	;
+	;   Determine the output circuit index.  If R0=0 then get the path from
+	;   the Phase II OL vector since Phase II nodes appear unreachable to 
+	;   the routing algorithms.  The Phase II OL vector cell will be 0 
+	;   unless the node is a reachable Phase II node.
+	;
+50$:	TSTB	R0			; Is the node reachable?
+	BNEQ	55$			; If NEQ then yes
+	MOVW	#^X<7FFF>,R2		; Make COST/HOPS infinite
+
+	;
+	;   Send routing msg only if  MINCOST or MINHOPS have changed.  If
+	;   there has been a change in the node's reachability then record
+	;   this fact so that it can be sent to the event logger.
+	;
+55$:	ASSUME	TR3S_RT_HOPS+TR3S_RT_COST EQ 15
+	BICW	#^X<8000>,-(R11)	; Ignore high bit
+	CMPW	R2,(R11)		; Was there a hops or cost change ?
+	BEQL	90$			; If EQL then no
+	CMPW	R2,#^X<7FFF>		; Is node currently unreachable?
+	BGEQU	57$			; If GEQU yes, reachability change
+	CMPW	(R11),#^X<7FFF>		; Was node unreachable before?
+	BLSSU	58$			; If LSSU no, no reachability change
+57$:	BBSS	R8,L^REACH_EVT,58$	; Indicate change in reachability status
+58$:	MOVW	R2,(R11)		; Update the vector
+	BISB	#RCB$M_STS_XRT,-	; Flag need to send routing messages
+		 RCB$B_STATUS(R4)
+
+	;
+	;   Update the OUT_LINE (actually "output circuit") vector.
+	;
+90$:	MOVB	R0,-(R10)		; Update output circuit path number
+100$:	SOBGTR	R8,10$			; Loop for each node address
+	MNEGB	#1,-(R10)		; Use "local" path for node 0
+					; (node 0 is the always the local node)
+	CLRW	-(R11)			; Use 0 cost/hops for the local node
+
+	;
+	;   Log an event for each node whose reachability status has changed.
+	;
+	MOVL	#NUM_NODES,R8		; Setup max node address
+200$:	BBCC	R8,L^REACH_EVT,210$	; If BS then reachability change
+	BSBB	RCH			; Log the event
+210$:	SOBGTR	R8,200$			; Loop for each node
+
+300$:	POPR	#^M<R4,R5>		; Restore regs
+	RSB
+
+
+RCH:	;
+	;  Signal reachability change on this node
+	;
+	PUSHL	R8			; Save node address
+	MOVAB	W^NET$AB_EVT_WQE,R5	; Point to common event WQE
+	MOVL	L^NET$GL_CNR_NDI,R11	; Get the NDI root block
+	MOVL	L^NET$GL_PTR_VCB,R4	; Get RCB
+	MOVL	W^NET$AL_NDI_VEC[R8],R10; Get node's CNF block
+	MOVW	R8,WQE$W_REQIDT(R5)	; Setup the node address
+	MOVB	#EVC$C_TPL_PSTS_RCH,-	; Assume node is now reachable
+		WQE$B_EVL_DT1(R5)	;
+	TSTB	@RCB$L_DSP_OL(R4)[R8]	; Is node now reachable?
+	BNEQ	10$			; If NEQ then yes
+	MOVB	#EVC$C_TPL_PSTS_URC,-	; Signal "unreachable"
+		WQE$B_EVL_DT1(R5)	;
+10$:	MOVW	#EVC$C_TPL_RCH,-	; Setup event logging code
+		WQE$W_EVL_CODE(R5)	;
+	BSBW	NET$EVT_INTRAW		; Log the event
+					; All regs but R5 come back clobbered
+	POPL	R8			; Restore node address
+	RSB
+
+CIRCUIT:;
+	;   Determine MINCOST, MINHOPS, and OUT_LINE
+	; 
+	MNEGL	#1,R0			; Setup index for 'local' circuit
+	CLRQ	R1			; Zero cost, hops
+	CMPW	R8,RCB$W_ADDR(R4)	; Is this the local node ?
+	BEQL	100$			; If so, exit
+	MOVL	#1,R7			; Init circuit's path index
+	CLRL	R0			; Assume unreachable
+	DECL	R1			; Init min hops value to infinity
+	DECL	R2			; Init min cost value to infinity
+;&	MOVAW	W^NET$AW_COST_HOP -	; Find matrix cell for this node and
+;&		 +<2*NUM_NODES>[R8],R9	; circuit number 1
+	MOVL	W^NET$GL_PTR_CHM,R9	; Get pointer to Cost/Hops matrix
+	BEQL	100$			; If EQL then none
+	MOVAW	<2*NUM_NODES>(R9)[R8],R9; Find matrix cell for this node and
+					; circuit #1
+
+7$:	EXTZV	#TR3V_RT_HOPS,-
+		#TR3S_RT_HOPS,(R9),R3	; Get the hops value	
+	INCB	R3			; Add in the hop to the adjacent node
+	CMPB	#^X<1F>,R3		; Has the max hops overflowed ?
+	BLSSU	10$			; If LSSU then yes, it's not a minimum
+	CMPB	R3,R1			; Is hops value a new minimum ?
+	BGEQU	10$			; If GEQU then no
+	MOVB	R3,R1			; Use the new value
+
+10$:	ASSUME	TR3V_RT_COST  EQ  0
+	ASSUME	TR3S_RT_COST  EQ 10
+
+	BICW3	#^X<FC00>,(R9),R3	; Get the cost value
+	ADDL	#2*NUM_NODES,R9		; Advance to cell for this node and the
+					; next circuit
+	ADDW	W^NET$AW_DLL_COST[R7],R3; Add in the circuit's cost
+	BVS	20$			; If VS then cost is infinite
+	CMPW	#^X<2FF>,R3		; Has cost overflowed allowed limit?
+	BLSSU	20$			; If LSSU then yes, it's not a minimum
+	CMPW	R3,R2			; Is cost value a new minumum ?
+	BGEQU	20$			; If GEQU then no
+	MOVW	R3,R2			; Use the new value
+	MOVL	R7,R0			; And save associate circuit path i.d.
+20$:	INCB	R7			; Update path index
+	CMPB	R7,RCB$B_MAX_LPD(R4)	; Done yet?
+	BLEQU	7$			; If LEQU then no.  Loop.
+100$:	RSB
+
+;+
+; UPD_NEIGHBORS - Schedule routing messages for neighboring nodes
+;
+;
+; Reset the automatic routing timer and schedule routing message
+; transmission on all Phase III routing LPD's.
+;
+; INPUTS:	*** tbs ***
+;
+; OUTPUTS:	*** tbs ***
+;
+;-
+UPD_NEIGHBORS:
+	;
+	;   Reset the automatic routing update timer
+	;
+	MOVL	L^NET$GL_CNR_LNI,R11		; Get LNI root
+	MOVL	L^NET$GL_PTR_LNI,R10		; Get LNI CNF
+	$GETFLD	lni,l,rti			; Get the routing timer 
+	BLBC	R0,105$				; Br on error
+	MOVZWL	#<<WQE$C_QUAL_RTG>@8>!-		; Set routing update timer i.d.
+		    NET$C_TID_XRT,R1		;
+	MOVAB	W^NET$TIMER_XRT,R2		; Setup action routine
+	EMUL	#10*1000*1000,R8,#0,R3		; Convert to standard VMS time
+	BSBW	WQE$RESET_TIM			; Reset the routing update timer
+	MOVL	L^NET$GL_PTR_VCB,R4		; Recover the RCB pointer
+	;
+	;   Schedule routing message transmission on all Phase III routing LPDs
+	;
+105$:	MOVZBL	 RCB$B_MAX_LPD(R4),R7		; Get number of circuits
+	BEQL	 200$				; If EQL then nothing to do
+	PUSHL	 R6				; Save current LPD
+	MOVL	 RCB$L_PTR_LPD(R4),R6		; Get LPD vector pointer
+	MOVAB	 12(R6),R6			; Get address of LPD cell #1
+110$:	BBC	#LPD$V_RUN,LPD$W_STS(R6),120$	; Br if LPD's circuit inactive
+	BITW	#LPD$M_PH2!-			;
+		 LPD$M_PH3N,LPD$W_STS(R6)	; Is partner a routing node
+	BNEQ	 120$				; If NEQ then no
+	BBSS	#LPD$V_XMT_RT,-			;
+		     LPD$B_XMTFLG(R6),130$	; Flag need to send routing msg
+	MOVQ	#LEV$C_NO_EVT,R0		; Setup event
+	BSBW	 SET_DLL_EVT			; Schedule LPD activity
+	BRB	 130$				; Continue
+120$:	BICB	#LPD$M_XMT_RT,LPD$B_XMTFLG(R6)	; No need for routing msg
+130$:	MOVAB	 LPD$C_LENGTH(R6),R6		; Advance to next cell
+	SOBGTR	 R7,110$			; Loop for all LPDs
+	POPL	 R6				; Restore LPD context
+200$:	RSB
+
+;+
+; ACT_ENT_MOP	- Circuit has entered MOP mode while in the "run" state
+; 
+; This routine is called when a it is detected that the circuit has entered
+; the so called "maintenance mode" -- also known as the "service mode".
+; An NML process is created to service the circuit.
+;
+; INPUTS:	R11	CRI CNR ptr
+;		R10	CRI CNF ptr
+;		R6	LPD ptr
+;		R5	WQE ptr (or zero if none)
+;		R4	RCB address
+;
+; OUTPUTS:	R5	Unchanged
+;		R1	Next event to be processed
+;		R0	Low bit set if state change is permitted,
+;			Low bit clear to avoid state change
+;
+;		All other regs may be clobbered.
+;-
+ACT_ENT_MOP:				; Put the circuit into a service substate
+	PUSHL	R5			; Save WQE
+	BBS	#LPD$V_ACCESS,-		; Ignore if circuit already accesssed
+		 LPD$W_STS(R6),5$	;
+	$GETFLD	cri,v,ser		; See if service functions are enabled
+	BLBS	R8,10$			; If LBS in R8 then no
+	MOVB	#NMA$C_LINSS_ASE,-	; Init substate as "auto-service"
+		 LPD$B_SUB_STA(R6)	;
+	$GETFLD	cri,s,col		; Get associated circuit device name
+	;
+	;   Build the process name on the stack and create the process
+	;
+	SUBL	#12,SP			; Create buffer area on the stack
+	MOVL	SP,R1			; Copy current stack pointer
+	MOVL	#^A"NML_",(R1)+		; Enter process name prefix
+	MOVC5	R7,(R8),#^A" ",#8,(R1)	; Append the circuit name
+	MOVL	#12,R4			; Setup size the process name string
+	MOVAB	(SP),R5			; Setup pointer to process name string
+	MOVQ	R7,R2			; Pass circuit name as SYS$NET
+	MOVL	#NML_OBJ_NUM,R8		; Setup Network Management's Listener's
+					; object number
+	BSBW	NET$STARTUP_OBJ		; Create the process
+	ADDL	#12,SP			; Restore original stack pointer
+	;
+	;   If process was created then save PID in CRI
+	;
+	BLBC	R0,5$			; If LBC then process creation failure
+					; Ignore the error and rely on timer
+					; mechanism for retry
+	MOVL	R1,R8			; Setup PID of created process
+	$PUTFLD	cri,l,owpid		; Store it in the CRI block
+5$:	MOVL	#LEV$C_NO_EVT,R1	; Assume circuit already marked for
+					; direct-access
+	BBSS	#LPD$V_DLE,-		; Mark line for direct-access
+		 LPD$W_STS(R6),20$	;
+	;
+	;   Log the event
+	;
+10$:	MOVL	#LEV$C_LOG_FTE,R1	; Generate "log fatal error" event
+20$:	POPL	R5			; Restore WQE
+	$LOG	TPL_LDF,TPL_PRSN_SYNC,,R5 ; Setup logging data
+					  ;! need to get better code from DRG
+	MOVL	#1,R0			; Allow state change
+	RSB
+
+;+
+; ACT_TST_DL  -	Run circuit acceptance algorithm
+; ACT_ENT_RUN -	Enter the RUN state
+;
+; INPUTS:	R11	CRI CNR ptr
+;		R10	CRI CNF ptr
+;		R9-R7	Scratch
+;		R6	LPD ptr
+;		R5	WQE ptr (or zero if none)
+;		R4	RCB ptr
+;		R3-R0	Scratch
+;
+; OUTPUTS:	R6	Preserved
+;		R5	Unchanged
+;		R1	Next event to be processed
+;		R0	Low bit set if state change is permitted,
+;			Low bit clear to avoid state change
+;
+;		All other regs may be clobbered.
+;-
+ACT_TST_DL:				; Run circuit acceptance algorithm
+	BSBW	CHK_IO			; Okay to xmit?
+	MOVL	#LEV$C_EXIT,R1		; Assume we cannot xmit
+	BLBC	R0,10$			; If LBC then no
+	TSTB	LPD$B_TSTCNT(R6)	; Any test messages to xmit?
+	BGTRU	20$			; If so, send one
+	MOVL	#LEV$C_LIN_UP,R1	; Signal circuit up event
+10$:	MOVB	#1,R0			; Always allow state change
+	RSB
+
+	;
+	;    Allocate and setup the buffer
+	;
+20$:	MOVL	#1+2+1+TR3C_TST_MAX,R1	; Setup max test size
+	CMPW	R1,LPD$W_XMTBUFSIZ(R6)	; Too big?
+	BLEQU	30$			; If LEQU then no
+	MOVW	LPD$W_XMTBUFSIZ(R6),R1	; Use partner's rcv buf size
+30$:	SUBL3	#1+2+1,R1,R8		; Save size of test data field
+	BSBW	NET$DLL_QIO_CO		; Call co-routine to allocate buffer
+	MOVL	R3,WQE$C_LENGTH+P1(R2)	; Point to I/O buffer
+	MNEGL	R3,WQE$C_LENGTH+P2(R2)	; Bias I/O buffer length
+	;
+	;   Build the message
+	;
+	MOVB	#TR2C_MSG_NOP,(R3)+	; Enter Phase II test msg type code
+	BBS	#LPD$V_PH2,-		;
+		 LPD$W_STS(R6),40$	; If BS then partner is Phase II
+	MOVB	#TR3C_MSG_TST,-1(R3)	; Partner is Phase III, replace type
+					; code with Phase III test msg type code
+	MOVW	RCB$W_ADDR(R4),(R3)+	; Enter source node address
+	MOVB	R8,(R3)+		; Enter # of test data bytes
+	PUSHR	#^M<R2,R4,R5>		; Save regs
+	MOVC5	#0,(SP),#^X<AA>,R8,(R3)	; Enter test data
+	POPR	#^M<R2,R4,R5>		; Restore regs
+40$:	DECB	LPD$B_TSTCNT(R6)	; Account for this test message
+	ADDL	R3,WQE$C_LENGTH+P2(R2)	; Setup buffer size
+	MOVL	S^#IO$_WRITELBLK,R0	; Setup I/O fct code
+	RSB				; Return to co-routine to xmit
+
+ACT_ENT_RUN:				; Setup OL vector
+	BBSS	#LPD$V_RUN,-		;
+		 LPD$W_STS(R6),7$	; Mark circuit as active for data msgs
+	MOVB	 RCB$B_MAX_SNK(R4),-	; Init max allowed queue length
+		 LPD$B_AVL_XMT(R6)	;
+	INCB	 RCB$B_ACT_DLL(R4)	; Account for datalink
+7$:	MOVZWL	 LPD$W_ADDR(R6),R2	; Get partner's node address
+	MOVZBL	 LPD$B_PTH_INX(R6),R1	; Get the circuit's index
+	BBC	#LPD$V_PH2,-		; Br unless partner is Phase II
+		 LPD$W_STS(R6),10$	;
+	MOVB	R1,W^NET$AB_PH2_OL[R2]  ; Flag the node as Phase II
+	;
+	;   Init the cell in the cost hops matrix associated with this node.
+	;   If the partner node is a non-routing node or a Phase II node then
+	;   this is the only setup that will occur for the matrix column for
+	;   this circuit.  Otherwise, the column will be updated again when the
+	;   partner node sends a routing message.
+	;
+10$:	MULL	#NUM_NODES,R1		; Get offset to this circuit, node 0
+	ADDL	R2,R1			; Add in the offset for this node
+	CLRW	@W^NET$GL_PTR_CHM[R1]	; Init the matrix cell
+	BSBW	UPDATE_ALL		; Update the data base
+	$LOG	TPL_LUP,,,R5		; Log circuit up
+	MOVL	S^#LEV$C_LOG_NFE,R1	; Log the event
+	MOVB	#1,R0			; Allow state change
+	RSB
+
+;+
+; ACT_DLL_UP  -	The datalink has initialized
+;
+; This routine is called after datalink protocol initialization.  It chooses
+; one of three actions to take:
+;
+;
+;   1.	If the operator state is "off" then the circuit is undergoing restart
+;	in order to notify the partner node that it is shutting down.  In this
+;	case, the state change is pre-empted with the LEV$C_OPR_OFF event.
+;
+;   2.	Else, if the circuit substate is "service" then the routine pre-empts 
+;	the state change and exits with the LEV$C_ENT_DLE event.
+;
+;   3.	Else, the  LPD is prepared to commence Transport layer initialization
+;	over the circuit.
+;
+;
+; INPUTS:	R11	CRI CNR ptr
+;		R10	CRI CNF ptr
+;		R9-R7	Scratch
+;		R6	LPD ptr
+;		R5	WQE ptr (or zero if none)
+;		R4	RCB ptr
+;		R3-R0	Scratch
+;
+; OUTPUTS:	R6	Preserved
+;		R5	Unchanged
+;		R1	Next event to be processed
+;		R0	Low bit set if state change is permitted,
+;			Low bit clear to avoid state change
+;
+;		All other regs may be clobbered.
+;-
+ACT_DLL_UP:				; The datalink has initialized
+	;
+	;   If the operator state is "off" then we are going thru data-link
+	;   re-init as a means to notify the opposite end of the circuit that
+	;   the link is shutting down.
+	;
+	$GETFLD	 cri,l,sta		; Get the operator state
+	BLBC	 R0,10$			; If LBC then the same as "off"
+	$DISPATCH  R8,-			; Case on operator state
+	<-
+	    <NMA$C_STATE_OFF, 10$>,-
+	    <NMA$C_STATE_SER, 20$>,-
+	    <NMA$C_STATE_ON,  20$>,-
+	>
+10$:	MOVL	#LEV$C_OPR_OFF,R1	; Generate "operator says off" event
+	CLRL	 R0			; Prevent previously intended state
+					; transition
+	BRB	 50$			; Take common exit
+20$:	;
+	;   The operator is not shutting down the circuit.  Either init for
+	;   use by Transport, or give it to a direct-access server process.
+	;
+	BBC	#LPD$V_DLE,-		; If BS then marked for direct access
+		 LPD$W_STS(R6),30$	; (state could be "...ON" or "...SER"
+	MOVL	#LEV$C_ENT_DLE,R1	; Generate new event
+	CLRL	 R0			; Prevent state change
+	BRB	 50$			; Take common exit
+	;
+	;   The datalink is undergoing a normal startup sequence.  Tell 
+	;   NETDRIVER about new LPD and schedule the Transport init messages.
+	;
+30$:	MOVL	#NETUPD$_DLL_ON,R0	; Setup function code
+	BSBW	 TELL_NETDRIVER		; Tell NETDRIVER
+	INCB	 LPD$B_ASTCNT(R6)	; Account for Rcv IRP queued to the
+					; datalink by NETDRIVER on our behalf
+	BISB	#LPD$M_XMT_STR!-	; Schedule "start" msg
+		 LPD$M_XMT_VRF!-	; Schedule "verification" msg
+		 LPD$M_XMT_IDLE,-	; Flag to detect when last msg was sent
+		 LPD$B_XMTFLG(R6)	;
+	$GETFLD	cri,l,xpt		; Get Transport protocol
+	BLBC	R0,40$			; If LBC then use default
+	$DISPATCH  R8,-			; Case on protocol type
+	<-
+	    <1,	 40$>,-			;   Z-node  (&use symbol) (&nyi)
+	    <2,  32$>,-			;   Phase II (&use symbol)
+	>
+	BRB	40$			; If unknown then ignore it
+32$:	BISW	#LPD$M_PH2,LPD$W_STS(R6); Force Phase II init sequence
+40$:	MOVB	#NMA$C_LINSS_STA,-	; Enter "starting" substate
+		    LPD$B_SUB_STA(R6)	;
+	MOVL	#LEV$C_NO_EVT,R1	; No more events
+	MOVB	#1,R0			; Allow state transition
+50$:	RSB
+
+;+
+; ACT_ENT_DLE	-  Tell sevrer process that circuit is ready 
+; ACT_EXI_SERV	-  Exit service state if needed
+; ACT_SYN_FAIL  -  The circuit failed to synchronize
+;
+; INPUTS:	R11	CRI CNR ptr
+;		R10	CRI CNF ptr
+;		R6	LPD ptr
+;		R5	WQE ptr (or zero if none)
+;		R4	RCB address
+;
+; OUTPUTS:	R5	Unchanged
+;		R1	Next event to be processed
+;		R0	Low bit set if state change is permitted,
+;			Low bit clear to avoid state change
+;
+;		All other regs may be clobbered.
+;-
+ACT_ENT_DLE:				; Tell server the circuit is ready
+	MOVB	#NMA$C_LINSS_ASE,-	; Init substate as "auto-service"
+		    LPD$B_SUB_STA(R6)	;
+	BBS	#LPD$V_ACCESS,-		; If BS then circuit is accessed by
+		 LPD$W_STS(R6),40$	; server process
+	;
+	;   The circuit is up (or at least the driver thinks so) but there is
+	;   no server process accessing the circuit.  Queue a receive to the
+	;   circuit.  When the receive completes it will serve as a signal that
+	;   the remote end of the circuit is requesting service.
+	;
+10$:	MOVZBL	#LEV$C_UNJAM,R1		; Assume some I/O is pending
+	TSTB	LPD$B_ASTCNT(R6)	; Any other I/O pending ?
+	BNEQ	100$			; If NEQ yes, recycle the circuit
+	MOVZBL	#128,R1			; Setup size of P1 buffer
+	BSBW	NET$DLL_QIO_CO		; Call co-routine to init WQE
+	MOVL	R3,WQE$C_LENGTH+P1(R2)	; Point to buffer
+	MOVZBL	#128,WQE$C_LENGTH+P2(R2); Setup buffer size
+	MOVL	S^#IO$_READLBLK,R0	; Setup I/O function
+	JSB	@(SP)+			; Return to co-routine for I/O
+	BRB	70$			; Done for now
+40$:	;
+	;   The circuit is already being accessed by a server process.  Tell
+	;   the circuit access module that the circuit is up and then tell
+	;   NETDRIVER to start its receiver.
+	;
+	MOVZBL	#NETUPD$_DLL_DLE,R0	; Fct code is "link up for service"
+	BSBW	TELL_NETDRIVER		; Tell NETDRIVER
+	INCB	LPD$B_ASTCNT(R6)	; Account for Rcv IRP queued to the
+	MOVB	#1,LPD$B_AVL_XMT(R6)	; Allow 1 xmit to be active at a time
+	MOVB	#1,LPD$B_AVL_SLT(R6)	; Here too
+	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+	BSBB	TELL_DLE_ACCESS		; Tell circuit access routine
+70$:	MOVL	#LEV$C_NO_EVT,R1	; No more events
+	MOVL	#1,R0			; Allow state change
+100$:	RSB
+
+ACT_EXI_SERV:				; Exit service state if needed
+	BBC	#LPD$V_DLE,-		; If not marked for direct-access then
+		 LPD$W_STS(R6),10$	; nothing to do
+	BBS	#LPD$V_ACCESS,-		; If currently being accessed then 
+		 LPD$W_STS(R6),10$	; allow operation to complete
+	BICW	#LPD$M_DLE,LPD$W_STS(R6); Else clear direct-access flag
+	BRW	ACT_QIO_SHUT		; And restart the init cycle
+10$:	MOVZWL	#LEV$C_NO_EVT,R1	; No further events
+	MOVL	S^#SS$_NORMAL,R0	; Allow state change
+	RSB
+
+ACT_SYN_FAIL:				; The circuit failed to synchronize
+	BBC	#LPD$V_ACCESS,-		; If BC then circuit is not being "accessed"
+		 LPD$W_STS(R6),10$	; for direct-link sevice
+	MOVZWL	#SS$_DEVINACT,R0	; Setup error code
+	BSBB	TELL_DLE_ACCESS		; Report bad news to link access routine
+	BSBW	STOP_ACCESS		; Cleanup LPD for failed IO$_ACCESS
+10$:	BSBW	ACT_QIO_SHUT		; Shut down the device
+	RSB				; Return with R0,R1 from ACT_QIO_SHUT
+
+
+TELL_DLE_ACCESS:
+	;
+	;   Report circuit transition to access routine
+	;
+	PUSHR	#^M<R4,R5,R6,R10,R11>	; Save critical regs
+	MOVZBL	LPD$B_PTH_INX(R6),R8	; Setup LPD index
+	BSBW	NET$ACCESS_DLE		; Tell DLE access routine
+	POPR	#^M<R4,R5,R6,R10,R11>	;
+	RSB				; Done
+
+;+
+; ACT_INI_FAIL -   I/O failure during transport initialization 
+; ACT_CND_SHUT -   Conditionally shut down the datalink
+; ACT_ENT_MPR  -   Circuit has entered MOP mode while in the "run" state
+; ACT_RUN_SHUT -   Shut down the datalink while in the "run" state
+; ACT_QIO_SHUT -   Shut down the datalink
+;
+; INPUTS:	R11	CRI CNR ptr
+;		R10	CRI CNF ptr
+;		R6	LPD ptr
+;		R5	WQE ptr (or zero if none)
+;		R4	RCB address
+;
+; OUTPUTS:	R5	Unchanged
+;		R1	Next event to be processed
+;		R0	Low bit set if state change is permitted,
+;			Low bit clear to avoid state change
+;
+;		All other regs may be clobbered.
+;-
+ACT_INI_FAIL:				; I/O failure during transport init
+	BUMP	B,LPD$B_CNT_IFL(R6)	; Increment circuit init failure count
+	BRW	ACT_QIO_SHUT		; Shut down the circuit
+
+ACT_CND_SHUT:				; Conditionally shutdown the datalink
+	BSBW	RESET_CHAN		; Cancel all I/O, etc.
+	TSTB	LPD$B_ASTCNT(R6)	; Any outstanding asynch activity?
+	BNEQ	10$			; If NEQ yes
+	BRW	ACT_QIO_SHUT		; If EQL then no
+10$:	CLRB	R0			; Inhibit state change
+	MOVL	S^#LEV$C_NO_EVT,R1	; No more events
+	RSB
+
+ACT_RUN_SYNC:				  ; Circuit down - synchronization lost
+	$LOG	TPL_LDF,TPL_PRSN_SYNC,,R5 ; Setup logging data
+	BRB	RS			  ; Share code
+ACT_RUN_UXPK:				  ; Circuit down - unexpected packet type
+	$LOG	TPL_LDS,TPL_PRSN_UXPK,,R5 ; Setup logging data
+RS:	BSBB	ACT_RUN_SHUT		  ; Shut the circuit down
+	MOVL	#LEV$C_LOG_FTE,R1	  ; Chain to "log fatal error event"
+	MOVL	#1,R0			  ; Allow state change
+	RSB
+
+ACT_ENT_MPR:				; Enter MOP mode from the run state
+	BSBB	ACT_RUN_SHUT		; Shut down the circuit, cleanup the
+					; routing data base.
+	MOVL	#LEV$C_IRP_MM,R1	; Resignal MOP mode event
+	MOVL	#1,R0			; Allow state change
+	RSB
+
+ACT_RUN_SHUT:
+	BUMP	B,LPD$B_CNT_LDN(R6)	; Increment circuit down count
+	BBCC	#LPD$V_RUN,-		; If leaving run state then
+		 LPD$W_STS(R6),7$	;
+	DECB	RCB$B_ACT_DLL(R4)	; Account for loss of datalink
+7$:	;
+	;   Mark as unreachable all nodes which were to use this path
+	;
+	MOVL	RCB$L_PTR_OL(R4),R2	; Get OL buffer
+	MOVZWL	RCB$W_SIZE(R2),R0	; Get its size
+	MOVAB	(R2)[R0],R2		; Point past end of buffer
+	MOVZBL	LPD$B_PTH_INX(R6),R3	; Get the path index
+10$:	CMPL	R2,RCB$L_DSP_OL(R4)	; Any more vector entries?
+	BLEQU	20$			; If LEQU then done
+	CMPB	R3,-(R2)		; Was node to use this path?
+	BNEQ	10$			; If not, loop
+	CLRB	(R2)			; Mark node unreachable
+	BRB	10$			; Loop
+	;
+	;   Mark the adjacent node unreachable in the Phase II OL vector
+	;
+20$:	MOVZWL	 LPD$W_PNA(R6),R2	; Get node address
+	CLRB	W^NET$AB_PH2_OL[R2]	; Mark it 'phase II unreachable'
+	;
+	;   Update the routing data base
+	;
+	PUSHR	#^M<R4,R5>		; Save critical regs
+	MULL	#NUM_NODES,R3		; Get matrix offset for this circuit
+	MOVAW	@W^NET$GL_PTR_CHM[R3],R3; Get circuit's matrix cell for node 0
+	MOVC5	#0,(SP),#-1,-		; Store infinity in each cell for
+		#<NUM_NODES>*2,(R3)	;  each node as known to this circuit
+	POPR	#^M<R4,R5>		; Restore regs
+	BSBW	UPDATE_ALL		; Update all routing tables
+					; Fall thru to ACT_QIO_SHUT
+
+ACT_QIO_SHUT:				; Shut down the datalink
+	CLRW	 LPD$W_ADDR(R6)		; Adjacent node is unknown
+	MNEGW	#1,LPD$W_XMTBUFSIZ(R6)	; Reset buffer size to infinity
+	BBCC	#LPD$V_RUN,-		; If leaving run state then
+		 LPD$W_STS(R6),7$	;
+	DECB	RCB$B_ACT_DLL(R4)	; Account for loss of datalink
+7$:	BICW	#LPD$M_ACTIVE!-		; Clear Transport status flags
+		 LPD$M_PH3N!-
+		 LPD$M_PH2,-
+		 LPD$W_STS(R6)		; Initialize LPD status
+	CLRB	 LPD$B_XMTFLG(R6)	; Clear Transport xmit flags
+	MOVB	#NMA$C_LINSS_SYN,-	; Change to "synchronizing" substate
+		 LPD$B_SUB_STA(R6)	;
+	BBC	#LPD$V_DLE,-		; If BC then not going down for
+		 LPD$W_STS(R6),10$	; "service" functions
+	MOVB	#NMA$C_LINSS_ASE,-	; Init substate as "auto-service"
+		 LPD$B_SUB_STA(R6)	;
+10$:	BSBW	 RESET_CHAN		; Cancel any lingering I/O
+	CLRL	 R1			; Indicate no need to extend P1 buffer
+	BSBW	 NET$DLL_QIO_CO		; Allocate and init WQE (co-routine)
+	MOVZWL	#IO$_SETMODE!-		; Setup function code
+		 IO$M_SHUTDOWN,R0	;
+	RSB				; Return to co-routine 
+
+
+;+	
+; ACT_RCV_STRTIM  -  Start timer has expired
+; ACT_QIO_STRT    -  Startup the datalink 
+;
+; INPUTS:	R11	CRI CNR ptr
+;		R10	CRI CNF ptr
+;		R6	LPD ptr
+;		R5	WQE ptr (or zero if none)
+;		R4	RCB address
+;
+; OUTPUTS:	R5	Unchanged
+;		R1	Next event to be processed
+;		R0	Low bit set if state change is permitted,
+;			Low bit clear to avoid state change
+;
+;		All other regs may be clobbered.
+;-
+ACT_RCV_STRTIM:				; Start timer has expired
+	BICW	#LPD$M_STRTIM,-		; Clear the "already ticking" bit
+		 LPD$W_STS(R6)		; 
+	MOVL	#LEV$C_AST_STIM,R1	; Say "start suppresson time expired"
+	MOVL	#1,R0			; Allow state transition
+	RSB
+
+
+ACT_QIO_STRT:				; Startup the datalink
+	BBCS	#LPD$V_STRTIM,-		; If BS then timer is already ticking
+		 LPD$W_STS(R6),10$	;
+	BRW	80$			; Take common exit
+10$:	;
+	;   Start the "start suppression" timer to prevent the circuit from
+	;   restarting too rapidly
+	;
+	MOVW	#<<WQE$C_QUAL_DLL>@8>!-	; Overlay QUAL and EVT fields
+		   LEV$C_TIM_STRT,R0	;
+	MOVQ	#TR$C_TIM_RESTRT*-	; Setup timer interval in seconds
+		10*1000*1000,R3		; Convert to quadword VMS clock ticks
+	BSBW	SET_TIM_COMMON		; Start the timer ticking
+	MOVL	W^NET$GL_PTR_VCB,R4	; Recover RCB address	
+	TSTB	LPD$B_ASTCNT(R6)	; Any asynch activity outstanding?
+	BEQL	20$			; If EQL yes, br to continue
+	MOVL	S^#LEV$C_UNJAM,R1	; Assume ASTCNT NEQ 0
+	BRW	90$			; Exit inhibiting state change
+	;
+	;   Determine if the user is allowed to init a Circuit - the ACP's 
+	;   state must not be "off" or "init".
+	;
+20$:	MOVL	#LEV$C_NO_EVT,R1	; Get ready
+	MOVZBL	LPD$B_PLVEC(R6),R2	; Get the associated line index
+	BSBW	NET$GET_VEC2		; Setup the line
+	BLBC	R0,80$			; If LBC then setup failed
+	CMPB	PLVEC$AB_STATE[R2],-	; Is the line "on"
+		#NMA$C_STATE_ON		;
+	BNEQ	80$			; If NEQ no, can't start circuit
+	$DISPATCH  TYPE=B,RCB$B_STI(R4),-
+	<-
+		<ACP$C_STA_I, 80$>,-	; Initializing
+		<ACP$C_STA_N, 50$>,-	; On
+		<ACP$C_STA_R, 50$>,-	; Restricted
+		<ACP$C_STA_S, 30$>,-	; Shut
+		<ACP$C_STA_F, 80$>,-	; Off
+		<ACP$C_STA_H, 80$>,-	; Hibernating (due to bug)
+	>
+30$:	TSTW	RCB$W_MCOUNT(R4)	; Time to shut down ?
+	BEQL	80$			; If so, go away
+50$:	$GETFLD	cri,l,sta		; Get the "operater" state
+	BLBC	R0,60$			; If LBC then assume "OFF" state
+	CMPL	S^#NMA$C_STATE_SER,R8	; Service state ?
+	BNEQ	60$			; If NEQ then no
+55$:	BISW	#LPD$M_DLE,LPD$W_STS(R6); Else setup for direct-access
+60$:	;
+	;   If XM$_ERR_FATAL is set then we must restart the controller.
+	;   This check must be made in the UCB.
+	;
+	CMPB	L^PLVEC$AB_DEV[R2],- 	; DMC11 ?
+		#DEVTRN$C_DEV_DMC	;
+	BEQL	70$			; If EQL yes, ignore XM$V_ERR_FATAL
+	MOVL	LPD$L_UCB(R6),R0	; Get device UCB
+	BEQL	70$			; If EQL then none
+	BBC	#XM$V_ERR_FATAL,-	; If BS the fatal controller error,
+		UCB$L_DEVDEPEND(R0),70$	; must toggle controller
+	BSBW	POKE_LINE		; Toggle the controller
+					; ...ignore errors
+	;
+	;   Reset the Circuit characteristics
+	;
+70$:	$CNFFLD	cri,s,chr,R9		; Identify characteristics buffer
+	MOVZWL	LPD$W_CHAN(R6),R2	; Get I/O channel
+	CLRL	R1			; Clear illegal I/O modifier mask
+	BSBW	NET$SET_QIOW		; Get buffer and issue $QIOW
+	BLBS	R0,200$			; If LBS then okay, br to continue
+80$:	MOVL	#LEV$C_NO_EVT,R1	; Nothing else to do
+90$:	CLRB	R0			; Don't allow state change
+	RSB
+
+
+200$:	CLRL	R1			; No I/O buffer needed
+	BSBW	NET$DLL_QIO_CO		; Allocate and init WQE (co-routine)
+	MOVZBL	LPD$B_PLVEC(R6),R1	; Get associated PLVEC index
+	;
+	;
+	;   Setup the "input packet limiter" value based on the number of
+	;   receive buffers assigned to the circuit's controller.  This is a
+	;   heuristic based on the idea that controller's requiring more
+	;   receive buffering (fast lines, satellite lines) also should be
+	;   allowed more local packet output buffering in order to prevent
+	;   severe performance degradation.
+	;
+	;
+	PUSHR	#^M<R1,R7,R10,R11>	; Save regs
+	MOVL	W^NET$GL_CNR_PLI,R11	; Get PLI root block
+	CLRL	R10			; Search from begining of list
+	MOVL	R1,R8			; Search key is the PLVEC index
+	$SEARCH	eql,pli,l,plvec		; Find PLI's CNF block
+	BLBC	R0,205$			; If LBC then not found
+	$GETFLD	pli,l,bfn		; Get number of receive buffers
+	BLBS	R0,210$			; If LBS then <pli,l,bfn> value exists
+205$:	MOVL	#4,R8			; Use 4 as the default
+210$:	POPR	#^M<R1,R7,R10,R11>	; Restore regs
+					;
+	MOVB	R8,LPD$B_AVL_SLT(R6)	; Use it as max local xmit queue length
+	CMPB	R8,#6			; But don't exceed six
+	BLEQU	220$			;
+	MOVB	#6,LPD$B_AVL_SLT(R6)	;
+220$:	;
+	;
+	;   Perform any device specific setup and return to issue QIO.
+	;
+	;
+	BSBB	DEV_SPEC		; Do any device specific setup
+	MOVZWL	#IO$_SETMODE!-		; Setup the default function code
+		 IO$M_STARTUP,R0	;
+	RSB				; Return to issue QIO
+
+
+DEV_SPEC:
+	;
+	;
+	;   Device specific setup.
+	;
+	;
+	$DISPATCH TYPE=B,-		; Dispatch on device type for special
+		  L^PLVEC$AB_DEV[R1],-	; setup if needed
+	<-
+	    <DEVTRN$C_DEV_DMC, DMC>,-
+	>
+	RSB				; For all others, simply return
+					;
+DMC:	MOVL	R8,WQE$C_LENGTH+P3(R2)	; Setup QIO parameter
+	RSB				; Return to co-routine to issue $QIO
+
+
+
+POKE_LINE:				; Toggle line state
+	;
+	;
+	;   The line is indicating a fatal device error.  Turn the device
+	;   OFF and ON in order to re-initialize it.
+	;
+	;
+	PUSHR	#^M<R2,R5,R6,R10,R11>	; Save crucial regs
+	MOVL	R2,R6			; Move PLVEC pointer to safe reg
+	MOVL	W^NET$GL_CNR_PLI,R11	; Get PLI root block
+	CLRL	R10			; Search from begining of list
+	MOVL	R6,R8			; Search key is the PLVEC index
+	$SEARCH	eql,pli,l,plvec		; Find PLI's CNF block
+	BLBC	R0,100$			; If LBC then not found
+	MOVB	#NMA$C_STATE_OFF,-	; Prepare to turn line off
+		PLVEC$AB_STATE[R6]	;
+	BSBB	110$			; Turn the line off
+					; ...ignore errors
+	MOVB	#NMA$C_STATE_ON,-	; Prepare to turn line on
+		PLVEC$AB_STATE[R6]	;
+	BSBB	110$			; Turn the line on
+100$:	POPR	#^M<R2,R5,R6,R10,R11>	; Restore regs
+	RSB				; Return status in R0
+
+110$:	MOVZWL	PLVEC$AW_CHAN[R6],R2	; Get I/O channel
+	CLRL	R1			; Clear "illegal" I/O fct code mask
+	$CNFFLD	pli,s,chr,R9		; Setup characteristics buffer i.d.
+	BSBW	NET$SET_QIOW		; Turn the line on
+	RSB
+
+
+;+
+; ACT_XMT   -	Conditionally xmit a message
+;
+; INPUTS:	R11	CRI CNR ptr
+;		R10	CRI CNF ptr
+;		R6	LPD ptr
+;		R5	WQE ptr (or zero if none)
+;		R4	RCB address
+;
+; OUTPUTS:	R5	Unchanged
+;		R1	Next event to be processed
+;		R0	Low bit set if state change is permitted,
+;			Low bit clear to avoid state change
+;
+;		All other regs may be clobbered.
+;-
+ACT_XMT:				; Xmit message if possible
+	BSBW	CHK_IO			; Okay to xmit?
+	BLBC	R0,10$			; If LBC no
+	FFS	#0,#8,LPD$B_XMTFLG(R6),R2 ; Get xmit flag
+	BEQL	10$			; If EQL then none set
+	$DISPATCH  R2,-			; Dispatch on xmit flag
+	<-
+	    <LPD$V_XMT_STR,  XMT_STR>,-	; Transport "Start" message
+	    <LPD$V_XMT_VRF,  XMT_VRF>,-	; Transport "Verificatoin" message
+	    <LPD$V_XMT_RT,   XMT_RT>,-	; Transport "Routing" message
+	    <LPD$V_XMT_IDLE, 100$>,-	; All Transport init messages xmitted
+	>
+10$:	MOVL	#LEV$C_EXIT,R1		; Nothing to do, exit state table
+	MOVL	#1,R0			; Allow state change
+	RSB				;
+
+100$:	BICB	#LPD$M_XMT_IDLE,-	; Clear the flag
+		 LPD$B_XMTFLG(R6)	;
+	MOVL	S^#LEV$C_XMT_IDLE,R1	; Xmitter is idle during Transport init
+	MOVL	#1,R0			; Allow state change
+	RSB				;
+
+
+
+;+
+; XMT_STR -	Build and transmit a Transport "start" message
+;
+; INPUTS:	R11	CRI CNR ptr
+;		R10	CRI CNF ptr
+;		R6	LPD ptr
+;		R5	Not used
+;		R4	RCB address
+;
+; OUTPUTS:	R5	Unchanged
+;		R1	Next event to be processed
+;		R0	Low bit set if state change is permitted,
+;			Low bit clear to avoid state change
+;
+;		All other registers may be clobbered
+;-
+XMT_STR:				; Xmt a transport initialization msg
+	ASSUME	TR3C_STR_LNG  LE TR2C_STR_MXL
+
+	MOVZBL	#TR2C_STR_MXL,R1	; Setup size of P1 buffer
+	BSBW	NET$DLL_QIO_CO		; Call co-routine to init WQE
+	MOVL	R3,WQE$C_LENGTH+P1(R2)	; Point to buffer
+	MNEGL	R3,WQE$C_LENGTH+P2(R2)	; Bias I/O buffer size
+	MOVL	L^NET$GL_CNR_LNI,R11	; Set CNR for local data base
+	MOVL	L^NET$GL_PTR_LNI,R10	; Get LNI CNF
+	BBC	#LPD$V_PH2,-		; Br unless partner is Phase II
+		 LPD$W_STS(R6),STR3
+	;
+	;   Build and transmit Phase II "init" message
+	;
+STR2:	MOVB	#TR2C_MSG_INI,(R3)+	; Enter message type code
+	MOVB	#TR2C_INI_STR,(R3)+	; Enter message sub-type code 
+					;
+	MULW3	#2,RCB$W_ADDR(R4),R0	; Start converting address to EX-2 field
+	DIVB2	#2,R0			; Now bits 7-15 are shifted
+	BISW3	#128,R0,(R3)+		; Set the extend bit and enter it
+	$CNFFLD	lni,s,nam,R9		; Identify local node name field
+	BSBB	MOVIT			; Fetch and enter the string
+	MOVB	#TR2C_STR_FCT,(R3)+	; Enter supported functions
+	MOVB	#TR2C_STR_REQ!-		;
+		 TR2M_REQ_VRF,(R3)+	; Enter 'requests'
+	SUBW3	#CXB$C_OVERHEAD,-	;
+		RCB$W_TOTBUFSIZ(R4),(R3)+ ; Enter block size
+	MOVW	RCB$W_ECLSEGSIZ(R4),(R3)+ ; Enter NSP segment size
+	MOVW	RCB$W_MAX_LNK(R4),(R3)+	  ; Enter max links
+	MOVW	#^X<0103>,(R3)+		; Enter PhaseII compatable routing
+	CLRB	(R3)+			; version (3.1.0)
+	MOVW	#^X<0103>,(R3)+		; Enter PhaseII compatable NSP version
+	CLRB	(R3)+			; (3.1.0)
+	$CNFFLD	lni,s,ide,R9		; Identify system version field
+	BSBB	MOVIT			; Fetch and enter the string
+	BRB	XMT			; Return to co-routine to xmt the msg
+	;
+	;   Build and transmit Phase III "start" message
+	;
+STR3:	MOVB	#TR3C_MSG_STR,(R3)+	; Enter msg type code
+	MOVW	RCB$W_ADDR(R4),(R3)+	; Enter the local address
+	MOVB	#TR3C_STR_INFO,(R3)+	; Enter the local node type and
+					; request for verification
+	SUBW3	#CXB$C_OVERHEAD,-	;
+		RCB$W_TOTBUFSIZ(R4),(R3)+ ; Enter block size
+	MOVB	#1,(R3)+		; Enter routing version number
+	MOVB	#3,(R3)+		; Enter routing ECO number
+	MOVB	#0,(R3)+		; Enter user ECO number
+	CLRB	(R3)+			; Enter the verification seed
+XMT:	ADDL	R3,WQE$C_LENGTH+P2(R2)	; Calculate I/O buffer size
+	MOVL	S^#IO$_WRITELBLK,R0	; Setup I/O function
+	BICB	#LPD$M_XMT_STR,-	; No further need to send message
+		 LPD$B_XMTFLG(R6)	;
+	RSB				; Return to co-routine, then to caller
+
+	
+MOVIT:	BSBW	CNF$GET_FIELD		; Fetch the string
+	MOVB	R7,(R3)+		; Enter count field
+	BRB	MOVITU			; Go to end of loop
+MC1:	MOVB	(R8)+,(R3)+		; Enter text without clobbering  R0-R5
+MOVITU:	SOBGEQ	R7,MC1			; Loop for each character
+	RSB
+
+
+;+
+; XMT_VRF   - Build and transmit Transport verification message
+;
+; INPUTS:	R11	CRI CNR ptr
+;		R10	CRI CNF ptr
+;		R6	LPD ptr
+;		R5	Not used
+;		R4	RCB ptr
+;
+; OUTPUTS:	R5	Unchanged
+;		R1	Next "event longword" to be processed
+;		R0	Low bit set if state change is permitted,
+;			Low bit clear to avoid state change
+;
+;		All other registers may be clobbered
+;-
+XMT_VRF:				; Xmt Transport verification message
+	MOVL	L^NET$GL_CNR_NDI,R11	; Set CNR for remote node data base
+	MOVZWL	LPD$W_PNA(R6),R8	; Get partner's node address
+	BNEQ	20$			; Not yet known  if EQL
+	MOVL	S^#LEV$C_EXIT,R1	; Partner is not yet known, - i.e.,
+					;  no 'start' message yet
+	CLRB	R0			; Inhibit state change
+	RSB				; Return with LBC in R0 
+
+20$:	;
+	;   Build and xmit the message
+	;
+	BSBW	NET$NDI_BY_ADD		; Find NDI CNF for partner node
+	CLRL	R7			; Zero password string size assuming
+					; no NDI was found
+	BLBC	R0,30$			; If LBC then no NDI was found
+	$GETFLD	 ndi,s,tpa		; Get transmit password descriptor
+					; R7,R8 = 0 on return if field is null 
+30$:	MOVZBL	#TR_C_VRF_LNG+2,R1	; Setup size of I/O buffer   ;! +2 is tmp
+	BSBW	NET$DLL_QIO_CO		; Call co-routine to init WQE
+	MOVL	R3,WQE$C_LENGTH+P1(R2)	; Point to buffer
+	MNEGL	R3,WQE$C_LENGTH+P2(R2)	; Bias I/O buffer size
+	BBS	#LPD$V_PH2,-
+		 LPD$W_STS(R6),60$	; Br if Phase II
+	;
+	;   Build Phase III header
+	;
+	MOVB	#TR3C_MSG_VRF,(R3)+	; Enter message type code
+	MOVW	 RCB$W_ADDR(R4),(R3)+	; Enter local node address
+	MOVB	 R7,(R3)+		; Enter length of password
+	MOVL	 R7,R0			; Setup msg psw field size
+	BRB	 70$			; Continue in common
+	;
+	;   Build Phase II header
+	;
+60$:	MOVB	#TR2C_MSG_INI,(R3)+	; Enter message type code
+	MOVB	#TR2C_INI_VRF,(R3)+	; Enter message sub-type code 
+	MOVL	#8,R0			; Setup msg psw field size
+	;
+	;   Move the password
+	;
+70$:	PUSHR	#^M<R2,R4,R5>		; Save regs
+	MOVC5	 R7,(R8),#0,R0,(R3)	; Move the password - null fill
+	POPR	#^M<R2,R4,R5>		; Restore regs
+	ADDL	R3,WQE$C_LENGTH+P2(R2)	; Calculate I/O buffer size
+	MOVL	S^#IO$_WRITELBLK,R0	; Setup I/O function
+	BICB	#LPD$M_XMT_VRF,-	; No further need to send message
+		 LPD$B_XMTFLG(R6)	;
+	RSB				; Return to co-routine, then to caller
+
+;+
+; XMT_RT - Transmit a routing message
+;
+;   INPUTS:	R11	CRI CNR ptr
+;		R10	CRI CNF ptr
+;		R6	LPD ptr
+;		R5	WQE ptr or zero 
+;		R4	RCB address
+;
+;   OUTPUTS:	R5	Unchanged
+;		R1	Next event to be processed
+;		R0	Low bit set if state change is permitted,
+;			Low bit clear to avoid state change
+;
+;		All other regs may be clobbered
+;-
+XMT_RT:					; Xmit routing message
+	;
+	;    Allocate and setup the buffer
+	;
+	MOVZWL	RCB$W_MAX_ADDR(R4),R1	; Get number of nodes
+	ADDL	R1,R1			; Need 1 word per entry
+	ADDL	#3+2,R1			; Add in header and trailer
+	BSBW	NET$DLL_QIO_CO		; Call co-routine to allocate buffer
+	MOVL	R3,WQE$C_LENGTH+P1(R2)	; Point to I/O buffer
+	MNEGL	R3,WQE$C_LENGTH+P2(R2)	; Bias the I/O buffer length
+	;
+	;   Build the message
+	;
+	MOVB	#TR3C_MSG_RT,(R3)+	; Enter type code
+	MOVW	RCB$W_ADDR(R4),(R3)+	; Enter source node address
+	CLRL	R7			; Init check sum
+	MOVZWL	RCB$W_MAX_ADDR(R4),R0	; Get number of nodes
+	MOVL	#1,R1			; Init the node index
+50$:	MOVW	#^X<7FFF>,R8		; Assume infinite cost/hops ;!symbol
+	TSTB	@RCB$L_DSP_OL(R4)[R1]	; Is node reachable?
+	BEQL	60$			; If EQL then no
+	TSTB	W^NET$AB_PH2_OL[R1]	; Is the node Phase II
+	BNEQ	60$			; If NEQ then Phase II, don't
+					; include node in routing message
+	MOVW	W^NET$AW_MIN_C_H[R1],R8	; Get cost-hops to the node
+60$:	MOVW	R8,(R3)+		; Enter cost-hops to the node
+	ADDW	R8,R7			; Include in checksum
+	ADWC	#0,R7			; 1's complement add - needs
+					; "end around carry"
+	INCL	R1			; Advance the node index
+	SOBGTR	R0,50$			; Loop for each node
+	MOVW	R7,(R3)+		; Enter the check sum
+	ADDL	R3,WQE$C_LENGTH+P2(R2)	; Setup I/O buffer size
+	MOVL	S^#IO$_WRITELBLK,R0	; Setup I/O fct code
+	BICB	#LPD$M_XMT_RT,-		; No further need to send message
+		 LPD$B_XMTFLG(R6)	;
+	RSB				; Return to co-routine to xmit
+
+
+;+
+; ACT_RUN_DOWN
+; ACT_SET_OPER
+;
+; INPUTS:	R11	CRI CNR ptr
+;		R10	CRI CNF ptr
+;		R6	LPD ptr
+;		R5	Not used
+;		R4	RCB ptr
+;
+; OUTPUTS:	R5	Unchanged
+;		R1	Next "event longword" to be processed
+;		R0	Low bit set if state change is permitted,
+;			Low bit clear to avoid state change
+;
+;		All other registers may be clobbered
+;-
+ACT_RUN_DOWN:				; Cancel all timers, etc.
+	MOVL	 LPD$W_PTH-2(R6),R1	; Get REQIDT
+	MOVW	#WQE$C_QUAL_DLL@8,R1	; Setup QUAL, zero EVT for cancel all
+	BSBW	 WQE$CANCEL_TIM		; Cancel all timers for the LPD cell
+	BICW	#LPD$M_STRTIM,-		; Start suppression timer is no longer
+		 LPD$W_STS(R6)		; ticking
+	$GETFLD	cri,l,sta		; Get "operator" state
+	BLBC	R0,10$			; If LBC then assume OFF
+	CMPB	#NMA$C_STATE_OFF,R8	; Is it OFF ?
+	BNEQ	50$			; If NEQ no
+10$:	;
+	;   The operator is turning the line off.
+	;
+	BSBW	STOP_ACCESS		; Disassocate any server process
+	BRB	100$			; Continue
+50$:	;
+	;   The circuit is entering a stalled state waiting for a server
+	;   process to start some activity.  Set a timer so that we don't wait
+	;   for ever.  
+	;
+	MOVQ	#60*<10*1000*1000>,R3	; Wait 60 seconds
+	BSBW	SET_IOTIM		; Start the timer
+100$:	MOVL	#LEV$C_EXIT,R1		; No further events
+	MOVL	#1,R0			; Allow state transition
+	RSB
+
+
+ACT_SET_OPER:				; Restart a stalled line
+	BSBW	STOP_ACCESS		; Stop any server processes
+	$GETFLD	cri,l,sta		; Get "operator" state
+	MOVZBL	OPR_EVT_MAP(R8),R1	; Get corresponding event
+	MOVL	#1,R0			; Allow state change
+	RSB				; Process new event
+
+CHK_IO:					; See if its okay to xmit
+	MOVL	#1,R0			; Assume its okay to xmit
+	CMPB	#2,LPD$B_ASTCNT(R6)	; Is AST queue getting too big?
+					; (ASTCNT=1 if no transmits are active,
+					;  the 1 is for the active receiver)
+	BLEQU	10$			; If so, don't send msg yes
+	BBS	#LPD$V_ACTIVE,-		;
+		    LPD$W_STS(R6),20$	; If BC, circuit is still active
+10$:	CLRL	R0			; Message cannot be sent
+20$:	RSB				; Done
+
+
+NET$DLL_QIO_CO::			; Common DLL Qio co-routine
+					;
+	IOSB =   0			; Define WQE extensions to hold the I/O
+	P5   =   8			; status block and the QIO parameters
+	P4   =  12			;
+	P3   =  16			;
+	P2   =  20			;
+	P1   =  24			; 
+	IOWQE_LENGTH = 28		; Size of extension
+					;
+	MOVL	#WQE$C_SUB_AST,R0	; Indicate WQE subtype
+	ADDL	#IOWQE_LENGTH,R1	; Add in WQE I/O extension
+	BSBW	WQE$ALLOCATE		; Allocate the element - always succeeds
+	MOVW	LPD$W_PTH(R6),-		;
+		    WQE$W_REQIDT(R2)	; Setup path i.d.
+	MOVZBW	S^#LEV$C_AST_IO,-	; Setup default QIO event code
+		    WQE$B_EVT(R2)	;!need assume statement
+	MOVAB	W^QIOAST,WQE$L_ACTION(R2) ; Setup post processing routine
+	MOVAB	WQE$C_LENGTH+IOSB(R2),R3; Get start WQE extension
+	CLRQ	(R3)+			; Zero the IOSB image
+	CLRQ	(R3)+			; Zero P5 and P4
+	CLRQ	(R3)+			; Zero P3 and P2
+	CLRL	(R3)+			; Zero P1
+	JSB	@(SP)+			; Get QIO data
+	$QIO_S	-			; Issue QIO
+	    FUNC = R0,-		
+	    EFN	 = #NET$C_EFN_ASYN,-
+	    CHAN = LPD$W_CHAN(R6),-
+	    IOSB = WQE$C_LENGTH+IOSB(R2),-
+	    P5	 = WQE$C_LENGTH+P5(R2),-
+	    P4	 = WQE$C_LENGTH+P4(R2),-
+	    P3	 = WQE$C_LENGTH+P3(R2),-
+	    P2	 = WQE$C_LENGTH+P2(R2),-
+	    P1	 = @WQE$C_LENGTH+P1(R2),-; $QIO_S macro does a PUSHAB for P1
+	    ASTADR = B^NET$DLLQIOAST,-	;
+	    ASTPRM = R2			; Use the WQE ptr as parameter
+					;
+	INCB	LPD$B_ASTCNT(R6)	; Account for $QIO
+	BLBC	R0,50$			; Br on error
+	;
+	;   I/O queued.  Set timer and wait for AST
+	;
+	MOVQ	#TR$C_TIM_DLLIO*-	; Setup I/O timer interval
+		10*1000*1000,R3		; in quadword VMS clock ticks
+	BSBW	SET_IOTIM		; Cancel old timer, set new one
+	BRB	100$			; Continue
+	;
+	;   I/O failure.  Setup status and queue WQE
+	;	
+50$:	MOVW	R0,WQE$C_LENGTH+IOSB(R2); Store status in IOSB field
+	MOVL	R2,R0			; Get the WQE address
+	BSBW	WQE$INSQUE		; Queue it
+100$:	MOVL	S^#LEV$C_NO_EVT,R1	; Setup next event longword
+	MOVB	#1,R0			; Allow state change
+	RSB
+
+
+NET$DLLQIOAST:
+	.WORD	0			; No need to save regs
+	MOVL	4(AP),R0		; Get the WQE address
+	BSBW	WQE$INSQUE		; Queue it
+	RET
+
+QIOAST:	MOVL	WQE$W_REQIDT-2(R5),R1	; Put Path i.d. into high order word
+	MOVW	#<<WQE$C_QUAL_DLL>@8>!-	; Setup timer qualifier
+		   LEV$C_TIM_IO,R1	; and timer event
+	BSBW	WQE$CANCEL_TIM		; Cancel the timer
+	MOVZWL	WQE$W_REQIDT(R5),R8	; Get path i.d.
+	BEQL	500$			; Bug if EQL
+	BSBW	NET$FIND_LPD		; Find the LPD
+	BLBC	R0,220$			; Br if not found
+	DECB	LPD$B_ASTCNT(R6)	; Account for AST
+	BLBS	WQE$C_LENGTH+IOSB(R5),220$ ; If LBC then I/O failed
+	$EVT	AST_FAIL,R5		; Setup event code
+220$:	MOVQ	WQE$L_PM1(R5),R1	; Get parameters
+	BSBW	NET$DLL_PRC_WQE		; Process the event
+	RSB
+
+500$:	BUG_CHECK  NETNOSTATE,FATAL	; Signal the bug
+
+;+
+; SET_TIM_COMMON  - Common set timer code
+;
+; INPUTS:	R11	CRI CNR ptr
+;		R10	CRI CNF ptr
+;		R6	LPD ptr
+;		R5	Not used
+;		R4,R3	Quadword value of timer
+;		R0	Low word contains timer i.d.
+;
+; OUTPUTS:	R11-R5	Preserved
+;
+;		All other registers may be clobbered
+;-
+SET_IOTIM:				; Start the I/O timer
+	MOVW	#<<WQE$C_QUAL_DLL>@8>!-	; Setup timer qualifier
+		   LEV$C_TIM_IO,R0	; and timer event
+SET_TIM_COMMON:				; Common set timer code
+	MOVL	LPD$W_PTH-2(R6),R1	; Get event's REQIDT
+	MOVW	R0,R1			;
+	MOVAB	W^NET$DLL_TIMER,R2	; Setup action routine address
+	BSBW	WQE$RESET_TIM		; Reset the timer
+	RSB
+
+
+	.SBTTL	PARSE PHASE II/III ADDRESS
+;+
+; PARSE_PH2_ADDR	- Parse Phase II  address field
+; PARSE_PH3_ADDR	- Parse Phase III address field
+;
+;
+; INPUTS:	R8	Scratch
+;		R5	WQE pointer
+;		R4	RCB address
+;		R1	Pointer to next field in message (node address)
+;		R0	Scratch
+;
+; OUTPUTS:	R8	Node address from message
+;		R1	Advance passed node address field in message
+;		R0	LBS if successful
+;			LBC otherwise.  In this case an event code is setup
+;			for the state table processing and the Event Logging
+;			info are setup in the WQE.
+;
+;		All other regs are unchanged
+;
+;-
+		.ENABL	LSB
+
+PARSE_PH2_ADDR:				; Parse Phase II node address field
+	CVTBL	(R1)+,R8		; Get partner's node address
+	BGEQ	10$			; Br unless field is extended
+	MOVZBL	(R1)+,R0		; Get next (final) byte of field
+	INSV	R0,#7,#25,R8		; Merge with low order bits
+	$LOG	TPL_PFM,,,R5		; Assume fatal event is "format error"
+	DECW	WQE$L_PM2+2(R5)		; Account for extra byte
+	BLSS	40$			; If LSS then msg is too small
+10$:	$LOG	TPL_ISF,TPL_PRSN_ADJR,,R5 ; Assume address out of range
+	CMPL	R8,#TR2C_MAX_PNA	; Less than max Phase II address ?
+	BGTRU	30$			; Out of range if GTRU
+	BRB	20$			; Continue in common
+
+PARSE_PH3_ADDR:				; Parse Phase III node address field
+	CVTWL	(R1)+,R8		; Get the node address
+	BLEQ	30$			; Error if LEQ
+20$:	MOVL	#1,R0			; Assume success
+	CMPW	R8,RCB$W_MAX_ADDR(R4)	; Within bounds?
+	BLEQU	50$			; If so, branch to report success
+30$:	$LOG	TPL_LDF,-		; Line down due to "address out 
+		TPL_PRSN_ADJR,,R5	; of range"
+40$:	;
+	;   Come here for all errors
+	;
+	$EVT	LOG_FTE,R5		; Event is "log fatal error"
+	CLRB	R0			; Set error flag
+50$:	;
+	;   Common exit
+	;
+	MOVW	R8,LEV_W_PNA		; Save the node address
+	RSB
+
+		.DSABL	LSB
+
+;+
+; RESET_CHAN	- Cancel all the I/O queued to device.
+;
+; FUNCTIONAL DESCRIPTION:
+;
+; If a channel is active to the driver then call the driver to cancel ALL
+; the I/O on the device.  A $CANCEL is not sufficient since the PID field 
+; of the internal IRPs queued to the data link driver by NETDRIVER would 
+; not match hence not all of the packets would be cancelled.
+;
+; INPUTS:	R11	CRI CNR pointer
+;		R10	CRI CNF pointer
+;		R9-R7	Scratch
+;		R6	LPD pointer
+;		R0	Scratch
+;
+; OUTPUTS:	R0	Status
+;		R9-R7	Clobbered
+;
+;		All other regs are preserved
+;-
+RESET_CHAN:
+	$CANCEL_S CHAN = LPD$W_CHAN(R6)	; Cancel stuff on the queue
+	MOVL	#1,R0			; Return success
+	RSB
+
+;+
+; NET$GET_LPD_CRI
+;
+; INPUTS	R11-R9	Scratch
+;		R8	Low byte contains LPD index
+;		R7,R6	Scratch
+;
+; OUTPUTS:	R11	CNR address 
+;		R10	CNF address 
+;		R9-R7	Garbage
+;		R6	LPD if low bit set in R0
+;		R0	Low bit set if successful
+;			Low bit clear otherwise
+;-
+NET$GET_LPD_CRI::
+	MOVL	L^NET$GL_CNR_CRI,R11	; Get data base root for CRI
+	CLRL	R10			; No CNF yet
+	BSBB	NET$FIND_LPD		; Find the LPD via index in R8
+	BLBC	R0,10$			; If LPD then none
+	MOVL	R11,R0			; Make a copy
+	MOVZWL	LPD$W_PTH(R6),R8	; Get full LPD path i.d.
+5$:	MOVL	CNF$L_FLINK(R0),R0	; Get next CNF
+	CMPL	R0,R11			; At head of list?
+	BEQL	10$			; If EQL yes, return with LBC in R0
+	CMPW	R8,CNF$W_ID(R0)		; This it?
+	BNEQ	5$			; If NEQ keep trying
+	MOVL	R0,R10			; Copy CNF address
+	MOVL	S^#SS$_NORMAL,R0	; Set status
+10$:	RSB				; Done
+;+
+; NET$LOCATE_LPD
+;
+; INPUTS:	R11	CNR address
+;		R10	CNF address
+;		R9-R6	Scratch
+;
+; OUTPUTS:	R11,R10	Preserved
+;		R9-R7	Garbage
+;		R6	LPD if low bit set in R0
+;			Zero if low bit clear in R0
+;		R0	SS$_NORMAL    if successful
+;			SS$_DEVINACT  otherwise
+;-
+NET$LOCATE_LPD::
+	MOVZWL	CNF$W_ID(R10),R8	; Get LPD i.d.
+					; And fall thru
+
+;+
+; NET$FIND_LPD
+;
+; INPUTS:	R8	Low byte contains LPD index
+;		R6	Scratch
+;
+; OUTPUTS:	R8	Garbage
+;		R6	LPD if low bit set in R0
+;			Zero if low bit clear in R0
+;		R0	SS$_NORMAL    if successful
+;			SS$_DEVINACT  otherwise
+;-
+NET$FIND_LPD::
+	MOVL	W^NET$GL_PTR_VCB,R0	; Get the RCB address
+	MOVL	RCB$L_LOC_LPD(R0),R6	; Get LPD address
+	CVTBL	R8,R8			; Sign extend path
+	BLSS	5$			; If LSS done - local
+	BEQL	10$			; If EQL then there's none
+	CMPB	R8,RCB$B_MAX_LPD(R0)	; Within range ?
+	BGTR	10$			; If not, branch
+	MOVL	RCB$L_PTR_LPD(R0),R6	; Get the vector of LPDs
+	MULL3	#LPD$C_LENGTH,R8,R0	; Get biased offset
+	MOVAB	12-LPD$C_LENGTH(R6)[R0],R6 ; Get LPD address
+	BBC	#LPD$V_INUSE,-		; Is it valid ?
+		    LPD$W_STS(R6),10$	;  if BC then no
+5$:	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+	BRB	15$			; Take common exit
+10$:	CLRL	R6			; Nullify LPD pointer
+	MOVZWL	#SS$_DEVINACT,R0	; Indicate failure
+15$:	RSB
+
+;+
+; NET$GET_PLVECLPD	- Find next active LPD using the indicated line (PLVEC)
+;
+; INPUTS:	R4	PLVEC index
+;		R1	Previous LPD index (scan starts with R1 +1)
+;
+; OUPUTS:	R1	New LPD address
+;		R0	SS$_NORMAL    if successful
+;			SS$_DEVINACT  otherwise
+;-
+NET$GET_PLVECLPD::			; Find next active LPD using this line
+	PUSHL	R3			; Save reg
+	MOVL	W^NET$GL_PTR_VCB,R3	; Get the RCB address
+	BEQL	110$			; If EQL then there's none
+	MULL3	#LPD$C_LENGTH,R1,R0	; Get offset to indicated LPD cell 
+	ADDL	#12-LPD$C_LENGTH,R0	; Adjust for bias
+	ADDL	RCB$L_PTR_LPD(R3),R0	; Add to base address
+	BRB	30$			; Start with next LPD entry
+20$:	CMPB	R1,RCB$B_MAX_LPD(R3)	; Within range ?
+	BGTRU	100$			; If not, branch
+	BBC	#LPD$V_INUSE,-		; Is LPD info valid ?
+		    LPD$W_STS(R0),30$	;  if BC then no
+	BBC	#LPD$V_ACTIVE,-		; Is LPD active ?
+		    LPD$W_STS(R0),30$	; If BC then no
+	CMPB	R4,LPD$B_PLVEC(R0)	; Is it using the indicated line?
+	BEQL	40$			; If EQL yes, we've found the LPD
+30$:	INCL	R1			; Bump the LPD index
+	ADDL	#LPD$C_LENGTH,R0	; Bump the pointer
+	BRB	20$			; Loop
+40$:	MOVL	R0,R1			; Copy LPD pointer
+	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+	BRB	110$			; Take common exit
+100$:	CLRL	R1			; Nullify LPD pointer
+	MOVZWL	#SS$_DEVINACT,R0	; Indicate failure
+110$:	POPL	R3			; Restore reg
+	RSB
+
+
+TELL_NETDRIVER:				;
+	PUSHR	#^M<R1,R2,R3,R4,R5>	; Save critical regs
+	MOVL	W^NET$GL_NET_UCB,R5	; Get the ACP's NET UCB
+	MOVL	W^NET$GL_PTR_VCB,R2	; Get RCB
+	MOVL	R6,R1			; Get the LPD address
+	JSB	@W^NET$GL_PTR_ACR	; Tell NETDRIVER
+	POPR	#^M<R1,R2,R3,R4,R5>	; Restore regs
+	RSB
+.END
+

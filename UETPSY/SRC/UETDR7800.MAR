@@ -1,0 +1,1997 @@
+	.TITLE UETDR7800 VAX/VMS UETP DEVICE TEST FOR DR780/DR750
+	.IDENT	'V03-002'
+	.ENABLE SUPPRESSION
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+
+;++
+; FACILITY:
+;	This module will be distributed with VAX/VMS under the [SYSTEST]
+;	account.
+;
+; ABSTRACT:
+;	This module exercises a DR780 or a DR750 in the VAX/VMS system using
+;	QIO functions.  2048(10) byte transfers are written and read
+;	using chained command packets.  The transfers are verified for
+;	correct data.
+;
+; ENVIRONMENT:
+; 	This program will run in user access mode, with interrupts enabled
+;	at all times.  This program  must be linked with SYS$SYSTEM:SYS.STB 
+;	because of its use of symbol IOC$GW_XFMXRATE to get the current DR
+;	max transfer rate. This program requires the following privileges and
+;	quotas:
+;
+;--
+;
+; AUTHOR: Larry Jones,	CREATION DATE: May, 1981
+;
+; MODIFIED BY:
+;
+;	V03-002	LDJ0002		Larry D. Jones,		11-Mar-1982
+;		Fixed missing bit set in command table for DR.
+;
+;	V03-001	LDJ0001		Larry D. Jones,		29-Sep-1981
+;		Filled in error path exits with missing STATUS values and
+;		reversed the order of the error/end test.
+;
+;**
+
+	.SBTTL	Declarations
+;
+; INCLUDE FILES:
+;
+;	SYS$LIBRARY:LIB.MLB	for general definitions
+;	SHRLIB$:UETP.MLB	for UETP definitions
+
+;
+; MACROS:
+;
+	$ACCDEF				; Accounting definitions
+	$CHFDEF				; Condition handler frame definitions
+	$DEVDEF				; Device definitions
+	$DIBDEF				; Device Information Block
+	$SHRDEF				; Shared messages
+	$STSDEF				; Status return
+	$UETUNTDEF			; UETP unit block offset definitions
+	$UETPDEF			; UETP
+	$XFDEF				; DR780 definitions
+;
+; USER MACRO DEFINITIONS
+;
+; QRETRY - This macro executes an interlocked queue instruction and
+;	   retries up to 25 times if the queue is locked.
+; INPUTS:
+;	OPCODE = OPCODE NAME : INSQHI, INSQTI, REMQHI, REMQTI.
+;	OPERAND1 = first operand for opcode.
+;	OPERAND2 = second operand for opcode.
+;	SUCCESS = label to branch to if operation succeeds (may be defaulted).
+;	ERROR  = label to branch to if operation fails (may be omitted).
+;
+; OUTPUTS:
+;	R0    = destroyed.
+;	C-BIT = clear if operation succeeded.
+;		set if operation failed - queue locked.
+;		(must be checked before V-bit or Z-bit)
+;
+;	REMQTI OR REMQHI:
+;
+;	V-bit = clear if an entry removed from queue.
+;		set if no entry removed from the queue.
+;
+;	INSQTI OR INSQHI:
+;
+;	Z-bit = clear if entry is not first in the queue.
+;		set if entry is first in the queue.
+;
+		.MACRO	QRETRY OPCODE,OPERAND1,OPERAND2,SUCCESS,ERROR,?LOOP,?OK
+		CLRL	R0
+LOOP:
+		OPCODE	OPERAND1,OPERAND2
+		.IF	NB	SUCCESS
+		BCC	SUCCESS
+		.IFF
+		BCC	OK
+		.ENDC
+		AOBLSS	#25,R0,LOOP
+		.IF 	NB	ERROR
+		BRW	ERROR
+		.ENDC
+OK:
+	.ENDM	QRETRY
+;
+	.MACRO BUILD,NAME,STATUS
+		.=PC1...		; PC of ASCIC pkt NAME table
+		.ADDRESS PC2...		; ASCIC pkt address
+		.LONG	^X'STATUS	; Expected packet return code
+		PC1...=PC1...+8		; Bump to the next address
+		.=PC2...		; Point to the next ASCIC msg
+					; Make it's label and function ID
+NAME:
+		.ASCIC /NAME, /
+		PC2...=.		; Update the string PC
+	.ENDM BUILD
+;
+; EQUATED SYMBOLS:
+;
+;   Facility number definitions:
+	UETP_K = 116
+	RMS_K = 1
+
+;   SHR message definitions:
+	UETP = UETP_K@STS$V_FAC_NO	; Define the UETP facility code
+;
+	UETP$_ABENDD = UETP!SHR$_ABENDD	; Define the UETP message codes
+	UETP$_BEGIND = UETP!SHR$_BEGIND
+	UETP$_ENDEDD = UETP!SHR$_ENDEDD
+	UETP$_OPENIN = UETP!SHR$_OPENIN
+	UETP$_TEXT   = UETP!SHR$_TEXT
+
+;   Internal flag bits...:
+	CC_FLGV      = 0		; Set when a control C is typed
+	TEST_OVERV   = 1		; Set when test is over
+	SAFE_TO_UPDV = 2		; Set when it's safe to update UETINIDEV
+	ERR_FLGV     = 3		; Set when an error occurs
+	FPAC_FLGV    = 4		; Set when first packet is serviced
+	BEGIN_MSGV   = 5		; Set when begin message printed
+
+;   ...and corresponding masks:
+	CC_FLGM      = 1@CC_FLGV
+	TEST_OVERM   = 1@TEST_OVERV
+	SAFE_TO_UPDM = 1@SAFE_TO_UPDV
+	ERR_FLGM     = 1@ERR_FLGV
+	FPAC_FLGM    = 1@FPAC_FLGV
+	BEGIN_MSGM   = 1@BEGIN_MSGV
+
+;   Miscellany:
+	LC_BITM       = ^X20		; Mask to convert lower case to upper
+	ESC           = ^X1B		; Escape definition
+	REC_SIZE      = 20		; UETINIDEV.DAT record size
+	TEXT_BUFFER   = 132		; Internal text buffer size
+	MAX_PROC_NAME = 15		; Longest process name
+	MAX_DEV_DESIG = 8		; Longest possible controller name
+	MAX_UNIT_DESIG= 5		; Longest possible unit number
+	NO_OF_POS_PKTS= 17		; Number of possible packet types
+	PKT_COUNT     = 13		; Number of packets to be processed
+	UNUSED_FUNC   = ^X6030		; Bit mask of the unused functions
+	BUFSIZ        = 2048		; Read/write buffer size
+	EFN1          = 1		; EF number definitions
+	EFN2          = 4		; EFN used for three minute timer
+
+;   The following definitions are set depending on the device under test.
+
+	DEVDEP_SIZE   = 0		; Size of device dependent part of UETUNT
+	WRITE_SIZE    = BUFSIZ		; Size of device write buffer
+	READ_SIZE     = BUFSIZ		; Size of device read buffer
+
+	PAGES = <<UETUNT$C_INDSIZ+-	; Add together all of the pieces...
+		  DEVDEP_SIZE+-		; ...which make up a UETP unit block...
+		  WRITE_SIZE+-		; ...to give to the $EXPREG service below
+		  READ_SIZE+-
+		  511>/512>
+
+
+	.SBTTL	Read-Only Data
+	.PSECT	RODATA,NOEXE,NOWRT,PAGE
+
+ACNT_NAME:				; Process name on exit
+	.ASCID	/SYSTEST/
+
+TEST_NAME:				; This test name
+	.ASCID	/UETDR7800/
+
+SUPDEV_GBLSEC:				; How we access UETSUPDEV.DAT
+	.ASCID	/UETSUPDEV/
+
+CONTROLLER:				; Logical name of controller
+	.ASCID	/CTRLNAME/
+
+PROCESS:				; ucode load program
+	.ASCID	/SYS$SYSTEM:XFLOADER.EXE/
+
+MODE:					; Run mode logical name
+	.ASCID	/MODE/
+
+CS:
+	.ASCID	/Bad DR !AC packet DSL of !XL expected !XL/
+
+CS1:					; Device class and type control string
+	.ASCID	/!2XB !2XB /
+
+CS2:
+	.ASCID	/The DR!AC data rate is !XW which is !AS megabytes per second./
+
+CS3:					; Device class-only control string
+	.ASCID	/!2XB **/
+
+CS4:
+	.LONG	CS1L
+	.ADDRESS .+4
+	.ASCII	\Bad packet count, expected !UL packets but received !UL.!/\
+	.ASCII	\!_!_Missing !UL!- packet!%S : !#(AC)\
+	CS1L=.-CS1-8
+
+ULOAD_FAILED:
+	.ASCID	\DR ucode load failure.\
+
+TTNAME_ROPTR:				; Descriptor for recursive...
+	.WORD	63,0			; ...translation of TTNAME
+	.ADDRESS TTNAME
+
+CNTRLCMSG:
+	.ASCID	\Aborted via a user CTRL/C\
+
+NO_CTRLNAME:
+	.ASCID	/No controller specified./
+
+DEAD_CTRLNAME:
+	.ASCID	/Can't test controller !AS, marked as unusable in UETINIDEV.DAT./
+
+NOUNIT_SELECTED:
+	.ASCID	/No units selected for testing./
+
+ILLEGAL_REC:
+	.ASCID	/Illegal record format in file UETINIDEV.DAT!/
+
+PASS_MSG:
+	.ASCID	/End of pass !UL with !UL iterations at !%D./
+
+DR780:					; DR780 name
+	.ASCIC	/780/
+DR750:					; DR750 name
+	.ASCIC	/750/
+
+THREEMIN:				; 3 minute delta time
+	.LONG	-10*1000*1000*180,-1
+TENSEC:
+	.LONG	-10*1000*1000*10,-1 	; 10 second delta time
+
+UNIT_DESC:				; Descriptor used to convert unit #
+	.LONG	5
+	.ADDRESS BUFFER+6
+
+CONT_DESC:				; Descriptor used to convert controller...
+	.WORD	REC_SIZE,0		; ...from lowercase to uppercase
+	.ADDRESS BUFFER
+
+FILE:					; Fills in RMS_ERR_STRING
+	.ASCID	/file/
+
+RECORD:					; Fills in RMS_ERR_STRING
+	.ASCID	/record/
+
+RMS_ERR_STRING:				; Announces an RMS error
+	.ASCID	/RMS !AS error in file !AD/
+
+PROMPT_MSG:
+	.ASCII	/Controller designation?: /
+	PMTSZ = .-PROMPT_MSG
+
+BADQUE:
+	.ASCID	/Bad queue entry detected! Fatal error!/
+
+TEST_HUNG:
+	.ASCID	/DR hung, check backplane jumpers needed for testing./
+
+CMDBLKDES:
+	.ADDRESS CMDBLK			; LKWSET parameter list for locking
+	.ADDRESS CMDBLKEND		; Down the command block
+
+NAME_TBL:				; Table of pointers to ASCIC packet names
+					; And expected packet status returns
+	.BLKL	NO_OF_POS_PKTS*2	; ** NOTE ** table must be in this order
+
+PKT_TBL:				; Table of pointers to DR packets
+	.ADDRESS FREE_PKT		; ** NOTE ** table must be in this order
+	.ADDRESS NOOP_PKT
+	.ADDRESS SET_SELF_PKT
+	.ADDRESS DIAG_WRI_PKT
+	.ADDRESS READ_DDI_PKT
+	.ADDRESS DIAG_REA_PKT
+	.ADDRESS WRITE_CH_PKT
+	.ADDRESS WRITE_PKT
+	.ADDRESS READ_CHA_PKT
+	.ADDRESS READ_PKT
+	.ADDRESS DIAG_WRT_PKT
+	.ADDRESS CLR_SELF_PKT
+	.ADDRESS HALT_PKT
+
+	PC1...=NAME_TBL				; Set name pointer 
+	PC2...=.				; Set name table pointer
+
+	.LIST MEB
+	BUILD READ,00000023			; Build the tables and the type names
+	BUILD READ_CHAIN,00000023
+	BUILD WRITE,00000023
+	BUILD WRITE_CHAIN,00000023
+	BUILD WRITE_DEV_CNTRL,00000023
+	BUILD RESERVED,00000000
+	BUILD SET_SELF_TEST,00000023
+	BUILD CLR_SELF_TEST,00000003
+	BUILD NOOP,00000003
+	BUILD DIAG_READ_INT,00000023
+	BUILD DIAG_WRIT_INT,00000023
+	BUILD READ_DDI,00000023
+	BUILD DIAG_WRT_CNTRL,00000023
+	BUILD SET_RAND_ENABLE,00000000
+	BUILD CLR_RAND_ENABLE,00000000
+	BUILD HALT,00000003
+	BUILD FREE,00000029
+	.NLIST MEB
+
+	.SBTTL	Read/Write Data
+	.PSECT	RWDATA,WRT,NOEXE,PAGE
+
+TTCHAN:					; Channel associated with ctrl. term.
+	.WORD	0
+
+MBCHAN:					; Mailbox channel
+	.WORD	0
+
+CHAN:					; DR780 channel
+	.WORD	0
+
+TTNAME_RWPTR:				; Descriptor for recursive...
+	.WORD	TTNAME_LEN,0		; ...translation of TTNAME
+	.ADDRESS TTNAME
+TTNAME:
+	.ASCII	/SYS$INPUT/
+	TTNAME_LEN=.-TTNAME
+	.BLKB	63-TTNAME_LEN
+
+PID:					; PID storage for ucode load process
+	.LONG	0
+
+FLAG:					; Miscellaneous flag bits
+	.WORD	0			; (See Equated Symbols for definitions)
+
+FAO_BUF:				; FAO output string descriptor
+	.WORD	TEXT_BUFFER,0
+	.ADDRESS BUFFER
+
+BUFFER_PTR:				; Fake .ASCID buffer for misc. strings
+	.WORD	TEXT_BUFFER,0		; A word for length, a word for desc.
+	.ADDRESS BUFFER
+
+BUFFER:					; FAO output and other misc. buffer
+	.BLKB	TEXT_BUFFER
+
+DEVDSC:					; Device name descriptor
+	.WORD	MAX_DEV_DESIG,0
+	.ADDRESS DEV_NAME
+
+
+; NOTE THAT THE CODE DEPENDS ON THE FOLLOWING TWO ITEMS BEING TOGETHER.
+PROCESS_NAME:				; Process name
+	.ASCID	/UETDR7800_/
+DEV_NAME:				; Device name buffer
+	.BLKB	MAX_DEV_DESIG+MAX_UNIT_DESIG
+	NAME_LEN = .-DEV_NAME
+
+; END OF ITEMS WHICH CODE DEPENDS ON BEING TOGETHER.
+
+
+DIB:					; Device Information Block
+	.WORD	DIB$K_LENGTH,0
+	.ADDRESS DIBBUF
+DIBBUF:
+	.BLKB	DIB$K_LENGTH
+
+ERROR_COUNT:				; Cumulative error count at runtime
+	.LONG	0
+
+STATUS:					; Status value on program exit
+	.LONG	0
+
+STAT:					; IO status block
+	.QUAD	0
+
+AST_MODE:				; Prior setting of AST delivery
+	.LONG	0
+
+SS_FAIL_MODE:				; Prior setting of SS failure mode
+	.LONG	0
+
+INADDRESS:				; $CRMPSC address storage
+	.LONG	0,0
+
+OUTADDRESS:
+	.LONG	0,0
+
+UNIT_NUMBER:				; Current dev unit number for GET_LINE
+	.WORD	0
+
+DEVNAM_LEN:				; Current device name length
+	.WORD	0
+
+RANDOM1:				; Random word #1
+	.LONG	^XAAAAAAAA
+
+RANDOM2:				; Random word #2
+	.LONG	^XA72EA72E
+
+ITERATION:				; # of times all tests were executed
+	.LONG	0
+
+PASS:					; Pass count
+	.LONG	0
+
+MSG_BLOCK:				; Auxiliary $GETMSG info
+	.BLKB	4
+
+EXIT_DESC:				; Exit handler descriptor
+	.LONG	0
+	.ADDRESS EXIT_HANDLER
+	.LONG	1
+	.ADDRESS STATUS
+
+ARG_COUNT:				; Argument counter used by ERROR_EXIT
+	.LONG	0
+
+;
+; Head of self-relative UETP unit block list.
+;
+	.ALIGN QUAD
+
+UNIT_LIST:				; Head of unit block circular list
+	.QUAD	0
+
+NEW_NODE:				; Newly aquired node address
+	.QUAD	0
+
+PKT_CNT:
+	.LONG	0			; Cumulative packet count for this PKT_CHECK call
+
+PACK_REMOVED:
+	.LONG	0			; Bit mask record of the packets which
+					; Have been removed from the termination
+					; Queue. Bit position is directly related
+					; To the fuction code e.g. the READ bit
+					; Is 0 and the READ_CHAIN bit is 1
+ARGS:
+	.BLKL	20			; Space for 20 arguments
+
+BADRPKT:
+	.LONG	0			; Bad DR packet message desc.
+	.ADDRESS BUFFER
+
+RATE_BUF:
+	.LONG	7			; Buffer for ASCII rate in decimal
+	.ADDRESS .+4
+	.BLKB	7
+
+RATE_FLOAT:
+	.DOUBLE	0			; Storage for double format rate
+
+RATE_DESC:
+	.LONG	0			; Desc for the full rate message
+	.ADDRESS BUFFER
+
+DRIOSTAT:
+	.QUAD	0			; DR780 IO status block
+
+BUFBLK:
+TEST_DATA:
+OUTPUT_BUF:				; Primary output data buffer
+	.BLKB	BUFSIZ
+
+INPUT_BUF:				; Primary input data buffer
+	.BLKB	BUFSIZ
+
+INPUT1_BUF:				; Secondary input data buffer
+	.BLKB	128
+	BUFBLKSIZ=.-BUFBLK
+
+;
+; Data transfer command table
+;
+CMDTBL:
+	.LONG	CMDBLKSIZ		; Length of command block in bytes
+	.LONG	CMDBLK			; Address of start of command block.
+					; Also head of input queue
+	.LONG	BUFBLKSIZ		; Length of buffer block in bytes
+	.LONG	BUFBLK			; Base address of the buffer block
+	.LONG	PKT1_AST		; Address of the packet interrupt routine
+	.LONG	0			; Parameter to be passed to AST routine.
+	.BYTE	0			; Data transfer rate
+	.BYTE	XF$M_CMT_DIPEAB!-
+		XF$M_CMT_SETRTE		; Flags byte
+	.WORD	0			; Not used
+	.LONG	GOBIT			; Address into which the address of the
+					; DR's gobit will be written by QIO.
+					;
+CMDTBLSIZ=.-CMDTBL			; Define the length of the command table
+;
+;Long word to receive the address of the gobit
+;
+GOBIT:
+	.LONG	0
+.PAGE
+	.Subtitle COMMAND BLOCK & PACKETS
+;
+; This is the start of the command block from which the DR fetches its commands
+;
+; The commands are in the form of a block of memory called a packet which is
+; linked into a list using the interlocked queue instructions.
+; The DR removes the command packets from the INPUT QUEUE processes them
+; and replaces them onto the TERMination QUEUE.
+; A status longword is written into each packet before it is connected to
+; to the TERMQ.
+;
+; The command block must be quad word aligned to support the queue instructions
+;
+	.ALIGN	QUAD	0
+CMDBLK::				;
+INPTQH:	.BLKQ	1
+TERMQH:	.BLKQ	1
+FREEQH:	.BLKQ	1
+;
+; Packet to do a nop command.
+;
+NOOP_PKT:
+	.LONG	0			; Queue forward link
+	.LONG	0			; Queue backward link
+	.WORD	0			; Log area and message length
+	.BYTE	XF$K_PKT_NOP@XF$V_PKT_FUNC ; Command = nop
+	.BYTE	XF$K_PKT_NOINT@XF$V_PKT_INTCTL ; No interrupt.
+					; Interrupt unconditionally.
+	.LONG	0			; Byte count not used here
+	.LONG	0			; Va not used here
+	.LONG	0			; Residual memory byte count
+					; Not used here.
+	.LONG	0			; Residual ddi byte count
+					; Not used here.
+	.LONG	0			; Dr status longword for this pkt
+					;
+;
+; Packet to do a halt command.
+;
+; This packet will cause two AST's to be queued regardless of the state
+; of the interrupt control field.
+;
+;
+
+HALT_PKT:				;
+	.LONG	0			; Queue forward link
+	.LONG	0			; Queue backward link
+	.WORD	0			; Log area and message length
+	.WORD	XF$K_PKT_HALT@XF$V_PKT_FUNC ; Command = halt
+					; Interrupt field ignored here
+	.LONG	0			; Byte count not used here
+	.LONG	0			; Va not used here
+	.LONG	0			; Residual memory byte count
+					; Not used here.
+	.LONG	0			; Residual DDI byte count
+					; Not used here.
+	.LONG	0			; DR status longword for this pkt
+					;
+;
+; Packet to set self test mode.
+;
+; This packet will get error status if DDI DISABLE is set when it is executed.
+;
+SET_SELF_PKT:				;
+					;
+	.LONG	0			; Queue forward link
+	.LONG	0			; Queue backward link
+	.WORD	0			; Log area and message length
+	.BYTE	XF$K_PKT_SETTST@XF$V_PKT_FUNC ; Command = set self test
+	.BYTE	XF$K_PKT_NOINT@XF$V_PKT_INTCTL ; No interrupt.
+	.LONG	0			; Byte count not used here
+	.LONG	0			; Va not used here
+	.LONG	0			; Residual memory byte count
+					; Not used here.
+	.LONG	0			; Residual DDI byte count
+					; Not used here.
+	.LONG	0			; DR status longword for this pkt
+					;
+;
+; Packet to clear self test.
+;
+
+CLR_SELF_PKT:				;
+					;
+	.LONG	0			; Queue forward link
+	.LONG	0			; Queue backward link
+	.WORD	0			; Log area and message length
+	.BYTE	XF$K_PKT_CLRTST@XF$V_PKT_FUNC ; Command = clear self test
+	.BYTE	XF$K_PKT_NOINT@XF$V_PKT_INTCTL ; No interrupt.
+	.LONG	0			; Byte count not used here
+	.LONG	0			; Va not used here
+	.LONG	0			; Residual memory byte count
+					; Not used here.
+	.LONG	0			; Residual DDI byte count
+					; Not used here.
+	.LONG	0			; DR status longword for this pkt
+					;
+;
+; Command packet to do a diagnostic write internal
+;
+; This command is used to test the dr's internal silo.
+; The number of bytes specified by the byte count are read from memory
+; and stored in the silo.
+;
+
+DIAG_WRI_PKT:				;
+					;
+	.LONG	0			; Queue forward link
+	.LONG	0			; Queue backward link
+	.WORD	0			; Log area and message length
+	.BYTE	XF$K_PKT_DIAGWI@XF$V_PKT_FUNC ; Command = diag write internal
+	.BYTE	XF$K_PKT_NOINT@XF$V_PKT_INTCTL ; No interrupt.
+	.LONG	128			; Byte count is 128 even though
+					; Only 124 bytes are valid
+	.ADDRESS OUTPUT_BUF		; Address of data buffer
+	.LONG	0			; Residual memory byte count
+	.LONG	0			; Residual DDI byte count
+	.LONG	0			; DR status long word for this pkt
+					;
+;
+; Command packet to do a diagnostic read internal command.
+;
+; This command is used to read the data in the DR's internal silo.
+; The number of bytes specified by the byte count are read from the dr
+; and written to memory specified by the virtual address field.
+;
+;
+
+DIAG_REA_PKT:				;
+	.LONG	0			; Queue forward link
+	.LONG	0			; Queue backward link
+	.WORD	0			; Log area and message length
+	.BYTE	XF$K_PKT_DIAGRI@XF$V_PKT_FUNC ; Command = diag read internal
+	.BYTE	XF$K_PKT_UNCOND@XF$V_PKT_INTCTL ; Interrupt unconditionally
+	.LONG	128			; Byte count is 128 even though
+					; Only 124 bytes are valid
+	.ADDRESS INPUT1_BUF		; Address of data buffer
+	.LONG	0			; Residual memory byte count
+	.LONG	0			; Residual DDI byte count
+	.LONG	0			; DR status long word for this pkt
+					;
+; 
+; Command packet to do a diagnostic read DDI command
+;
+; This command wraps the data around on the DDI bus and stores it back into
+; the silo.
+;
+;
+READ_DDI_PKT:				;
+					;
+	.LONG	0			; Queue forward link
+	.LONG	0			; Queue backward link
+	.WORD	0			; Log area and message length
+	.BYTE	XF$K_PKT_DIAGRD@XF$V_PKT_FUNC ; Command = diag read DDI
+	.BYTE	XF$K_PKT_NOINT@XF$V_PKT_INTCTL	; No interrupt.
+	.LONG	128			; Byte count = silo size
+	.LONG	0			; Address field not used
+	.LONG	0			; Residual memory byte count
+	.LONG	0			; Residual DDI byte count
+	.LONG	0			; DR status long word for this pkt
+					;
+; 
+; Packet to do a write chained command.
+;
+WRITE_CH_PKT:				;
+	.LONG	0			; Queue forward link
+	.LONG	0			; Queue backward link
+	.WORD	16			; Log area and message length
+	.BYTE	XF$K_PKT_WRTCHN@XF$V_PKT_FUNC ; Command = write chained
+	.BYTE	<XF$K_PKT_CBDMBC@XF$V_PKT_CISEL>!-
+		<XF$K_PKT_NOINT@XF$V_PKT_INTCTL> ; No interrupt. Send command,
+						 ; Byte count,device message 
+						 ; Message is 16 bytes long
+	.LONG	59			; Byte count is 59 to keep
+					; Things on odd boundries.
+	.ADDRESS OUTPUT_BUF		; Address of data buffer
+	.LONG	0			; Residual memory byte count
+	.LONG	0			; Residual DDI byte count
+	.LONG	0			; DR status long word for this pkt
+					; Generate and incrementing pattern
+					; For the device message.
+	X=0
+	.REPT	16			; Device message is 16 bytes long
+	.BYTE X
+	X=X+1
+	.ENDR
+					;
+;
+; Command packet do to a write device command
+;
+WRITE_PKT:				;
+	.LONG	0			; Queue forward link
+	.LONG	0			; Queue backward link
+	.WORD	128			; Log area and message length
+	.BYTE	XF$K_PKT_WRT@XF$V_PKT_FUNC ; Command = write device 
+	.BYTE	<XF$K_PKT_CBDMBC@XF$V_PKT_CISEL>!-
+		<XF$K_PKT_NOINT@XF$V_PKT_INTCTL> ; No interrupt. Send command,
+						  ; Byte count,device message 
+						  ; Message is 128 bytes long
+	.LONG	1989			; Byte count is 1989 to keep
+					; Things on odd boundries.
+	.ADDRESS OUTPUT_BUF+59		; Address of data buffer
+	.LONG	0			; Residual memory byte count
+	.LONG	0			; Residual DDI byte count
+	.LONG	0			; DR status long word for this pkt
+					; Device message for this packet
+					; Even though in self test mode
+					; The dr will not look at the message
+					; An incrementing pattern is used.
+	X=^XFF
+	.REPT	128			; Generate an decrementing pattern
+	.BYTE	X
+	X=X-1
+	.ENDR
+					;
+;
+; Command packet to do a read chained command.
+;
+; This packet must only be executed in self test mode.
+; A device message is transmitted to never never land to use more
+; microcode in the DR.
+;
+READ_CHA_PKT:				;
+	.LONG	0			; Queue forward link
+	.LONG	0			; Queue backward link
+	.WORD	16			; Log area and message length
+	.BYTE	XF$K_PKT_RDCHN@XF$V_PKT_FUNC ; Command = read chained
+	.BYTE	<XF$K_PKT_CBDMBC@XF$V_PKT_CISEL>!-
+		<XF$K_PKT_NOINT@XF$V_PKT_INTCTL> ; No interrupt device message 
+						 ; 16 bytes long.send command
+						 ; Byte count and device message
+
+	.LONG	59			; Byte count is 59 to keep
+					; Things on odd boundries.
+	.ADDRESS INPUT_BUF		; Address of data buffer
+	.LONG	0			; Residual memory byte count
+	.LONG	0			; Residual DDI byte count
+	.LONG	0			; DR status long word for this pkt
+					; Generate and incrementing pattern
+					; For the device message.
+	X=0
+	.REPT	16			; Device message is 16 bytes long
+	.BYTE X
+	X=X+1
+	.ENDR
+					;
+;
+; Command packet do to a read device command
+;
+READ_PKT:				;
+	.LONG	0			; Queue forward link
+	.LONG	0			; Queue backward link
+	.WORD	128			; Log area and message length
+	.BYTE	XF$K_PKT_RD@XF$V_PKT_FUNC ; Command = read device
+	.BYTE	<XF$K_PKT_CBDMBC@XF$V_PKT_CISEL>!-
+		<XF$K_PKT_UNCOND@XF$V_PKT_INTCTL> ; Interrupt when done,send command
+						  ; Byte count and device message.
+						  ; Device message is 128 bytes.
+	.LONG	1989			; Byte count is 1989 to keep
+					; Things on odd boundries.
+	.ADDRESS INPUT_BUF+59		; Address of data buffer
+	.LONG	0			; Residual memory byte count
+	.LONG	0			; Residual DDI byte count
+	.LONG	0			; DR status long word for this pkt
+					; Device message for this packet
+					; Even though in self test mode
+					; The dr will not look at the message
+					; An incrementing pattern is used.
+	X=0
+	.REPT	128			; Generate an incrementing pattern
+	.BYTE	X
+	X=X+1
+	.ENDR
+					;
+;
+; Command packet to do a diagnostic write device message command.
+;
+; This command writes a single byte onto the control bus and reads it
+; back again. A packet is then removed from FREE Q and the data read is
+; placed into the message area of this packet.
+;
+; This command can only be executed in self test mode.
+;
+DIAG_WRT_PKT:				;
+					;
+	.LONG	0			; Queue forward link
+	.LONG	0			; Queue backward link
+	.WORD	1			; Log area and message length
+	.WORD	XF$K_PKT_DIAGWC@XF$V_PKT_FUNC ; Command = diagnostic write
+	.BYTE	XF$K_PKT_NOINT@XF$V_PKT_INTCTL ; No interrupt.
+					;
+	.LONG	0			; Byte count not used here
+	.LONG	0			; Va field not used here
+	.LONG	0			; Residual memory byte count 
+					; Not used here
+	.LONG	0			; Residual DDI byte count 
+					; Not used here.
+	.LONG	0			; DR status longword for this pkt.
+DIAG_CNTRL_MESS:
+	.LONG	^X0AA			; Longword for the device message
+					; This is modified dynamically
+					;
+;
+; Packet to be placed onto FREE QUEUE to receive the message from the
+; diagnostic write device message command.
+;
+;
+	.ALIGN	QUAD
+FREE_PKT:				;
+					;
+	.LONG	0			; Queue forward link
+	.LONG	0			; Queue backward link
+	.LONG	1			; Reserve 1 byte for the incoming
+					; Message
+	.LONG	0			; Byte count not used here
+	.LONG	0			; Va not used here
+	.LONG	0			; Residual byte counts not used here
+	.LONG	0			;
+	.LONG	0			; DR status longword for this packet.
+	.LONG	0			; Long word to receive the message byte.
+					;
+					;
+;
+; End of command block
+;
+	CMDBLKSIZ=.-CMDBLK		; Define the length of the 
+CMDBLKEND:				; Command block
+
+	.SBTTL	RMS-32 Data Structures
+	.ALIGN	LONG
+
+INFAB:					; Allocate FAB for SYS$INPUT
+	$FAB-
+	FNM=<SYS$INPUT:>
+INRAB:					; Allocate RAB for SYS$INPUT
+	$RAB-
+	FAB=INFAB,-
+	ROP=PMT,-
+	PBF=PROMPT_MSG,-
+	PSZ=PMTSZ,-
+	UBF=DEV_NAME,-
+	USZ=NAME_LEN
+
+INI_FAB:				; Allocate FAB for UETINIDEV
+	$FAB-
+	FAC = <GET,PUT,UPD>,-
+	RAT = CR,-
+	SHR = <GET,PUT,UPI>,-
+	FNM = <UETINIDEV.DAT>
+
+INI_RAB:				; Allocate RAB for UETINIDEV
+	$RAB-
+	FAB = INI_FAB,-
+	RBF = BUFFER,-
+	UBF = BUFFER,-
+	USZ = REC_SIZE
+
+DDB_RFA:				; RFA storage for INI_RAB
+	.BLKB	6
+
+	.ALIGN	LONG
+SUP_FAB:				; Allocate FAB for UETSUPDEV
+	$FAB-
+	FAC = GET,-
+	SHR = <UPI,GET>,-
+	RAT = CR,-
+	FOP = UFO,-
+	FNM = <UETSUPDEV.DAT>
+
+;
+; Dummy FAB and RAB to copy to the UETP unit blocks
+; The following FAB and RAB must be contiguous and in this order!
+;
+
+DUMMY_FAB:
+	$FAB
+
+DUMMY_RAB:
+	$RAB	RSZ = WRITE_SIZE,-
+		USZ = READ_SIZE
+
+	.SBTTL	Main Program
+	.PSECT	DR78,EXE,NOWRT,PAGE
+
+	.DEFAULT DISPLACEMENT,WORD
+
+;+
+; This is the main code for the DR780 test. The byte transfer sizes were chosen
+; for hardware dependent reasons.  The test sequence is as follows:
+;
+;	1.	do a NOP packet
+;	2.	do a set self test mode packet
+;	3.	do a 128. byte write diagnostic internal packet
+;	4.	do a 128. byte read diagnostic DDI packet
+;	5.	do a 128. byte read diagnostic internal packet
+;	6.	do a 59. byte write chained packet
+;	7.	do a 1989. byte write packet
+;	8.	do a 59. byte read chained packet
+;	9.	do a 1989. byte read packet
+;	10.	do a 1. byte diagnostic control message packet
+;	11.	do a halt packet
+;	12.	set the go bit
+;	13.	check the 124. bytes transfered by the diag write/read internal
+;	14.	check the packet status and packet count
+;	15.	check for control C's
+;	16.	loop until 3 minutes are up
+;
+;-
+
+.ENTRY UETDR7800,^M<>			; Entry mask
+
+	MOVAL	SSERROR,(FP)		; Declare exception handler
+	$SETSFM_S ENBFLG = #1		; Enable system service failure mode
+	$DCLEXH_S DESBLK = EXIT_DESC	; Declare an exit handler
+	$TRNLOG_S LOGNAM = TTNAME_RWPTR,- ; Try SYS$INPUT to make sure it
+		  RSLBUF = BUFFER_PTR	; We have to put the result somewhere
+	CMPL	R0,#SS$_NOTRAN		; Is there something there?
+	BEQL	20$			; BR if no SYS$INPUT assigned
+	$OPEN	FAB = INFAB,-		; Open SYS$INPUT
+		ERR = RMS_ERROR
+	$CONNECT-			; Connect RAB to SYS$INPUT
+		RAB = INRAB,-
+		ERR = RMS_ERROR
+	BBC	#DEV$V_TRM,-		; BR if SYS$INPUT is NOT a terminal
+		INFAB+FAB$L_DEV,10$
+	$TRNLOG_S LOGNAM = CONTROLLER,-	; Get the name of controller if
+		  RSLLEN = DEVNAM_LEN,-	;   logical name exists
+		  RSLBUF = DEVDSC
+	CMPL	R0,#SS$_NORMAL		; Was a controller specified?
+	BEQL	PROC_CONT_NAME		; Yes, go process it 
+10$:
+	$GET	RAB = INRAB,-		; Read SYS$INPUT for controller name
+		ERR = RMS_ERROR
+	MOVW	INRAB+RAB$W_RSZ,-	; Save the name length
+		DEVNAM_LEN
+	BNEQ	PROC_CONT_NAME		; BR if we got something
+20$:	MOVL	#SS$_BADPARAM,STATUS	; Save the exit status
+	PUSHAL	NO_CTRLNAME		; Prepare for message...
+	PUSHL	#1			; ...arg count
+	PUSHL	#UETP$_TEXT!STS$K_ERROR ; ...signal name
+	PUSHL	#3			; ...arg count
+	BRW	ERROR_EXIT		; ...go tell of bad setup
+
+
+
+PROC_CONT_NAME:
+	MOVW	DEVNAM_LEN,DEVDSC	; Set the device name length
+	PUSHAL	DEVDSC			; Make sure...
+	PUSHAL	DEVDSC			; ...that the specified controller...
+	CALLS	#2,G^STR$UPCASE		; ...is all uppercase for later comaparison
+	ADDW2	DEVNAM_LEN,PROCESS_NAME	; Get true process name length
+	CMPW	PROCESS_NAME,#MAX_PROC_NAME ; Is the result too long for VMS?
+	BLEQ	10$			; BR if not
+	MOVW	#MAX_PROC_NAME,PROCESS_NAME ; Make it as long as you can
+10$:
+	CLRL	-(SP)			; Set the time stamp flag
+	PUSHAL	PROCESS_NAME		; Set the test name
+	PUSHL	#2			; Push the argument count
+	PUSHL	#UETP$_BEGIND!STS$K_SUCCESS ; Set the message code
+	CALLS	#4,G^LIB$SIGNAL		; Print the startup message
+	BISW2	#BEGIN_MSGM,FLAG	; Set flag so we don't output it again
+	$SETPRN_S PRCNAM = PROCESS_NAME	; Set the process name to UETDEVS00_x
+	BBS	#DEV$V_TRM,-		; BR if SYS$INPUT is a terminal
+		INFAB+FAB$L_DEV,20$
+	BRW	40$
+20$:	$TRNLOG_S LOGNAM = TTNAME_RWPTR,- ; Recursively translate the name
+		  RSLLEN = TTNAME_RWPTR,- ;   of our controlling terminal
+		  RSLBUF = TTNAME_ROPTR
+	MOVAL	TTNAME,TTNAME_RWPTR+4	; Undo possible previous PPF fixup
+	CMPL	R0,#SS$_NOTRAN		; Have we reached the end yet?
+	BEQL	30$			; BR if we have
+	CMPW	#ESC,TTNAME		; Is this a Process Permanent File?
+	BNEQ	20$			; Recursively translate if not
+	SUBW	#4,TTNAME_RWPTR		; Remove RMS overhead from PPF name
+	ADDL2	#4,TTNAME_RWPTR+4
+	BRB	20$
+30$:	; SYS$INPUT translation finished
+	$ASSIGN_S DEVNAM = TTNAME_RWPTR,- ; We always need to assign a channel
+		  CHAN   = TTCHAN	  ; Returned channel number
+	$QIOW_S-			; Enable CTRL/C AST's...we are interractive
+		CHAN     = TTCHAN,-
+		FUNC     = #IO$_SETMODE!IO$M_CTRLCAST,-
+		P1       = CCASTHAND	; Handler address
+	PUSHAL	TEST_NAME		; ...and tell the user...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_ABORTC!STS$K_SUCCESS ; ...how to abort gracefully...
+	CALLS	#3,G^LIB$SIGNAL		; ...
+40$:
+
+
+;
+; From UETINIDEV.DAT and UETSUPDEV.DAT, get information which gives controller
+; and unit configuration and lets us know if the setup to run this test was
+; done correctly.
+;
+	$OPEN	FAB = INI_FAB,-		; Open file "UETINIDEV.DAT"
+		ERR = RMS_ERROR
+	$CONNECT RAB = INI_RAB,-	; Connect the RAB and FAB
+		 ERR = RMS_ERROR
+	$MGBLSC_S  INADR = INADDRESS,-	; Connect to UETSUPDEV global section
+		  RETADR = OUTADDRESS,-
+		  GSDNAM = SUPDEV_GBLSEC,-
+		   FLAGS = #SEC$M_EXPREG
+	CMPL	R0,#SS$_NOSUCHSEC	; Was the section already there?
+	BNEQ	50$			; BR if it was...
+	$OPEN	FAB = SUP_FAB,-		; ...else open "UETSUPDEV.DAT"
+		ERR = RMS_ERROR
+	$CRMPSC_S CHAN = SUP_FAB+FAB$L_STV,- ; Create the global section
+		 INADR = INADDRESS,-
+		RETADR = OUTADDRESS,-
+		GSDNAM = SUPDEV_GBLSEC,-
+		 FLAGS = #SEC$M_EXPREG!SEC$M_GBL
+50$:
+	SUBL3	OUTADDRESS,OUTADDRESS+4,R6 ; Create global section length
+
+FIND_IT:
+	$GET	RAB = INI_RAB,-		; Get the first record
+		ERR = RMS_ERROR
+	PUSHAL	CONT_DESC		; Make sure...
+	PUSHAL	CONT_DESC		; ...that the controller name...
+	CALLS	#2,G^STR$UPCASE		; ...is all uppercase letters
+	CMPB	#^A/D/,BUFFER		; Is this a DDB?
+	BEQL	10$			; Go on if not
+	CMPB	#^A/E/,BUFFER		; Is this the end of the file?
+	BNEQ	FIND_IT			; Continue on if not
+	PUSHAL	DEVDSC			; Push device not supported message
+	PUSHAL	PROCESS_NAME		; Parameters on the stack
+	PUSHL	#2
+	PUSHL	#UETP$_DENOSU
+	INSV	#STS$K_ERROR,-
+		#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,(SP)	; Set the severity code...
+	MOVL	(SP),STATUS		; ...and save it as the exit status
+	PUSHL	#4
+	BRW	ERROR_EXIT		; Exit in error
+10$:
+	CMPC	DEVNAM_LEN,BUFFER+6,DEV_NAME ; Is this the right controller?
+	BNEQ	FIND_IT			; BR if not
+	MOVC3	#6,INI_RAB+RAB$W_RFA,DDB_RFA ; Save the Record File Address
+	CMPB	#^A/T/,BUFFER+4		; Can we test this controller?
+	BEQL	FOUND_IT		; BR if we can...
+	$FAO_S	CTRSTR = DEAD_CTRLNAME,- ; ...and yell at user if we can't
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = #DEVDSC
+	MOVL	#SS$_BADPARAM,STATUS	; Set return status
+	PUSHAL	BUFFER_PTR		; ...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; ...
+	PUSHL	#3			; ...
+	BRW	ERROR_EXIT		; We can't test what we can't test
+
+FOUND_IT:
+	$GET	RAB = INI_RAB,-		; Get a record
+		ERR = RMS_ERROR
+	PUSHAL	CONT_DESC		; Make sure...
+	PUSHAL	CONT_DESC		; ...that this line...
+	CALLS	#2,G^STR$UPCASE		; ...is all uppercase letters
+	CMPB	#^A/U/,BUFFER		; Is this a UCB?
+	BEQL	20$			; BR if it is
+	CMPB	#^A/D/,BUFFER		; Is this a DDB?
+	BEQL	10$			; BR if yes
+	CMPB	#^A/E/,BUFFER		; Is this the end?
+	BEQL	10$			; BR if yes
+	PUSHAL	ILLEGAL_REC		; Then this is an error in the record
+	PUSHL	#1			; Push the error message
+	PUSHL	#UETP$_TEXT!STS$K_ERROR ; Push the signal name
+	PUSHL	#3			; Push the temp arg count
+	BRW	ERROR_EXIT		; Finish for good
+10$:
+	BRW	ALL_SET			; Found DDB or END
+20$:
+	CMPB	#^A/T/,BUFFER+4		; Is the unit testable?
+	BNEQ	FOUND_IT		; BR if not
+	PUSHL	#1			; Flag to ignore blanks when converting
+	PUSHL	#2			; Set byte size of results
+	PUSHAL	UNIT_NUMBER		; Set address to receive word
+	PUSHAL	UNIT_DESC		; Push string address
+	CALLS	#4,G^OTS$CVT_TZ_L	; Convert ASCII unit # to hex
+	SKPC	#^A/ /,#MAX_UNIT_DESIG,-
+		BUFFER+6		; Find out where unit number really is
+	ADDW3	R0,DEVNAM_LEN,DEVDSC	; Calculate device'unit string length
+	MOVZWL	DEVNAM_LEN,R2		; Offset to unit number in DEVDSC
+	MOVC3	R0,(R1),DEV_NAME(R2)	; Append unit number to device
+	$GETDEV_S DEVNAM = DEVDSC,-	; Get the device characteristics
+		  PRIBUF = DIB
+	MOVZBL	DIBBUF+DIB$B_DEVCLASS,R7 ; Save the device class
+	MOVZBL	DIBBUF+DIB$B_DEVTYPE,R8	; Save the device type
+	$FAO_S	CTRSTR = CS1,-
+		OUTBUF = FAO_BUF,-
+		P1     = R7,-
+		P2     = R8		; Make it into a string
+	MATCHC	#6,BUFFER,R6,@OUTADDRESS ; Find the device class and type
+	BEQL	30$			; BR if it was found
+	$FAO_S	CTRSTR = CS3,-		; Try for full class support
+		OUTBUF = FAO_BUF,-
+		    P1 = R7
+	MATCHC	#6,BUFFER,R6,@OUTADDRESS ; Find the device class only
+	BNEQ	40$			; BR if not found
+30$:
+	MOVZBL	TEST_NAME,R5		; Get the test name length
+	CMPC3	R5,(R3),TEST_NAME+8	; Are we the right test?
+	BEQL	50$			; BR if yes
+40$:
+	PUSHAL	DEVDSC			; Push device not supported message
+	PUSHAL	PROCESS_NAME		; Parameters on the stack
+	PUSHL	#2			; Push the argument count
+	PUSHL	#UETP$_DENOSU
+	INSV	#STS$K_ERROR,-
+		#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,(SP)	; Set the severity code...
+	MOVL	(SP),STATUS		; ...and save it as the exit status
+	PUSHL	#4			; Push the partial arg count...
+	BRW	ERROR_EXIT		; ...and split this scene
+
+;+
+; The following code dynamically allocates enough memory for a unit block,
+; a device dependent parameter area and I/O buffers. The unit block is inserted
+; into the queue header UNIT_LIST.  It then initializes the unit block.
+; A comment indicates where the device dependent parameters should be
+; initialized.  The unit block format is as follows:
+;
+;			+---------------+ -------
+;	UETUNT$L_FLINK	!		!	^
+;			+---------------+	!
+;	UETUNT$L_BLINK	!		!	!
+;			+-----------+---+	!
+;	UETUNT$B_TYPE		    !   !	!
+;			    +-------+---+	!
+;	UETUNT$W_SIZE	    !   !   !    contains DEVDEP_SIZE + UETUNT$C_INDSIZ
+;			+---+-------+		!
+;	UETUNT$B_FLAGS  !   !			!
+;			+---+   +-------+	!
+;	UETUNT$W_CHAN	        !   !   !	!
+;			+-------+-------+	!
+;	UETUNT$W_FUNC	!   !   !		!
+;			+-------+-------+	+----- UETUNT$C_SIZE
+;	UETUNT$L_ITER	!		!	!
+;			+---------------+	!
+;	UETUNT$T_FILSPC	!		!	!
+;			!/\/\/\/\/\/\/\/!	!
+;			     128 bytes		!
+;			!/\/\/\/\/\/\/\/!	!
+;			!		!	!
+;	UETUNT$K_FAB	!---------------!	!
+;			!		!	!
+;			!/\/\/\/\/\/\/\/!	!
+;			 FAB$C_BLN bytes	!
+;			!/\/\/\/\/\/\/\/!	!
+;			!		!	!
+;	UETUNT$K_RAB	+---------------+	!
+;			!		!	!
+;			!\/\/\/\/\/\/\/\!	!
+;			 RAB$C_BLN bytes	!
+;			!\/\/\/\/\/\/\/\!	!
+;			!		!	v
+;	UETUNT$K_DEVDEP	+---------------+ -------
+;			!		!	^
+;			!\/\/\/\/\/\/\/\!	!
+;			   user defined		+----- DEVDEP_SIZE
+;			!\/\/\/\/\/\/\/\!	!
+;			!		!	v
+;			+---------------+ -------
+;    READ/WRITE buffers !		!	^
+;			!\/\/\/\/\/\/\/\!	!
+;			   user defined		+----- WRITE_SIZE and READ_SIZE
+;			!/\/\/\/\/\/\/\/!	!
+;			!		!	v
+;			+---------------+ -------
+;-
+
+50$:
+	$EXPREG_S PAGCNT = #PAGES,-	; Get a new node of demand zero memory
+		  RETADR = NEW_NODE
+	INSQTI	@NEW_NODE,UNIT_LIST	; Put the new node in the unit list
+	MOVL	NEW_NODE,R6		; Save a copy of its address
+	MOVB	#1,UETUNT$B_TYPE(R6)	; Set the structure type
+	MOVW	#UETUNT$C_INDSIZ+DEVDEP_SIZE,-
+		UETUNT$W_SIZE(R6)	; Set the structure size
+	MOVB	DEVDSC,UETUNT$T_FILSPC(R6) ; Set the device name size
+	MOVC3	DEVDSC,@DEVDSC+4,-
+		UETUNT$T_FILSPC+1(R6)	; Save the device name
+	MOVC3	#FAB$C_BLN+RAB$C_BLN,-
+		DUMMY_FAB,UETUNT$C_FAB(R6) ; Save a FAB and a RAB away
+	MOVAL	UETUNT$K_FAB(R6),R7	; Save the FAB address
+	MOVAL	UETUNT$K_RAB(R6),R8	; Save the RAB address
+	MOVL	R7,RAB$L_FAB(R8)	; Set the FAB address in the RAB
+	MOVB	UETUNT$T_FILSPC(R6),-
+		FAB$B_FNS(R7)		; Set the FNS field in the FAB
+	MOVAL	UETUNT$T_FILSPC+1(R6),-
+		FAB$L_FNA(R7)		; Set the FNA field in the FAB
+;
+; Set the device dependent parameters in here
+;
+	BRW	FOUND_IT		; Do the next UCB
+
+;
+; Arrive here when we have the device configuration.  In normal or loop forever
+; mode, set a timer far enough in the future such that we can do a reasonable
+; set of tests before the timer expires, but if our device gets hung, the
+; program won't waste too much time before noticing.  Let one-shot mode be a
+; special case.
+;
+ALL_SET:
+	TSTL	UNIT_LIST		; Anything to test?
+	BNEQ	10$			; BR if yes
+	PUSHAL	NOUNIT_SELECTED		; Else set up the error message...
+	PUSHL	#1			; ...argument count...
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; ...signal name...
+	PUSHL	#3			; ...and parameter count
+	MOVL	#SS$_BADPARAM,STATUS	; Set return status
+	BRW	ERROR_EXIT		; ...and give up, complaining
+10$:
+	BISW2	#SAFE_TO_UPDM,FLAG	; OK safe to update UETINIDEV.DAT now
+	$ASSIGN_S CHAN   = CHAN,-
+		  DEVNAM = DEVDSC 	; Get a channel
+	$LKWSET_S INADR  = CMDBLKDES	; Lock command block into WS
+					; 11/780 ucode bug in QUEUE
+					; Instructions
+	MOVZBL	G^IOC$GW_XFMXRATE,R2	; Get the current max xfer rate
+	MOVB	R2,W^CMDTBL+XF$B_CMT_RATE ; Set the data transfer rate
+	SUBL3	R2,#256,R3		; 256-max xfer rate into R3
+	CVTLD	R3,R4			; Convert to double float format
+	MOVF	#^F40.,R6		; Set the double constant
+	MOVAL	DR780,R7		; Set default device name
+	CMPB	#DT$_DR750,DIBBUF+DIB$B_DEVTYPE ; Is it a 750?
+	BNEQ	15$			; BR if not
+	MOVF	#^F12.5,R6		; Set new convertion rate
+	MOVAL	DR750,R7		; Set correct device name
+15$:
+	DIVD3	R4,R6,W^RATE_FLOAT	; 40/(256-max xfer rate)
+	PUSHL	#3			; Push # of digits in the fraction
+	PUSHAL	W^RATE_BUF		; Push string storage desc adr
+	PUSHAQ	W^RATE_FLOAT		; Push adr of floating number
+	CALLS	#3,G^FOR$CNV_OUT_F	; Make the number a string
+	$FAO_S	W^CS2,W^RATE_DESC,W^FAO_BUF,-
+		R7,R2,#RATE_BUF		; Make up the message
+	PUSHAL	W^RATE_DESC		; Push the string address
+	PUSHL	#1			; Push the arg count
+	PUSHL	#UETP$_TEXT!STS$K_INFO	; Push the signal name
+	CALLS	#3,G^LIB$SIGNAL		; Report the message
+	$CREMBX_S CHAN   = MBCHAN	; make a mailbox
+	$GETCHN_S CHAN   = MBCHAN,-
+		  PRIBUF = DIB		; get the unit number of the mailbox
+	$CREPRC_S IMAGE  = PROCESS,-
+		  MBXUNT = DIBBUF+DIB$W_UNIT,-
+		  PIDADR = PID		; load the ucode
+	$WAKE_S PIDADR   = PID		; wake XFLOADER.EXE from the HIBER
+	$QIOW_S	FUNC     = #IO$_READVBLK,-
+		EFN      = #1,-
+		CHAN     = MBCHAN,-
+		P1       = BUFFER,-
+		P2       = #256		; read the ucode load results
+	BLBS	BUFFER+ACC$L_FINALSTS,20$ ; check the load status
+	PUSHL	BUFFER+ACC$L_FINALSTS	; Push the failure code
+	PUSHAL	ULOAD_FAILED		; Push failure message address
+	PUSHL	#1			; Push arg count
+	PUSHL	#UETP$_TEXT!STS$K_ERROR ; Push the signal name
+	PUSHL	#4			; Push the temp arg count
+	BRW	ERROR_EXIT		; And die
+20$:
+	$TRNLOG_S LOGNAM = MODE,-	; Get the run mode
+		  RSLLEN = BUFFER_PTR,-
+		  RSLBUF = FAO_BUF
+	BICB2	#LC_BITM,BUFFER		; Convert to upper case
+	CMPB	#^A/O/,BUFFER		; Is this a one shot?
+	BNEQ	TIME_IT			; BR if not
+	BISW2	#TEST_OVERM,FLAG	; End after one iteration
+	BRB	RESTART			; Skip the SETIMR
+TIME_IT:
+	$SETIMR_S DAYTIM = THREEMIN,-	; Set timer AST to 3 minutes
+		  ASTADR = TEST_END,-
+		  EFN    = #EFN2
+
+RESTART:
+;******************************************************************************
+;
+; Device test specific code goes here.
+;
+; At this point the device designation is in location DEV_NAME pointed to by
+; descriptor DEVDSC. The device is known to be supported and testable by this test.
+; To leave successfully BRW SUC_EXIT, to leave in error BRW ERROR_EXIT.
+;
+;******************************************************************************
+
+	BICB2	#FPAC_FLGM,FLAG			; clear the first packet AST flag
+	$SETIMR_S DAYTIM = TENSEC,-
+		  EFN    = #EFN2,-
+		  ASTADR = HUNG_TEST,-
+		  REQIDT = #1			; set 10 sec watch dog timer in case
+						; the clock jumpers are missing
+	$QIO_S	FUNC   = #IO$_STARTDATA,-	; Initialize the mapping pointers
+		CHAN   = CHAN,-			; channel must have been assigned.
+		EFN    = #EFN1,-		; EF
+		IOSB   = DRIOSTAT,-		; IO status block.
+		ASTADR = IO_COMPLETE,-		; ast to be taken when dr halts
+		P1     = CMDTBL,-		; address of the command table
+		P2     = #XF$K_CMT_LENGTH	; length of command table.
+	BITB	#CC_FLGM!ERR_FLGM,FLAG		; control C or error occured?
+	BEQL	5$				; br if no
+	BRW	ERROR_EXIT1			; br if yes
+5$:
+	MOVAL	PKT_TBL,R10			; set pkt address pointer
+	MOVAL	INPTQH,R11			; set the queue header pointer
+	MOVL	(R10),R9			; get the packet address
+	CLRL	XF$L_PKT_DSL(R9)		; init the DSL
+	QRETRY	ERROR = BADQUEUE,-
+	INSQTI	@(R10)+,FREEQH			; put a free packet on the free queue
+	.REPT	PKT_COUNT-1
+	MOVL	(R10),R9			; get the packet address
+	CLRL	XF$L_PKT_DSL(R9)		; init the DSL
+	QRETRY	ERROR = BADQUEUE,-
+	INSQTI	@(R10)+,(R11)			; put a command packet on the input queue
+	.ENDR
+	MOVL	#1,@GOBIT			; give it heck!
+	$WAITFR_S EFN = #EFN1			; wait for further AST's or iteration complete
+	BITB	#CC_FLGM!ERR_FLGM,FLAG		; control C or error occured?
+	BEQL	10$				; br if no
+	BRW	ERROR_EXIT1			; br if yes
+10$:
+	INCL	ITERATION			; increment iteration count
+	MOVL	#UNUSED_FUNC,PACK_REMOVED	; mask out unused packet types
+	CALLS	#0,PKT_CHECK			; check the packet status and count
+	BITB	#ERR_FLGM,FLAG			; were any DSL's bad?
+	BEQL	20$				; br if not
+	BRW	ERROR_EXIT1			; fatal error
+20$:
+	CMPB	#PKT_COUNT,PKT_CNT		; right number of packets?
+	BEQL	50$				; br if yes
+	CLRL	R5				; set starting position
+	MOVL	#NO_OF_POS_PKTS,R8		; set starting size
+	MOVAL	ARGS,R2				; set arg pointer
+	MOVL	#PKT_COUNT,(R2)+		; set expected pkt count
+	MOVL	PKT_CNT,(R2)+			; set received pkt count
+	SUBL3	PKT_CNT,#PKT_COUNT,(R2)+	; set the argument count
+30$:
+	FFC	R5,R8,PACK_REMOVED,R6		; find a missing packet
+	BEQL	40$
+	SUBL3	R6,#NO_OF_POS_PKTS,R8		; update the size
+	ADDL3	R6,#1,R5			; update the starting position
+	MULL2	#8,R6				; make it a byte displacement
+	ADDL2	#NAME_TBL,R6			; make it an address
+	MOVL	(R6),(R2)+			; save it in the argument list
+	BRB	30$				; get the next packet that is missing
+40$:
+	$FAOL_S CTRSTR = CS4,-
+		OUTLEN = BADRPKT,-
+		OUTBUF = FAO_BUF,-
+		PRMLST = ARGS 			; convert into a string 
+	MOVL	#UETP$_ABENDD!STS$K_ERROR,-
+		STATUS				; set an exit status
+	PUSHAL	BADRPKT				; push the constructed message
+	PUSHL	#1				; push arg count
+	PUSHL	#UETP$_TEXT!STS$K_ERROR		; push the signal name
+	PUSHL	#3				; Push temp arg count
+	BRW	ERROR_EXIT			; bail out
+50$:
+	MCOMB	DIAG_CNTRL_MESS,DIAG_CNTRL_MESS ; toggle the control message
+	BITB	#TEST_OVERM,FLAG		; is the test over?
+	BEQL	60$				; br if no
+	BRW	SUC_EXIT			; br if yes
+60$:
+	BRW	RESTART				; do it again!
+;
+; Packet AST routine 
+;
+PKT1_AST:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	BBSS	#FPAC_FLGV,FLAG,10$		; only check data on the first packet
+	CMPC3	#124,OUTPUT_BUF+4,INPUT1_BUF+4	; check the data
+	BEQL	10$				; br if OK
+	INCL	ERROR_COUNT			; bump the cum. error cnt
+	MOVZBL	(R3),-(SP)			; get bad byte
+	MOVZBL	(R1),-(SP)			; get good byte
+	SUBL3	R0,#124,-(SP)			; get the byte number
+	PUSHL	#0				; push the unit number
+	PUSHAL	DEVDSC				; push the controller name
+	PUSHL	#5				; push arg count
+	PUSHL	#UETP$_DATAER!STS$K_ERROR	; push the signal name
+	PUSHL	ERROR_COUNT			; push the cumulative error count
+	PUSHL	#1				; push arg count
+	PUSHL	#UETP$_ERBOX!STS$K_ERROR	; push the signal name
+	CALLS	#10,G^LIB$SIGNAL		; output the message
+	MOVL	#UETP$_DATAER!STS$K_ERROR,-
+		STATUS				; push the signal name
+ 10$:
+	MOVC5	#0,INPUT1_BUF,#0,#124,INPUT1_BUF+4 ; clear the data buffer
+	RET
+;
+; Watch dog timer will come to here if the DR does not complete one
+; execution of all packets within 10 seconds.
+;
+HUNG_TEST:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; entry mask
+	BISB2	#ERR_FLGM,FLAG			; set the error flag
+	MOVL	#SS$_TIMEOUT,STATUS		; Set the exit status
+	INCL	ERROR_COUNT			; bump the error counter
+	PUSHAL	TEST_HUNG			; push the constructed message
+	PUSHL	#1				; push arg count
+	PUSHL	#UETP$_TEXT!STS$K_ERROR		; push the signal name
+	PUSHL	ERROR_COUNT			; push the cumulative error count
+	PUSHL	#1				; push the arg count
+	PUSHL	#UETP$_ERBOX!STS$K_ERROR	; push the signal name
+	CALLS	#6,G^LIB$SIGNAL			; output the message
+	$SETEF_S EFN=#EFN1			; time to wake up
+	RET					; go and fail
+IO_COMPLETE:
+	.WORD	0				; QIO completion ast entry point
+	$CANTIM_S REQIDT=#1			; stop the watch dog timer only
+	CMPW	DRIOSTAT,#SS$_NORMAL		; check the IO status
+	BEQL	10$				; br if OK
+	MOVW	DRIOSTAT,STATUS			; save the status
+	INCL	ERROR_COUNT			; bump the error count
+	PUSHL	DRIOSTAT			; push the DSL
+	PUSHL	ERROR_COUNT			; push the cumulative error count
+	PUSHL	#1				; push arg count
+	PUSHL	#UETP$_ERBOX!STS$K_ERROR	; push the signal name
+	CALLS	#4,G^LIB$SIGNAL			; output the message
+	BISB2	#ERR_FLGM,FLAG			; set error flag
+10$:
+	CLRL	DRIOSTAT			; reset the DR's IO status block
+	RET					; and return
+TEST_END:
+	.WORD	0				; entry mask
+	BISB2	#TEST_OVERM,FLAG		; set the test ended flag
+	RET					; return
+;
+
+
+SUC_EXIT:
+	$TRNLOG_S LOGNAM = MODE,-
+		  RSLLEN = BUFFER_PTR,-
+		  RSLBUF = FAO_BUF	; Get the run mode
+	BICB2	#LC_BITM,BUFFER		; Convert to upper case
+	CMPB	#^A/L/,BUFFER		; Is this a loop for ever?
+	BNEQ	10$			; BR if not
+	BICW2	#TEST_OVERM,FLAG	; Reset the termination flag
+	INCL	PASS			; Bump the pass count
+	$FAO_S	CTRSTR = PASS_MSG,-
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = PASS,-
+		P2     = ITERATION,-
+		P3     = #0		; Make the end of pass message
+	PUSHAL	BUFFER_PTR		; Push the string desc.
+	PUSHL	#1			; Push arg count
+	PUSHL	#UETP$_TEXT!STS$K_INFO	; Push the signal name
+	CALLS	#3,G^LIB$SIGNAL		; Print the end of pass message
+	CLRL	ITERATION		; Reset the iteration count
+	BRW	TIME_IT			; Do the next pass
+10$:
+	ADDL3	#UNIT_LIST,UNIT_LIST,R6 ; Set the unit block list header
+	BISB2	#UETUNT$M_TESTABLE,-
+		UETUNT$B_FLAGS(R6)	; Set the testable bit
+	MOVL	#SS$_NORMAL!STS$M_INHIB_MSG,STATUS ; Set successful exit status
+	$EXIT_S STATUS			; Exit with the status
+
+	.SBTTL	RANBUF
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine fills buffer TEST_DATA with random numbers.
+;
+; CALLING SEQUENCE:
+;	BSBW	RANBUF
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	BUFSIZ bytes of random data are left in buffer TEST_DATA
+;
+;--
+
+RANBUF:
+	MOVAL	TEST_DATA,R2			; set buffer adr
+	MOVZWL	#BUFSIZ/4,R3			; BUFSIZ/4 bytes is the size
+10$:
+	ADDL2	RANDOM2,RANDOM1			; make a new random number
+	MOVL	RANDOM1,(R2)+			; put it in the buffer
+	SOBGTR	R3,10$				; do the whole thing!
+	RSB					; return
+.PAGE
+	.SBTTL	BADQUEUE
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine indicates a bad queue entry has been discovered by the
+;	QRETRY macro and an error is reported.
+;
+; CALLING SEQUENCE:
+;	BRW	BADQUEUE
+;
+; INPUT PARAMETERS:
+;	ERROR_COUNT = current cumulative error count
+;
+; OUTPUT PARAMETERS:
+;	ERROR_COUNT = bumped by one
+;
+;--
+
+BADQUEUE:
+	MOVL	#UETP$_ABENDD!STS$K_ERROR,-
+		STATUS				; set the status code
+	PUSHAL	BADQUE				; push message address
+	PUSHL	#1				; push arg count
+	PUSHL	#UETP$_TEXT!STS$K_ERROR		; push signal name
+	PUSHL	#3				; Push temp arg count
+	BRW	ERROR_EXIT
+.PAGE
+;
+	.SBTTL	PKT_CHECK
+;++
+; FUNCTIONAL DESCRIPTION:
+;	Routine to check DR packet status off the termination queue.
+;	Each packet is removed from the termination queue and the
+;	DSL is checked for XF$M_IOS_SUCCES and XF$M_IOS_CMDSTD. A
+;	total count is maintianed for each call to the routine at
+;	location PKT_CNT.
+;
+; CALLING SEQUENCE:
+;	CALLS	#0,PKT_CHECK
+;
+; INPUT PARAMETERS:
+;	TERMQH = termination queue head
+;
+; OUTPUT PARAMETERS:
+;	PKT_CNT = number of packets serviced for this call
+;	FLAG  = BIT1 set if an error is encountered
+;	PACK_REMOVED =  bit mask record of which packets were removed
+;			from the termination queue
+;
+;--
+PKT_CHECK:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11>
+	CLRB	PKT_CNT			; set packet count to zero
+PC1:
+	QRETRY	ERROR = BADQUEUE,-
+	REMQHI	TERMQH,R2		; get a packet from the queue
+	BVC	5$			; br if an entry removed
+	RET				; return
+5$:
+	INCB	PKT_CNT			; bump the packet count
+	BITL	#XF$M_PKT_FREQPK,XF$L_PKT_DSL(R2) ; is it a free queue packet?
+	BEQL	10$			; br if not
+	MOVL	#16,R3			; set the free packet index
+	BRB	15$			; carry on
+10$:
+	EXTZV	#XF$V_PKT_FUNC,#XF$S_PKT_FUNC,-
+		XF$B_PKT_CMDCTL(R2),R3	; get the packet command
+15$:
+	INSV	#1,R3,#1,PACK_REMOVED	; record it's removal
+	MULL2	#8,R3			; make it an index
+	ADDL2	#NAME_TBL,R3		; make it an ascic packet type pointer
+	ADDL3	#4,R3,R4		; make the status address
+	CMPL	(R4),XF$L_PKT_DSL(R2)	; is the DSL correct?
+	BEQL	PC1			; br if OK
+20$:
+	MOVL	#UETP$_ABENDD!STS$K_ERROR,-
+		STATUS			; set the status code
+	INCL	ERROR_COUNT		; bump the error counter
+	$FAO_S	CTRSTR = CS,-
+		OUTLEN = BADRPKT,-
+		OUTBUF = FAO_BUF,-
+		P1     = (R3),-
+		P2     = XF$L_PKT_DSL(R2),-
+		P3     = (R4)		; create the error string
+	PUSHAL	BADRPKT			; set message address
+	PUSHL	#1			; set arg count
+	PUSHL	#UETP$_TEXT!STS$K_ERROR	; set signal name
+	PUSHL	ERROR_COUNT		; push cumulative error count
+	PUSHL	#1			; push arg count
+	PUSHL	#UETP$_ERBOX!STS$K_ERROR ; set signal name
+	CALLS	#6,G^LIB$SIGNAL		; output the message
+	BISB2	#ERR_FLGM,FLAG		; set the error flag
+	RET				; return
+
+	.SBTTL	System Service Exception Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine is executed if a software or hardware exception occurs or
+;	if a LIB$SIGNAL system service is used to output a message.
+;	Information about this method of handling messages and errors can be
+;	found in the VMS COMMON RUN-TIME manual and in the VMS SYSTEM SERVICE
+;	manual.
+;
+; CALLING SEQUENCE:
+;	Entered via an exception from the system
+;
+; INPUT PARAMETERS:
+;	ERROR_COUNT   = previous cumulative error count
+;	                -----------------
+;	   AP ---->     !       2       !
+;			!---------------!
+;			! SIGNL ARY PNT !
+;			!---------------!
+;			! MECH  ARY PNT !
+;			!---------------! ---------
+;			!       4       !         ^
+;			!---------------!         !
+;			! ESTABLISH FP  !         !
+;			!---------------!         !
+;			!    DEPTH      ! Mechanism Array
+;			!---------------!         !
+;			!      R0       !         !
+;			!---------------!         !
+;			!      R1       !         v
+;			!---------------! ---------
+;			!       N       !         ^
+;			!---------------!         !
+;			! CONDITION NAME!         !
+;			!---------------!         !
+;			! N-3 ADDITIONAL!    Signal Array
+;			! LONG WORD ARGS!         !
+;			!---------------!         !
+;			!      PC       !         !
+;			!---------------!         !
+;			!      PSL      !         v
+;			!---------------! ---------
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	May branch to ERROR_EXIT
+;--
+
+SSERROR:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	$SETAST_S ENBFLG = #0		; Disable AST delivery
+	CLRL	AST_MODE		; Assume it was disabled
+	CMPL	R0,#SS$_WASSET		; Were AST's enabled?
+	BNEQ	10$			; BR if not enabled
+	MOVL	#1,AST_MODE		; Set it to be reenabled
+10$:	$SETSFM_S ENBFLG = #0		; Disable SS failure mode for PUTMSG
+	CLRL	SS_FAIL_MODE		; Assume it was disabled
+	CMPL	R0,#SS$_WASSET		; Was SS failure mode enabled?
+	BNEQ	20$			; BR if not enabled
+	MOVL	#1,SS_FAIL_MODE		; Set it to be reenabled
+20$:	MOVL	CHF$L_SIGARGLST(AP),R6	; Get the signal array pointer
+	CMPZV	#STS$V_FAC_NO,#STS$S_FAC_NO,- ; Is this a message from LIB$SIGNAL?
+		CHF$L_SIG_NAME(R6),#UETP_K
+	BNEQ	30$			; BR if this is a system exception
+	SUBL2	#2,CHF$L_SIG_ARGS(R6)	; Drop the PC and PSL
+	$PUTMSG_S MSGVEC = CHF$L_SIG_ARGS(R6) ; Print the message
+	$SETSFM_S ENBFLG = SS_FAIL_MODE	; Set to previous state
+	$SETAST_S ENBFLG = AST_MODE	; Set to previous state
+	RET				; Return to the program
+30$:
+	CMPZV	#STS$V_FAC_NO,#STS$S_FAC_NO,- ; Is it an RMS failure?
+		CHF$L_SIG_ARG1(R6),#RMS_K
+	BNEQ	40$			; BR if not
+	$SETSFM_S ENBFLG = SS_FAIL_MODE	; Set to previous state
+	$SETAST_S ENBFLG = AST_MODE	; Set to previous state
+	RET				; Yes, RMS_ERROR gets to handle them
+40$:
+	MOVL	CHF$L_SIG_NAME(R6),STATUS ; Save the status
+	CLRL	R8			; Assume for now it's not SS failure
+	CMPL	#SS$_SSFAIL,STATUS	; But is it a System Service failure?
+	BNEQ	60$			; BR if not - no special case message
+	$GETMSG_S MSGID = CHF$L_SIG_ARG1(R6),- ; Get SS failure code associated text
+		 MSGLEN = BUFFER_PTR,-
+		 BUFADR = FAO_BUF,-
+		 FLAGS  = #14,-
+		 OUTADR = MSG_BLOCK
+	TSTB	MSG_BLOCK+1		; Get FAO arg count for SS failure code
+	BEQL	50$			; Don't use $GETMSG if no $FAO args...
+	PUSHAL	BUFFER_PTR		; ...else build up...
+	PUSHL	#1			; ...a message describing...
+	PUSHL	#UETP$_TEXT		; ...why the System Service failed
+	INSV	CHF$L_SIG_ARG1(R6),-	; Give the message...
+		#STS$V_SEVERITY,-	; ...the correct severity code
+		#STS$S_SEVERITY,(SP)
+	MOVL	#3,R8			; Count the number of args we pushed
+	BRB	60$
+50$:
+	PUSHL	CHF$L_SIG_ARG1(R6)	; Save SS failure code
+	MOVL	#1,R8			; Count the number of args we pushed
+60$:
+	MULL3	#4,CHF$L_SIG_ARGS(R6),R7 ; Convert longwords to bytes
+	SUBL2	R7,SP			; Save the current signal array...
+	MOVC3	R7,CHF$L_SIG_NAME(R6),(SP) ; ...on the stack
+	ADDL3	R8,CHF$L_SIG_ARGS(R6),-(SP) ; Push the current arg count
+	BRW	ERROR_EXIT
+
+
+	.SBTTL	RMS Error Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles error returns from RMS calls.
+;
+; CALLING SEQUENCE:
+;	Called by RMS when a file processing error is found.
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	The FAB or RAB associated with the RMS call.
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Error message
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	Program may exit, depending on severity of the error.
+;
+;--
+
+RMS_ERROR:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	MOVL	4(AP),R6		; See whether we're dealing with...
+	CMPB	#FAB$C_BID,FAB$B_BID(R6) ; ...a FAB or a RAB
+	BNEQ	10$			; BR if it's a RAB
+	MOVAL	FILE,R7			; FAB-specific code:  text string...
+	MOVL	R6,R8			; ...address of FAB...
+	PUSHL	FAB$L_STV(R6)		; ...STV field for error...
+	PUSHL	FAB$L_STS(R6)		; ...STS field for error...
+	MOVL	FAB$L_STS(R6),STATUS	; ...and save the error code
+	BRB	COMMON			; FAB and RAB share other code
+10$:
+	MOVAL	RECORD,R7		; RAB-specific code:  text string...
+	MOVL	RAB$L_FAB(R6),R8	; ...address of associated FAB...
+	PUSHL	RAB$L_STV(R6)		; ...STV field for error...
+	PUSHL	RAB$L_STS(R6)		; ...STS field for error...
+	MOVL	RAB$L_STS(R6),STATUS	; ...and save the error code
+COMMON:
+	MOVZBL	FAB$B_FNS(R8),R10	; Get the file name size
+	$FAO_S	CTRSTR = RMS_ERR_STRING,- ; Common code, prepare error message...
+		OUTLEN = BUFFER_PTR,-
+		OUTBUF = FAO_BUF,-
+		P1     = R7,-
+		P2     = R10,-
+		P3     = FAB$L_FNA(R8)
+	PUSHAL	BUFFER_PTR		; ...and arguments for ERROR_EXIT...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_TEXT		; ...
+	EXTZV	#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,-
+		STATUS,R9 		; ...get the severity code...
+	BISB2	R9,(SP)			; ...and add it into the signal name
+	PUSHL	#5			; Current arg count
+	BRW	ERROR_EXIT
+
+	.SBTTL	CTRL/C Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles CTRL/C AST's
+;
+; CALLING SEQUENCE:
+;	Called via AST
+;
+; INPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	NONE
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+CCASTHAND:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	PUSHAL	CNTRLCMSG		; Set message pointer
+	PUSHL	#1			; Set arg count
+	PUSHL	#UETP$_TEXT!STS$K_WARNING ; Set signal name
+	PUSHL	#0			; Indicate an abnormal termination
+	PUSHAL	PROCESS_NAME		; ...
+	PUSHL	#2			; ...
+	PUSHL	#UETP$_ABENDD!STS$K_WARNING ; ...
+	CALLS	#7,G^LIB$SIGNAL		; Output the message
+	MOVL	#<SS$_CONTROLC-STS$K_SUCCESS+STS$K_WARNING>,-
+		STATUS			; Set the exit status
+	$EXIT_S	STATUS			; Terminate program cleanly
+
+	.SBTTL	Error Exit
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine prints an error message and exits.
+;
+; CALLING SEQUENCE:
+;	MOVx  error status value,STATUS
+;	PUSHx error specific information on the stack
+;	PUSHL current argument count
+;	BRW   ERROR_EXIT
+;
+; INPUT PARAMETERS:
+;	Arguments to LIB$SIGNAL, as above
+;
+; IMPLICIT INPUTS:
+;	NONE
+;
+; OUTPUT PARAMETERS:
+;	Message to SYS$OUTPUT and SYS$ERROR
+;
+; IMPLICIT OUTPUTS:
+;	Program exit
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+ERROR_EXIT:
+
+	$SETAST_S ENBFLG = #0		; Disable AST's
+	BBS	#BEGIN_MSGV,FLAG,10$	; BR if "begin" msg has already been output
+	CLRL	-(SP)			; Set the time stamp flag
+	PUSHAL	PROCESS_NAME		; Set the test name
+	PUSHL	#2			; Push the argument count
+	PUSHL	#UETP$_BEGIND!STS$K_SUCCESS ; Set the message code
+	CALLS	#4,G^LIB$SIGNAL		; Print the startup message
+10$:	ADDL3	(SP)+,#7,ARG_COUNT	; Get total # args, pop partial count
+	INCL	ERROR_COUNT		; Keep running error count
+	PUSHL	#0			; Push the time parameter
+	PUSHAL	PROCESS_NAME		; Push test name...
+	PUSHL	#2			; ...arg count...
+	PUSHL	#UETP$_ABENDD!STS$K_ERROR ; ...and signal name
+	PUSHL	ERROR_COUNT		; Finish off arg list...
+	PUSHL	#1			; ...
+	PUSHL	#UETP$_ERBOX!STS$K_ERROR ; ...for error box message
+	CALLS	ARG_COUNT,G^LIB$SIGNAL	; Truly bitch
+
+ERROR_EXIT1:
+	BISL	#STS$M_INHIB_MSG,STATUS	; Don't print messages twice!
+	$EXIT_S STATUS			; Exit in error
+
+	.SBTTL	Exit Handler
+;++
+; FUNCTIONAL DESCRIPTION:
+;	This routine handles cleanup at exit.  If the MODE logical name is
+;	equated to "ONE", the routine will update the test flag in the
+;	UETINIDEV.DAT file depending on the UETUNT$M_TESTABLE flag state in the
+;	UETUNT$B_FLAGS field of the unit block for each unit for the device
+;	under test.
+;
+; CALLING SEQUENCE:
+;	Invoked automatically by $EXIT System Service.
+;
+; INPUT PARAMETERS:
+;	STATUS  contains the exit status.
+;	FLAG    has synchronizing bits.
+;	DDB_RFA contains the RFA of the DDB record for this device in UETINIDEV.
+;
+; IMPLICIT INPUTS:
+;	UNIT_LIST points to the head of a doubly linked circular list of unit
+;		  blocks for the device under test.
+;
+; OUTPUT PARAMETERS:
+;	NONE
+;
+; IMPLICIT OUTPUTS:
+;	Various files are de-accessed and the process name is reset.
+;	If the MODE logical name is equated to "ONE", the routine will update
+;	the test flag in the UETINIDEV.DAT file depending on the 
+;	UETUNT$M_TESTABLE flag state in the UETUNT$B_FLAGS field of the unit
+;	block for each unit for the device under test.
+;
+; COMPLETION CODES:
+;	NONE
+;
+; SIDE EFFECTS:
+;	NONE
+;
+;--
+
+EXIT_HANDLER:
+	.WORD	^M<R2,R3,R4,R5,R6,R7,R8,R9,R10,R11> ; Entry mask
+
+	$SETSFM_S ENBFLG = #0		; Turn off System Service failure mode
+	$SETAST_S ENBFLG = #0		; Disable AST's
+	$TRNLOG_S LOGNAM = MODE,-	; Get the run mode
+		  RSLLEN = BUFFER_PTR,-
+		  RSLBUF = FAO_BUF
+	BICB2	#LC_BITM,BUFFER		; Convert to upper case
+	CMPB	#^A/O/,BUFFER		; Is this a one shot?
+	BEQL	10$			; BR if yes...
+	BRW	END_UPDATE		; ...else don't update UETINIDEV.DAT
+10$:
+	BBS	#SAFE_TO_UPDV,FLAG,20$	; Only update if it's safe
+	BRW	END_UPDATE		; Else forget it
+20$:
+	MOVAL	INI_RAB,R10		; Set the RAB address
+	MOVB	#RAB$C_RFA,RAB$B_RAC(R10) ; Set RFA mode
+	MOVC3	#6,DDB_RFA,RAB$W_RFA(R10) ; Set RFA to DDB line
+	$GET	RAB = (R10)		; Go back to the DDB record
+	BLBC	R0,END_UPDATE		; If failure then forget it
+	MOVB	#RAB$C_SEQ,RAB$B_RAC(R10) ; Set back to sequential mode
+	ADDL3	#UNIT_LIST,UNIT_LIST,R11 ; Set the unit block list header
+	CLRL	R9			; Init an index
+UNIT_LOOP:
+	BITB	#UETUNT$M_TESTABLE,-
+		UETUNT$B_FLAGS(R11)	; Is this unit testable?
+	BEQL	10$			; BR if not
+	INCL	R9			; Another unit that's testable
+10$:
+	ADDL2	(R11),R11		; Next unit block
+	CMPL	R11,#UNIT_LIST		; Are we full circle in the list?
+	BNEQ	UNIT_LOOP		; BR if not
+	TSTL	R9			; Any testable units?
+	BNEQ	20$			; BR if yes...
+	MOVB	#^A/N/,BUFFER+4		; ...else disable the DDB record...
+	$UPDATE RAB = (R10)		; ...here
+	BLBC	R0,END_UPDATE		; If error then forget it
+20$:
+	ADDL2	(R11),R11		; Next unit block
+	CMPL	R11,#UNIT_LIST		; Are we full circle in the list?
+	BEQL	END_UPDATE		; BR if yes
+	$GET	RAB = (R10)		; Get a record
+	BLBC	R0,END_UPDATE		; If error then forget it
+	BICB2	#LC_BITM,BUFFER		; Convert to uppercase
+	CMPB	#^A/U/,BUFFER		; Is it a UCB record?
+	BNEQ	END_UPDATE		; BR if not
+	BITB	#UETUNT$M_TESTABLE,-
+		UETUNT$B_FLAGS(R11)	; Is this unit testable?
+	BNEQ	20$			; BR if yes...
+	MOVB	#^A/N/,BUFFER+4		; ...else disable the UCB record...
+	$UPDATE RAB = (R10)		; ...here
+	BLBC	R0,END_UPDATE		; If error then forget it
+	BRB	20$			; Look at the next record
+END_UPDATE:
+	PUSHL	#0			; Set the time flag
+	PUSHAL	PROCESS_NAME		; Push the test name
+	PUSHL	#2			; Push arg count
+	PUSHL	#UETP$_ENDEDD		; Push signal name
+	EXTZV	#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,-
+		STATUS,R0		; Get the proper exit severity
+	INSV	R0,#STS$V_SEVERITY,-
+		#STS$S_SEVERITY,(SP)	; Set the end message severity
+	CALLS	#4,G^LIB$SIGNAL		; Output the message
+	$DASSGN_S   CHAN = SUP_FAB+FAB$L_STV ; Deassign the channel
+	$DISCONNECT  RAB = INI_RAB	; Disconnect the RAB from the FAB
+	$CLOSE	     FAB = INI_FAB	; Close the file
+	$SETPRN_S PRCNAM = ACNT_NAME	; Reset the process name
+	RET				; That's all folks!
+
+	.END	UETDR7800

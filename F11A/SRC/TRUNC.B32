@@ -1,0 +1,410 @@
+MODULE TRUNC (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-002'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This routine truncates a file by deallocating the indicated blocks.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  21-Mar-1977  10:41
+!
+! MODIFIED BY:
+!
+!	V03-002	ACG0287		Andrew C. Goldstein,	14-Apr-1982  17:18
+!		Check for index file ID in header rather than FCB
+!
+!	V03-001	LMP0023		L. Mark Pilant,		 7-Apr-1982  16:45
+!		Give a privilege violation if attempting to truncate the
+!		index file (INDEXF.SYS).
+!
+!	V02-003	ACG35898	Andrew C. Goldstein,	11-Mar-1981  16:31
+!		Update HIBLK in primary file header
+!
+!	V02-002	ACG0167		Andrew C. Goldstein,	7-May-1980  18:52
+!		Previous revision history moved to F11A.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	TRUNCATE	: NOVALUE,	! truncate file
+	TRUNCATE_HEADER	: NOVALUE;	! truncate individual file header
+
+GLOBAL ROUTINE TRUNCATE (FIB, FILE_HEADER, DEALLOCATE) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine truncates a file to the size indicated in the FIB by
+!	deallocating the necessary blocks. The erase flag controls whether
+!	the retrieval pointers are erased in the header. The deallocate flag
+!	controls whether or not the blocks are actually returned to the
+!	storage map.
+!
+! CALLING SEQUENCE:
+!	TRUNCATE (ARG1, ARG2, ARG3)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of FIB for operation
+!	ARG2: address of file header
+!	ARG3: = 1 to return space to storage map
+!	      = 0 to just clean out header
+!
+! IMPLICIT INPUTS:
+!	CURRENT_VCB: VCB of volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	storage bitmap altered
+!	file header altered
+!
+!--
+
+BEGIN
+
+MAP
+	FIB		: REF BBLOCK,	! FIB for operation
+	FILE_HEADER	: REF BBLOCK;	! file header
+
+LOCAL
+	FCB		: REF BBLOCK,	! FCB of current file header
+	HEADER		: REF BBLOCK,	! address of current file header
+	NEW_HEADER	: REF BBLOCK,	! address of extension file header
+	MAP_AREA	: REF BBLOCK,	! file header map area
+	MAP_POINTER	: REF BBLOCK,	! pointer to scan map
+	MAP_COUNT,			! retrieval pointer count
+	VBN,				! relative VBN of operation
+	COUNT,				! count of blocks returned
+	EXT_FID		: BBLOCK [FID$C_LENGTH], ! file ID of extension header
+	EX_SEGNUM,			! segment number of ext header
+	REREAD,				! flag to reread primary header
+	REREAD2;			! flag to update primary header
+
+LABEL
+	DO_TRUNCATE,			! main truncate operation body
+	VBN_LOOP;			! main loop to scan for starting VBN
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	USER_STATUS	: VECTOR,	! I/O status block of user
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume
+	PRIMARY_FCB	: REF BBLOCK;	! FCB of file
+
+EXTERNAL ROUTINE
+	PMS_START_SUB,			! start subfunction metering
+	PMS_END_SUB,			! end subfunction metering
+	SEARCH_FCB,			! search FCB list for FCB
+	MARK_DIRTY,			! mark buffer for write-back
+	CHECKSUM,			! checksum file header
+	NEXT_HEADER,			! read next extension header
+	UPDATE_FILESIZE,		! update file size in primary FCB
+	INIT_FCB,			! initialize FCB
+	WRITE_HEADER,			! write file header
+	READ_HEADER,			! read file header
+	DEL_EXTFCB,			! delete extension FCB's
+	DELETE_FILE;			! delete remainder of file
+
+
+! Start metering for this subfunction.
+!
+
+PMS_START_SUB (PMS_ALLOC);
+
+! Establish the basic pointers. Round up the starting VBN to the next cluster
+! boundary and adjust it to a zero start. The block count must be zero (default).
+!
+
+HEADER = .FILE_HEADER;
+FCB = .PRIMARY_FCB;
+
+! Check for the index file INDEXF.SYS
+!
+
+IF  .HEADER[FH1$W_FID_NUM] EQL FID$C_INDEXF
+AND .HEADER[FH1$W_FID_SEQ] EQL FID$C_INDEXF
+THEN ERR_EXIT (SS$_NOPRIV);
+
+VBN = ((.FIB[FIB$L_EXVBN] - 1 + .CURRENT_VCB[VCB$W_CLUSTER] - 1)
+	 / .CURRENT_VCB[VCB$W_CLUSTER]) * .CURRENT_VCB[VCB$W_CLUSTER];
+
+IF .FIB[FIB$L_EXSZ] NEQ 0 THEN ERR_EXIT (SS$_BADPARAM);
+
+! Init the user's return parameters.
+!
+
+USER_STATUS[1] = .VBN + 1 - .FIB[FIB$L_EXVBN];
+FIB[FIB$L_EXVBN] = .VBN + 1;
+FIB[FIB$L_EXSZ] = 0;
+REREAD = 0;
+
+! Now scan the file headers for the retrieval pointer containing the starting
+! VBN. If the VBN is off the end of file, report the error; if it coincides,
+! the operation is a noop.
+!
+
+DO_TRUNCATE:
+BEGIN
+
+VBN_LOOP:
+BEGIN
+WHILE 1 DO
+    BEGIN
+    MAP_AREA = .HEADER + .HEADER[FH1$B_MPOFFSET]*2;
+    MAP_POINTER = .MAP_AREA + FM1$C_POINTERS;
+    MAP_COUNT = .MAP_AREA[FM1$B_INUSE] / 2;
+
+    WHILE .MAP_COUNT GTR 0 DO
+	BEGIN
+	COUNT = .MAP_POINTER[FM1$B_COUNT] + 1;
+	IF .COUNT GTRU .VBN THEN LEAVE VBN_LOOP;
+	VBN = .VBN - .COUNT;
+	MAP_POINTER = .MAP_POINTER + 4;
+	MAP_COUNT = .MAP_COUNT - 1;
+	END;
+
+! We have scanned through an entire header. Chain to the next header if it
+! exists. First check for the boundary condition of starting the truncate
+! at the header boundary to avoid leaving an empty header.
+!
+
+    IF .VBN EQL 0
+    THEN
+	BEGIN
+	IF .MAP_AREA[FM1$W_EX_FILNUM] EQL 0
+	THEN LEAVE DO_TRUNCATE		! truncate coincides with EOF
+	ELSE LEAVE VBN_LOOP;		! dump the extension headers
+	END;
+
+    NEW_HEADER = NEXT_HEADER (.HEADER, .FCB);
+    IF .NEW_HEADER EQL 0 THEN EXITLOOP;
+    REREAD = 1;
+    HEADER = .NEW_HEADER;
+
+    IF .FCB NEQ 0
+    THEN FCB = .FCB[FCB$L_EXFCB]
+    ELSE IF SEARCH_FCB (HEADER[FH1$W_FID]) NEQ 0
+    THEN ERR_EXIT (SS$_ACCONFLICT);
+    END;				! end of header scan loop
+
+ERR_EXIT (SS$_ENDOFFILE)
+END;					! end of VBN_LOOP
+
+! We are now pointing at the retrieval pointer in which the truncation starts.
+! Clean out the rest of this header. If there are extension headers, use
+! the delete routine to dispose of them. Also flush extension FCB's, if they
+! exist.
+!
+
+MARK_DIRTY (.HEADER);
+CLEANUP_FLAGS[CLF_FIXFCB] = 1;
+CLEANUP_FLAGS[CLF_INVWINDOW] = 1;
+CLEANUP_FLAGS[CLF_CLEANTRUNC] = 1;
+KERNEL_CALL (UPDATE_FILESIZE, .FIB[FIB$L_EXVBN] - 1);
+
+! Update the HIBLK field in the record attributes to reflect the new file
+! size.
+!
+
+IF NOT .REREAD
+THEN BBLOCK [HEADER[FH1$W_RECATTR], FAT$L_HIBLK] = ROT (.FIB[FIB$L_EXVBN]-1, 16);
+
+TRUNCATE_HEADER (.FIB, .HEADER, .DEALLOCATE, .MAP_POINTER, .VBN);
+EX_SEGNUM = .MAP_AREA[FM1$B_EX_SEGNUM] + 1;
+EXT_FID[FID$W_NUM] = .MAP_AREA[FM1$W_EX_FILNUM];
+EXT_FID[FID$W_SEQ] = .MAP_AREA[FM1$W_EX_FILSEQ];
+EXT_FID[FID$W_RVN] = 0;
+MAP_AREA[FM1$W_EX_FILNUM] = 0;
+MAP_AREA[FM1$W_EX_FILSEQ] = 0;
+
+IF .FCB NEQ 0 AND .FCB NEQ .PRIMARY_FCB
+THEN KERNEL_CALL (INIT_FCB, .FCB, .HEADER);
+
+CHECKSUM (.HEADER);
+WRITE_HEADER ();
+
+REREAD2 = .REREAD;
+IF .DEALLOCATE AND (.EXT_FID[FID$W_NUM] NEQ 0)
+THEN
+    BEGIN
+    REREAD = 1;
+    HEADER = NEXT_HEADER (0, .FCB, EXT_FID, .EX_SEGNUM);
+    KERNEL_CALL (DEL_EXTFCB, .FCB);
+    DELETE_FILE (.FIB, .HEADER);
+    END;
+
+END;					! end of block DO_TRUNCATE
+
+! If this was a truncate of a multi-header file, reread the primary header
+! and update the HIBLK field in the record attributes to reflect the new file
+! size.
+!
+
+IF .REREAD
+THEN HEADER = READ_HEADER (FIB[FIB$W_FID], .PRIMARY_FCB);
+
+IF .REREAD2
+THEN
+    BEGIN
+    BBLOCK [HEADER[FH1$W_RECATTR], FAT$L_HIBLK] = ROT (.FIB[FIB$L_EXVBN]-1, 16);
+    MARK_DIRTY (.HEADER);
+    END;
+
+
+! Stop metering of this subfunction
+!
+
+PMS_END_SUB ();
+
+END;					! end of routine TRUNCATE
+
+GLOBAL ROUTINE TRUNCATE_HEADER (FIB, HEADER, DEALLOCATE, POINTER, LAST_COUNT) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine returns the indicated retrieval pointers in the given
+!	file header to the storage map and erases them in the file header.
+!
+!
+! CALLING SEQUENCE:
+!	TRUNCATE_HEADER (ARG1, ARG2, ARG3, ARG4, ARG5)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of FIB of operation
+!	ARG2: address of file header
+!	ARG3: = 1 to return space to the storage map
+!	      = 0 to just erase the retrieval pointers
+!	ARG4: address of first retrieval pointer to process, if present
+!	ARG5: new count field of first pointer, if present
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	file header altered, storage map altered
+!
+!--
+
+BEGIN
+
+MAP
+	FIB		: REF BBLOCK,	! user FIB
+	HEADER		: REF BBLOCK;	! file header
+
+LOCAL
+	MAP_AREA	: REF BBLOCK,	! address of file header map area
+	MAP_POINTER	: REF BBLOCK,	! pointer to map pointers
+	MAP_END,			! address of end of map area
+	COUNT,				! count field of current retrieval pointer
+	LBN,				! LBN field of current retrieval pointer
+	RP_COUNT;			! new count field for retrieval pointer
+
+EXTERNAL ROUTINE
+	RETURN_BLOCKS;			! return blocks to storage map
+
+
+! Establish pointers into the file header. If explicit args are supplied, use
+! them; else default to releasing the entire file header.
+!
+
+MAP_AREA = .HEADER + .HEADER[FH1$B_MPOFFSET]*2;
+MAP_POINTER = .MAP_AREA + FM1$C_POINTERS;
+MAP_END = .MAP_POINTER + .MAP_AREA[FM1$B_INUSE]*2;
+RP_COUNT = 0;
+
+IF ACTUALCOUNT GEQ 4
+THEN
+    BEGIN
+    MAP_POINTER = .POINTER;
+    RP_COUNT = .LAST_COUNT;
+    END;
+
+! Now scan the map area, cleaning out pointers and releasing blocks.
+!
+
+UNTIL .MAP_POINTER GEQA .MAP_END DO
+    BEGIN
+    COUNT = .MAP_POINTER[FM1$B_COUNT] + 1;
+    LBN = .MAP_POINTER[FM1$W_LOWLBN];
+    LBN<16,8> = .MAP_POINTER[FM1$B_HIGHLBN];
+    IF .RP_COUNT NEQ 0
+    THEN
+	MAP_POINTER[FM1$B_COUNT] = .RP_COUNT - 1
+    ELSE
+	BEGIN
+	MAP_POINTER[FM1$B_HIGHLBN] = 0;
+	MAP_POINTER[FM1$B_COUNT] = 0;
+	MAP_POINTER[FM1$W_LOWLBN] = 0;
+	MAP_AREA[FM1$B_INUSE] = .MAP_AREA[FM1$B_INUSE] - 2;
+	END;
+
+    IF .DEALLOCATE THEN RETURN_BLOCKS (.LBN + .RP_COUNT, .COUNT - .RP_COUNT);
+    FIB[FIB$L_EXSZ] = .FIB[FIB$L_EXSZ] + .COUNT - .RP_COUNT;
+    RP_COUNT = 0;
+    MAP_POINTER = .MAP_POINTER + 4;
+    END;
+
+END;					! end of routine TRUNCATE_HEADER
+
+END
+ELUDOM

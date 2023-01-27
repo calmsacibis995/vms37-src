@@ -1,0 +1,983 @@
+MODULE BINDVL (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  Mount Utility Structure Level 2
+!
+! ABSTRACT:
+!
+!	This module updates the volume set list and home blocks to bind a
+!	new volume into a volume set.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  27-Oct-1978  17:54
+!
+! MODIFIED BY:
+!
+!	V02-004	STJ0196		Steven T. Jeffreys,	02-Feb-1982
+!		Zero OWN and GLOBAL storage to guaranty restartablity.
+!		Also make use of a global buffer.
+!
+!	V02-003	ACG0167		Andrew C. Goldstein,	18-Apr-1980  13:37
+!		Previous revision history moved to MOUNT.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:MOUDEF.B32';
+REQUIRE 'SRCD$:[VMSLIB.OBJ]MOUNTMSG.B32';
+
+
+FORWARD ROUTINE
+	BIND_VOLUME	: NOVALUE,	! main bind routine
+	UPDATE_HOMEBLK	: NOVALUE,	! update home blocks on volume
+	OPEN_FILE	: NOVALUE,	! open a file
+	CLOSE_FILE	: NOVALUE,	! close a file
+	READ_VIRTUAL	: NOVALUE,	! read a virtual block
+	WRITE_VIRTUAL	: NOVALUE,	! write a virtual block
+	UNLOCK_INDEXF,			! remove write locks on the index file
+	LOCK_INDEXF,			! restore above write locks
+	BIND_HANDLER;			! condition handler for this module
+
+!+
+!
+! Global and own storage for this module.
+!
+!-
+
+EXTERNAL
+	CHANNEL,			! channel assigned to device being mounted
+	BUFFER		: BBLOCK,	! general purpose I/O buffer
+	HOME_BLOCK	: BBLOCK;	! buffer containing home block of volume
+
+OWN
+	OWN_START	: VECTOR [0],	! Mark start of OWN storage
+	CHANNEL2	: WORD,		! channel for index file on RVN 1
+	CHANNEL3	: WORD,		! channel for volume set list on RVN 1
+	LOCK_COUNT,			! saved lock count of volume's index file
+	LOCK_COUNT1,			! as above, for RVN 1
+	OWN_END		: VECTOR [0];	! Markk end of OWN storage
+
+LITERAL
+	OWN_LENGTH	= OWN_END - OWN_START;
+
+GLOBAL ROUTINE BIND_VOLUME : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine incorporates a new volume into a volume set. It enters
+!	it into the volume set list and updates the home blocks on the new
+!	volume and the root volume.
+!
+!
+! CALLING SEQUENCE:
+!	BIND_VOLUME ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+LITERAL
+	ENTRY_COUNT	= 512 / VSL$C_LENGTH; ! Number of entries per block
+					! in volume set list file
+
+LOCAL
+	PROCESS_PRIV	: BBLOCK [8],	! privileges of process
+	CLEAR_PRIV	: BBLOCK [8],	! privilege bits to clear
+	NEW_SET,			! flag indicating creation of new volume set
+	STATUS,				! catch-all status value
+	IO_STATUS	: VECTOR [4, WORD], ! I/O status block
+	EOF,				! last block used in volume set list
+	REC_ATTR	: BBLOCK [ATR$S_RECATTR], ! record attributes of vol set list
+	P		: REF BBLOCK,	! block scan pointer
+	FIB		: BBLOCK [FIB$C_EXTDATA], ! FIB to extend file
+	FIB_DESC	: VECTOR [2];	! descriptor for FIB
+
+EXTERNAL
+	PHYS_NAME	: VECTOR;	! descriptor of physical device name
+
+
+ENABLE BIND_HANDLER;
+
+! Zero the OWN and GLOBAL storage so that $MOUNT
+! my be called repeatedly from a given image.
+!
+
+CH$FILL (0, OWN_LENGTH, OWN_START);
+
+! See if the process has BYPASS and/or SYSPRV privileges. Clear the image
+! privileges if not, to let file protection work in the /BIND processing.
+!
+
+CLEAR_PRIV<0,32> = 0;
+(CLEAR_PRIV+4)<0,32> = 0;
+$SETPRV (ENBFLG = 0,			! read process privileges
+	 PRMFLG = 1,
+	 PRVADR = CLEAR_PRIV,
+	 PRVPRV = PROCESS_PRIV
+	 );
+
+IF NOT .PROCESS_PRIV[PRV$V_SYSPRV]
+THEN CLEAR_PRIV[PRV$V_SYSPRV] = 1;
+IF NOT .PROCESS_PRIV[PRV$V_BYPASS]
+THEN CLEAR_PRIV[PRV$V_BYPASS] = 1;
+$SETPRV (ENBFLG = 0,			! disable image privileges
+	 PRMFLG = 0,
+	 PRVADR = CLEAR_PRIV
+	 );
+
+! Get a flag indicating whether we are adding a volume to a set or creating
+! RVN 1 of a new set. This affects various actions along the way.
+!
+
+NEW_SET = .HOME_BLOCK[HM2$W_RVN] EQL 1;
+
+! We already have one channel open on the new volume, which will be used to
+! access its index file. Open two more channels, for the index file and volume
+! set list on the root volume. File protection is used to control the user's
+! privilege to bind a volume; we open all three files concurrently to avoid
+! error cleanup problems later.
+!
+
+STATUS = $ASSIGN (CHAN   = CHANNEL2,
+		  DEVNAM = PHYS_NAME[0]);
+IF NOT .STATUS THEN ERR_EXIT (.STATUS);
+
+STATUS = $ASSIGN (CHAN   = CHANNEL3,
+		  DEVNAM = PHYS_NAME[0]);
+IF NOT .STATUS THEN ERR_EXIT (.STATUS);
+
+! Patch off the write locks on the index files, so that we can write access
+! them.
+!
+
+STATUS = KERNEL_CALL (UNLOCK_INDEXF);
+IF NOT .STATUS THEN ERR_EXIT (.STATUS);
+
+! Now open the files.
+!
+
+OPEN_FILE (UPLIT WORD (FID$C_INDEXF, FID$C_INDEXF, 0), .CHANNEL, 0);
+
+IF NOT .NEW_SET
+THEN OPEN_FILE (UPLIT WORD (FID$C_INDEXF, FID$C_INDEXF, 1), .CHANNEL2, 0);
+
+OPEN_FILE (UPLIT WORD (FID$C_VOLSET, FID$C_VOLSET, 1), .CHANNEL3, REC_ATTR);
+
+! We now scan the volume set list file and check for uniquness of volume
+! labels.
+!
+
+IF CH$EQL (HM2$S_STRUCNAME, HOME_BLOCK[HM2$T_STRUCNAME],
+	   HM2$S_STRUCNAME, HOME_BLOCK[HM2$T_VOLNAME], ' ')
+THEN ERR_EXIT (MOUN$_DUPVOLNAM);
+
+INCR J FROM 1 TO (.HOME_BLOCK[HM2$W_RVN]-1+ENTRY_COUNT-1) / ENTRY_COUNT
+DO
+    BEGIN
+    READ_VIRTUAL (.CHANNEL3, .J);
+
+    P = BUFFER;
+    INCR K FROM 1 TO ENTRY_COUNT
+    DO
+	BEGIN
+	IF CH$EQL (HM2$S_VOLNAME, HOME_BLOCK[HM2$T_VOLNAME],
+		   VSL$S_NAME, P[VSL$T_NAME], ' ')
+	THEN ERR_EXIT (MOUN$_DUPVOLNAM);
+	P = .P + VSL$C_LENGTH;
+	END;
+    END;
+
+! Enter the new volume in the volume set list and rewrite the block. We
+! extend the file if necessary.
+!
+
+EOF = (.HOME_BLOCK[HM2$W_RVN] + ENTRY_COUNT - 1) / ENTRY_COUNT;
+IF .EOF GEQU .REC_ATTR[FAT$L_EFBLK]
+THEN
+    BEGIN
+    CH$FILL (0, 512, BUFFER);
+    REC_ATTR[FAT$L_EFBLK] = .EOF + 1;
+    IF .EOF GTRU .REC_ATTR[FAT$L_HIBLK]
+    THEN
+	BEGIN
+	CH$FILL (0, FIB$C_EXTDATA, FIB);
+	FIB[FIB$V_EXTEND] = 1;
+	FIB[FIB$V_NOHDREXT] = 1;
+	FIB[FIB$L_EXSZ] = 1;
+	FIB_DESC[0] = FIB$C_EXTDATA;
+	FIB_DESC[1] = FIB;
+	STATUS = $QIOW (CHAN = .CHANNEL3,
+			FUNC = IO$_MODIFY,
+			IOSB = IO_STATUS,
+			P1   = FIB_DESC
+			);
+	IF NOT .STATUS THEN ERR_EXIT (.STATUS);
+	IF NOT .IO_STATUS[0] THEN ERR_EXIT (.IO_STATUS[0]);
+	REC_ATTR[FAT$L_HIBLK] = .FIB[FIB$L_EXSZ] + .FIB[FIB$L_EXVBN] - 1;
+	END;
+    END;
+
+P = (.HOME_BLOCK[HM2$W_RVN] MOD ENTRY_COUNT) * VSL$C_LENGTH + BUFFER;
+CH$MOVE (HM2$S_VOLNAME, HOME_BLOCK[HM2$T_VOLNAME], P[VSL$T_NAME]);
+IF .NEW_SET
+THEN CH$MOVE (HM2$S_STRUCNAME, HOME_BLOCK[HM2$T_STRUCNAME], BUFFER[VSL$T_NAME]);
+WRITE_VIRTUAL (.CHANNEL3, .EOF);
+
+CLOSE_FILE (.CHANNEL3, REC_ATTR);
+
+! Now update the home blocks on the volumes. On the new volume, we insert the
+! volume set name and RVN. On RVN 1, we update the count of volumes in the set.
+! On a new set, both happen on the same volume.
+!
+
+IF .NEW_SET
+THEN
+    UPDATE_HOMEBLK (.CHANNEL, 3)
+ELSE
+    BEGIN
+    UPDATE_HOMEBLK (.CHANNEL, 1);
+    UPDATE_HOMEBLK (.CHANNEL2, 2);
+    END;
+
+CLOSE_FILE (.CHANNEL, 0);
+IF NOT .NEW_SET THEN CLOSE_FILE (.CHANNEL2, 0);
+
+KERNEL_CALL (LOCK_INDEXF);
+
+$DASSGN (CHAN = .CHANNEL2);
+$DASSGN (CHAN = .CHANNEL3);
+
+! Re-enable image privileges for the next volume mounted.
+!
+
+$SETPRV (ENBFLG = 1,			! disable image privileges
+	 PRMFLG = 0,
+	 PRVADR = CLEAR_PRIV
+	 );
+
+END;					! end of routine BIND_VOLUME
+
+ROUTINE UPDATE_HOMEBLK (CHANNEL, MODE) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine updates the home blocks in the index file open on the
+!	indicated channel. It enters volume set name, RVN, and number of
+!	volumes as directed.
+!
+!
+! CALLING SEQUENCE:
+!	UPDATE_HOMEBLK (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: channel on which index file is open
+!	ARG2: mode flag:
+!	      bit 0 set to update RVN and structure name
+!	      bit 1 set to update count of volumes in set
+!
+! IMPLICIT INPUTS:
+!	HOME_BLOCK: home block of volume being mounted, containing needed data
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	index file of specified disk written
+!
+!--
+
+BEGIN
+
+MAP
+	MODE		: BITVECTOR;	! mode flags arg
+
+LOCAL
+	ERR_COUNT,			! inverse count of errors encountered
+	COUNT,				! highest VBN to process
+	VBN,				! current VBN in index file
+	STATUS,				! catch-all status value
+	STATUS2,			! 2nd status value
+	IO_STATUS	: VECTOR [4, WORD]; ! I/O status block
+
+EXTERNAL ROUTINE
+	CHECK_HOMEBLK2,			! verify level 2 home block
+	CHECKSUM2;			! compute home block checksum
+
+
+! We read and update all of the home blocks of the volume. Each home block, as
+! it is read, is checked for validity. If there is an error, we write back that
+! home block with a bad checksum to prevent misinterpretation of bad data.
+! On a second such error, we give up to avoid risking leaving a volume with
+! no good home blocks.
+!
+
+ERR_COUNT = 2;				! we quit after the 2nd error
+COUNT = -1;
+VBN = 2;
+DO
+    BEGIN
+    STATUS = $QIOW (CHAN = .CHANNEL,
+		    FUNC = IO$_READVBLK,
+		    IOSB = IO_STATUS,
+		    P1   = BUFFER,
+		    P2   = 512,
+		    P3   = .VBN
+		    );
+    IF .STATUS THEN STATUS = .IO_STATUS[0];
+    IF .STATUS
+    THEN IF NOT CHECK_HOMEBLK2 (BUFFER, .BUFFER[HM2$L_HOMELBN],
+				  UPLIT (HM2$S_VOLNAME, BUFFER[HM2$T_VOLNAME]))
+	THEN STATUS = MOUN$_HOMBLKCHK;
+
+    IF NOT .STATUS
+    THEN
+	BEGIN
+	ERR_COUNT = .ERR_COUNT - 1;
+	IF .ERR_COUNT LEQ 0
+	THEN ERR_EXIT (MOUN$_BADHOMBLK, 0, .STATUS);
+
+	ERR_MESSAGE (MOUN$_BADHOMBLK, 0, .STATUS);
+	END
+
+    ELSE				! get loop count from 1st good home block
+	IF .COUNT EQL -1 THEN COUNT = .BUFFER[HM2$W_CLUSTER] * 3;
+
+! Update the home block read with structure name, RVN, and/or volume set size
+! as requested. Recompute the checksums. If the block was bad, bash a checksum.
+! Finally rewrite it.
+!
+
+    IF .MODE[0]
+    THEN
+	BEGIN
+	CH$MOVE (HM2$S_STRUCNAME, HOME_BLOCK[HM2$T_STRUCNAME], BUFFER[HM2$T_STRUCNAME]);
+	BUFFER[HM2$W_RVN] = .HOME_BLOCK[HM2$W_RVN];
+	END;
+
+    IF .MODE[1]
+    THEN
+	BUFFER[HM2$W_SETCOUNT] = .HOME_BLOCK[HM2$W_RVN];
+
+    CHECKSUM2 (BUFFER, $BYTEOFFSET (HM2$W_CHECKSUM1));
+    CHECKSUM2 (BUFFER, $BYTEOFFSET (HM2$W_CHECKSUM2));
+    IF NOT .STATUS THEN BUFFER[HM2$W_CHECKSUM2] = NOT .BUFFER[HM2$W_CHECKSUM2];
+
+    STATUS2 = $QIOW (CHAN = .CHANNEL,
+		    FUNC = IO$_WRITEVBLK,
+		    IOSB = IO_STATUS,
+		    P1   = BUFFER,
+		    P2   = 512,
+		    P3   = .VBN
+		    );
+    IF .STATUS2 THEN STATUS2 = .IO_STATUS[0];
+
+    IF .STATUS				! ignore write error if it was bad
+    THEN
+	IF NOT .STATUS2
+	THEN
+	    BEGIN
+	    ERR_MESSAGE (MOUN$_WRTHOMBLK, 0, .STATUS2);
+	    ERR_COUNT = .ERR_COUNT - 1;
+	    END;
+
+    VBN = .VBN + 1;
+    END
+UNTIL .VBN GTRU .COUNT;			! loop for all home blocks
+
+END;					! end of routine UPDATE_HOMEBLK
+
+ROUTINE OPEN_FILE (FID, CHANNEL, ATTRIB) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine opens the file given by the file ID on the indicated
+!	channel.
+!
+!
+! CALLING SEQUENCE:
+!	OPEN_FILE (ARG1, ARG2, ARG3)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of file ID
+!	ARG2: channel number to use
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	ARG3: address of buffer to receive record attributes, if not 0
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	file opened
+!
+!--
+
+BEGIN
+
+
+MAP
+	FID		: REF BBLOCK,	! file ID arg
+	ATTRIB		: REF BBLOCK;	! attribute buffer arg
+
+BUILTIN
+	ROT;
+
+LOCAL
+	STATUS,				! general status return
+	IO_STATUS	: VECTOR [4, WORD], ! I/O status block
+	ATTR_CTL	: BBLOCKVECTOR [2, 8],	! attribute control list
+	FIB		: BBLOCK [FIB$C_ACCDATA], ! FIB
+	FIB_DESC	: VECTOR [2];	! FIB descriptor
+
+
+! Fill in the control blocks and open the file.
+!
+
+CH$MOVE (FID$C_LENGTH, .FID, FIB[FIB$W_FID]);
+FIB[FIB$L_ACCTL] = FIB$M_WRITE OR FIB$M_NOWRITE;
+
+ATTR_CTL[0, ATR$W_SIZE] = 0;
+ATTR_CTL[0, ATR$W_TYPE] = 0;
+IF .ATTRIB NEQ 0
+THEN
+    BEGIN
+    ATTR_CTL[0, ATR$W_SIZE] = ATR$S_RECATTR;
+    ATTR_CTL[0, ATR$W_TYPE] = ATR$C_RECATTR;
+    ATTR_CTL[0, ATR$L_ADDR] = .ATTRIB;
+    ATTR_CTL[1, ATR$W_SIZE] = 0;
+    ATTR_CTL[1, ATR$W_TYPE] = 0;
+    END;
+
+FIB_DESC[0] = FIB$C_ACCDATA;
+FIB_DESC[1] = FIB;
+
+STATUS = $QIOW (CHAN = .CHANNEL,
+		FUNC = IO$_ACCESS OR IO$M_ACCESS,
+		IOSB = IO_STATUS,
+		P1   = FIB_DESC,
+		P5   = ATTR_CTL
+		);
+IF .STATUS THEN STATUS = .IO_STATUS[0];
+IF NOT .STATUS THEN ERR_EXIT (.STATUS);
+
+! If attributes were requested, invert the numbers into the standard longword
+! format and normalize the end of file mark.
+!
+
+IF .ATTRIB NEQ 0
+THEN
+    BEGIN
+    ATTRIB[FAT$L_HIBLK] = ROT (.ATTRIB[FAT$L_HIBLK], 16);
+    ATTRIB[FAT$L_EFBLK] = ROT (.ATTRIB[FAT$L_EFBLK], 16);
+    IF .ATTRIB[FAT$W_FFBYTE] NEQ 0
+    THEN
+	BEGIN
+	ATTRIB[FAT$W_FFBYTE] = 0;
+	ATTRIB[FAT$L_EFBLK] = .ATTRIB[FAT$L_EFBLK] + 1;
+	END;
+    END;
+
+END;					! end of routine OPEN_FILE
+
+ROUTINE CLOSE_FILE (CHANNEL, ATTRIB) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine closes the file open on the given channel.
+!
+!
+! CALLING SEQUENCE:
+!	CLOSE_FILE (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: channel number to use
+!	ARG2: address of buffer to receive record attributes, if not 0
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	file closed
+!
+!--
+
+BEGIN
+
+MAP
+	ATTRIB		: REF BBLOCK;	! attribute buffer arg
+
+BUILTIN
+	ROT;
+
+LOCAL
+	STATUS,				! general status return
+	IO_STATUS	: VECTOR [4, WORD], ! I/O status block
+	ATTR_CTL	: BBLOCKVECTOR [2, 8];	! attribute control list
+
+
+! Fill in the control blocks and close the file.
+!
+
+ATTR_CTL[0, ATR$W_SIZE] = 0;
+ATTR_CTL[0, ATR$W_TYPE] = 0;
+IF .ATTRIB NEQ 0
+THEN
+    BEGIN
+    ATTR_CTL[0, ATR$W_SIZE] = ATR$S_RECATTR;
+    ATTR_CTL[0, ATR$W_TYPE] = ATR$C_RECATTR;
+    ATTR_CTL[0, ATR$L_ADDR] = .ATTRIB;
+    ATTR_CTL[1, ATR$W_SIZE] = 0;
+    ATTR_CTL[1, ATR$W_TYPE] = 0;
+
+    ATTRIB[FAT$L_HIBLK] = ROT (.ATTRIB[FAT$L_HIBLK], 16);
+    ATTRIB[FAT$L_EFBLK] = ROT (.ATTRIB[FAT$L_EFBLK], 16);
+    END;
+
+STATUS = $QIOW (CHAN = .CHANNEL,
+		FUNC = IO$_DEACCESS,
+		IOSB = IO_STATUS,
+		P5   = ATTR_CTL
+		);
+IF .STATUS THEN STATUS = .IO_STATUS[0];
+IF NOT .STATUS THEN ERR_EXIT (.STATUS);
+
+END;					! end of routine CLOSE_FILE
+
+ROUTINE READ_VIRTUAL (CHANNEL, VBN) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine reads the indicated virtual block in the given channel.
+!
+!
+! CALLING SEQUENCE:
+!	READ_VIRTUAL (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: channel number to use
+!	ARG2: VBN to read
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	BUFFER: contains block read
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+
+LOCAL
+	STATUS,				! status return
+	IO_STATUS	: VECTOR [4, WORD]; ! I/O status block
+
+STATUS = $QIOW (CHAN = .CHANNEL,
+		FUNC = IO$_READVBLK,
+		IOSB = IO_STATUS,
+		P1   = BUFFER,
+		P2   = 512,
+		P3   = .VBN
+		);
+IF .STATUS THEN STATUS = .IO_STATUS[0];
+IF NOT .STATUS THEN ERR_EXIT (.STATUS);
+
+END;					! end of routine READ_VIRTUAL
+
+ROUTINE WRITE_VIRTUAL (CHANNEL, VBN) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine writes the indicated virtual block in the given channel.
+!
+!
+! CALLING SEQUENCE:
+!	WRITE_VIRTUAL (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: channel number to use
+!	ARG2: VBN to write
+!
+! IMPLICIT INPUTS:
+!	BUFFER: contains block to be written
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	NONE
+!
+!--
+
+BEGIN
+
+
+LOCAL
+	STATUS,				! status return
+	IO_STATUS	: VECTOR [4, WORD]; ! I/O status block
+
+STATUS = $QIOW (CHAN = .CHANNEL,
+		FUNC = IO$_WRITEVBLK,
+		IOSB = IO_STATUS,
+		P1   = BUFFER,
+		P2   = 512,
+		P3   = .VBN
+		);
+IF .STATUS THEN STATUS = .IO_STATUS[0];
+IF NOT .STATUS THEN ERR_EXIT (.STATUS);
+
+END;					! end of routine WRITE_VIRTUAL
+
+ROUTINE UNLOCK_INDEXF =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine zeroes the lock count in the index file FCB's of the
+!	volume being mounted /BIND and of RVN 1. In addition, it resets
+!	the LOG_IO and PHY_IO privilege bits to the process' unamplified
+!	bits, to allow the file system's protection check to work. Once
+!	we have a separate privilege bit to grant SYSTEM file access, this
+!	kluge can be removed. It must be called in kernel mode.
+!
+!
+! CALLING SEQUENCE:
+!	UNLOCK_INDEXF ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CHANNEL: channel number assigned to current volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1 if all OK
+!	MOUN$_RVN1NOTMT if RVN 1 is not on line
+!
+! SIDE EFFECTS:
+!	lock count in index file FCB's zeroed
+!
+!--
+
+BEGIN
+
+LOCAL
+	PRIVILEGE_MASK	: REF BBLOCK,	! pointer to current privilege mask
+	UCB		: REF BBLOCK,	! address of UCB
+	UCB1		: REF BBLOCK,	! address of UCB of RVN 1
+	FCB		: REF BBLOCK,	! address of index file FCB
+	RVT		: REF BBLOCK;	! address of relative volume table
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	CTL$GL_PHD	: REF BBLOCK ADDRESSING_MODE (ABSOLUTE),
+					! pointer to process header
+	CTL$GQ_PROCPRIV	: BBLOCK ADDRESSING_MODE (ABSOLUTE);
+					! permanent process privileges
+
+EXTERNAL ROUTINE
+	GET_CHANNELUCB;			! get UCB address of channel
+
+
+! Chase through the I/O database to find the index file FCB's. The present lock
+! count is saved so it can be restored later.
+!
+
+UCB = GET_CHANNELUCB (.CHANNEL);
+RVT = .BBLOCK [.UCB[UCB$L_VCB], VCB$L_RVT];
+UCB1 = .RVT[RVT$L_UCBLST];
+IF .UCB1 EQL 0 THEN RETURN MOUN$_RVN1NOTMT;
+
+SET_IPL (IPL$_SYNCH);
+FCB = .BBLOCK [.UCB1[UCB$L_VCB], VCB$L_FCBFL];
+LOCK_COUNT1 = .FCB[FCB$W_LCNT];
+FCB[FCB$W_LCNT] = 0;
+
+FCB = .BBLOCK [.UCB[UCB$L_VCB], VCB$L_FCBFL];
+LOCK_COUNT = .FCB[FCB$W_LCNT];
+FCB[FCB$W_LCNT] = 0;
+SET_IPL (0);
+
+! Reduce LOG_IO and PHY_IO privileges to the normal process values.
+!
+
+PRIVILEGE_MASK = CTL$GL_PHD[PHD$Q_PRIVMSK];
+IF NOT .CTL$GQ_PROCPRIV[PRV$V_LOG_IO] THEN PRIVILEGE_MASK[PRV$V_LOG_IO] = 0;
+IF NOT .CTL$GQ_PROCPRIV[PRV$V_PHY_IO] THEN PRIVILEGE_MASK[PRV$V_PHY_IO] = 0;
+
+CLEANUP_FLAGS[CLF_RELOCK] = 1;
+
+RETURN 1;
+
+END;					! end of routine UNLOCK_INDEXF
+
+ROUTINE LOCK_INDEXF =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine restores the lock counts to the index file FCB's of
+!	the volume being mounted and of RVN 1. It also set the LOG_IO and
+!	PHY_IO bits in the process privilege mask. It must be called in
+!	kernel mode.
+!
+!
+! CALLING SEQUENCE:
+!	LOCK_INDEXF ()
+!
+! INPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT INPUTS:
+!	CHANNEL: channel assigned to volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	1
+!
+! SIDE EFFECTS:
+!	lock counts in FCB's restored
+!
+!--
+
+BEGIN
+
+LOCAL
+	PRIVILEGE_MASK	: REF BBLOCK,	! pointer to current privilege mask
+	UCB		: REF BBLOCK,	! address of UCB
+	UCB1		: REF BBLOCK,	! address of UCB of RVN 1
+	FCB		: REF BBLOCK,	! address of index file FCB
+	RVT		: REF BBLOCK;	! address of relative volume table
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	CTL$GL_PHD	: REF BBLOCK ADDRESSING_MODE (ABSOLUTE);
+					! pointer to process header
+
+EXTERNAL ROUTINE
+	GET_CHANNELUCB;			! get UCB address of channel
+
+
+! Find the FCB's in the I/O database and add in the old counts (thus allowing
+! for changes in the meantime).
+!
+
+UCB = GET_CHANNELUCB (.CHANNEL);
+FCB = .BBLOCK [.UCB[UCB$L_VCB], VCB$L_FCBFL];
+FCB[FCB$W_LCNT] = .FCB[FCB$W_LCNT] + .LOCK_COUNT;
+
+RVT = .BBLOCK [.UCB[UCB$L_VCB], VCB$L_RVT];
+UCB1 = .RVT[RVT$L_UCBLST];
+IF .UCB1 NEQ 0 AND .UCB1 NEQ .UCB
+THEN
+    BEGIN
+    FCB = .BBLOCK [.UCB1[UCB$L_VCB], VCB$L_FCBFL];
+    FCB[FCB$W_LCNT] = .FCB[FCB$W_LCNT] + .LOCK_COUNT1;
+    END;
+
+! Turn on the LOG_IO and PHY_IO privilege bits again.
+!
+
+PRIVILEGE_MASK = CTL$GL_PHD[PHD$Q_PRIVMSK];
+PRIVILEGE_MASK[PRV$V_LOG_IO] = 1;
+PRIVILEGE_MASK[PRV$V_PHY_IO] = 1;
+
+CLEANUP_FLAGS[CLF_RELOCK] = 0;
+RETURN 1;
+
+END;					! end of routine LOCK_INDEXF
+
+ROUTINE BIND_HANDLER (SIGNAL, MECHANISM) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is the condition handler for the /BIND processing.
+!	It closes files and deassigns channels as necessary, and resignals
+!	the error to the main condition handler.
+!
+!
+! CALLING SEQUENCE:
+!	BIND_HANDLER (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of signal array
+!	ARG2: address of mechanism array
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	various cleanups
+!
+!--
+
+BEGIN
+
+MAP
+	SIGNAL		: REF BBLOCK,	! signal array
+	MECHANISM	: REF BBLOCK;	! mechanism array
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR;	! cleanup status flags
+
+
+! Do cleanup as indicated by the status flags. Close files and deassign
+! channels.
+!
+
+IF .BBLOCK [SIGNAL[CHF$L_SIG_NAME], STS$V_SEVERITY] EQL STS$K_SEVERE
+THEN
+    BEGIN
+
+    IF .CHANNEL2 NEQ 0
+    THEN
+	BEGIN
+	$QIOW (CHAN = .CHANNEL2, FUNC = IO$_DEACCESS);
+	$DASSGN (CHAN = .CHANNEL2);
+	CHANNEL2 = 0;
+	END;
+
+    IF .CHANNEL3 NEQ 0
+    THEN
+	BEGIN
+	$QIOW (CHAN = .CHANNEL3, FUNC = IO$_DEACCESS);
+	$DASSGN (CHAN = .CHANNEL3);
+	CHANNEL3 = 0;
+	END;
+
+    IF .CLEANUP_FLAGS[CLF_RELOCK]
+    THEN KERNEL_CALL (LOCK_INDEXF);
+    END;
+
+RETURN SS$_RESIGNAL;
+
+END;					! end of routine BIND_HANDLER
+
+END
+ELUDOM

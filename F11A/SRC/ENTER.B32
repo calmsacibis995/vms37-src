@@ -1,0 +1,245 @@
+MODULE ENTER (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 1
+!
+! ABSTRACT:
+!
+!	This routine enters the given file name in the specified directory.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  30-Mar-1977  15:05
+!
+! MODIFIED BY:
+!
+!	V02-002	ACG0238		Andrew C. Goldstein,	29-Dec-1981  19:37
+!		Invalidate RMS caches when a directory is superseded
+!
+!	V02-001	ACG0167		Andrew C. Goldstein,	7-May-1980  18:49
+!		Previous revision history moved to F11A.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+GLOBAL ROUTINE ENTER (ABD, FIB, RESULT_LENGTH, RESULT) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine enters the given file name in the specified directory.
+!
+! CALLING SEQUENCE:
+!	ENTER (ARG1, ARG2, ARG3, ARG4)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of buffer descriptor packet
+!	ARG2: address of FIB of operation
+!
+! IMPLICIT INPUTS:
+!	NONE
+!
+! OUTPUT PARAMETERS:
+!	ARG3: address of longword to receive length of result string
+!	ARG4: address of result string buffer
+!
+! IMPLICIT OUTPUTS:
+!	DIR_RECORD: record number of new directory entry
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	directory altered, result string and length written into buffer packet
+!
+!--
+
+BEGIN
+
+MAP
+	ABD		: REF BBLOCKVECTOR [,ABD$C_LENGTH],
+					! descriptor list arg
+	FIB		: REF BBLOCK,	! FIB argument
+	RESULT		: REF VECTOR [,BYTE]; ! result string arg
+
+LOCAL
+	NAMEBLOCK	: BBLOCK [NMB$C_LENGTH],
+					! RAD-50 name block
+	COUNT,				! count of name string
+	STRINGP,			! address of name string
+	RECADDR		: REF BBLOCK;	! pointer to found directory entry
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	HIGHEST_VERSION	: SIGNED WORD,	! highest version encountered
+	LOWEST_VERSION	: SIGNED WORD,	! lowest version number encountered
+	FIRST_FREE,			! record number of free slot in directory
+	DIR_RECORD,			! record number of entry created
+	SUPER_FID	: BBLOCK;	! file ID of superseded file
+
+EXTERNAL ROUTINE
+	PMS_START_SUB,			! start subfunction metering
+	PMS_END_SUB,			! end subfunction metering
+	DIR_ACCESS,			! access the directory
+	MAKE_NAMEBLOCK,			! construct name block
+	DIR_SCAN,			! search the directory
+	EXTEND_DIR,			! extend the directory
+	DIRGET,				! read a directory record
+	DIRPUT,				! write a directory record
+	UPDATE_DIRSEQ,			! update volume directory sequence
+	MAKE_STRING,			! convert directory entry to string
+	RETURN_DIR;			! return data to buffer packet
+
+
+! Start metering for this subfunction.
+!
+
+PMS_START_SUB (PMS_ENTER);
+
+! The file ID to be entered must be non-zero
+!
+
+IF .FIB[FIB$W_FID_NUM] EQL 0
+THEN ERR_EXIT (SS$_BADPARAM);
+
+! Find the name string in the buffer packet. Construct the RAD-50 name block
+! from it and the other data in the FIB. Mask out the wild card bits, since
+! they are ignored.
+!
+
+COUNT = .ABD[ABD$C_NAME, ABD$W_COUNT];
+STRINGP = .ABD[ABD$C_NAME, ABD$W_TEXT] + ABD[ABD$C_NAME, ABD$W_TEXT] + 1;
+
+MAKE_NAMEBLOCK (.COUNT, .STRINGP, NAMEBLOCK);
+IF .NAMEBLOCK[NMB$V_WILD]
+THEN ERR_EXIT (SS$_BADFILENAME);
+
+CH$MOVE (FIB$S_FID, FIB[FIB$W_FID], NAMEBLOCK[NMB$W_FID]);
+NAMEBLOCK[NMB$W_FLAGS] = .FIB[FIB$W_NMCTL] AND FIB$M_NEWVER;
+NAMEBLOCK[NMB$W_CONTEXT] = 0;
+
+! Access the directory.
+!
+
+DIR_ACCESS (.FIB, 1);
+
+! Now search the directory. If the search succeeds, we have a duplicate
+! entry. If superseding is enabled, save away the old file ID for
+! deletion later on. If the file being superseded is of the form
+! xxx.DIR;1, invalidate the RMS caches by updating the directory
+! sequence count.
+!
+
+RECADDR = DIR_SCAN (NAMEBLOCK, 1);
+IF .RECADDR NEQ 0			! if success, a duplicate exists
+THEN
+    BEGIN
+    IF NOT .FIB[FIB$V_SUPERSEDE]	! see if supersede mode
+    THEN ERR_EXIT (SS$_DUPFILENAME);
+
+    CH$MOVE (FIB$S_FID, RECADDR[NMB$W_FID], SUPER_FID);
+    CLEANUP_FLAGS[CLF_SUPERSEDE] = 1;
+    CLEANUP_FLAGS[CLF_REENTER] = 1;
+
+    IF  .RECADDR[NMB$W_TYPE] EQL %RAD50_11 'DIR'
+    AND .RECADDR[NMB$W_VERSION] EQL 1
+    THEN KERNEL_CALL (UPDATE_DIRSEQ);
+    END
+
+! Given that the search failed, compute the new version number. Then position
+! to the free slot found in the directory scan and insert the new entry.
+! If no empty record has been found, the directory must be extended.
+!
+
+ELSE
+    BEGIN
+    IF .NAMEBLOCK[NMB$W_VERSION] EQL 0
+    OR (.NAMEBLOCK[NMB$V_NEWVER] AND .NAMEBLOCK[NMB$W_VERSION] LEQ .HIGHEST_VERSION)
+    THEN NAMEBLOCK[NMB$W_VERSION] = .HIGHEST_VERSION + 1;
+
+    IF .FIRST_FREE EQL 0
+    THEN
+	BEGIN
+	RECADDR = EXTEND_DIR ();
+	END
+
+    ELSE
+	BEGIN
+	DIR_RECORD = .FIRST_FREE;
+	RECADDR = DIRGET (.FIRST_FREE, 0);
+	END;
+    END;
+
+! Set the higher and lower version flags according to what the directory
+! scan found.
+!
+
+IF .HIGHEST_VERSION GTR .NAMEBLOCK[NMB$W_VERSION]
+THEN FIB[FIB$V_HIGHVER] = 1;
+IF .LOWEST_VERSION LSS .NAMEBLOCK[NMB$W_VERSION]
+THEN FIB[FIB$V_LOWVER] = 1;
+
+! Check the new version number for legality. Copy the new directory entry
+! into the record and write it back.
+!
+
+IF .NAMEBLOCK[NMB$W_VERSION] GTRU 32767
+THEN ERR_EXIT (SS$_BADFILEVER);
+
+CH$MOVE (16, NAMEBLOCK, .RECADDR);
+DIRPUT (.RECADDR);
+CLEANUP_FLAGS[CLF_REMOVE] = 1;
+
+! Finally convert the name block into the resultant string.
+!
+
+.RESULT_LENGTH = MAKE_STRING (NAMEBLOCK, .RESULT);
+KERNEL_CALL (RETURN_DIR, ..RESULT_LENGTH, .RESULT, .ABD);
+
+! Stop metering of this subfunction
+!
+
+PMS_END_SUB ();
+
+END;					! end of routine ENTER
+
+END
+ELUDOM

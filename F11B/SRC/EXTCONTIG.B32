@@ -1,0 +1,310 @@
+MODULE EXTCONTIG (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This routine extends a file, keeping it contiguous by actually
+!	reallocating and copying the blocks.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  13-Jun-1979  17:39
+!
+! MODIFIED BY:
+!
+!	V02-004	STJ41739	Steven T. Jeffreys,   24-Nov-1981
+!		Explicitly set the allocation control bits when
+!		extending the quota file.  This will prevent the
+!		extend from suceededing when it should have failed.
+!
+!	V02-003	STJ33788	Steven T. Jeffreys,   27-Feb-1981
+!		Signal error if extend fails.
+!
+!	B0102	ACG0055		Andrew C. Goldstein,  25-Jul-1979  18:41
+!	Interface changes to TRUNCATE_HEADER
+!
+!	B0101	ACG0053		Andrew C. Goldstein,  19-Jul-1979  17:51
+!	Disk quota bug fixes
+!
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+
+FORWARD ROUTINE
+	EXTEND_CONTIG,			! extend a file contiguously
+	HANDLER;			! local condition handler
+
+GLOBAL ROUTINE EXTEND_CONTIG (FIB, FCB, SIZE) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine extends a file. If allocated but unused space is
+!	present, this means simply pushing back the EOF and materializing a
+!	block of zeroes. If the file is to be physically extended, it is
+!	copied to a new location on the disk to keep it contiguous.
+!
+! CALLING SEQUENCE:
+!	EXTEND_CONTIG (ARG1, ARG2, ARG3)
+!
+! INPUT PARAMETERS:
+!	ARG1: scratch FIB for operation
+!	ARG2: FCB on which file is open
+!	ARG3: size by which to extend the file (0 means exponentially)
+!
+! IMPLICIT INPUTS:
+!	CURRENT_RVN: RVN of current volume
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	PRIMARY_FCB: FCB of file
+!
+! ROUTINE VALUE:
+!	address of buffer containing next block to use
+!
+! SIDE EFFECTS:
+!	file extended, storage map altered, FCB & windows altered
+!
+!--
+
+BEGIN
+
+LINKAGE
+	L_MAKE_POINTER	= CALL :
+			  GLOBAL (MAP_POINTER = 9);
+
+MAP
+	FIB		: REF BBLOCK,	! address of FIB for this operation
+	FCB		: REF BBLOCK;	! address of FCB for file
+
+BUILTIN
+	FP;
+
+GLOBAL REGISTER
+	MAP_POINTER	= 9 : REF BBLOCK; ! pointer to current retrieval pointer
+
+LOCAL
+	HEADER		: REF BBLOCK,	! address of file file header
+	NEXT_VBN,			! next file VBN to use
+	NEW_SIZE,			! size to extend file to
+	NEW_LBN,			! starting LBN of new space
+	BUFFER,				! buffer address of current file block
+	NEXT_LBN;			! LBN of next block to use
+
+EXTERNAL
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	PRIMARY_FCB	: REF BBLOCK,	! FCB of file in process
+	CURRENT_RVN,			! RVN of this volume
+	UNREC_COUNT,			! count of unrecorded blocks
+	UNREC_LBN,			! starting LBN of unrecorded blocks
+	UNREC_RVN;			! RVN of above
+
+EXTERNAL ROUTINE
+	READ_HEADER,			! read file header
+	CHARGE_QUOTA,			! charge space to user's quota
+	ALLOC_BLOCKS,			! allocate blocks from storage map
+	RETURN_BLOCKS,			! return blocks to storage map
+	MAKE_POINTER	: L_MAKE_POINTER, ! build header map pointer
+	READ_BLOCK,			! read a disk block
+	RESET_LBN,			! assign new LBN to buffer
+	WRITE_BLOCK,			! write block to disk
+	CREATE_BLOCK,			! fabricate a block buffer
+	INVALIDATE,			! invalidate a buffer
+	TRUNCATE_HEADER,		! truncate file header
+	CHECKSUM,			! compute file header checksum
+	WRITE_HEADER,			! write file header
+	INIT_FCB2,			! update file control block
+	ZERO_WINDOWS;			! invalidate related file windows
+
+
+! Set up context and read the file header. Note that the file must be contiguous.
+!
+
+CH$MOVE (FIB$S_FID, FCB[FCB$W_FID], FIB[FIB$W_FID]);
+PRIMARY_FCB = .FCB;
+IF .FCB[FCB$L_STLBN] EQL 0
+THEN ERR_EXIT (SS$_FILESTRUCT);
+HEADER = READ_HEADER (0, .FCB);
+
+! The next VBN to use is the current file eof block number. If the block
+! is not present in the file, the file must be physically extended.
+!
+
+NEW_SIZE = 0;
+NEXT_VBN = .FCB[FCB$L_EFBLK] + 1;
+
+IF .NEXT_VBN GTRU .FCB[FCB$L_FILESIZE]
+THEN
+    BEGIN
+
+! Compute the number of blocks needed (50% of the current file size),
+! or as specified if non-zero, and allocate the new space contiguously.
+!
+
+    IF .SIZE NEQ 0
+    THEN NEW_SIZE = .SIZE + .FCB[FCB$L_FILESIZE]
+    ELSE NEW_SIZE = .FCB[FCB$L_FILESIZE] + MAXU (.FCB[FCB$L_FILESIZE]/2, 1);
+    CHARGE_QUOTA (.HEADER[FH2$L_FILEOWNER], .NEW_SIZE - .FCB[FCB$L_FILESIZE],
+		BITLIST (QUOTA_CHECK));
+
+    CLEANUP_FLAGS[CLF_FIXFCB] = 1;
+    FIB[FIB$W_EXCTL] = (FIB$M_ALCON OR FIB$M_FILCON);
+    IF NOT ALLOC_BLOCKS (.FIB, .NEW_SIZE, NEW_LBN, NEW_SIZE)
+    THEN
+	ERR_EXIT (SS$_DEVICEFULL);
+    UNREC_COUNT = .NEW_SIZE;
+    UNREC_LBN = .NEW_LBN;
+    UNREC_RVN = .CURRENT_RVN;
+
+! Now copy the file data from the old file to the newly allocated space.
+!
+
+    INCR VBN FROM 1 TO .FCB[FCB$L_FILESIZE] DO
+	BEGIN
+	BUFFER = READ_BLOCK (.VBN + .FCB[FCB$L_STLBN] - 1, 1, DATA_TYPE);
+	RESET_LBN (.BUFFER, .VBN + .NEW_LBN - 1);
+	WRITE_BLOCK (.BUFFER);
+	END;
+
+! Now deallocate the old file blocks. Then build retrieval pointers
+! for the new blocks in the file header. Do the truncation with a local
+! condition handler enabled for special error recovery.
+!
+
+    .FP = HANDLER;
+    TRUNCATE_HEADER (.FIB, .HEADER);
+    .FP = 0;
+
+    HEADER[FH2$B_MAP_INUSE] = 0;
+    CH$FILL (0, (.HEADER[FH2$B_ACOFFSET] - .HEADER[FH2$B_MPOFFSET])*2,
+	    .HEADER + .HEADER[FH2$B_MPOFFSET]*2);
+    MAP_POINTER = .HEADER + .HEADER[FH2$B_MPOFFSET]*2;
+    MAKE_POINTER (.NEW_SIZE, .NEW_LBN, .HEADER);
+    UNREC_COUNT = 0;
+    NEW_SIZE = .NEW_SIZE - .FCB[FCB$L_FILESIZE];
+    KERNEL_CALL (ZERO_WINDOWS, .FCB);
+    END;				! end of file extension
+
+! Now that we have enough space in the file, push the end of file
+! mark back one block and materialize the new block in memory. Also
+! update the FCB and flush any windows on it.
+!
+
+BBLOCK [HEADER[FH2$W_RECATTR], FAT$W_EFBLKL] = .NEXT_VBN + 1;
+BBLOCK [HEADER[FH2$W_RECATTR], FAT$W_FFBYTE] = 0;
+KERNEL_CALL (INIT_FCB2, .FCB, .HEADER);
+BBLOCK [HEADER[FH2$W_RECATTR], FAT$W_HIBLKL] = .FCB[FCB$L_FILESIZE];
+CHECKSUM (.HEADER);
+WRITE_HEADER ();
+IF .NEW_SIZE NEQ 0
+THEN CHARGE_QUOTA (.HEADER[FH2$L_FILEOWNER], .NEW_SIZE, BITLIST (QUOTA_CHARGE));
+
+NEXT_LBN = .FCB[FCB$L_STLBN] + .NEXT_VBN - 1;
+BUFFER = CREATE_BLOCK (.NEXT_LBN, 1, DATA_TYPE);
+
+RETURN .BUFFER;
+
+END;					! end of routine EXTEND_CONTIG
+
+ROUTINE HANDLER (SIGNAL, MECHANISM) =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine is the condition handler for file extension. It is
+!	enabled only during the truncate call (deallocating the old file
+!	blocks). Normal error handling would cause the entire file to
+!	be dropped on the floor. Since we already have a new good copy, we
+!	should forge ahead. Note that no error status is returned to the user,
+!	although we will log a system error.
+!
+!
+! CALLING SEQUENCE:
+!	HANDLER (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of signal array
+!	ARG2: address of mechanism array
+!
+! IMPLICIT INPUTS:
+!	FILE_HEADER: address of file file header
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	SS$_RESIGNAL or none if unwind
+!
+! SIDE EFFECTS:
+!	file header map area cleaned out
+!
+!--
+
+BEGIN
+
+MAP
+	SIGNAL		: REF BBLOCK,	! signal array arg
+	MECHANISM	: REF BBLOCK;	! mechanism array arg
+
+
+! Check the condition code for FCP error exit and check that it is not a
+! write error. Then initialize the header's map area and unwind. On other
+! signals we simply resignal.
+!
+
+IF .SIGNAL[CHF$L_SIG_NAME] EQL SS$_CMODUSER
+THEN $UNWIND (DEPADR = MECHANISM[CHF$L_MCH_DEPTH]);
+
+RETURN SS$_RESIGNAL;			! status is irrelevant if unwind
+
+END;					! end of routine handler
+
+END
+ELUDOM

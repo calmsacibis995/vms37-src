@@ -1,0 +1,410 @@
+MODULE EXTEND (
+		LANGUAGE (BLISS32),
+		IDENT = 'V03-000'
+		) =
+BEGIN
+
+!
+!****************************************************************************
+!*									    *
+!*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+!*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+!*  ALL RIGHTS RESERVED.						    *
+!* 									    *
+!*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+!*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+!*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+!*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+!*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+!*  TRANSFERRED.							    *
+!* 									    *
+!*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+!*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+!*  CORPORATION.							    *
+!* 									    *
+!*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+!*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+!* 									    *
+!*									    *
+!****************************************************************************
+
+!++
+!
+! FACILITY:  F11ACP Structure Level 2
+!
+! ABSTRACT:
+!
+!	This routine extends a file by the requested number of blocks.
+!
+! ENVIRONMENT:
+!
+!	STARLET operating system, including privileged system services
+!	and internal exec routines.
+!
+!--
+!
+!
+! AUTHOR:  Andrew C. Goldstein,	 CREATION DATE:  24-Feb-1977  15:42
+!
+! MODIFIED BY:
+!
+!	V02-002	LMP0005		L. Mark Pilant,		29-Dec-1981  14:50
+!		Added support for extending a file with Cathedral windows.
+!
+!	A0101	ACG26369	Andrew C. Goldstein,	28-Dec-1979  15:46
+!		Fix multi-header interlock bug
+!
+!	A0100	ACG00001	Andrew C. Goldstein,  10-Oct-1978  20:02
+!	Previous revision history moved to F11A.REV
+!**
+
+
+LIBRARY 'SYS$LIBRARY:LIB.L32';
+REQUIRE 'SRC$:FCPDEF.B32';
+
+FORWARD ROUTINE
+	EXTEND		: NOVALUE,	! extend a file
+	UPDATE_FILESIZE	: NOVALUE;	! update file size in FCB
+
+GLOBAL ROUTINE EXTEND (USER_FIB, FILEHEADER) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine extends the given file by the amount and in the
+!	mode given in the FIB. The blocks are allocated from the storage
+!	bitmap and retrieval pointers are constructed in the header.
+!
+! CALLING SEQUENCE:
+!	EXTEND (ARG1, ARG2)
+!
+! INPUT PARAMETERS:
+!	ARG1: address of FIB for operation
+!	ARG2: addres of file header
+!
+! IMPLICIT INPUTS:
+!	CURRENT_WINDOW: window of file, if open
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	blocks allocated, file header altered
+!
+!--
+
+BEGIN
+
+MAP
+	USER_FIB	: REF BBLOCK,	! FIB of operation
+	FILEHEADER	: REF BBLOCK;	! file header to extend
+
+LABEL
+	ALLOC_LOOP;			! Block allocation and recording loop
+LOCAL
+	FIB		: REF BBLOCK,	! address of FIB
+	HEADER		: REF BBLOCK,	! address of current file header
+	FCB		: REF BBLOCK,	! FCB of header being extended
+	NEW_HEADER	: REF BBLOCK,	! next extension file header
+	WINDOW_SEGMENT	: REF BBLOCK,	! address of the next window segment
+	BLOCKS_NEEDED,			! number of blocks to be allocated
+	MAP_AREA	: REF BBLOCK,	! address of header map area
+	MAP_POINTER	: REF BBLOCK,	! pointer to current retrieval pointer
+	CBT_COUNT,			! count of bitmap scans
+	EXTEND_VBN,			! starting VBN of extend
+	LBN,				! LBN of blocks allocated
+	ALLOC_COUNT,			! number of blocks allocated
+	COUNT,				! count of blocks for map pointers
+	OLD_LBN,			! LBN of previous retrieval pointer
+	OLD_COUNT;			! count of previous retrieval pointer
+
+EXTERNAL
+	USER_STATUS	: VECTOR,	! I/O status block of user
+	PRIMARY_FCB	: REF BBLOCK,	! FCB of file
+	UNREC_LBN,			! LBN of unrecorded blocks
+	UNREC_COUNT,			! count of unrecorded blocks
+	CLEANUP_FLAGS	: BITVECTOR,	! cleanup action flags
+	CURRENT_VCB	: REF BBLOCK,	! VCB of volume
+	CURRENT_WINDOW	: REF BBLOCK;	! window of file if open
+
+EXTERNAL ROUTINE
+	PMS_START_SUB,			! start subfunction metering
+	PMS_END_SUB,			! end subfunction metering
+	SEARCH_FCB,			! search FCB list for FCB
+	NEXT_HEADER,			! read next extension header
+	MARK_DIRTY,			! mark buffer for write-back
+	ALLOC_BLOCKS,			! allocate blocks from storage map
+	EXTEND_HEADER,			! create extension header
+	RETURN_BLOCKS,			! return blocks to storage map
+	CHECKSUM,			! compute file header checksum
+	TURN_WINDOW,			! update file window
+	INIT_FCB,			! initialize FCB
+	WRITE_HEADER,			! write file header
+	READ_HEADER,			! read file header
+	MARK_INCOMPLETE;		! flag all windows as incomplete
+
+
+! Start metering for this subfunction.
+!
+
+PMS_START_SUB (PMS_ALLOC);
+
+! Check the allocation control bits for validity. Then get the block count
+! and set up pointers.
+!
+
+FIB = .USER_FIB;
+IF (NOT .FIB[FIB$V_ALCON] AND .FIB[FIB$V_FILCON])
+OR .FIB[FIB$L_EXSZ] LSS 0
+THEN ERR_EXIT (SS$_BADPARAM);
+
+BLOCKS_NEEDED = (
+    IF .FIB[FIB$V_ALDEF]
+    THEN MAXU (.CURRENT_VCB[VCB$W_EXTEND], .FIB[FIB$L_EXSZ])
+    ELSE .FIB[FIB$L_EXSZ]
+    );
+
+HEADER = .FILEHEADER;
+FCB = .PRIMARY_FCB;
+EXTEND_VBN = 1;
+
+! If the file is marked contiguous best effort, make the extend so.
+!
+
+IF .HEADER[FH1$V_CONTIGB]
+THEN
+    IF NOT .FIB[FIB$V_ALCON] THEN FIB[FIB$V_ALCONB] = 1;
+
+! Scan through this header's map area and through the map area of all
+! extension headers to compute the current file size and find the end of file
+! to start extension.
+!
+
+WHILE 1 DO
+    BEGIN
+    MAP_AREA = .HEADER + .HEADER[FH1$B_MPOFFSET]*2;
+
+    IF .MAP_AREA[FM1$B_INUSE] NEQ 0 AND .FIB[FIB$V_FILCON]
+    THEN ERR_EXIT (SS$_BADPARAM);
+
+    MAP_POINTER = .MAP_AREA + FM1$C_POINTERS;
+
+    DECR MAPCOUNT FROM .MAP_AREA[FM1$B_INUSE]/2 TO 1 DO
+	BEGIN
+	EXTEND_VBN = .EXTEND_VBN + .MAP_POINTER[FM1$B_COUNT] + 1;
+	MAP_POINTER = .MAP_POINTER + 4;
+	END;
+
+    NEW_HEADER = NEXT_HEADER (.HEADER, .FCB);
+    IF .NEW_HEADER EQL 0 THEN EXITLOOP;
+    HEADER = .NEW_HEADER;
+
+    IF .FCB NEQ 0
+    THEN FCB = .FCB[FCB$L_EXFCB]
+    ELSE IF SEARCH_FCB (HEADER[FH1$W_FID]) NEQ 0
+    THEN ERR_EXIT (SS$_ACCONFLICT);
+    END;
+
+! Check the remaining parameters and set the relevant cleanup action flags.
+!
+
+IF .FIB[FIB$L_EXVBN] NEQ 0 AND .FIB[FIB$L_EXVBN] NEQ .EXTEND_VBN
+THEN ERR_EXIT (SS$_BADPARAM);
+
+MARK_DIRTY (.HEADER);
+CLEANUP_FLAGS[CLF_TRUNCATE] = 1;
+CLEANUP_FLAGS[CLF_FIXFCB] = 1;
+
+CBT_COUNT = 0;				! init count of bitmap scans
+FIB[FIB$L_EXSZ] = 0;
+FIB[FIB$L_EXVBN] = .EXTEND_VBN;
+
+! Now loop, allocating blocks fom the storage map and building retrieval
+! pointers in the header. Accumulate blocks allocated in the I/O
+! status block.
+!
+
+ALLOC_LOOP:
+BEGIN
+UNTIL .BLOCKS_NEEDED EQL 0 DO
+    BEGIN
+
+    ALLOC_BLOCKS (.FIB, .BLOCKS_NEEDED, LBN, ALLOC_COUNT);
+    COUNT = .ALLOC_COUNT;
+    FIB[FIB$L_EXSZ] = .FIB[FIB$L_EXSZ] + .COUNT;
+    BLOCKS_NEEDED = .BLOCKS_NEEDED - MINU (.BLOCKS_NEEDED, .COUNT);
+
+! Build the map pointers. If the new area allocated is contiguous with
+! the last pointer in the header, merge the pointers.
+!
+
+    IF .MAP_AREA[FM1$B_INUSE] NEQ 0
+    THEN
+	BEGIN
+	OLD_LBN = .MAP_POINTER[FM1$W_PREVLLBN];
+	OLD_LBN<16,8> = .MAP_POINTER[FM1$B_PREVHLBN];
+	OLD_COUNT = .MAP_POINTER[FM1$B_PREVCOUNT] + 1;
+
+	IF .OLD_LBN + .OLD_COUNT EQL .LBN
+	THEN
+	    BEGIN
+	    MAP_POINTER = .MAP_POINTER - 4;
+	    MAP_AREA[FM1$B_INUSE] = .MAP_AREA[FM1$B_INUSE] - 2;
+	    COUNT = .COUNT + .OLD_COUNT;
+	    LBN = .OLD_LBN;
+	    END;
+	END;
+
+! Now build retrieval pointers to map the allocated blocks. If the map fills
+! up, store the unrecorded blocks in common so they can be returned
+! by the extend cleanup, and create an extension header. If header
+! extension is inhibited, return the unrecorded blocks and get out quietly.
+! We return header full status only if no new blocks were recorded.
+!
+
+    UNTIL .COUNT EQL 0 DO
+	BEGIN
+	IF .MAP_AREA[FM1$B_INUSE] + 2 GTR .MAP_AREA[FM1$B_AVAIL]
+	THEN
+	    BEGIN
+	    IF .FIB[FIB$V_NOHDREXT]
+	    THEN
+		BEGIN
+		RETURN_BLOCKS (.LBN, .COUNT);
+		FIB[FIB$L_EXSZ] = .FIB[FIB$L_EXSZ] - .COUNT;
+		IF .FIB[FIB$L_EXSZ] EQL 0
+		THEN ERR_EXIT (SS$_HEADERFULL);
+		LEAVE ALLOC_LOOP;
+		END
+	    ELSE
+		BEGIN
+		UNREC_LBN = .LBN;
+		UNREC_COUNT = .COUNT;
+		HEADER = EXTEND_HEADER (.HEADER, .FCB);
+		IF .FCB NEQ 0 THEN FCB = .FCB[FCB$L_EXFCB];
+		MAP_AREA = .HEADER + .HEADER[FH1$B_MPOFFSET]*2;
+		MAP_POINTER = .MAP_AREA + FM1$C_POINTERS;
+		END;
+	    END;
+
+! Finally build the next retrieval pointer.
+!
+
+	MAP_AREA[FM1$B_INUSE] = .MAP_AREA[FM1$B_INUSE] + 2;
+
+	MAP_POINTER[FM1$B_HIGHLBN] = .LBN<16,8>;
+	MAP_POINTER[FM1$B_COUNT] = MIN (.COUNT, 256) - 1;
+	MAP_POINTER[FM1$W_LOWLBN] = .LBN<0,16>;
+	MAP_POINTER = .MAP_POINTER + 4;
+
+	LBN = .LBN + MIN (.COUNT, 256);
+	COUNT = .COUNT - MIN (.COUNT, 256);
+	END;
+
+    UNREC_COUNT = 0;			! all blocks are now recorded
+
+! If this was a contiguous allocation, we are done. Else count the pass
+! through the allocator. After 3 passes, shut off the contiguous best try
+! bit to avoid taking forever (since each CBT try is a full sweep of the map).
+!
+
+    IF .FIB[FIB$V_ALCON] THEN EXITLOOP;
+    CBT_COUNT = .CBT_COUNT + 1;
+    IF .CBT_COUNT GEQU 3
+    THEN FIB[FIB$V_ALCONB] = 0;
+    END;
+END;					! end of allocation loop
+
+! If the file is open by the caller, turn the window to the last VBN
+! that previously existed as a friendly gesture. Then, if the current header
+! is an extension header, write it and read back the primary header. Also
+! set the contiguous bit in the header appropriately and return the extend
+! data in the FIB. Update the file size in the primary FCB.
+!
+
+IF .CURRENT_WINDOW NEQ 0
+THEN
+    BEGIN
+    IF NOT .CURRENT_WINDOW[WCB$V_CATHEDRAL]
+    THEN KERNEL_CALL (TURN_WINDOW, .CURRENT_WINDOW, .HEADER, .FIB[FIB$L_EXVBN]-1, .FCB[FCB$L_STVBN])
+    ELSE KERNEL_CALL (MARK_INCOMPLETE, .PRIMARY_FCB);
+    END;
+
+IF .HEADER[FH1$W_FID_NUM] NEQ .FIB[FIB$W_FID_NUM]
+THEN
+    BEGIN
+    CHECKSUM (.HEADER);
+    WRITE_HEADER ();
+    IF .FCB NEQ 0 THEN KERNEL_CALL (INIT_FCB, .FCB, .HEADER);
+    HEADER = READ_HEADER (FIB[FIB$W_FID], .PRIMARY_FCB);
+    END;
+
+! Update the HIBLK field in the record attributes to reflect the new file
+! size.
+!
+
+MARK_DIRTY (.HEADER);
+BBLOCK [HEADER[FH1$W_RECATTR], FAT$L_HIBLK] = ROT (.FIB[FIB$L_EXVBN] + .FIB[FIB$L_EXSZ] - 1, 16);
+HEADER[FH1$V_CONTIG] = .FIB[FIB$V_FILCON];
+HEADER[FH1$V_CONTIGB] = .FIB[FIB$V_ALCONB];
+USER_STATUS[1] = .FIB[FIB$L_EXSZ];
+KERNEL_CALL (UPDATE_FILESIZE, .FIB[FIB$L_EXVBN] + .FIB[FIB$L_EXSZ] - 1);
+
+! Stop metering of this subfunction
+!
+
+PMS_END_SUB ();
+
+END;					! end of routine EXTEND
+
+GLOBAL ROUTINE UPDATE_FILESIZE (SIZE) : NOVALUE =
+
+!++
+!
+! FUNCTIONAL DESCRIPTION:
+!
+!	This routine updates the file size recorded in the primary FCB of
+!	the file extended.
+!
+! CALLING SEQUENCE:
+!	UPDATE_FILESIZE (ARG1)
+!
+! INPUT PARAMETERS:
+!	ARG1: amount to increase size to
+!
+! IMPLICIT INPUTS:
+!	PRIMARY_FCB: address of file FCB or zero
+!
+! OUTPUT PARAMETERS:
+!	NONE
+!
+! IMPLICIT OUTPUTS:
+!	NONE
+!
+! ROUTINE VALUE:
+!	NONE
+!
+! SIDE EFFECTS:
+!	FCB updated
+!
+!--
+
+BEGIN
+
+EXTERNAL
+	PRIMARY_FCB	: REF BBLOCK;	! FCB of file
+
+IF .PRIMARY_FCB NEQ 0
+THEN PRIMARY_FCB[FCB$L_FILESIZE] = .SIZE;
+
+END;					! end of routine UPDATE_FILESIZE
+
+END
+ELUDOM

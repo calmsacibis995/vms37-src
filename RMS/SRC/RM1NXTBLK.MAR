@@ -1,0 +1,559 @@
+	$BEGIN	RM1NXTBLK,023,$RMS1,<GET NEXT BLOCK FOR SEQUENTIAL FILE ORG>,-
+	<NOWRT,QUAD>
+
+;
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+;++
+; Facility: RMS32
+;
+; Abstract:
+;		this module performs get next block processing
+;		for the sequential file organization.
+;
+; Environment:
+;		star processor running starlet exec.
+;
+; Author: L F Laverdure,	 creation date: 3-FEB-1977
+;
+; Modified By:
+;
+;	V02-023	REFORMAT	Keith B. Thompson	29-Jul-1980
+;
+; Revision History:
+;
+;				L F Laverdure		13-JUN-1978  17:08
+;			add mbf rah/wbh logic
+;--
+;
+
+
+	.SBTTL	DECLARATIONS
+
+;
+; Include Files:
+;
+
+;
+; Macros:
+;
+
+	$IFBDEF
+	$DEVDEF
+	$IRBDEF
+	$BDBDEF
+	$RABDEF
+	$RMSDEF
+
+;
+; Equated Symbols:
+;
+
+	ROP	= RAB$L_ROP * 8		; bit offset to rop
+
+;
+; Own Storage:
+;
+
+
+
+;++
+; notes on the multi-block buffering scheme
+;
+; this routine causes multiple blocks to be read together
+; (as specified by mbc) but returned one at a time for
+; processing by the calling routines.
+;
+; assumptions:
+;
+;	1.  mbc is never > 0 except for disk(= # vbn's - 1)
+;	2.  records are always written at eof (only updates
+;	    may occur elsewhere in the file).
+;	3.  all sequential i/o calls go thru one of the
+;	    following routines:
+;		RM$NXTBLK1
+;		RM$WTLST1
+;		RM$RELBLK1
+;	4.  there is no write sharing for sequential files.
+;	5.  a direct release will be done only when there
+;	    is no i/o for the buffer.
+;
+; bdb field usage:
+;
+;	1.  BDB$L_VBN = vbn of first block in buffer
+;	2.  (IRB$L_RP_VBN = vbn of current block)
+;	3.  BDB$B_REL_VBN = current vbn rel to start vbn for buffer
+;	4.  BDB$B_VAL_VBNS = # of valid vbns in buffer
+;	5.  BDB$B_FLGS:
+;		-BDB$V_DRT:all blocks up to the greater of the current vbn
+;		 and the number of val_vbns are dirty
+;		-BDB$V_VAL:the current vbn is valid
+;
+;	6.  the relative vbn = requested vbn - start vbn
+;	7.  current block buffer addr = buff addr + (REL_VBN*512)
+;	8.  bdb$w_numb = # bytes in current block
+;		on reads = min(# blocks desired, (IRB$B_MBC+1)) * 512
+;		on writes = (max(VAL_VBN,REL_VBN+1))*512
+;	9.  requested vbn is in buffer if its REL_VBN < VAL_VBNS
+;	    (VAL_VBNS will be recalculated from REL_VBN if the val bit is on
+;	    for calls to RM$NXTBLK1 and RM$GETBLKNRP)
+;	10. if read required and REL_VBN < VAL_VBNS ok,
+;		else release buffer and reread
+;	11. on release (RM$RELBLK1) if BDB$V_VAL is off and the
+;	    BDB$V_DRT bit is set, merely decrement the
+;	    current vbn and set the valid bit.
+;--
+
+
+	.SBTTL	RM$NXTBLK1 - GET NEXT BLOCK SEQUENTIAL ROUTINE
+
+;++
+;
+;  RM$NXTBLK1	-
+;  RM$GETBLKNRP	-
+;  RM$GETBLK1	-
+;  RM$GETBLK1ALT-
+;  RM$MAPBLK1	-
+;  RM$MAPBLK1ALT-
+;  RM$MAPCURBLK1-
+;
+; this routine locates the next block of a sequential file,
+; reading it if necessary, and updating the appropriate fields
+; in the irab and BDB.
+;
+; Calling sequence:
+;
+; there are six entry points:
+;
+;	BSBW	RM$NXTBLK1		; return the next block
+;	BSBW	RM$GETBLKNRP		; return the block specified by nrp
+;	BSBW	RM$GETBLK1		; return the block specified by r1
+;	BSBW	RM$GETBLK1ALT		; read record for unit record device
+;					; (note: r2=size of buffer)
+;	BSBW	RM$MAPBLK1		; set start and end
+;					; address for current
+;					; block of BDB whose
+;					; address is in r4
+;	BSBW	RM$MAPCURBLK1		; same as RM$MAPBLK1 except maps
+;					; block pointed to by IRB$L_CURBDB
+;	BSBW	RM$MAPBLK1ALT		; same as RM$MAPBLK1 except doesn't
+;					; store bdb addr in IRB$L_CURBDB
+;
+; Input Parameters:
+;
+;	R11	impure area addr
+;	R10	ifab addr
+;	R9	irab addr
+;	R8	rab addr
+;	R4	BDB addr (entry at RM$MAPBLK1 only)
+;	R3	option to avoid read if bit 0 set (not input to RM$MAPBLK1)
+;		option to do short disk read if bit 1 set
+;	R2	# of blocks to read minus 1 (only if bit 1 set in r3)
+;	R1	vbn to read (entry at RM$GETBLK1 only)
+;
+; Implicit Inputs:
+;
+;	the various fields of the ifab, irab, and associated BDB.
+;
+; Output Parameters:
+;
+;	R7	addr of end of block buffer+1
+;	R4	addr of current bdb
+;	R1	addr of current block in buffer
+;	R0	status code (except for entry at any of the RM$MAPxxx entries)
+;	R2-R3	destroyed (except for entry at any of the RM$MAPxxx entries)
+;
+; Implicit Outputs:
+;
+;	various fields of the irab and associated BDB are updated.
+;
+; Completion Codes:
+;
+;	standard rms. upon error, IRAB$L_IOS & _IOS4 have
+;	error information.
+;	if RM$_EOF, then IRB$V_EOF set.
+;
+; Side Effects:
+;
+;	none
+;
+;--
+
+
+
+RM$NXTBLK1::
+	$TSTPT	NXTBLK1
+
+;
+; get new value for NRP
+;
+
+	INCL	IRB$L_NRP_VBN (R9)	; bump vbn
+	CLRW	IRB$W_NRP_OFF(R9)	; zero offset
+
+;
+;  entry to return block specified by nrp
+;
+
+RM$GETBLKNRP::
+	MOVL	IRB$L_CURBDB(R9),R4	; get BDB address
+	BEQL	READAHEAD		; branch if no current BDB
+
+;
+; is the requested block already in the buffer?
+;
+
+	SUBL3	BDB$L_VBN(R4),-		; compute rel vbn
+		IRB$L_NRP_VBN(R9),R1
+	CVTLB	R1,R1			; mbc is at most 127
+	BVS	RELEASE			; so branch if not in range
+
+;
+; if read requested, must be within the valid count
+; otherwise, it need merely be within mbc
+;
+
+	ASSUME	BDB$V_VAL EQ 0
+	BLBC	BDB$B_FLGS(R4),20$	; branch if buffer not valid
+
+;
+;  recompute # valid blocks = max(VAL_VBNS,REL_VBN+1)
+;
+
+2$:	ADDB3	#1,BDB$B_REL_VBN(R4),R0	; compute min. # valid vbns
+	CMPB	R0,BDB$B_VAL_VBNS(R4)	; need to adjust # valid vbns?
+	BLEQ	5$			; branch if not
+	MOVB	R0,BDB$B_VAL_VBNS(R4)	; set new value for # valid vbns
+5$:
+
+;
+;  check validity of desired block
+;
+
+	CMPB	R1,BDB$B_VAL_VBNS(R4)	; is the block valid?
+	BLSSU	10$			; yes - go use it
+	BGTRU	RELEASE			; no - go release current bdb
+	BLBC	R3,RELEASE		; branch if read required
+
+;
+;  block desired is the 'next' block and it's for output.
+;  merely add it to the current buffer if < or = mbc.
+;
+
+	CMPB	R1,IRB$B_MBC(R9)	; will block fit in the buffer?
+	BGTRU	RELEASE			; branch if not
+
+;
+;  check for auto extend required
+;
+
+	CMPL	IRB$L_NRP_VBN(R9),-	; is next block allocated?
+		IFB$L_HBK(R10)
+	BGTRU	RELEASE			; branch if not, writing buffer
+
+;
+; (note: will allocate space below)
+;
+
+	BICB	#1@BDB$V_VAL,-		; invalidate the buffer
+		BDB$B_FLGS(R4)
+
+;
+; (flags current blk as not yet valid)
+;
+
+10$:	MOVB	R1,BDB$B_REL_VBN(R4)	; set new current rel vbn
+	RMSSUC				; show success
+	BRW	RM$MAPBLK1ALT
+
+
+;
+;  buffer valid flag is off.
+;  if buffer is dirty decrement REL_VBN, set valid, & try for a hit.
+;
+
+20$:	BBC	#BDB$V_DRT,-		; branch if not dirty
+		BDB$B_FLGS(R4),-
+		RELEASE
+	DECB	BDB$B_REL_VBN(R4)	; adjust REL_VBN
+	BBCS	#BDB$V_VAL,-
+		BDB$B_FLGS(R4),2$	; set valid and branch
+
+;
+; required block not in this buffer
+; release current contents of buffer before reusing
+;
+
+RELEASE:
+	BSBW	RM$RELBLK1		; release the buffer
+	BLBS	R0,READAHEAD		; continue on success
+	RSB
+READAHEAD:
+	BBC	#IRB$V_RAHWBH,(R9),80$	; branch if rah not enabled
+	BLBS	R3,80$			; branch if not a real read
+	ASSUME	RAB$C_SEQ EQ 0
+	TSTB	RAB$B_RAC(R8)		; only do rah if rac=seq
+	BNEQ	80$			; branch if not seq
+	BBC	#RAB$V_RAH+ROP,(R8),80$	; branch if user does not want rah
+
+;
+; all is go for read ahead so fire up as many as needed or possible
+;
+
+	PUSHL	R4			; set last BDB for RAH limit
+20$:	MOVL	IRB$L_NXTBDB(R9),R4	; get BDB for next RAH
+25$:	BSBW	RM$SEQFLNKBDB
+	BBS	#BDB$V_IOP,-		; branch if io in progress
+		BDB$B_FLGS(R4),60$
+28$:	TSTL	(SP)			; first time call ?
+	BNEQ	30$			; branch if no
+	MOVL	IRB$L_NRP_VBN(R9),R1	; start rah at NRP_VBN
+	MOVL	IRB$L_NXTBDB(R9),(SP)	; set last BDB for RAH limit
+	MOVL	(SP),IRB$L_CURBDB(R9)	; set up CURBDB to pickup the
+
+;
+; BDB for which this RAH will
+; be issued (ie NXTBDB=CURBDB
+; rah is for flnk of NXTBDB and
+; rm$seqrd uses flnk of CURBDB)
+;
+
+	BRB	50$
+30$:	MOVL	IRB$L_NXTBDB(R9),R0	; get BDB addr for last RAH
+	MOVL	#1,R1			; assume 1 vbn xfer
+	BBC	#DEV$V_RND,-		; branch if not disk
+		IFB$L_PRIM_DEV(R10),40$
+	EXTZV	#9,#7,BDB$W_NUMB(R0),R1	; get # of vbn's in buffer
+
+;
+; (assumes 512 byte block size)
+;
+
+40$:	ADDL2	BDB$L_VBN(R0),R1	; r1 = start vbn for xfer
+50$:	MOVZBL	IRB$B_MBC(R9),R2	; calc xfer size (mbc = # of
+	INCW	R2			; blocks - 1 so increment)
+	MULW2	IFB$W_DEVBUFSIZ(R10),R2	; make bytes
+	CMPL	R1,IFB$L_EBK(R10)	; don't read past eof block
+	BGTRU	70$			; branch if start vbn past eof block
+	BSBW	RM$SEQRAH		; issue read ahead
+	BLBC	R0,70$			; branch if errors
+	MOVL	R4,IRB$L_NXTBDB(R9)	; update NXTBDB
+	CMPL	R4,(SP)			; reached limit ?
+	BNEQ	25$			; branch if no
+	BRB	70$			; otherwise exit rah loop
+
+60$:	TSTL	BDB$L_IOSB(R4)		; we bumped into a wbh
+	BEQL	70$			; branch if not done
+	BSBW	RM$STALLRAHWBH		; otherwise process bdb
+
+;
+; (note: does not stall)
+;
+
+	CSB	#BDB$V_IOP,-		; clear i/o in progress
+		BDB$B_FLGS(R4)
+	BLBS	R0,28$			; branch if all ok
+	ADDL2	#4,SP			; pop stack
+	RSB				; and exit with wbe error
+
+70$:	ADDL2	#4,SP			; pop limit off stack
+80$:	MOVL	IRB$L_NRP_VBN(R9),R1	; set block to read
+
+;
+; and fall into RM$GETBLK1
+;
+
+
+
+;
+; entry to read specified block   r1 = vbn
+;
+
+RM$GETBLK1::
+
+;
+; compute size for xfer
+;
+
+	BBC	#1,R3,5$		; branch unless flag indicates
+
+;
+; a short read for random i/o
+;
+
+	CMPB	R2,IRB$B_MBC(R9)	; r2 < mbc?
+	BLEQU	10$			; branch if yes
+5$:	MOVZBL	IRB$B_MBC(R9),R2	; mbc = # blocks -1
+10$:	INCW	R2			; get # of blocks
+	MULW2	IFB$W_DEVBUFSIZ(R10),R2	; and size in bytes
+
+;
+;  entry point for unit record device read ( and foreign unblocked mt)
+;
+
+RM$GETBLK1ALT::
+	PUSHL	R3			; save flags
+	BSBW	RM$SEQRD		; and go read the record
+	POPR	#^M<R3>
+	ASSUME	<BDB$B_REL_VBN+1> EQ BDB$B_VAL_VBNS
+	CLRW	BDB$B_REL_VBN(R4)	; reset relative vbn
+	BLBC	R0,ERRXFR		; go process error
+	BBC	#DEV$V_RND,-		; branch if not disk
+		IFB$L_PRIM_DEV(R10),-
+		RM$MAPBLK1
+	BLBS	R3,CHK_EXTEND		; branch if not reading
+SET_VBNS:
+
+;+!!!!!
+; note:  this code assumes that disk has a block size of 512 bytes
+;	number of valid blocks = # bytes xferred divided by 512
+;--
+
+	EXTZV	#9,#7,BDB$W_NUMB(R4),R1	; get # of vbns xferred
+	MOVB	R1,BDB$B_VAL_VBNS(R4)	; set # valid blocks
+
+;
+;-!!!!
+;
+
+SET_NUMB:
+	MOVW	IFB$W_DEVBUFSIZ(R10),-	; reset numb to blocksize
+		BDB$W_NUMB(R4)
+
+;
+; entry to set beginning and end of current buffer addresses
+; r4 = bdb address
+;
+
+RM$MAPBLK1::
+	MOVL	R4,IRB$L_CURBDB(R9)	; set current bdb
+
+;
+;  entry to set beginning and end of current buffer addresses but without
+;  setting irb$l_curbdb to the bdb address in r4
+;
+
+RM$MAPBLK1ALT::
+	MOVZBL	BDB$B_REL_VBN(R4),R1	; get current relative block
+	BBS	#DEV$V_SQD,-		; branch if magtape
+		IFB$L_PRIM_DEV(R10),-
+		MTABLS
+	MOVZWL	IFB$W_DEVBUFSIZ(R10),R7	; get length of block
+	MULW2	R7,R1			; convert to buffer offset
+SETR1:	ADDL2	BDB$L_ADDR(R4),R1	; get buffer addr for block
+	MOVL	R1,BDB$L_CURBUFADR(R4)	; save current buffer address
+	ADDL2	R1,R7			; set ending address
+EXIT:	RSB				; and return
+
+;
+;  set block size for magtape (it may have been a short block)
+;
+
+MTABLS:	MOVZWL	BDB$W_NUMB(R4),R7	; set block size from # bytes read
+	BRB	SETR1			; rejoin common code
+
+
+;
+;  entry to map block pointed to by irb$l_curbdb
+;
+
+RM$MAPCURBLK1::
+	MOVL	IRB$L_CURBDB(R9),R4	; get current bdb addr
+	BRB	RM$MAPBLK1ALT
+
+;
+;  this is a "no read" request (to get a buffer for a write operation).
+;  check for past high block and, if so, allocate the file space now, before
+;  the buffer is used.
+;
+
+CHK_EXTEND:
+	SUBL3	IFB$L_HBK(R10),-	; calc # of blks past HBK
+		BDB$L_VBN(R4),R2
+	BLEQU	SET_NUMB		; branch if not past HBK
+	PUSHL	R3			; save flags
+	BSBW	RM$AUTOEXTEND		; go do the extend
+	POPR	#^M<R3>			; restore flags
+	BLBS	R0,SET_NUMB		; branch on success
+
+;
+; fall thru to handle error
+;
+
+;
+;  RM$AUTOEXTEND or RM$SEQRD returned an error
+; check for eof error and if eof check for non-zero
+; xfer size, in which case return the partial buffer
+;
+
+ERRXFR:
+
+	$PSECT_BR	L$RMS1GET
+	CMPW	R0,#RMS$_EOF&^XFFFF	; is error eof?
+	BNEQ	10$			; branch if not
+	MOVW	IRB$W_IOS2(R9),-	; set xfer size in bdb
+		BDB$W_NUMB(R4)
+	BEQL	5$			; and branch if zero
+
+;
+; eof was seen but some data was transferred
+; compute the number of valid blocks
+;
+
+	BISB	#1@BDB$V_VAL,-		; say buffer valid
+		BDB$B_FLGS(R4)
+	INCB	BDB$B_VAL_VBNS(R4)	; say 1 block valid
+	RMSSUC				; indicate success
+	TSTB	IRB$B_MBC(R9)		; multi-block buffer?
+	BEQL	1$			; branch if not
+
+;
+; recompute # of valid blocks for disk (intergral # of blocks)
+;
+
+	BRW	SET_VBNS
+1$:	BRW	RM$MAPBLK1
+
+;
+; true eof
+;
+
+5$:	BITL	#DEV$M_TRM!DEV$M_MBX!DEV$M_FOR,-
+		IFB$L_PRIM_DEV(R10)
+	BNEQ	10$			; don't latch eof for terminal,
+
+;
+;  mailbox, or foreign devices
+;
+
+	SSB	#IRB$V_EOF,(R9)		; else set eof flag
+10$:	PUSHR	#^M<R0>
+	BSBW	RM$QUIET_SEQMBF		; flush all rah/wbh
+	BLBC	R0,20$			; branch if wbe errors
+	POPR	#^M<R0>
+	RSB
+20$:	POPR	#^M<R1>			; get rid of saved status
+	RSB				; and exit
+	$PSECT_RESTORE
+	.END

@@ -1,0 +1,1355 @@
+	.TITLE	NETCTLALL - Process ACP control Qio's
+	.IDENT	'V03-000'
+
+;****************************************************************************
+;*									    *
+;*  COPYRIGHT (c) 1978, 1980, 1982 BY					    *
+;*  DIGITAL EQUIPMENT CORPORATION, MAYNARD, MASSACHUSETTS.		    *
+;*  ALL RIGHTS RESERVED.						    *
+;* 									    *
+;*  THIS SOFTWARE IS FURNISHED UNDER A LICENSE AND MAY BE USED AND COPIED   *
+;*  ONLY IN  ACCORDANCE WITH  THE  TERMS  OF  SUCH  LICENSE  AND WITH THE   *
+;*  INCLUSION OF THE ABOVE COPYRIGHT NOTICE. THIS SOFTWARE OR  ANY  OTHER   *
+;*  COPIES THEREOF MAY NOT BE PROVIDED OR OTHERWISE MADE AVAILABLE TO ANY   *
+;*  OTHER PERSON.  NO TITLE TO AND OWNERSHIP OF  THE  SOFTWARE IS  HEREBY   *
+;*  TRANSFERRED.							    *
+;* 									    *
+;*  THE INFORMATION IN THIS SOFTWARE IS  SUBJECT TO CHANGE WITHOUT NOTICE   *
+;*  AND  SHOULD  NOT  BE  CONSTRUED AS  A COMMITMENT BY DIGITAL EQUIPMENT   *
+;*  CORPORATION.							    *
+;* 									    *
+;*  DIGITAL ASSUMES NO RESPONSIBILITY FOR THE USE  OR  RELIABILITY OF ITS   *
+;*  SOFTWARE ON EQUIPMENT WHICH IS NOT SUPPLIED BY DIGITAL.		    *
+;* 									    *
+;*									    *
+;****************************************************************************
+;
+; FACILITY:	NETWORK ACP
+;
+; ABSTRACT:	This module processes control QIO's to NETACP.
+;
+; ENVIRONMENT:	MODE = KERNEL
+;
+; AUTHOR:	A.ELDRIDGE, CREATION DATE: 8-JAN-80
+;
+;	V03-07	ADE0036		A.Eldridge		01-Mar-1981
+;		Add support for initializing with the PSIACP.  A channel
+;		is assigned to the NW device and a QIO is issued to
+;		obtain the PSIACP database mutex.  Another QIO is issued
+;		to declare NETACP's X25 sub-address range.
+;
+;	V03-06	ADE0035		A.Eldridge		01-Feb-1981
+;		Remove DIAGNOSE privilege requirements.  Don't require
+;		any privilege to enter a raw event.
+;
+;	V03-05	ADE0034		A.Eldridge		14-Dec-1981
+;		Added support for X.25 databases not maintained by
+;		directly by this ACP.  Basically, a synchronous $QIO
+;		is reissued to the X25 ACP.
+;
+;	V03-04	ADE0033		A.Eldridge		14-Dec-1981
+;		Return SS$_NOMBX on NFB$_DECLNAME and NFB$_DECLOBJ
+;		QIOs.
+;	V03-03	ADE0032		A.Eldridge		01-Aug-1981
+;		General cleanup.  
+;	V03-02  		A.Eldridge		20-Jul-1981
+;		Remove references to the DLI database
+;	V03-01			A.Eldridge		20-Apr-1981
+;		Converted to new $QIO format for database management
+;		$QIOs.
+;	V02-50			S.G.D.			14-Mar-1980
+;		Add declare name and declare object (and cleanup).
+
+	.SBTTL	DECLARATIONS
+;
+; INCLUDE FILES:
+;
+	$ABDDEF
+	$IRPDEF
+	$UCBDEF
+	$CRBDEF
+	$VECDEF
+	$PRVDEF
+
+	$DRDEF
+	$NETSYMDEF
+	$NETUPDDEF
+
+	$CNFDEF
+	$CNRDEF
+	$NFBDEF
+
+	$ICBDEF
+	$LPDDEF				; Logical path descriptor
+	$LTBDEF
+	$RCBDEF
+	$XWBDEF
+	$WQEDEF
+
+
+
+;
+; OWN STORAGE:
+;
+	.PSECT	NET_IMPURE,WRT,NOEXE,LONG
+
+DUMMY_P2_LNG  =  200
+DUMMY_P4_LNG  =	 200
+DUMMY_P4:				; Shared dummy P2/P4 buffer in case
+DUMMY_P2:	.BLKB	DUMMY_P4_LNG	; either was optional and not supplied
+DUMMY_P3:	.LONG	0		; Dummy P3 buffer in case none supplied
+
+SIZ_L_P4:	.LONG	0		; Local P4 buffer size field
+PTR_L_P4:	.LONG	0		; Local P4 buffer pointer
+
+PTR_CNFCNT:	.LONG	0		; Pointer to count of CNFs processed
+PTR_OLD_CNF:	.LONG	0		; Pointer to CNF being replaced
+
+LOCAL_L_FLAG:	.LONG	0		; For LOCAL "line" check
+P4_ABD_CNT:	.LONG	0		; Address of P4 ABD count field
+P2_ABD_CNT:	.LONG	0		; Address of P2 ABD count field
+P1_ABD_CNT:	.LONG	0		; Address of P1 ABD count field
+GET_W_STATUS:	.LONG	0		; Storage for CNF$GET_FIELD call status
+QUAD_BUF:	.QUAD	0		; A scratch buffer  
+CANCEL_L_PID:	.LONG	0		; For holding PID of canceller
+CANCEL_W_CHN:	.LONG	0		; For holding channel of canceller
+CTL_Q_DCLZNA:	.QUAD	0		; Desciptor of the following
+CTL_DCLZNA:	.BLKB	NET$C_MAXOBJNAM+4 ; For holding Declared Object number
+					; and name plus 3 bytes slop
+
+	.PSECT	NET_PURE,NOWRT,NOEXE,LONG
+
+X25_DB_MASK:	.LONG	0		; Mask identifying all databases 
+					; maintained exclusively by the X25 ACP
+					;
+
+ASSUME	PRV$V_DIAGNOSE LE 31		; Insure bits are in low order
+ASSUME	PRV$V_OPER     LE 31		; longword
+
+.MACRO	NFB_CHAR   FCT,WRTBCK,PRVLIST	; Define NFB fct characteristics
+	TMPMASK = 0			; Init writeback mask
+	.IRP	A,<WRTBCK>
+		TMPMASK = TMPMASK!<1@'A>
+	.ENDR
+	.=WRTBCKFCT+NFB$C_'FCT		; Find writeback cell
+	.BYTE	TMPMASK			; Enter writeback mask
+
+	TMPMASK = 0			; Note that only the low order
+	.IRP	A,<PRVLIST>		; longword of the priv mask is used
+		TMPMASK = TMPMASK!<1@<PRV$V_'A>>
+	.ENDR
+	.=PRV_Q_REQ+<8*NFB$C_'FCT>
+	.LONG	TMPMASK			; Setup privilege mask
+.ENDM
+
+PRV_Q_REQ:  .LONG   0[NFB$C_FC_MAX+1]	; Required privilege
+	    .LONG   0[NFB$C_FC_MAX+1]	; masks
+WRTBCKFCT:  .BYTE   0[NFB$C_FC_MAX+1]	; NFB functions requiring write-back
+
+
+	.ALIGN	LONG
+
+
+TMP=.
+
+;    NFB_CHAR	GETLINSTA,  <1>,	<>
+;    NFB_CHAR	SETLINSTA,  <>,		<OPER>
+;    NFB_CHAR	GETLINCTR,  <1,4>,	<DIAGNOSE>
+;    NFB_CHAR	CLRLINCTR,  <>,		<DIAGNOSE>
+;    NFB_CHAR	GETLOCNAM,  <1,4>,	<>
+;    NFB_CHAR	GETLOCSTA,  <1>,	<>
+;    NFB_CHAR	SETLOCSTA,  <>,		<OPER>
+;    NFB_CHAR	GETLOCCTR,  <1,4>,	<DIAGNOSE>
+;    NFB_CHAR	CLRLOCCTR,  <>,		<DIAGNOSE>
+;    NFB_CHAR	DISCLINK,   <>,		<OPER>
+;    NFB_CHAR	GETLOGLNK,  <1,4>	<>
+;    NFB_CHAR	GETNODNAM,  <1,4>,	<>
+;    NFB_CHAR	GETLINNAM,  <1,4>,	<>
+;    NFB_CHAR	GETNDBYLN,  <1,4>,	<>
+;    NFB_CHAR	GETLNBYND,  <1,4>,	<>
+;    NFB_CHAR	GETNAMNUM,  <1,4>,	<>
+;    NFB_CHAR	GETNUMNAM,  <1,4>,	<>
+;    NFB_CHAR	GETVER,     <1,4>,	<>
+;    NFB_CHAR	CHG_SRV,    <>,		<OPER>
+;    NFB_CHAR	SET,        <>,		<OPER>
+;    NFB_CHAR	CLEAR,      <>,		<OPER>
+;    NFB_CHAR	DELETE,     <>,		<OPER>
+;    NFB_CHAR	SHOW,       <4>,	<>
+;    NFB_CHAR	SHOW_ONE,   <4>,	<>
+;    NFB_CHAR	SHOW_ALL,   <4>,	<>
+;    NFB_CHAR	READ_CLR,   <4>,	<OPER,DIAGNOSE>
+
+    NFB_CHAR	LOGEVENT,   <>,		<>
+    NFB_CHAR	READEVENT,  <1,4>,	<OPER>
+
+    NFB_CHAR	DECLNAME,   <>,		<SYSNAM>
+    NFB_CHAR	DECLOBJ,    <>,		<SYSNAM>
+
+    NFB_CHAR	FC_SET,     <2>,	<OPER>
+    NFB_CHAR	FC_CLEAR,   <2>,	<OPER>
+    NFB_CHAR	FC_DELETE,  <2>,	<OPER>
+    NFB_CHAR	FC_SHOW,    <2,4>,	<>
+    NFB_CHAR	FC_ZERCOU,  <2,4>,	<OPER>
+
+.=TMP
+
+	.PSECT	NET_CODE,NOWRT,LONG,EXE
+	.SBTTL	DISPATCHING
+;++
+; FUNCTIONAL DESCRIPTION:
+;
+; NET$CONTROL_QIO - DETERMINE WHICH CONTROL FUNCTION HAS BEEN
+;		    REQUESTED AND DISPATCH TO IT.
+;
+; CALLING SEQUENCE:
+;
+;	BSB	NET$CONTROL_QIO
+;
+; INPUT PARAMETERS:
+;
+;	R3 - IRP address
+;	R5 - UCB address
+;
+;	ACP Control Block - generally has the following args:
+;
+;		P1 - (FIB) 1 byte of function code, 4 bytes of parameter
+;		P2 - Supplies key into data base (counted or uncounted)
+;		P3 - Returns result length
+;		P4 - Returns result buffer
+;
+;
+; COMPLETION CODES:
+;
+;	SS$_BADPARAM	Bad or conflicting parameter(s)
+;	SS$_DIRFULL	No room in connect name table
+;	SS$_INSFMEM	Couldn't allocate a control block
+;	SS$_NOMBX	No associated mbx for declared name or object
+;	SS$_NOPRIV	No privilege for requested operation 
+;	SS$_NORMAL	Successful completion
+;	SS$_NOSUCHNODE	Unknown node or line
+;	SS$_RESULTOVF	Supplied result buffer too short
+;	SS$_WRITLCK	Attempt to write a read-only parameter
+;	SS$_ILLCNTRFUNC	Unrecognized controller function
+;
+;	OTHER CODES FROM $ASSIGN, $QIO
+;
+;--
+NET$CONTROL_QIO::
+	;
+	;   Set up pointers to all strings in the funny ACP buffer.
+	;
+	MOVL	@IRP$L_SVAPTE(R3),R0	; Get the complex bfr address
+	MOVZBL	#ABD$C_RES,R2		; Get value of P4 type for loop
+	MOVAB	W^NET$GL_SIZ_P4,R11	; Get table address for loop
+
+10$:	ASSUME	ABD$W_TEXT EQ 0
+
+	EMUL	#ABD$C_LENGTH,R2,R0,R6	; Get address of offset
+	MOVZWL	(R6),-(SP)		; Get offset
+	MOVZWL	ABD$W_COUNT(R6),(R11)+	; Store the parameter lth
+	ADDL	(SP)+,R6		; Get address of text
+	MOVAL	1(R6),(R11)+		; Store pointer to text area 
+					; (biased for access mode)
+	SOBGTR	R2,10$			; Loop
+	;
+	;
+	;   Zero the 'window' descriptor in the ABD so that it is not written 
+	;   back when the IRP completes.  Also, save pointers to the P1, P2, 
+	;   and P4 descriptor count fields so that they may eventually be
+	;   zeroed since these buffers are conditionally written back.
+	;
+	CLRW	<ABD$C_LENGTH*ABD$C_WINDOW>+ ABD$W_COUNT(R0)
+	MOVAB	<ABD$C_LENGTH*ABD$C_FIB>   + ABD$W_COUNT(R0),W^P1_ABD_CNT
+	MOVAB	<ABD$C_LENGTH*ABD$C_NAME>  + ABD$W_COUNT(R0),W^P2_ABD_CNT
+	MOVAB	<ABD$C_LENGTH*ABD$C_RES>   + ABD$W_COUNT(R0),W^P4_ABD_CNT
+
+	;
+	;   Initialize miscellaneous info used by action routines
+	;
+	CLRQ	W^NET$GQ_USR_STAT	; Init user's IOSB image
+	CLRL	W^NET$GL_PM_OUT		; Init NFB output parameter
+	;
+	;
+	;   Verify that the P1 and P3 buffers meet the minimum size
+	;   requirements
+	;
+	MOVW	#SS$_ILLCNTRFUNC,R0	; Assume NFB too small
+	MOVL	#NFB$_ERR_P1,-		; Qualify the error
+		    W^NET$GQ_USR_STAT+4	;
+	MOVL	W^NET$GL_PTR_P1,R11	; Get address of NFB
+	CMPL	#5,W^NET$GL_SIZ_P1	; Check for legal NFB size
+	BGTRU	32$			; If GTRU too small
+	CLRL	W^NET$GL_PM_OUT		; Init output item count
+	TSTL	W^NET$GL_SIZ_P3		; Was there a P3 buffer?
+	BNEQ	20$			; If EQL no
+	MOVAB	W^DUMMY_P3,W^NET$GL_PTR_P3 ; Use dummy P3
+	MOVL	#2,W^NET$GL_SIZ_P3	; ...and setup its size
+20$:	MOVL	#NFB$_ERR_P3,-		; Assume P3 buffer is too small
+		    W^NET$GQ_USR_STAT+4
+	CMPL	#2,W^NET$GL_SIZ_P3	; Is P3 buffer big enough ?
+	BGTRU	32$			; If GTRU then no
+	CLRW	@W^NET$GL_PTR_P3	; Init P3 "buffer"
+	;
+	;
+	;   Dispatch to action routine. Mark the IPR for buffer writeback
+	;   if the action routine was successful or if R0 = SS$_RESULTOVF
+	;
+30$:	CALLS	#0,B^DISPATCH		; Disptach to process the request
+32$:	MOVW	R0,W^NET$GQ_USR_STAT	; Set I/O status
+	BNEQ	33$			; Was the status code zero?
+	MOVZWL	#SS$_ABORT,R0		; If so there's a bug, use catch-all
+	MOVW	R0,W^NET$GQ_USR_STAT	; Set I/O status
+33$:	BLBS	R0,35$			; If LBS successful
+	CMPW	R0,#SS$_RESULTOVF	; Result overflow ?
+	BNEQ	60$			; If not, branch
+35$:	MOVZBL	(R11)+,R2		; Get NFB fct
+	MOVZBL	W^WRTBCKFCT[R2],R2	; Get write-back buffer i.d.'s
+	BEQL	60$			; If EQL then none
+	BBS	#1,R2,40$		; If BS P1 buffer is to be written back
+	CLRW	@W^P1_ABD_CNT		; Prevent write-back of P1 buffer
+40$:	BBS	#2,R2,45$		; If BS P2 buffer is to be written back
+	CLRW	@W^P2_ABD_CNT		; Clear descriptor count field
+45$:	BBS	#4,R2,50$		; If BS P4 buffer is to be written back
+	CLRW	@W^P4_ABD_CNT		; Clear descriptor count field
+	CLRW	@W^NET$GL_PTR_P3	; Clear count of bytes returned via P4
+50$:	BISW	#IRP$M_FUNC,IRP$W_STS(R3) ; Mark IRP for writeback
+	MOVL	W^NET$GL_PM_OUT,(R11)	; Update NFB parameter
+60$:	RSB				; Return
+
+;
+; Dispatch to proper function processor
+;
+DISPATCH:	.WORD	^M<R3,R5,R11>	; ENTRY
+	MOVZBL	(R11)+,R2		; Get NFB function
+	MOVL	(R11),W^NET$GL_PM_IN	; Save NFB parameter
+	CMPB	R2,#NFB$C_FC_MAX	; Within range ?
+	BGTRU	ILLFCT			; Illegal NFB fct if GTRU
+
+	MOVQ	W^PRV_Q_REQ[R2],W^QUAD_BUF   ; Get user's privilege mask
+	BBC	#PRV$V_BYPASS,-		     ; If BC user doesn't have
+		    IRP$Q_NT_PRVMSK(R3),10$  ; "bypass" priv
+	BISW	#NET$M_BYPASS,W^NET$GL_FLAGS ; Remember privilege
+	;!
+	;!  #64 is illegal in the FFS instruction -- this logic must be updated
+	;!  to include both parts of the mask when privilege bits 32-63 are 
+	;!  defined.
+	;!
+10$:	FFS	#0,#32,W^QUAD_BUF,R0	; Get required privilege
+	BEQL	30$			; If EQL none left
+	BBCC	R0,W^QUAD_BUF,20$	; Clear the bit for loop
+20$:	BBS	R0,IRP$Q_NT_PRVMSK(R3),-
+		10$			; If BS user has privilege
+	BRB	NO_PRV			; Else report error
+30$:	CLRQ	R10			; Init CNF,CNR pointers
+	PUSHAB	B^40$			; Setup return address
+	$DISPATCH   R2,-		; Dispatch on NFB function
+	<-
+	    <NFB$C_LOGEVENT,  NET$LOG_EVENT>,-
+	    <NFB$C_READEVENT, NET$READ_EVENT>,-
+
+	    <NFB$C_DECLNAME,  DCL_NAME>,-
+	    <NFB$C_DECLOBJ,   DCL_OBJECT>,-
+
+	    <NFB$C_FC_SET,    CTL_DATABASE>,-
+	    <NFB$C_FC_CLEAR,  CTL_DATABASE>,-
+	    <NFB$C_FC_SHOW,   CTL_DATABASE>,-
+	    <NFB$C_FC_DELETE, CTL_DATABASE>,-
+	    <NFB$C_FC_ZERCOU, CTL_DATABASE>,-
+	>
+	BRB	ILLFCT			; IO$_ACPCONTROL function unkown
+40$:	RET
+
+NO_PRV:	MOVL	R0,W^NET$GQ_USR_STAT+4	; Qualify error
+	MOVZWL	S^#SS$_NOPRIV,R0	; Set status
+	RET				; Return to dispatcher
+
+ILLFCT:	MOVL	#NFB$_ERR_FCT,-		; Qualify error
+		    W^NET$GQ_USR_STAT+4 ;
+	MOVZWL	#SS$_ILLCNTRFUNC,R0	; Illegal ACP control function
+	RET				; Return to dispatcher
+
+	.SBTTL	Declare Name or Object
+
+			.ENABL	LSB
+DCL_OBJECT:				; "DECLARE OBJECT" action routine
+	ASSUME	NET$C_MAX_OBJ  LE  255
+	ASSUME  DUMMY_P2_LNG   GE    8  ; DUMMY_P2 buffer will hold object name
+
+	TSTL	W^NET$GL_SIZ_P2		; Was a P2 specified?
+	BNEQ	10$			; If NEQ yes - error
+	MOVZBL	W^NET$GL_PM_IN,R0	; Pick up number for name conversion
+	BEQL	10$			; Zero is illegal for DECLARED Objects
+	CMPL	R0,#NET$C_MAX_OBJ	; Is number within allowed range?
+	BGTRU	10$			; If GTRU then out of range
+	MOVB	R0,W^CTL_DCLZNA		; Save object number as ZNA string
+	MOVAB	W^DUMMY_P2,R3		; Get pointer to name buffer
+	MOVL	R3,W^NET$GL_PTR_P2	; Setup pointer to it
+	MNEGL	R3,W^NET$GL_SIZ_P2	; Bias the name's size
+	MOVL	#^A"OBJ_",(R3)+		; Start building object name
+	BSBW	NET$BIN2ASC		; Append converted object number
+	ADDL	R3,W^NET$GL_SIZ_P2	; Calculate name's size
+	CLRQ	R7			; Object name portion is null in ZNA
+					; string for numbered objects
+	BRB	DCL_COMMON		; Finish in common code
+
+DCL_NAME:				; "DECLARE NAME" action routine
+	MOVL	W^NET$GL_PTR_P2,R8	; Get string pointer
+	MOVL	W^NET$GL_SIZ_P2,R7	; And its size
+	CMPL	R7,#NET$C_MAXOBJNAM	; Can't be bigger than this
+	BLEQU	20$			; If GTRU the QIO error
+10$:	BRW	BADPARAM1		;!better error code needed?
+
+20$:	CLRB	W^CTL_DCLZNA		; Make obj number be 0
+
+DCL_COMMON:				; Common code for obj and names
+	;
+	;
+	;  INPUTS:	R7,R8	Descriptor of "name" portion of ZNA field
+	;
+	;	NET$GL_PTR_P2	Descriptor of actual object name
+	;	NET$GL_SIZ_P2
+	;
+	;
+	MOVC3	R7,(R8),W^CTL_DCLZNA+1	; Finish building the ZNA string
+	INCL	R7			; Account for the object number
+	MOVAB	W^CTL_DCLZNA,R8		; Point to it
+	MOVQ	R7,W^CTL_Q_DCLZNA	; Save object's ZNA descriptor
+	MOVL	W^NET$GL_SAVE_UCB,R1	; Get UCB address
+	MOVZWL	#SS$_NOMBX,R0		; Assume error
+	TSTL	UCB$L_AMB(R1)		; Is there an associated mailbox?
+	BGEQ	100$			; If GEQ then no
+	MOVL	W^NET$GL_CNR_OBI,R11	; Point the OBI root block
+	$SEARCH eql,obi,s,zna		; Locate matching object in database
+	BLBC	R0,40$			; If LBC no its not there
+	$GETFLD obi,l,ucb		; See if name has been declared
+	BLBS	R0,BADPARAM1		; If LBS yes - error
+	BRB	50$			; Continue
+40$:	;
+	;
+	;   The OBI doesn't exist in the database, create one
+	;
+	BSBB	CREATE_OBI		; Create OBI entry
+	BLBC	R0,100$			; Exit on error
+50$:	;
+	;   Mark OBI as "declared"
+	;
+	MOVL	W^NET$GL_SAVE_IRP,R6	; Get the IRP address
+	MOVL	IRP$L_UCB(R6),R8	; Get UCB address...
+	$PUTFLD	obi,l,ucb		; ...and store it in the OBI block
+	MOVL	IRP$L_PID(R6),R8	; Get the declarer's PID...
+	$PUTFLD	obi,l,pid		; ...and store it in the OBI block
+	MOVZWL	IRP$W_CHAN(R6),R8	; Get the declarer's channel...
+	$PUTFLD	obi,l,chn		; ...and store it in the OBI block
+	;
+	;
+	;   Send any pending connects to the declaring process
+	;
+	MOVQ	W^CTL_Q_DCLZNA,R7	; Get ZNA descriptor
+	BSBW	NET$SCAN_FOR_ZNA	; Send pending connects to object
+	MOVZWL	#SS$_NORMAL,R0		; Return success if we made it this far
+	BRB	100$			; Return with R0
+
+BADPARAM1:
+	MOVL	S^#SS$_BADPARAM,R0	; Bad parameter
+100$:	RSB				; Return
+
+			.DSABL	LSB
+
+
+CREATE_OBI:				; Create OBI and insert it into the list
+	;
+	;   This subroutine in required so that the  "utility buffer"  acquired 
+	;   by the NET$GETUTLBUF co-routine will be released in a timely manner.
+	;   
+	BSBW	NET$GETUTLBUF		; Get permission to use utility buffer
+	BSBW	CNF$INIT_UTL		; Init "utility buffer" as a CNF
+	MOVL	W^NET$GL_PTR_P2,R8	; Get object name string pointer
+	MOVL	W^NET$GL_SIZ_P2,R7	; And its size
+	$PUTFLD	obi,s,nam		; Store by object name
+	MOVZBL	W^CTL_DCLZNA,R8		; Setup the object number...
+	$PUTFLD	obi,l,num		; ...and store it in the CNF
+	CLRL	R6			; No "old" CNF
+	BSBW	CNF$INSERT		; Try to put block into list
+	BLBC	R0,10$			; If LBC then failure
+	$CLRFLD	obi,v,set		; Not created via a "set" QIO
+	MOVL	S^#SS$_NORMAL,R0	; Indicate success
+10$:	RSB				; Release utility buffer
+
+
+	.SBTTL	Cancel I/O
+;++
+;
+; NET$DRV_CANCEL - Process cancel function from driver
+; NET$ACP_CANCEL - Process cancel function from exec
+;
+; INPUTS:
+;	NET$GL_SAVE_IRP - IRP address (NET$ACP_CANCEL)
+;	R11 - pointer to PID and CHN (NET$DRV_CANCEL)
+;
+;--
+NET$DRV_CANCEL::
+	MOVL	(R11)+,W^CANCEL_L_PID	; Get the PID
+	MOVW	(R11),W^CANCEL_W_CHN	; Get the channel
+	BRB	CANCEL_COMMON		; Finish in common code
+
+NET$ACP_CANCEL::
+	MOVL	W^NET$GL_SAVE_IRP,R3	      ; Get the IRP
+	MOVL	IRP$L_PID(R3),W^CANCEL_L_PID  ; Get the PID
+	MOVW	IRP$W_CHAN(R3),W^CANCEL_W_CHN ; Get the channel
+
+CANCEL_COMMON:
+	;
+	;  Search known object list to see if cancelling process is a known
+	;  object  that should be removed.
+	;
+	MOVL	W^NET$GL_CNR_OBI,R11	; Get known object list root address
+	CLRL	R10			; No CNF yet
+10$:	MOVL	W^CANCEL_L_PID,R8	; Get the match value
+	$SEARCH	eql,obi,l,pid		; Set to match on PID
+	BLBC	R0,20$			; If LBC no match
+	$GETFLD	obi,l,chn		; Get the channel 
+	CMPW	W^CANCEL_W_CHN,R8	; Channels match?
+	BNEQ	10$			; If NEQ no - try next
+	$CLRFLD	obi,l,ucb		; Clear the UCB field
+	$CLRFLD obi,l,pid		; Clear the PID field
+	$CLRFLD	obi,l,chn		; Clear the CHN field
+	$GETFLD	obi,v,set		; Was the "set" QIO used to create OBI?
+	BLBS	R8,10$			; If LBS yes, leave it in the database
+	BSBW	CNF$DELETE		; Else attempt to mark it for delete
+	BRB	10$			; Loop
+20$:	BSBW	CNF$PURGE		; Drain queue of all CNFs marked for
+					; delete
+	;
+	;  If cancelling process has a line accessed then turn it off
+	;
+40$:	MOVL	W^CANCEL_L_PID,R1	; Setup PID 
+	BSBW	NET$CANCEL_DLE		; Inform direct-line access module
+	RSB				; Done
+
+
+;
+;  Above the QIO interface each database appears to consist of a number of
+;  entries, e.g., node FRED, node 33, object FAL, etc.   Each entry contains a 
+;  number of parameters, e.g., a node name, a node address, and object number,
+;  a line cost, etc.
+;
+;  Below the QIO interface each database consists of a number of CNF blocks,
+;  one CNF block per entry.  Each CNF block consists of a number of fields, one
+;  field per parameter.  Although many CNF "fields" are actually data cells
+;  found within the CNF block, some are actually indexes of action routines
+;  which calculate the field's value.  These action routine "fields" are read-
+;  only.  An example of such a field is the number of hops to a given node.
+;
+;  Each field has an "i.d." and a "value".  The field i.d. serves as an index
+;  into the semantic table portion of that database's CoNfiguration Root block
+;  (CNR).  The semantic table contains information for each field describing
+;  the field format (longword, string, etc), where in the CNF it may be found
+;  or which action routine to call to calculate its value, and miscellaneous
+;  information such as whether it is read-write, read-only, etc.
+;
+;  Two generic action routine fields defined for all CNFs for databases are
+;  the "NFB$C_COLLATE" and "NFB$_WILDCARD" fields.  The NFB$C_COLLATE field
+;  is the field used to sort the database.  The NFB$_WILDCARD field is a field
+;  which always matches any value it is compared against; this field is used to
+;  facilitate database searches where it is desireable to find the "next" CNF.
+;  
+;  There are actually two types of CNF blocks: The "actual" CNF blocks are CNFs
+;  which exist in the database even while not being referenced -- these blocks
+;  are created as a consequence of some IO$_ACPCONTROL QIO.  The "phantom" CNF
+;  blocks are CNFs which exist only while being referenced -- these blocks
+;  represent things known to the ACP but for which no database entry was ever
+;  defined.  As an example, a "phantom" CNF is created while the ACP is 
+;  obtaining information about a node which was made known to the ACP via a
+;  routing message but for which was never explicitly defined by the Network
+;  Management layer.
+;
+
+;
+;  QIOs To Access the NETACP DataBase
+;
+;  The following control QIOs provide access to the NETACP data base.  The
+;  factors which influenced the design of these QIOs were:
+;
+;
+;    o	To provide a common mechanism to access all parts of the database
+;	in order to simplify programming.
+;
+;    o	To allow the user to utilize a table driven approach.
+;
+;    o	To reduce the proliferation of a series of  ad hoc  QIOs which are
+;	difficult to re-implement if and when the NETACP is modified.
+;
+;
+;  The QIO parameters specific to these functions are:
+;
+;  FUNC	= #IO$_ACPCONTROL.
+;  IOSB	= Address of the optional IOSB.
+;	
+;	  Parameters P1 thru P5 each pass the address of a quadword 
+;	  buffer descriptor.  The buffers are used as follows:
+;
+;  P1	= Supplies the Network Qio Control block (NFB).
+;  P2	= Supplies the search key block.
+;  P3	= Number of bytes returned in the P4 buffer.
+;  P4	= Returns or supplies the specified parameter values.
+;
+;
+;  Errors returned in the IOSB:
+;
+;  SS$_NOPRIV	   User lacks the required privilege.  The second longword of
+;		   the IOSB contains the bit number of the first required
+;		   privilege which the user did not have.
+;
+;  SS$_ILLCNTRFUNC Illegal ACP control function.  The second longword of the
+;		   IOSB contains the reason as follows:
+;
+;  SS$_RESULTOVF   The P4 buffer is too small.
+;
+;  SS$_BADPARAM	   One of the field identifiers was unrecognized.  The value of
+;		   the identifier is returned in the second IOSB longword.
+;
+;  SS$_ENDOFFILE   No entries were found which matched a search key.  The field
+;		   i.d. of this search key is returned in the 2nd IOSB longword.
+;
+
+
+		.ENABL	LSB
+
+CTL_DATABASE:				; Common Control Qio Processing
+	MOVL	W^NET$GL_PTR_P1,R6	; Get base address of NFB
+	MOVL	W^NET$GL_PTR_P4,W^PTR_L_P4 ; Make copy of P4 descriptor 
+	MOVL	W^NET$GL_SIZ_P4,W^SIZ_L_P4
+	;
+	;
+	;   Verify that the NFB (P1) buffer is large enough and that all fields
+	;   have proper values.  This excludes the field i.d. list at the end
+	;   which is checked separately
+	;
+	;
+	MOVL	#NFB$_ERR_P1,R1		; Preset error qualifier
+	MOVL	W^NET$GL_SIZ_P1,R2	; Get size of P1 buffer
+	SUBL	#NFB$L_FLDID,R2		; Subtract all but the field i.d. list
+					; size
+	BLEQ	ILL_FUNC		; If LEQ then too small, report error
+	MOVL	#NFB$_ERR_CELL,R1	; Assume illegal cell size
+	CMPW	NFB$W_CELL_SIZE(R6),#1	; Cell size must either be GEQU 2, or
+					; EQL 0 (indicating no fixed cell size)
+	BEQL	ILL_FUNC		; If EQL then illegal cell size
+	MOVL	#NFB$_ERR_OPER,R1	; Assume illegal OPER value specified
+	CMPB	NFB$B_OPER(R6),-	; Is it out of range?
+		    #NFB$C_OP_MAXFCT	;
+	BGTRU	ILL_FUNC		; If GTRU then yes, report error
+	;
+	;
+	;   Find the CNR (semantic table) according for the database type.
+	;
+	;
+	MOVL	#NFB$_ERR_DB,R1		; Preset error qualifier
+	MOVZBL	NFB$B_DATABASE(R6),R11	; Get the database i.d.
+	BEQL	ILL_FUNC		; If EQL then no such database
+	CMPB	R11,#NFB$C_DB_MAX	; Within range?
+	BGTRU	ILL_FUNC		; If GTRU then out of range
+	BBC	R11,X25_DB_MASK,10$	; If BC then not exclusively an X.25
+					; database 
+	BRW	REISSUE_X25		; Re-issue QIO to X25 ACP
+10$:	MOVL	W^NET$AL_CNR_TAB[R11],R11 ; Get pointer to the root block (CNR)
+	;
+	;
+	;   Setup pointer to the count of CNF's successfully processed.  This
+	;   counter is found in the first longword of the P2 buffer.  Update
+	;   the internal P2 buffer descriptor.
+	;
+	;
+	MOVL	#NFB$_ERR_P2,R1		; Assume P2 is too small
+	MOVL	W^NET$GL_PTR_P2,-	; Save pointer to counter cell
+		    W^PTR_CNFCNT	;
+	SUBL	#4,W^NET$GL_SIZ_P2	; Account for bytes used
+	BLSS	ILL_FUNC		; If LSS then too small
+	ADDL	#4,W^NET$GL_PTR_P2	; Advance P4 pointer
+	CLRL	@W^PTR_CNFCNT		; Zero the P4 count field
+	;
+	;
+	;   Verify that all field i.d.s in the NFB are known.
+	;
+	;
+	MOVAB	NFB$L_FLDID(R6),R5	; Get address of first field i.d.
+20$:	MOVL	#NFB$_ERR_P1,R1		; Assume P1 is too small
+	SUBL	#4,R2			; Account for next field
+	BLSS	ILL_FUNC		; If LSS then P1 is too small
+	MOVL	(R5)+,R9		; Get next field
+	ASSUME	NFB$C_ENDOFLIST EQ 0	; Field terminator value
+	BEQL	30$			; If EQL then at end of list
+	BSBW	CNF$VERIFY		; Make sure the field i.d. is valid
+	BLBS	R0,20$			; If LBS then i.d. is valid
+	;
+	;
+	;    Some common error return paths
+	;
+	;
+BAD_PARAM:				; Report "bad parameter"
+	MOVZWL	#SS$_BADPARAM,R0	; Setup status code
+	BRW	200$			; Exit
+ILL_FUNC:				; Report "illegal control function"
+	MOVZWL	#SS$_ILLCNTRFUNC,R0	; Setup status code
+	MOVL	R1,R9			; Copy error qualifier
+	BRW	200$			; Exit
+30$:	;
+	;
+	;   Setup SEARCH KEY descriptor
+	;
+	;
+	MOVL	#NFB$_ERR_SRCH,R1	; Assume illegal SEARCH KEY i.d.
+	MOVL	NFB$L_SRCH_KEY(R6),R9	; Get search key i.d.
+	BSBW	GET_P2_KEY		; Get key/descriptor
+	BLBC	R0,ILL_FUNC		; If LBC error
+	MOVL	R9,W^NET$GL_SRCH_ID	; Save i.d. -- it may have been modified
+	MOVQ	R7,W^NET$GQ_SRCH_KEY	; Copy the key/descriptor
+	SUBL	R2,W^NET$GL_SIZ_P2	; Account for bytes used in P2 buffer
+	ADDL	R2,W^NET$GL_PTR_P2	; Advance past bytes used
+	;
+	;
+	;   Find the entry in the list at which to begin the search.  If the
+	;   key value in the P2 buffer is null (no space left, string count=0,
+	;   32 bit -1 value, or field i.d. is NFB$C_WILDCARD) then set the CNF
+	;   pointer to the head of the list.
+	;
+	;   If the START KEY is  NFB$C_COLLATE then the P2 buffer may be
+	;   automatically updated with a new START KEY value.  Since there can
+	;   be no errors accessing the NFB$C_COLLATE field of any entry, the
+	;   only error which can occur would be caused by lack of space in the
+	;   P2 buffer.  By checking now that this is at least NFB$C_P2STRTLNG
+	;   bytes then no errors can occur later.
+	;
+	;
+	MOVL	R11,R10			; Start standard CNF pointer at the 
+					; begining of the database list
+	MOVL	#NFB$_ERR_STRT,R1	; Assume illegal START KEY i.d.
+	MOVL	NFB$L_STRT_KEY(R6),R9	; Get START KEY i.d.
+	CMPL	R9,#NFB$C_COLLATE 	; Is it the generic collating field ?
+	BNEQ	45$			; If NEQ no, the P2 buffer will not be
+					; automatically updated.
+	MOVL	#NFB$_ERR_P2,R1		; Assume P2 is too small
+	CMPL	#NFB$C_P2STRTLNG,-	; Enough room in the P2 buffer for
+		    W^NET$GL_SIZ_P2	; automatic START KEY value update?
+	BGTRU	ILL_FUNC		; If GTRU then no
+45$:	BSBW	GET_P2_KEY		; Get the key/descriptor
+	BLBC	R0,ILL_FUNC		; If LBC error
+	MOVL	R9,W^NET$GL_STRT_ID	; Save i.d. -- it may have been modified
+	MOVQ	R7,W^NET$GQ_STRT_KEY	; Copy the key/descriptor
+	BSBW	CNF$PRE_QIO		; Preprocess database, SEARCH and START
+					; keys before processing the QIO request
+	BLBC	R0,200$			; If LBC then error
+	TSTL	R2			; Is key value "null"
+	BEQL	50$			; If EQL yes, start at head of list.
+	MOVL	W^NET$GL_STRT_ID,R9	; Get the START KEY i.d.
+	MOVQ	W^NET$GQ_STRT_KEY,R7	; Get the START KEY value/descriptor
+	MOVZWL	#SS$_ENDOFFILE,R0	; Assume START CNF can't be found
+	MOVL	S^#NFB$C_OP_FNDPOS,R1	; Find last CNF whose key value is GEQU
+	BSBW	CNF$KEY_SRCH_EX		; the key passed in R7/R8
+	MOVL	#NFB$_ERR_STRT,R9	; Assume starting entry is not found
+	BLBC	R0,200$			; If LBC then not found
+	;
+	;
+	;   Process the selected database entries (CNFs)
+	;
+50$:	BSBW	PROCESS_CNF		; Process next CNF
+	BLBC	R0,60$			; If LBC then error
+	BBS	#NFB$V_KNO,-		; If BS then process next CNF
+		    NFB$B_FLAGS(R6),50$
+60$:	;
+	;
+	;   If an error has been detected then map it.
+	;
+	TSTL	@W^PTR_CNFCNT		; Any CNFs successfully processed?
+	BEQL	200$			; If EQL then no mapping needed
+	CMPW	R0,#SS$_ENDOFFILE	; Did the search fail ?
+	BNEQ	110$			; If NEQ no
+	MOVL	S^#SS$_NORMAL,R0	; Else report success since there were
+					; no more entries to process
+	BRB	200$			; Continue
+110$:	CMPW	R0,#SS$_RESULTOVF	; Result overflow
+	BNEQ	200$			; If NEQ then no mapping needed
+	MOVZWL	#SS$_BUFFEROVF,R0	; Else convert to a warning since some
+					; entries have been successfully 
+					; displayed in the P4 buffer
+200$:	;
+	;
+	;   Update the IOSB image
+	;
+	;
+	MOVW	R0,W^NET$GQ_USR_STAT	; Set status code in IOSB
+	MOVL	R9,W^NET$GQ_USR_STAT+4	; Error qualifier if LBC in R0
+	SUBL3	W^NET$GL_PTR_P4,-	; Get number of bytes moved to P4
+		    W^PTR_L_P4,R2	; buffer
+	MOVW	R2,@W^NET$GL_PTR_P3	; Update count in P3 buffer
+	MOVW	R2, W^NET$GQ_USR_STAT+2	; Update count in IOSB image
+	BBC	#NET$V_PURGE,-		; If BC then no need to purge database
+		    W^NET$GL_FLAGS,210$	;
+	BSBW	CNF$PURGE		; Drain the queue of all CNFs marked 
+					; for delete.
+210$:	RSB				; Done
+
+		.DSABL	LSB
+
+;
+;  INPUTS:	R9	Field i.d. of the key
+;		R8,R7	Scratch
+;		R2	Scratch
+;		R0	Scratch
+;
+;  OUTPUTS:	R8,R7	Key value/descriptor
+;		R2	Number of bytes in field.  If the field value is "null"
+;			(negative longword value or string with a zero count
+;			field or field i.d. of NFB$C_COLLATE) then R2 is 
+;			returned as a zero.
+;		R0	Status
+;
+GET_P2_KEY:				; Locate next key in the P2 buffer
+	MOVL	S^#SS$_NORMAL,R0	; Assume success
+	CMPL	R9,#NFB$C_WILDCARD	; "wild card" key ?
+	BNEQ	5$			; If NEQ no
+	
+	ASSUME	NFB$V_INX  EQ   0
+	ASSUME	NFB$V_TYP  EQ  16
+	ASSUME	NFB$V_DB   EQ  24
+	
+	MOVB	CNR$B_TYPE(R11),-(SP)	; Push database type
+	MOVB	#0,-(SP)		; Push type code for "bit"
+	MOVW	#0,-(SP)		; Push field index of bit field known 
+					; to exist
+	POPL	R9			; Use this as the key i.d.
+	MOVL	#1,R8			; Its value is always = 1
+	BRB	35$			; Return success
+
+5$:	CMPL	R9,#NFB$C_COLLATE	; Generic collating field i.d. ?
+	BNEQ	7$			; If NEQ no
+	MOVL	CNR$L_FLD_COLL(R11),R9	; Map to specific collating field i.d.
+7$:	BSBW	CNF$VERIFY		; Is field i.d. valid ?
+	BLBC	R0,70$			; If LBC then no
+	CMPZV	#NFB$V_TYP,-
+		#NFB$S_TYP,R9,-
+		#NFB$C_TYP_STR		; Is field a string ?
+	BEQL	10$			; If EQL yes
+	;
+	;   The field is type "bit" or "longword".  In either case the key
+	;   value is stored as a longword in the P2 buffer
+	;
+	MOVL	#4,R2			; Setup field size
+	CMPL	R2,W^NET$GL_SIZ_P2	; Can it fit?
+	BGTRU	60$			; If GTRU then no
+	MOVL	@W^NET$GL_PTR_P2,R8	; Get field value
+	BLSS	30$			; If LSS then field value is "null"
+	BRB	70$			; Continue in common
+10$:	;
+	;   The field is type "string".  It is stored in the P2 buffer as a
+	;   word of count followed by the string.
+	;
+	CMPL	#2,W^NET$GL_SIZ_P2	; P2 buffer big enough for  count field
+	BGTRU	60$			; If GTRU then no
+	MOVL	W^NET$GL_PTR_P2,R8	; Get pointer to the count field
+	CVTWL	(R8)+,R7		; Get count field value
+	BGTRU	40$			; If GTRU then not "null" 
+30$:	CLRQ	R7			; Zero value/descriptor
+35$:	CLRL	R2			; Indicate "null" field value
+	BRB	70$			; Take common exit
+40$:	ADDL3	#2,R7,R2		; Get total field size
+	CMPL	R2,W^NET$GL_SIZ_P2	; Is the P2 buffer big enough ?
+	BLEQU	70$			; If LEQU then yes
+60$:	MOVL	#NFB$_ERR_P2,R1		; Indicate P2 is too small
+	CLRL	R0			; Indicate error
+70$:	RSB				; Return status in R0
+
+;
+;  Process each (or the first) CNF block found which matches the search key
+;
+;
+;   Creating a new CNF
+;   -----------------
+;
+;    o	The SET Qio is used to both create new and modify existing entries.
+;    o	The Qio issuer is not always aware if the entry already exists
+;    o	If the CNF addressed in a SET Qio is not found then a new CNF will be 
+;	created only if the SEARCH_KEY is not "NQC$C_WILDCARD".  The SEARCH_KEY
+;	value is inserted into the CNF immediately after it is created.  If
+;	this field is not write-able then the returned Qio status code should
+;	convey the meaning "no such entry" (i.e., SS$_ENDOFFILE).
+;
+;	Note that the created CNF may not meet the requirements which allow it
+;	to be inserted into the database.  
+;
+;    o	The decision whether or not create a new CNF entry is independent of
+;	the START_KEY value or i.d.
+;
+PROCESS_CNF:				; Process the next database entry
+	;
+	;   Find the next CNF and process it
+	;
+	MOVQ	W^NET$GQ_SRCH_KEY,R7	; Get the search key/descritor
+	MOVL	W^NET$GL_SRCH_ID,R9	; And its i.d.
+	MOVZWL	#SS$_ENDOFFILE,R0	; Preset error code
+	MOVZBL	NFB$B_OPER(R6),R1	; Get the search operator (e.g., GEQU)
+10$:	BSBW	CNF$KEY_SRCH_EX		; Find the block
+	MOVL	R10,W^PTR_OLD_CNF	; Store its address
+	BNEQ	70$			; If NEQ then found
+	;
+	;   Initialize a new CNF entry if its called for
+	;
+	CMPB	NFB$B_FCT(R6),-		; Is this a "SET" Qio?
+		    #NFB$C_FC_SET	;
+	BNEQ	40$			; If NEQ then don't attempt creation
+	CMPL	#NFB$C_WILDCARD, -	; Did user have particular CNF in mind?
+		   NFB$L_SRCH_KEY(R6)	;
+	BEQL	40$			; If EQL no, don't attempt creation
+	BSBW	NET$GETUTLBUF		; Claim the utility buffer
+	BSBW	CNF$INIT_UTL		; Init the "utility buffer" as a CNF
+	MOVZWL	#SS$_WRITLCK,R0		; Assume PUT_FIELD error
+	BSBW	CNF$PUT_FIELD		; Attempt to store SEARCH KEY
+	BLBS	R0,70$			; If LBC then return error to user.
+40$:	BRW	200$			; Take common exit
+	;
+	;
+	;   Call action routine to process CNF fields.
+	;
+	;
+70$:	BBC	#NFB$V_UPD,-		; If BC then update P2 START KEY only
+		    NFB$B_FLAGS(R6),75$	; after operation is successful
+	BSBW	UPDATE_STRT		; Else do it now because the CNF may
+					; not exist after a SET/CLEAR if it
+					; is new and fails to be inserted.
+75$:	PUSHAB	B^80$			; Setup return address
+	$DISPATCH  NFB$B_FCT(R6),TYPE=B,- ; Dispatch on Funtion code
+	<-
+	    <NFB$C_FC_SET,	ACTION_SET>,	-;
+	    <NFB$C_FC_SHOW,	ACTION_SHOW>,	-;
+	    <NFB$C_FC_CLEAR,	ACTION_CLEAR>,	-;
+	    <NFB$C_FC_DELETE,	ACTION_DELETE>,	-;
+	    <NFB$C_FC_ZERCOU,	ACTION_ZERCOU>, -;
+	>
+	BUG_CHECK NETNOSTATE,FATAL
+80$:	;
+	;
+	;   If the START_KEY i.d. is "NFB$C_COLLATE" then update the P2 
+	;   START_KEY value with this CNF's collate value.
+	;
+	;
+	MOVL	W^NET$GL_PTR_P1,R6	; Recover pointer to the NFB
+	BLBC	R0,100$			; If error then don't update P2
+	BBS	#NFB$V_UPD,-		; If BS then update option was done
+		    NFB$B_FLAGS(R6),90$	; already
+	BSBB	UPDATE_STRT		; Else do it
+90$:	;
+	;
+	;   Update the CNF count and the P3 count of P4 buffer bytes used
+	;
+	;
+	INCL	@W^PTR_CNFCNT		; Update number of complete CNF blocks 
+					; processed
+100$:	SUBW3	W^NET$GL_PTR_P4,-	; Update count of bytes used in the P4
+		W^PTR_L_P4,-		; buffer
+		@W^NET$GL_PTR_P3
+200$:	RSB
+
+
+UPDATE_STRT:				; Optionally update the START KEY
+	BBS	#NFB$V_NOUPD,-		; If BS then don't update
+		    NFB$B_FLAGS(R6),10$	;
+	CMPL	#NFB$C_COLLATE,-	;
+		    NFB$L_STRT_KEY(R6)	; Special processing required ?
+	BNEQ	10$			; If NEQ no, don't update P2 buffer
+	PUSHR	#^M<R0,R5>		; Save regs
+	MOVL	CNR$L_FLD_COLL(R11),R9	; Get field i.d. for this database
+	BSBW	CNF$GET_FIELD		; Get field's value
+	MOVL	W^NET$GL_PTR_P2,R1	; Point to P2 START KEY field
+	MOVW	R7,(R1)+		; Enter count of bytes in string
+	MOVC5	R7,(R8),#0,-		; Enter string text
+		   #NFB$C_P2STRTLNG,(R1);
+	POPR	#^M<R0,R5>		; Restore regs
+10$:	RSB
+
+
+		.ENABL	LSB
+
+ACTION_SET:				; ACP Control 'set' QIO action routine
+	BISW	#NET$M_SETQIO,-		; Set flag to indicate QIO type
+			W^NET$GL_FLAGS	;
+	BRB	50$			; Continue in common
+
+ACTION_CLEAR:				; ACP 'clear' QIO action routine
+	BBC	#CNF$V_FLG_ACP,-	; If BS then block is a "phantom"
+		 CNF$B_FLG(R10),50$	;
+	;
+	;
+	;   The "phantom" CNF is being used to represent a specific database
+	;   entry.  Go thru the motions of clearing the specified parameters in
+	;   order detect errors (such as clearing a read-only parameter) so 
+	;   that this entry has the same behavior as the CNFs that exist in the
+	;   database as "actual" CNF blocks.
+	;
+	;   
+	BSBW	SETCLEAR		; Clear specified parameters
+	BRB	100$			; Delete the "new" CNF
+	;
+	;
+	;   Attempt to SET/CLEAR the new CNF values.  If successful then 
+	;   attempt to replace the old CNF entry with the new one.
+	;
+	;
+50$:	BSBB	SETCLEAR		; SET/CLEAR the new values
+	BLBC	R0,100$			; If LBC then error
+	MOVL	W^PTR_OLD_CNF,R6	; Get pointer to original CNF
+	BSBW	CNF$INSERT		; R6 -> old,  R10 -> util on input
+					; R10 -> whatever one makes it, R6
+					; and original R10 are lost
+					; Attempt to insert new CNF entry
+100$:	RSB				; Else return error
+		
+		.DSABL	LSB
+
+
+SETCLEAR:				; Common SET/CLEAR processing
+	;
+	;   R11 = CNR pointer
+	;   R10 = CNF pointer
+	;   R6  = NFB pointer
+	;
+
+10$:	;
+	;
+	;   See if the CNF is "locked", that is, if its conditionally 
+	;   writeable fields are locked and cannot be written.
+	;
+	;
+	MOVL	CNR$L_FLD_LOCK(R11),R9	; Get i.d. of "lock" field
+	BICW	#NET$M_CNFLCK,-		; Assume that conditionally writeable
+			W^NET$GL_FLAGS	; fields are writeable
+	BSBW	CNF$GET_FIELD		; See if it's set
+	BLBC	R8,20$			; If LBC then not set, not "locked"
+	BISW	#NET$M_CNFLCK,-		; Indicate that conditionally writeable
+			W^NET$GL_FLAGS	; fields are not writeable
+20$:	;
+	;
+	;   We cannot alter the only copy of the current CNF in case the Qio
+	;   eventually fails.  We must create a clone and modify it.  If all
+	;   goes well it will eventually replace the original CNF in the
+	;   database.
+	;
+	;
+	MOVL	W^PTR_OLD_CNF,R8	; Recover pointer to "old" CNF
+	BEQL	25$			; If EQL then none, R10 points to
+					; the utility buffer already
+	BSBW	CNF$INIT_UTL		; Init "utility buffer" as a CNF
+	BSBW	CNF$COPY		; Copy R8 CNF to R10 CNF
+	BLBC	R0,40$			; If LBC then error
+25$:	;
+	;
+	;   Zip down the field i.d. list in the P1 buffer.  For each field
+	;   attempt to either clear or set the field according to the type of
+	;   Qio being processed.
+	;
+	;   Before setting/clearing the field, read it so that it may be 
+	;   compared to the value which the Qio is trying to set (comparison 
+	;   for the CLEAR Qio is 'is it already clear?';  comparison for the 
+	;   SET Qio is 'does it already have this value').  This is done for
+	;   the following reasons:
+	;
+	;    o	If the field is write-locked and the new value equals the old
+	;	value then no error should be returned.  This is easier to 
+	;	check before the modification is attempted than after it fails.
+	;    o  If the values are the same then the modification is not needed
+	;	and the "put field" is more expensive than a "read field".
+	;	Setting a field to its original value is actually too uncommon
+	;	since (in NCP terms) the safest way to update both the 
+	;	disk resident and NETACP resident databases is with the 
+	;	NCP commands:
+	;
+	;		NCP>DEF  entity-type  entity-id  parameter
+	;		NCP>SET  entity-type  entity-id  ALL
+	;
+	;
+	MOVAB	NFB$L_FLDID(R6),R5	; Point to the first field i.d.
+30$:	MOVL	(R5)+,R9		; Get next field i.d.
+	ASSUME	NFB$C_ENDOFLIST  EQ  0
+	BEQL	40$			; If EQL then no more field i.d.s
+	BSBB	100$			; SET/CLEAR the field
+	BLBS	R0,30$			; Loop unless error is signalled
+40$:	MOVL	W^NET$GL_PTR_P4,-	; Reset the P4 descriptor for the next
+		    W^PTR_L_P4		; pass
+	MOVL	W^NET$GL_SIZ_P4,-	;
+		    W^SIZ_L_P4		;
+	RSB				; Return with status in R0 and error
+					; qualifier in R9
+
+100$:	;
+	;
+	;   If this is a SET Qio then branch.  Else, this is a CLEAR Qio --
+	;   if LBC in R0 then the field is already clear in the new CNF and
+	;   there's no need to attempt to clear it again.
+	;
+	;
+	BSBW	CNF$GET_FLD_EX		; Get the current field value for later
+					; reference using access rights of user
+	MOVW	R0,GET_W_STATUS		; Save status
+	BBS	#NET$V_SETQIO,-		; If BS then SET Qio
+		    W^NET$GL_FLAGS,105$	;
+	BLBC	R0,102$			; If LBC then field is already clear
+	BSBW	CNF$CLR_FLD_EX		; Clear the field according to the 
+					; user's access rights
+	BRW	330$			; Return with status in R0
+102$:	BRW	320$			; Return with success in R0
+105$:	;
+	;
+	;   This is a "SET" Qio.  If the field value is not null and it is 
+	;   different than the current value in the CNF then store it into the
+	;   CNF.
+	;
+	;
+	MOVQ	R7,R3			; Save the field/descriptor
+	MOVL	W^PTR_L_P4,R8		; Get new parameter pointer
+	MOVZWL	#SS$_RESULTOVF,R0	; Assume P4 is too small
+	EXTZV	#NFB$V_TYP,-		;
+		#NFB$S_TYP,R9,R1	; Get field type 
+	$DISPATCH  R1,-			; Dispatch on field type
+	<-
+	    <NFB$C_TYP_V,	200$>,	-; Bit
+	    <NFB$C_TYP_L,	200$>,	-; Longword
+	    <NFB$C_TYP_S,	300$>,	-; String
+	>
+	BUG_CHECK	NETNOSTATE,FATAL
+200$:	;
+	;
+	;   SET "bit" or "longword" field value
+	;
+	;
+	SUBL	#4,W^SIZ_L_P4		; Account for field size
+	BLSS	330$			; If LSS the P4 buffer is too small
+	MOVAB	4(R8),W^PTR_L_P4	; Update to next parameter pointer
+	MOVL	(R8),R8			; Get parameter value
+	BLSS	320$			; If LSS then treat as a NOP
+	BLBC	GET_W_STATUS,317$	; If LBC then param not yet set
+	CMPL	R8,R4			; Does old value EQL new value ?
+	BRB	315$			; Continue in common
+300$:	;
+	;
+	;   SET "string" value
+	;
+	;
+	SUBL	#2,W^SIZ_L_P4		; Account for string count field
+	BLSS	330$			; If LSS then too small, report error
+	MOVZWL	(R8)+,R7		; Get string size
+	MOVL	R7,R2			; Make a copy
+	MOVZWL	NFB$W_CELL_SIZE(R6),R1	; Get fixed string cell size
+	BEQL	310$			; If EQL then cell size is not fixed
+	SUBW	#2,R1			; Adjust for count field
+	CMPW	R1,R7			; Can string fit in cell?
+	BLSSU	330$			; If LSS then P4 buffer is too small
+	MOVL	R1,R2			; Store string size
+310$:	MOVAB	(R8)[R2],W^PTR_L_P4	; Store address of next field
+	SUBL	R2,W^SIZ_L_P4		; Calculate P4 buffer bytes remaining
+	BLSS	330$			; If LSS then P4 buffer is too small
+	TSTL	R7			; Is the string null?
+	BEQL	320$			; If EQL yes, treat as a NOP
+	BLBC	GET_W_STATUS,317$	; If LBC then param not yet set
+	CMPL	R3,R7			; Are old and new strings of equal size
+	BNEQ	317$			; If NEQ then must set new value
+	CMPC3	R3,(R4),(R8)		; Is old value EQL new value
+315$:	BEQL	320$			; If EQL then no need for set
+317$:	CLRL	R0			; No pre-set error code
+	BSBW	CNF$PUT_FLD_EX		; Attempt to store new value
+	BRB	330$			; Take common exit with status in R0
+320$:	MOVL	#1,R0			; Indicate success
+330$:	RSB
+
+ACTION_DELETE:				; ACP 'Delete' QIO action routine
+	BISW	#NET$M_DELETE,-		; Indicate function type
+		    W^NET$GL_FLAGS	;
+	;
+	;
+	;   First move the specified fields to the P4 buffer if it exists
+	;
+	;
+	MOVL	#1,R0			; Assume success
+	TSTL	W^NET$GL_SIZ_P4		; Is there a P4 buffer?
+	BEQL	10$			; If EQL no, continue
+	BSBB	ACTION_SHOW		; Move the fields to the P4 buffer
+	BLBC	R0,20$			; If LBC then error
+	;
+	;
+	;   Mark the CNF for deletion.
+	;
+	;
+10$:	BSBW	CNF$DELETE		; Attempt to mark CNF for delete
+20$:	RSB				; Return status in R0, qualifier in R9
+
+
+ACTION_ZERCOU:				; Zero and optionally read counters
+	BISW	#NET$M_CLRCNT,-		; Flag "clear counters"
+		    W^NET$GL_FLAGS 	; and fall thru
+
+
+ACTION_SHOW:				; "SHOW" Qio action routine
+	BSBW	CNF$PRE_SHOW		; Pre-process the CNF for "show" QIO
+	;
+	;
+	;   Move each field specified in the NFB into the P4 buffer.
+	;
+	;   
+	MOVAB	NFB$L_FLDID(R6),R5	; Get address of first field i.d.
+20$:	MOVL	(R5)+,R9		; Get next field i.d.
+	ASSUME	NFB$C_ENDOFLIST EQ 0
+	BEQL	30$			; If EQL then we're done
+	MOVL	W^PTR_L_P4,R3		; Get pointer into P4 buffer
+	BSBB	100$			; Dispatch on field type
+	MOVL	R3,W^PTR_L_P4		; Update pointer into P4 buffer
+	BLBC	R0,40$			; If LBC then error
+	REMQUE	@W^NET$GQ_TMP_BUF,R0	; Drain the temp buffer queue to keep
+	BVS	20$			; The pool as available as possible
+	BSBW	NET$DEALLOCATE		; (CNF$GET_FIELD may have allocated one)
+	BRB	20$			; Loop for each field
+30$:	MOVL	#1,R0			; Indicate success
+40$:	RSB				; Done
+
+
+100$:	BSBW	CNF$GET_FLD_EX		; Get the field/descriptor and possibly
+					; zero counters as a side effect
+	BBC	#NET$V_CLRCNT,-		; If BC not ZERO COUNTER function
+		    W^NET$GL_FLAGS,105$	;
+	TSTL	W^NET$GL_SIZ_P4		; Is there a user P4 buffer ?
+	BGEQ	200$			; If GEQ no, not a READ-and-ZERO
+105$:	EXTZV	#NFB$V_TYP,-		;
+		#NFB$S_TYP,R9,R1	; Get field type 
+	$DISPATCH  R1,-			; Dispatch on field type
+	<-
+	    <NFB$C_TYP_V,	110$>,	-; 
+	    <NFB$C_TYP_L,	110$>,	-;
+	    <NFB$C_TYP_S,	140$>,	-;
+	>
+	BUG_CHECK	NETNOSTATE,FATAL
+110$:	;
+	;
+	;   The field is not a "string".  If the field is valid then store it
+	;   into the P4 buffer.  Else store the value -1.
+	;
+	;
+	BLBS	R0,120$			; If LBS then field is valid
+	MNEGL	#1,R8			; Else use -1
+120$:	SUBL	#4,W^SIZ_L_P4		; Account for bytes to be taken
+	BLSS	220$			; If LSS then P4 is too small
+	MOVL	R8,(R3)+		; Move field value to P4 buffer
+	BRB	200$			; Take common exit
+140$:	;
+	;
+	;   The field is type "string".  If field is valid then store it into
+	;   the P4 buffer.  Else store a null string.
+	;
+	;
+	BLBS	R0,150$			; If LBS then field is valid
+	CLRL	R7			; Nullify count if type string
+	MOVL	SP,R8			; Point R8 to somewhere accessible
+					; (!need P5 buffer of status codes)
+150$:	SUBL	#2,W^SIZ_L_P4		; Account for bytes to be taken
+	BLSS	220$			; If LSS then P4 is too small
+	MOVW	R7,(R3)+		; Enter count field
+	MOVZWL	NFB$W_CELL_SIZE(R6),R0	; Get fixed cell size
+	BNEQ	160$			; If EQL then cell size is not fixed
+	MOVL	R7,R0			; Use string size as cell size
+160$:	SUBL	R0,W^SIZ_L_P4		; Account for bytes to be taken
+	BLSS	220$			; If LSS then P4 is too small
+	PUSHL	R5			; Save critical reg
+	MOVC5	R7,(R8),#0,R0,(R3)	; Move string text to cell
+	POPL	R5			; Restore reg
+200$:	MOVL	#1,R0			; Indicate success
+	RSB
+
+220$:	MOVZWL	#SS$_RESULTOVF,R0	; Indicate P4 is too small
+	RSB
+
+
+
+;+
+; REISSUE_X25	- Reissue X25 QIO
+;
+; The IO$_ACPCONTROL QIO is reissued to the X25 ACP since the database
+; addressed by the QIO is maintained by that ACP.  If there is no channel
+; currently active to the X25 ACP then one is assigned.
+;
+;
+;-
+REISSUE_X25:				; Re-issue QIO to X25 ACP
+	TSTW	NET$GW_X25_CHAN		; Is there an active channel?
+	BNEQ	50$			; If NEQL then yes
+	BSBB	NET$GET_X25_CHAN	; Assign channel, get PSI mutex
+	BLBC	R0,100$			; If LBC then error
+50$:	$QIOW_S	FUNC = #IO$_ACPCONTROL	-; Re-issue QIO
+		EFN  = #NET$C_EFN_WAIT	-; event flag for synchronous calls
+		CHAN = NET$GW_X25_CHAN	-;
+		IOSB = QUAD_BUF		-; Scratch quadword buffer
+		P1   = NET$GL_SIZ_P1	-; Address of NFB descriptor
+		P2   = #NET$GL_SIZ_P2	-; Address of P2 buffer desciptor
+		P3   = @NET$GL_PTR_P3	-; Address of word to return P4 bytecnt
+		P4   = #NET$GL_SIZ_P4	 ; Address of P4 buffer
+	BLBC	R0,100$			; If LBC then error
+	MOVQ	QUAD_BUF,R0		; Setup IOSB image
+100$:	RSB				; Done
+
+;+
+; NET$GET_X25_CHAN	- Assign channel to the PSIACP and get its mutex
+;
+; A channel is assigned to the NW device.  This is the path to the PSI ACP.
+; If successful, then issue a $QIO to obtain the PSI ACP database mutex.
+; If that fails then deassign the channel.
+;
+;
+; INPUTS:	R0,R1	Scratch
+;
+; OUTPUTS:	R0,R1	Status
+;
+;-
+NET$GET_X25_CHAN::			; Get channel to X25 ACP
+	;
+	;
+	;   ASSIGN a channel to the NW driver.  This is the path to the
+	;   PSI ACP.  The only expected error return if SS$_NOSUCHDEV
+	;   indicating that the NW driver has not been loaded.
+	;
+	;
+	$ASSIGN_S -			; Assign channel to X25 ACP
+		CHAN   = NET$GW_X25_CHAN,-
+		DEVNAM = NET$GQ_X25_DEV
+	BLBC	R0,200$			; If LBC then X25 is not active
+	;
+	;
+	;   NETACP is to be the sole modifier of the PSIACP database (other 
+	;   processes to issue $QIO's to show the PSIACP database).  Thus, a
+	;   $QIO must be issued to obtain the PSIACP database mutex.
+	;
+	;   The  expected return status codes are:
+	;
+	;	SS$_NORMAL	if successful
+	;	SS$_DEVACTIVE	if the mutex is already owned
+	;	SS$_DEVNOTMNT	if the PSIACP is not yet running
+	;
+	;
+	$QIOW_S	EFN  = #NET$C_EFN_WAIT,-; Event flag for synchronous calls
+		IOSB = QUAD_BUF,-	; Scratch quadword buffer
+		CHAN = NET$GW_X25_CHAN,-;
+		FUNC = #IO$_INITIALIZE!IO$M_ACCESS ; Ask for the mutex	
+	BLBC	R0,100$			; If LBC then error
+	MOVQ	QUAD_BUF,R0		; Setup IOSB image
+100$:	BLBS	R0,200$			; If LBS then no error
+	;
+	;
+	;   The attempt to obtain the mutex has failed.  $DASSGN the channel in
+	;   order to leave our database consistent, and it order to allow the 
+	;   PSIACP to assign a channel to the one and only NW UCB (the template
+	;   bit is set to allow NW UCBs to be cloned after PSIACP initializes).
+	;
+	;
+	PUSHR	#^M<R0,R1>		; Save error status
+	$DASSGN_S NET$GW_X25_CHAN	; Deassign the channel
+	CLRW	NET$GW_X25_CHAN		; Zero indicates "no channel assigned"
+	POPR	#^M<R0,R1>		; Restore original status
+200$:	RSB				; Done
+
+
+.END
+
